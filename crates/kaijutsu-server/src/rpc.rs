@@ -114,7 +114,7 @@ use kaijutsu_kernel::{
     shared_block_flow_bus,
 };
 use kaijutsu_types::paths;
-use kaijutsu_types::{ContextId, KernelId, Principal, PrincipalId, SessionId};
+use kaijutsu_types::{BlockId, ContextId, KernelId, Principal, PrincipalId, SessionId};
 // Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
 use kaijutsu_types::ToolKind as TypesToolKind;
 use serde_json;
@@ -620,6 +620,355 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
     }
 }
 
+/// What acting on one answered ask leaves for the driver to do.
+enum ExecAction {
+    /// Handled to the end. The ask is redeemed and the blocks waiting on it
+    /// carry the outcome, so the blocks settling IS the delivery and there
+    /// is nobody left to wake.
+    Settled,
+    /// The action ran into a pair this driver authored, and the model has
+    /// to be told with this text — its own turn ended when the gate
+    /// refused, so nothing else will notice the new blocks.
+    Tell(String),
+    /// Not this branch's business: take the ordinary wake path, where the
+    /// caller retries and its retry is what redeems.
+    FallThrough,
+    /// Nothing was done and nothing was consumed. Leave the answer
+    /// outstanding and try again on the next ledger change.
+    Deferred,
+}
+
+/// What the driver needs off an approval row to act on its answer, lifted
+/// out of the row so nothing below has to name a ledger type.
+///
+/// `pair` is `None` when the ask names no blocks — and also when a key no
+/// longer parses, because authoring a fresh pair shows the human something
+/// while a half-resolved pair would settle one block and strand the other.
+struct ExecutableAsk {
+    source: String,
+    cwd: Option<String>,
+    pair: Option<(BlockId, BlockId)>,
+    /// The denial as the model reads it on the output block's stderr. Short
+    /// on purpose — `kj ledger show <id>` is where the whole ask lives.
+    denial: String,
+}
+
+/// Both halves of "archived", because they are stored separately: archiving
+/// stamps `archived_at` and leaves `context_state` alone, so a check on the
+/// state column by itself reads an archived context as Live.
+fn context_row_is_live(row: &kaijutsu_kernel::kernel_db::ContextRow) -> bool {
+    row.context_state == kaijutsu_types::ContextState::Live && !row.is_archived()
+}
+
+fn context_is_live(kernel: &SharedKernel, context_id: ContextId) -> bool {
+    matches!(
+        kernel.kernel_db.lock().get_context(context_id),
+        Ok(Some(row)) if context_row_is_live(&row)
+    )
+}
+
+/// Seed the values an ask's free variables held when the human was asked,
+/// so the approved text expands to what was reviewed and not to whatever
+/// the context holds now. An ask that recorded nothing seeds nothing. A
+/// failure here is a reason not to run: the approval was for those values.
+async fn seed_ask_env(
+    kaish: &EmbeddedKaish,
+    request_id: &str,
+    kernel: &SharedKernel,
+) -> Result<(), String> {
+    let rows = kernel
+        .kernel_db
+        .lock()
+        .ask_env(request_id)
+        .map_err(|e| format!("could not read the variable values this ask recorded: {e}"))?;
+    kaish
+        .apply_ask_env(&rows)
+        .await
+        .map_err(|e| format!("could not restore the variable values this ask recorded: {e:#}"))
+}
+
+/// Author the command/output pair for an ask that never had one — the MCP
+/// `shell_write` path, whose ToolCall/ToolResult blocks belong to the layer
+/// above it and were already settled when its turn ended.
+fn author_pair_for_ask(
+    kernel: &SharedKernel,
+    context_id: ContextId,
+    principal_id: PrincipalId,
+    source: &str,
+) -> Result<(BlockId, BlockId), kaijutsu_kernel::block_store::BlockStoreError> {
+    let documents = &kernel.documents;
+    let last_block = documents.last_block_id(context_id);
+    let command_block_id = documents.insert_tool_call_as(
+        context_id,
+        None,
+        last_block.as_ref(),
+        "shell",
+        serde_json::json!({"code": source}),
+        Some(TypesToolKind::Shell),
+        Some(principal_id),
+        None,
+        None,
+    )?;
+    let output_block_id = documents.insert_tool_result_as(
+        context_id,
+        &command_block_id,
+        Some(&command_block_id),
+        "",
+        false,
+        None,
+        Some(TypesToolKind::Shell),
+        Some(PrincipalId::system()),
+        None,
+    )?;
+    if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
+        log::warn!("gate-resume: failed to set the new output block Running: {e}");
+    }
+    Ok((command_block_id, output_block_id))
+}
+
+/// Settle a pair to `Error` with `reason` on the output block's stderr —
+/// the shape a refused `shellExecute` already uses, so a human reading the
+/// conversation sees why nothing ran in the place the command would have
+/// printed.
+fn settle_pair_error(
+    kernel: &SharedKernel,
+    context_id: ContextId,
+    command_block_id: &BlockId,
+    output_block_id: &BlockId,
+    reason: String,
+) {
+    let documents = &kernel.documents;
+    let _ = documents.set_stderr(context_id, output_block_id, Some(reason));
+    let _ = documents.set_status(context_id, output_block_id, Status::Error);
+    let _ = documents.set_status(context_id, command_block_id, Status::Error);
+}
+
+/// Run an answered ask that carries executable source, or settle the blocks
+/// waiting on it when it was refused.
+///
+/// **Redeem before execute, always.** The redemption row is the
+/// exactly-once claim (`approval_redemptions.request_id` is a primary key),
+/// so claiming it first means a crash between the claim and the run loses
+/// the action. That is the chosen side of the trade: an approved
+/// destructive action that runs twice is much the worse outcome, and
+/// nothing here is durable enough to resume — a pending ask is abandoned at
+/// boot. See `docs/gate-shape-b.md`.
+async fn act_on_executable_answer(
+    kernel: &SharedKernel,
+    context_id: ContextId,
+    principal_id: PrincipalId,
+    answer: &kaijutsu_kernel::UndeliveredAnswer,
+    ask: &ExecutableAsk,
+) -> ExecAction {
+    let source = ask.source.as_str();
+    let linked = ask.pair;
+
+    // A denial runs nothing. With a pair to settle, the settling is the
+    // whole delivery and the answer is consumed here; with no pair there is
+    // nothing to show, so the caller keeps the wake it would have had and
+    // its retry collects the refusal.
+    if !matches!(answer.status, kaijutsu_kernel::ApprovalStatus::Allowed) {
+        let Some((command_block_id, output_block_id)) = linked else {
+            return ExecAction::FallThrough;
+        };
+        settle_pair_error(
+            kernel,
+            context_id,
+            &command_block_id,
+            &output_block_id,
+            ask.denial.clone(),
+        );
+        // Redeem after the blocks carry the reason: the answer is not
+        // delivered until there is something to read.
+        if let Err(e) = kernel.kernel_db.lock().redeem_ask(&answer.request_id) {
+            log::error!(
+                "gate-resume: ask {} was refused and its blocks settled, but the \
+                 redemption did not write ({e}); it may be delivered again",
+                answer.request_id
+            );
+        }
+        return ExecAction::Settled;
+    }
+
+    match kernel.kernel_db.lock().redeem_ask(&answer.request_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::info!(
+                "gate-resume: ask {} was already redeemed by someone else; not running it",
+                answer.request_id
+            );
+            return ExecAction::Settled;
+        }
+        Err(e) => {
+            // Fail closed. Running without the claim is the one outcome
+            // this whole ordering exists to prevent.
+            log::error!(
+                "gate-resume: could not claim ask {} ({e}); not running it",
+                answer.request_id
+            );
+            return ExecAction::Deferred;
+        }
+    }
+
+    // The second archived check (`docs/gate-shape-b.md`, "Archived contexts
+    // are inert"). The driver checked before reading the row; a context can
+    // be archived in the gap, and an archived context runs nothing.
+    //
+    // Reaching this after the claim spends the answer without running
+    // anything. That is the narrow window the first check exists to keep
+    // narrow, and it is the correct direction to fail in: the context is
+    // archived, so the action can never run, and a spent answer is a
+    // recorded one.
+    if !context_is_live(kernel, context_id) {
+        log::info!(
+            "gate-resume: {context_id} stopped being Live before ask {} could run; \
+             nothing was run",
+            answer.request_id
+        );
+        return ExecAction::Settled;
+    }
+
+    // A synthetic session: the seat that raised this ask is gone (its turn
+    // ended when the gate refused, or its connection closed), and a shell
+    // needs a session id to key its context binding on. Nothing durable is
+    // keyed by it.
+    let session_id = SessionId::new();
+    let name = format!("{}-gate-{}", kernel.name, session_id.short());
+    let kaish = match kernel
+        .kj_dispatcher
+        .materialize_context_kaish(
+            &name,
+            principal_id,
+            context_id,
+            session_id,
+            kernel.kj_dispatcher.semantic_index(),
+            kernel.kj_dispatcher.block_source(),
+        )
+        .await
+    {
+        Ok(kaish) => kaish,
+        Err(e) => {
+            log::error!(
+                "gate-resume: could not materialize a shell for ask {} ({e}); the \
+                 approval is spent and nothing ran",
+                answer.request_id
+            );
+            if let Some((command_block_id, output_block_id)) = linked {
+                settle_pair_error(
+                    kernel,
+                    context_id,
+                    &command_block_id,
+                    &output_block_id,
+                    format!("approved, but no shell could be built to run it: {e}"),
+                );
+            }
+            return ExecAction::Settled;
+        }
+    };
+
+    let (command_block_id, output_block_id, authored) = match linked {
+        Some((command_block_id, output_block_id)) => (command_block_id, output_block_id, false),
+        None => match author_pair_for_ask(kernel, context_id, principal_id, source) {
+            Ok((command_block_id, output_block_id)) => (command_block_id, output_block_id, true),
+            Err(e) => {
+                log::error!(
+                    "gate-resume: could not author blocks for ask {} ({e}); the approval \
+                     is spent and nothing ran",
+                    answer.request_id
+                );
+                return ExecAction::Settled;
+            }
+        },
+    };
+
+    // The directory the human was asked about, not wherever the context has
+    // reached since. A cwd that no longer resolves stops the run: the
+    // approved text was read against that directory, and running it
+    // somewhere else is a different action.
+    if let Some(cwd) = ask.cwd.as_deref()
+        && !kaish.try_set_cwd(std::path::PathBuf::from(cwd)).await
+    {
+        let reason = format!(
+            "approved, but not run: {cwd} — the directory this was raised in — no longer \
+             resolves to a directory"
+        );
+        settle_pair_error(
+            kernel,
+            context_id,
+            &command_block_id,
+            &output_block_id,
+            reason,
+        );
+        return if authored {
+            ExecAction::Tell(format!(
+                "A human approved the action you were waiting on: {}\n\n\
+                 It did NOT run: {cwd} — the directory it was raised in — no longer \
+                 resolves. Block {} carries the same message. Ask again from a \
+                 directory that exists.",
+                answer.description,
+                output_block_id.to_key()
+            ))
+        } else {
+            ExecAction::Settled
+        };
+    }
+
+    if let Err(why) = seed_ask_env(&kaish, &answer.request_id, kernel).await {
+        let reason = format!("approved, but not run: {why}");
+        settle_pair_error(
+            kernel,
+            context_id,
+            &command_block_id,
+            &output_block_id,
+            reason.clone(),
+        );
+        return if authored {
+            ExecAction::Tell(format!(
+                "A human approved the action you were waiting on: {}\n\n\
+                 It did NOT run: {why}. Block {} carries the same message. Ask again.",
+                answer.description,
+                output_block_id.to_key()
+            ))
+        } else {
+            ExecAction::Settled
+        };
+    }
+
+    log::info!(
+        "gate-resume: running approved ask {} in {context_id}",
+        answer.request_id
+    );
+    crate::shell_run::run_into_blocks(
+        &kaish,
+        source,
+        context_id,
+        &command_block_id,
+        &output_block_id,
+        &kernel.documents,
+        kernel.kernel.block_flows(),
+        &kernel.kernel_db,
+        &kernel.kernel,
+        principal_id,
+        session_id,
+        kernel.id,
+        // Nothing to move a context switch onto: this run has no session
+        // map of its own and no connection behind it.
+        None,
+    )
+    .await;
+
+    if authored {
+        ExecAction::Tell(format!(
+            "A human approved the action you were waiting on: {}\n\n\
+             It has already run — do NOT call it again. The output is in block {}.",
+            answer.description,
+            output_block_id.to_key()
+        ))
+    } else {
+        ExecAction::Settled
+    }
+}
+
 /// Spawn the server-lifetime gate-resume driver.
 ///
 /// The gate does not block the wire: an escalated call returns
@@ -634,17 +983,25 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
 /// publishing a turn request — the same two steps `kj drive --prompt` takes.
 /// The woken turn retries the tool call, and *that* attempt is what redeems.
 ///
-/// **It does not need exactly-once, and deliberately does not implement it.**
-/// The single-use guarantee lives in the `approval_redemptions` row that
-/// `find_redeemable` filters on, not here. Waking a context twice costs one
-/// wasted turn: the second retry finds nothing redeemable and gets a fresh
-/// ask. That is why the durable claimable row this replaced could be deleted
-/// — every hard problem it carried (exactly-once across a crash, a `claimed`
-/// row nobody can resolve) belonged to executing the action, and this does
-/// not execute anything.
+/// **An ask that carries `exec_source` does not wake anybody — it runs.**
+/// The kernel executes the stored source in the ask's context, as the ask's
+/// principal, in the ask's cwd, and fills the command/output pair the
+/// original call already authored (or authors a fresh one when the ask
+/// names none). Exactly-once for that path is the `approval_redemptions`
+/// row, claimed BEFORE the run: a crash in between loses the action rather
+/// than running it twice. Nothing here is durable — a pending ask is still
+/// abandoned at boot. See `docs/gate-shape-b.md`.
+///
+/// **The wake path needs no exactly-once and deliberately has none.** For
+/// an ask with no `exec_source` the single-use guarantee lives in the
+/// redemption row that `find_redeemable` filters on, and waking a context
+/// twice costs one wasted turn: the second retry finds nothing redeemable
+/// and gets a fresh ask.
 ///
 /// Denials wake a context too. A denied caller that is never woken keeps
-/// "waiting on a human" as its last word and never learns it was refused.
+/// "waiting on a human" as its last word and never learns it was refused —
+/// unless the ask names blocks, in which case settling them to `Error` with
+/// the reason is the delivery and no turn is spent.
 pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
     let builder = std::thread::Builder::new().name("gate-resume".to_string());
     if let Err(e) = builder.spawn(move || {
@@ -658,7 +1015,11 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                 return;
             }
         };
-        rt.block_on(async move {
+        // A LocalSet, like the turn driver: executing an approved ask
+        // materializes an `EmbeddedKaish` on this thread, and kaish's own
+        // execution path is not `Send`.
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
             let kernel = &registry.kernel;
             let mut sub = kernel.kernel.ledger_flows().subscribe("ledger.changed");
             log::info!("Gate-resume driver online");
@@ -729,7 +1090,8 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                     }
                     if woken_this_event >= WAKE_CAP_PER_EVENT {
                         log::warn!(
-                            "gate-resume: stopped at {WAKE_CAP_PER_EVENT} wakes for one ledger                              change; the rest wait for the next one"
+                            "gate-resume: stopped at {WAKE_CAP_PER_EVENT} wakes for one ledger \
+                             change; the rest wait for the next one"
                         );
                         break;
                     }
@@ -741,6 +1103,24 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                         continue;
                     };
                     let context_id = ContextId::from(uuid::Uuid::from_bytes(bytes));
+
+                    // The principal that RAISED the ask, never a fresh one:
+                    // `find_redeemable` scopes by principal, so a turn woken
+                    // under a different identity mints a new ask instead of
+                    // collecting the answer. Measured — the first cut used
+                    // `PrincipalId::new()` and every wake produced a fresh
+                    // ask id while the approval sat uncollected.
+                    let Ok(pbytes) = <[u8; 16]>::try_from(answer.principal_id.as_slice())
+                    else {
+                        log::error!(
+                            "gate-resume: ask {} has a principal_id that is not 16 bytes; skipping",
+                            answer.request_id
+                        );
+                        continue;
+                    };
+                    let principal_id =
+                        kaijutsu_types::PrincipalId::from(uuid::Uuid::from_bytes(pbytes));
+
 
                     // Only a Live context may be woken. An ask outlives the
                     // context that raised it on purpose (`approvals` has no
@@ -755,12 +1135,15 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                     // Marked woken either way: a context that is not Live is
                     // not going to become Live because we looked again.
                     match kernel.kernel_db.lock().get_context(context_id) {
-                        Ok(Some(row)) if row.context_state == kaijutsu_types::ContextState::Live => {}
+                        Ok(Some(row)) if context_row_is_live(&row) => {}
                         Ok(Some(row)) => {
                             log::info!(
-                                "gate-resume: {context_id} is {:?}, not Live; leaving ask {} \
-                                 uncollected",
-                                row.context_state,
+                                "gate-resume: {context_id} is {}; leaving ask {} uncollected",
+                                if row.is_archived() {
+                                    "archived".to_string()
+                                } else {
+                                    format!("{:?}, not Live", row.context_state)
+                                },
                                 answer.request_id
                             );
                             woken.insert(answer.request_id.clone());
@@ -785,28 +1168,117 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                         }
                     }
 
+                    // The whole row, because the summary does not carry
+                    // `exec_source` — and whether an answer runs here or
+                    // sends its caller back to try again is exactly that
+                    // field.
+                    let row = match kernel.kernel_db.lock().get_approval(&answer.request_id) {
+                        Ok(Some(row)) => row,
+                        Ok(None) => {
+                            log::error!(
+                                "gate-resume: ask {} has an answer but no row; skipping",
+                                answer.request_id
+                            );
+                            woken.insert(answer.request_id.clone());
+                            continue;
+                        }
+                        Err(e) => {
+                            // Fail closed: an unreadable row is not a reason
+                            // to guess which branch it belongs in.
+                            log::error!(
+                                "gate-resume: could not read ask {} ({e}); not acting on it",
+                                answer.request_id
+                            );
+                            continue;
+                        }
+                    };
+
+                    // An ask that carries executable source runs here, on
+                    // this driver, as the ask's principal in the ask's cwd
+                    // — `docs/gate-shape-b.md`, "Slice 5: approval
+                    // executes". Everything else keeps the wake below,
+                    // where the caller retries and the retry redeems.
+                    let executable = row.exec_source.clone().map(|source| {
+                        let pair = row
+                            .command_block_id
+                            .as_deref()
+                            .and_then(BlockId::from_key)
+                            .zip(row.output_block_id.as_deref().and_then(BlockId::from_key));
+                        let who = row
+                            .decided_by
+                            .as_deref()
+                            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+                            .map(|b| PrincipalId::from(uuid::Uuid::from_bytes(b)).short())
+                            .unwrap_or_else(|| "a human".to_string());
+                        let denial = match row.decided_option.as_deref() {
+                            Some(option) => format!("denied by {who} ({option}) — nothing was run"),
+                            None => format!("denied by {who} — nothing was run"),
+                        };
+                        ExecutableAsk {
+                            source,
+                            cwd: row.cwd.clone(),
+                            pair,
+                            denial,
+                        }
+                    });
+
+                    let executed_seed = match executable {
+                        None => None,
+                        Some(ask) => {
+                            match act_on_executable_answer(
+                                kernel,
+                                context_id,
+                                principal_id,
+                                &answer,
+                                &ask,
+                            )
+                            .await
+                            {
+                                ExecAction::Settled => {
+                                    woken.insert(answer.request_id.clone());
+                                    woken_this_event += 1;
+                                    continue;
+                                }
+                                ExecAction::Deferred => continue,
+                                ExecAction::Tell(text) => Some(text),
+                                ExecAction::FallThrough => None,
+                            }
+                        }
+                    };
+
                     // A turn already running will make its own next attempt.
                     // Not marked woken: if that turn ends without retrying,
                     // the next ledger change picks this up again.
+                    //
+                    // An execution that already happened is different: its
+                    // blocks are in the log, and the running turn's mailbox
+                    // finds them on its next catch_up, so there is nothing
+                    // left to say.
                     if kernel.kernel.turn_in_flight(context_id) {
+                        if executed_seed.is_some() {
+                            woken.insert(answer.request_id.clone());
+                            woken_this_event += 1;
+                        }
                         continue;
                     }
 
-                    let decision = match answer.status {
-                        kaijutsu_kernel::ApprovalStatus::Allowed => "approved",
-                        _ => "denied",
-                    };
-                    // Written as the model reads it: the outcome first, then
-                    // what to do about it. It must not imply the action ran
-                    // — an approval authorizes the retry, it does not
-                    // perform it.
-                    let seed = format!(
-                        "A human {decision} the action you were waiting on: {}\n\n\
-                         Nothing has run yet. Try the same call again — an approval \
-                         authorizes it exactly once. If it was denied, do not retry it; \
-                         say so and continue with the rest of your work.",
-                        answer.description
-                    );
+                    let seed = executed_seed.unwrap_or_else(|| {
+                        let decision = match answer.status {
+                            kaijutsu_kernel::ApprovalStatus::Allowed => "approved",
+                            _ => "denied",
+                        };
+                        // Written as the model reads it: the outcome first, then
+                        // what to do about it. It must not imply the action ran
+                        // — an approval authorizes the retry, it does not
+                        // perform it.
+                        format!(
+                            "A human {decision} the action you were waiting on: {}\n\n\
+                             Nothing has run yet. Try the same call again — an approval \
+                             authorizes it exactly once. If it was denied, do not retry it; \
+                             say so and continue with the rest of your work.",
+                            answer.description
+                        )
+                    });
 
                     let tail = kernel.documents.last_block_id(context_id);
                     let seed_block = match kernel.documents.insert_block_as(
@@ -828,23 +1300,6 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                             continue;
                         }
                     };
-
-                    // The principal that RAISED the ask, never a fresh one:
-                    // `find_redeemable` scopes by principal, so a turn woken
-                    // under a different identity mints a new ask instead of
-                    // collecting the answer. Measured — the first cut used
-                    // `PrincipalId::new()` and every wake produced a fresh
-                    // ask id while the approval sat uncollected.
-                    let Ok(pbytes) = <[u8; 16]>::try_from(answer.principal_id.as_slice())
-                    else {
-                        log::error!(
-                            "gate-resume: ask {} has a principal_id that is not 16 bytes; skipping",
-                            answer.request_id
-                        );
-                        continue;
-                    };
-                    let principal_id =
-                        kaijutsu_types::PrincipalId::from(uuid::Uuid::from_bytes(pbytes));
 
                     kernel.kernel.mark_turn_begun(context_id);
                     let delivered =
@@ -868,8 +1323,8 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                     woken.insert(answer.request_id.clone());
                     woken_this_event += 1;
                     log::info!(
-                        "gate-resume: woke {context_id} for {} ask {}",
-                        decision,
+                        "gate-resume: woke {context_id} for {:?} ask {}",
+                        answer.status,
                         answer.request_id
                     );
                 }
@@ -8303,7 +8758,7 @@ pub(crate) fn build_output_data(
 /// deepseek's review: this does mean the app (renders the node tree) and MCP
 /// (returns `rich_json` verbatim) can show divergent views of the same
 /// block when both are set — an accepted caveat, not a bug.
-fn block_output_data(
+pub(crate) fn block_output_data(
     result: &kaish_kernel::interpreter::ExecResult,
 ) -> Option<kaijutsu_types::OutputData> {
     let output = result.output().cloned();
@@ -8781,24 +9236,31 @@ fn propagate_context_switch(
 ) -> Option<ContextId> {
     match kaish.context_id() {
         Some(new_id) if new_id != started_at => {
-            let conn = connection.borrow();
-            conn.session_contexts.insert(conn.session_id, new_id);
+            record_context_switch(connection, new_id);
             Some(new_id)
         }
         _ => None,
     }
 }
 
+/// Write a context switch into this connection's shared `session_contexts`.
+/// Split out so `shell_run` can hand the same write to a caller that has
+/// already detected the switch itself.
+fn record_context_switch(connection: &Rc<RefCell<ConnectionState>>, new_id: ContextId) {
+    let conn = connection.borrow();
+    conn.session_contexts.insert(conn.session_id, new_id);
+}
+
 /// The durable surface of a context shell: working directory + exported env.
 /// Snapshotted before and after a command so we can persist exactly what the
 /// command changed back to L1, the same way a real shell's `cd` / `export`
 /// outlive the command that ran them.
-struct ShellStateSnapshot {
+pub(crate) struct ShellStateSnapshot {
     cwd: std::path::PathBuf,
     env: std::collections::BTreeMap<String, String>,
 }
 
-async fn snapshot_shell_state(kaish: &EmbeddedKaish) -> ShellStateSnapshot {
+pub(crate) async fn snapshot_shell_state(kaish: &EmbeddedKaish) -> ShellStateSnapshot {
     ShellStateSnapshot {
         cwd: kaish.cwd().await,
         env: kaish.exported_vars().await.into_iter().collect(),
@@ -8814,7 +9276,7 @@ async fn snapshot_shell_state(kaish: &EmbeddedKaish) -> ShellStateSnapshot {
 /// Caller must skip this when the command switched context (`kj context switch`
 /// / `kj fork`): the snapshots straddle two contexts, and the outgoing cwd is
 /// already saved inside kaish on switch (`KjBuiltin::save_context_cwd`).
-fn persist_shell_state(
+pub(crate) fn persist_shell_state(
     kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
     context_id: ContextId,
     before: &ShellStateSnapshot,
@@ -9027,310 +9489,31 @@ async fn execute_shell_command(
     let kernel_db_for_persist = kernel.kernel_db.clone();
     let kernel_arc_for_hooks = kernel_arc.clone();
     let kernel_id = kernel.id;
+    let session_id = connection.borrow().session_id;
 
     tokio::task::spawn_local(async move {
-        // Yield to let the event loop flush BlockInserted events to clients
-        // before we start producing text ops. Without this, fast commands
-        // (like `ls`) can emit edit_text before the client has processed the
-        // BlockInserted, causing DataMissing errors on the client side.
-        tokio::task::yield_now().await;
-
-        // Snapshot the shell's durable surface (cwd + exported env) so we can
-        // persist whatever this command changes (`cd`, `export`) back to L1.
-        let state_before = snapshot_shell_state(&kaish).await;
-
-        log::info!(
-            "shell_execute: executing code via EmbeddedKaish: {:?}",
-            code
-        );
-        match kaish
-            .execute_with_options(&code, kaish_kernel::ExecuteOptions::default())
-            .await
-        {
-            Ok(result) => {
-                log::info!(
-                    "shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",
-                    result.code,
-                    result.original_code,
-                    result.did_spill,
-                    result.text_out().len(),
-                    result.err.len()
-                );
-
-                // stdout → block content (DTE-tracked, app-observable, streams).
-                // stderr → its own metadata field so callers can tell them apart
-                // (a successful-with-warnings command carries stderr + exit 0).
-                // The LLM still sees both: hydration merges stderr back into the
-                // tool_result content (see hydrate.rs).
-                //
-                // ANSI ingest (docs/ansi-and-beyond.md): the raw bytes are the
-                // provenance, the projection is the block. `raw_stdout` reads
-                // `result.out` directly because `text_out()` is already lossy
-                // on the `Bytes` arm — storing a lossy "original" would defeat
-                // the whole point of keeping one.
-                let raw_out = kaijutsu_kernel::ansi_ingest::raw_stdout(&result);
-                let projection = kaijutsu_kernel::ansi_ingest::project(&raw_out);
-                let out_text = match projection {
-                    Some(ref p) => p.text.clone(),
-                    None => result.text_out().into_owned(),
-                };
-                if let Err(e) = documents_clone.edit_text_as(
-                    context_id,
-                    &output_block_id_clone,
-                    0,
-                    &out_text,
-                    0,
-                    Some(PrincipalId::system()),
-                ) {
-                    log::error!("Failed to update shell output: {}", e);
-                }
-                // Strictly after the edit: `edit_text` clears style_spans.
-                if let Some(p) = projection {
-                    kaijutsu_kernel::ansi_ingest::record(
-                        &documents_clone,
-                        context_id,
-                        &output_block_id_clone,
-                        p.spans,
-                        &raw_out,
-                    );
-                }
-
-                if !result.err.is_empty()
-                    && let Err(e) = documents_clone.set_stderr(
-                        context_id,
-                        &output_block_id_clone,
-                        Some(result.err.clone()),
-                    )
-                {
-                    log::error!("Failed to set shell stderr: {}", e);
-                }
-
-                if let Some(output_data) = block_output_data(&result)
-                    && let Err(e) = documents_clone.set_output(
-                        context_id,
-                        &output_block_id_clone,
-                        Some(&output_data),
-                    )
-                {
-                    log::error!("Failed to set output data: {}", e);
-                }
-
-                if let Some(ref ct_str) = result.content_type {
-                    let ct = ContentType::from_mime(ct_str);
-                    if ct != ContentType::Plain
-                        && let Err(e) =
-                            documents_clone.set_content_type(context_id, &output_block_id_clone, ct)
-                    {
-                        log::error!("Failed to set content_type: {}", e);
-                    }
-                }
-
-                // Read baggage: mark blocks ephemeral if tool signaled it
-                if result
-                    .baggage
-                    .get("kaijutsu.ephemeral")
-                    .map(|v| v == "true")
-                    .unwrap_or(false)
-                {
-                    for bid in [&command_block_id_clone, &output_block_id_clone] {
-                        if let Err(e) = documents_clone.set_ephemeral(context_id, bid, true) {
-                            log::error!("Failed to set ephemeral on block: {}", e);
-                        }
-                    }
-                }
-
-                // Persist the real kaish exit code on the ToolResult block
-                // before flipping status. Consumers (MCP context_shell return,
-                // BRP introspection, history views) read this to distinguish
-                // exit codes that all map to the same Status::Error.
-                //
-                // `result.code` is the code kaish hands back for `$?` inside a
-                // script — and on this `OutputProfile::Agent` shell, a capped
-                // command (`did_spill`) has that field FORCIBLY remapped to 3,
-                // with the command's actual exit stashed in `original_code`
-                // (kaish-kernel's `output_limit` module doc). That remap is a
-                // deliberate, loud signal for a script's own control flow — but
-                // this durable field is not control flow, it's the permanent
-                // record. Resolving through `original_code` here is the same
-                // move `mcp/servers/shell.rs`'s `shell_result_to_kernel` makes
-                // ("truncation is not failure") — a command that exited 0 and
-                // merely printed a lot must not read back as exit_code=3
-                // forever because it once got captured over 8 KB.
-                // Clamp to i32 — POSIX exit codes are 0-255; saturating cast
-                // covers the i64-to-i32 narrowing without surprise.
-                let real_code = result.original_code.unwrap_or(result.code);
-                let exit_code_i32: i32 = real_code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                if let Err(e) = documents_clone.set_exit_code(
-                    context_id,
-                    &output_block_id_clone,
-                    Some(exit_code_i32),
-                ) {
-                    log::error!("Failed to set output block exit_code: {}", e);
-                }
-
-                // Settle durable context state *before* flipping status to a
-                // terminal value: clients (and our own e2e harness) treat the
-                // ToolResult reaching Done/Error as "command finished" and may
-                // fire their next command immediately. If we persisted after, a
-                // back-to-back `cd /x` then `pwd` could re-materialize the shell
-                // off stale L1. Detect an in-shell context switch (kj fork /
-                // context switch) and propagate it to the connection's shared
-                // map; otherwise persist this command's cwd/export changes to the
-                // context it ran in. (On a switch the snapshots straddle two
-                // contexts and the outgoing cwd is already saved inside kaish, so
-                // we skip the write-back.)
-                match propagate_context_switch(&kaish, context_id, &connection_switch) {
-                    Some(new_context_id) => {
-                        log::info!(
-                            "shell_execute: context switched {} → {}",
-                            context_id,
-                            new_context_id
-                        );
-                        block_flows.publish(kaijutsu_kernel::flows::BlockFlow::ContextSwitched {
-                            context_id: new_context_id,
-                        });
-                    }
-                    None => {
-                        let state_after = snapshot_shell_state(&kaish).await;
-                        persist_shell_state(
-                            &kernel_db_for_persist,
-                            context_id,
-                            &state_before,
-                            &state_after,
-                        );
-                    }
-                }
-
-                // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
-                // Exit 3: truncation (did_spill) OR a command's own genuine exit 3 — neither is a failure
-                //
-                // Matched on `real_code`, not `result.code`: kaish's did_spill
-                // remap is unconditional — a command that FAILED and also
-                // spilled >8KB of output gets `code = 3` with the real failing
-                // code stashed in `original_code` (kaish-kernel's `output_limit`
-                // remap in `Kernel::run`/`spill_if_needed`, unconditional on the
-                // pre-spill exit). Matching on the raw code would fold that
-                // failure into the `3 => Done` arm and misreport it as success.
-                // `real_code` collapses back to `result.code` whenever
-                // `original_code` is `None` (no spill), so a command that
-                // genuinely exits 2 or 3 on its own is unaffected — this only
-                // changes classification for the spilled-and-failed case.
-                let final_status = match real_code {
-                    0 | 2 | 3 => Status::Done,
-                    _ => Status::Error,
-                };
-                if let Err(e) =
-                    documents_clone.set_status(context_id, &output_block_id_clone, final_status)
-                {
-                    log::error!("Failed to set output block status: {}", e);
-                }
-                if let Err(e) =
-                    documents_clone.set_status(context_id, &command_block_id_clone, final_status)
-                {
-                    log::error!("Failed to set command block status: {}", e);
-                }
-
-                // PostCall — hand the hook the real result this command
-                // produced (docs/gate-and-shell-split.md, "The three rpc.rs
-                // shell paths take the hook path"): mirrors `Broker::
-                // call_tool`'s own PostCall pinch point. `Proceed` changes
-                // nothing — the real output above already stands.
-                // `ShortCircuit` overrides it the same way `call_tool`'s
-                // PostCall can override a real server result; `Deny` settles
-                // both blocks to `Error` with the hook's reason, same as a
-                // `call_tool` caller getting `Denied` instead of the result
-                // it actually produced.
-                let hook_result = exec_result_to_hook_tool_result(&result);
-                let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
-                    user_principal_id,
-                    context_id,
-                    connection_switch.borrow().session_id,
-                    kernel_id,
-                );
-                match kernel_arc_for_hooks
-                    .broker()
-                    .shell_post_call_hooks(&code, &call_ctx, &hook_result)
-                    .await
-                {
-                    kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
-                    kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
-                        let text = shell_hook_result_text(&sc_result);
-                        let status = if sc_result.is_error { Status::Error } else { Status::Done };
-                        if let Err(e) =
-                            overwrite_block_text(&documents_clone, context_id, &output_block_id_clone, &text)
-                        {
-                            log::error!("Failed to write PostCall short-circuited shell output: {}", e);
-                        }
-                        let _ = documents_clone.set_status(context_id, &output_block_id_clone, status);
-                        let _ = documents_clone.set_status(context_id, &command_block_id_clone, status);
-                    }
-                    kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-                        // "on ...", not "denied by ...": the next line asks
-                        // for a settled status precisely because this carries
-                        // `GatePending` too, and a pending ask is not a no.
-                        let reason = format!("on shell command result: {err}");
-                        let settled = err.settled_block_status();
-                        let _ = documents_clone.set_stderr(context_id, &output_block_id_clone, Some(reason));
-                        let _ = documents_clone.set_status(context_id, &output_block_id_clone, settled);
-                        let _ = documents_clone.set_status(context_id, &command_block_id_clone, settled);
-                    }
-                }
-            }
-            Err(e) => {
-                let error_msg = format!("Error: {}", e);
-                log::error!("Shell execution failed: {}", e);
-                if let Err(e) = documents_clone.edit_text_as(
-                    context_id,
-                    &output_block_id_clone,
-                    0,
-                    &error_msg,
-                    0,
-                    Some(PrincipalId::system()),
-                ) {
-                    log::error!("Failed to update shell output with error: {}", e);
-                }
-                if let Err(e) =
-                    documents_clone.set_status(context_id, &output_block_id_clone, Status::Error)
-                {
-                    log::error!("Failed to set output block error status: {}", e);
-                }
-                if let Err(e) =
-                    documents_clone.set_status(context_id, &command_block_id_clone, Status::Error)
-                {
-                    log::error!("Failed to set command block error status: {}", e);
-                }
-
-                // OnError — hand the hook the real failure (mirrors
-                // `call_tool`'s own OnError pinch point). `ShortCircuit` can
-                // convert the failure into a synthetic success, same as
-                // `call_tool`'s OnError; `Proceed`/`Deny` both leave the
-                // real error above standing — a failed command is already
-                // the terminal state a `Deny` would produce.
-                let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
-                    user_principal_id,
-                    context_id,
-                    connection_switch.borrow().session_id,
-                    kernel_id,
-                );
-                let mcp_err = kaijutsu_kernel::mcp::McpError::Protocol(e.to_string());
-                if let kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) =
-                    kernel_arc_for_hooks
-                        .broker()
-                        .shell_on_error_hooks(&code, &call_ctx, &mcp_err)
-                        .await
-                {
-                    let text = shell_hook_result_text(&sc_result);
-                    let status = if sc_result.is_error { Status::Error } else { Status::Done };
-                    if let Err(e) =
-                        overwrite_block_text(&documents_clone, context_id, &output_block_id_clone, &text)
-                    {
-                        log::error!("Failed to write OnError short-circuited shell output: {}", e);
-                    }
-                    let _ = documents_clone.set_status(context_id, &output_block_id_clone, status);
-                    let _ = documents_clone.set_status(context_id, &command_block_id_clone, status);
-                }
-            }
-        }
+        // The connection's session map is what an in-shell `kj context
+        // switch` has to move; a detached run has no such map, which is the
+        // one thing that differs between the two callers of this run.
+        let record_switch = |new_id: ContextId| {
+            record_context_switch(&connection_switch, new_id);
+        };
+        crate::shell_run::run_into_blocks(
+            &kaish,
+            &code,
+            context_id,
+            &command_block_id_clone,
+            &output_block_id_clone,
+            &documents_clone,
+            &block_flows,
+            &kernel_db_for_persist,
+            &kernel_arc_for_hooks,
+            user_principal_id,
+            session_id,
+            kernel_id,
+            Some(&record_switch),
+        )
+        .await;
     });
 
     Ok(Ok(command_block_id))
@@ -9376,7 +9559,7 @@ struct ExecutedKjLatch { command: String, target: String, message: String }
 /// text-content half of `error_to_hook_json`/`result_to_hook_json` do in
 /// `mcp/broker.rs`, minus the JSON wrapper (this becomes the block's plain
 /// text, not a hook-visible var).
-fn shell_hook_result_text(result: &kaijutsu_kernel::mcp::KernelToolResult) -> String {
+pub(crate) fn shell_hook_result_text(result: &kaijutsu_kernel::mcp::KernelToolResult) -> String {
     result
         .content
         .iter()
@@ -9395,7 +9578,7 @@ fn shell_hook_result_text(result: &kaijutsu_kernel::mcp::KernelToolResult) -> St
 /// channel. Judged by the real exit the way `shell_result_to_kernel`
 /// judges it — a spilled-and-remapped `code=3` reads back as its
 /// `original_code`, not as truncation-flavored success.
-fn exec_result_to_hook_tool_result(
+pub(crate) fn exec_result_to_hook_tool_result(
     result: &kaish_kernel::interpreter::ExecResult,
 ) -> kaijutsu_kernel::mcp::KernelToolResult {
     let real_code = result.original_code.unwrap_or(result.code);
@@ -9468,7 +9651,7 @@ fn kaish_quote(word: &str) -> String {
 /// hook's `ShortCircuit` override a real command's output the block already
 /// carries, the same override `Broker::call_tool`'s own `PostCall` grants a
 /// hook over a real server result.
-fn overwrite_block_text(
+pub(crate) fn overwrite_block_text(
     documents: &SharedBlockStore,
     context_id: ContextId,
     block_id: &kaijutsu_types::BlockId,

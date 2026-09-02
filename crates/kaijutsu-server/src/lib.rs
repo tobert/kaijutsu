@@ -13,6 +13,7 @@ pub mod llm_stream;
 pub mod rpc;
 pub mod sftp;
 pub mod share;
+pub mod shell_run;
 pub mod ssh;
 
 // Generated Cap'n Proto code

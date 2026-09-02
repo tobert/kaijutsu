@@ -667,6 +667,41 @@ impl EmbeddedKaish {
     }
 }
 
+impl EmbeddedKaish {
+    /// Restore the values an ask's free variables held when it escalated:
+    /// export each recorded value into the root frame the way durable
+    /// `context_env` is seeded, and `unset` each name the ask recorded as
+    /// absent. After this, a variable set since the human read the statement
+    /// cannot change what runs. Rejects a name that is not a legal kaish
+    /// identifier before anything is executed. `docs/gate-shape-b.md`.
+    pub async fn apply_ask_env(&self, rows: &[approval_ledger::types::AskEnvRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut overlay = std::collections::HashMap::new();
+        let mut script = String::new();
+        for (i, row) in rows.iter().enumerate() {
+            if !is_valid_env_key(&row.name) {
+                anyhow::bail!("ask env: name {:?} is not a valid identifier", row.name);
+            }
+            match &row.value {
+                Some(value) => {
+                    let tmp = format!("__kj_ask_env_{i}__");
+                    overlay.insert(tmp.clone(), kaish_kernel::ast::Value::String(value.clone()));
+                    script.push_str(&format!("export {}=\"${tmp}\"\n", row.name));
+                }
+                None => script.push_str(&format!("unset {}\n", row.name)),
+            }
+        }
+        let opts = ExecuteOptions::new().with_vars(overlay);
+        let result = self.execute_with_options(&script, opts).await?;
+        if result.code != 0 {
+            anyhow::bail!("ask env script exited {}: {}", result.code, result.err);
+        }
+        Ok(())
+    }
+}
+
 /// Validate and convert durable `context_env` rows into `(name, Value)`
 /// pairs ready to export. The one helper both `apply_context_config`
 /// implementations share — this file's [`EmbeddedKaish::apply_context_config`]

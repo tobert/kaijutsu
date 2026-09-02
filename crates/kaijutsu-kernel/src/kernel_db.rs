@@ -1848,6 +1848,37 @@ impl KernelDb {
         )?)
     }
 
+    /// One approval row, whole — the executable source, the cwd, the block
+    /// pair and the decision, all of which the answer summary omits.
+    ///
+    /// The gate-resume driver reads this before acting on an answer:
+    /// whether an ask executes on approval or its caller must retry is a
+    /// property of the row, not of the summary.
+    pub fn get_approval(
+        &self,
+        request_id: &str,
+    ) -> KernelDbResult<Option<approval_ledger::types::ApprovalRow>> {
+        Ok(approval_ledger::ask::get_approval(
+            self.conn_for_ledger(),
+            request_id,
+        )?)
+    }
+
+    /// Consume an answered ask's single-use delivery. `Ok(true)` means THIS
+    /// call inserted the redemption row and owns the action; `Ok(false)`
+    /// means someone else already has it.
+    ///
+    /// The public face of `approval_ledger::decide::redeem_ask`, for the
+    /// same reason the reads above are wrapped: exactly-once lives in the
+    /// `approval_redemptions` primary key, and the server reaches it
+    /// through the kernel rather than through the ledger connection.
+    pub fn redeem_ask(&self, request_id: &str) -> KernelDbResult<bool> {
+        Ok(approval_ledger::decide::redeem_ask(
+            self.conn_for_ledger(),
+            request_id,
+        )?)
+    }
+
     // ========================================================================
     // Quiesce
     // ========================================================================
