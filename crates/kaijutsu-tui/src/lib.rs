@@ -28,6 +28,7 @@
 //! | [`keys`] | key events → intents, including the `Ctrl+A` prefix |
 //! | [`run`] | the event loop |
 //! | [`compose`], [`shell`], [`picker`], [`asks`] | later lanes |
+//! | [`editor`], [`diff`] | the two alternate-screen surfaces |
 
 pub mod app;
 pub mod asks;
@@ -40,3 +41,5 @@ pub mod render;
 pub mod run;
 pub mod shell;
 pub mod status;
+pub mod diff;
+pub mod editor;

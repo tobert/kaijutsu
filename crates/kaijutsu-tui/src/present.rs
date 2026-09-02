@@ -126,6 +126,77 @@ impl Palette {
             Style::new().fg(Color::DarkGray)
         }
     }
+
+    // ── the alternate screen: editor and diff (docs/tui.md, ruling 1) ───────
+
+    /// Buffer text in the editor.
+    pub fn editor_text(&self) -> Style {
+        Style::new().fg(Color::Reset)
+    }
+
+    /// vi's `~` marker for a row past the end of the buffer.
+    pub fn editor_filler(&self) -> Style {
+        self.dim()
+    }
+
+    /// The editor's mode line: path, dirty marker, mode label, position.
+    pub fn editor_status(&self) -> Style {
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Gray)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// The `:`-line while command mode is active.
+    pub fn editor_command(&self) -> Style {
+        Style::new().fg(Color::Reset)
+    }
+
+    /// The editor's transient message line (vim `E492`).
+    pub fn editor_message(&self) -> Style {
+        Style::new().fg(Color::Yellow)
+    }
+
+    /// A diff's file heading.
+    pub fn diff_header(&self) -> Style {
+        Style::new()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// A diff's `@@` hunk header.
+    pub fn diff_hunk(&self) -> Style {
+        Style::new().fg(Color::Cyan)
+    }
+
+    /// An inserted line's band.
+    pub fn diff_insert(&self) -> Style {
+        Style::new().fg(Color::Green)
+    }
+
+    /// A deleted line's band.
+    pub fn diff_delete(&self) -> Style {
+        Style::new().fg(Color::Red)
+    }
+
+    /// An unchanged line.
+    pub fn diff_context(&self) -> Style {
+        Style::new().fg(Color::Reset)
+    }
+
+    /// The changed words inside an inserted line, over its band.
+    pub fn diff_word_insert(&self) -> Style {
+        Style::new()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
+
+    /// The changed words inside a deleted line, over its band.
+    pub fn diff_word_delete(&self) -> Style {
+        Style::new()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
 }
 
 /// What a block needs from outside itself to render.

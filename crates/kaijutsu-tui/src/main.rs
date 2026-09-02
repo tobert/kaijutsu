@@ -54,6 +54,12 @@ struct Cli {
     /// a bound the client would hang instead of saying why.
     #[arg(long, default_value_t = 30)]
     connect_timeout: u64,
+
+    /// Open the diff viewer on `kj diff <A> [B]` instead of the conversation.
+    /// One path diffs disk against the kernel document that owns its text;
+    /// two paths diff the two documents.
+    #[arg(long, num_args = 1..=2, value_names = ["A", "B"])]
+    diff: Option<Vec<String>>,
 }
 
 fn main() -> Result<()> {
@@ -107,5 +113,5 @@ async fn run(cli: Cli) -> Result<()> {
     };
     tracing::info!(context = %start.id.short(), label = %start.label, "attached");
 
-    kaijutsu_tui::run::run(bridge, start, identity).await
+    kaijutsu_tui::run::run(bridge, start, identity, cli.diff).await
 }

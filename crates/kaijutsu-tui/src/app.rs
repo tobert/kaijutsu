@@ -114,6 +114,11 @@ pub struct App {
     pub quit: bool,
     notice: Option<String>,
     last_ctrl_c: Option<Instant>,
+    /// What has displaced the inline viewport, when anything has. Only the
+    /// editor and the diff viewer take the alternate screen (`docs/tui.md`,
+    /// ruling 1), and the key path early-returns on it, which is what makes
+    /// the editor the sanctioned raw key reader.
+    pub screen: crate::editor::ScreenMode,
 }
 
 impl App {
@@ -133,6 +138,7 @@ impl App {
             quit: false,
             notice: None,
             last_ctrl_c: None,
+            screen: crate::editor::ScreenMode::Inline,
         }
     }
 

@@ -291,6 +291,49 @@ on `:q`. `kaijutsu-editor` drives modalkit on
 `modalkit::crossterm::event::KeyEvent`, so the app's `keyconv.rs` translation
 is the identity here.
 
+**An open is a peer signal, not a push.** `subscribeEditor @79` carries
+`onEditorState` and `onEditorClosed` only — `Kernel::editor_open_as` publishes
+neither — so a client that watches that stream alone never learns a session
+exists. `signal_open_editor` sends the `open_editor` peer invoke to the
+*submitter principal's* attached peers, so the TUI attaches as a peer under
+the nick `kaijutsu-tui` and serves that one action. A `vi` submitted by
+another principal does not arrive: it goes to the `kaijutsu-app` fallback.
+Exact-window targeting is `docs/vi.md`'s open item, and it is what would let a
+terminal and an app window stop both popping.
+
+**The wire carries a cursor, no selection anchor.** `EditorState` has
+`cursor @2` and nothing else positional, so no client can draw a visual-mode
+highlight — the TUI renders the mode label and no band. Adding a selection
+range to the kernel's `EditorState` and to the capnp struct is step 1 of
+`docs/vi.md`'s "Selection rects", and it is what unblocks both renderers at
+once.
+
+**Keys bypass the prefix.** While the alternate screen is up every key goes to
+`editor_keys` verbatim, so `Ctrl+A` is vim's increment and `Ctrl+C` is vim's
+interrupt — the editor is the sanctioned raw reader (`docs/input.md`). The
+notation `kaijutsu-editor`'s `parse_keys` accepts is a literal char, `<Esc>`,
+`<CR>`, `<BS>`, `<Tab>`, a space, and `<C-x>`; an arrow, a function key and a
+literal `<` have no token, and are refused rather than sent and silently
+dropped. The loop awaits one `editor_keys` call per key, so keystrokes cannot
+reorder in flight and no ordering pipe is needed.
+
+**Restart staleness gives the viewport back.** A kernel restart drops the
+in-memory sessions while the persisted kernel id is unchanged, so the
+reconnect looks ordinary and only `editor: no such session N` reports it. The
+TUI leaves the alternate screen with a status-line notice on that verdict and
+on nothing else, probes with an empty key batch when `ServerEvent::Reconnected`
+arrives, and leaves on a `ConnectionStatus::Terminal`.
+
+**Nothing on the wire opens a diff view.** `kj diff` authors a
+`ContentType::Diff` block and each client decides for itself; the app's gesture
+is `v` on a focused block. The TUI's are `Ctrl+A v`, which opens on the newest
+openable block in the current context, and `kaijutsu-tui --diff <A> [B]`, which
+runs `kj diff` through `execute_kj` and opens on its output. The open rule is
+the app's `openable_diff`, ported: a declared diff always opens (an error state
+when it will not parse), and `Plain` opens only when its text — or a leading
+` ```diff ` fence — really parses. `q`/`Esc` closes; `j`/`k`, `Ctrl+D`/`Ctrl+U`
+and `g`/`G` move.
+
 ### Images
 
 Blocks already carry everything the wire needs: `ContentType::Svg` is inline

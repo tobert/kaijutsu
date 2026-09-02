@@ -30,6 +30,12 @@ pub enum Intent {
     NotYet(&'static str),
     /// The prefix was armed or cancelled; the legend line changed.
     LegendChanged,
+    /// `Ctrl+A v` — open the diff viewer on the newest diff block in the
+    /// current context. The app's `v`-on-a-focused-block gesture, ported:
+    /// nothing on the wire opens a diff view, so this is a local decision
+    /// about a block the context already holds (`docs/tui.md`, "Editor and
+    /// diff").
+    OpenDiff,
 }
 
 /// The prefix state machine.
@@ -68,6 +74,7 @@ impl Keys {
                 }
                 KeyCode::Char('"') | KeyCode::Char('w') => Intent::NotYet("picker: later lane"),
                 KeyCode::Char('l') => Intent::NotYet("ledger: later lane"),
+                KeyCode::Char('v') => Intent::OpenDiff,
                 KeyCode::Char('\'') | KeyCode::Char('A') | KeyCode::Char('q')
                 | KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char('d')
                 | KeyCode::Char('h') => Intent::NotYet("chord: later lane"),
@@ -159,6 +166,14 @@ mod tests {
             keys.interpret(ctrl('z')),
             Intent::NotYet("shell surface: later lane")
         );
+    }
+
+    #[test]
+    fn ctrl_a_v_opens_the_diff_viewer() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('v'))), Intent::OpenDiff);
+        assert!(!keys.armed());
     }
 
     #[test]
