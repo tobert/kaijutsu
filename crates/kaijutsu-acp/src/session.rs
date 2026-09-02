@@ -680,11 +680,23 @@ pub(crate) async fn settle_delivery(
 
 /// Let the event pump publish a kj command's ToolResult before the ACP prompt
 /// response closes the client's turn widget.
+///
+/// `command_block_id` is `None` only for a quiet `executeKj` run, which ACP
+/// never issues on this path (`bridge.kernel.execute_kj` always runs loud) —
+/// `None` here means that invariant broke, so this settles nothing and warns
+/// rather than waiting on a block that was never authored.
 pub(crate) async fn settle_command_delivery(
     bridge: &KernelBridge,
     session: &Arc<Session>,
-    command_block_id: BlockId,
+    command_block_id: Option<BlockId>,
 ) {
+    let Some(command_block_id) = command_block_id else {
+        tracing::warn!(
+            context = %session.context_id.short(),
+            "settle_command_delivery called with no command_block_id (quiet executeKj on a player command path?)"
+        );
+        return;
+    };
     const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
     const SETTLE_MAX_POLLS: u32 = 20;
     for _ in 0..SETTLE_MAX_POLLS {

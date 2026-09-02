@@ -527,6 +527,10 @@ struct ExecuteKjOutcome {
       #
       # Some `kj` verbs do not populate `.data` yet.
       data @8 :Text;
+      # True iff `commandBlockId` names a real block. False for a quiet
+      # run, which authors no blocks — `commandBlockId` carries no meaning
+      # in that case.
+      hasCommandBlockId @10 :Bool;
     }
     refused @9 :Refusal;
   }
@@ -2482,7 +2486,10 @@ interface Kernel {
   # command text from becoming an unintended general shell surface. The latch
   # fields reserve the confirmation round trip even though the first ACP
   # catalog is deliberately read-mostly.
-  executeKj @99 (contextId :Data, argv :List(Text), trace :TraceContext) -> (outcome :ExecuteKjOutcome);
+  #
+  # quiet: run the verb but author no blocks for it. For a client's own
+  # bookkeeping (polling the ledger), never for a player's command.
+  executeKj @99 (contextId :Data, argv :List(Text), trace :TraceContext, quiet :Bool) -> (outcome :ExecuteKjOutcome);
 
   # ACP-facing command metadata. argvPrefix is the exact kj argv represented
   # by name; clients append parsed user arguments. The server owns curation so

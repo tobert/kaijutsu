@@ -5419,17 +5419,23 @@ impl kernel::Server for KernelImpl {
         if argv.len() > 64 || argv.iter().any(|arg| arg.len() > 16 * 1024) {
             return Promise::err(capnp::Error::failed("kj argv exceeds wire limits".into()));
         }
+        let quiet = p.get_quiet();
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
         let principal = self.connection.borrow().principal.id;
         Promise::from_future(async move {
-            match execute_kj_command(context_id, principal, &argv, &kernel, &connection).await? {
+            match execute_kj_command(context_id, principal, &argv, &kernel, &connection, quiet).await? {
                 Ok(executed) => {
                     let mut out = results.get().init_outcome().init_ok();
                     out.set_exit_code(executed.exit_code);
                     out.set_stdout(&executed.stdout);
                     out.set_stderr(&executed.stderr);
-                    set_block_id_builder(&mut out.reborrow().init_command_block_id(), &executed.command_block_id);
+                    if let Some(command_block_id) = &executed.command_block_id {
+                        set_block_id_builder(&mut out.reborrow().init_command_block_id(), command_block_id);
+                        out.set_has_command_block_id(true);
+                    } else {
+                        out.set_has_command_block_id(false);
+                    }
                     if let Some(latch) = executed.latch {
                         out.set_latch_command(&latch.command);
                         out.set_latch_target(&latch.target);
@@ -9637,7 +9643,8 @@ struct ExecutedKj {
     exit_code: i32,
     stdout: String,
     stderr: String,
-    command_block_id: kaijutsu_types::BlockId,
+    /// `None` for a quiet run, which authors no blocks — see `KjBlockSink`.
+    command_block_id: Option<kaijutsu_types::BlockId>,
     latch: Option<ExecutedKjLatch>,
     /// `KjResult::Ok`'s structured data (via `block_output_data`'s
     /// `rich_json`), carried alongside the block-persistence path that
@@ -9858,16 +9865,40 @@ mod overwrite_block_text_tests {
     }
 }
 
+/// Where `execute_kj_command` writes its tool-call/tool-result pair — or
+/// nowhere, for a quiet run (`quiet` on `executeKj`, kaijutsu.capnp). Every
+/// block-store write past the pair's creation guards on this, so a quiet run
+/// executes the verb and returns its outcome without touching the store.
+enum KjBlockSink {
+    Authored { command_block_id: BlockId, output_block_id: BlockId },
+    Quiet,
+}
+
+impl KjBlockSink {
+    fn command_block_id(&self) -> Option<BlockId> {
+        match self {
+            Self::Authored { command_block_id, .. } => Some(*command_block_id),
+            Self::Quiet => None,
+        }
+    }
+}
+
 /// Execute exactly one `kj` builtin against an addressed context. This is a
 /// sibling of shell execution, not a call through its facade: the context's
 /// materialized kaish supplies kj's rc, persistence and latch semantics while
 /// structured argv prevents this RPC from becoming a general shell escape.
+///
+/// `quiet` skips the tool-call/tool-result pair: the verb still runs with
+/// the same context, principal, capability checks and gate, but nothing
+/// lands in the transcript. For a client's own bookkeeping (polling the
+/// ledger), never for a player's command.
 async fn execute_kj_command(
     context_id: ContextId,
     principal: PrincipalId,
     argv: &[String],
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
+    quiet: bool,
 ) -> Result<Result<ExecutedKj, kaijutsu_types::Refusal>, capnp::Error> {
     require_context_exists(kernel, context_id)?;
     let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
@@ -9875,16 +9906,21 @@ async fn execute_kj_command(
     if documents.get(context_id).is_none() {
         return Err(capnp::Error::failed(format!("context {} is not materialized", context_id)));
     }
-    let last = documents.last_block_id(context_id);
-    let command_block_id = documents.insert_tool_call_as(
-        context_id, None, last.as_ref(), "kj", serde_json::json!({"argv": argv}),
-        Some(TypesToolKind::Builtin), Some(principal), None, Some(Role::User),
-    ).map_err(|e| capnp::Error::failed(format!("failed to insert kj command: {e}")))?;
-    let output_block_id = documents.insert_tool_result_as(
-        context_id, &command_block_id, Some(&command_block_id), "", false, None,
-        Some(TypesToolKind::Builtin), Some(PrincipalId::system()), None,
-    ).map_err(|e| capnp::Error::failed(format!("failed to insert kj output: {e}")))?;
-    let _ = documents.set_status(context_id, &output_block_id, Status::Running);
+    let sink = if quiet {
+        KjBlockSink::Quiet
+    } else {
+        let last = documents.last_block_id(context_id);
+        let command_block_id = documents.insert_tool_call_as(
+            context_id, None, last.as_ref(), "kj", serde_json::json!({"argv": argv}),
+            Some(TypesToolKind::Builtin), Some(principal), None, Some(Role::User),
+        ).map_err(|e| capnp::Error::failed(format!("failed to insert kj command: {e}")))?;
+        let output_block_id = documents.insert_tool_result_as(
+            context_id, &command_block_id, Some(&command_block_id), "", false, None,
+            Some(TypesToolKind::Builtin), Some(PrincipalId::system()), None,
+        ).map_err(|e| capnp::Error::failed(format!("failed to insert kj output: {e}")))?;
+        let _ = documents.set_status(context_id, &output_block_id, Status::Running);
+        KjBlockSink::Authored { command_block_id, output_block_id }
+    };
 
     let mut code = String::from("kj");
     for arg in argv {
@@ -9907,12 +9943,15 @@ async fn execute_kj_command(
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
             let text = shell_hook_result_text(&sc_result);
             let status = if sc_result.is_error { Status::Error } else { Status::Done };
-            let _ = documents.edit_text_as(context_id, &output_block_id, 0, &text, 0, Some(PrincipalId::system()));
-            let _ = documents.set_status(context_id, &output_block_id, status);
-            let _ = documents.set_status(context_id, &command_block_id, status);
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                let _ = documents.edit_text_as(context_id, output_block_id, 0, &text, 0, Some(PrincipalId::system()));
+                let _ = documents.set_status(context_id, output_block_id, status);
+                let _ = documents.set_status(context_id, command_block_id, status);
+            }
             let exit_code = if sc_result.is_error { 1 } else { 0 };
             return Ok(Ok(ExecutedKj {
-                exit_code, stdout: text, stderr: String::new(), command_block_id, latch: None, data: None,
+                exit_code, stdout: text, stderr: String::new(),
+                command_block_id: sink.command_block_id(), latch: None, data: None,
             }));
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
@@ -9922,9 +9961,11 @@ async fn execute_kj_command(
             // Display already names what happened.
             let reason = err.to_string();
             let settled = err.settled_block_status();
-            let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
-            let _ = documents.set_status(context_id, &output_block_id, settled);
-            let _ = documents.set_status(context_id, &command_block_id, settled);
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                let _ = documents.set_stderr(context_id, output_block_id, Some(reason.clone()));
+                let _ = documents.set_status(context_id, output_block_id, settled);
+                let _ = documents.set_status(context_id, command_block_id, settled);
+            }
             // A verdict rides the result; only a fault still throws.
             return Ok(Err(refusal_or_fault(err, "kj")?));
         }
@@ -9935,14 +9976,16 @@ async fn execute_kj_command(
         Ok(result) => result,
         Err(e) => {
             let stderr = format!("kj execution failed: {e}");
-            documents.set_stderr(context_id, &output_block_id, Some(stderr.clone()))
-                .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
-            documents.set_exit_code(context_id, &output_block_id, Some(1))
-                .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
-            documents.set_status(context_id, &output_block_id, Status::Error)
-                .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
-            documents.set_status(context_id, &command_block_id, Status::Error)
-                .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                documents.set_stderr(context_id, output_block_id, Some(stderr.clone()))
+                    .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
+                documents.set_exit_code(context_id, output_block_id, Some(1))
+                    .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
+                documents.set_status(context_id, output_block_id, Status::Error)
+                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
+                documents.set_status(context_id, command_block_id, Status::Error)
+                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+            }
 
             // OnError — hand the hook the real failure (mirrors
             // `call_tool`'s own OnError pinch point). `ShortCircuit` can
@@ -9959,19 +10002,22 @@ async fn execute_kj_command(
             {
                 let text = shell_hook_result_text(&sc_result);
                 let status = if sc_result.is_error { Status::Error } else { Status::Done };
-                if let Err(e) = overwrite_block_text(&documents, context_id, &output_block_id, &text) {
-                    log::error!("Failed to write OnError short-circuited kj output: {}", e);
+                if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                    if let Err(e) = overwrite_block_text(&documents, context_id, output_block_id, &text) {
+                        log::error!("Failed to write OnError short-circuited kj output: {}", e);
+                    }
+                    let _ = documents.set_status(context_id, output_block_id, status);
+                    let _ = documents.set_status(context_id, command_block_id, status);
                 }
-                let _ = documents.set_status(context_id, &output_block_id, status);
-                let _ = documents.set_status(context_id, &command_block_id, status);
                 let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
                 return Ok(Ok(ExecutedKj {
                     exit_code: sc_exit_code, stdout: text, stderr: String::new(),
-                    command_block_id, latch: None, data: None,
+                    command_block_id: sink.command_block_id(), latch: None, data: None,
                 }));
             }
             return Ok(Ok(ExecutedKj {
-                exit_code: 1, stdout: String::new(), stderr, command_block_id, latch: None, data: None,
+                exit_code: 1, stdout: String::new(), stderr,
+                command_block_id: sink.command_block_id(), latch: None, data: None,
             }));
         }
     };
@@ -9997,41 +10043,43 @@ async fn execute_kj_command(
         None => result.text_out().into_owned(),
     };
     let stderr = result.err.clone();
-    documents.edit_text_as(context_id, &output_block_id, 0, &stdout, 0, Some(PrincipalId::system()))
-        .map_err(|e| capnp::Error::failed(format!("failed to persist kj output: {e}")))?;
-    // After the edit — `edit_text` clears style_spans.
-    if let Some(p) = projection {
-        kaijutsu_kernel::ansi_ingest::record(
-            &documents,
-            context_id,
-            &output_block_id,
-            p.spans,
-            &raw_out,
-        );
-    }
-    if !stderr.is_empty() {
-        documents.set_stderr(context_id, &output_block_id, Some(stderr.clone()))
-            .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
-    }
-    let output_data = block_output_data(&result);
-    if let Some(output) = &output_data {
-        documents.set_output(context_id, &output_block_id, Some(output))
-            .map_err(|e| capnp::Error::failed(format!("failed to persist kj data: {e}")))?;
-    }
     let exit_code = result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    documents.set_exit_code(context_id, &output_block_id, Some(exit_code))
-        .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
+    let output_data = block_output_data(&result);
+    if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+        documents.edit_text_as(context_id, output_block_id, 0, &stdout, 0, Some(PrincipalId::system()))
+            .map_err(|e| capnp::Error::failed(format!("failed to persist kj output: {e}")))?;
+        // After the edit — `edit_text` clears style_spans.
+        if let Some(p) = projection {
+            kaijutsu_kernel::ansi_ingest::record(
+                &documents,
+                context_id,
+                output_block_id,
+                p.spans,
+                &raw_out,
+            );
+        }
+        if !stderr.is_empty() {
+            documents.set_stderr(context_id, output_block_id, Some(stderr.clone()))
+                .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
+        }
+        if let Some(output) = &output_data {
+            documents.set_output(context_id, output_block_id, Some(output))
+                .map_err(|e| capnp::Error::failed(format!("failed to persist kj data: {e}")))?;
+        }
+        documents.set_exit_code(context_id, output_block_id, Some(exit_code))
+            .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
+        let status = if matches!(result.code, 0 | 2 | 3) { Status::Done } else { Status::Error };
+        documents.set_status(context_id, output_block_id, status)
+            .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
+        documents.set_status(context_id, command_block_id, status)
+            .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+    }
     // Deliberately ignore kaish.context_id(): ACP sessions stay pinned even
     // when a (future or direct-RPC) kj command returns KjResult::Switch.
     let state_after = snapshot_shell_state(&kaish).await;
     if kaish.context_id() == Some(context_id) {
         persist_shell_state(&kernel.kernel_db, context_id, &state_before, &state_after);
     }
-    let status = if matches!(result.code, 0 | 2 | 3) { Status::Done } else { Status::Error };
-    documents.set_status(context_id, &output_block_id, status)
-        .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
-    documents.set_status(context_id, &command_block_id, status)
-        .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
     let data = output_data.and_then(|od| od.rich_json);
 
     // PostCall — hand the hook the real result this command produced
@@ -10051,20 +10099,24 @@ async fn execute_kj_command(
         .await
     {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {
-            Ok(Ok(ExecutedKj { exit_code, stdout, stderr, command_block_id, latch, data }))
+            Ok(Ok(ExecutedKj {
+                exit_code, stdout, stderr, command_block_id: sink.command_block_id(), latch, data,
+            }))
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
             let text = shell_hook_result_text(&sc_result);
             let status = if sc_result.is_error { Status::Error } else { Status::Done };
-            if let Err(e) = overwrite_block_text(&documents, context_id, &output_block_id, &text) {
-                log::error!("Failed to write PostCall short-circuited kj output: {}", e);
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                if let Err(e) = overwrite_block_text(&documents, context_id, output_block_id, &text) {
+                    log::error!("Failed to write PostCall short-circuited kj output: {}", e);
+                }
+                let _ = documents.set_status(context_id, output_block_id, status);
+                let _ = documents.set_status(context_id, command_block_id, status);
             }
-            let _ = documents.set_status(context_id, &output_block_id, status);
-            let _ = documents.set_status(context_id, &command_block_id, status);
             let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
             Ok(Ok(ExecutedKj {
                 exit_code: sc_exit_code, stdout: text, stderr: String::new(),
-                command_block_id, latch: None, data: None,
+                command_block_id: sink.command_block_id(), latch: None, data: None,
             }))
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
@@ -10077,9 +10129,11 @@ async fn execute_kj_command(
             // every other verdict here does.
             let reason = format!("on kj command result: {err}");
             let settled = err.settled_block_status();
-            let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
-            let _ = documents.set_status(context_id, &output_block_id, settled);
-            let _ = documents.set_status(context_id, &command_block_id, settled);
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                let _ = documents.set_stderr(context_id, output_block_id, Some(reason.clone()));
+                let _ = documents.set_status(context_id, output_block_id, settled);
+                let _ = documents.set_status(context_id, command_block_id, settled);
+            }
             Ok(Err(refusal_or_fault(err, "kj")?))
         }
     }

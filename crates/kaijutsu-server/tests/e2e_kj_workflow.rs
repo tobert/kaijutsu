@@ -1131,3 +1131,50 @@ fn test_rpc_created_context_does_not_stamp_the_registry_default() {
         );
     });
 }
+
+// ============================================================================
+// Variant: quiet executeKj authors no blocks
+// ============================================================================
+
+#[test]
+fn test_execute_kj_quiet_authors_no_blocks_e2e() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let ctx = kernel.create_context("quiet-kj").await.unwrap();
+        kernel.join_context(ctx, "test").await.unwrap();
+
+        let argv = vec!["ledger".to_string(), "list".to_string()];
+
+        let before = get_all_blocks(&kernel, ctx).await.len();
+        let quiet = kernel
+            .execute_kj_quiet(ctx, &argv)
+            .await
+            .expect("quiet execute_kj");
+        assert_eq!(quiet.exit_code, 0, "kj ledger list should succeed: {}", quiet.stderr);
+        assert!(
+            quiet.command_block_id.is_none(),
+            "a quiet run authors no block, so there is no command_block_id to report"
+        );
+        let after_quiet = get_all_blocks(&kernel, ctx).await.len();
+        assert_eq!(
+            before, after_quiet,
+            "a quiet executeKj must not author a tool-call/tool-result pair"
+        );
+
+        let loud = kernel.execute_kj(ctx, &argv).await.expect("non-quiet execute_kj");
+        assert_eq!(loud.exit_code, 0, "kj ledger list should succeed: {}", loud.stderr);
+        assert!(
+            loud.command_block_id.is_some(),
+            "a non-quiet run authors a block and must report its id"
+        );
+        let after_loud = get_all_blocks(&kernel, ctx).await.len();
+        assert_eq!(
+            after_loud,
+            after_quiet + 2,
+            "a non-quiet executeKj must author exactly a tool-call/tool-result pair"
+        );
+    });
+}

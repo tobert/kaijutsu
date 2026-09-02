@@ -515,7 +515,9 @@ pub struct KjExecutionResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    pub command_block_id: BlockId,
+    /// `None` for a quiet run (`KernelHandle::execute_kj_quiet`), which authors
+    /// no block — there is no id to report.
+    pub command_block_id: Option<BlockId>,
     pub latch: Option<KjLatch>,
     /// `KjResult::Ok`'s structured data, always wired when the verb
     /// produced one (no `--json` opt-in). `None` when it did not.
@@ -2346,11 +2348,35 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Run `argv`, authoring a tool-call/tool-result block pair — the
+    /// ordinary path for a player's own command.
     #[tracing::instrument(skip(self, argv), name = "rpc_client.execute_kj")]
     pub async fn execute_kj(
         &self,
         context_id: ContextId,
         argv: &[String],
+    ) -> Result<KjExecutionResult, RpcError> {
+        self.execute_kj_impl(context_id, argv, false).await
+    }
+
+    /// Run `argv` authoring no blocks. For a client's own bookkeeping
+    /// (polling the ledger), never for a player's command — see `quiet` on
+    /// `executeKj` in kaijutsu.capnp. `command_block_id` on the result is
+    /// always `None`.
+    #[tracing::instrument(skip(self, argv), name = "rpc_client.execute_kj_quiet")]
+    pub async fn execute_kj_quiet(
+        &self,
+        context_id: ContextId,
+        argv: &[String],
+    ) -> Result<KjExecutionResult, RpcError> {
+        self.execute_kj_impl(context_id, argv, true).await
+    }
+
+    async fn execute_kj_impl(
+        &self,
+        context_id: ContextId,
+        argv: &[String],
+        quiet: bool,
     ) -> Result<KjExecutionResult, RpcError> {
         let mut request = self.kernel.execute_kj_request();
         request.get().set_context_id(context_id.as_bytes());
@@ -2366,6 +2392,7 @@ impl KernelHandle {
             trace.set_traceparent(&traceparent);
             trace.set_tracestate(&tracestate);
         }
+        request.get().set_quiet(quiet);
         let response = request.send().promise.await?;
         let result = match response.get()?.get_outcome()?.which()? {
             crate::kaijutsu_capnp::execute_kj_outcome::Ok(ok) => ok,
@@ -2397,11 +2424,16 @@ impl KernelHandle {
                 }
             }
         };
+        let command_block_id = if result.get_has_command_block_id() {
+            Some(parse_block_id(&result.get_command_block_id()?)?)
+        } else {
+            None
+        };
         Ok(KjExecutionResult {
             exit_code: result.get_exit_code(),
             stdout: result.get_stdout()?.to_string()?,
             stderr: result.get_stderr()?.to_string()?,
-            command_block_id: parse_block_id(&result.get_command_block_id()?)?,
+            command_block_id,
             latch,
             data,
         })

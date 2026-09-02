@@ -6,8 +6,9 @@
 //! (`docs/gate-and-shell-split.md`, "The shared seam: one ledger, one
 //! announcement, one write path"). The ledger is the one durable record and
 //! `kj ledger` is the one write path, from any surface. This module drives
-//! that path through [`ActorHandle::execute_kj`]; it opens no bespoke
-//! connection and holds no state beyond the `seen` set a caller passes in.
+//! that path through [`ActorHandle::execute_kj`] and
+//! [`ActorHandle::execute_kj_quiet`]; it opens no bespoke connection and
+//! holds no state beyond the `seen` set a caller passes in.
 //!
 //! # The kernel is the authority, and nothing expires
 //!
@@ -17,12 +18,15 @@
 //! outgoing round trip to a *player* (a client waiting on a human) is each
 //! caller's own concern, not this module's.
 //!
-//! # Every call here authors blocks
+//! # Reads are quiet; the decision is not
 //!
-//! `kj ledger list` and `show` run through [`ActorHandle::execute_kj`], and a
-//! `kj` run in a context leaves a tool-call/tool-result pair in that context's
-//! block log. Poll on a timer and the transcript fills with the client's own
-//! bookkeeping. Drive [`poll_new_asks`] from
+//! `kj ledger list` and `show` run through
+//! [`ActorHandle::execute_kj_quiet`] and author no blocks — this is the
+//! client's own bookkeeping, not a player's command, and polling it on a
+//! timer must not fill the transcript. [`decide_ask`] and
+//! [`decide_ask_remember`] run through [`ActorHandle::execute_kj`] instead:
+//! an allow/deny is a real decision and leaves a tool-call/tool-result pair
+//! in the answering context. Drive [`poll_new_asks`] from
 //! `ActorHandle::subscribe_ledger_events` (one poll per generation bump) plus
 //! one poll at startup, never from a clock.
 //!
@@ -78,7 +82,7 @@ pub enum LedgerError {
 /// in doesn't matter).
 pub async fn list_pending(actor: &ActorHandle, ctx: ContextId) -> Result<Vec<String>, LedgerError> {
     let result = actor
-        .execute_kj(ctx, vec!["ledger".to_string(), "list".to_string()])
+        .execute_kj_quiet(ctx, vec!["ledger".to_string(), "list".to_string()])
         .await?;
     if result.exit_code != 0 {
         return Err(LedgerError::Failed {
@@ -102,7 +106,7 @@ pub async fn list_pending(actor: &ActorHandle, ctx: ContextId) -> Result<Vec<Str
 /// again next poll", not as a decision (see [`poll_new_asks`]).
 pub async fn show_ask(actor: &ActorHandle, ctx: ContextId, request_id: &str) -> Option<AskInfo> {
     let result = match actor
-        .execute_kj(
+        .execute_kj_quiet(
             ctx,
             vec!["ledger".to_string(), "show".to_string(), request_id.to_string()],
         )
@@ -223,7 +227,7 @@ async fn list_ids(
 ) -> Result<Vec<String>, LedgerError> {
     let mut argv = vec!["ledger".to_string(), "list".to_string()];
     argv.extend(extra_args.iter().map(|s| s.to_string()));
-    let result = actor.execute_kj(ctx, argv).await?;
+    let result = actor.execute_kj_quiet(ctx, argv).await?;
     if result.exit_code != 0 {
         return Err(LedgerError::Failed {
             verb: "list",
@@ -298,7 +302,7 @@ pub async fn show_ask_detail(
     request_id: &str,
 ) -> Result<Option<AskDetail>, LedgerError> {
     let result = actor
-        .execute_kj(
+        .execute_kj_quiet(
             ctx,
             vec!["ledger".to_string(), "show".to_string(), request_id.to_string()],
         )

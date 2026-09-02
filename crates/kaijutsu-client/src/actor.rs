@@ -531,6 +531,11 @@ enum RpcCommand {
         argv: Vec<String>,
         reply: oneshot::Sender<Result<crate::rpc::KjExecutionResult, CallError>>,
     },
+    ExecuteKjQuiet {
+        context_id: ContextId,
+        argv: Vec<String>,
+        reply: oneshot::Sender<Result<crate::rpc::KjExecutionResult, CallError>>,
+    },
     GetKjCommandCatalog {
         context_id: ContextId,
         reply: oneshot::Sender<Result<Vec<crate::rpc::KjCommandInfo>, CallError>>,
@@ -816,6 +821,7 @@ impl RpcCommand {
             Self::GetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteKj { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ExecuteKjQuiet { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetKjCommandCatalog { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ShellDryRun { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1474,6 +1480,18 @@ impl ActorHandle {
         argv: Vec<String>,
     ) -> Result<crate::rpc::KjExecutionResult, CallError> {
         self.send(|reply| RpcCommand::ExecuteKj { context_id, argv, reply }).await
+    }
+
+    /// Run `argv` authoring no blocks — for a client's own bookkeeping
+    /// (polling the ledger), never for a player's command. See `quiet` on
+    /// `executeKj` in kaijutsu.capnp.
+    #[tracing::instrument(skip(self, argv))]
+    pub async fn execute_kj_quiet(
+        &self,
+        context_id: ContextId,
+        argv: Vec<String>,
+    ) -> Result<crate::rpc::KjExecutionResult, CallError> {
+        self.send(|reply| RpcCommand::ExecuteKjQuiet { context_id, argv, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -3591,6 +3609,15 @@ async fn dispatch_kernel_command(
                 kernel, reply, close_tx, k,
                 kaijutsu_types::timeout::gate::CLIENT_CALL,
                 k.execute_kj(context_id, &argv)
+            );
+        }
+        // Same deadline as `ExecuteKj`: a quiet run still reaches the gate,
+        // it just authors no blocks along the way.
+        RpcCommand::ExecuteKjQuiet { context_id, argv, reply } => {
+            dispatch_deadline!(
+                kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::gate::CLIENT_CALL,
+                k.execute_kj_quiet(context_id, &argv)
             );
         }
         RpcCommand::GetKjCommandCatalog { context_id, reply } => {
