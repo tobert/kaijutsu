@@ -2273,3 +2273,171 @@ context. Two paragraphs survived the melt, the two cursors and the principal
 model, and they are in `docs/tui.md` now. The beat phasor everyone assumed
 would need extracting turned out to have been in `kaijutsu-audio` since July;
 only a map of them was still app-side. Reading before planning, again.
+
+## The answer that travelled as an error (September 1–2)
+
+Probing a gated surface minted five asks. Not one probe five times: one
+probe, whose refusal arrived as a transport error, and a transport error
+means *"I could not tell you what happened"*, so the caller retried with
+slightly different text, and each retry with different text minted a new
+durable row. That is the whole defect in one receipt. A verdict is a result:
+the machinery worked and reached an answer, even when the answer is no, and
+the caller must not retry. A fault is an error: the machinery broke, the
+caller learned nothing, and a retry is reasonable. The gate had been
+delivering the first on the channel that means the second.
+
+The kernel already knew the difference. `McpError` drew the line in its own
+doc comments, and the durable projection was right: a pending ask settled its
+blocks `Waiting`, because an unanswered question is not a refusal. It was the
+*return path* that had nowhere to put the distinction. The same error object
+went two directions, and only the one into the block store kept its type. The
+one back to the caller became `capnp::Error::failed(reason)`, and there is no
+`capnp::ErrorKind` that describes a verdict, because every one of them
+describes a fault. This was not a careless implementation. It was a careful
+one, with a comment above the collapse saying exactly what was being lost.
+
+An inventory followed, because the obvious move was a general verdict type
+and the obvious move deserved a look before it got built. One hundred and
+fifty-two RPC methods; about one in eight had any second channel at all. The
+other seven-eighths had exactly one way to say anything went wrong, which was
+to throw. So this was not a gate bug that leaked. Throwing was the default,
+and the gate was merely where it hurt most. Amy's ruling closed the general
+question: **no general verdict facility.** The unit of work is the family.
+The inventory made that concrete: the VFS wants an errno, validation and
+policy already have a `(success, error)` pair on fourteen methods and needed
+nothing invented, and only the gate and capability family wanted a shape of
+its own. Six families, four changes.
+
+The VFS family went first and was smaller than its count. Of seventeen wire
+methods, four had a caller. General filesystem access over that interface had
+been superseded by SFTP months earlier and nobody had said so in the schema.
+Thirteen retired to stubs. One got fixed: `read` returns an error kind beside
+its data, the way `snapshot` had already modelled a denied node as a seam
+rather than a failed walk. The errno idea survived and its encoding did not: a
+raw platform number cannot cross this wire, because `ENOTEMPTY` is one number
+on Linux and another on macOS, and a Mac client talks to a Linux kernel. So
+the wire carries POSIX semantics under a stable encoding and each side maps
+to its own numbers.
+
+Then the fix that stopped at the wire turned out to buy nothing. The client's
+own actor repeated the collapse one hop later, flattening the freshly typed
+error back into a string in `CallError::Rpc`. The chain had a fifth layer
+nobody had named, and the receipt for why it mattered was already in the
+tree, written by its own victim: a roster function that lowercased kernel
+prose and searched it for "not found", with a doc comment explaining that
+text was all the wire carried, and a test pinning the exact wording including
+the transport prefix. It matches on a typed kind now. **Every boundary that
+stringifies is a place the type dies.**
+
+The gate family got its shape: a `Refusal` with a kind, a reason, a subject,
+an optional handle to the ask and an optional remedy, declared once in the
+schema and returned as a union with each method's old result, so a caller
+cannot miss it by forgetting to check a flag. Ordinals did not move. That was
+the plumbing, and the plumbing was the smaller half. Four things the
+inventory had not predicted cost more than all of it.
+
+A mandatory hook id had kept the model's own shell path off the type
+entirely: the direct `shell_write` gate has no hook, so it had been reporting
+every verdict as a protocol fault. The ask id was born as prose, formatted
+out of a typed reference one line away, and every consumer carried the
+string; a test recovered it by splitting a `kj ledger list` line. A denial
+had been dropping its reason, which is why a hook that could not read its
+own body after the config melt moved it presented to every caller as a bare
+"denied by hook shell-escape-guard" while the real reason sat one layer away
+in the journal; the earlier argument that hiding gate state assumes an
+adversary, and there is none inside the trust boundary, finally had a cost
+attached to it. And there was a seventh block-settling site. The model's own
+tool path derived block status from an `is_error` boolean and never reached
+the one mapping everything else used, so a pending ask reached the model as
+"Execution error" no matter how carefully the kernel had typed it, on the
+surface where a retry loop costs the most.
+
+Both families paid for the same lesson and it is the one to carry forward.
+**Counting the methods in a family is not counting the work.** The inventory
+listed RPC methods, and the type dies wherever anything stringifies: one hop
+past the wire, and in any consumer that derives one fact from another.
+
+Which left the part of the gate that had been waiting since August. The
+state-machine ruling, made when the wire stopped blocking, had said that when
+an answer lands the kernel performs the action itself. Nothing had. The
+approved caller still had to run the same command again, and the ledger
+matched the resubmission by digest. Amy ruled it the rest of the way:
+**approval triggers execution.** `kj ledger allow <id>` runs it, and fills
+the command and output blocks already sitting `Waiting` on that ask. There is
+nothing for a caller to present, so the tool parameter and the redeem verb
+from the earlier sketch never got built.
+
+Three things had to be true first, and one plan turned out wrong. The ask
+had to know its blocks, and nothing on the gate path could tell it: the RPC
+shell path authors its pair *before* gating and reaches the gate through the
+broker's hook evaluation, which never sees a block id. The ruling was that
+the caller records the link after escalation, in the one scope where the ask
+id and both block ids are together, so nothing threads through the broker.
+The cwd moved onto the ask row, replacing an in-memory pin that a restart
+had been quietly discarding. And the plan to delete the digest match was
+found wrong and recorded rather than done: the subscriber never calls it,
+but every origin that still retries does, and `kj cc send` renders the
+concrete message into its statement precisely so that an approval for one
+message cannot redeem a send of any other. The matcher was the authorization
+key for the retry path, not the duplication the lane had set out to remove.
+
+The last open question was a free `${VAR}`. The text a human approves and
+the bytes kaish runs can differ if a variable is set between the two, and
+the gate already refused to *learn a rule* for such a statement. The
+proposal on the table was to refuse to execute one. Amy asked instead:
+*"how hard would it be to snapshot kaish state along with the request?"* It
+was easy, and it made the case better than it had been, because both gated
+shell paths run on a single-use shell seeded only from the context's durable
+state, so "kaish state" at ask time is the `context_env` rows and the cwd,
+and the cwd was already on the ask. The free names are captured with their
+value or an explicit unset, restored verbatim before the source runs, and
+appended to the review so the human sees the expansion and not just the
+name. Amy added the constraint that made it one function rather than two:
+the classifier that scores the plan has to see the same data. So the
+snapshot is computed once in the kernel and rides both the ask row and the
+plan the hook reads.
+
+An archived context is inert at two levels, because one was not enough: an
+answer is refused on request, and the executor checks again before running,
+since the gap between answer and execution is exactly where a context can be
+archived. Archiving sweeps the context's unresolved asks the way a boot does.
+
+The executor landed the same afternoon as a branch inside the driver that
+already listened for answers. Its order is the design: claim the redemption
+row first, because the primary key is the only exactly-once there is; check
+the context is live again after the claim, because the window between an
+answer and its execution is where a context gets archived; move to the cwd
+the human was asked about and refuse if it is gone; restore the values the
+human read and refuse if that fails; run into the pair that was waiting. A
+crash between the claim and the run loses the action rather than doubling
+it, and that is the side of the trade the August ruling chose. The test for
+the archived case went red on the first try and found a bug older than the
+lane: archiving stamps a timestamp and leaves the state column at `live`,
+so the driver's guard had been reading the wrong half and had never once
+seen an archived context.
+
+Honesty about the ending: approval executes for one origin. Only the shell
+gate records executable source, only the RPC shell box links a block pair,
+and no shipped path does both, because the shell box gates through hooks
+and a hook's ask carries no source. The model's `shell_write` path runs on
+approval today; the human at the shell box still runs the command again
+until the hook gate learns to carry it. The wire tests synthesize the
+linked case and say so in their header. The lesson from the morning held to
+the end: the count of prerequisites was not the count of the work.
+
+The alignment question had one more turn in it. The scorer sees an
+unexpanded variable as a middle guess — measured that afternoon, a
+`chmod -R 777` on a variable scored a quarter as dangerous, on `/` almost
+certain, on a build cache almost nothing — so the values the human now
+sees should reach the classifier too. They do, as a field beside the plan.
+Whether the scorer substitutes them into what it judges is a different
+question, because kaish's plan is declared parse information and the
+classifier is meant to judge what was asked. That went to the kaish lead
+as a request for a second, expanded rendering rather than being rebuilt
+here in jq. And the hook that feeds the scorer from Amy's own terminal
+turned out to be shelling to whichever `kaish` was on the path, which the
+0.17 bump had swapped underneath it the day before. Amy's answer was the
+one the rest of the day had been circling: *"let's use kaish as a library
+which mcp already does so there's no way to have version skew."* The hook
+began moving into kaijutsu-mcp that evening, planning in process against
+the lockfile and replying to Claude Code before it scores.

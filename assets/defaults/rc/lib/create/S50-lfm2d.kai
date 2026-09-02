@@ -20,7 +20,7 @@
 # Model labels are NOT exported and never will be: the hook body reads them
 # from `GET /v1/models` at fire time, because lfm2d's own integration doc
 # says the label vocabulary changes between checkpoints
-# (lfm2d/docs/integration.md, invariant 2) -- a label baked in here would go
+# (lfm2d docs/integration.md, invariant 2) -- a label baked in here would go
 # stale the next time the daemon's checkpoint changes, silently.
 
 kj context set . --env LFM2D_MODE=escalate

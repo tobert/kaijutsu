@@ -237,9 +237,20 @@ It is one column, not a claim protocol.
    `gate.denied`, `gate.unavailable`, `capability.*`), following
    `tool.timeout`'s precedent, so a consumer branches on a code rather than
    on prose.
-5. **Redeem by id.** The ledger read, the divergence check, the cwd column
-   replacing the pin map, and the deletion of the digest set match.
-   `PENDING_REASON` stops saying "run the same command again".
+5. **Approval executes.** SHIPPED. The cwd and `exec_source` columns, the
+   block link, the free-variable snapshot, the executor branch in the
+   `ledger.changed` driver, and the split of `PENDING_REASON` into an
+   executes text and a retry text. The digest set match STAYS (below).
+
+   **Live for one origin.** Only the shell gate records `exec_source`, and
+   only the RPC `shellExecute` path links a block pair, and no shipped path
+   does both: `shellExecute` gates through installed hooks, whose asks are
+   built by `hook_gate.rs` with `exec_source: None`, so the human shell box
+   still retries; the MCP `shell_write` path executes on approval into a
+   pair the executor authors. The wire tests synthesize the linked case and
+   say so in their header. The next slice is the hook gate carrying the
+   command as `exec_source` when the hooked tool is the shell — then the
+   pair the shell box already authored is the one that fills.
 
 ## Slice 5: approval executes
 
@@ -313,10 +324,9 @@ describe.
   The gate is all-or-nothing per submission, so the executable unit is the
   whole submission, not the per-statement renderings.
 - **A free `${VAR}` means the approved text and the executed bytes can
-  differ.** Guarantee 3 already refuses to learn a RULE for such a statement;
-  a single-use ask has no equivalent guard, and executing stored source makes
-  the gap reachable rather than theoretical. The proposal is to refuse to
-  execute a stored statement with free variables and say so — not yet ruled.
+  differ.** Guarantee 3 already refuses to learn a RULE for such a statement.
+  The proposal was to refuse to execute one. **Ruled instead (Amy): snapshot
+  the values onto the ask** — "The ask carries its free variables", below.
 
 ### The rest, settled
 
@@ -372,10 +382,13 @@ and its ToolCall/ToolResult blocks are authored by the layer above it. An ask
 from that path carries `NULL`, and the subscriber authors into the ask's
 context instead.
 
-**Coverage gap, named rather than papered over.** `link_ask_blocks` is unit
-tested both ways, including that an unknown ask is an error rather than a
-silent no-op. The CALL SITE in `execute_shell_command` is not covered — it
-needs an RPC-level harness, and the subscriber work needs one anyway.
+**Coverage.** `link_ask_blocks` is unit tested both ways, including that an
+unknown ask is an error rather than a silent no-op. The executor is covered
+by `kaijutsu-server/tests/gate_executes_wire.rs` over the real surfaces —
+`shell_write` mints the ask, `kj ledger allow|deny` answers it from a second
+context — with the block link synthesized, because no shipped path is both
+executable and linked (see slice 5). The CALL SITE in
+`execute_shell_command` is exercised only once the hook gate carries source.
 
 ## What the ask must carry, and what it must not try to
 
@@ -398,6 +411,72 @@ So the ask carries only what the *kernel* must know to run the thing at all:
 the executable source, the principal, the context, and the cwd. Everything
 else is the caller's.
 
+## The ask carries its free variables
+
+**Ruled (Amy, 2026-09-02): snapshot, do not refuse.** Both gated shell
+paths run on a single-use materialized shell seeded only from the context's
+durable state, so "kaish state" at ask time is the `context_env` rows and
+the cwd, and the cwd was already on the ask. The snapshot is exact, not an
+estimate: it is the value substitution would read.
+
+`kj::env_snapshot::free_variable_values` is the one place the rule lives:
+the union of each statement's `free_variables` and its non-literal
+heredocs' `free_variables`, deduplicated, first-seen order, each name read
+from `context_env` as a value or an explicit unset. `approval_env` stores
+it (`request_id, seq, name, value NULL-for-unset`, cascading with the ask);
+`KernelDb::ask_env` reads it back. The executor restores it before running:
+one kaish script that `export`s each value through the typed-overlay path
+durable `context_env` uses and `unset`s each recorded absence, identifiers
+validated first. A failure to restore is a reason not to run.
+
+**Both consumers call the same function** (Amy: the classifier "should see
+the same data"). The broker's `KJ_TOOL_PLAN` gains an additive top-level
+`env: [{name, value|null}]` beside `statements`. The lfm2d hook script does
+not read it yet; whether the scorer substitutes values into its clause is
+a scorer decision, in `docs/issues.md`.
+
+**The human sees the values on the ask's `description`, not on the
+statement rendering.** `approval_statements` is content-addressed and
+inserted once per digest, so a value baked into that row would show a later
+ask with different values the first ask's stale ones. The description is
+per-ask and already the line `kj ledger show` prints.
+
+**What it does not cover.** A command substitution runs a program and a
+clock reads the wall; neither is a variable, and neither appears as a free
+name. Those stay under the ruling that environment stability is the
+caller's contract.
+
+## The subscriber, in order
+
+On each `ledger.changed` the driver re-reads the undelivered answers and,
+for each it has not acted on: resolves the context and refuses anything not
+Live; reads the whole approval row, because `exec_source` decides the branch
+and the answer summary does not carry it. No `exec_source`: the old wake,
+unchanged. A denial with a linked pair: settle the pair `Error` with the
+reason on stderr, then redeem — the blocks carrying the reason ARE the
+delivery, so they exist before the answer is spent; a denial with no pair
+falls back to the wake. An allow: **redeem first**, re-check Live,
+materialize a shell for the ask's principal and context under a synthetic
+session id, resolve or author the pair, move to the ask's cwd, restore the
+ask's env, run. A run into a pair the caller authored tells nobody. A run
+into a pair the driver authored ends with a seed block naming the output
+and a turn request, because that caller's turn ended when the gate refused.
+
+**What a crash costs.** The redemption row is claimed before the run, so a
+crash between the two loses the action: the ask reads redeemed, nothing
+ran. That is the chosen side; the other ordering runs an approved
+destructive action twice. Short of a crash the same ordering has one
+visible consequence: a context archived between the claim and the re-check
+spends the answer without an execution, which is correct in direction — the
+action can never run there, and a spent answer is a recorded one. A shell
+that will not materialize or a cwd that no longer resolves land in the same
+place by design: the approval is spent, the pair says why, the human asks
+again if they still want it.
+
+**Not gated on `turn_in_flight`.** A running turn is a reason not to spend
+a turn waking someone, not a reason not to run an approved action; blocks
+that land during a live turn are discovered by that turn's next `catch_up`.
+
 ## Archived contexts are inert
 
 An archived context runs nothing and answers nothing. Two checks, because one
@@ -412,7 +491,11 @@ is not enough:
 
 `ContextState::Archived` and `archived_at` both exist and are already read
 together (`kj/context.rs:1304`); the checks match that precedent rather than
-inventing a third reading.
+inventing a third reading. **The precedent is load-bearing:** `archive_context`
+stamps `archived_at` only and leaves `context_state` at `live`, so a check
+that read the state column alone never saw an archived context — which is
+what the gate-resume driver's original Live check did, found by the wire
+test for check 2. Both checks now read both halves.
 
 **Archiving should also sweep the ledger.** A context going archived leaves
 its unresolved asks answerable-in-principle and dead-in-fact. The existing
@@ -422,43 +505,9 @@ reason naming the archive.
 
 ## The receipts
 
-Kept here because they are what the design was argued from, and
-`docs/issues.md` is a backlog of what is *not* done. They belong in a devlog
-chapter once this arc closes.
-
-**Five asks from one probe, 2026-08-30.** Probing a gated surface minted five
-durable rows, because each refusal arrived as a transport error, every
-transport error invited a retry, and every retry with different text minted a
-new ask. That is the cost of a verdict on the fault channel, measured.
-
-**A broken control presented as a verdict, 2026-08-30.** `shell-escape-guard`
-was installed pointing at a hook body path the `/config` melt had moved out
-from under it. It could not read its own body and failed closed, denying
-every `shell_write` call in the kernel — including the `kj` verbs needed to
-diagnose it. What reached the caller was:
-
-```
-remote exception: denied by hook shell-escape-guard
-```
-
-No reason. The reason existed the whole time, one layer away in the journal:
-
-```
-hook.deny hook_id=hook:shell-escape-guard phase=PreCall
-  reason=kaish hook body at "/etc/rc/lib/hooks/shell-guard.kai" could not be
-         read: not found: No such file or directory (os error 2)
-```
-
-`emit_deny_attribution` called that deliberate — the model was to see only
-the hook id. `docs/gate-and-shell-split.md` had already argued the collapse
-was wrong on doctrine: the usual reason to hide gate state is an adversary,
-and there is none inside the trust boundary. This was that argument with a
-cost attached, and it is why a denial now carries its reason.
-
-**A live one, 2026-09-01.** A `shell` call came back as `Cap'n Proto error:
-remote exception: gate ... is waiting on a human: ask 01a05d19-...` — an open
-question, delivered on the channel that means "I could not tell you what
-happened", with the id a caller needs recoverable only by regex.
+Moved to `docs/devlog.md`, "The answer that travelled as an error". The
+five asks from one probe, the broken control presented as a verdict, and
+the live one are the story this design was argued from.
 
 ## Adjacent, not in scope
 

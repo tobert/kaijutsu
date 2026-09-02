@@ -353,55 +353,79 @@ the natural idiom silently produces a link that resolves to nothing. Either
 `symlink` translates an in-mount absolute target to a relative one, or the
 surface has to say "relative targets only" and fail loudly on an absolute one.
 
-## Gate wiring: symptoms 1 and 2 SHIPPED; symptom 3 is slice 5 (2026-09-01)
+## Approval executes for one origin; the shell box still retries (2026-09-02)
 
-`docs/gate-shape-b.md` is canonical for this work. Four slices shipped
-2026-09-01 (`5966ec23`, `0b1ec146`, `4c33bca8`, `814070b1`); one remains.
+Shape B slice 5 shipped (`f4494cce`): `kj ledger allow <id>` runs the ask's
+source into the blocks waiting on it. `docs/gate-shape-b.md` is canonical.
+**But only the shell gate records `exec_source`, and only the RPC
+`shellExecute` path links a block pair, and no shipped path does both.**
+`shellExecute` gates through installed hooks; `hook_gate.rs` builds those
+asks with `exec_source: None`, so the human shell box's asks still carry
+"run the same command again". The MCP `shell_write` path executes today.
 
-**Symptom 1 — a verdict travelled the error channel. CLOSED.** A refusal is a
-result now: `McpError::Refused(Refusal)` in the kernel, a union on the seven
-refusable RPC methods, `RpcError::Refused` → `CallError::Refused` at the
-client. A verdict cannot ride the capnp error channel at all — every
-`capnp::ErrorKind` describes a fault — so it rides the result.
+Next slice: the hook gate carries the hooked shell command as
+`exec_source` when the tool is `shell`/`shell_write`, so the pair the shell
+box already authored is the one that fills. Then `find_redeemable`'s
+digest match is deletable only when `cc send` and rc hooks execute too —
+not before (`docs/gate-shape-b.md`, "The rest, settled").
 
-**Symptom 2 — no identifier came back. CLOSED.** `Refusal.ask_id()` hands the
-caller the ask id as a handle. It used to exist only as prose inside a
-message, formatted from a typed `AskRef` one line away.
+Also open from the same lane: `archive_context` stamps `archived_at` and
+leaves `context_state` at `live`. The two checks that matter now read both
+halves, but every other reader of `context_state` alone is wrong the same
+way. Either archiving sets the state column too, or the column goes.
 
-**Symptom 3 — redemption matches a resubmitted string. OPEN, and the shape
-changed.** It is no longer "present the id": **approval executes**. Amy ruled
-2026-09-01 that `kj ledger allow <id>` runs the stored source into the blocks
-already waiting on that ask, so there is no retry call and nothing to
-present. `docs/gate-shape-b.md`, "Slice 5: approval executes" carries the
-build, the two prerequisites, and the archived-context rules.
+## The status read must be ungated by construction (2026-09-01)
 
-### Three things this uncovered that were not in the original write-up
+S50's predicate exempts the whole `kj ledger` verb, which is a policy in an
+rc script rather than a structural guarantee. A gated poll path is not a
+poll path. Read-only `kj` now bypasses the classifier in the kernel
+(`0f972f46`), which covers the reads; `kj ledger allow`/`deny` are writes
+and still ride the exemption.
 
-- **The model's own shell path was never on the typed channel.** The gate
-  variants of `McpError` each required a `HookId`; the direct `shell_write`
-  gate has none, so `mcp/servers/shell.rs` reported every verdict as
-  `McpError::Protocol` — a fault variant. FIXED.
-- **A pending ask read as a crashed tool call.** `llm_stream.rs` was a
-  seventh block-settling site that derived status from an `is_error` bool and
-  never reached `settled_block_status()`, so a pending ask settled `Error`
-  and reached the model as "Execution error: …" — the retry loop that mints
-  duplicate asks, on the surface where it costs most. FIXED.
-- **A decided ask outlives its cwd pin.** Reachable today: approve, restart,
-  retry, and the approved command runs wherever the context now is. Ruled —
-  record the cwd on the ask, delete the pin map. Part of slice 5.
+## The scorer and the snapshot: two follow-ups (2026-09-02)
 
-### What is still true and still open
+`KJ_TOOL_PLAN` carries `env: [{name, value|null}]` — the free-variable
+values the human sees on the ask — and each command carries a rendered
+`clause` (once lane C lands). The lfm2d hook reads neither yet.
 
-**The status read must be ungated by construction.** S50's predicate exempts
-the whole `kj ledger` verb, which is a policy in an rc script rather than a
-structural guarantee. A gated poll path is not a poll path.
+1. **Substitute values into the scored clause?** Measured 2026-09-02: an
+   unexpanded variable scores as a middle guess (`chmod -R 777 ${DIR}` 26%
+   data-critical vs `/` 97% vs `/tmp/build-cache` 3%; `dd of=${DEV}` 67 vs
+   `/dev/sda` 95 vs a tmp file 29). kaish's `Plan` doc says a classifier
+   judges what was asked, not what it resolved to, and a jq substitution
+   would re-derive kaish's expansion rules and drift. Proposed: a second,
+   kaish-rendered *expanded* view scored beside the unexpanded one, max
+   severity taken — parse-time substitution with a supplied map is not
+   execution. **An ask to the kaish lead**, not ours to build.
+2. **Read `clause` instead of rebuilding it in jq.** Same rule, one
+   implementation, in `kj::plan_clauses`.
 
-**The classifier still cannot see a redirect.** It scores `clause` (name +
-args), so `kj ledger list > ~/.bashrc` reaches it as a bare `kj ledger list`.
-The exemptions now require `has_redirect != true`, so the bypass became a
-scored call with an audit trail — nothing more.
+## Advisory scoring moves into kaijutsu-mcp; the ledger is the next stop (2026-09-02)
 
-## Three MCP compose tools report failure as success (2026-09-01)## Three MCP compose tools report failure as success (2026-09-01)
+Amy: *"move the hook to kaijutsu instead of messing with the repl … let's
+use kaish as a library which mcp already does so there's no way to have
+version skew. the kaish repl is more of a demo than serious tool."* And:
+the lfm2d path is for learning and must never block Claude Code.
+
+Slice 1 (lane C, in flight): the `HookListener` handles `tool.before` for
+Bash — reply allow at once, plan in process with the lockfile's
+kaish-kernel, score against lfm2d in a background task, append a row to
+`~/.cache/claude-hooks/kaijutsu-advisory.jsonl` in the Python hook's row
+shape. Runs beside the Python hook until the two agree row for row; then
+the PreToolUse entry in `~/.claude/settings.json` flips (Amy's file).
+Measured motivation: one Python-hook row cost Claude Code 2.3 s scoring
+14 clauses synchronously, and the `kaish` under it moved 0.16→0.17
+unpinned on 2026-09-01 09:35.
+
+Slice 2, designed not built: the row goes to the kernel's ledger as
+`approval_signals` on an auto-allowed ask for the cc-* context, instead of
+a file. Needs an advisory-only phase evaluation (score and record, never
+deny) and fail-open when the kernel is down — the Stop hook's known
+kernel-unreachable block must not be inherited. Amy on the volume
+(~1.2k rows/day here): *"good load test :) yeah that sounds fine and we
+should work through it."*
+
+## Three MCP compose tools report failure as success (2026-09-01)
 
 `write_input`, `edit_input` and `submit_input` in `kaijutsu-mcp/src/lib.rs`
 (lines 2332, 2372, 2403) return a plain `String`, not a `CallToolResult`. So
