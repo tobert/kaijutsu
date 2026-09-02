@@ -23,6 +23,7 @@ use kaijutsu_kernel::SharedBlockStore;
 use kaijutsu_client::{ActorHandle, AuthorBlock};
 
 use crate::RemoteState;
+use crate::advisory::{AdvisoryCall, AdvisoryConfig};
 use crate::hook_types::{
     HookEvent, HookResponse, KAIJUTSU_MCP_TOOLS, PingResponse, normalize_tool_name,
     short_session_suffix,
@@ -170,6 +171,11 @@ pub struct HookListener {
     /// Guards `set_context_model` (from `session.start`'s `model` field) to
     /// at most one call per process.
     context_model_set: Mutex<bool>,
+    /// Where a `tool.before` Bash command is scored, when scoring is on.
+    /// `None` leaves the arm doing nothing at all. Never set by a
+    /// constructor — `with_advisory` is the one way in, so a test is
+    /// hermetic against whatever `LFM2D_URL` the runner's environment holds.
+    advisory: Option<Arc<AdvisoryConfig>>,
 }
 
 impl HookListener {
@@ -193,6 +199,7 @@ impl HookListener {
             agent_name: Arc::new(Mutex::new(None)),
             pending_label_base: Mutex::new(None),
             context_model_set: Mutex::new(false),
+            advisory: None,
         }
     }
 
@@ -240,7 +247,17 @@ impl HookListener {
             agent_name,
             pending_label_base: Mutex::new(pending_label_base),
             context_model_set: Mutex::new(false),
+            advisory: None,
         }
+    }
+
+    /// Attach an advisory scorer for `tool.before` Bash commands.
+    ///
+    /// `None` turns scoring off, which is what `AdvisoryConfig::from_env`
+    /// returns when `LFM2D_URL` is unset.
+    pub fn with_advisory(mut self, config: Option<AdvisoryConfig>) -> Self {
+        self.advisory = config.map(Arc::new);
+        self
     }
 
     /// Start listening on a Unix socket. Runs until the socket is closed or
@@ -619,7 +636,11 @@ impl HookListener {
                 }
             }
 
-            // tool.before — no block
+            // tool.before authors no block. It hands a Bash command to the
+            // advisory scorer and moves on: the scoring task cannot change,
+            // delay, or fail this reply (crate::advisory).
+            "tool.before" => self.spawn_advisory_scoring(event),
+
             _ => {}
         }
 
@@ -639,6 +660,32 @@ impl HookListener {
             }
             None => response,
         }
+    }
+
+    /// Hand one `tool.before` Bash command to the advisory scorer.
+    ///
+    /// Returns as soon as the task is spawned. Every other outcome — no
+    /// scorer configured, a tool that is not `Bash`, a `Bash` call whose
+    /// `command` is absent or not a string — is a silent no-op, because the
+    /// caller is waiting on this reply and the scoring is advisory.
+    fn spawn_advisory_scoring(&self, event: &HookEvent) {
+        let Some(config) = self.advisory.as_ref() else {
+            return;
+        };
+        let Some(tool) = event.tool.as_ref() else {
+            return;
+        };
+        if tool.name != "Bash" {
+            return;
+        }
+        let Some(command) = tool.input.get("command").and_then(|v| v.as_str()) else {
+            return;
+        };
+        config.spawn(AdvisoryCall {
+            command: command.to_string(),
+            cwd: event.cwd.clone(),
+            session_id: self.session_id.lock().ok().and_then(|g| g.clone()),
+        });
     }
 
     // -- Block insertion helpers --
@@ -1403,6 +1450,83 @@ mod tests {
         store.create_document(ctx_id, DocKind::Conversation, None).unwrap();
         let listener = HookListener::local(store.clone(), ctx_id);
         (listener, store, ctx_id)
+    }
+
+    /// **The contract.** `tool.before` answers before the scorer does.
+    ///
+    /// The scorer here accepts the connection and then never answers, which
+    /// is the case that actually costs something: a synchronous call would
+    /// hold the reply for the scorer's full request timeout before Claude
+    /// Code could run the command. A refused port would not pin this — a
+    /// loopback refusal returns in microseconds and an awaited call passes
+    /// the assertion just as a spawned one does.
+    ///
+    /// Falsified by awaiting the scoring task instead of spawning it.
+    #[tokio::test]
+    async fn advisory_scoring_never_delays_the_reply() {
+        let (listener, _store, _ctx_id) = local_listener_with_context();
+        let log = std::env::temp_dir().join(format!(
+            "kaijutsu-advisory-reply-{}.jsonl",
+            std::process::id()
+        ));
+
+        let black_hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = black_hole.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and hold. The POST gets a connection and no bytes back,
+            // so it can only end at its own timeout.
+            let held = black_hole.accept().await;
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+
+        let listener = listener.with_advisory(Some(crate::advisory::AdvisoryConfig::new(
+            format!("http://{addr}"),
+            &log,
+        )));
+
+        let mut event = empty_hook_event("tool.before");
+        event.tool = Some(ToolInfo {
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "find /tmp -name '*.log' | head"}),
+            output: None,
+            error: None,
+            duration_ms: None,
+        });
+
+        let started = std::time::Instant::now();
+        let response = listener.process_event(&event).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.block, "allow", "tool.before never blocks");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "the reply must not wait on scoring; took {elapsed:?}"
+        );
+    }
+
+    /// A listener with no scorer configured does nothing at all on
+    /// `tool.before` — it must not start authoring blocks or changing the
+    /// reply.
+    #[tokio::test]
+    async fn tool_before_authors_no_block() {
+        let (listener, store, ctx_id) = local_listener_with_context();
+        let mut event = empty_hook_event("tool.before");
+        event.tool = Some(ToolInfo {
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            output: None,
+            error: None,
+            duration_ms: None,
+        });
+
+        let response = listener.process_event(&event).await;
+
+        assert_eq!(response.block, "allow");
+        assert!(
+            store.block_snapshots(ctx_id).unwrap().is_empty(),
+            "tool.before must author nothing"
+        );
     }
 
     // -- item 8: hook-authored tool_call must complete, not stay Running --

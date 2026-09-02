@@ -2322,6 +2322,15 @@ impl Broker {
         // of re-deriving verb/subcommand structure itself. Additive — every
         // field above already existed and is unchanged.
         //
+        // `clause` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): the text
+        // a classifier scores for that command, from
+        // `kj::plan_clauses::command_clause_texts` — the one place the cut
+        // between statement and command is decided, shared with
+        // kaijutsu-mcp's advisory scorer. A statement whose arguments are
+        // not all plain is not cut, and every command in it carries the
+        // whole statement's rendering, because that is the string the
+        // classifier will see for it. Additive.
+        //
         // `env` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): the value
         // every free `${VAR}` across every statement held in `context_env`
         // at fire time — `kj::env_snapshot::free_variable_values`, the same
@@ -2353,8 +2362,13 @@ impl Broker {
                                 else {
                                     continue;
                                 };
-                                for (cmd, cmd_json) in
-                                    stmt.plan.commands.iter().zip(cmd_json.iter_mut())
+                                let clauses = crate::kj::plan_clauses::command_clause_texts(stmt);
+                                for ((cmd, cmd_json), clause) in stmt
+                                    .plan
+                                    .commands
+                                    .iter()
+                                    .zip(cmd_json.iter_mut())
+                                    .zip(clauses)
                                 {
                                     if let Some(obj) = cmd_json.as_object_mut() {
                                         obj.insert(
@@ -2362,6 +2376,10 @@ impl Broker {
                                             serde_json::Value::Bool(
                                                 crate::kj::readonly::is_read_only_kj(cmd),
                                             ),
+                                        );
+                                        obj.insert(
+                                            "clause".to_string(),
+                                            serde_json::Value::String(clause),
                                         );
                                     }
                                 }
@@ -7344,6 +7362,60 @@ mod tests {
             .call_tool(call, &CallContext::test(), CancellationToken::new())
             .await
             .expect("KJ_TOOL_PLAN must carry three statements with `delete` inside the loop");
+        assert!(!result.is_error);
+    }
+
+    /// `clause` on every command object is exactly what
+    /// `kj::plan_clauses::command_clause_texts` renders, at the same array
+    /// position. The expected string is computed in Rust from the module and
+    /// compared inside the hook body, so a change to the cut that misses the
+    /// JSON twin (or vice versa) fails here rather than drifting apart
+    /// unnoticed.
+    #[tokio::test]
+    async fn kj_tool_plan_clause_matches_the_shared_renderer() {
+        let (broker, _kernel, _kj) = wired_kaish_broker("kaish-hook-clause").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let command = "cat notes.txt | grep -i todo; kj block list";
+        let expected = kaish_kernel::ast::plan::plan_program(command)
+            .expect("test command must parse")
+            .iter()
+            .flat_map(crate::kj::plan_clauses::command_clause_texts)
+            .collect::<Vec<_>>()
+            .join("|");
+        assert_eq!(
+            expected, "cat notes.txt|grep -i todo|kj block list",
+            "the renderer's own output is pinned here so this test cannot pass \
+             by both sides being wrong the same way"
+        );
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("clause-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(format!(
+                "got=$(echo $KJ_TOOL_PLAN | jq -r '[.statements[].plan.commands[].clause] | join(\"|\")')\n\
+                 test \"$got\" = \"{expected}\" || exit 1\n\
+                 exit 0"
+            ))),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let mut call = params("svc", "shell_write");
+        call.arguments = serde_json::json!({ "command": command });
+
+        let result = broker
+            .call_tool(call, &CallContext::test(), CancellationToken::new())
+            .await
+            .expect("KJ_TOOL_PLAN's `clause` must match the shared renderer");
         assert!(!result.is_error);
     }
 

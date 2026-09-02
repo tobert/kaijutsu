@@ -262,6 +262,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             tracing::info!(removed, dir = %dir.display(), "Stale hook socket sweep complete");
         }
 
+        let advisory = kaijutsu_mcp::advisory::AdvisoryConfig::from_env();
         let listener = match mcp.backend() {
             kaijutsu_mcp::Backend::Local(store) => {
                 // Local mode: hooks write to the same in-memory store
@@ -269,17 +270,20 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 let ctx_id = doc_ids.first()
                     .copied()
                     .unwrap_or_else(kaijutsu_types::ContextId::new);
-                Arc::new(HookListener::local(store.clone(), ctx_id))
+                Arc::new(HookListener::local(store.clone(), ctx_id).with_advisory(advisory))
             }
             kaijutsu_mcp::Backend::Remote(remote) => {
                 // shared_context_id is updated by register_session when a context is joined
-                Arc::new(HookListener::remote_with_agent(
-                    remote.clone(),
-                    Arc::clone(&remote.shared_context_id),
-                    Arc::clone(mcp.session_id_arc()),
-                    Arc::clone(mcp.agent_name_arc()),
-                    pending_label_base.clone(),
-                ))
+                Arc::new(
+                    HookListener::remote_with_agent(
+                        remote.clone(),
+                        Arc::clone(&remote.shared_context_id),
+                        Arc::clone(mcp.session_id_arc()),
+                        Arc::clone(mcp.agent_name_arc()),
+                        pending_label_base.clone(),
+                    )
+                    .with_advisory(advisory),
+                )
             }
         };
 

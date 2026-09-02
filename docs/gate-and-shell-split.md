@@ -1317,6 +1317,22 @@ skips scoring without a network round trip to the classifier. See
 qualify, and for why `kj ledger` stays exempted by the hook's own rule
 rather than by this table.
 
+**`clause`** (added on top of the surface above, `broker.rs`'s
+`KJ_TOOL_PLAN` construction): a string on every command object — the text a
+classifier scores for that command, from
+`kj::plan_clauses::command_clause_texts`
+(`crates/kaijutsu-kernel/src/kj/plan_clauses.rs`). That module is the one
+place the cut between statement and command is decided, and it is shared
+with `kaijutsu-mcp`'s advisory scorer (`crates/kaijutsu-mcp/src/advisory.rs`),
+so the two producers send identical text for identical input and their rows
+are comparable. A command's clause is its name plus its plain arguments
+joined by single spaces; a statement whose arguments are not all plain is
+not cut at all, and every command in it carries the whole statement's
+`plan.rendered`, because that is the string the classifier will see for it.
+Additive. Test: `kj_tool_plan_clause_matches_the_shared_renderer`, which
+computes the expected string from the module and compares it inside the
+hook body, so the twin and the renderer cannot drift apart unnoticed.
+
 **`env`** (added on top of the surface above, `docs/gate-shape-b.md`'s free
 `${VAR}` snapshot): a top-level sibling of `statements`, an array of
 `{"name":…,"value":…}` — one entry per free variable across every

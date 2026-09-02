@@ -39,6 +39,7 @@ pub mod kaish;
 pub mod mcp;
 pub mod midi;
 pub mod parse;
+pub mod plan_clauses;
 pub mod play;
 pub mod policy;
 pub mod preset;

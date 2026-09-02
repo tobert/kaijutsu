@@ -14,7 +14,9 @@
 //! - `models`: Request and response types for MCP tools
 //! - `helpers`: Parsing and utility functions
 //! - `tree`: DAG visualization as ASCII tree
+//! - `advisory`: off-reply-path risk scoring for Claude Code `Bash` calls
 
+pub mod advisory;
 mod helpers;
 pub mod hook_listener;
 pub mod hook_adapter;
