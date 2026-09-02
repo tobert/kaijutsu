@@ -166,36 +166,35 @@ Measure a normal day's WAL high-water mark before picking one.
 **Do not switch to `wal_checkpoint(TRUNCATE)` on a timer as the fix** — it
 blocks writers, and the limit does the same job at checkpoint time for free.
 
-## The terminal client — `kaijutsu-tui` (RULED 2026-08-30, unbuilt)
+## The terminal client — `kaijutsu-tui` (RULED 2026-08-30, prerequisites landing)
 
 Design: [`tui.md`](tui.md). Standalone ratatui binary on `kaijutsu-client`, the
 `kaijutsu-acp` shape minus the protocol; inline viewport; one process is the
-mux; `docs/ssh-shell.md` retired into it. Lanes, in order:
+mux; `docs/ssh-shell.md` retired into it.
 
-1. Move `rank.rs` and the ledger round trip of `permission.rs` from
-   `kaijutsu-acp` down into `kaijutsu-client`; ACP consumes them from there.
-2. Presentation crate: lift `view/format.rs`, `text/markdown.rs`,
-   `kaish/mod.rs`, the `Action` enum and `WellBeats` out of `kaijutsu-app`
-   with the `bevy::Color` leaks replaced by a semantic color enum.
-3. Skeleton: event loop, `Backend`-generic renderer, `present.rs`, the actor
+Shipped 2026-09-02: `rank.rs` and the ledger ask poll live in
+`kaijutsu-client` (`rank`, `ledger`; ACP consumes them), and cache health
+rides `ContextHandleInfo` (`lastCallAt` in unix ms, `cacheReadTokens`,
+`cacheWriteTokens`, `cacheTtlSecs`; 0 = unknown, never a guess). The
+`docs/tui.md` "Cache health" paragraph that says "until that lands" is
+stale and reads as shipped once the presentation lane's edit to that file
+is in.
+
+Lanes, in order:
+
+1. **Presentation crate `kaijutsu-present`** (in flight): lift
+   `view/format.rs`, `text/markdown.rs`, `kaish/mod.rs`, the `Action` enum
+   and `WellBeats` out of `kaijutsu-app` with the `bevy::Color`, `Reflect`
+   and `Resource` leaks replaced by a semantic color enum and app-side
+   wrappers.
+2. Skeleton: event loop, `Backend`-generic renderer, `present.rs`, the actor
    wiring. Then five parallel lanes: transcript printer + wrap cache, compose
    (modalkit over the input block) + shell surface, picker + status line +
    beat timer, asks + the ledger view + slash completion, editor + diff
    screens. Paste rule throughout: nothing you would paste is inside a box.
-4. `bindings.toml` keyed by vim notation, commentary reviewed by two
+3. `bindings.toml` keyed by vim notation, commentary reviewed by two
    flash-tier kaibo casts; then a lane to convert the app to the same file.
-5. **Cache-health projection (kernel + wire, small, can go first).** Project
-   the rest of `ContextUsageRow` (`kernel_db.rs:375`) onto
-   `ContextHandleInfo` next to `contextWindow`/`contextUsedTokens`
-   (`rpc.rs`, `resolve_usage_wire_fields`): `lastCallAt` (= `updated_at`),
-   `cacheReadTokens`, `cacheWriteTokens`, and a new `cacheTtlSecs` column
-   recorded at call completion from the request's `CacheTtl`
-   (`llm/stream.rs`: Ephemeral 300, Extended 3600; 0 = provider declares
-   none). Sentinels stay honest: 0 on the wire = unknown, never a guess.
-   Consumers: the TUI status line (`docs/tui.md`, "Cache health"), the app's
-   bottom-dock gauge, ACP `UsageUpdate`. Amy: *"how long since the last api
-   turn; a proxy for KV health … expose the data we have."*
-6. **Images (post-skeleton, additive).** Render `Svg`/`Image` blocks in the
+4. **Images (post-skeleton, additive).** Render `Svg`/`Image` blocks in the
    transcript: resvg raster at cell-derived pixel size, OSC 1337 emission
    (wezterm + iTerm2) with a unicode half-block fallback, in-band detection
    only. Rules: `docs/tui.md`, "Images". `Abc` needs no new emitter —
