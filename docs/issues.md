@@ -385,28 +385,27 @@ values the human sees on the ask — and each command carries a rendered
 2. **Read `clause` instead of rebuilding it in jq.** Same rule, one
    implementation, in `kj::plan_clauses`.
 
-## The Claude Code advisory hook forwards to the kernel (2026-09-02, plan awaiting Amy)
+## The Claude Code advisory hook forwards to the kernel (2026-09-02, SHIPPED; open follow-ups)
 
-Amy: *"move the hook to kaijutsu instead of messing with the repl … let's
-use kaish as a library which mcp already does so there's no way to have
-version skew."* A first cut put a scorer INSIDE kaijutsu-mcp — its own
-HTTP client, its own JSONL — and was reverted the same morning: *"my
-intention was not to put the scorer in the mcp … my intention was to feed
-the hook into the mcp and have the mcp forward it to the kernel."* The
-kernel already has the scorer: `S50-lfm2d.kai` curls lfm2d through kaish
-and records a signal in the ledger. What survives from the first cut is
-kernel-side: `kj::plan_clauses` and the `clause` field on `KJ_TOOL_PLAN`.
+Shipped and evaluated live the same day: `PreToolUse` Bash runs
+`kaijutsu-mcp hook claude`, the listener forwards the command over
+`shellDryRun @103`, the kernel runs the PreCall phase in dry-run mode and
+records the outcome as an abandoned ask row, and the reply is always allow.
+The command never runs, asks, or wakes. `docs/gate-and-shell-split.md`,
+"Dry-run mode" is canonical; the design decisions (forwarding, not a scorer
+in the MCP; kaish as a library so there is no version skew; the lfm2d path
+must never block Claude Code) are in the devlog.
 
-The plan, not built: `tool.before` for Bash reaches the `HookListener`
-today and is dropped. The listener forwards the command to the kernel over
-a new chatty RPC (an observe-only shell evaluation for the cc context) and
-replies allow at once — the lfm2d path is for learning and must never
-block Claude Code. The kernel runs the PreCall hook phase for that context
-in an observe mode (`KJ_HOOK_MODE=observe` handed to hook bodies) where a
-would-deny or would-ask is RECORDED as a signal on an auto-allowed ask row
-and never enforced. One renderer, one scorer, one store; the corpus
-builders read the ledger. Fail-open when the kernel is down. Volume
-(~1.2k rows/day here) is a load test Amy welcomed.
+Still open from the eval:
+
+1. **Count a day of rows.** `kj ledger list --status abandoned --since 24h`:
+   would-deny (kaish cannot plan a bash `( … ) &` subshell, so S45 denies
+   "no execution plan") vs would-ask vs the Python hook's verdicts for the
+   same calls. The Python hook stays until the two agree.
+2. **The `( … ) &` planning gap** is an ask to the kaish lead, alongside
+   the expanded-rendering request below.
+3. **Export verb** for the corpus builders — ruled "later"; they read the
+   ledger directly for now.
 
 ## Three MCP compose tools report failure as success (2026-09-01)
 
