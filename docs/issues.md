@@ -367,17 +367,6 @@ leaves `context_state` at `live`. The two checks that matter now read both
 halves, but every other reader of `context_state` alone is wrong the same
 way. Either archiving sets the state column too, or the column goes.
 
-## `kj ledger show` hides what an approval now runs (2026-09-02)
-
-`kj ledger show <id>` (and its `--json` data) prints the statement, the
-seats and the decision, but not `exec_source`, `cwd`, or the recorded
-free-variable values — the three things an approval actually executes
-with. The values reach the human only through the NOTE appended to
-`description`. Verified live: an ask whose refusal promised execution
-showed `exec_source` absent in `show --json`. Its `///` says "Show one ask
-in full"; make that true — print all three, in the table and in `.data`.
-Small; found during the first live run of approval-executes.
-
 ## The scorer and the snapshot: two follow-ups (2026-09-02)
 
 `KJ_TOOL_PLAN` carries `env: [{name, value|null}]` — the free-variable
@@ -472,6 +461,16 @@ sources: an unresolvable value fails that one server with a reason, never
 launches it blank, and never quotes the value into a log line.
 
 ## `register_session` lets a caller pick an ungated seat (2026-08-28)
+
+**Mostly closed 2026-09-02 (`5f0066d5`).** An unknown context type is
+refused at both creation points when the rc tree lists any type
+(`kj::rc::check_context_type`), and `default` and `toolie` now ship
+`S50-lfm2d.kai` like `coder` and `mcp`, with a seed test that every
+binding granting `*`, `exec` or `facade:shell` ships both S45 and S50.
+**Owed to Amy:** `director` grants exec and `facade:shell` and ships no
+scorer. It is the operator's console; scoring it means the operator's own
+commands need a second seat to answer (no self-approval). The seed test
+defers it by name rather than exempting it. The original analysis follows.
 
 `context_type` on `register_session` is caller-chosen free text with no
 allow-list: `kaijutsu-mcp/src/lib.rs:1986` defaults it to `"mcp"` and hands it
