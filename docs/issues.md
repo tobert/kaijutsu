@@ -213,6 +213,18 @@ What the lanes left open, in rough priority:
 9. Bar/beat in the picker and status line assume 4/4; the wire carries no
    time signature (`picker::BEATS_PER_BAR`).
 
+**Terminal-fit harness** (`tests/terminal_fit.rs`, shipped 2026-09-02): the
+real binary in a portable-pty against an ephemeral kernel, parsed by vt100.
+Seven probes pass, including a mid-screen start reaching the bottom band and a
+partial shell line never repeating. **Open:** Amy saw, in wezterm, the status
+line a third of the way up the screen and partial `Ctrl+Z` lines repeating in
+the conversation; a strict emulator does not reproduce either. Needs a live
+reproduction (terminal size, mux or not, at startup or after the picker).
+Candidates: scroll-region semantics (`ratatui`'s `scrolling-regions` feature
+drives `insert_before` with DECSTBM + SD/SU) and `set_viewport_height`
+re-anchoring at the cursor row on every picker toggle. A probe that fails
+under a second emulator (`termwiz` is in the lock) would settle which.
+
 Two client facts every TUI-shaped consumer needs: `ContextInfo.label` and
 `.model` are routinely empty on real rows (fall back to `ContextId::short()`
 and the cast), and `ActorHandle::subscribe_events` warns per dropped event
