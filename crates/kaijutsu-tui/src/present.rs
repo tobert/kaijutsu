@@ -16,7 +16,9 @@ use std::collections::HashMap;
 
 use kaijutsu_present::format::{BlockTone, block_tone, format_single_block};
 use kaijutsu_present::markdown::{SpanTone, parse_to_rich_spans};
-use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, Role};
+use kaijutsu_types::{
+    BlockId, BlockKind, BlockSnapshot, ContextId, Role, StyleAttrs, StyleColor, StyleSpan,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
@@ -227,24 +229,126 @@ pub fn render_block(
 
     // Markdown is a model's own prose. A tool's stdout is not markdown, and
     // parsing it would eat the very backticks and asterisks a paste needs.
-    let styled: Vec<(Style, String)> =
-        if block.kind == BlockKind::Text && block.role == Role::Model {
-            parse_to_rich_spans(&text)
-                .into_iter()
-                .map(|span| {
-                    let mut style = base.patch(palette.span(span.tone()));
-                    if span.italic {
-                        style = style.add_modifier(Modifier::ITALIC);
-                    }
-                    (style, span.text)
-                })
-                .collect()
-        } else {
-            vec![(base, text)]
-        };
+    // Its own color, if any, comes from `style_spans` instead — the ANSI the
+    // kernel already stripped at ingestion (`ansi_segments`).
+    let styled: Vec<(Style, String)> = if block.kind == BlockKind::Text && block.role == Role::Model
+    {
+        parse_to_rich_spans(&text)
+            .into_iter()
+            .map(|span| {
+                let mut style = base.patch(palette.span(span.tone()));
+                if span.italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                (style, span.text)
+            })
+            .collect()
+    } else if let Some(segments) = ansi_segments(block, base) {
+        segments
+    } else {
+        vec![(base, text)]
+    };
 
     lines.extend(wrap_styled(&styled, width));
     lines
+}
+
+/// A kernel-side [`StyleColor`] as a ratatui color. Indexed stays semantic —
+/// the terminal's own palette slot, themeable by the terminal, not us —
+/// truecolor rides verbatim.
+fn ansi_color(color: StyleColor) -> Color {
+    match color {
+        StyleColor::Indexed(n) => Color::Indexed(n),
+        StyleColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// One [`StyleSpan`]'s style, layered over the block's own tone. Every
+/// attribute the kernel's `ansi-strip` transform records
+/// (`crates/kaijutsu-ansi`) maps onto a ratatui [`Modifier`] bit but italic
+/// and blink, which ratatui's own doc notes most terminals render as bold or
+/// not at all — carried anyway so a terminal that does support them shows
+/// them, and dropped by no terminal's fault of ours if it doesn't.
+fn ansi_span_style(span: &StyleSpan, base: Style) -> Style {
+    let mut style = base;
+    if let Some(fg) = span.fg {
+        style = style.fg(ansi_color(fg));
+    }
+    if let Some(bg) = span.bg {
+        style = style.bg(ansi_color(bg));
+    }
+    if span.attrs.contains(StyleAttrs::BOLD) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if span.attrs.contains(StyleAttrs::DIM) {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if span.attrs.contains(StyleAttrs::ITALIC) {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if span.attrs.contains(StyleAttrs::UNDERLINE) {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if span.attrs.contains(StyleAttrs::BLINK) {
+        style = style.add_modifier(Modifier::SLOW_BLINK);
+    }
+    if span.attrs.contains(StyleAttrs::INVERSE) {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    if span.attrs.contains(StyleAttrs::STRIKETHROUGH) {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    style
+}
+
+/// A tool block's own `style_spans`, sliced against its content, when the
+/// spans' byte offsets are still meaningful against the text this module
+/// renders.
+///
+/// The kernel's `ansi-strip` ingest transform (`crates/kaijutsu-ansi`) turns
+/// escape bytes into clean text plus this exact span map at ingestion — there
+/// is no escape byte left to strip here, only the already-parsed spans to
+/// paint. Offsets are bytes into `BlockSnapshot::content`
+/// (`kaijutsu_types::StyleSpan`, "Byte offset of span start in `content`"),
+/// so this only fires on the plain-content path: a `ToolResult` with
+/// structured `output` renders from that instead
+/// (`kaijutsu_present::format::format_block_inner`), and a span's offset
+/// means nothing against a different string.
+fn ansi_segments(block: &BlockSnapshot, base: Style) -> Option<Vec<(Style, String)>> {
+    if block.style_spans.is_empty() || block.output.is_some() {
+        return None;
+    }
+    // Matches `format_single_block`'s own trailing trim (the leading edge is
+    // left alone, so every span offset — measured from byte 0 of `content` —
+    // still lands on the text this slices).
+    let content = block.content.trim_end();
+    let mut segments = Vec::new();
+    let mut cursor = 0usize;
+    for span in &block.style_spans {
+        let start = (span.start as usize).min(content.len());
+        let end = (span.end as usize).min(content.len());
+        if end <= start {
+            continue;
+        }
+        if start > cursor {
+            segments.push((base, content[cursor..start].to_string()));
+        }
+        segments.push((ansi_span_style(span, base), content[start..end].to_string()));
+        cursor = end;
+    }
+    if cursor < content.len() {
+        segments.push((base, content[cursor..].to_string()));
+    }
+    // `format_block_inner` appends stderr after the body for a `ToolResult`;
+    // spans never cover it (it is a separate field, not part of `content`),
+    // so it rides in the block's own tone.
+    if let Some(stderr) = block.stderr.as_deref() {
+        let stderr = stderr.trim();
+        if !stderr.is_empty() {
+            segments.push((base, format!("\n{stderr}")));
+        }
+    }
+    Some(segments)
 }
 
 /// A one-line stub: `▸ cargo test -p kaijutsu-kernel vfs::`, cut with `…`
@@ -585,6 +689,21 @@ mod tests {
         }
     }
 
+    /// Emoji are wide too, and a run of them must not be split mid-glyph the
+    /// way the byte-oriented `truncate`/wrap path could if it counted bytes
+    /// instead of display columns.
+    #[test]
+    fn emoji_count_two_columns_and_survive_narrow_wrap() {
+        let b = block(BlockKind::Text, Role::User, "🎺🎺🎺🎺 rest");
+        let lines = render_block(&b, &view(), 6, &Palette::builtin());
+        for line in plain(&lines) {
+            let w: usize = line.chars().map(|c| c.width().unwrap_or(0)).sum();
+            assert!(w <= 6, "line {line:?} is {w} columns wide");
+        }
+        let joined = plain(&lines).join("");
+        assert_eq!(joined.chars().filter(|c| *c == '🎺').count(), 4, "no glyph lost");
+    }
+
     /// Nothing pasteable is inside a box: a tool result's text starts at
     /// column zero with no border glyph in front of it.
     #[test]
@@ -618,6 +737,109 @@ mod tests {
         v.collapsed = false;
         let lines = render_block(&b, &v, 60, &Palette::builtin());
         assert_eq!(plain(&lines), vec!["**not bold** `not code`"]);
+    }
+
+    /// The shape `kaijutsu_ansi::strip` actually produces for `a\x1b[31mred\x1b[0mb`
+    /// (crates/kaijutsu-ansi/src/lib.rs, `basic_color_span`): clean text plus
+    /// one span over the styled run. The TUI never sees the escape bytes —
+    /// only this projection — so this is what it has to paint from.
+    #[test]
+    fn ansi_style_spans_color_a_tool_results_text() {
+        let mut b = block(BlockKind::ToolResult, Role::Tool, "aredb");
+        b.status = Status::Done;
+        b.style_spans = vec![StyleSpan {
+            start: 1,
+            end: 4,
+            fg: Some(StyleColor::Indexed(1)),
+            bg: None,
+            attrs: StyleAttrs::default(),
+        }];
+        let mut v = view();
+        v.collapsed = false;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        assert_eq!(lines.len(), 1);
+        let spans = &lines[0].spans;
+        let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, vec!["a", "red", "b"], "got {text:?}");
+        assert_eq!(spans[1].style.fg, Some(Color::Indexed(1)));
+        assert_eq!(
+            spans[0].style.fg,
+            Some(Color::Gray),
+            "the unstyled runs keep the block's own tone (BlockTone::ToolResult)"
+        );
+    }
+
+    /// Bold, underline and truecolor all land on the ratatui `Style` the
+    /// kernel's `StyleAttrs`/`StyleColor` describe.
+    #[test]
+    fn ansi_attributes_and_truecolor_map_onto_ratatui_modifiers() {
+        let mut b = block(BlockKind::ToolResult, Role::Tool, "warn");
+        b.status = Status::Done;
+        b.style_spans = vec![StyleSpan {
+            start: 0,
+            end: 4,
+            fg: Some(StyleColor::Rgb(255, 200, 0)),
+            bg: None,
+            attrs: StyleAttrs::BOLD | StyleAttrs::UNDERLINE,
+        }];
+        let mut v = view();
+        v.collapsed = false;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        let style = lines[0].spans[0].style;
+        assert_eq!(style.fg, Some(Color::Rgb(255, 200, 0)));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    /// A `ToolResult` with structured `output` renders from that, not from
+    /// `content` (`format_block_inner`), so a span's offset — always measured
+    /// against `content` — means nothing there and must not be applied.
+    #[test]
+    fn style_spans_are_ignored_when_output_data_is_present() {
+        let mut b = block(BlockKind::ToolResult, Role::Tool, "aredb");
+        b.status = Status::Done;
+        b.style_spans = vec![StyleSpan {
+            start: 1,
+            end: 4,
+            fg: Some(StyleColor::Indexed(1)),
+            bg: None,
+            attrs: StyleAttrs::default(),
+        }];
+        b.output = Some(kaijutsu_types::OutputData::text("aredb"));
+        let mut v = view();
+        v.collapsed = false;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(Color::Gray)),
+            "output data has no span offsets to honor, so every run keeps the plain block tone: {lines:?}"
+        );
+    }
+
+    /// stderr rides after the body in the block's own tone — spans cover
+    /// `content` only, never the separate `stderr` field.
+    #[test]
+    fn stderr_appends_after_styled_content_in_the_blocks_own_tone() {
+        let mut b = block(BlockKind::ToolResult, Role::Tool, "ok");
+        b.status = Status::Done;
+        b.style_spans = vec![StyleSpan {
+            start: 0,
+            end: 2,
+            fg: Some(StyleColor::Indexed(2)),
+            bg: None,
+            attrs: StyleAttrs::default(),
+        }];
+        b.stderr = Some("warning: deprecated".to_string());
+        let mut v = view();
+        v.collapsed = false;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("warning: deprecated"), "got {text:?}");
     }
 
     #[test]

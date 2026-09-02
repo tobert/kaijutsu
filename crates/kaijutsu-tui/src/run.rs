@@ -196,6 +196,9 @@ async fn event_loop(
                 if mark_activity(app, &event) {
                     dirty = true;
                 }
+                if collapse_thinking_on_turn_end(app, &event) {
+                    dirty = true;
+                }
             }
             Ok(()) = status.changed() => {
                 app.connection = Some(status.borrow().clone());
@@ -318,6 +321,7 @@ async fn apply_feed(
         FeedEvent::Changed(delivery) => {
             for change in delivery.changes() {
                 app.observe_change(context_id, change);
+                app.apply_collapse_change(context_id, change);
             }
             if let Some(view) = app.views.get_mut(&context_id) {
                 if let Err(e) = view.mirror.receive(delivery) {
@@ -395,4 +399,110 @@ fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, term_lock: 
     let _ = terminal.flush();
     let _ = disable_raw_mode();
     println!();
+}
+
+/// Collapse a context's `Thinking` blocks when its turn ends.
+///
+/// `ServerEvent::TurnCompleted`/`TurnFailed` are the signal, not any one
+/// block's status — the push that replaces inferring completion from block
+/// status (`kaijutsu_client::subscriptions`, `ServerEvent::TurnCompleted`
+/// doc). Runs whether or not the context is on screen, so a background
+/// turn's reasoning is already collapsed by the time you switch to it —
+/// unlike [`mark_activity`], which deliberately skips the current context.
+fn collapse_thinking_on_turn_end(app: &mut App, event: &ServerEvent) -> bool {
+    let context_id = match event {
+        ServerEvent::TurnCompleted { context_id, .. } | ServerEvent::TurnFailed { context_id, .. } => {
+            *context_id
+        }
+        _ => return false,
+    };
+    app.views
+        .get_mut(&context_id)
+        .is_some_and(ContextView::collapse_thinking)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaijutsu_client::{ContextMirror, TurnCompletedStopReason, TurnOrigin};
+    use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, PrincipalId, Role};
+
+    fn thinking_block(context: ContextId) -> kaijutsu_types::BlockSnapshot {
+        BlockSnapshotBuilder::new(BlockId::new(context, PrincipalId::new(), 1), BlockKind::Thinking)
+            .role(Role::Model)
+            .content("considering")
+            .build()
+    }
+
+    /// The turn's own end collapses a context's live `Thinking` block, even
+    /// for a context that is not the one on screen right now — a background
+    /// turn's reasoning is already tidy by the time you switch to it.
+    #[test]
+    fn turn_completed_collapses_a_background_contexts_thinking_block() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(vec![thinking_block(id)], 1)
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        app.current = None; // not the context on screen
+
+        let event = ServerEvent::TurnCompleted {
+            context_id: id,
+            principal_id: PrincipalId::new(),
+            output_block_id: None,
+            stop_reason: TurnCompletedStopReason::EndTurn,
+            origin: TurnOrigin::Interactive,
+        };
+        assert!(collapse_thinking_on_turn_end(&mut app, &event));
+        assert!(app.views[&id].collapsed.values().all(|c| *c));
+    }
+
+    /// A `TurnFailed` also ends the turn — the reasoning that led to the
+    /// failure is no more live than a successful one's.
+    #[test]
+    fn turn_failed_also_collapses_thinking() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(vec![thinking_block(id)], 1)
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+
+        let event = ServerEvent::TurnFailed {
+            context_id: id,
+            principal_id: PrincipalId::new(),
+            error: "provider stream error".to_string(),
+            origin: TurnOrigin::Autonomous,
+        };
+        assert!(collapse_thinking_on_turn_end(&mut app, &event));
+    }
+
+    /// An event for a context nobody is watching is not a bug — `false`,
+    /// not a panic.
+    #[test]
+    fn turn_completed_for_an_unwatched_context_is_a_no_op() {
+        let mut app = App::new("amy");
+        let event = ServerEvent::TurnCompleted {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            output_block_id: None,
+            stop_reason: TurnCompletedStopReason::EndTurn,
+            origin: TurnOrigin::Interactive,
+        };
+        assert!(!collapse_thinking_on_turn_end(&mut app, &event));
+    }
+
+    /// Every other `ServerEvent` variant is `mark_activity`'s business, not
+    /// this function's.
+    #[test]
+    fn an_unrelated_event_is_ignored() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        app.views.insert(id, ContextView::new(ContextMirror::new(id)));
+        let event = ServerEvent::ContextSwitched { context_id: id };
+        assert!(!collapse_thinking_on_turn_end(&mut app, &event));
+    }
 }

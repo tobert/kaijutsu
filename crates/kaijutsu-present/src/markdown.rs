@@ -88,6 +88,8 @@ impl RichSpan {
 /// - `` `code` `` -> RichSpan { code: true }
 /// - `# Heading` -> RichSpan { heading_level: Some(1), bold: true }
 /// - Fenced code blocks -> RichSpan { code_block: true }
+/// - `> quoted` -> plain text, `"> "` prefixed onto every line — a marker, not
+///   a rendered border, so a paste carries it verbatim
 pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
     let parser = Parser::new(text);
     let mut spans = Vec::new();
@@ -100,6 +102,8 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
     let mut list_depth: u32 = 0;
     let mut item_index: Vec<Option<u64>> = Vec::new(); // None = unordered, Some(n) = ordered
     let mut need_item_prefix = false;
+    let mut blockquote_depth: u32 = 0;
+    let mut need_quote_prefix = false;
 
     for event in parser {
         match event {
@@ -118,6 +122,9 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
                 // Add blank line before paragraphs (unless at start)
                 if !spans.is_empty() && !ends_with_newlines(&spans, 2) {
                     push_span(&mut spans, "\n");
+                }
+                if blockquote_depth > 0 {
+                    need_quote_prefix = true;
                 }
             }
             Event::End(TagEnd::Paragraph) => {
@@ -157,10 +164,15 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
                 }
             }
 
+            // A quoted paragraph gets a `"> "` prefix, the same plain-text
+            // marking a list item gets — never a rendered border, so a paste
+            // carries the marker verbatim.
             Event::Start(Tag::BlockQuote(_)) => {
-                // Simple: just treat as indented text
+                blockquote_depth += 1;
             }
-            Event::End(TagEnd::BlockQuote(_)) => {}
+            Event::End(TagEnd::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_sub(1);
+            }
 
             // -- Inline tags --
             Event::Start(Tag::Strong) => bold_depth += 1,
@@ -181,6 +193,10 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
             Event::Text(cow) => {
                 let content = cow.as_ref();
 
+                if need_quote_prefix {
+                    push_span(&mut spans, "> ");
+                    need_quote_prefix = false;
+                }
                 // Emit list item prefix before first text in an item
                 if need_item_prefix {
                     let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
@@ -202,6 +218,10 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
 
             Event::Code(cow) => {
                 // Inline code
+                if need_quote_prefix {
+                    push_span(&mut spans, "> ");
+                    need_quote_prefix = false;
+                }
                 if need_item_prefix {
                     let indent = "  ".repeat(list_depth.saturating_sub(1) as usize);
                     let prefix = match item_index.last() {
@@ -219,8 +239,14 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
                 spans.push(span);
             }
 
-            Event::SoftBreak => push_span(&mut spans, "\n"),
-            Event::HardBreak => push_span(&mut spans, "\n"),
+            Event::SoftBreak => push_span(
+                &mut spans,
+                if blockquote_depth > 0 { "\n> " } else { "\n" },
+            ),
+            Event::HardBreak => push_span(
+                &mut spans,
+                if blockquote_depth > 0 { "\n> " } else { "\n" },
+            ),
             Event::Rule => push_span(
                 &mut spans,
                 "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
@@ -339,6 +365,26 @@ mod tests {
         assert!(text.contains("\u{2022} one"));
         assert!(text.contains("\u{2022} two"));
         assert!(text.contains("\u{2022} three"));
+    }
+
+    /// A blockquote is plain prefixed text — `"> "` on every line, never a
+    /// rendered border — the same treatment a list item's bullet gets.
+    #[test]
+    fn blockquote_lines_are_prefixed() {
+        let spans = parse_to_rich_spans("> a quote\n> spanning two lines");
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("> a quote"), "got {text:?}");
+        assert!(text.contains("> spanning two lines"), "got {text:?}");
+    }
+
+    /// Text after a blockquote returns to being unprefixed.
+    #[test]
+    fn text_after_a_blockquote_is_not_prefixed() {
+        let spans = parse_to_rich_spans("> quoted\n\nplain after");
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("> quoted"), "got {text:?}");
+        assert!(text.contains("\nplain after"), "got {text:?}");
+        assert!(!text.contains("> plain after"), "got {text:?}");
     }
 
     #[test]

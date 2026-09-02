@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
 };
-use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, Role};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, Role};
 
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
@@ -68,6 +68,24 @@ impl ContextView {
             .get(&block.id)
             .copied()
             .unwrap_or_else(|| block.collapsed || collapses_by_default(block.kind))
+    }
+
+    /// Collapse every still-expanded `Thinking` block — the signal is the
+    /// turn's own end, not any one block's status, so a `Thinking` block
+    /// stays visible until the reply it belongs to is actually in
+    /// (`docs/tui.md`, "Conversation"). `Thinking` carries no
+    /// collapse-by-default (`collapses_by_default`), so this is the only
+    /// place it ever collapses on its own. Returns whether anything changed,
+    /// so a caller only redraws when it must.
+    pub fn collapse_thinking(&mut self) -> bool {
+        let mut changed = false;
+        for block in self.mirror.blocks() {
+            if block.kind == BlockKind::Thinking && self.collapsed.get(&block.id) != Some(&true) {
+                self.collapsed.insert(block.id, true);
+                changed = true;
+            }
+        }
+        changed
     }
 }
 
@@ -312,6 +330,22 @@ impl App {
             pending_asks: self.pending_asks,
             connection: self.connection.clone(),
             notice: self.notice.clone(),
+        }
+    }
+
+    /// Sync a still-live block's collapse state from the feed. Collapse is
+    /// kernel state (`docs/tui.md`, "Conversation": "a sibling's expand is
+    /// yours too") — this is what makes `ContextChange::CollapsedChanged`
+    /// actually reach [`ContextView::collapsed`], for a sibling's manual
+    /// toggle and for [`ContextView::collapse_thinking`]'s auto-collapse
+    /// alike. A block already printed to scrollback cannot be redrawn either
+    /// way (`App::observe_change` posts that notice); updating the map here
+    /// is harmless in that case because nothing reads it again.
+    pub fn apply_collapse_change(&mut self, context_id: ContextId, change: &ContextChange) {
+        if let ContextChange::CollapsedChanged { block_id, collapsed } = change
+            && let Some(view) = self.views.get_mut(&context_id)
+        {
+            view.collapsed.insert(*block_id, *collapsed);
         }
     }
 }
@@ -597,5 +631,76 @@ mod tests {
         let mut b = block(aid, 1, BlockKind::ToolResult, Role::Tool);
         b.tool_name = Some("shell".to_string());
         assert_eq!(app.speaker_for(&b, app.info(aid)), "shell");
+    }
+
+    /// `Thinking` carries no collapse-by-default (`collapses_by_default`
+    /// excludes it deliberately, so live reasoning stays visible), but the
+    /// turn that produced it ending is what auto-collapses it.
+    #[test]
+    fn collapse_thinking_collapses_every_expanded_thinking_block() {
+        let (_, aid, _) = app_with_two();
+        let mut mirror = ContextMirror::new(aid);
+        let thinking = block(aid, 1, BlockKind::Thinking, Role::Model);
+        let reply = block(aid, 2, BlockKind::Text, Role::Model);
+        mirror
+            .apply_snapshot(vec![thinking.clone(), reply.clone()], 1)
+            .expect("snapshot applies");
+        let mut view = ContextView::new(mirror);
+        assert!(!view.is_collapsed(&thinking), "visible while the turn runs");
+
+        assert!(view.collapse_thinking(), "the turn's end collapses it");
+        assert!(view.is_collapsed(&thinking));
+        assert!(
+            !view.is_collapsed(&reply),
+            "only Thinking collapses; the reply itself is unaffected"
+        );
+
+        assert!(
+            !view.collapse_thinking(),
+            "an already-collapsed Thinking block reports no further change"
+        );
+    }
+
+    /// `ContextChange::CollapsedChanged` is what makes a sibling's expand (or
+    /// the turn-end auto-collapse) visible on a still-live block —
+    /// `docs/tui.md`: "Collapse is kernel state ... so a sibling's expand is
+    /// yours too."
+    #[test]
+    fn a_collapsed_change_updates_a_still_live_blocks_collapse_state() {
+        let (mut app, aid, _) = app_with_two();
+        let mut mirror = ContextMirror::new(aid);
+        let call = block(aid, 1, BlockKind::ToolCall, Role::Model);
+        mirror
+            .apply_snapshot(vec![call.clone()], 1)
+            .expect("snapshot applies");
+        let view = ContextView::new(mirror);
+        assert!(view.is_collapsed(&call), "ToolCall collapses by default");
+        app.views.insert(aid, view);
+
+        app.apply_collapse_change(
+            aid,
+            &ContextChange::CollapsedChanged {
+                block_id: call.id,
+                collapsed: false,
+            },
+        );
+        assert!(!app.views[&aid].is_collapsed(&call), "the sibling's expand landed");
+    }
+
+    /// A `CollapsedChanged` for a context with no watched view is not a bug
+    /// — the ledger view, say, can see events for a context nobody has
+    /// opened yet.
+    #[test]
+    fn a_collapsed_change_for_an_unwatched_context_is_a_no_op() {
+        let (mut app, aid, _) = app_with_two();
+        let block_id = BlockId::new(aid, PrincipalId::new(), 1);
+        app.apply_collapse_change(
+            aid,
+            &ContextChange::CollapsedChanged {
+                block_id,
+                collapsed: true,
+            },
+        );
+        assert!(!app.views.contains_key(&aid));
     }
 }
