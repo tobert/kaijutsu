@@ -368,6 +368,17 @@ leaves `context_state` at `live`. The two checks that matter now read both
 halves, but every other reader of `context_state` alone is wrong the same
 way. Either archiving sets the state column too, or the column goes.
 
+## `kj ledger show` hides what an approval now runs (2026-09-02)
+
+`kj ledger show <id>` (and its `--json` data) prints the statement, the
+seats and the decision, but not `exec_source`, `cwd`, or the recorded
+free-variable values — the three things an approval actually executes
+with. The values reach the human only through the NOTE appended to
+`description`. Verified live: an ask whose refusal promised execution
+showed `exec_source` absent in `show --json`. Its `///` says "Show one ask
+in full"; make that true — print all three, in the table and in `.data`.
+Small; found during the first live run of approval-executes.
+
 ## The status read must be ungated by construction (2026-09-01)
 
 S50's predicate exempts the whole `kj ledger` verb, which is a policy in an
