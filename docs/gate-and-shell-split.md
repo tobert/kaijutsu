@@ -1314,8 +1314,9 @@ filter treats `kj_readonly == true` as a third exemption alongside
 `--help`/`kj ledger`, so a call built entirely of read-only `kj` commands
 skips scoring without a network round trip to the classifier. See
 `kj::readonly`'s module doc for the six conditions a command must meet to
-qualify, and for why `kj ledger` stays exempted by the hook's own rule
-rather than by this table.
+qualify. `kj ledger` is not in that table; it is exempt as a whole verb by
+`kj::readonly::is_gate_exempt_kj`, and the kernel enforces both exemptions
+before any hook runs — see "The exemption is the whole `kj ledger` verb".
 
 **`clause`** (added on top of the surface above, `broker.rs`'s
 `KJ_TOOL_PLAN` construction): a string on every command object — the text a
@@ -1634,6 +1635,22 @@ just `allow` and `deny`. `list`/`show`/`rules`/`runs` are reads, `signal add`
 is what the hook itself calls, and `forget` only ever makes the gate more
 conservative. `kj ledgerfoo` and `notkj ledger allow` are still scored, and a
 mixed call is scored in full.
+
+**The kernel enforces it, by construction.** A gated answer path is not an
+answer path: if the asking hook could see `kj ledger allow <id>`, answering
+an ask would require answering another. So the exemption is no longer only
+S50's policy. `Broker::evaluate_phase_with_mode` skips PreCall entirely —
+every hook, asking, denying or scoring — for a `shell`/`shell_write`
+program in which every command of every statement passes
+`kj::readonly::is_gate_exempt_kj`: read-only `kj` by the static table, or
+`kj ledger` with any subcommand, under the same six structural conditions
+(exactly `kj`, no redirect, no background, no heredoc, plain arguments, a
+resolvable verb). A substitution is planned as its own command and fails
+the program rule; an empty or unparseable program is not exempt. The dry
+run reports `WouldProceed` with no hook id for the same programs. S50's jq
+predicate is now a second statement of the same rule and can go when that
+hook is next edited; `contrib/lfm2d-ladder-check.kai`'s copy stays for the
+reason below. Safe only while a seat cannot answer its own ask.
 
 `contrib/lfm2d-ladder-check.kai` holds a **copy** of that predicate, on
 purpose: staying free of kernel, config and network is what lets the lfm2d

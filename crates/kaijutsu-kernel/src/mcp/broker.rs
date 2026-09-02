@@ -1878,6 +1878,21 @@ impl Broker {
         ctx: &CallContext,
         payload: PhasePayload<'_>,
     ) -> McpResult<PhaseEval> {
+        // The gate's answer path is ungated by construction: a shell
+        // program made only of `kj ledger` calls, or of read-only `kj`,
+        // reaches no PreCall hook at all — not the asking hook it would
+        // deadlock, and not the scorer either. The decision is
+        // `kj::readonly::program_is_gate_exempt`, on kaish's plan; a program
+        // that does not parse is not exempt and the hooks see it as before.
+        if phase == McpHookPhase::PreCall
+            && matches!(params.tool.as_str(), "shell" | "shell_write")
+            && let Some(command) = params.arguments.get("command").and_then(|v| v.as_str())
+            && let Ok(statements) = kaish_kernel::ast::plan::plan_program(command)
+            && crate::kj::readonly::program_is_gate_exempt(&statements)
+        {
+            return Ok(no_hook_matched(mode));
+        }
+
         // Snapshot matching entries + their indices so the sort is stable
         // across priority ties (the HashTable::entries Vec is the
         // authoritative insertion order).
@@ -7837,6 +7852,54 @@ mod tests {
             priority: 0,
             kaish_script_id: None,
         });
+    }
+
+    /// The gate's answer path is ungated by construction: a program made
+    /// only of `kj ledger` calls (or read-only `kj`) never reaches a PreCall
+    /// hook, so an asking hook cannot deadlock the seat that has to answer.
+    /// The same hook still fires for the same verb once anything else rides
+    /// along in the program.
+    ///
+    /// Falsified by evaluating PreCall for the exempt program: the first
+    /// call refuses and mints a pending ask.
+    #[tokio::test]
+    async fn a_ledger_answer_never_reaches_an_asking_hook() {
+        let (broker, kj, ctx) = dry_run_fixture("ledger-exempt").await;
+        push_shell_write_hook(
+            &broker,
+            "ask-everything",
+            HookAction::Ask(AskSpec { description: Some("asks about anything".into()) }),
+        )
+        .await;
+        let db = kj.kernel_db();
+
+        match broker.shell_pre_call_hooks("kj ledger allow 01a0-abc", &ctx).await {
+            ShellHookVerdict::Proceed => {}
+            other => panic!("the answer path must proceed without a hook, got {other:?}"),
+        }
+        match broker.shell_pre_call_hooks("kj block list", &ctx).await {
+            ShellHookVerdict::Proceed => {}
+            other => panic!("a read-only kj call must proceed without a hook, got {other:?}"),
+        }
+        assert!(
+            db.lock().list_pending_asks().unwrap().is_empty(),
+            "an exempt program must not mint an ask"
+        );
+        let report = broker
+            .shell_pre_call_hooks_dry_run("kj ledger deny 01a0-abc", &ctx)
+            .await
+            .expect("a dry run reports");
+        assert_eq!(report.outcome, DryRunOutcome::WouldProceed);
+        assert!(report.hook_id.is_none(), "no hook fired: {report:?}");
+
+        match broker
+            .shell_pre_call_hooks("kj ledger allow 01a0-abc; dd if=/dev/zero of=/tmp/x", &ctx)
+            .await
+        {
+            ShellHookVerdict::Denied(_) => {}
+            other => panic!("a mixed program is scored like any other, got {other:?}"),
+        }
+        assert_eq!(db.lock().list_pending_asks().unwrap().len(), 1);
     }
 
     /// A `Deny` hook in dry run refuses nothing: the report says what would

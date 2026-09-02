@@ -378,14 +378,6 @@ showed `exec_source` absent in `show --json`. Its `///` says "Show one ask
 in full"; make that true — print all three, in the table and in `.data`.
 Small; found during the first live run of approval-executes.
 
-## The status read must be ungated by construction (2026-09-01)
-
-S50's predicate exempts the whole `kj ledger` verb, which is a policy in an
-rc script rather than a structural guarantee. A gated poll path is not a
-poll path. Read-only `kj` now bypasses the classifier in the kernel
-(`0f972f46`), which covers the reads; `kj ledger allow`/`deny` are writes
-and still ride the exemption.
-
 ## The scorer and the snapshot: two follow-ups (2026-09-02)
 
 `KJ_TOOL_PLAN` carries `env: [{name, value|null}]` — the free-variable

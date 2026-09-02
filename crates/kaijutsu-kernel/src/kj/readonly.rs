@@ -70,17 +70,20 @@
 //! edge`); `backend default show` is the one case that gives up a real
 //! read-only path for safety — recorded in the per-entry table below.
 //!
-//! ## `kj ledger` is out of scope here, on purpose
+//! ## `kj ledger` is exempt as a verb, not as a set of reads
 //!
 //! `kj ledger list`/`show`/`rules`/`runs` are genuinely read-only by this
 //! module's own rules, but none of `kj ledger`'s subcommands appear in
 //! [`READ_ONLY_TABLE`] — the whole verb stays classified mutating in
 //! [`MUTATING_TABLE`] (for [`every_kj_subcommand_is_classified`]'s
-//! exhaustiveness only) and is left to the hook's own `kj ledger`
-//! exemption, which exists for a reason specific to the gate's answer path
-//! (self-approval is impossible by a context check, not a score — see the
-//! hook's own comment). Folding ledger into this table would duplicate that
-//! reasoning in a second place for no benefit.
+//! exhaustiveness only). The verb is exempt whole, reads and answers
+//! alike, by [`is_gate_exempt_kj`]: it is the gate's answer path, and a
+//! gated answer path is not one. The evaluator in `mcp/broker.rs` skips
+//! PreCall for a program made only of exempt commands
+//! ([`program_is_gate_exempt`]), so no hook — asking, denying, or
+//! scoring — sees `kj ledger allow <id>`. The advisory hook's own
+//! `kj ledger` exemption in jq is now a second statement of the same rule
+//! and can go when that hook is next edited.
 
 use kaish_types::plan::{PlannedCommand, PlannedValue};
 
@@ -231,7 +234,7 @@ pub(crate) const READ_ONLY_NO_SUBCOMMAND: &[&str] = &[
 ///
 /// `kj ledger`'s subcommands are listed here even though `list`/`show`/
 /// `rules`/`runs` are themselves reads — see the module doc, "`kj ledger`
-/// is out of scope here, on purpose". `kj transport`'s subcommands are
+/// is exempt as a verb, not as a set of reads". `kj transport`'s subcommands are
 /// listed here in full, `list` included, even though its own doc comment
 /// calls `list` read-only — excluded on Amy's explicit instruction to keep
 /// the whole verb out of this module for now, not out of a per-verb
@@ -375,45 +378,86 @@ const MUTATING_NO_SUBCOMMAND: &[&str] = &["cp", "play", "attach", "fork", "drive
 ///    closed: this function returns `false`, not an error, on anything it
 ///    cannot positively place in the tables.
 pub(crate) fn is_read_only_kj(cmd: &PlannedCommand) -> bool {
-    if cmd.name != "kj" {
+    let Some((verb, subcommand)) = resolved_kj_verb(cmd) else {
         return false;
+    };
+    if READ_ONLY_NO_SUBCOMMAND.contains(&verb) {
+        return true;
+    }
+    let Some(subcommand) = subcommand else {
+        return false;
+    };
+    READ_ONLY_TABLE.contains(&(verb, subcommand))
+}
+
+/// Whether one command may reach the shell without any PreCall hook
+/// seeing it: a read-only `kj` call, or any `kj ledger` call.
+///
+/// `kj ledger` is the gate's own answer path. A hook that could ask about
+/// `kj ledger allow <id>` makes answering an ask require answering another
+/// ask, so the exemption is structural rather than a hook's policy: the
+/// evaluator skips PreCall for a program made only of exempt commands
+/// (`program_is_gate_exempt`). The whole verb is covered — `list`, `show`,
+/// `rules` and `runs` are reads, `signal add` is what the advisory hook
+/// itself calls, and `forget` only makes the gate more conservative. It is
+/// safe only because a seat cannot answer its own ask (a context check in
+/// the ledger, `docs/gate-and-shell-split.md`, "No self-approval"); remove
+/// that invariant and this exemption goes with it.
+///
+/// The same six structural conditions as [`is_read_only_kj`] apply, so a
+/// redirect, a background call, a heredoc or a substituted argument refuse.
+pub(crate) fn is_gate_exempt_kj(cmd: &PlannedCommand) -> bool {
+    if is_read_only_kj(cmd) {
+        return true;
+    }
+    matches!(resolved_kj_verb(cmd), Some(("ledger", _)))
+}
+
+/// Whether a whole planned program is exempt from PreCall hooks: every
+/// command of every statement passes [`is_gate_exempt_kj`]. An empty
+/// program is not exempt — there is nothing to exempt, and the hooks decide
+/// what an empty submission means.
+pub(crate) fn program_is_gate_exempt(statements: &[kaish_kernel::PlannedStatement]) -> bool {
+    let mut commands = statements.iter().flat_map(|s| s.plan.commands.iter()).peekable();
+    if commands.peek().is_none() {
+        return false;
+    }
+    commands.all(is_gate_exempt_kj)
+}
+
+/// Conditions 1–5 of [`is_read_only_kj`], shared with [`is_gate_exempt_kj`]:
+/// the command is exactly `kj`, carries no redirect, background flag or
+/// heredoc, and every argument is plain text. Returns the verb and the
+/// subcommand when neither is a flag; `None` refuses.
+fn resolved_kj_verb(cmd: &PlannedCommand) -> Option<(&str, Option<&str>)> {
+    if cmd.name != "kj" {
+        return None;
     }
     if !cmd.redirects.is_empty() {
-        return false;
+        return None;
     }
     if cmd.background {
-        return false;
+        return None;
     }
     if !cmd.heredocs.is_empty() {
-        return false;
+        return None;
     }
 
     let mut plain_args: Vec<&str> = Vec::with_capacity(cmd.args.len());
     for arg in &cmd.args {
         match arg {
             PlannedValue::Plain(s) => plain_args.push(s.as_str()),
-            // Any variant kaish adds to its redaction seam: never read-only.
-            _ => return false,
+            // Any variant kaish adds to its redaction seam: never exempt.
+            _ => return None,
         }
     }
 
-    let Some(&verb) = plain_args.first() else {
-        return false;
-    };
+    let &verb = plain_args.first()?;
     if verb.starts_with('-') {
-        return false;
+        return None;
     }
-    if READ_ONLY_NO_SUBCOMMAND.contains(&verb) {
-        return true;
-    }
-
-    let Some(&subcommand) = plain_args.get(1) else {
-        return false;
-    };
-    if subcommand.starts_with('-') {
-        return false;
-    }
-    READ_ONLY_TABLE.contains(&(verb, subcommand))
+    let subcommand = plain_args.get(1).copied().filter(|s| !s.starts_with('-'));
+    Some((verb, subcommand))
 }
 
 #[cfg(test)]
@@ -598,6 +642,53 @@ mod tests {
     fn a_known_read_only_pair_passes() {
         let cmd = plan_one("kj block list");
         assert!(is_read_only_kj(&cmd));
+    }
+
+    // -- gate exemption: the ledger's own verb, under the same six conditions
+
+    /// The gate's answer path is exempt by construction: `kj ledger` never
+    /// reaches a hook that can ask. Read-only verbs are exempt too.
+    #[test]
+    fn a_ledger_answer_is_gate_exempt() {
+        assert!(is_gate_exempt_kj(&plan_one("kj ledger allow 01a0-abc")));
+        assert!(is_gate_exempt_kj(&plan_one("kj ledger deny 01a0-abc")));
+        assert!(is_gate_exempt_kj(&plan_one("kj ledger list --status abandoned")));
+        assert!(is_gate_exempt_kj(&plan_one("kj block list")));
+    }
+
+    /// `kj ledger` is exempt only under the structural conditions
+    /// `is_read_only_kj` applies: a redirect, a background call, a
+    /// substituted argument, or a mutating verb that is not `ledger` all
+    /// refuse.
+    #[test]
+    fn a_ledger_answer_with_a_redirect_or_substitution_is_not_exempt() {
+        assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 > /tmp/out")));
+        assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 &")));
+        assert!(!is_gate_exempt_kj(&plan_one("kj block create --role user --kind text")));
+        // A substitution is planned as its own command beside the kj call,
+        // so the kj half is exempt in isolation and the program rule is what
+        // refuses the whole: the substituted command is not exempt.
+        let program =
+            kaish_kernel::ast::plan::plan_program("kj ledger allow $(cat /tmp/id)").unwrap();
+        assert!(!program_is_gate_exempt(&program));
+    }
+
+    /// A whole program is exempt only when every command of every
+    /// statement is: `kj ledger allow x; dd ...` must still be scored.
+    #[test]
+    fn a_program_is_exempt_only_when_every_command_is() {
+        let only_answers = kaish_kernel::ast::plan::plan_program(
+            "kj ledger show 01a0-abc; kj ledger allow 01a0-abc",
+        )
+        .unwrap();
+        assert!(program_is_gate_exempt(&only_answers));
+        let mixed = kaish_kernel::ast::plan::plan_program(
+            "kj ledger allow 01a0-abc; dd if=/dev/zero of=/dev/sda",
+        )
+        .unwrap();
+        assert!(!program_is_gate_exempt(&mixed));
+        let empty = kaish_kernel::ast::plan::plan_program("").unwrap();
+        assert!(!program_is_gate_exempt(&empty), "an empty program is not an exemption");
     }
 
     #[test]
