@@ -296,10 +296,11 @@ enum LedgerCommand {
         #[arg(long)]
         signals: bool,
     },
-    /// Show one ask in full, including the statement being authorized, the
-    /// context and principal that raised it, and — once it is decided —
-    /// whether its answer has already been spent. Works for a decided ask
-    /// as well as a pending one.
+    /// Show one ask in full: the statement being authorized, what an
+    /// approval runs it with — source, working directory, recorded free
+    /// variable values — the context and principal that raised it, and —
+    /// once it is decided — whether its answer has already been spent.
+    /// Works for a decided ask as well as a pending one.
     Show {
         /// The ask to show. Request ids come from `kj ledger list`.
         request_id: String,
@@ -691,6 +692,14 @@ impl KjDispatcher {
             Ok(at) => at,
             Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
         };
+        // The free-variable values an approval runs with, recorded on the
+        // ask at raise time (`docs/gate-shape-b.md`, "The ask carries its
+        // free variables") — always loaded, not gated on `--signals`, since
+        // this is what execution reads, not an advisory extra.
+        let env_rows = match approval_ledger::ask::load_ask_env(conn, request_id) {
+            Ok(e) => e,
+            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
+        };
         let signal_rows = if show_signals {
             match approval_ledger::ask::list_signals(conn, request_id) {
                 Ok(s) => s,
@@ -721,6 +730,23 @@ impl KjDispatcher {
         ];
         for s in &statements {
             lines.push(format!("statement:  {}", s.statement.rendered));
+        }
+        // What an allow actually runs — the source, the directory, and the
+        // free variables' recorded values. Omitted line by line when the
+        // ask carries nothing for it (an advisory or non-executing ask has
+        // no `exec_source`/`cwd`, and a statement with no free variable has
+        // no env rows at all).
+        if let Some(exec_source) = &row.exec_source {
+            lines.push(format!("exec_source: {exec_source}"));
+        }
+        if let Some(cwd) = &row.cwd {
+            lines.push(format!("cwd:        {cwd}"));
+        }
+        for e in &env_rows {
+            match &e.value {
+                Some(v) => lines.push(format!("env:        {}={v:?}", e.name)),
+                None => lines.push(format!("env:        {} unset", e.name)),
+            }
         }
         if let Some(decided) = &row.decided_option {
             lines.push(format!("decided:    {decided}"));
@@ -776,6 +802,12 @@ impl KjDispatcher {
             "description": row.description,
             "authorized_label": row.authorized_label,
             "statements": statements.iter().map(|s| s.statement.rendered.clone()).collect::<Vec<_>>(),
+            "exec_source": row.exec_source,
+            "cwd": row.cwd,
+            "env": env_rows.iter().map(|e| serde_json::json!({
+                "name": e.name,
+                "value": e.value,
+            })).collect::<Vec<_>>(),
         });
         if show_signals {
             data["signals"] = serde_json::Value::Array(signal_rows.iter().map(signal_row_json).collect());
@@ -1773,6 +1805,72 @@ mod tests {
             data["redeemed_at"].as_i64().is_some_and(|at| at > 0),
             "redeemed_at is a unix-epoch millisecond stamp: {data}"
         );
+    }
+
+    /// `show` renders what an approval NOW RUNS WITH — the source, the
+    /// directory it runs in, and the free-variable values recorded at ask
+    /// time — not only the statement text. Until this landed, none of the
+    /// three appeared in `kj ledger show`, so a human deciding a shell ask
+    /// could not see what execution would actually do.
+    ///
+    /// Falsified by leaving out any of the three render blocks, or by
+    /// leaving `exec_source`/`cwd`/`env` out of `.data`.
+    #[tokio::test]
+    async fn ledger_show_reports_what_an_approval_runs_with() {
+        let d = test_dispatcher().await;
+        let ctx_id = crate::kj::test_helpers::register_context(
+            &d,
+            Some("show-exec-source"),
+            None,
+            PrincipalId::new(),
+        );
+        d.kernel_db.lock().set_context_env(ctx_id, "FOO", "asked").unwrap();
+        d.kernel_db
+            .lock()
+            .upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: ctx_id,
+                cwd: Some("/work/dir".into()),
+                updated_at: 0,
+            })
+            .unwrap();
+        let mut c = test_caller();
+        c.context_id = Some(ctx_id);
+
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("echo ${FOO} ${BAR}").unwrap();
+        let first = gate_once(&d, &c, spec).await;
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+
+        let result = d
+            .dispatch(&[s("ledger"), s("show"), s(&request_id)], &c)
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        let msg = result.message().to_string();
+        assert!(msg.contains("exec_source: echo ${FOO} ${BAR}"), "{msg}");
+        assert!(msg.contains("cwd:        /work/dir"), "{msg}");
+        assert!(msg.contains("env:        FOO=\"asked\""), "{msg}");
+        assert!(msg.contains("env:        BAR unset"), "{msg}");
+
+        let data = match &result {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("kj ledger show must emit structured data: {other:?}"),
+        };
+        assert_eq!(data["exec_source"].as_str(), Some("echo ${FOO} ${BAR}"), "{data}");
+        assert_eq!(data["cwd"].as_str(), Some("/work/dir"), "{data}");
+        // Rows come in the ask's recorded order, which follows kaish's
+        // free-variable listing rather than the source; look up by name.
+        let env = data["env"].as_array().expect("env is an array");
+        assert_eq!(env.len(), 2, "{data}");
+        let by_name = |name: &str| {
+            env.iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("env row {name} missing: {data}"))
+        };
+        assert_eq!(by_name("FOO")["value"], "asked");
+        assert!(by_name("BAR")["value"].is_null());
+
+        // Clean up the pending ask so the spawned gate terminates.
+        d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &answering_seat())
+            .await;
     }
 
     /// Both decision verbs report themselves in correct English. The `deny`
