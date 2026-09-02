@@ -1317,6 +1317,18 @@ skips scoring without a network round trip to the classifier. See
 qualify, and for why `kj ledger` stays exempted by the hook's own rule
 rather than by this table.
 
+**`env`** (added on top of the surface above, `docs/gate-shape-b.md`'s free
+`${VAR}` snapshot): a top-level sibling of `statements`, an array of
+`{"name":…,"value":…}` — one entry per free variable across every
+statement, statement-level and non-literal-heredoc free variables unioned
+together, `value` reading `null` for a name unset in `context_env` at fire
+time. Built by `kj::env_snapshot::free_variable_values`, the SAME function
+`kj::gate::build_ask` calls when it escalates a `shell_write` ask — so this
+classifier reads the identical snapshot the ask records and a human later
+approves, never a second, potentially different, read of `context_env`.
+Additive: `statements` is unchanged. Test:
+`kj_tool_plan_carries_the_free_variable_env_snapshot`.
+
 **The three `rpc.rs` shell paths take the hook path — PreCall today; PostCall/OnError are filed in `docs/issues.md`.** `Broker` gains two
 public methods (`shell_pre_call_hooks`/`shell_post_call_hooks`,
 `mcp/broker.rs`) that run the same `PreCall`/`PostCall` phases a real

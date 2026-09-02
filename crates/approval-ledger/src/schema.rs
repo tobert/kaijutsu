@@ -394,6 +394,21 @@ CREATE TABLE IF NOT EXISTS approval_options (
     PRIMARY KEY (request_id, seq)
 );
 
+-- ── Approval environment snapshot ────────────────────────────────────
+-- The value every free `${VAR}` this ask's statements read held at ask
+-- time, captured once so the human who approves and the execution that
+-- later runs see the same values. `value` is NULL when the variable was
+-- unset then — a row exists for every free variable name regardless, so
+-- an unset variable and no snapshot at all are never confused. Wholly
+-- owned by one ask, same as `approval_options` above: CASCADE is safe.
+CREATE TABLE IF NOT EXISTS approval_env (
+    request_id TEXT    NOT NULL REFERENCES approvals(request_id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    name       TEXT    NOT NULL,
+    value      TEXT,
+    PRIMARY KEY (request_id, seq)
+);
+
 -- ── Approval signals ─────────────────────────────────────────────────
 -- Advisory annotations attached to an ask (a rule that almost matched, a
 -- classifier's risk score on one command) — informational, never itself a
@@ -990,9 +1005,10 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
 /// carried this particular `CHECK`, does nothing; `migrate` must stay safe
 /// to call on every process start.
 ///
-/// `approvals` is the `ON DELETE CASCADE` parent of six tables
-/// (`approval_ask_statements`, `approval_options`, `approval_signals`,
-/// `approval_events`, `approval_refusals`, `approval_redemptions`).
+/// `approvals` is the `ON DELETE CASCADE` parent of seven tables
+/// (`approval_ask_statements`, `approval_options`, `approval_env`,
+/// `approval_signals`, `approval_events`, `approval_refusals`,
+/// `approval_redemptions`).
 /// Rebuilding a table is create, copy, `DROP TABLE`, rename — and with
 /// `PRAGMA foreign_keys = ON` (the kernel's connection-wide setting,
 /// `kernel_db.rs`), `DROP TABLE` performs an implicit `DELETE FROM`, which
@@ -1325,6 +1341,7 @@ mod tests {
             "approvals",
             "approval_ask_statements",
             "approval_options",
+            "approval_env",
             "approval_signals",
             "approval_events",
             "approval_redemptions",
@@ -1662,7 +1679,7 @@ mod tests {
     }
 
     /// The whole point of the `foreign_keys = OFF` window: `approvals` is
-    /// the `ON DELETE CASCADE` parent of six tables, and a naive rebuild
+    /// the `ON DELETE CASCADE` parent of seven tables, and a naive rebuild
     /// (`DROP TABLE approvals` with FK enforcement left ON) deletes every
     /// one of their rows along with it. This seeds a row in each of the
     /// six, puts `approvals` back on its legacy `CHECK` shape while it is
@@ -1751,6 +1768,11 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO approval_env (request_id, seq, name, value) VALUES ('r1', 0, 'FOO', 'bar')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO approval_signals (request_id, seq, source_kind, verdict) VALUES ('r1', 0, 'rule', 'allow')",
             [],
         )
@@ -1769,6 +1791,7 @@ mod tests {
         for (table, expected) in [
             ("approval_ask_statements", 1_i64),
             ("approval_options", 1),
+            ("approval_env", 1),
             ("approval_signals", 1),
             ("approval_events", 1),
             ("approval_refusals", 1),

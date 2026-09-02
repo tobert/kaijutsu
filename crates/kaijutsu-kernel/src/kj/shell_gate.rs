@@ -164,6 +164,10 @@ pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateB
         // generalize it.
         exec_source: Some(source.trim().to_string()),
         statements,
+        // The same `plan_program` output `statements` was built from —
+        // carried through so `gate::build_ask` can compute the free-variable
+        // env snapshot without re-parsing `source` a second time.
+        planned,
     })
 }
 

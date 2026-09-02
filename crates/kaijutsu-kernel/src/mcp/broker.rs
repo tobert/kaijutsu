@@ -2306,13 +2306,14 @@ impl Broker {
         // the hooked tool is the shell, hand the body kaish's own plan
         // projection of the `command` argument — `{"statements":[{"index",
         // "plan":{"rendered","statement_kind","commands":[{"name","args",
-        // ...,"kj_readonly"},...]}}]}`. `commands[]` descends into
-        // control-structure and `$(...)` bodies and `--confirm=<key>`
-        // literals are redacted, so a classifier scores what was asked for
-        // without the body re-deriving clause structure. This is the stable
-        // surface; the AST types are not. Read entries by array position,
-        // never by `index`. On a parse failure the var is absent and
-        // `KJ_TOOL_PLAN_ERROR` carries the diagnostics.
+        // ...,"kj_readonly"},...]}}],"env":[{"name","value"},...]}`.
+        // `commands[]` descends into control-structure and `$(...)` bodies
+        // and `--confirm=<key>` literals are redacted, so a classifier
+        // scores what was asked for without the body re-deriving clause
+        // structure. This is the stable surface; the AST types are not.
+        // Read entries by array position, never by `index`. On a parse
+        // failure the var is absent and `KJ_TOOL_PLAN_ERROR` carries the
+        // diagnostics.
         //
         // `kj_readonly` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): a
         // bool on every command object, `true` only when
@@ -2320,6 +2321,14 @@ impl Broker {
         // static read-only table. A hook body can check this once instead
         // of re-deriving verb/subcommand structure itself. Additive — every
         // field above already existed and is unchanged.
+        //
+        // `env` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): the value
+        // every free `${VAR}` across every statement held in `context_env`
+        // at fire time — `kj::env_snapshot::free_variable_values`, the same
+        // function `kj::gate::build_ask` calls, so this classifier sees
+        // exactly what the ask will record. `value` is `null` for a
+        // variable that was unset. Additive, top-level, sibling to
+        // `statements`.
         if matches!(params.tool.as_str(), "shell" | "shell_write") {
             if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
                 match kaish_kernel::ast::plan::plan_program(command) {
@@ -2358,8 +2367,27 @@ impl Broker {
                                 }
                             }
                         }
+                        let env_entries = crate::kj::env_snapshot::free_variable_values(
+                            dispatcher.kernel_db(),
+                            ctx.context_id,
+                            &statements,
+                        );
+                        if let Some(obj) = plan_value.as_object_mut() {
+                            obj.insert(
+                                "env".to_string(),
+                                serde_json::json!(
+                                    env_entries
+                                        .iter()
+                                        .map(|e| serde_json::json!({
+                                            "name": e.name,
+                                            "value": e.value,
+                                        }))
+                                        .collect::<Vec<_>>()
+                                ),
+                            );
+                        }
                         let json = serde_json::to_string(&plan_value)
-                            .unwrap_or_else(|_| r#"{"statements":[]}"#.to_string());
+                            .unwrap_or_else(|_| r#"{"statements":[],"env":[]}"#.to_string());
                         vars.insert(
                             "KJ_TOOL_PLAN".into(),
                             kaish_kernel::ast::Value::String(json),
@@ -7316,6 +7344,68 @@ mod tests {
             .call_tool(call, &CallContext::test(), CancellationToken::new())
             .await
             .expect("KJ_TOOL_PLAN must carry three statements with `delete` inside the loop");
+        assert!(!result.is_error);
+    }
+
+    /// `env` (`docs/gate-and-shell-split.md`, "KJ_TOOL_PLAN"): the classifier
+    /// sees the same free-variable snapshot the ask records —
+    /// `kj::env_snapshot::free_variable_values` called with the calling
+    /// context's `context_env`. `FOO` is set, `BAZ` is free but unset, so
+    /// its JSON value reads `null`.
+    #[tokio::test]
+    async fn kj_tool_plan_carries_the_free_variable_env_snapshot() {
+        let (broker, _kernel, kj) = wired_kaish_broker("kaish-hook-plan-env").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // `set_context_env` FK-references `contexts`, so the snapshot needs
+        // a REGISTERED context — `CallContext::test()`'s random id was
+        // never inserted and the write would fail closed.
+        let context_id = crate::kj::test_helpers::register_context(
+            &kj,
+            Some("plan-env-check"),
+            None,
+            kaijutsu_types::PrincipalId::new(),
+        );
+        let ctx = CallContext::new(
+            kaijutsu_types::PrincipalId::new(),
+            context_id,
+            kaijutsu_types::SessionId::new(),
+            kj.kernel_id(),
+        );
+        kj.kernel_db()
+            .lock()
+            .set_context_env(ctx.context_id, "FOO", "bar")
+            .unwrap();
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("plan-env-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(
+                "foo=$(echo $KJ_TOOL_PLAN | jq -r '.env[] | select(.name==\"FOO\") | .value')\n\
+                 baz=$(echo $KJ_TOOL_PLAN | jq -r '.env[] | select(.name==\"BAZ\") | .value')\n\
+                 test \"$foo\" = bar || exit 1\n\
+                 test \"$baz\" = null || exit 1"
+                    .into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let mut call = params("svc", "shell_write");
+        call.arguments = serde_json::json!({ "command": "echo ${FOO} ${BAZ}" });
+
+        let result = broker
+            .call_tool(call, &ctx, CancellationToken::new())
+            .await
+            .expect("KJ_TOOL_PLAN must carry the env snapshot with FOO=bar and BAZ unset");
         assert!(!result.is_error);
     }
 

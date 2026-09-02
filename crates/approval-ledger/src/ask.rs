@@ -15,9 +15,10 @@ use crate::error::{LedgerError, Result};
 use crate::events;
 use crate::time::now_millis;
 use crate::types::{
-    ApprovalRow, AskStatementRow, EventKind, EventRow, NewAsk, NewPlanStatement, NewPlannedValue,
-    Origin, OptionRow, PlanCommandRow, PlanRedirectRow, PlanStatementRow, PlannedValueRow, RefusalRow,
-    SignalRow, SignalSourceKind, SignalVerdict, ValueKind, VarBinding, parse_enum,
+    ApprovalRow, AskEnvRow, AskStatementRow, EventKind, EventRow, NewAsk, NewPlanStatement,
+    NewPlannedValue, Origin, OptionRow, PlanCommandRow, PlanRedirectRow, PlanStatementRow,
+    PlannedValueRow, RefusalRow, SignalRow, SignalSourceKind, SignalVerdict, ValueKind,
+    VarBinding, parse_enum,
 };
 
 /// Durably record one ask and return its `request_id`. Commits before
@@ -133,6 +134,14 @@ fn insert_ask(tx: &Transaction, request_id: &str, req: &NewAsk) -> Result<()> {
             "INSERT INTO approval_options (request_id, seq, option_id, label, kind)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![request_id, seq as i64, opt.option_id, opt.label, opt.kind],
+        )?;
+    }
+
+    for (seq, entry) in req.env.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO approval_env (request_id, seq, name, value)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![request_id, seq as i64, entry.name, entry.value],
         )?;
     }
 
@@ -541,6 +550,28 @@ pub fn list_options(conn: &Connection, request_id: &str) -> Result<Vec<OptionRow
                 option_id: row.get(1)?,
                 label: row.get(2)?,
                 kind: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The free-variable value snapshot recorded on this ask, in the order it
+/// was captured. Empty for an unknown `request_id`, same as every other
+/// read in this module keyed off a join table (`list_options`,
+/// `load_ask_statements`) — there is no row to be missing, only rows to
+/// find or not find.
+pub fn load_ask_env(conn: &Connection, request_id: &str) -> Result<Vec<AskEnvRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, name, value FROM approval_env
+         WHERE request_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt
+        .query_map(params![request_id], |row| {
+            Ok(AskEnvRow {
+                seq: row.get(0)?,
+                name: row.get(1)?,
+                value: row.get(2)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -995,7 +1026,7 @@ pub fn undelivered_answers(conn: &Connection) -> Result<Vec<UndeliveredAnswer>> 
 mod tests {
     use crate::fixtures::{ask_with_statement, minimal_ask, open_memory};
     use crate::types::{
-        ApprovalStatus, NewPlanRedirect, NewPlannedValue, NewSignal, PlannedValueRow,
+        ApprovalStatus, NewAskEnv, NewPlanRedirect, NewPlannedValue, NewSignal, PlannedValueRow,
         SignalSourceKind, SignalVerdict, VarBinding,
     };
 
@@ -1223,6 +1254,81 @@ mod tests {
         assert_eq!(opts[1].option_id, "deny");
         assert_eq!(opts[0].seq, 0);
         assert_eq!(opts[1].seq, 1);
+    }
+
+    /// `value` round-trips as SQL `NULL` for an unset variable, never an
+    /// empty string — the two mean different things (an unset variable vs.
+    /// one that resolved to `""`), and only `NULL` says the first.
+    ///
+    /// Falsified by writing `entry.value.unwrap_or_default()` in
+    /// `insert_ask` instead of `entry.value`: the raw-column assertion
+    /// below would see `""`, not `NULL`.
+    #[test]
+    fn env_round_trips_in_seq_order_with_unset_as_null() {
+        let conn = open_memory();
+        let mut ask = minimal_ask();
+        ask.env = vec![
+            NewAskEnv { name: "FOO".into(), value: Some("bar".into()) },
+            NewAskEnv { name: "BAZ".into(), value: None },
+        ];
+        let request_id = create_ask(&conn, &ask).unwrap();
+
+        let env = load_ask_env(&conn, &request_id).unwrap();
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0].seq, 0);
+        assert_eq!(env[0].name, "FOO");
+        assert_eq!(env[0].value.as_deref(), Some("bar"));
+        assert_eq!(env[1].seq, 1);
+        assert_eq!(env[1].name, "BAZ");
+        assert_eq!(env[1].value, None, "an unset variable must round-trip as NULL, not \"\"");
+
+        let raw: rusqlite::types::Value = conn
+            .query_row(
+                "SELECT value FROM approval_env WHERE request_id = ?1 AND name = 'BAZ'",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(raw, rusqlite::types::Value::Null), "expected SQL NULL, got {raw:?}");
+    }
+
+    #[test]
+    fn an_ask_with_no_free_variables_has_zero_env_rows() {
+        let conn = open_memory();
+        let ask = minimal_ask();
+        assert!(ask.env.is_empty(), "the fixture carries no env by default");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        assert!(load_ask_env(&conn, &request_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_ask_env_on_an_unknown_ask_returns_empty() {
+        let conn = open_memory();
+        assert!(load_ask_env(&conn, "does-not-exist").unwrap().is_empty());
+    }
+
+    /// `approval_env.request_id REFERENCES approvals(request_id) ON DELETE
+    /// CASCADE` — deleting the ask row removes its env rows with it, same
+    /// as `approval_options` and every other ask-owned child.
+    ///
+    /// Falsified by a schema missing `ON DELETE CASCADE` on `approval_env`:
+    /// the row deletion below would then fail an FK constraint (or, with
+    /// enforcement off, leave the env row orphaned) instead of cascading.
+    #[test]
+    fn deleting_the_ask_cascades_its_env_rows() {
+        let conn = open_memory();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let mut ask = minimal_ask();
+        ask.env = vec![NewAskEnv { name: "FOO".into(), value: Some("bar".into()) }];
+        let request_id = create_ask(&conn, &ask).unwrap();
+        assert_eq!(load_ask_env(&conn, &request_id).unwrap().len(), 1);
+
+        conn.execute("DELETE FROM approvals WHERE request_id = ?1", params![request_id]).unwrap();
+
+        assert!(
+            load_ask_env(&conn, &request_id).unwrap().is_empty(),
+            "ON DELETE CASCADE must remove the env rows along with their ask"
+        );
     }
 
     #[test]

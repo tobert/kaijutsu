@@ -29,6 +29,7 @@ pub mod diff;
 pub mod doc;
 pub mod drift;
 pub mod drive;
+pub mod env_snapshot;
 pub mod fork;
 pub mod format;
 pub mod gate;

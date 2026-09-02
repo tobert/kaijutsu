@@ -83,5 +83,8 @@ pub(crate) fn build_hook_gate_spec(
         // would resume, and nothing here reconstructs it, so an answer to
         // this ask still means the caller retries.
         exec_source: None,
+        // No source program to plan — see the module docs on why a hook
+        // ask has no free variables to snapshot either.
+        planned: Vec::new(),
     }
 }

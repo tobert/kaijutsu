@@ -169,6 +169,7 @@ pub(crate) mod fixtures {
             signals: vec![],
             cwd: None,
             exec_source: None,
+            env: vec![],
         }
     }
 

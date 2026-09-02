@@ -353,7 +353,7 @@ pub type McpResult<T> = Result<T, McpError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kj::gate::{GateOutcome, GateVerdict, PENDING_REASON, ask_ref};
+    use crate::kj::gate::{GateOutcome, GateVerdict, PENDING_REASON_RETRY, ask_ref};
     use approval_ledger::types::ApprovalStatus;
     use kaijutsu_types::AskStatus;
 
@@ -364,9 +364,10 @@ mod tests {
             verdict: GateVerdict::Pending,
             ask: Some(ask_ref(ASK.to_string(), ApprovalStatus::Pending)),
             cwd: None,
-            // The REAL text `run_gate` uses, not a stand-in — a stand-in
-            // makes this test unable to fail when that text regresses.
-            reason: PENDING_REASON.to_string(),
+            // The REAL text `run_gate` uses for a hook ask (`exec_source:
+            // None`), not a stand-in — a stand-in makes this test unable to
+            // fail when that text regresses.
+            reason: PENDING_REASON_RETRY.to_string(),
         }
     }
 

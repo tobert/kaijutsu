@@ -1300,6 +1300,7 @@ impl KjDispatcher {
                 // directory to run it in.
                 cwd: None,
                 exec_source: None,
+                env: vec![],
             };
             let result = {
                 let db = self.kernel_db.lock();
@@ -1414,6 +1415,7 @@ mod tests {
                 source_index: None,
             }],
             exec_source: None,
+            planned: Vec::new(),
         }
     }
 
@@ -1439,6 +1441,7 @@ mod tests {
                 source_index: Some(0),
             }],
             exec_source: None,
+            planned: Vec::new(),
         }
     }
 
@@ -2697,6 +2700,7 @@ mod tests {
                     signals: vec![],
                     cwd: None,
                     exec_source: None,
+                    env: vec![],
                 };
                 let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();
                 conn.execute(
@@ -2996,6 +3000,7 @@ mod tests {
                     signals: vec![],
                     cwd: None,
                     exec_source: None,
+                    env: vec![],
                 };
                 let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();
                 approval_ledger::decide::decide(

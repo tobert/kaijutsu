@@ -56,14 +56,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use approval_ledger::types::{
-    ApprovalStatus, AskCoverage, AskVerdict, NewAsk, NewOption, NewPlanCommand, NewPlanStatement,
-    NewPlanVar, NewPlannedValue, Origin, StatementVerdict, VarBinding,
+    ApprovalStatus, AskCoverage, AskVerdict, NewAsk, NewAskEnv, NewOption, NewPlanCommand,
+    NewPlanStatement, NewPlanVar, NewPlannedValue, Origin, StatementVerdict, VarBinding,
 };
 
 use kaijutsu_types::{AskRef, AskStatus};
 
 use crate::flows::SharedLedgerFlowBus;
 use crate::kernel_db::KernelDb;
+use crate::kj::env_snapshot::{self, AskEnvEntry};
 use crate::kj::KjCaller;
 
 /// How a gate wait ended — a decision, or the absence of one.
@@ -143,11 +144,20 @@ pub(crate) struct GateOutcome {
     pub cwd: Option<PathBuf>,
 }
 
-/// What a player does about a pending ask. "waiting for a human" is
-/// deliberately absent: that fact belongs to the refusal that wraps this,
-/// and stating it here made the composed message say it three times. Named
-/// rather than inline so the layering test reads the real text.
-pub const PENDING_REASON: &str = "nothing was run. Answer with `kj ledger \
+/// What a player does about a pending ask whose `exec_source` is `Some` —
+/// answering it runs the command, so this says where and with what values.
+/// "waiting for a human" is deliberately absent: that fact belongs to the
+/// refusal that wraps this, and stating it here made the composed message
+/// say it three times. Named rather than inline so the layering test reads
+/// the real text.
+pub const PENDING_REASON_EXECUTES: &str = "nothing was run. Answer with `kj ledger \
+     allow <id>` and the command runs, in the directory and with the free-variable \
+     values this ask recorded; `kj ledger deny <id>` runs nothing.";
+
+/// What a player does about a pending ask whose `exec_source` is `None` —
+/// there is nothing durable to execute, so the caller must resubmit once
+/// it is answered.
+pub const PENDING_REASON_RETRY: &str = "nothing was run. Answer with `kj ledger \
      allow <id>` or `kj ledger deny <id>`, then run the same command again — \
      an allowed ask authorizes it exactly once.";
 
@@ -254,6 +264,12 @@ pub(crate) struct GateSpec {
     /// caller must retry instead. That is not a silent fallback: the
     /// refusal's remedy says which of the two the caller is getting.
     pub exec_source: Option<String>,
+    /// The `plan_program()` output `statements` was built from —
+    /// `Origin::ShellGate` only; empty for every other origin, which has no
+    /// source program to plan. Carried here so `build_ask` can compute the
+    /// free-variable env snapshot ([`crate::kj::env_snapshot`]) without
+    /// re-parsing the submission a second time.
+    pub planned: Vec<kaish_kernel::PlannedStatement>,
 }
 
 /// Statement digest: the ledger keys statements by an opaque
@@ -303,7 +319,54 @@ fn caller_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, caller: &KjCaller) -> Opti
     db.get_context_shell(context_id).ok().flatten().and_then(|row| row.cwd)
 }
 
-fn build_ask(caller: &KjCaller, spec: &GateSpec, cwd: Option<String>) -> NewAsk {
+/// The env snapshot's human-facing summary, appended to the ask's
+/// `description` — a per-ask column, never content-addressed. This is
+/// deliberately NOT appended to any statement's `rendered` text: unlike
+/// the heredoc notes `shell_gate::render_for_review` appends (a pure
+/// function of the statement's own source, invariant across every ask
+/// that shares its digest), a free variable's VALUE varies ask to ask even
+/// for byte-identical source. `approval_statements` is content-addressed
+/// and only ever inserted once per digest (`insert_statement_if_new`), so
+/// baking one ask's values into it would show a LATER ask, with different
+/// values, whatever the FIRST ask recorded — silently wrong, not merely
+/// stale. The description column is per-ask and never deduplicated, so it
+/// is the value-safe place for a fact that varies per ask.
+fn render_env_note(env: &[AskEnvEntry]) -> String {
+    let parts: Vec<String> = env
+        .iter()
+        .map(|e| match &e.value {
+            Some(v) => format!("{}={v:?}", e.name),
+            None => format!("{} is unset", e.name),
+        })
+        .collect();
+    format!(
+        "NOTE: at ask time {} — an approval runs with exactly these values.",
+        parts.join(", ")
+    )
+}
+
+fn build_ask(
+    db: &Arc<parking_lot::Mutex<KernelDb>>,
+    caller: &KjCaller,
+    spec: &GateSpec,
+    cwd: Option<String>,
+) -> NewAsk {
+    // The values every free variable in this submission held at ask time —
+    // `Amy, 2026-09-02: snapshot the free variables' values onto the ask at
+    // ask time, restore them verbatim at execution, and show them to the
+    // human in the review rendering` (docs/gate-shape-b.md). `None` for a
+    // caller with no `context_id`, same as `caller_cwd`: there is no
+    // persisted `context_env` to read.
+    let env = caller
+        .context_id
+        .map(|context_id| env_snapshot::free_variable_values(db, context_id, &spec.planned))
+        .unwrap_or_default();
+    let description = if env.is_empty() {
+        spec.description.clone()
+    } else {
+        format!("{}\n\n{}", spec.description, render_env_note(&env))
+    };
+
     NewAsk {
         context_id: caller_context_bytes(caller),
         principal_id: caller.principal_id.as_bytes().to_vec(),
@@ -311,7 +374,11 @@ fn build_ask(caller: &KjCaller, spec: &GateSpec, cwd: Option<String>) -> NewAsk 
         instance: Some(spec.instance.clone()),
         tool: Some(spec.tool.clone()),
         hook_id: spec.hook_id.clone(),
-        description: spec.description.clone(),
+        description,
+        env: env
+            .into_iter()
+            .map(|e| NewAskEnv { name: e.name, value: e.value })
+            .collect(),
         statements: spec
             .statements
             .iter()
@@ -596,7 +663,7 @@ pub(crate) async fn run_gate(
 
     // Read before the row commits, so the directory recorded is the one the
     // ask was raised in rather than one a later `cd` moved to.
-    let ask = build_ask(caller, &spec, caller_cwd(db, caller));
+    let ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
 
     // 3. Durable before asked — the row commits before anyone is told.
     let request_id = {
@@ -684,7 +751,11 @@ pub(crate) async fn run_gate(
         verdict: GateVerdict::Pending,
         ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
         cwd: None,
-        reason: PENDING_REASON.to_string(),
+        reason: if spec.exec_source.is_some() {
+            PENDING_REASON_EXECUTES.to_string()
+        } else {
+            PENDING_REASON_RETRY.to_string()
+        },
     }
 }
 
@@ -760,6 +831,7 @@ mod tests {
                 source_index: None,
             }],
             exec_source: None,
+            planned: Vec::new(),
         }
     }
 
@@ -789,6 +861,7 @@ mod tests {
                 },
             ],
             exec_source: None,
+            planned: Vec::new(),
         }
     }
     async fn gate_dispatcher() -> crate::kj::KjDispatcher {
@@ -1133,6 +1206,7 @@ mod tests {
             signals: vec![],
             cwd: None,
             exec_source: None,
+            env: vec![],
         };
         let db = db.lock();
         let conn = db.conn_for_ledger();
@@ -1548,5 +1622,100 @@ mod tests {
             None,
             "a caller with no context_id has no persisted cwd to record"
         );
+    }
+
+    /// `PENDING_REASON` splits on whether the ask can execute on approval:
+    /// `exec_source: Some` gets the text that says the command runs;
+    /// `exec_source: None` gets the text that says to resubmit. Both keep
+    /// the "nothing was run" opening the layering test in `mcp/error.rs`
+    /// reads.
+    ///
+    /// Falsified by returning `PENDING_REASON_RETRY` unconditionally: the
+    /// executing-spec assertion below then sees the retry text instead.
+    #[tokio::test]
+    async fn pending_reason_selects_on_whether_the_ask_can_execute() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+
+        let mut executing = cc_spec("kaijutsu-chan");
+        executing.exec_source = Some("echo hi".into());
+        let executing_outcome =
+            run_gate(&d.kernel_db.clone(), &caller, executing, d.kernel.ledger_flows()).await;
+        assert_eq!(executing_outcome.verdict, GateVerdict::Pending);
+        assert_eq!(
+            executing_outcome.reason, PENDING_REASON_EXECUTES,
+            "an ask with exec_source: Some must get the executing text"
+        );
+
+        let retry_outcome = run_gate(
+            &d.kernel_db.clone(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+        )
+        .await;
+        assert_eq!(retry_outcome.verdict, GateVerdict::Pending);
+        assert_eq!(
+            retry_outcome.reason, PENDING_REASON_RETRY,
+            "an ask with exec_source: None must get the retry text"
+        );
+        assert_ne!(PENDING_REASON_EXECUTES, PENDING_REASON_RETRY);
+    }
+
+    /// The whole point: an escalating shell ask records the value each free
+    /// variable held in `context_env` at ask time, and the human-facing
+    /// description carries a NOTE naming it (Amy's ruling, 2026-09-02,
+    /// `docs/gate-shape-b.md`) — so a human approving the ask and the
+    /// execution that later runs it never see different values.
+    ///
+    /// Falsified by making `build_ask` pass `env: vec![]` unconditionally
+    /// instead of `env_snapshot::free_variable_values`'s result: both the
+    /// `ask_env` read and the description assertion below fail.
+    #[tokio::test]
+    async fn an_escalating_shell_ask_records_the_free_variable_env_snapshot() {
+        let d = gate_dispatcher().await;
+        let ctx_id =
+            register_context(&d, Some("env-snapshot"), None, kaijutsu_types::PrincipalId::new());
+        d.kernel_db.lock().set_context_env(ctx_id, "FOO", "bar").unwrap();
+        let caller = caller_with_context(ctx_id);
+
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("echo ${FOO}").unwrap();
+        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending);
+        let request_id = outcome.ask.expect("an escalated ask has a row").request_id;
+
+        let env = d.kernel_db.lock().ask_env(&request_id).unwrap();
+        assert_eq!(env.len(), 1, "exactly one free variable, FOO: {env:?}");
+        assert_eq!(env[0].name, "FOO");
+        assert_eq!(env[0].value.as_deref(), Some("bar"));
+
+        let row = {
+            let db = d.kernel_db.lock();
+            approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            row.description.contains("FOO=\"bar\""),
+            "the human-facing description must show the value an approval runs with: {}",
+            row.description
+        );
+    }
+
+    /// A caller with no `context_id` has no persisted `context_env` to
+    /// snapshot — same shape as [`a_caller_with_no_context_id_records_no_cwd`].
+    #[tokio::test]
+    async fn a_caller_with_no_context_id_records_no_env() {
+        let d = gate_dispatcher().await;
+        let mut caller = test_caller();
+        caller.context_id = None;
+
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("echo ${FOO}").unwrap();
+        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending);
+        let request_id = outcome.ask.expect("still a normal escalation").request_id;
+
+        let env = d.kernel_db.lock().ask_env(&request_id).unwrap();
+        assert!(env.is_empty(), "no context_id means no context_env to snapshot: {env:?}");
     }
 }

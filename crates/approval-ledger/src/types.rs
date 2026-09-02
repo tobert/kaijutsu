@@ -398,6 +398,15 @@ pub struct NewOption {
     pub kind: String,
 }
 
+/// One free variable's value, ready to insert — the snapshot
+/// `kaijutsu_kernel`'s `kj::env_snapshot::free_variable_values` computes at
+/// ask time. `value` is `None` when the variable was unset then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewAskEnv {
+    pub name: String,
+    pub value: Option<String>,
+}
+
 /// One advisory signal, ready to insert. `PartialEq` only (not `Eq`) —
 /// `score` is an `f64`.
 #[derive(Clone, Debug, PartialEq)]
@@ -442,6 +451,11 @@ pub struct NewAsk {
     /// ask cannot be executed on approval and its caller must retry —
     /// `docs/gate-shape-b.md`.
     pub exec_source: Option<String>,
+    /// The value every free variable in `statements` held at ask time —
+    /// `kj::env_snapshot::free_variable_values`'s output, ready to insert.
+    /// Empty for an ask whose statements have no free variables, or whose
+    /// origin has none to compute (`docs/gate-shape-b.md`).
+    pub env: Vec<NewAskEnv>,
 }
 
 // ============================================================================
@@ -488,6 +502,17 @@ pub struct OptionRow {
     pub option_id: String,
     pub label: String,
     pub kind: String,
+}
+
+/// One `approval_env` row: a free variable this ask's statements read, and
+/// the value it held at ask time. `value` is `None` when the variable was
+/// unset then — a row exists for every free variable name regardless, so
+/// an unset variable and no snapshot are never confused.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AskEnvRow {
+    pub seq: i64,
+    pub name: String,
+    pub value: Option<String>,
 }
 
 /// One `approval_signals` row.
