@@ -150,6 +150,11 @@ pub struct HookListener {
     max_block_size: usize,
     /// Shared session ID — updated from hook events when detected.
     session_id: Arc<Mutex<Option<String>>>,
+    /// Where the current `session_id` came from. Startup detection scrapes
+    /// the newest transcript and can name the previous session; a hook
+    /// event names the session it is really part of. See
+    /// [`should_adopt_session_id`].
+    session_id_source: Mutex<SessionIdSource>,
     /// Shared hosting-agent name — bootstrapped from hook event `source` when
     /// startup detection could not identify the MCP host.
     agent_name: Arc<Mutex<Option<String>>>,
@@ -172,6 +177,38 @@ pub struct HookListener {
     context_model_set: Mutex<bool>,
 }
 
+/// Where a listener's session id came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionIdSource {
+    /// Startup detection (a transcript scrape), or nothing yet. May name
+    /// the previous session.
+    Detected,
+    /// A hook event that carried `session_id`. Names the session this
+    /// process really serves.
+    Event,
+}
+
+/// Whether `incoming`, carried by a hook event named `event`, replaces the
+/// current session id.
+///
+/// An event-carried id outranks a detected one on any event, because
+/// `session.start` may have fired before this process had a socket. Once an
+/// event has named the session, only `session.start` renames it — a stray
+/// event routed here by the sole-responder fallback must not re-identify
+/// the process. The same id again is never an adoption.
+pub fn should_adopt_session_id(
+    current: Option<&str>,
+    source: SessionIdSource,
+    event: &str,
+    incoming: &str,
+) -> bool {
+    match current {
+        None => true,
+        Some(cur) if cur == incoming => false,
+        Some(_) => source == SessionIdSource::Detected || event == "session.start",
+    }
+}
+
 impl HookListener {
     /// Get the current context ID (from shared or local).
     fn context_id(&self) -> Option<ContextId> {
@@ -190,6 +227,7 @@ impl HookListener {
             remote: None,
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             session_id: Arc::new(Mutex::new(None)),
+            session_id_source: Mutex::new(SessionIdSource::Detected),
             agent_name: Arc::new(Mutex::new(None)),
             pending_label_base: Mutex::new(None),
             context_model_set: Mutex::new(false),
@@ -237,6 +275,7 @@ impl HookListener {
             remote: Some(remote),
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             session_id,
+            session_id_source: Mutex::new(SessionIdSource::Detected),
             agent_name,
             pending_label_base: Mutex::new(pending_label_base),
             context_model_set: Mutex::new(false),
@@ -328,16 +367,16 @@ impl HookListener {
         // matches the wrong session forever. Other events only fill a void.
         if let Some(ref event_session_id) = event.session_id
             && let Ok(mut guard) = self.session_id.lock()
+            && let Ok(mut source) = self.session_id_source.lock()
+            && should_adopt_session_id(guard.as_deref(), *source, &event.event, event_session_id)
         {
-            let stale = guard.as_deref().is_some_and(|cur| cur != event_session_id.as_str());
-            if guard.is_none() || (event.event == "session.start" && stale) {
-                tracing::info!(
-                    session_id = %event_session_id,
-                    replaced = %stale,
-                    "Captured session ID from hook event"
-                );
-                *guard = Some(event_session_id.clone());
-            }
+            tracing::info!(
+                session_id = %event_session_id,
+                replaced = ?guard.as_deref(),
+                "Captured session ID from hook event"
+            );
+            *guard = Some(event_session_id.clone());
+            *source = SessionIdSource::Event;
         }
 
         // Hook source is authoritative when startup agent detection was not
@@ -1370,6 +1409,66 @@ mod tests {
     use kaijutsu_types::DocKind;
 
     use super::*;
+
+    // -- session id adoption: an event-carried id outranks a detected one --
+
+    /// Startup detection scrapes the newest transcript, which can belong to
+    /// the PREVIOUS session; the first hook event that names a session is
+    /// the first reliable word. It must replace a detected id whatever the
+    /// event type, because `session.start` may have fired before this
+    /// process had a socket to receive it.
+    #[test]
+    fn an_event_carried_session_id_replaces_a_detected_one() {
+        assert!(should_adopt_session_id(
+            Some("b853c4f0-prev"),
+            SessionIdSource::Detected,
+            "tool.before",
+            "83768815-this",
+        ));
+        assert!(should_adopt_session_id(
+            None,
+            SessionIdSource::Detected,
+            "tool.before",
+            "83768815-this",
+        ));
+    }
+
+    /// Once an event has named the session, only `session.start` may rename
+    /// it: a stray event from another session (the sole-responder fallback
+    /// in `resolve_hook_socket`) must not re-identify this process.
+    #[test]
+    fn an_event_carried_session_id_is_kept_until_session_start() {
+        assert!(!should_adopt_session_id(
+            Some("83768815-this"),
+            SessionIdSource::Event,
+            "tool.before",
+            "other-session",
+        ));
+        assert!(should_adopt_session_id(
+            Some("83768815-this"),
+            SessionIdSource::Event,
+            "session.start",
+            "other-session",
+        ));
+    }
+
+    /// The same id again is never an adoption, whatever its source, so the
+    /// capture log line stays quiet on the steady state.
+    #[test]
+    fn the_same_session_id_is_not_adopted_again() {
+        assert!(!should_adopt_session_id(
+            Some("83768815-this"),
+            SessionIdSource::Detected,
+            "session.start",
+            "83768815-this",
+        ));
+        assert!(!should_adopt_session_id(
+            Some("83768815-this"),
+            SessionIdSource::Event,
+            "tool.before",
+            "83768815-this",
+        ));
+    }
     use crate::hook_types::ToolInfo;
 
     /// The hook must answer before Claude Code gives up. When the work
