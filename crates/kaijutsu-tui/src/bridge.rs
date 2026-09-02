@@ -292,6 +292,18 @@ impl KernelBridge {
             .await
             .context("execute addressed kj command")
     }
+
+    /// The context's authoritative, loadout-filtered `kj` command surface —
+    /// what `completion.rs`'s slash completion offers.
+    pub async fn kj_command_catalog(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Vec<kaijutsu_client::rpc::KjCommandInfo>> {
+        self.actor
+            .get_kj_command_catalog(context_id)
+            .await
+            .context("get kj command catalog")
+    }
 }
 
 /// Attaching is never a resurrection act. Keep this immediately before

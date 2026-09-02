@@ -1,7 +1,717 @@
 //! Asks and the ledger view (`Ctrl+A l`) — an ask rendered in the viewport
 //! and answered through `kj ledger allow|deny`.
 //!
-//! Not built. The skeleton counts pending asks
-//! (`kaijutsu_client::ledger::poll_new_asks`) and shows the count in the
-//! status line; nothing here answers one.
+//! Pure: every render fn takes rows and a width and returns `Line`s, and
+//! every key fn takes a `KeyEvent` and returns an action — no RPC, no I/O, no
+//! clock. The kernel round trip (`kj ledger list`/`show`/`allow`/`deny`) is
+//! [`kaijutsu_client::ledger`]; wiring these two together is [`crate::run`].
 //! Spec: `docs/tui.md`, "Asks" and "The ledger (`Ctrl+A l`, proposed chord)".
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::text::{Line, Span};
+
+use crate::present::Palette;
+
+/// What a decided ask's own key answers, on the ask card and on a selected
+/// ledger row alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskDecision {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+    ViewLedger,
+}
+
+/// `a`/`A`/`d`/`v` on a live ask card (`docs/tui.md`'s Asks figure). `None`
+/// for anything else, including a key-release event — a card key is never
+/// swallowed by acting on both edges of one press.
+pub fn ask_key_to_decision(key: KeyEvent) -> Option<AskDecision> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('a') => Some(AskDecision::AllowOnce),
+        KeyCode::Char('A') => Some(AskDecision::AllowAlways),
+        KeyCode::Char('d') => Some(AskDecision::Deny),
+        KeyCode::Char('v') => Some(AskDecision::ViewLedger),
+        _ => None,
+    }
+}
+
+/// One ask, resolved to what the card needs to render — the fields
+/// [`crate::app::App`] already has to hand (context label/type from
+/// `ContextInfo`, the rest from [`kaijutsu_client::AskDetail`]).
+pub struct AskCard<'a> {
+    pub request_id: &'a str,
+    /// The ledger `tool` column, e.g. `"shell_write"` — `docs/tui.md` calls
+    /// this the ask's "hook" in the figure; the field it reads is `tool`.
+    pub hook: &'a str,
+    pub context_label: &'a str,
+    pub context_type: &'a str,
+    pub statement: &'a str,
+}
+
+/// `⚠ ask <id>  <hook>  from <context> (<type>)`, the statement flush-left,
+/// then the key line — `docs/tui.md`'s Asks figure, verbatim.
+pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "⚠ ask {}  {}  from {} ({})",
+            card.request_id, card.hook, card.context_label, card.context_type
+        ),
+        palette.warning(),
+    )));
+    for row in wrap_plain(card.statement, width.saturating_sub(2)) {
+        lines.push(Line::from(Span::styled(format!("  {row}"), palette.status())));
+    }
+    lines.push(Line::from(Span::styled(
+        "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger".to_string(),
+        palette.divider(),
+    )));
+    lines
+}
+
+/// One row of the ledger view's PENDING section.
+pub struct PendingRow {
+    pub request_id: String,
+    /// Formatted age (`format_age` in `status.rs`'s convention), or `None`
+    /// when unknown — `created_at` is not on `kj ledger show`'s `.data` yet
+    /// ([`kaijutsu_client::AskDetail`]'s doc names the gap).
+    pub age: Option<String>,
+    pub context_label: String,
+    pub context_type: String,
+    pub hook: String,
+    pub statement: String,
+}
+
+/// One row of the ledger view's ANSWERED section.
+pub struct AnsweredRow {
+    pub request_id: String,
+    /// Formatted decision time, or `None` — `decided_at` is not on the wire
+    /// yet, same gap as [`PendingRow::age`].
+    pub time: Option<String>,
+    pub context_label: String,
+    /// `"allow once"`, `"allow always"`, `"deny"` — or `None` when the wire
+    /// carried only `status` (`allowed`/`denied`) and not `decided_option`.
+    pub decision: Option<String>,
+    /// Who decided it — `decided_by` is not on the wire yet.
+    pub principal: Option<String>,
+    /// `redeemed <time>` / `redeemed ×N` / `—`, pre-formatted by the caller
+    /// because a rule's redeem count is a different query than the ask's own
+    /// `redeemed_at` and this module has no opinion on which a caller used.
+    pub redeemed: RedeemedMark,
+    pub statement: String,
+}
+
+/// How an answered row's redemption renders — `docs/tui.md`'s "was this
+/// consumed" column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedeemedMark {
+    /// This exact ask's decision was never redeemed.
+    Never,
+    /// This exact ask's decision was redeemed once, at this wallclock.
+    At(String),
+    /// A standing rule born from this decision has been redeemed this many
+    /// times (`allow always`'s `×3`).
+    Count(u64),
+}
+
+impl RedeemedMark {
+    fn text(&self) -> String {
+        match self {
+            Self::Never => "—".to_string(),
+            Self::At(when) => format!("redeemed {when}"),
+            Self::Count(n) => format!("redeemed ×{n}"),
+        }
+    }
+}
+
+/// A pending or answered row, addressed by the ledger view's cursor
+/// (`j`/`k`) — the request id is enough to route `Enter`/`a`/`A`/`d` back to
+/// the right `kj ledger` call.
+pub enum LedgerRow {
+    Pending(PendingRow),
+    Answered(AnsweredRow),
+}
+
+impl LedgerRow {
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Pending(r) => &r.request_id,
+            Self::Answered(r) => &r.request_id,
+        }
+    }
+
+    /// Substring match across every column a filter might target — the id,
+    /// context, hook (pending only) and statement.
+    fn matches(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        let needle = needle.to_ascii_lowercase();
+        let hay = match self {
+            Self::Pending(r) => format!(
+                "{} {} {} {}",
+                r.request_id, r.context_label, r.hook, r.statement
+            ),
+            Self::Answered(r) => format!(
+                "{} {} {}",
+                r.request_id, r.context_label, r.statement
+            ),
+        };
+        hay.to_ascii_lowercase().contains(&needle)
+    }
+}
+
+/// Every row a filter admits, PENDING first then ANSWERED, in the order the
+/// caller supplied within each section — [`list_pending`]/[`list_history`]'s
+/// own ordering (`kaijutsu_client::ledger`), not re-sorted here.
+///
+/// [`list_pending`]: kaijutsu_client::list_pending
+/// [`list_history`]: kaijutsu_client::list_history
+pub fn filtered_rows<'a>(rows: &'a [LedgerRow], filter: &str) -> Vec<&'a LedgerRow> {
+    rows.iter().filter(|r| r.matches(filter)).collect()
+}
+
+/// `LEDGER                          pending 2   answered 7` down through the
+/// PENDING and ANSWERED sections and the key line — `docs/tui.md`'s ledger
+/// figure. `answered {N}` stands in for the figure's `answered today {N}`
+/// until `decided_at` reaches the wire (needed to scope "today";
+/// [`kaijutsu_client::AskDetail`]'s doc names the gap) — every answered row
+/// this call is handed counts, not just today's.
+pub fn render_ledger(
+    rows: &[LedgerRow],
+    filter: &str,
+    selected: usize,
+    width: u16,
+    palette: &Palette,
+) -> Vec<Line<'static>> {
+    let width_usize = usize::from(width.max(1));
+    let pending_total = rows.iter().filter(|r| matches!(r, LedgerRow::Pending(_))).count();
+    let answered_total = rows.len() - pending_total;
+    let visible = filtered_rows(rows, filter);
+
+    let mut lines = Vec::new();
+    let header_right = format!("pending {pending_total}   answered {answered_total}");
+    let header_left = "LEDGER".to_string();
+    let pad = width_usize.saturating_sub(header_left.chars().count() + header_right.chars().count());
+    lines.push(Line::from(Span::styled(
+        format!("{header_left}{}{header_right}", " ".repeat(pad.max(1))),
+        palette.status(),
+    )));
+
+    let mut section: Option<bool> = None; // Some(true) = pending, Some(false) = answered
+    for (idx, row) in visible.iter().enumerate() {
+        let is_pending = matches!(row, LedgerRow::Pending(_));
+        if section != Some(is_pending) {
+            section = Some(is_pending);
+            lines.push(Line::from(Span::styled(
+                if is_pending { "PENDING" } else { "ANSWERED" }.to_string(),
+                palette.divider(),
+            )));
+        }
+        let text = match row {
+            LedgerRow::Pending(r) => format!(
+                "! {:<36} {:>6}  {:<12} {:<10} {:<14} {}",
+                r.request_id,
+                r.age.as_deref().unwrap_or("—"),
+                clip(&r.context_label, 12),
+                clip(&r.context_type, 10),
+                clip(&r.hook, 14),
+                r.statement,
+            ),
+            LedgerRow::Answered(r) => format!(
+                "  {:<36} {:>6}  {:<12} {:<14} {:<8} {:<16} {}",
+                r.request_id,
+                r.time.as_deref().unwrap_or("—"),
+                clip(&r.context_label, 12),
+                clip(r.decision.as_deref().unwrap_or("—"), 14),
+                clip(r.principal.as_deref().unwrap_or("—"), 8),
+                r.redeemed.text(),
+                r.statement,
+            ),
+        };
+        let style = if idx == selected { palette.warning() } else { palette.status() };
+        lines.push(Line::from(Span::styled(truncate_plain(&text, width_usize), style)));
+    }
+    if visible.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if filter.is_empty() {
+                "(nothing pending or answered)".to_string()
+            } else {
+                format!("(nothing matches {filter:?})")
+            },
+            palette.divider(),
+        )));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "a allow once  A allow always  d deny  Enter show  j/k move  / filter  Esc back".to_string(),
+        palette.divider(),
+    )));
+    lines
+}
+
+/// What one key does inside the ledger view (`Ctrl+A l`). Mode-dependent:
+/// while `filtering`, every printable key edits the filter text instead of
+/// answering a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerAction {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+    Show,
+    Up,
+    Down,
+    StartFilter,
+    FilterInsert(char),
+    FilterBackspace,
+    CommitFilter,
+    CancelFilter,
+    Back,
+    Ignored,
+}
+
+/// Interpret one key inside the ledger view. `docs/tui.md`'s ledger key
+/// line, plus `/` to enter filter-typing mode and `Esc`/`Enter` to leave it.
+pub fn ledger_key_to_action(key: KeyEvent, filtering: bool) -> LedgerAction {
+    if key.kind == KeyEventKind::Release {
+        return LedgerAction::Ignored;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if filtering {
+        return match key.code {
+            KeyCode::Esc => LedgerAction::CancelFilter,
+            KeyCode::Enter => LedgerAction::CommitFilter,
+            KeyCode::Backspace => LedgerAction::FilterBackspace,
+            KeyCode::Char(c) if !ctrl => LedgerAction::FilterInsert(c),
+            _ => LedgerAction::Ignored,
+        };
+    }
+    match key.code {
+        KeyCode::Char('a') => LedgerAction::AllowOnce,
+        KeyCode::Char('A') => LedgerAction::AllowAlways,
+        KeyCode::Char('d') => LedgerAction::Deny,
+        KeyCode::Enter => LedgerAction::Show,
+        KeyCode::Char('j') | KeyCode::Down => LedgerAction::Down,
+        KeyCode::Char('k') | KeyCode::Up => LedgerAction::Up,
+        KeyCode::Char('/') => LedgerAction::StartFilter,
+        KeyCode::Esc => LedgerAction::Back,
+        _ => LedgerAction::Ignored,
+    }
+}
+
+/// One ask shown in full (`Enter` on a ledger row, or the ask card's
+/// `[v]iew ledger` having answered nothing yet): every field
+/// [`kaijutsu_client::AskDetail`] carries, laid out one per line, including
+/// the env snapshot an approval runs with.
+pub fn render_ask_detail(detail: &AskDetailView<'_>, width: u16, palette: &Palette) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut lines = vec![
+        Line::from(Span::styled(format!("ask:        {}", detail.request_id), palette.status())),
+        Line::from(Span::styled(format!("status:     {}", detail.status), palette.status())),
+        Line::from(Span::styled(format!("origin:     {}", detail.origin), palette.status())),
+        Line::from(Span::styled(
+            format!("context:    {} ({})", detail.context_label, detail.context_type),
+            palette.status(),
+        )),
+    ];
+    if let Some(hook) = detail.hook {
+        lines.push(Line::from(Span::styled(format!("hook:       {hook}"), palette.status())));
+    }
+    for statement in detail.statements {
+        for row in wrap_plain(statement, width.saturating_sub(12)) {
+            lines.push(Line::from(Span::styled(format!("statement:  {row}"), palette.status())));
+        }
+    }
+    if let Some(source) = detail.exec_source {
+        lines.push(Line::from(Span::styled(format!("exec_source: {source}"), palette.status())));
+    }
+    if let Some(cwd) = detail.cwd {
+        lines.push(Line::from(Span::styled(format!("cwd:        {cwd}"), palette.status())));
+    }
+    for (name, value) in detail.env {
+        let text = match value {
+            Some(v) => format!("env:        {name}={v}"),
+            None => format!("env:        {name} unset"),
+        };
+        lines.push(Line::from(Span::styled(text, palette.divider())));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("redeemed:   {}", detail.redeemed.text()),
+        palette.status(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "a allow once  A allow always  d deny  Esc back".to_string(),
+        palette.divider(),
+    )));
+    lines
+}
+
+/// What [`render_ask_detail`] needs, resolved by the caller from
+/// [`kaijutsu_client::AskDetail`] plus the context label/type
+/// [`crate::app::App`] already has.
+pub struct AskDetailView<'a> {
+    pub request_id: &'a str,
+    pub status: &'a str,
+    pub origin: &'a str,
+    pub hook: Option<&'a str>,
+    pub context_label: &'a str,
+    pub context_type: &'a str,
+    pub statements: &'a [String],
+    pub exec_source: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub env: &'a [(String, Option<String>)],
+    pub redeemed: RedeemedMark,
+}
+
+/// Cut a string to fit a column, marking the cut with `…`.
+fn clip(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_string()
+    } else if width == 0 {
+        String::new()
+    } else {
+        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Cut a whole line to `width` columns, marking the cut with `…` — the
+/// table-row analogue of [`clip`], applied after a row's columns are already
+/// joined.
+fn truncate_plain(s: &str, width: usize) -> String {
+    clip(s, width)
+}
+
+/// Greedy word wrap over plain text, one style throughout — the asks/ledger
+/// surfaces render flush-left text, never a model's markdown
+/// (`docs/tui.md`, "Surfaces"), so this needs none of `present.rs`'s
+/// per-span wrap machinery.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    for source_line in text.lines() {
+        if source_line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in source_line.split(' ') {
+            if cur.is_empty() {
+                cur.push_str(word);
+            } else if cur.chars().count() + 1 + word.chars().count() <= width {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur.push_str(word);
+            }
+        }
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// The ask card's live state: which ask is showing, and its full detail
+/// (`kj ledger show`) once fetched — [`crate::run`] opens one when a new
+/// ask arrives for the context on screen, and closes it once answered.
+pub struct AskCardState {
+    pub request_id: String,
+    pub context_id: kaijutsu_types::ContextId,
+    pub detail: kaijutsu_client::AskDetail,
+}
+
+/// The ledger view's live state (`Ctrl+A l`): every row, the cursor, and
+/// whether `/` has put it into filter-typing mode.
+#[derive(Default)]
+pub struct LedgerViewState {
+    pub rows: Vec<LedgerRow>,
+    pub filter: String,
+    pub selected: usize,
+    pub filtering: bool,
+}
+
+impl LedgerViewState {
+    /// How many rows the current filter admits — [`Self::selected`]'s valid
+    /// range.
+    pub fn visible_len(&self) -> usize {
+        filtered_rows(&self.rows, &self.filter).len()
+    }
+
+    /// The request id `j`/`k`'s cursor is on, or `None` when the filter
+    /// admits nothing.
+    pub fn selected_request_id(&self) -> Option<String> {
+        filtered_rows(&self.rows, &self.filter)
+            .get(self.selected)
+            .map(|r| r.request_id().to_string())
+    }
+
+    pub fn move_down(&mut self) {
+        let len = self.visible_len();
+        if len > 0 {
+            self.selected = (self.selected + 1).min(len - 1);
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+}
+
+/// A context's label/type, defaulting to its short id and `"default"` when
+/// [`crate::app::App`] has no [`kaijutsu_client::ContextInfo`] for it (an
+/// ask can outlive the context it named — `docs/gate-shape-b.md`, "Archived
+/// contexts are inert").
+pub fn context_facts(app: &crate::app::App, ctx: kaijutsu_types::ContextId) -> (String, String) {
+    match app.info(ctx) {
+        Some(info) => (
+            if info.label.is_empty() { ctx.short() } else { info.label.clone() },
+            info.context_type.clone(),
+        ),
+        None => (ctx.short(), "default".to_string()),
+    }
+}
+
+/// The grown-view content that replaces the live region's block stream when
+/// an ask card or the ledger view is open (`docs/tui.md`'s "grows the
+/// viewport" treatment). Budget-truncated to the current fixed viewport
+/// height rather than actually resizing the terminal: `ratatui`'s
+/// `Viewport::Inline` height is fixed at `Terminal::with_options` and has no
+/// public setter in 0.30 (`ratatui-core::terminal::resize`), so growing the
+/// real viewport needs a terminal-recreation mechanism this pass does not
+/// build — a follow-up shared with whichever lane owns the picker, which
+/// wants the same growth.
+pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'static>>> {
+    if let Some(card) = &app.ask_card {
+        let (context_label, context_type) = context_facts(app, card.context_id);
+        let statement = card
+            .detail
+            .statements
+            .first()
+            .map(String::as_str)
+            .unwrap_or(card.detail.description.as_str());
+        let view = AskCard {
+            request_id: &card.request_id,
+            hook: card.detail.tool.as_deref().unwrap_or("-"),
+            context_label: &context_label,
+            context_type: &context_type,
+            statement,
+        };
+        return Some(render_ask_card(&view, width, &app.palette));
+    }
+    if let Some(view) = &app.ledger_view {
+        return Some(render_ledger(&view.rows, &view.filter, view.selected, width, &app.palette));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn ask_keys_map_to_decisions() {
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('a'))), Some(AskDecision::AllowOnce));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('A'))), Some(AskDecision::AllowAlways));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('d'))), Some(AskDecision::Deny));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('v'))), Some(AskDecision::ViewLedger));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('x'))), None);
+    }
+
+    #[test]
+    fn a_ctrl_chord_is_never_an_ask_decision() {
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(ask_key_to_decision(ctrl_a), None);
+    }
+
+    #[test]
+    fn the_ask_card_renders_the_figures_shape() {
+        let card = AskCard {
+            request_id: "01a04eb6",
+            hook: "shell_write",
+            context_label: "kaijutsu",
+            context_type: "coder",
+            statement: "rm -rf ~/src/wt/kaish-arith",
+        };
+        let lines = render_ask_card(&card, 80, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(text[0], "⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)");
+        assert_eq!(text[1], "  rm -rf ~/src/wt/kaish-arith");
+        assert_eq!(text[2], "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger");
+    }
+
+    #[test]
+    fn a_long_statement_wraps_under_the_ask_card_header() {
+        let card = AskCard {
+            request_id: "id",
+            hook: "shell_write",
+            context_label: "kaijutsu",
+            context_type: "coder",
+            statement: "one two three four five six seven eight nine ten",
+        };
+        let lines = render_ask_card(&card, 24, &Palette::builtin());
+        // Header, N wrapped statement lines, key line.
+        assert!(lines.len() > 3, "expected the statement to wrap: {lines:?}");
+    }
+
+    fn pending(id: &str, ctx: &str) -> LedgerRow {
+        LedgerRow::Pending(PendingRow {
+            request_id: id.to_string(),
+            age: Some("12s".to_string()),
+            context_label: ctx.to_string(),
+            context_type: "coder".to_string(),
+            hook: "shell_write".to_string(),
+            statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
+        })
+    }
+
+    fn answered(id: &str, ctx: &str, redeemed: RedeemedMark) -> LedgerRow {
+        LedgerRow::Answered(AnsweredRow {
+            request_id: id.to_string(),
+            time: Some("13:58".to_string()),
+            context_label: ctx.to_string(),
+            decision: Some("allow once".to_string()),
+            principal: Some("amy".to_string()),
+            redeemed,
+            statement: "git worktree remove …".to_string(),
+        })
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_ledger_view_carries_both_sections_and_the_key_line() {
+        let rows = vec![
+            pending("p1", "kaijutsu"),
+            pending("p2", "lfm2d"),
+            answered("a1", "kaijutsu", RedeemedMark::At("13:58".to_string())),
+        ];
+        let lines = render_ledger(&rows, "", 0, 100, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text[0].starts_with("LEDGER"), "got {text:?}");
+        assert!(text[0].contains("pending 2"), "got {text:?}");
+        assert!(text[0].contains("answered 1"), "got {text:?}");
+        assert!(text.iter().any(|l| l == "PENDING"));
+        assert!(text.iter().any(|l| l == "ANSWERED"));
+        assert!(text.iter().any(|l| l.contains("p1") && l.contains("shell_write")));
+        assert!(text.iter().any(|l| l.contains("a1") && l.contains("redeemed 13:58")));
+        assert_eq!(text.last().unwrap(), "a allow once  A allow always  d deny  Enter show  j/k move  / filter  Esc back");
+    }
+
+    #[test]
+    fn a_redeem_count_renders_as_a_multiplier() {
+        let rows = vec![answered("a1", "kaish", RedeemedMark::Count(3))];
+        let lines = render_ledger(&rows, "", 0, 100, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|l| l.contains("redeemed ×3")), "got {text:?}");
+    }
+
+    #[test]
+    fn never_redeemed_renders_as_a_dash() {
+        let rows = vec![answered("a1", "kaish", RedeemedMark::Never)];
+        let lines = render_ledger(&rows, "", 0, 100, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|l| l.trim_end().ends_with('—') || l.contains(" —  ")), "got {text:?}");
+    }
+
+    #[test]
+    fn a_filter_narrows_both_sections() {
+        let rows = vec![pending("p1", "kaijutsu"), pending("p2", "lfm2d")];
+        let visible = filtered_rows(&rows, "lfm2d");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].request_id(), "p2");
+    }
+
+    #[test]
+    fn an_empty_filter_admits_everything() {
+        let rows = vec![pending("p1", "kaijutsu"), pending("p2", "lfm2d")];
+        assert_eq!(filtered_rows(&rows, "").len(), 2);
+    }
+
+    #[test]
+    fn a_filter_with_no_match_says_so() {
+        let rows = vec![pending("p1", "kaijutsu")];
+        let lines = render_ledger(&rows, "nope", 0, 100, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|l| l.contains("nothing matches")), "got {text:?}");
+    }
+
+    #[test]
+    fn ledger_keys_answer_a_selected_row() {
+        assert_eq!(ledger_key_to_action(press(KeyCode::Char('a')), false), LedgerAction::AllowOnce);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Char('A')), false), LedgerAction::AllowAlways);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Char('d')), false), LedgerAction::Deny);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Enter), false), LedgerAction::Show);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Char('j')), false), LedgerAction::Down);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Char('k')), false), LedgerAction::Up);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Esc), false), LedgerAction::Back);
+    }
+
+    #[test]
+    fn slash_enters_filter_mode_and_typed_chars_edit_it_not_answer_a_row() {
+        assert_eq!(ledger_key_to_action(press(KeyCode::Char('/')), false), LedgerAction::StartFilter);
+        assert_eq!(
+            ledger_key_to_action(press(KeyCode::Char('a')), true),
+            LedgerAction::FilterInsert('a'),
+            "while filtering, 'a' types into the filter, it does not allow a row"
+        );
+        assert_eq!(ledger_key_to_action(press(KeyCode::Backspace), true), LedgerAction::FilterBackspace);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Enter), true), LedgerAction::CommitFilter);
+        assert_eq!(ledger_key_to_action(press(KeyCode::Esc), true), LedgerAction::CancelFilter);
+    }
+
+    #[test]
+    fn the_ask_detail_view_shows_the_env_snapshot() {
+        let env = vec![
+            ("TARGET".to_string(), Some("kaish-arith".to_string())),
+            ("FORCE".to_string(), None),
+        ];
+        let detail = AskDetailView {
+            request_id: "01a04eb6",
+            status: "pending",
+            origin: "shell_gate",
+            hook: Some("shell_write"),
+            context_label: "kaijutsu",
+            context_type: "coder",
+            statements: &["rm -rf ~/src/wt/kaish-arith".to_string()],
+            exec_source: Some("kaish"),
+            cwd: Some("/home/amy/src/wt/kaish-arith"),
+            env: &env,
+            redeemed: RedeemedMark::Never,
+        };
+        let lines = render_ask_detail(&detail, 100, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|l| l.contains("cwd:") && l.contains("kaish-arith")));
+        assert!(text.iter().any(|l| l == "env:        TARGET=kaish-arith"));
+        assert!(text.iter().any(|l| l == "env:        FORCE unset"));
+        assert!(text.iter().any(|l| l.contains("redeemed:   —")));
+    }
+
+    #[test]
+    fn wrap_plain_breaks_at_the_last_space_that_fits() {
+        assert_eq!(
+            wrap_plain("one two three", 7),
+            vec!["one two".to_string(), "three".to_string()]
+        );
+    }
+}

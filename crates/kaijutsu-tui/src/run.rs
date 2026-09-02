@@ -20,8 +20,10 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use crate::app::{App, ContextView};
+use crate::asks;
 use crate::bridge::KernelBridge;
 use crate::compose::Compose;
+use crate::completion;
 use crate::keys::{Intent, Keys};
 use crate::render;
 use crate::shell::{CtrlZ, ShellAction};
@@ -80,6 +82,10 @@ pub async fn run(
 ) -> Result<()> {
     let mut app = App::new(identity);
     app.set_contexts(bridge.list_contexts().await?);
+    // Best-effort: a kernel that cannot answer this yet just means slash
+    // completion offers nothing until a later poll fills it in, never a
+    // failure to start.
+    app.kj_catalog = bridge.kj_command_catalog(start.id).await.unwrap_or_default();
 
     // Subscribed before the first hydrate, not inside the loop: the actor's
     // kernel-wide event bus drops an event it has no receiver for, and the
@@ -274,7 +280,16 @@ async fn event_loop(
                     {
                         for ask in &new_asks {
                             seen_asks.insert(ask.request_id.clone());
+                            app.note_ask(ask.request_id.clone(), ask.info.context_id);
+                            // Auto-show only the current context's own ask,
+                            // never a modal for a seat you are not looking
+                            // at (`docs/tui.md`, "Asks") — those surface as
+                            // the seat's `!` and the status line's `!n`.
+                            if app.ask_card.is_none() && app.current == Some(ask.info.context_id) {
+                                open_ask_card(bridge, app, &ask.request_id, ask.info.context_id).await;
+                            }
                         }
+                        app.forget_asks_not_pending(&seen_asks);
                         app.pending_asks = seen_asks.len();
                     }
                 }
@@ -373,6 +388,21 @@ async fn act(
         act_alternate(bridge, app, key).await?;
         return Ok(Acted::Continue);
     }
+    // The ask card and the ledger view capture every key while open — their
+    // own a/A/d/v/j/k/Esc keys are never compose text or a `Ctrl+A` chord
+    // (`docs/tui.md`, "Asks" / "The ledger").
+    if app.ask_card.is_some() {
+        if let Some(decision) = asks::ask_key_to_decision(key) {
+            let card = app.ask_card.take().expect("checked Some above");
+            handle_ask_decision(bridge, app, card, decision).await;
+        }
+        return Ok(Acted::Continue);
+    }
+    if app.ledger_view.is_some() {
+        handle_ledger_key(bridge, app, key).await;
+        return Ok(Acted::Continue);
+    }
+
     match keys.interpret(key) {
         Intent::Ignored | Intent::LegendChanged => {}
         Intent::Interrupt => {
@@ -430,6 +460,19 @@ async fn act(
             None => app.note("no diff block in this context"),
         },
         Intent::NotYet(message) => app.note(message),
+        Intent::OpenLedger => open_ledger(bridge, app).await,
+        Intent::Tab => {
+            if !app.shell.active && app.compose.text().starts_with('/') {
+                apply_tab_completion(bridge, app).await;
+            } else {
+                let tab = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab);
+                if app.shell.active {
+                    shell_key(bridge, app, tab).await?;
+                } else {
+                    compose_key(bridge, app, tab).await?;
+                }
+            }
+        }
     }
     Ok(Acted::Continue)
 }
@@ -540,6 +583,214 @@ fn raise_stop() {
 #[cfg(not(unix))]
 fn raise_stop() {
     tracing::warn!("suspend is a unix gesture; nothing to raise here");
+}
+
+/// `Tab` on a `/`-prefixed draft: recompute candidates for the current
+/// draft, cycling the selection when it's the same prefix as last time
+/// (repeated `Tab` walks the list, the way a shell's does), and write the
+/// selected candidate straight into the compose line.
+async fn apply_tab_completion(bridge: &KernelBridge, app: &mut App) {
+    let Some(ctx) = app.current else {
+        app.note("no context attached");
+        return;
+    };
+    let draft = app.compose.text();
+    let fresh = completion::complete(&draft, &app.kj_catalog);
+    app.completion = match (app.completion.take(), fresh) {
+        (Some(mut prev), Some(next)) if prev.prefix == next.prefix => {
+            prev.cycle();
+            Some(prev)
+        }
+        (_, next) => next,
+    };
+    let Some(candidate) = app.completion.as_ref().and_then(|c| c.current()) else {
+        return;
+    };
+    let takes_input = !app
+        .kj_catalog
+        .iter()
+        .find(|k| k.name == candidate.name)
+        .is_some_and(|k| k.input_hint.is_empty());
+    // The draft is the kernel's; the completed text goes through the same
+    // edit path a keystroke takes, then the local buffer reconciles to it.
+    let accepted = completion::accept(&candidate.name, !takes_input);
+    let old_len = draft.chars().count() as u64;
+    match bridge.edit_input(ctx, 0, &accepted, old_len).await {
+        Ok(version) => {
+            app.compose.record_ack(version);
+            app.compose.reconcile(&accepted, version);
+        }
+        Err(e) => app.note(format!("draft edit failed: {e}")),
+    }
+}
+
+/// Open the ledger view (`Ctrl+A l`): every pending and answered ask for the
+/// kernel, resolved to full detail. `kj ledger list`/`list --history` name
+/// the ids; `kj ledger show` is one round trip per id — acceptable at the
+/// default `--limit` (20 pending + 20 history) and no worse than the
+/// kernel's own listing commands already accept
+/// (`kaijutsu-kernel/src/kj/ledger.rs`, `truncation_notice`).
+async fn open_ledger(bridge: &KernelBridge, app: &mut App) {
+    let Some(ctx) = app.current else {
+        app.note("no context attached");
+        return;
+    };
+    let pending_ids = kaijutsu_client::list_pending(bridge.actor(), ctx).await.unwrap_or_default();
+    let history_ids = kaijutsu_client::list_history(bridge.actor(), ctx).await.unwrap_or_default();
+
+    let mut rows = Vec::with_capacity(pending_ids.len() + history_ids.len());
+    for id in pending_ids {
+        if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
+            rows.push(asks::LedgerRow::Pending(pending_row(app, &detail)));
+        }
+    }
+    for id in history_ids {
+        if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
+            rows.push(asks::LedgerRow::Answered(answered_row(app, &detail)));
+        }
+    }
+    app.ledger_view = Some(asks::LedgerViewState { rows, filter: String::new(), selected: 0, filtering: false });
+}
+
+/// One `AskDetail` as the ledger view's PENDING row.
+fn pending_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::PendingRow {
+    let (context_label, context_type) = detail
+        .context_id
+        .map(|ctx| asks::context_facts(app, ctx))
+        .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
+    asks::PendingRow {
+        request_id: detail.request_id.clone(),
+        // `created_at` is not on `kj ledger show`'s `.data` yet
+        // (`kaijutsu_client::AskDetail`'s doc names the gap).
+        age: None,
+        context_label,
+        context_type,
+        hook: detail.tool.clone().unwrap_or_else(|| "-".to_string()),
+        statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
+    }
+}
+
+/// One `AskDetail` as the ledger view's ANSWERED row. `decision`/`time`/
+/// `principal` are only as precise as the wire is today: `status` alone
+/// (`allowed`/`denied`) stands in for `decided_option`
+/// (`allow_once`/`allow_always`/`deny`), and `time`/`principal` stay `None`
+/// — `kaijutsu_client::AskDetail`'s doc names the same gap.
+fn answered_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::AnsweredRow {
+    let (context_label, _context_type) = detail
+        .context_id
+        .map(|ctx| asks::context_facts(app, ctx))
+        .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
+    let redeemed = match detail.redeemed_at {
+        Some(at) => asks::RedeemedMark::At(render::wallclock(at as u64)),
+        None => asks::RedeemedMark::Never,
+    };
+    asks::AnsweredRow {
+        request_id: detail.request_id.clone(),
+        time: None,
+        context_label,
+        decision: Some(detail.status.clone()),
+        principal: None,
+        redeemed,
+        statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
+    }
+}
+
+/// Fetch one ask's full detail and open the ask card over it. Silent on
+/// failure — the poll loop tries again next generation bump
+/// (`ledger_events`), and a card that never opens still shows as the seat's
+/// `!` and the status line's `!n`.
+async fn open_ask_card(bridge: &KernelBridge, app: &mut App, request_id: &str, context_id: ContextId) {
+    if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), context_id, request_id).await {
+        app.ask_card = Some(asks::AskCardState {
+            request_id: request_id.to_string(),
+            context_id,
+            detail,
+        });
+    }
+}
+
+/// Answer the ask card's own ask, then close it.
+async fn handle_ask_decision(
+    bridge: &KernelBridge,
+    app: &mut App,
+    card: asks::AskCardState,
+    decision: asks::AskDecision,
+) {
+    if matches!(decision, asks::AskDecision::ViewLedger) {
+        open_ledger(bridge, app).await;
+        return;
+    }
+    let allow = !matches!(decision, asks::AskDecision::Deny);
+    let remember = matches!(decision, asks::AskDecision::AllowAlways)
+        .then_some(kaijutsu_client::RememberScope::Always);
+    report_decision(
+        app,
+        &card.request_id,
+        allow,
+        kaijutsu_client::decide_ask_remember(bridge.actor(), card.context_id, &card.request_id, allow, remember)
+            .await,
+    );
+}
+
+/// One key inside the ledger view: navigate, filter, show, or answer the
+/// selected row. Closes the view after any decision — the next
+/// `ledger_events` generation bump refreshes the seat flags and the pending
+/// count; re-fetching and re-selecting inline is a follow-up, not this
+/// pass's scope.
+async fn handle_ledger_key(bridge: &KernelBridge, app: &mut App, key: crossterm::event::KeyEvent) {
+    let Some(view) = app.ledger_view.as_mut() else { return };
+    let filtering = view.filtering;
+    match asks::ledger_key_to_action(key, filtering) {
+        asks::LedgerAction::Back => app.ledger_view = None,
+        asks::LedgerAction::Up => view.move_up(),
+        asks::LedgerAction::Down => view.move_down(),
+        asks::LedgerAction::StartFilter => view.filtering = true,
+        asks::LedgerAction::FilterInsert(c) => view.filter.push(c),
+        asks::LedgerAction::FilterBackspace => {
+            view.filter.pop();
+        }
+        asks::LedgerAction::CommitFilter | asks::LedgerAction::CancelFilter => view.filtering = false,
+        asks::LedgerAction::Show => {
+            // Full-detail render (`render_ask_detail`) needs its own grown
+            // view to host it; wiring that is a follow-up, not this pass.
+            if let Some(id) = view.selected_request_id() {
+                app.note(format!("ask {id}: full detail view not yet wired"));
+            }
+        }
+        asks::LedgerAction::AllowOnce | asks::LedgerAction::AllowAlways | asks::LedgerAction::Deny => {
+            let Some(request_id) = view.selected_request_id() else { return };
+            let Some(ctx) = app.current else { return };
+            let action = asks::ledger_key_to_action(key, filtering);
+            let allow = !matches!(action, asks::LedgerAction::Deny);
+            let remember = matches!(action, asks::LedgerAction::AllowAlways)
+                .then_some(kaijutsu_client::RememberScope::Always);
+            app.ledger_view = None;
+            report_decision(
+                app,
+                &request_id,
+                allow,
+                kaijutsu_client::decide_ask_remember(bridge.actor(), ctx, &request_id, allow, remember).await,
+            );
+        }
+        asks::LedgerAction::Ignored => {}
+    }
+}
+
+/// Post the status-line notice for one `kj ledger allow|deny` round trip —
+/// shared by the ask card and the ledger view so the two surfaces report a
+/// decision, a lost race, or a call failure the same way.
+fn report_decision(
+    app: &mut App,
+    request_id: &str,
+    allow: bool,
+    result: std::result::Result<kaijutsu_client::rpc::KjExecutionResult, kaijutsu_client::actor::CallError>,
+) {
+    let verb = if allow { "allowed" } else { "denied" };
+    match result {
+        Ok(r) if r.exit_code == 0 => app.note(format!("{verb} ask {request_id}")),
+        Ok(r) => app.note(format!("kj ledger {verb}: {}", r.stderr.trim())),
+        Err(e) => app.note(format!("kj ledger {verb}: {e}")),
+    }
 }
 
 /// Apply one feed event to its mirror, and say so when it touches a block

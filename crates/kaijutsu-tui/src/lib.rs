@@ -29,13 +29,16 @@
 //! | [`run`] | the event loop |
 //! | [`compose`] | the vi surface over the context's kernel-owned draft |
 //! | [`shell`] | the `Ctrl+Z` shell surface and the suspend gesture |
-//! | [`picker`], [`asks`] | later lanes |
+//! | [`asks`] | the ask card, the ledger view (`Ctrl+A l`) |
+//! | [`completion`] | slash completion over the `kj` command catalog |
+//! | [`picker`] | later lane |
 //! | [`editor`], [`diff`] | the two alternate-screen surfaces |
 
 pub mod app;
 pub mod asks;
 pub mod bridge;
 pub mod compose;
+pub mod completion;
 pub mod keys;
 pub mod picker;
 pub mod present;

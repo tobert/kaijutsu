@@ -105,8 +105,7 @@ pub struct App {
     pub previous: Option<ContextId>,
     pub views: HashMap<ContextId, ContextView>,
     pub connection: Option<ConnectionStatus>,
-    /// Pending asks across every context. Display only in this lane;
-    /// answering one is the asks lane (`asks.rs`).
+    /// Pending asks across every context (`asks.rs` answers them).
     pub pending_asks: usize,
     /// The compose surface — a modalkit `VimMachine` over the context's
     /// kernel-owned draft block (`compose.rs`).
@@ -128,6 +127,24 @@ pub struct App {
     /// ruling 1), and the key path early-returns on it, which is what makes
     /// the editor the sanctioned raw key reader.
     pub screen: crate::editor::ScreenMode,
+    /// Which context each pending ask belongs to
+    /// (`kaijutsu_client::AskInfo::context_id`), kept current by
+    /// [`Self::note_ask`]/[`Self::forget_asks_not_in`] from the same poll
+    /// loop that maintains `seen_asks` (`run.rs`) — what
+    /// [`Self::status_model`] reads to mark a seat `!` without re-deriving
+    /// it from the ledger on every frame.
+    pub ask_owners: HashMap<String, ContextId>,
+    /// The ask card showing in the live region, when one is — never more
+    /// than one at a time (`docs/tui.md`, "Asks": it grows the viewport, it
+    /// is not a queue of modals).
+    pub ask_card: Option<crate::asks::AskCardState>,
+    /// The ledger view (`Ctrl+A l`), when open.
+    pub ledger_view: Option<crate::asks::LedgerViewState>,
+    /// The `kj` command catalog (`get_kj_command_catalog`), fetched once at
+    /// connect and cached for slash completion (`completion.rs`).
+    pub kj_catalog: Vec<kaijutsu_client::rpc::KjCommandInfo>,
+    /// The slash-completion popup, when `Tab` has one open.
+    pub completion: Option<crate::completion::SlashCompletion>,
 }
 
 impl App {
@@ -150,6 +167,11 @@ impl App {
             notice: None,
             last_ctrl_c: None,
             screen: crate::editor::ScreenMode::Inline,
+            ask_owners: HashMap::new(),
+            ask_card: None,
+            ledger_view: None,
+            kj_catalog: Vec::new(),
+            completion: None,
         }
     }
 
@@ -347,7 +369,7 @@ impl App {
                     .views
                     .get(&seat.context_id)
                     .is_some_and(|v| v.activity),
-                ask: false,
+                ask: self.has_pending_ask(seat.context_id),
             })
             .collect();
         let info = self.current_info();
@@ -384,6 +406,28 @@ impl App {
         {
             view.collapsed.insert(*block_id, *collapsed);
         }
+    }
+
+    /// Record that an ask is pending for `context_id` — called from the
+    /// poll loop (`run.rs`) for every ask [`kaijutsu_client::poll_new_asks`]
+    /// reports.
+    pub fn note_ask(&mut self, request_id: String, context_id: ContextId) {
+        self.ask_owners.insert(request_id, context_id);
+    }
+
+    /// Drop every tracked ask whose id is not in `still_pending` — an ask
+    /// leaves `still_pending` the moment it is decided, by any answerer,
+    /// through any surface, so this is how a seat's `!` clears without this
+    /// client having answered it itself. Same contract as the ledger's own
+    /// `seen` pruning (`kaijutsu_client::ledger`'s `diff_new`).
+    pub fn forget_asks_not_pending(&mut self, still_pending: &HashSet<String>) {
+        self.ask_owners.retain(|id, _| still_pending.contains(id));
+    }
+
+    /// Whether any tracked ask belongs to `context_id` — [`SeatCell::ask`]'s
+    /// derivation.
+    pub fn has_pending_ask(&self, context_id: ContextId) -> bool {
+        self.ask_owners.values().any(|c| *c == context_id)
     }
 }
 

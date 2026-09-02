@@ -38,7 +38,10 @@ pub use context_feed::{
     context_feed_channel,
 };
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
-pub use ledger::{AskInfo, LedgerError, PendingAsk, decide_ask, list_pending, poll_new_asks, show_ask};
+pub use ledger::{
+    AskDetail, AskInfo, EnvVar, LedgerError, PendingAsk, RememberScope, decide_ask,
+    decide_ask_remember, list_history, list_pending, poll_new_asks, show_ask, show_ask_detail,
+};
 pub use rank::{RankedSeat, ranked_context_ids, ranked_seats};
 pub use sftp::{CasFetch, CasResolver, ResolveSource, SftpClient, SftpError, default_cache_dir};
 pub use share_server::{

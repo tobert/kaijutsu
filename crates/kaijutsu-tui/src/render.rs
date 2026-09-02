@@ -149,6 +149,24 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
 /// line (or the armed-prefix legend in its place).
 pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Vec<Line<'static>> {
     let palette = app.palette;
+
+    // The ask card and the ledger view replace the block stream and compose
+    // line entirely while open — `docs/tui.md`'s "grows the viewport"
+    // treatment (`asks.rs`'s doc names why this stays budget-truncated
+    // rather than a real terminal resize for now).
+    if let Some(mut lines) = crate::asks::active_view_lines(app, width) {
+        let budget = usize::from(VIEWPORT_LINES.saturating_sub(1));
+        if lines.len() > budget {
+            lines.truncate(budget);
+        }
+        lines.push(if armed {
+            legend_line(width, &palette)
+        } else {
+            status_line(&app.status_model(now_millis), width, &palette)
+        });
+        return lines;
+    }
+
     let mut lines = Vec::new();
 
     // Resolve everything the wrap needs while `app` is only borrowed
@@ -189,6 +207,16 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
     let budget = usize::from(VIEWPORT_LINES.saturating_sub(chrome));
     if lines.len() > budget {
         lines.drain(..lines.len() - budget);
+    }
+
+    // The slash-completion popup rides above the compose line, only while
+    // the draft is actually a `/` command in progress — a stale popup left
+    // over from an earlier `Tab` press does not reappear once the draft has
+    // moved past it (`completion.rs`).
+    if let Some(completion) = &app.completion
+        && app.compose.text().starts_with('/')
+    {
+        lines.extend(crate::completion::render_popup(completion, width, &palette));
     }
 
     lines.extend(input);
@@ -586,5 +614,64 @@ mod tests {
         assert!(!is_settled(&waiting), "an unanswered ask can still move");
         let done = block(id, 2, BlockKind::ToolCall, Role::Model, Status::Done, "ls");
         assert!(is_settled(&done));
+    }
+
+    /// An open ask card replaces the block stream and compose line entirely
+    /// — the status line still renders beneath it (`docs/tui.md`, "Asks").
+    #[test]
+    fn an_ask_card_replaces_the_live_region_and_keeps_the_status_line() {
+        let (mut app, id) = fixture();
+        app.ask_card = Some(crate::asks::AskCardState {
+            request_id: "01a04eb6".to_string(),
+            context_id: id,
+            detail: kaijutsu_client::AskDetail {
+                request_id: "01a04eb6".to_string(),
+                context_id: Some(id),
+                status: "pending".to_string(),
+                origin: "shell_gate".to_string(),
+                tool: Some("shell_write".to_string()),
+                hook_id: None,
+                instance: None,
+                description: "rm -rf ~/src/wt/kaish-arith".to_string(),
+                authorized_label: None,
+                statements: vec!["rm -rf ~/src/wt/kaish-arith".to_string()],
+                exec_source: None,
+                cwd: None,
+                env: Vec::new(),
+                redeemed_at: None,
+            },
+        });
+        let mut terminal = Terminal::new(TestBackend::new(96, 4)).expect("test backend builds");
+        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
+        let text = rows(&terminal);
+        assert!(text[0].contains("⚠ ask 01a04eb6"), "got {text:?}");
+        assert!(text[0].contains("shell_write"), "got {text:?}");
+        assert!(text.iter().any(|l| l.contains("rm -rf ~/src/wt/kaish-arith")), "got {text:?}");
+        assert!(text.last().unwrap().starts_with("0 kaijutsu*"), "status line still renders: {text:?}");
+    }
+
+    /// The ledger view replaces the live region the same way, both sections
+    /// visible (`docs/tui.md`, "The ledger").
+    #[test]
+    fn the_ledger_view_replaces_the_live_region() {
+        let (mut app, _id) = fixture();
+        app.ledger_view = Some(crate::asks::LedgerViewState {
+            rows: vec![crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
+                request_id: "p1".to_string(),
+                age: Some("12s".to_string()),
+                context_label: "kaijutsu".to_string(),
+                context_type: "coder".to_string(),
+                hook: "shell_write".to_string(),
+                statement: "git worktree remove --force".to_string(),
+            })],
+            filter: String::new(),
+            selected: 0,
+            filtering: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(96, 4)).expect("test backend builds");
+        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
+        let text = rows(&terminal);
+        assert!(text[0].starts_with("LEDGER"), "got {text:?}");
+        assert!(text.iter().any(|l| l.contains("p1") && l.contains("shell_write")), "got {text:?}");
     }
 }

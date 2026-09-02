@@ -41,6 +41,12 @@ pub enum Intent {
     /// about a block the context already holds (`docs/tui.md`, "Editor and
     /// diff").
     OpenDiff,
+    /// `Ctrl+A l` — open the ledger view (`docs/tui.md`, "The ledger").
+    OpenLedger,
+    /// Bare `Tab`. Only meaningful when the compose draft starts with `/`
+    /// (`crate::completion`); the caller decides that, not this module —
+    /// `Keys::interpret` has no view of the compose line.
+    Tab,
 }
 
 /// The prefix state machine.
@@ -78,7 +84,7 @@ impl Keys {
                     Intent::SwitchSeat(c as usize - '0' as usize)
                 }
                 KeyCode::Char('"') | KeyCode::Char('w') => Intent::NotYet("picker: later lane"),
-                KeyCode::Char('l') => Intent::NotYet("ledger: later lane"),
+                KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
                 KeyCode::Char('\'') | KeyCode::Char('A') | KeyCode::Char('q')
                 | KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char('d')
@@ -98,6 +104,9 @@ impl Keys {
             // Everything else belongs to the input region. Control chords go
             // too: `<C-w>` and `<C-r>` are vi keys, and the two this client
             // reserves are already claimed above.
+            // Bare `Tab` is completion when the draft is a `/` command and
+            // compose text otherwise; `run.rs` decides, this module cannot.
+            KeyCode::Tab if !ctrl => Intent::Tab,
             _ => Intent::InputKey(key),
         }
     }
@@ -186,6 +195,19 @@ mod tests {
         keys.interpret(ctrl('a'));
         assert_eq!(keys.interpret(press(KeyCode::Char('v'))), Intent::OpenDiff);
         assert!(!keys.armed());
+    }
+
+    #[test]
+    fn ctrl_a_l_opens_the_ledger() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('l'))), Intent::OpenLedger);
+    }
+
+    #[test]
+    fn bare_tab_is_never_swallowed() {
+        let mut keys = Keys::new();
+        assert_eq!(keys.interpret(press(KeyCode::Tab)), Intent::Tab);
     }
 
     #[test]
