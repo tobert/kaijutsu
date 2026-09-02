@@ -245,11 +245,28 @@ It is one column, not a claim protocol.
 
 `kj ledger allow <id>` runs it. The caller checks its own blocks.
 
-**Ruled (Amy, 2026-09-01): approval triggers execution.** An in-memory
-`ledger.changed` subscriber picks up the answer, runs the stored source, and
-fills the command and output blocks that are already sitting `Waiting` on
-that ask. There is nothing for a caller to present, so the `ask` tool
-parameter and `kj ledger redeem <id>` from the earlier sketch are both gone.
+**Ruled (Amy, 2026-09-01): approval triggers execution.** The answer runs the
+stored source and fills the command and output blocks already sitting
+`Waiting` on that ask. There is nothing for a caller to present, so the `ask`
+tool parameter and `kj ledger redeem <id>` from the earlier sketch are both
+gone.
+
+**This modifies a driver that already exists; it does not add one.**
+`spawn_gate_resume_driver` (`kaijutsu-server/src/rpc.rs`) already subscribes
+to `ledger.changed` and already finds the answers nobody has collected. What
+it does with them is WAKE the context — a seed block plus a turn request —
+so the woken turn retries the call and that retry redeems. The change is to
+run the source instead of driving a turn.
+
+**Its doc comment carries the warning to read first.** It notes that it does
+not need exactly-once and deliberately does not implement it, because "every
+hard problem it carried — exactly-once across a crash, a `claimed` row
+nobody can resolve — belonged to executing the action, and this does not
+execute anything." Executing is exactly what the ruling asks for, so that
+sentence stops being a reason the driver is simple and becomes the list of
+things to get right. Staying in memory with nothing surviving a restart is
+what keeps it to the within-process exactly-once `approval_redemptions`
+already provides.
 
 **What changed to make this available.** `docs/gate-resume.md` gave two
 reasons this was not on the table: the environment had to be captured at ask

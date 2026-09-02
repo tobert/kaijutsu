@@ -398,17 +398,36 @@ is redeemable.*
 
 ## Still open
 
-**Ruled 2026-09-01, not yet built: approval triggers execution**
-(`docs/gate-shape-b.md`, "Slice 5: approval executes"). This section used to
-say nothing resumes an approval on its own — an answer was redeemed only on
-the caller's *next attempt*, so a model still working came back and got it,
-but a delegated coder whose turn already ended had nothing that retried and
-the approval sat until something drove that context again. Amy has now
-ruled the fix: `kj ledger allow <id>` runs the stored statement itself. An
-in-memory `ledger.changed` subscriber picks up the decision, runs it, and
-fills the command and output blocks already sitting `Waiting` on that ask —
-the caller checks its own blocks' status rather than presenting anything
-back to the kernel.
+**A `ledger.changed` driver already exists and is shipped.**
+`spawn_gate_resume_driver` (`kaijutsu-server/src/rpc.rs`) wakes each context
+holding an answer nobody has collected, by writing a seed block and
+publishing a turn request — the two steps `kj drive --prompt` takes. The
+woken turn retries the tool call, and *that* attempt is what redeems. It is
+seeded with the outstanding backlog at start (waking all of it once drove
+the kernel to 754% CPU), capped at four wakes per event, and wakes only a
+`Live` context. Denials wake too: a denied caller that is never woken keeps
+"waiting on a human" as its last word.
+
+An earlier version of this section said nothing resumes an approval on its
+own. That was true when written and stopped being true when the driver
+shipped; it was restated as still-open on 2026-09-01 and is corrected here.
+
+**Ruled 2026-09-01: approval should EXECUTE, not wake**
+(`docs/gate-shape-b.md`, "Slice 5: approval executes"). `kj ledger allow
+<id>` runs the stored source itself and fills the command and output blocks
+already sitting `Waiting` on that ask, instead of driving a turn that
+re-issues the call.
+
+**The driver's own doc comment is the caution to read first.** It says it
+does not need exactly-once and deliberately does not implement it, because
+"every hard problem it carried — exactly-once across a crash, a `claimed`
+row nobody can resolve — belonged to executing the action, and this does not
+execute anything." Waking twice costs one wasted turn; executing twice does
+not. What keeps the ruled design out of that territory is that it stays in
+memory and nothing survives a restart, so the exactly-once it needs is the
+within-process one `approval_redemptions` already gives — but the line is
+thinner here than anywhere else in this lane, and it is where to look first
+if something goes wrong.
 
 **Why this is available now, and not a return to the durable resume
 machinery this document deleted above.** That machinery — the
