@@ -203,6 +203,29 @@ pub struct StatusModel {
     /// A notice replaces the seat list until the next keystroke — the
     /// scrollback-staleness channel (`docs/tui.md`, "Conversation").
     pub notice: Option<String>,
+    /// `bar.beat` + pulse for the playing track (`docs/tui.md`, "TRACKS +
+    /// beat" / "Status line"). `None` when nothing is playing.
+    pub track: Option<TrackFigure>,
+}
+
+/// The status line's `17.3 ●` figure: bar.beat from the last `listTracks`
+/// poll, pulse from the phasor's live envelope at redraw time — the same
+/// `bar`/`beat` [`crate::picker::bar_beat`] derives, so the picker's TRACKS
+/// row and this figure never disagree about which beat a track is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackFigure {
+    pub bar: u64,
+    pub beat: u64,
+    /// Whether the phasor's envelope is over the beat threshold right now —
+    /// `●` on the beat, `○` between beats.
+    pub pulse: bool,
+}
+
+impl TrackFigure {
+    fn figure(&self) -> Figure {
+        let glyph = if self.pulse { "●" } else { "○" };
+        Figure::ok(format!("{}.{} {glyph}", self.bar, self.beat))
+    }
 }
 
 impl StatusModel {
@@ -246,6 +269,9 @@ impl StatusModel {
         });
         figures.push(self.cache.share_figure());
         figures.push(self.cache.age_figure());
+        if let Some(track) = &self.track {
+            figures.push(track.figure());
+        }
         figures.push(connection_figure(self.connection.as_ref()));
         figures
     }
@@ -499,6 +525,7 @@ mod tests {
             pending_asks: 0,
             connection: None,
             notice: None,
+            track: None,
         };
         let line = status_line(&model, 100, &palette);
         let rendered = text(&line);
@@ -587,6 +614,24 @@ mod tests {
         };
         let rendered = text(&status_line(&model, 20, &palette));
         assert_eq!(rendered, "0 kaijutsu*");
+    }
+
+    #[test]
+    fn the_track_figure_renders_bar_dot_beat_and_the_pulse_glyph() {
+        let palette = Palette::builtin();
+        let model = StatusModel {
+            track: Some(TrackFigure { bar: 17, beat: 3, pulse: true }),
+            ..Default::default()
+        };
+        let rendered = text(&status_line(&model, 40, &palette));
+        assert!(rendered.contains("17.3 ●"), "got {rendered:?}");
+    }
+
+    #[test]
+    fn no_playing_track_carries_no_figure() {
+        let model = StatusModel { track: None, ..Default::default() };
+        let figures = model.right_figures();
+        assert!(figures.iter().all(|f| !f.text.contains('.')), "got {figures:?}");
     }
 
     #[test]

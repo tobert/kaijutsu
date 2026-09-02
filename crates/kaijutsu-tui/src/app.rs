@@ -145,6 +145,26 @@ pub struct App {
     pub kj_catalog: Vec<kaijutsu_client::rpc::KjCommandInfo>,
     /// The slash-completion popup, when `Tab` has one open.
     pub completion: Option<crate::completion::SlashCompletion>,
+    /// The last `listTracks` answer, refreshed on [`crate::run`]'s
+    /// [`REFRESH`](crate::run) cadence — feeds the picker's TRACKS section
+    /// and the status line's `bar.beat` figure (`docs/tui.md`, "TRACKS +
+    /// beat"). Kept as [`crate::picker::TrackRow`] so both readers agree
+    /// on `bar`/`beat`.
+    pub tracks: Vec<crate::picker::TrackRow>,
+    /// Per-track beat phasors, fed from `ServerEvent::BeatSync` on the
+    /// kernel-wide event stream (`docs/tui.md`, "Timing to music").
+    pub beats: kaijutsu_present::beats::WellBeats,
+    /// The picker's single-line tail buffer, fed from the same kernel-wide
+    /// stream, independent of which context is watched.
+    pub tails: crate::picker::PickerTails,
+    /// The picker, when `Ctrl+A "` has it open — `render::viewport_lines`
+    /// and `render::live_lines` both read this.
+    pub picker: Option<crate::picker::PickerModel>,
+    /// The playing track's beat envelope, sampled against `Instant::now()`
+    /// once per redraw tick in [`crate::run`] — the only place this module
+    /// reads a live clock. [`Self::track_figure`] projects it; nothing here
+    /// samples `beats` directly.
+    pub track_pulse: bool,
 }
 
 impl App {
@@ -172,6 +192,11 @@ impl App {
             ledger_view: None,
             kj_catalog: Vec::new(),
             completion: None,
+            tracks: Vec::new(),
+            beats: kaijutsu_present::beats::WellBeats::default(),
+            tails: crate::picker::PickerTails::new(),
+            picker: None,
+            track_pulse: false,
         }
     }
 
@@ -389,6 +414,7 @@ impl App {
             pending_asks: self.pending_asks,
             connection: self.connection.clone(),
             notice: self.notice.clone(),
+            track: self.track_figure(),
         }
     }
 
@@ -428,6 +454,30 @@ impl App {
     /// derivation.
     pub fn has_pending_ask(&self, context_id: ContextId) -> bool {
         self.ask_owners.values().any(|c| *c == context_id)
+    }
+
+    /// `bar.beat` + pulse for the playing track: the current context's own
+    /// attached track when it is playing, else the first playing track —
+    /// "the playing track" the status line names (`docs/tui.md`, "Status
+    /// line"). Reads [`Self::track_pulse`] rather than the phasor directly —
+    /// [`crate::run`]'s event loop is the one place that reads
+    /// `Instant::now()` against `beats`, on every redraw tick, the same way
+    /// it already stamps [`Self::connection`]; this stays a pure projection
+    /// of state already on `self`, like every other `status_model` field.
+    pub fn track_figure(&self) -> Option<crate::status::TrackFigure> {
+        let playing = self.playing_track()?;
+        Some(crate::status::TrackFigure { bar: playing.bar, beat: playing.beat, pulse: self.track_pulse })
+    }
+
+    /// "The playing track" — the current context's own attached track when
+    /// it is playing, else the first playing track in the roster. Shared by
+    /// [`Self::track_figure`] (the status line) and `run.rs`'s beat-timer
+    /// re-arm, so both name the same track.
+    pub fn playing_track(&self) -> Option<&crate::picker::TrackRow> {
+        self.current_info()
+            .and_then(|c| c.track_id.as_deref())
+            .and_then(|tid| self.tracks.iter().find(|t| t.id == tid && t.playing))
+            .or_else(|| self.tracks.iter().find(|t| t.playing))
     }
 }
 

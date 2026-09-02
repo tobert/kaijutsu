@@ -7,11 +7,12 @@
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::Event;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use kaijutsu_audio::RefDisposition;
 use kaijutsu_client::{ContextInfo, FeedEvent, ServerEvent};
 use parking_lot::Mutex;
 use kaijutsu_types::ContextId;
@@ -25,6 +26,7 @@ use crate::bridge::KernelBridge;
 use crate::compose::Compose;
 use crate::completion;
 use crate::keys::{Intent, Keys};
+use crate::picker::{self, Outcome as PickerOutcome};
 use crate::render;
 use crate::shell::{CtrlZ, ShellAction};
 
@@ -222,6 +224,12 @@ async fn event_loop(
     // The alternate screen, when one is up. `draw` owns the transition: the
     // screen mode is state on `App`, and the terminal follows it.
     let mut alt: Option<AltScreen> = None;
+    // The inline viewport's current height (`Viewport::Inline` has no public
+    // runtime resize — see `set_viewport_height`) and the beat-driven redraw
+    // wake, both `None`/base until a track is found playing.
+    let mut viewport_height = render::VIEWPORT_LINES;
+    let mut beat_wake: Option<Instant> = None;
+    let mut beat_tempo_bps: f64 = 0.0;
 
     app.connection = Some(bridge.actor().current_status());
 
@@ -231,7 +239,9 @@ async fn event_loop(
                 match event {
                     Event::Key(key) => {
                         dirty = true;
-                        if act(bridge, app, &mut keys, key, &wires.feed_tx).await? == Acted::Suspend {
+                        if app.picker.is_some() {
+                            handle_picker_key(bridge, app, key, &wires.feed_tx).await?;
+                        } else if act(bridge, app, &mut keys, key, &wires.feed_tx).await? == Acted::Suspend {
                             suspend(terminal, &wires.term_lock)?;
                         }
                     }
@@ -251,6 +261,16 @@ async fn event_loop(
                     dirty = true;
                 }
                 if observe_editor_event(bridge, app, &event).await {
+                    dirty = true;
+                }
+                // The picker's tail buffer (`docs/tui.md`, "The picker") is
+                // fed ungated, like the app's `ContextTails` — every context,
+                // not just the ones watched.
+                if app.tails.observe(&event, kaijutsu_types::now_millis()) {
+                    dirty = true;
+                }
+                if let ServerEvent::BeatSync { context_id, beat_ref } = &event {
+                    observe_beat_sync(app, *context_id, *beat_ref);
                     dirty = true;
                 }
             }
@@ -293,9 +313,30 @@ async fn event_loop(
                         app.pending_asks = seen_asks.len();
                     }
                 }
+                if let Ok(tracks) = bridge.actor().list_tracks().await {
+                    app.tracks = tracks.iter().map(picker::track_row_from).collect();
+                }
+                rearm_beat_wake(app, &mut beat_wake, &mut beat_tempo_bps);
+                dirty = true;
+            }
+            // The beat-driven redraw: armed at the playing track's predicted
+            // next onset, re-armed at `scheduled + period` inside the arm
+            // body — never `actual_wake + period` (`docs/tui.md`, "Timing to
+            // music"; `docs/midi.md`, "The one timebase"). The `if` guard
+            // skips this arm entirely while nothing is playing, so it never
+            // busy-polls a zero sleep.
+            _ = tokio::time::sleep(beat_wake.map(|t| t.saturating_duration_since(Instant::now())).unwrap_or_default()), if beat_wake.is_some() => {
+                if let Some(scheduled) = beat_wake {
+                    beat_wake = Some(picker::rearm(scheduled, beat_tempo_bps));
+                }
                 dirty = true;
             }
             _ = tick.tick() => {
+                let want = render::viewport_lines(app);
+                if want != viewport_height {
+                    set_viewport_height(&wires.term_lock, terminal, want)?;
+                    viewport_height = want;
+                }
                 if dirty {
                     dirty = false;
                     draw(terminal, &mut alt, &wires.term_lock, app, keys.armed())?;
@@ -306,6 +347,104 @@ async fn event_loop(
     if let Some(screen) = alt.take() {
         let _guard = wires.term_lock.lock();
         editor::leave(screen);
+    }
+    Ok(())
+}
+
+/// Fold one `ServerEvent::BeatSync` into `app.beats`, the same
+/// fold/touch/drop routing as the app's `time_well::live::ingest_live_events`
+/// (`docs/tui.md`, "TRACKS + beat").
+fn observe_beat_sync(app: &mut App, context_id: ContextId, beat_ref: kaijutsu_audio::BeatRef) {
+    let now_inst = Instant::now();
+    let now_epoch_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    match beat_ref.disposition(now_inst, now_epoch_ns) {
+        RefDisposition::Fold(at) => {
+            app.beats.observe(context_id, beat_ref, at, now_inst);
+        }
+        RefDisposition::Touch | RefDisposition::Drop => {
+            app.beats.touch(&context_id, now_inst);
+        }
+    }
+}
+
+/// Re-arm the beat timer from the playing track's live phasor position and
+/// its last-polled tempo. `None` while nothing is playing or its phasor
+/// hasn't anchored yet — the timer arm's `if beat_wake.is_some()` guard then
+/// simply stays off until the next refresh finds one.
+fn rearm_beat_wake(app: &App, beat_wake: &mut Option<Instant>, beat_tempo_bps: &mut f64) {
+    let Some(track) = app.playing_track() else {
+        *beat_wake = None;
+        return;
+    };
+    let now = Instant::now();
+    let Some(position) = app.beats.beat_position(&track.score_context_id, now) else {
+        *beat_wake = None;
+        return;
+    };
+    *beat_tempo_bps = track.tempo_bps();
+    *beat_wake = Some(picker::next_onset(position, *beat_tempo_bps, now));
+}
+
+/// Recreate the inline viewport at a new height. `Viewport::Inline`'s height
+/// is fixed at construction (`ratatui-core` exposes no runtime setter — see
+/// `terminal/resize.rs`'s `resize()`, which only recomputes the ORIGIN from
+/// the height already stored on `Terminal::with_options`), so a grown/shrunk
+/// view re-enters the inline viewport at the new height, anchored to the
+/// cursor's current row exactly as the first `enter_terminal` call was.
+fn set_viewport_height(
+    term_lock: &TermLock,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    height: u16,
+) -> Result<()> {
+    let _guard = term_lock.lock();
+    // A freshly constructed `Terminal` has no memory of what the OLD one
+    // painted, so it diffs against an empty buffer and never emits the
+    // blanks needed to erase what is still on screen. Blank the current
+    // viewport through the OLD terminal (which still has last frame's
+    // buffer to diff against) before swapping it out, or a shrink/regrow
+    // leaves stale rows behind.
+    terminal
+        .draw(|frame| frame.render_widget(ratatui::widgets::Clear, frame.area()))
+        .context("clear the viewport before resizing it")?;
+    let _ = terminal.flush();
+    *terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions { viewport: Viewport::Inline(height) },
+    )
+    .context("resize inline viewport")?;
+    Ok(())
+}
+
+/// Route one key to the open picker, then act on its [`PickerOutcome`].
+async fn handle_picker_key(
+    bridge: &KernelBridge,
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    feed_tx: &mpsc::Sender<TaggedFeed>,
+) -> Result<()> {
+    let Some(picker) = app.picker.as_mut() else {
+        return Ok(());
+    };
+    match picker.handle_key(key) {
+        PickerOutcome::None => {}
+        PickerOutcome::Dismiss => app.picker = None,
+        PickerOutcome::Switch(id) => {
+            watch_context(bridge, app, id, feed_tx).await?;
+            app.switch_to(id);
+            app.picker = None;
+            app.clear_notice();
+        }
+        PickerOutcome::Placement { context_id, argv } => match bridge.execute_kj(context_id, argv).await {
+            Ok(result) if result.latch.is_some() => {
+                let message = result.latch.map(|l| l.message).unwrap_or_default();
+                app.note(message);
+            }
+            Ok(result) => app.note(result.stdout.lines().next().unwrap_or("done").to_string()),
+            Err(e) => app.note(format!("placement failed: {e}")),
+        },
     }
     Ok(())
 }
@@ -341,6 +480,12 @@ fn draw(
     let prints = render::take_settled_prints(app, width);
     let _guard = term_lock.lock();
     render::print_scrollback(terminal, &prints)?;
+    // The status line's live pulse dot — the one place this crate samples
+    // the phasor's envelope against a real clock; `App::track_figure` only
+    // projects the value stamped here.
+    app.track_pulse = app
+        .playing_track()
+        .is_some_and(|t| app.beats.envelope(&t.score_context_id, Instant::now()) > 0.5);
     render::draw_live(terminal, app, kaijutsu_types::now_millis(), armed)?;
     Ok(())
 }
@@ -472,6 +617,16 @@ async fn act(
                     compose_key(bridge, app, tab).await?;
                 }
             }
+        }
+        Intent::TogglePicker => {
+            let tracks = bridge.actor().list_tracks().await.unwrap_or_default();
+            app.picker = Some(crate::picker::PickerModel::build(
+                &app.contexts,
+                &tracks,
+                &app.views.iter().filter(|(_, v)| v.activity).map(|(id, _)| *id).collect(),
+                &app.tails,
+                kaijutsu_types::now_millis(),
+            ));
         }
     }
     Ok(Acted::Continue)

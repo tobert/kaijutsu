@@ -148,6 +148,13 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
 /// The live region: still-streaming blocks, the compose line, the status
 /// line (or the armed-prefix legend in its place).
 pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Vec<Line<'static>> {
+    // The picker grows the viewport and replaces the live region entirely
+    // while open — its own key line is the view's key line, the same
+    // contract every grown view (`docs/tui.md`, "The picker") follows.
+    if let Some(picker) = &app.picker {
+        return crate::picker::render(picker, width, &app.palette);
+    }
+
     let palette = app.palette;
 
     // The ask card and the ledger view replace the block stream and compose
@@ -280,9 +287,17 @@ pub fn draw_full<B: Backend>(
         frame.render_widget(Paragraph::new(live.to_vec()), bottom);
     })?;
     Ok(())
+}/// Rows the inline viewport should occupy right now — [`VIEWPORT_LINES`]
+/// ordinarily, or a grown view's own height while one is open. The one place
+/// viewport growth lands (`docs/tui.md`, "grows the viewport and shrinks on
+/// dismiss"): a future grown view (ledger, asks) adds its own arm here rather
+/// than each surface picking its own resize path.
+pub fn viewport_lines(app: &App) -> u16 {
+    match &app.picker {
+        Some(picker) => VIEWPORT_LINES.max(crate::picker::viewport_lines(picker)),
+        None => VIEWPORT_LINES,
+    }
 }
-
-
 
 #[cfg(test)]
 mod tests {

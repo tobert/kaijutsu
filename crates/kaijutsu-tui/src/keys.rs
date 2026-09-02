@@ -47,6 +47,11 @@ pub enum Intent {
     /// (`crate::completion`); the caller decides that, not this module —
     /// `Keys::interpret` has no view of the compose line.
     Tab,
+    /// `Ctrl+A "` / `Ctrl+A w` — open or close the picker
+    /// (`docs/tui.md`, "The picker"). While the picker is open, keys are
+    /// routed to it directly rather than through [`Keys::interpret`] — see
+    /// `run.rs`.
+    TogglePicker,
 }
 
 /// The prefix state machine.
@@ -83,7 +88,7 @@ impl Keys {
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     Intent::SwitchSeat(c as usize - '0' as usize)
                 }
-                KeyCode::Char('"') | KeyCode::Char('w') => Intent::NotYet("picker: later lane"),
+                KeyCode::Char('"') | KeyCode::Char('w') => Intent::TogglePicker,
                 KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
                 KeyCode::Char('\'') | KeyCode::Char('A') | KeyCode::Char('q')
@@ -170,16 +175,13 @@ mod tests {
         assert!(!keys.armed());
     }
 
-    /// A key a later lane owns is named, never swallowed.
     #[test]
-    fn the_picker_says_it_is_a_later_lane() {
+    fn ctrl_a_quote_opens_the_picker() {
         let mut keys = Keys::new();
         keys.interpret(ctrl('a'));
-        assert_eq!(
-            keys.interpret(press(KeyCode::Char('"'))),
-            Intent::NotYet("picker: later lane")
-        );
+        assert_eq!(keys.interpret(press(KeyCode::Char('"'))), Intent::TogglePicker);
     }
+
 
     /// `Ctrl+Z` is never compose text, and its double-tap window is the
     /// caller's to time.

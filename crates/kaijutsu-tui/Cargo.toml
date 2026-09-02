@@ -20,6 +20,14 @@ kaijutsu-editor.workspace = true
 kaijutsu-present.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-telemetry.workspace = true
+# The picker's ring placement (`assign_ring_seats`) — the same pure function
+# `kaijutsu_client::rank` calls, taken directly because the picker also needs
+# the horizon list that crate does not expose.
+kaijutsu-viz.workspace = true
+# The beat phasor (`WellBeats`) the status line's pulse and the beat timer
+# read; `BeatRef`/`RefDisposition` decode the `ServerEvent::BeatSync` wire
+# shape the same way the app's `time_well::live::ingest_live_events` does.
+kaijutsu-audio.workspace = true
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }
