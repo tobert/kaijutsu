@@ -242,15 +242,18 @@ It is one column, not a claim protocol.
    `ledger.changed` driver, and the split of `PENDING_REASON` into an
    executes text and a retry text. The digest set match STAYS (below).
 
-   **Live for one origin.** Only the shell gate records `exec_source`, and
-   only the RPC `shellExecute` path links a block pair, and no shipped path
-   does both: `shellExecute` gates through installed hooks, whose asks are
-   built by `hook_gate.rs` with `exec_source: None`, so the human shell box
-   still retries; the MCP `shell_write` path executes on approval into a
-   pair the executor authors. The wire tests synthesize the linked case and
-   say so in their header. The next slice is the hook gate carrying the
-   command as `exec_source` when the hooked tool is the shell — then the
-   pair the shell box already authored is the one that fills.
+   **Live for every shell origin.** The first live probe after deploy
+   showed the gap: with hooks installed, every production shell ask comes
+   through `hook_gate.rs`, which carried no source, no plan and no
+   variables, so approval executed for nothing and, worse, an ALLOW rule
+   remembered on `dd of=${DEV}` would have redeemed every future value of
+   `DEV`. The hook gate now plans a shell-shaped call the way the shell
+   gate plans a submission: the command rides as `exec_source`, the
+   planned statements feed the snapshot, and the free and bound names go
+   on the statement so the rule refusal fires. The RPC shell box's own
+   pair fills; the MCP `shell` path gets a pair authored and a wake. A
+   command that does not parse keeps the retry shape. The wire tests still
+   synthesize the link, because the harness installs no hook.
 
 ## Slice 5: approval executes
 

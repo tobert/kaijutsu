@@ -1702,6 +1702,40 @@ mod tests {
         );
     }
 
+    /// The hook origin is where every production shell ask comes from once
+    /// hooks are installed, so it must snapshot too. Falsified by the hook
+    /// gate passing `planned: Vec::new()` for a shell-shaped call.
+    #[tokio::test]
+    async fn an_escalating_hook_ask_on_a_shell_call_records_the_env_snapshot() {
+        let d = gate_dispatcher().await;
+        let ctx_id =
+            register_context(&d, Some("hook-env-snapshot"), None, kaijutsu_types::PrincipalId::new());
+        d.kernel_db.lock().set_context_env(ctx_id, "FOO", "bar").unwrap();
+        let caller = caller_with_context(ctx_id);
+
+        let params = crate::mcp::types::KernelCallParams {
+            instance: crate::mcp::types::InstanceId::new("builtin.shell_write"),
+            tool: "shell_write".to_string(),
+            arguments: serde_json::json!({ "command": "echo ${FOO}" }),
+        };
+        let spec = crate::kj::hook_gate::build_hook_gate_spec("h", "hooked".into(), &params);
+        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending);
+        let request_id = outcome.ask.expect("an escalated ask has a row").request_id;
+
+        let env = d.kernel_db.lock().ask_env(&request_id).unwrap();
+        assert_eq!(env.len(), 1, "FOO is the one free variable: {env:?}");
+        assert_eq!(env[0].value.as_deref(), Some("bar"));
+        let row = {
+            let db = d.kernel_db.lock();
+            approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(row.exec_source.as_deref(), Some("echo ${FOO}"));
+        assert!(row.description.contains("FOO=\"bar\""), "{}", row.description);
+    }
+
     /// A caller with no `context_id` has no persisted `context_env` to
     /// snapshot — same shape as [`a_caller_with_no_context_id_records_no_cwd`].
     #[tokio::test]

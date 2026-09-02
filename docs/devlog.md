@@ -2416,14 +2416,18 @@ lane: archiving stamps a timestamp and leaves the state column at `live`,
 so the driver's guard had been reading the wrong half and had never once
 seen an archived context.
 
-Honesty about the ending: approval executes for one origin. Only the shell
-gate records executable source, only the RPC shell box links a block pair,
-and no shipped path does both, because the shell box gates through hooks
-and a hook's ask carries no source. The model's `shell_write` path runs on
-approval today; the human at the shell box still runs the command again
-until the hook gate learns to carry it. The wire tests synthesize the
-linked case and say so in their header. The lesson from the morning held to
-the end: the count of prerequisites was not the count of the work.
+The first live probe after deploy said the ending was not there yet. Only
+the shell gate recorded executable source, and with hooks installed no
+production ask comes from the shell gate; they all come from the hook gate,
+whose module doc said a hook ask has no free variables. For a shell-shaped
+call that was false in a way sharper than the executor: an allow rule
+remembered on `dd of=${DEV}` would have redeemed every future value of
+`DEV`, the exact hazard the rule refusal exists for. The hook gate now
+plans a shell call the way the shell gate does, and the ask carries the
+source, the plan and the names. The lesson from the morning held to the
+end: the count of prerequisites was not the count of the work, and the
+inventory that missed this one listed origins, not the paths a live
+kernel actually routes through.
 
 The alignment question had one more turn in it. The scorer sees an
 unexpanded variable as a middle guess — measured that afternoon, a

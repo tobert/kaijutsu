@@ -353,21 +353,15 @@ the natural idiom silently produces a link that resolves to nothing. Either
 `symlink` translates an in-mount absolute target to a relative one, or the
 surface has to say "relative targets only" and fail loudly on an absolute one.
 
-## Approval executes for one origin; the shell box still retries (2026-09-02)
+## After approval-executes: what is still retry-shaped (2026-09-02)
 
-Shape B slice 5 shipped (`f4494cce`): `kj ledger allow <id>` runs the ask's
-source into the blocks waiting on it. `docs/gate-shape-b.md` is canonical.
-**But only the shell gate records `exec_source`, and only the RPC
-`shellExecute` path links a block pair, and no shipped path does both.**
-`shellExecute` gates through installed hooks; `hook_gate.rs` builds those
-asks with `exec_source: None`, so the human shell box's asks still carry
-"run the same command again". The MCP `shell_write` path executes today.
-
-Next slice: the hook gate carries the hooked shell command as
-`exec_source` when the tool is `shell`/`shell_write`, so the pair the shell
-box already authored is the one that fills. Then `find_redeemable`'s
-digest match is deletable only when `cc send` and rc hooks execute too —
-not before (`docs/gate-shape-b.md`, "The rest, settled").
+Shape B slice 5 shipped (`f4494cce`, hook gate carrying source the same
+morning): every shell ask executes on approval. Still retry-shaped, by
+design: `kj cc send` and non-shell hook asks. `find_redeemable`'s digest
+match is deletable only when those execute too, not before
+(`docs/gate-shape-b.md`, "The rest, settled"). The executor wire tests
+synthesize the block link because the harness installs no hook; a test
+that installs one and drives `shellExecute` end to end is owed.
 
 Also open from the same lane: `archive_context` stamps `archived_at` and
 leaves `context_state` at `live`. The two checks that matter now read both
