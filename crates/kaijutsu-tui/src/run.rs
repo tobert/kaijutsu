@@ -21,8 +21,10 @@ use tokio::sync::mpsc;
 
 use crate::app::{App, ContextView};
 use crate::bridge::KernelBridge;
+use crate::compose::Compose;
 use crate::keys::{Intent, Keys};
 use crate::render;
+use crate::shell::{CtrlZ, ShellAction};
 
 use crossterm::event::KeyEvent;
 use kaijutsu_client::{PeerConfig, PeerInvocation};
@@ -103,6 +105,13 @@ pub async fn run(
     if let Err(e) = attach_editor_peer(&bridge, open_tx).await {
         tracing::warn!(error = %e, "no open_editor peer; `vi` will not open a screen here");
     }
+
+    // The draft block is per (context, principal), so compose needs to know
+    // which principal is ours before it can pick its own draft out of the
+    // mirror. A draft this or another client left behind is picked up rather
+    // than overwritten.
+    app.principal = Some(bridge.principal().await?);
+    app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
 
     // The inline viewport's first cursor query runs before the key reader
     // exists, so nothing is holding the reader it needs.
@@ -216,7 +225,9 @@ async fn event_loop(
                 match event {
                     Event::Key(key) => {
                         dirty = true;
-                        act(bridge, app, &mut keys, key, &wires.feed_tx).await?;
+                        if act(bridge, app, &mut keys, key, &wires.feed_tx).await? == Acted::Suspend {
+                            suspend(terminal, &wires.term_lock)?;
+                        }
                     }
                     Event::Resize(..) => dirty = true,
                     _ => {}
@@ -339,6 +350,13 @@ fn draw_alternate(alt: &mut AltScreen, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Whether a key asked the loop to hand the terminal back to the host shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acted {
+    Continue,
+    Suspend,
+}
+
 /// Act on one key.
 async fn act(
     bridge: &KernelBridge,
@@ -346,57 +364,64 @@ async fn act(
     keys: &mut Keys,
     key: crossterm::event::KeyEvent,
     feed_tx: &mpsc::Sender<TaggedFeed>,
-) -> Result<()> {
+) -> Result<Acted> {
     // The editor is the sanctioned raw key reader (`docs/input.md`): while a
     // vi surface holds the alternate screen every key belongs to it, so the
     // `Ctrl+A` prefix and the `Ctrl+C` double-tap are bypassed here rather
     // than being taught to stand aside.
     if editor::route_key(app) == editor::KeyRoute::AlternateScreen {
-        return act_alternate(bridge, app, key).await;
+        act_alternate(bridge, app, key).await?;
+        return Ok(Acted::Continue);
     }
     match keys.interpret(key) {
         Intent::Ignored | Intent::LegendChanged => {}
         Intent::Interrupt => {
             app.press_ctrl_c(std::time::Instant::now());
         }
-        Intent::ComposeInsert(c) => {
-            app.clear_notice();
-            app.compose.push(c);
-        }
-        Intent::ComposeBackspace => {
-            app.clear_notice();
-            app.compose.pop();
-        }
-        Intent::Submit => {
-            let text = std::mem::take(&mut app.compose);
-            if text.trim().is_empty() {
-                return Ok(());
+        Intent::InputKey(key) => {
+            if app.shell.active {
+                shell_key(bridge, app, key).await?;
+            } else {
+                compose_key(bridge, app, key).await?;
             }
-            let Some(ctx) = app.current else {
-                app.note("no context attached");
-                return Ok(());
-            };
-            // The kernel-owned input surface (`edit_input` / `submit_input`),
-            // reached through the bridge. The modalkit compose lane replaces
-            // the whole-line rewrite, not this call.
-            match bridge.send_prompt(ctx, &text).await {
-                Ok(_) => app.clear_notice(),
-                Err(e) => app.note(format!("submit failed: {e}")),
+        }
+        Intent::ShellToggle => {
+            let gesture = app.shell.press_ctrl_z(std::time::Instant::now());
+            if app.shell.active {
+                // Both prompt cursors are resolved live, so the cwd is read
+                // when the surface comes up rather than cached from startup.
+                // Read before the suspend, so the frame `fg` returns to is
+                // the frame that was there.
+                if let Some(ctx) = app.current {
+                    app.shell.set_cwd(bridge.context_cwd(ctx).await.unwrap_or(None));
+                }
+                app.note("shell surface — Ctrl+Z leaves, Ctrl+Z Ctrl+Z suspends");
+            } else {
+                app.clear_notice();
+            }
+            if gesture == CtrlZ::Suspend {
+                return Ok(Acted::Suspend);
             }
         }
         Intent::SwitchSeat(n) => match app.seat_context(n) {
             Some(id) => {
                 watch_context(bridge, app, id, feed_tx).await?;
                 app.switch_to(id);
+                // The draft is per context, so the compose buffer follows the
+                // switch rather than carrying the old context's text along.
+                app.compose = Compose::over(&bridge.read_input(id).await.unwrap_or_default());
+                app.shell.set_cwd(bridge.context_cwd(id).await.unwrap_or(None));
                 app.clear_notice();
             }
             None => app.note(format!("no context on seat {n}")),
         },
-        Intent::LastContext => {
-            if app.switch_to_previous().is_none() {
-                app.note("no previous context");
+        Intent::LastContext => match app.switch_to_previous() {
+            Some(id) => {
+                app.compose = Compose::over(&bridge.read_input(id).await.unwrap_or_default());
+                app.shell.set_cwd(bridge.context_cwd(id).await.unwrap_or(None));
             }
-        }
+            None => app.note("no previous context"),
+        },
         Intent::OpenDiff => match open_diff(app) {
             Some(screen) => {
                 app.screen = ScreenMode::Diff(screen);
@@ -406,7 +431,115 @@ async fn act(
         },
         Intent::NotYet(message) => app.note(message),
     }
+    Ok(Acted::Continue)
+}
+
+/// One keystroke on the compose surface: mirror what the vi engine did onto
+/// the context's draft block, and submit when it asks.
+async fn compose_key(
+    bridge: &KernelBridge,
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+) -> Result<()> {
+    let Some(ctx) = app.current else {
+        app.note("no context attached");
+        return Ok(());
+    };
+    let action = app.compose.press(key, std::time::Instant::now());
+    for op in &action.ops {
+        match bridge
+            .edit_input(ctx, op.offset as u64, &op.insert, op.delete as u64)
+            .await
+        {
+            Ok(version) => app.compose.record_ack(version),
+            // The draft is the kernel's copy; a failed edit means the two have
+            // diverged, and saying so beats typing into a line that is no
+            // longer going anywhere.
+            Err(e) => app.note(format!("draft edit failed: {e}")),
+        }
+    }
+    if action.unfocus {
+        app.note("compose unfocused — i to type");
+    }
+    if action.submit {
+        if app.compose.text().trim().is_empty() {
+            return Ok(());
+        }
+        match bridge.submit_input(ctx).await {
+            Ok(_) => {
+                app.compose.reset();
+                app.clear_notice();
+            }
+            Err(e) => app.note(format!("submit failed: {e}")),
+        }
+    }
     Ok(())
+}
+
+/// One keystroke on the shell surface. A line runs through `shell_execute`,
+/// the gated human path; its output arrives as blocks on the context feed and
+/// the transcript prints it, so nothing is echoed here.
+async fn shell_key(
+    bridge: &KernelBridge,
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+) -> Result<()> {
+    let Some(ctx) = app.current else {
+        app.note("no context attached");
+        return Ok(());
+    };
+    if let ShellAction::Run(line) = app.shell.press(key) {
+        match bridge.shell_execute(ctx, &line).await {
+            Ok(_) => app.clear_notice(),
+            Err(e) => app.note(format!("shell failed: {e}")),
+        }
+        // `cd` moves one of the two cursors, so re-read it after every line
+        // rather than modeling kaish's own state here.
+        app.shell.set_cwd(bridge.context_cwd(ctx).await.unwrap_or(None));
+    }
+    Ok(())
+}
+
+/// Hand the terminal back to the host shell: leave raw mode, stop ourselves
+/// the way a shell job does, and re-anchor the inline viewport when `SIGCONT`
+/// brings us back. The transcript stays in scrollback either way, so nothing
+/// else needs restoring (`docs/tui.md`, "Shell (`Ctrl+Z`)").
+fn suspend(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    term_lock: &TermLock,
+) -> Result<()> {
+    // Held across the stop so the key reader cannot read in cooked mode, and
+    // so the cursor query on the way back has crossterm's reader to itself.
+    let _guard = term_lock.lock();
+    let _ = terminal.flush();
+    let _ = disable_raw_mode();
+    println!();
+
+    raise_stop();
+
+    // Back from SIGCONT. The host shell moved the cursor, so the viewport is
+    // re-anchored where the cursor is now rather than where it used to be.
+    enable_raw_mode()?;
+    let size = terminal.size()?;
+    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
+    Ok(())
+}
+
+/// Stop this process with `SIGTSTP` — the unix suspend, not an emulation of
+/// it, so the shell's job control sees a stopped job and `fg` resumes it.
+#[cfg(unix)]
+fn raise_stop() {
+    // SAFETY: `raise` takes an integer and is async-signal-safe.
+    unsafe {
+        libc::raise(libc::SIGTSTP);
+    }
+}
+
+/// There is no `SIGTSTP` off unix; the toggle still works and the second tap
+/// says why nothing happened.
+#[cfg(not(unix))]
+fn raise_stop() {
+    tracing::warn!("suspend is a unix gesture; nothing to raise here");
 }
 
 /// Apply one feed event to its mirror, and say so when it touches a block
@@ -429,6 +562,7 @@ async fn apply_feed(
                 }
                 view.seed_collapse();
             }
+            reconcile_draft(app, context_id);
         }
         FeedEvent::Resubscribed => {
             // The actor already re-subscribed on this receiver's behalf;
@@ -440,6 +574,7 @@ async fn apply_feed(
                         view.mirror = fresh;
                         view.seed_collapse();
                     }
+                    reconcile_draft(app, context_id);
                     app.note("reconnected; context rehydrated");
                 }
                 Err(e) => app.note(format!("rehydrate failed: {e}")),
@@ -453,6 +588,19 @@ async fn apply_feed(
             app.note(format!("context feed ended ({reason:?}); press Ctrl+A to reattach"));
         }
     }
+}
+
+/// Draw the compose line from kernel state rather than from the local buffer
+/// alone. The draft is an ordinary block on the same change feed, so a
+/// sibling typing into it arrives here with every other block edit.
+fn reconcile_draft(app: &mut App, context_id: ContextId) {
+    if app.current != Some(context_id) {
+        return;
+    }
+    let Some((text, version)) = app.current_draft() else {
+        return;
+    };
+    app.compose.reconcile(&text, version);
 }
 
 /// Mark a context as having moved since it was last on screen — screen's `@`

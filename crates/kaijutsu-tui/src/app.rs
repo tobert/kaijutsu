@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
 };
-use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, Role};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 
+use crate::compose::Compose;
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
+use crate::shell::Shell;
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 
 /// The double-tap window, shared by `Ctrl+C Ctrl+C` and the prefix's
@@ -106,12 +108,19 @@ pub struct App {
     /// Pending asks across every context. Display only in this lane;
     /// answering one is the asks lane (`asks.rs`).
     pub pending_asks: usize,
-    /// The compose line. A single local line until the modalkit compose lane
-    /// lands (`compose.rs`).
-    pub compose: String,
+    /// The compose surface — a modalkit `VimMachine` over the context's
+    /// kernel-owned draft block (`compose.rs`).
+    pub compose: Compose,
+    /// The shell surface (`Ctrl+Z`), and the `Ctrl+Z Ctrl+Z` suspend gesture
+    /// (`shell.rs`).
+    pub shell: Shell,
     pub palette: Palette,
     pub wrap: WrapCache,
     pub quit: bool,
+    /// This client's own principal, from `whoami`. It selects which draft
+    /// block in the mirror is ours — there is at most one per
+    /// (context, principal).
+    pub principal: Option<PrincipalId>,
     notice: Option<String>,
     last_ctrl_c: Option<Instant>,
     /// What has displaced the inline viewport, when anything has. Only the
@@ -132,10 +141,12 @@ impl App {
             views: HashMap::new(),
             connection: None,
             pending_asks: 0,
-            compose: String::new(),
+            compose: Compose::new(),
+            shell: Shell::new(),
             palette: Palette::builtin(),
             wrap: WrapCache::new(),
             quit: false,
+            principal: None,
             notice: None,
             last_ctrl_c: None,
             screen: crate::editor::ScreenMode::Inline,
@@ -288,6 +299,26 @@ impl App {
             self.note("Ctrl+C again to quit");
         }
         quit
+    }
+
+    /// The current context's draft block for this client's principal, and the
+    /// mirror version it was read at.
+    ///
+    /// The draft is an ordinary `Status::Draft` block riding the same change
+    /// feed as everything else, so a sibling's typing arrives here with no
+    /// separate fetch. There is at most one per (context, principal), so the
+    /// first match is the only one.
+    pub fn current_draft(&self) -> Option<(String, u64)> {
+        let context_id = self.current?;
+        let principal = self.principal?;
+        let view = self.views.get(&context_id)?;
+        let text = view
+            .mirror
+            .blocks()
+            .iter()
+            .find(|b| b.status == Status::Draft && b.id.principal_id == principal)
+            .map(|b| b.content.clone())?;
+        Some((text, view.mirror.version()))
     }
 
     /// Cache health for the context on screen.

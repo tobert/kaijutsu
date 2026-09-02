@@ -12,7 +12,7 @@ use kaijutsu_client::rpc::KjExecutionResult;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
-use kaijutsu_types::{BlockId, BlockQuery, ContextId};
+use kaijutsu_types::{BlockId, BlockQuery, ContextId, PrincipalId};
 use tokio::sync::mpsc;
 
 /// Per-process subscription identity.
@@ -216,28 +216,68 @@ impl KernelBridge {
         Ok(mirror)
     }
 
-    /// Write `text` into the context's input doc and submit it as a chat turn.
-    ///
-    /// This is the kernel-owned input surface (`edit_input` / `submit_input`,
-    /// `docs/tui.md`, "Compose"). The draft is a shared block, so a modalkit
-    /// compose lane replaces the whole-buffer rewrite below with incremental
-    /// `edit_input` calls without changing the submit half.
-    pub async fn send_prompt(&self, context_id: ContextId, text: &str) -> Result<BlockId> {
-        let state = self.actor.get_input_state(context_id).await?;
-        // Char count, not `.len()`. `edit_input`'s `pos`/`delete` are
-        // character offsets; a byte length truncates or over-deletes the
-        // moment anyone types non-ASCII.
-        let existing = state.content.chars().count() as u64;
-        self.actor
-            .edit_input(context_id, 0, text, existing)
+    /// This client's own principal, which selects its draft block out of the
+    /// mirror.
+    pub async fn principal(&self) -> Result<PrincipalId> {
+        Ok(self.actor.whoami().await.context("whoami")?.principal_id)
+    }
+
+    /// The context's draft as the kernel holds it right now, for the first
+    /// compose buffer of a session.
+    pub async fn read_input(&self, context_id: ContextId) -> Result<String> {
+        Ok(self
+            .actor
+            .get_input_state(context_id)
             .await
-            .context("write input doc")?;
+            .context("read input doc")?
+            .content)
+    }
+
+    /// One edit against the context's draft block. `pos` and `delete` are
+    /// **character** offsets, matching `kaijutsu_editor::EditOp`; a byte
+    /// length truncates or over-deletes the moment anyone types non-ASCII.
+    /// Returns the context version the kernel acknowledged.
+    pub async fn edit_input(
+        &self,
+        context_id: ContextId,
+        pos: u64,
+        insert: &str,
+        delete: u64,
+    ) -> Result<u64> {
+        self.actor
+            .edit_input(context_id, pos, insert, delete)
+            .await
+            .context("edit input doc")
+    }
+
+    /// Submit the draft as a chat turn. The kernel snapshots it into a block
+    /// and clears the draft.
+    pub async fn submit_input(&self, context_id: ContextId) -> Result<BlockId> {
         let result = self
             .actor
             .submit_input(context_id, false)
             .await
             .context("submit input")?;
         Ok(result.block_id)
+    }
+
+    /// Run one kaish statement as the human — the gated path
+    /// (`docs/gate-and-shell-split.md`). Output arrives as blocks on the
+    /// context feed; nothing is returned here to print.
+    pub async fn shell_execute(&self, context_id: ContextId, code: &str) -> Result<BlockId> {
+        self.actor
+            .shell_execute(code, context_id, true)
+            .await
+            .context("shell execute")
+    }
+
+    /// The context's cwd — the second of the shell prompt's two cursors.
+    /// `None` when the kernel has none recorded.
+    pub async fn context_cwd(&self, context_id: ContextId) -> Result<Option<String>> {
+        self.actor
+            .get_context_cwd(context_id)
+            .await
+            .context("read context cwd")
     }
 
     /// Execute structured `kj` argv against a context without changing the

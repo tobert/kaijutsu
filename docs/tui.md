@@ -133,10 +133,36 @@ Rules the figure carries:
 
 ### Compose
 
+```text
+  ❯ and getattr?                                                  -- INSERT --
+```
+
 Compose is a modalkit `VimMachine` over the kernel-owned input block
 (`edit_input` / `submit_input`), as the app's compose overlay is. The draft is
 a shared block: a sibling's typing shows. `Enter` in normal mode submits;
 `Esc Esc` in normal mode clears focus (`docs/input.md`, "Escape").
+
+Rules the figure carries:
+
+- The vi engine is `kaijutsu-editor`'s `EditorCore`, the same pure modalkit
+  core the kernel's vi sessions run on. Its `EditOp`s are char-indexed, which
+  is `edit_input`'s `(pos, insert, delete)` addressing exactly, so one
+  keystroke is one `edit_input` and nothing translates between the two. Keys
+  reach it as `crossterm::event::KeyEvent` through
+  `EditorCore::apply_key_event` — the vim-notation string cannot carry a
+  literal `<`.
+- A fresh draft opens in insert mode, which is what the banner at the right
+  reports; normal mode shows nothing there.
+- **The sibling's edit wins only when it is newer.** The draft is redrawn from
+  the change feed, and `edit_input` acknowledges the same context version the
+  feed speaks, so a mirror older than this client's last ack is refused rather
+  than applied — otherwise our own echo, arriving one keystroke behind, would
+  delete what was just typed.
+- Enter in insert mode is a newline: that is how a multi-line draft is
+  written, and the compose region grows inside the viewport, taking rows from
+  the transcript.
+- Unfocused, compose answers only `i`/`a`/`o`; every other key is left for
+  another surface to claim, and the banner says `i to type`.
 
 ### Shell (`Ctrl+Z`)
 
@@ -149,7 +175,16 @@ cursors:
 ```
 
 `kaijutsu` is the acting context; the path is cwd. They move independently —
-see "Melted from the ssh shell design".
+see "Melted from the ssh shell design". Both are resolved live: cwd is read
+from `get_context_cwd` when the surface comes up and after every line, so a
+`cd` moves that cursor and nothing else. A context the kernel has no cwd
+recorded for renders the label and `$` alone rather than a guessed path.
+
+A line runs through `shell_execute` with `user_initiated`, and its output
+arrives as blocks on the context feed — the transcript prints it like any
+other block, so the surface itself echoes nothing. `Up`/`Down` walk the
+commands run this process, oldest entry ending the walk and past-the-newest
+restoring the line that was being typed; `Ctrl+U` kills the line.
 
 **`Ctrl+Z` once toggles the shell surface; `Ctrl+Z Ctrl+Z` suspends the
 process.** The second press inside the 500 ms double-tap window (the app's
@@ -449,8 +484,9 @@ for a usable first cut; five parallel lanes once the skeleton (event loop, app
 state, the `Backend`-generic renderer, `present.rs`) lands.
 
 Version note: `modalkit-ratatui 0.0.25` matches the workspace's modalkit pin
-but wants `ratatui ^0.29`; ratatui is at 0.30. The editor renders from wire
-state so the widget crate is optional; if wanted, pin 0.29.
+but wants `ratatui ^0.29`; ratatui is at 0.30. It is not a dependency and does
+not need to become one — compose and the editor both render from state the
+client already holds, so the ratatui widget crate buys nothing here.
 
 ## Roads not taken
 

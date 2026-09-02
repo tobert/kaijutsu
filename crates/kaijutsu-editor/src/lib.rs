@@ -295,93 +295,119 @@ impl EditorCore {
     /// that changed the buffer (no-op keystrokes emit nothing).
     pub fn apply_keys(&mut self, keys: &str) -> Vec<EditOp> {
         let mut ops = Vec::new();
-        // A fresh batch; any close/command intent from a prior batch was already
-        // consumed by the kernel (or is irrelevant — the session is still open).
+        self.start_batch();
+        for key in parse_keys(keys) {
+            ops.extend(self.feed_key(key));
+        }
+        ops
+    }
+
+    /// Feed one already-decoded terminal key — the seam a crossterm client
+    /// uses instead of [`apply_keys`](Self::apply_keys)'s vim-notation string,
+    /// which cannot carry a literal `<`. `KeyEvent` here is
+    /// `modalkit::crossterm::event::KeyEvent`, so a crossterm frontend passes
+    /// its own event through unchanged.
+    ///
+    /// One key is one batch: the `ZZ`/`:`-line intents
+    /// ([`take_close`](Self::take_close), [`take_commands`](Self::take_commands),
+    /// [`take_io`](Self::take_io)) reflect this key alone.
+    pub fn apply_key_event(&mut self, key: KeyEvent) -> Vec<EditOp> {
+        self.start_batch();
+        self.feed_key(TerminalKey::from(key))
+    }
+
+    /// Drop the intents a prior key batch left behind. They were already
+    /// consumed by the caller, or are irrelevant — the session is still open.
+    fn start_batch(&mut self) {
         self.pending_close = None;
         self.pending_commands = None;
         self.pending_substitution = None;
         self.pending_io = None;
-        for key in parse_keys(keys) {
-            // Diff against the normalized (terminator-stripped) view so emitted
-            // offsets are char-indexed into the logical content, matching the
-            // kernel block — not modalkit's trailing-newline'd rope.
-            let before = strip_one_trailing_newline(&self.buffer.get_text());
-            self.machine.input_key(key);
-            while let Some((action, ctx)) = self.machine.pop() {
-                match action {
-                    // `:`/`/`/`?` focus the command-line/search bar — a separate
-                    // `EditBuffer` (`cmdline`). Reset it and remember the prefix
-                    // so subsequent keystrokes type into it, not the document.
-                    Action::CommandBar(CommandBarAction::Focus(prefix, _ct, _act)) => {
-                        self.cmdline_active = true;
-                        self.cmdline_prefix = prefix;
-                        self.cmdline = EditBuffer::<EmptyInfo>::from_str(String::new(), "");
-                        self.cmdline_group = self.cmdline.create_group();
-                    }
-                    Action::CommandBar(CommandBarAction::Unfocus) => {
-                        self.cmdline_active = false;
-                    }
-                    // `<CR>` in the bar submits: parse the typed line for its
-                    // dialect. Lifecycle verbs (`:w`/`:q`/…) queue intents the
-                    // kernel acts on; a `:s` queues a buffer edit applied below.
-                    Action::Prompt(PromptAction::Submit) if self.cmdline_active => {
-                        let body = strip_one_trailing_newline(&self.cmdline.get_text());
-                        match parse_command_line(&self.cmdline_prefix, &body) {
-                            Ok(ParsedLine::Commands(cmds)) => {
-                                self.pending_commands = Some(Ok(cmds));
-                            }
-                            Ok(ParsedLine::Substitute(sub)) => {
-                                self.pending_substitution = Some(sub);
-                            }
-                            Ok(ParsedLine::Io(io)) => {
-                                self.pending_io = Some(io);
-                            }
-                            Ok(ParsedLine::Noop) => {}
-                            Err(e) => self.pending_commands = Some(Err(e)),
-                        }
-                        self.cmdline_active = false;
-                    }
-                    // `<Esc>` / `<C-C>` (Abort) and any other prompt action close
-                    // the bar without running anything.
-                    Action::Prompt(_) if self.cmdline_active => {
-                        self.cmdline_active = false;
-                    }
-                    // While the bar is focused, edits go to `cmdline` — real
-                    // command-line editing (insert, backspace, motion).
-                    Action::Editor(ea) if self.cmdline_active => {
-                        let ictx = (self.cmdline_group, &self.viewport, &ctx);
-                        let _ = self.cmdline.editor_command(&ea, &ictx, &mut self.store);
-                    }
-                    Action::Editor(ea) => {
-                        let ictx = (self.group, &self.viewport, &ctx);
-                        // Editing errors (e.g. motion off the end) are non-fatal
-                        // vim behavior, not corruption — drop them, keep the buffer.
-                        let _ = self.buffer.editor_command(&ea, &ictx, &mut self.store);
-                    }
-                    // `ZZ`/`ZQ`: modalkit knows the real mode, so it only emits a
-                    // window-close here when the keys truly mean quit (an inserted
-                    // `ZZ` produces InsertText, not this). We have no windows —
-                    // record the intent for the kernel. `WQ` = write+quit (`ZZ`);
-                    // anything else here is force-quit (`ZQ` = `FQ`).
-                    Action::Window(WindowAction::Close(_, flags)) if !self.cmdline_active => {
-                        self.pending_close = Some(if flags.contains(CloseFlags::WRITE) {
-                            CloseRequest::Write
-                        } else {
-                            CloseRequest::Discard
-                        });
-                    }
-                    _ => {}
+    }
+
+    /// One keystroke: feed the machine, drain the actions it produced, and
+    /// diff the buffer into the [`EditOp`]s the caller mirrors.
+    fn feed_key(&mut self, key: TerminalKey) -> Vec<EditOp> {
+        let mut ops = Vec::new();
+        // Diff against the normalized (terminator-stripped) view so emitted
+        // offsets are char-indexed into the logical content, matching the
+        // kernel block — not modalkit's trailing-newline'd rope.
+        let before = strip_one_trailing_newline(&self.buffer.get_text());
+        self.machine.input_key(key);
+        while let Some((action, ctx)) = self.machine.pop() {
+            match action {
+                // `:`/`/`/`?` focus the command-line/search bar — a separate
+                // `EditBuffer` (`cmdline`). Reset it and remember the prefix
+                // so subsequent keystrokes type into it, not the document.
+                Action::CommandBar(CommandBarAction::Focus(prefix, _ct, _act)) => {
+                    self.cmdline_active = true;
+                    self.cmdline_prefix = prefix;
+                    self.cmdline = EditBuffer::<EmptyInfo>::from_str(String::new(), "");
+                    self.cmdline_group = self.cmdline.create_group();
                 }
+                Action::CommandBar(CommandBarAction::Unfocus) => {
+                    self.cmdline_active = false;
+                }
+                // `<CR>` in the bar submits: parse the typed line for its
+                // dialect. Lifecycle verbs (`:w`/`:q`/…) queue intents the
+                // kernel acts on; a `:s` queues a buffer edit applied below.
+                Action::Prompt(PromptAction::Submit) if self.cmdline_active => {
+                    let body = strip_one_trailing_newline(&self.cmdline.get_text());
+                    match parse_command_line(&self.cmdline_prefix, &body) {
+                        Ok(ParsedLine::Commands(cmds)) => {
+                            self.pending_commands = Some(Ok(cmds));
+                        }
+                        Ok(ParsedLine::Substitute(sub)) => {
+                            self.pending_substitution = Some(sub);
+                        }
+                        Ok(ParsedLine::Io(io)) => {
+                            self.pending_io = Some(io);
+                        }
+                        Ok(ParsedLine::Noop) => {}
+                        Err(e) => self.pending_commands = Some(Err(e)),
+                    }
+                    self.cmdline_active = false;
+                }
+                // `<Esc>` / `<C-C>` (Abort) and any other prompt action close
+                // the bar without running anything.
+                Action::Prompt(_) if self.cmdline_active => {
+                    self.cmdline_active = false;
+                }
+                // While the bar is focused, edits go to `cmdline` — real
+                // command-line editing (insert, backspace, motion).
+                Action::Editor(ea) if self.cmdline_active => {
+                    let ictx = (self.cmdline_group, &self.viewport, &ctx);
+                    let _ = self.cmdline.editor_command(&ea, &ictx, &mut self.store);
+                }
+                Action::Editor(ea) => {
+                    let ictx = (self.group, &self.viewport, &ctx);
+                    // Editing errors (e.g. motion off the end) are non-fatal
+                    // vim behavior, not corruption — drop them, keep the buffer.
+                    let _ = self.buffer.editor_command(&ea, &ictx, &mut self.store);
+                }
+                // `ZZ`/`ZQ`: modalkit knows the real mode, so it only emits a
+                // window-close here when the keys truly mean quit (an inserted
+                // `ZZ` produces InsertText, not this). We have no windows —
+                // record the intent for the kernel. `WQ` = write+quit (`ZZ`);
+                // anything else here is force-quit (`ZQ` = `FQ`).
+                Action::Window(WindowAction::Close(_, flags)) if !self.cmdline_active => {
+                    self.pending_close = Some(if flags.contains(CloseFlags::WRITE) {
+                        CloseRequest::Write
+                    } else {
+                        CloseRequest::Discard
+                    });
+                }
+                _ => {}
             }
-            // A submitted `:s` edits the document here, so the diff below turns
-            // it into the EditOp(s) the kernel mirrors onto the kernel block.
-            if let Some(sub) = self.pending_substitution.take() {
-                self.apply_substitution(&sub);
-            }
-            let after = strip_one_trailing_newline(&self.buffer.get_text());
-            if let Some(op) = diff_op(&before, &after) {
-                ops.push(op);
-            }
+        }
+        // A submitted `:s` edits the document here, so the diff below turns
+        // it into the EditOp(s) the kernel mirrors onto the kernel block.
+        if let Some(sub) = self.pending_substitution.take() {
+            self.apply_substitution(&sub);
+        }
+        let after = strip_one_trailing_newline(&self.buffer.get_text());
+        if let Some(op) = diff_op(&before, &after) {
+            ops.push(op);
         }
         ops
     }
@@ -1434,6 +1460,49 @@ mod tests {
         let mut ed = EditorCore::new("a");
         assert!(ed.apply_remote_text("x\na"));
         assert_eq!(ed.text(), "x\na");
+    }
+
+    /// The crossterm seam. A vim-notation string cannot carry a literal `<`
+    /// — `parse_keys` reads it as the start of a `<Esc>`-style token — so a
+    /// terminal client feeds decoded key events instead.
+    #[test]
+    fn apply_key_event_types_a_literal_less_than() {
+        let mut ed = EditorCore::new("");
+        for c in ['i', 'a', ' ', '<', ' ', 'b'] {
+            ed.apply_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(ed.text(), "a < b");
+    }
+
+    /// Why the seam exists: the vim-notation string reads `<` as the start
+    /// of a `<Esc>`-style token and eats everything up to the next `>`.
+    #[test]
+    fn apply_keys_cannot_carry_a_literal_less_than() {
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("ia < b");
+        assert_ne!(ed.text(), "a < b");
+    }
+
+    /// Uppercase arrives from crossterm with SHIFT set; `TerminalKey` folds
+    /// that back to a bare uppercase char, so `A` still means append.
+    #[test]
+    fn apply_key_event_folds_the_shift_modifier() {
+        let mut ed = EditorCore::new("ab");
+        ed.apply_key_event(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        ed.apply_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(ed.text(), "abc");
+        assert_eq!(ed.mode().as_deref(), Some("-- INSERT --"));
+    }
+
+    /// One key is one batch, and `<Esc>` reaches the machine as a key event.
+    #[test]
+    fn apply_key_event_reports_the_ops_one_key_at_a_time() {
+        let mut ed = EditorCore::new("");
+        assert!(ed.apply_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)).is_empty());
+        let ops = ed.apply_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(ops, vec![EditOp { offset: 0, insert: "h".into(), delete: 0 }]);
+        ed.apply_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(ed.mode(), None, "Esc leaves insert mode");
     }
 
     #[test]

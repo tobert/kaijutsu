@@ -14,12 +14,11 @@ use chrono::{Local, TimeZone};
 use kaijutsu_types::{BlockSnapshot, ContextId, Status};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
 use crate::app::App;
-use crate::present::Palette;
 use crate::status::{legend_line, status_line};
 
 /// Lines the live region always holds: the compose line and the status line.
@@ -177,32 +176,28 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
         );
     }
 
+    // The input region is drawn first because it sizes the transcript: a
+    // multi-line draft grows the compose region inside the viewport and the
+    // transcript gives up the rows (`docs/tui.md`, "Compose").
+    let input = crate::compose::input_lines(app, width, &palette);
+
     // Keep the tail: a long stream shows its newest lines, not its oldest.
     // The budget is the viewport's own height, so a line this function emits
     // is a line the terminal actually shows.
-    let budget = usize::from(VIEWPORT_LINES.saturating_sub(LIVE_CHROME_LINES));
+    // One status line, plus however many rows the input region takes.
+    let chrome = 1 + u16::try_from(input.len()).unwrap_or(u16::MAX);
+    let budget = usize::from(VIEWPORT_LINES.saturating_sub(chrome));
     if lines.len() > budget {
         lines.drain(..lines.len() - budget);
     }
 
-    lines.push(compose_line(app, &palette));
+    lines.extend(input);
     lines.push(if armed {
         legend_line(width, &palette)
     } else {
         status_line(&app.status_model(now_millis), width, &palette)
     });
     lines
-}
-
-/// `❯ and getattr? _` — the single local line the skeleton composes with.
-/// The modalkit surface over the kernel-owned input block replaces this
-/// (`compose.rs`).
-pub fn compose_line(app: &App, palette: &Palette) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("❯ ", palette.status()),
-        Span::styled(app.compose.clone(), palette.compose()),
-        Span::styled("_", palette.status()),
-    ])
 }
 
 /// Print completed blocks into the terminal's scrollback, above the inline
@@ -521,6 +516,67 @@ mod tests {
             .collect();
         assert!(text.iter().any(|l| l == "line 59"), "got {text:?}");
         assert!(!text.iter().any(|l| l == "line 0"), "got {text:?}");
+    }
+
+    /// A multi-line draft grows the compose region inside the viewport, and
+    /// the transcript gives up the rows.
+    #[test]
+    fn a_multi_line_draft_takes_rows_from_the_transcript() {
+        let (mut app, id) = fixture();
+        let body = (0..20).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(
+                vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
+                1,
+            )
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+
+        let one_line = live_lines(&mut app, 80, 0, false).len();
+        let now = std::time::Instant::now();
+        for code in [
+            ratatui::crossterm::event::KeyCode::Char('a'),
+            ratatui::crossterm::event::KeyCode::Enter,
+            ratatui::crossterm::event::KeyCode::Char('b'),
+        ] {
+            app.compose.press(
+                ratatui::crossterm::event::KeyEvent::new(
+                    code,
+                    ratatui::crossterm::event::KeyModifiers::NONE,
+                ),
+                now,
+            );
+        }
+        let grown = live_lines(&mut app, 80, 0, false);
+        assert_eq!(grown.len(), one_line, "the viewport height did not change");
+        let text: Vec<String> = grown
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.starts_with("❯ a")), "got {text:?}");
+        assert!(text.iter().any(|l| l.trim() == "b"), "the second draft row: {text:?}");
+    }
+
+    /// `Ctrl+Z` swaps the compose line for the shell prompt, and the prompt
+    /// carries both cursors.
+    #[test]
+    fn the_shell_surface_replaces_the_compose_line() {
+        let (mut app, _) = fixture();
+        app.shell.press_ctrl_z(std::time::Instant::now());
+        app.shell.set_cwd(Some("/v/ctx/7f/kaish-arith".to_string()));
+
+        let live = live_lines(&mut app, 96, 0, false);
+        let text: Vec<String> = live
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            text.iter()
+                .any(|l| l.starts_with("kaijutsu ▸ /v/ctx/7f/kaish-arith $ ")),
+            "got {text:?}"
+        );
+        assert!(!text.iter().any(|l| l.starts_with("❯ ")), "compose stepped aside");
     }
 
     #[test]

@@ -27,7 +27,9 @@
 //! | [`render`] | the `Backend`-generic renderer and the inline viewport |
 //! | [`keys`] | key events → intents, including the `Ctrl+A` prefix |
 //! | [`run`] | the event loop |
-//! | [`compose`], [`shell`], [`picker`], [`asks`] | later lanes |
+//! | [`compose`] | the vi surface over the context's kernel-owned draft |
+//! | [`shell`] | the `Ctrl+Z` shell surface and the suspend gesture |
+//! | [`picker`], [`asks`] | later lanes |
 //! | [`editor`], [`diff`] | the two alternate-screen surfaces |
 
 pub mod app;

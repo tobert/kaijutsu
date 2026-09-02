@@ -20,11 +20,16 @@ pub enum Intent {
     LastContext,
     /// `Ctrl+C` — the caller decides whether this is the second press.
     Interrupt,
-    /// Type into the compose line.
-    ComposeInsert(char),
-    ComposeBackspace,
-    /// `Enter` — submit the compose line through the kernel's input surface.
-    Submit,
+    /// A key for whichever surface holds the input region — the compose
+    /// `VimMachine`, or the shell line when `Ctrl+Z` toggled it on. The event
+    /// rides through undecoded because modalkit reads it directly
+    /// (`kaijutsu-editor` drives modalkit on `crossterm::event::KeyEvent`) and
+    /// because what `Enter` or `Esc` means depends on the vi mode, which this
+    /// module deliberately does not know.
+    InputKey(KeyEvent),
+    /// `Ctrl+Z` — toggle the shell surface, or suspend on the second press.
+    /// The caller times the double tap (`crate::shell::Shell::press_ctrl_z`).
+    ShellToggle,
     /// A chord a later lane owns. The text is what the status line says, so
     /// a key is never swallowed silently.
     NotYet(&'static str),
@@ -89,12 +94,11 @@ impl Keys {
                 Intent::LegendChanged
             }
             KeyCode::Char('c') if ctrl => Intent::Interrupt,
-            KeyCode::Char('z') if ctrl => Intent::NotYet("shell surface: later lane"),
-            KeyCode::Enter => Intent::Submit,
-            KeyCode::Backspace => Intent::ComposeBackspace,
-            // A control chord that reached here is not compose text.
-            KeyCode::Char(c) if !ctrl => Intent::ComposeInsert(c),
-            _ => Intent::Ignored,
+            KeyCode::Char('z') if ctrl => Intent::ShellToggle,
+            // Everything else belongs to the input region. Control chords go
+            // too: `<C-w>` and `<C-r>` are vi keys, and the two this client
+            // reserves are already claimed above.
+            _ => Intent::InputKey(key),
         }
     }
 }
@@ -111,12 +115,16 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    /// An unclaimed key reaches the input region undecoded: the compose
+    /// `VimMachine` is what decides whether `h` is text or a motion.
     #[test]
-    fn typing_edits_the_compose_line() {
+    fn an_unclaimed_key_reaches_the_input_region() {
         let mut keys = Keys::new();
-        assert_eq!(keys.interpret(press(KeyCode::Char('h'))), Intent::ComposeInsert('h'));
-        assert_eq!(keys.interpret(press(KeyCode::Backspace)), Intent::ComposeBackspace);
-        assert_eq!(keys.interpret(press(KeyCode::Enter)), Intent::Submit);
+        for code in [KeyCode::Char('h'), KeyCode::Backspace, KeyCode::Enter, KeyCode::Esc] {
+            assert_eq!(keys.interpret(press(code)), Intent::InputKey(press(code)));
+        }
+        let chord = ctrl('w');
+        assert_eq!(keys.interpret(chord), Intent::InputKey(chord), "vi keeps its ctrl chords");
     }
 
     #[test]
@@ -141,7 +149,7 @@ mod tests {
         keys.interpret(ctrl('a'));
         assert_ne!(
             keys.interpret(press(KeyCode::Char('0'))),
-            Intent::ComposeInsert('0')
+            Intent::InputKey(press(KeyCode::Char('0')))
         );
     }
 
@@ -155,17 +163,21 @@ mod tests {
 
     /// A key a later lane owns is named, never swallowed.
     #[test]
-    fn the_picker_and_the_shell_surface_say_they_are_later_lanes() {
+    fn the_picker_says_it_is_a_later_lane() {
         let mut keys = Keys::new();
         keys.interpret(ctrl('a'));
         assert_eq!(
             keys.interpret(press(KeyCode::Char('"'))),
             Intent::NotYet("picker: later lane")
         );
-        assert_eq!(
-            keys.interpret(ctrl('z')),
-            Intent::NotYet("shell surface: later lane")
-        );
+    }
+
+    /// `Ctrl+Z` is never compose text, and its double-tap window is the
+    /// caller's to time.
+    #[test]
+    fn ctrl_z_toggles_the_shell_surface() {
+        let mut keys = Keys::new();
+        assert_eq!(keys.interpret(ctrl('z')), Intent::ShellToggle);
     }
 
     #[test]

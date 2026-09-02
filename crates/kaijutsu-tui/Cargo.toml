@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 kaijutsu-client.workspace = true
 kaijutsu-diff.workspace = true
+kaijutsu-editor.workspace = true
 kaijutsu-present.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-telemetry.workspace = true
@@ -42,3 +43,8 @@ serde_json = { workspace = true }
 # schemars' chrono04 feature; taken as a direct dep rather than hand-rolling
 # a timezone.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# `SIGTSTP` for `Ctrl+Z Ctrl+Z`. The inline viewport suspends the process the
+# way a shell job does, so the raise is a real signal, not an emulation.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
