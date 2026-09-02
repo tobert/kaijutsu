@@ -8,22 +8,26 @@
 //! announcement, one write path"). The ledger is the one durable record and
 //! `kj ledger` is the one write path, from any surface, ACP included.
 //!
+//! The ledger round trip itself — `kj ledger list`/`show`/`allow`/`deny` —
+//! is `kaijutsu_client::ledger`, shared with every client. What is ACP-only
+//! here is deciding *whether this bridge is the one to answer* an ask, and
+//! the `session/request_permission` call/response mapping.
+//!
 //! # Shape
 //!
 //! 1. [`start_permission_pump`] subscribes to `LedgerEvents::onChanged` —
 //!    a broadcast of bare generation numbers, no ask id, no content
 //!    (`ActorHandle::subscribe_ledger_events`).
 //! 2. Each bump (or a `Lagged` warning that changes were missed) triggers
-//!    [`poll_ledger`], which runs `kj ledger list` in an arbitrary live
-//!    session's context — the verb reads kernel-wide state, so which
-//!    context it runs in doesn't matter — and diffs the returned ids
-//!    against a `seen` set so each ask is only offered to the client once.
-//! 3. For every unseen id, `kj ledger show <id>` names the ask's own
-//!    `context_id`. If no ACP session here is bound to that context, the
-//!    ask is **skipped, not denied** — see "Not ours to answer" below.
+//!    [`poll_ledger`], which calls `kaijutsu_client::ledger::poll_new_asks`
+//!    in an arbitrary live session's context — the ledger reads kernel-wide
+//!    state, so which context it runs in doesn't matter.
+//! 3. For every ask that call returns, if no ACP session here is bound to
+//!    its `context_id`, the ask is **skipped, not denied** — see "Not ours
+//!    to answer" below.
 //! 4. Otherwise the round trip is spawned (`cx.spawn`): a
-//!    `session/request_permission` call to the client, and on answer, `kj
-//!    ledger allow|deny <id>` to write the decision back.
+//!    `session/request_permission` call to the client, and on answer,
+//!    `kaijutsu_client::ledger::decide_ask` to write the decision back.
 //!
 //! # The kernel is the authority, and nothing expires
 //!
@@ -66,7 +70,7 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionResponse, SessionId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use kaijutsu_types::ContextId;
+use kaijutsu_client::ledger::{self, AskInfo, PendingAsk};
 use tokio::sync::broadcast;
 
 use crate::bridge::KernelBridge;
@@ -87,10 +91,10 @@ pub async fn start_permission_pump(bridge: &Arc<AcpBridge>, cx: ConnectionTo<Cli
     run_permission_pump(generations, bridge, cx).await;
 }
 
-/// Drain the ledger's generation-bump stream forever, polling `kj ledger
-/// list` after each bump and offering every newly-seen, ours-to-answer ask
-/// to the client. Never itself an error: a pump that failed should stop
-/// pumping, not hang up the ACP connection.
+/// Drain the ledger's generation-bump stream forever, polling the ledger
+/// after each bump and offering every newly-seen, ours-to-answer ask to the
+/// client. Never itself an error: a pump that failed should stop pumping,
+/// not hang up the ACP connection.
 pub async fn run_permission_pump(
     mut generations: broadcast::Receiver<i64>,
     bridge: &Arc<AcpBridge>,
@@ -118,9 +122,9 @@ pub async fn run_permission_pump(
     }
 }
 
-/// One poll: list pending asks, prune `seen`, and spawn a round trip for
-/// each unseen ask that belongs to a context this bridge has a live ACP
-/// session for.
+/// One poll: read every newly-seen pending ask and spawn a round trip for
+/// each one that belongs to a context this bridge has a live ACP session
+/// for.
 async fn poll_ledger(
     kernel: &KernelBridge,
     sessions: &SessionRegistry,
@@ -134,31 +138,15 @@ async fn poll_ledger(
         return;
     };
 
-    let ids = match list_pending(kernel, admin_ctx).await {
-        Ok(ids) => ids,
+    let new_asks = match ledger::poll_new_asks(kernel.actor(), admin_ctx, seen).await {
+        Ok(asks) => asks,
         Err(e) => {
             tracing::warn!(error = %e, "kj ledger list failed; skipping this poll");
             return;
         }
     };
 
-    // Prune `seen` down to the ids still pending, so it doesn't grow
-    // forever as asks get answered and drop off the list.
-    let still_pending: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    seen.retain(|id| still_pending.contains(id.as_str()));
-
-    for id in ids {
-        if seen.contains(&id) {
-            continue;
-        }
-
-        let Some(ask) = show_ask(kernel, admin_ctx, &id).await else {
-            // A failed read is a slow read: leave the id UNSEEN so the next
-            // generation bump retries it. Marking it here would make one
-            // transient `kj ledger show` failure suppress the ask for as
-            // long as it stays pending.
-            continue;
-        };
+    for PendingAsk { request_id: id, info: ask } in new_asks {
         let session_id = rank::session_id_of(ask.context_id);
         if sessions.get(&session_id).is_none() {
             // Not ours to answer (see module docs) — some other surface
@@ -194,78 +182,8 @@ async fn poll_ledger(
     }
 }
 
-/// One pending ask's `kj ledger show` fields, decoded once so the caller
-/// doesn't hand around a raw `serde_json::Value`.
-struct AskInfo {
-    context_id: ContextId,
-    description: String,
-}
-
-async fn list_pending(kernel: &KernelBridge, ctx: ContextId) -> anyhow::Result<Vec<String>> {
-    let result = kernel
-        .execute_kj(ctx, vec!["ledger".to_string(), "list".to_string()])
-        .await?;
-    if result.exit_code != 0 {
-        anyhow::bail!("kj ledger list exited {}: {}", result.exit_code, result.stderr);
-    }
-    let ids = match result.data {
-        Some(serde_json::Value::Array(items)) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    };
-    Ok(ids)
-}
-
-async fn show_ask(kernel: &KernelBridge, ctx: ContextId, request_id: &str) -> Option<AskInfo> {
-    let result = match kernel
-        .execute_kj(
-            ctx,
-            vec!["ledger".to_string(), "show".to_string(), request_id.to_string()],
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(request = %request_id, error = %e, "kj ledger show errored");
-            return None;
-        }
-    };
-    if result.exit_code != 0 {
-        tracing::warn!(
-            request = %request_id,
-            exit_code = result.exit_code,
-            stderr = %result.stderr,
-            "kj ledger show failed"
-        );
-        return None;
-    }
-    let data = result.data?;
-    let context_id = match data
-        .get("context_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| ContextId::parse(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            tracing::warn!(request = %request_id, "ledger ask has no parseable context_id; skipping");
-            return None;
-        }
-    };
-    let description = data
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_default();
-    Some(AskInfo {
-        context_id,
-        description,
-    })
-}
-
 /// Run one `session/request_permission` round trip and write the answer
-/// back through `kj ledger allow|deny`.
+/// back through `kaijutsu_client::ledger::decide_ask`.
 async fn answer_ask(
     kernel: &KernelBridge,
     cx: &ConnectionTo<Client>,
@@ -305,13 +223,7 @@ async fn answer_ask(
     let verb = if allow { "allow" } else { "deny" };
     // The decide verb doesn't care which context it runs in — the ask's
     // own context is as good as any.
-    match kernel
-        .execute_kj(
-            ask.context_id,
-            vec!["ledger".to_string(), verb.to_string(), request_id.clone()],
-        )
-        .await
-    {
+    match ledger::decide_ask(kernel.actor(), ask.context_id, &request_id, allow).await {
         Ok(result) if result.exit_code == 0 => {
             tracing::debug!(request = %request_id, verb, "ledger ask answered");
         }

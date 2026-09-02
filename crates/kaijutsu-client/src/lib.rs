@@ -7,7 +7,9 @@ pub mod actor;
 pub mod constants;
 pub mod context_feed;
 pub mod document_store;
+pub mod ledger;
 pub mod midi_exchange;
+pub mod rank;
 pub mod rpc;
 pub mod sftp;
 pub mod share_server;
@@ -36,6 +38,8 @@ pub use context_feed::{
     context_feed_channel,
 };
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
+pub use ledger::{AskInfo, LedgerError, PendingAsk, decide_ask, list_pending, poll_new_asks, show_ask};
+pub use rank::{RankedSeat, ranked_context_ids, ranked_seats};
 pub use sftp::{CasFetch, CasResolver, ResolveSource, SftpClient, SftpError, default_cache_dir};
 pub use share_server::{
     ShareArg, ShareHandler, ShareServerConfig, parse_share_arg, validate_unique_names,

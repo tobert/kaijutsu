@@ -32,6 +32,10 @@ kaijutsu-telemetry.workspace = true
 # Shared CRDT types
 kaijutsu-types.workspace = true
 
+# The rank's seat computation (rank.rs) — zero-dep beyond voronator, pulls in
+# no Bevy (docs/tui.md, "Shape: the ACP bridge minus the protocol").
+kaijutsu-viz.workspace = true
+
 # Audio render seam (docs/pcm.md) — AudioRef/AudioFormatHint carried by ServerEvent::PlayAudio.
 kaijutsu-audio.workspace = true
 kaijutsu-cas.workspace = true

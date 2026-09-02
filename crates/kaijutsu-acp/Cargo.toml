@@ -16,7 +16,6 @@ workspace = true
 [dependencies]
 kaijutsu-client.workspace = true
 kaijutsu-types.workspace = true
-kaijutsu-viz.workspace = true
 kaijutsu-telemetry.workspace = true
 
 # ACP v1. The `2.0.0` is CRATE SemVer, not protocol v2 — protocol v2 lives
