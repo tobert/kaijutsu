@@ -261,9 +261,11 @@ we have"*):
   warning color past 80% of the TTL and reads `⏱ 6m01s ✗5m` once past it.
   With no TTL known (DeepSeek, a local model) the age stands alone — an age
   is never dressed up as an expiry.
-- **`⟳ 91%`** — the cached share of the last call's prompt,
-  `cache_read / input`. `⟳ —` when the provider reported no cache
-  accounting.
+- **`⟳ 91%`** — the cached share of the last call,
+  `cacheReadTokens / contextUsedTokens`. `⟳ —` when either is unknown. The
+  denominator is the last call's whole fill (input + output) because the wire
+  carries no separate input-token count; an `inputTokens` field beside
+  `cacheReadTokens` is what would make it the prompt share exactly.
 
 The wire carries all of it on `ContextHandleInfo`, beside `contextWindow` /
 `contextUsedTokens`: `lastCallAt` (unix milliseconds of the last completed
@@ -456,11 +458,11 @@ subsystem.
 
 ## Open
 
-- Crate and binary name (`kaijutsu-tui` is the placeholder).
 - Whether `RichSpan` should ride on `BlockSnapshot` next to `style_spans`,
   kernel-side, the way ANSI already does — consistent with "derived logic
   lives in the kernel", at the cost of a wire change. Not needed for v1.
-- Scrollback staleness: whether a block edited after it scrolled out earns a
-  one-line "block `#12` changed after print" notice, or only the status flag.
+- Scrollback staleness: the skeleton posts `block #12 changed after print`
+  in the status line and never redraws. Whether a change also earns its own
+  line in the transcript is still open.
 - Internal splits. Ruled out for v1; wezterm splits with
   `kaijutsu-tui --context <id>` cover it. Revisit when the itch is real.

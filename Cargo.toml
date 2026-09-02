@@ -11,6 +11,7 @@ members = [
     "crates/kaijutsu-mcp",
     "crates/kaijutsu-present",
     "crates/kaijutsu-acp",
+    "crates/kaijutsu-tui",
     "crates/kaijutsu-telemetry",
     "crates/kaijutsu-agent-tools",
     "crates/kaijutsu-index",
@@ -183,6 +184,13 @@ http = "1"
 # Vi-modal editing (keystroke → semantic action state machine)
 modalkit = "0.0.25"
 editor-types = "0.0.2"
+
+# Terminal UI (kaijutsu-tui). `crossterm_0_29` pins ratatui's backend to the
+# same crossterm the workspace already carries through modalkit, so one
+# crossterm serves both the renderer and the vi surfaces.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache", "underline-color", "scrolling-regions"] }
+crossterm = { version = "0.29" }
+unicode-width = "0.2"
 
 # System clipboard
 arboard = { version = "3", features = ["wayland-data-control"] }

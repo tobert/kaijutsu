@@ -1,0 +1,601 @@
+//! Client state: which contexts are watched, what has already been printed,
+//! the rank, the pending-ask count, and what the status line says.
+//!
+//! Pure. Nothing here opens a connection, reads a clock, or draws a cell —
+//! every value a decision needs is handed in, so the whole module is
+//! unit-testable without a kernel and without a terminal.
+
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use kaijutsu_client::{
+    ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
+};
+use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, Role};
+
+use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
+use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
+
+/// The double-tap window, shared by `Ctrl+C Ctrl+C` and the prefix's
+/// `Ctrl+A Ctrl+A` (`docs/input.md`, the app's `Esc Esc` pattern).
+pub const DOUBLE_TAP: Duration = Duration::from_millis(500);
+
+/// One watched context: its mirror, and what this client has already printed
+/// into the terminal's scrollback.
+pub struct ContextView {
+    pub mirror: ContextMirror,
+    /// Blocks already printed to scrollback. They cannot be redrawn — that
+    /// is the price of the inline viewport (`docs/tui.md`, ruling 1).
+    pub printed: HashSet<BlockId>,
+    /// Per-block collapse, seeded from [`collapses_by_default`] on first
+    /// arrival and then carried forward, so a later expand is not wiped by
+    /// the next redraw.
+    pub collapsed: HashMap<BlockId, bool>,
+    /// Activity since this context was last on screen — screen's `@` flag.
+    pub activity: bool,
+    /// Who the last block printed to scrollback was from, so a run of blocks
+    /// by one speaker carries one divider even when they print on separate
+    /// frames.
+    pub last_printed_speaker: Option<String>,
+}
+
+impl ContextView {
+    pub fn new(mirror: ContextMirror) -> Self {
+        let mut view = Self {
+            mirror,
+            printed: HashSet::new(),
+            collapsed: HashMap::new(),
+            activity: false,
+            last_printed_speaker: None,
+        };
+        view.seed_collapse();
+        view
+    }
+
+    /// Apply the first-arrival collapse default to every block that has not
+    /// been seen before.
+    pub fn seed_collapse(&mut self) {
+        for block in self.mirror.blocks() {
+            self.collapsed
+                .entry(block.id)
+                .or_insert_with(|| block.collapsed || collapses_by_default(block.kind));
+        }
+    }
+
+    /// Whether a block renders collapsed right now.
+    pub fn is_collapsed(&self, block: &BlockSnapshot) -> bool {
+        self.collapsed
+            .get(&block.id)
+            .copied()
+            .unwrap_or_else(|| block.collapsed || collapses_by_default(block.kind))
+    }
+}
+
+/// The whole client's state.
+pub struct App {
+    /// The local principal's display name, for the role divider.
+    pub identity: String,
+    /// The last `list_contexts` answer.
+    pub contexts: Vec<ContextInfo>,
+    /// The rank, recomputed from `contexts` — the same seats the app and an
+    /// ACP session list, in the same order.
+    pub seats: Vec<RankedSeat>,
+    pub current: Option<ContextId>,
+    /// Where `Ctrl+A Ctrl+A` goes.
+    pub previous: Option<ContextId>,
+    pub views: HashMap<ContextId, ContextView>,
+    pub connection: Option<ConnectionStatus>,
+    /// Pending asks across every context. Display only in this lane;
+    /// answering one is the asks lane (`asks.rs`).
+    pub pending_asks: usize,
+    /// The compose line. A single local line until the modalkit compose lane
+    /// lands (`compose.rs`).
+    pub compose: String,
+    pub palette: Palette,
+    pub wrap: WrapCache,
+    pub quit: bool,
+    notice: Option<String>,
+    last_ctrl_c: Option<Instant>,
+}
+
+impl App {
+    pub fn new(identity: impl Into<String>) -> Self {
+        Self {
+            identity: identity.into(),
+            contexts: Vec::new(),
+            seats: Vec::new(),
+            current: None,
+            previous: None,
+            views: HashMap::new(),
+            connection: None,
+            pending_asks: 0,
+            compose: String::new(),
+            palette: Palette::builtin(),
+            wrap: WrapCache::new(),
+            quit: false,
+            notice: None,
+            last_ctrl_c: None,
+        }
+    }
+
+    /// Take a fresh `list_contexts` answer and recompute the rank.
+    pub fn set_contexts(&mut self, contexts: Vec<ContextInfo>) {
+        self.seats = ranked_seats(&contexts);
+        self.contexts = contexts;
+    }
+
+    pub fn info(&self, id: ContextId) -> Option<&ContextInfo> {
+        self.contexts.iter().find(|c| c.id == id)
+    }
+
+    pub fn current_info(&self) -> Option<&ContextInfo> {
+        self.current.and_then(|id| self.info(id))
+    }
+
+    pub fn current_view(&self) -> Option<&ContextView> {
+        self.current.and_then(|id| self.views.get(&id))
+    }
+
+    /// The context sitting on seat `digit`, or `None` when the rank is
+    /// shorter than that.
+    pub fn seat_context(&self, digit: usize) -> Option<ContextId> {
+        self.seats.get(digit).map(|s| s.context_id)
+    }
+
+    /// Switch to a context, remembering where we came from. Switching to the
+    /// context already on screen is a no-op, so `Ctrl+A Ctrl+A` never
+    /// collapses onto itself.
+    pub fn switch_to(&mut self, id: ContextId) {
+        if self.current == Some(id) {
+            return;
+        }
+        self.previous = self.current;
+        self.current = Some(id);
+        if let Some(view) = self.views.get_mut(&id) {
+            view.activity = false;
+        }
+    }
+
+    /// `Ctrl+A Ctrl+A`. Returns the context switched to, or `None` when
+    /// there is nowhere to go back to.
+    pub fn switch_to_previous(&mut self) -> Option<ContextId> {
+        let target = self.previous?;
+        self.switch_to(target);
+        Some(target)
+    }
+
+    /// Who a block's divider names: the local user for their own text, the
+    /// context's model for a reply, otherwise the role.
+    pub fn speaker_for(&self, block: &BlockSnapshot, info: Option<&ContextInfo>) -> String {
+        match block.role {
+            Role::User => self.identity.clone(),
+            Role::Model => info
+                .and_then(|c| c.cast_label.clone())
+                .or_else(|| info.map(|c| model_leaf(&c.model).to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "model".to_string()),
+            Role::System => "system".to_string(),
+            Role::Tool => block.tool_name.clone().unwrap_or_else(|| "tool".to_string()),
+            Role::Asset => "asset".to_string(),
+        }
+    }
+
+    /// The view a block renders under. `stamp` is the block's wallclock,
+    /// formatted at the edge (see [`crate::render::wallclock`]).
+    pub fn block_view<'a>(
+        &'a self,
+        block: &BlockSnapshot,
+        speaker: &'a str,
+        stamp: &'a str,
+        show_divider: bool,
+    ) -> BlockView<'a> {
+        let ctx = block.id.context_id;
+        BlockView {
+            speaker,
+            context_type: self
+                .info(ctx)
+                .map(|c| c.context_type.as_str())
+                .unwrap_or("default"),
+            stamp,
+            show_divider,
+            collapsed: self
+                .views
+                .get(&ctx)
+                .map(|v| v.is_collapsed(block))
+                .unwrap_or_else(|| block.collapsed || collapses_by_default(block.kind)),
+            local_ctx: Some(ctx),
+        }
+    }
+
+    /// Post a status-line notice. It stands until something replaces it or
+    /// [`Self::clear_notice`] runs.
+    pub fn note(&mut self, message: impl Into<String>) {
+        self.notice = Some(message.into());
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
+    /// Record that a block has been printed into scrollback and can never be
+    /// redrawn, and remember who spoke it.
+    pub fn mark_printed(&mut self, context_id: ContextId, block_id: BlockId, speaker: &str) {
+        if let Some(view) = self.views.get_mut(&context_id) {
+            view.printed.insert(block_id);
+            view.last_printed_speaker = Some(speaker.to_string());
+        }
+        self.wrap.forget(&block_id);
+    }
+
+    /// Late-change honesty: a change to a block already in scrollback cannot
+    /// redraw it, so say so instead of pretending. The change is real in the
+    /// kernel and in the next hydrate (`docs/tui.md`, "Conversation").
+    ///
+    /// Returns `true` when a notice was posted.
+    pub fn observe_change(&mut self, context_id: ContextId, change: &ContextChange) -> bool {
+        let Some(block_id) = changed_block(change) else {
+            return false;
+        };
+        let printed = self
+            .views
+            .get(&context_id)
+            .is_some_and(|v| v.printed.contains(&block_id));
+        if !printed {
+            return false;
+        }
+        self.note(format!("block #{} changed after print", block_id.seq));
+        true
+    }
+
+    /// `Ctrl+C`. The second press inside [`DOUBLE_TAP`] quits.
+    pub fn press_ctrl_c(&mut self, now: Instant) -> bool {
+        let quit = self
+            .last_ctrl_c
+            .is_some_and(|prev| now.duration_since(prev) <= DOUBLE_TAP);
+        if quit {
+            self.quit = true;
+            self.last_ctrl_c = None;
+        } else {
+            self.last_ctrl_c = Some(now);
+            self.note("Ctrl+C again to quit");
+        }
+        quit
+    }
+
+    /// Cache health for the context on screen.
+    pub fn cache_health(&self, now_millis: u64) -> CacheHealth {
+        self.current_info()
+            .map(|info| cache_health(info, now_millis))
+            .unwrap_or_default()
+    }
+
+    /// Everything the status line draws.
+    pub fn status_model(&self, now_millis: u64) -> StatusModel {
+        let seats = self
+            .seats
+            .iter()
+            .enumerate()
+            .take(10)
+            .map(|(digit, seat)| SeatCell {
+                digit,
+                label: self
+                    .info(seat.context_id)
+                    .map(|c| c.label.clone())
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| seat.context_id.short()),
+                current: self.current == Some(seat.context_id),
+                activity: self
+                    .views
+                    .get(&seat.context_id)
+                    .is_some_and(|v| v.activity),
+                ask: false,
+            })
+            .collect();
+        let info = self.current_info();
+        StatusModel {
+            seats,
+            cast_model: info.map(|c| {
+                let cast = c.cast_label.clone().unwrap_or_else(|| c.context_type.clone());
+                // A context that has never completed a call carries no model.
+                // `coder` is the honest answer there; `coder/` is not.
+                match model_leaf(&c.model) {
+                    "" => cast,
+                    model => format!("{cast}/{model}"),
+                }
+            }),
+            occupancy: info.and_then(|c| c.context_used_pct).map(|p| p as u32),
+            cache: self.cache_health(now_millis),
+            pending_asks: self.pending_asks,
+            connection: self.connection.clone(),
+            notice: self.notice.clone(),
+        }
+    }
+}
+
+/// The block a change names, or `None` for a change that adds one.
+fn changed_block(change: &ContextChange) -> Option<BlockId> {
+    match change {
+        ContextChange::BlockInserted { .. } => None,
+        ContextChange::BlockDeleted { block_id }
+        | ContextChange::BlockMoved { block_id, .. }
+        | ContextChange::TextAppended { block_id, .. }
+        | ContextChange::TextReplaced { block_id, .. }
+        | ContextChange::StatusChanged { block_id, .. }
+        | ContextChange::CollapsedChanged { block_id, .. }
+        | ContextChange::ExcludedChanged { block_id, .. }
+        | ContextChange::MetadataChanged { block_id, .. }
+        | ContextChange::OutputChanged { block_id, .. }
+        | ContextChange::SpansChanged { block_id, .. } => Some(*block_id),
+    }
+}
+
+/// `"deepseek/deepseek-v4"` → `"deepseek-v4"`.
+fn model_leaf(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, PrincipalId, Status};
+
+    fn ctx(label: &str) -> ContextInfo {
+        ContextInfo {
+            id: ContextId::new(),
+            label: label.to_string(),
+            forked_from: None,
+            provider: String::new(),
+            model: "deepseek/deepseek-v4".to_string(),
+            created_at: 1_000,
+            trace_id: [0u8; 16],
+            fork_kind: None,
+            context_type: "coder".to_string(),
+            archived: false,
+            concluded_at: None,
+            keywords: Vec::new(),
+            top_block_preview: None,
+            live_status: Status::Pending,
+            last_activity_at: None,
+            track_id: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            context_window: None,
+            context_used_tokens: None,
+            context_used_pct: None,
+            background_running_count: 0,
+            background_oldest_running_started_at: None,
+            background_last_finished_at: None,
+            background_last_finished_status: None,
+            background_last_exit_code: None,
+            cast_label: None,
+            origin_host: None,
+            cwd: None,
+            last_call_at: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_ttl_secs: None,
+        }
+    }
+
+    fn block(context: ContextId, seq: u64, kind: BlockKind, role: Role) -> BlockSnapshot {
+        let id = BlockId::new(context, PrincipalId::new(), seq);
+        BlockSnapshotBuilder::new(id, kind)
+            .role(role)
+            .content("body")
+            .build()
+    }
+
+    fn app_with_two() -> (App, ContextId, ContextId) {
+        let mut a = ctx("kaijutsu");
+        a.promoted_at = Some(1_000);
+        let mut b = ctx("kaish");
+        b.promoted_at = Some(2_000);
+        let (aid, bid) = (a.id, b.id);
+        let mut app = App::new("amy");
+        app.set_contexts(vec![a, b]);
+        (app, aid, bid)
+    }
+
+    #[test]
+    fn the_rank_seats_contexts_in_promote_order() {
+        let (app, aid, bid) = app_with_two();
+        assert_eq!(app.seat_context(0), Some(aid));
+        assert_eq!(app.seat_context(1), Some(bid));
+        assert_eq!(app.seat_context(9), None);
+    }
+
+    #[test]
+    fn switching_remembers_where_we_came_from() {
+        let (mut app, aid, bid) = app_with_two();
+        app.switch_to(aid);
+        app.switch_to(bid);
+        assert_eq!(app.current, Some(bid));
+        assert_eq!(app.switch_to_previous(), Some(aid));
+        assert_eq!(app.current, Some(aid));
+        assert_eq!(app.switch_to_previous(), Some(bid));
+    }
+
+    #[test]
+    fn switching_to_the_context_already_on_screen_is_a_no_op() {
+        let (mut app, aid, _) = app_with_two();
+        app.switch_to(aid);
+        app.switch_to(aid);
+        assert_eq!(app.previous, None, "the toggle target was not overwritten");
+    }
+
+    #[test]
+    fn there_is_nowhere_to_go_back_to_at_startup() {
+        let (mut app, aid, _) = app_with_two();
+        app.switch_to(aid);
+        assert_eq!(app.switch_to_previous(), None);
+    }
+
+    #[test]
+    fn a_context_with_no_label_takes_its_short_id_in_the_rank() {
+        let mut a = ctx("");
+        a.promoted_at = Some(1_000);
+        let id = a.id;
+        let mut app = App::new("amy");
+        app.set_contexts(vec![a]);
+        assert_eq!(app.status_model(0).seats[0].label, id.short());
+    }
+
+    #[test]
+    fn a_context_that_has_never_called_a_model_shows_the_cast_alone() {
+        let mut a = ctx("fresh");
+        a.model = String::new();
+        a.promoted_at = Some(1_000);
+        let id = a.id;
+        let mut app = App::new("amy");
+        app.set_contexts(vec![a]);
+        app.switch_to(id);
+        assert_eq!(app.status_model(0).cast_model.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn the_status_model_marks_the_current_seat() {
+        let (mut app, _, bid) = app_with_two();
+        app.switch_to(bid);
+        let model = app.status_model(0);
+        assert_eq!(model.seats[0].label, "kaijutsu");
+        assert!(!model.seats[0].current);
+        assert!(model.seats[1].current);
+        assert_eq!(model.cast_model.as_deref(), Some("coder/deepseek-v4"));
+    }
+
+    /// A change to a block already printed to scrollback cannot redraw it.
+    /// The TUI says so in the status line rather than pretending — this is
+    /// the price of the inline viewport, paid knowingly.
+    #[test]
+    fn a_change_to_a_printed_block_posts_a_notice() {
+        let (mut app, aid, _) = app_with_two();
+        app.views
+            .insert(aid, ContextView::new(ContextMirror::new(aid)));
+        let b = block(aid, 12, BlockKind::Text, Role::Model);
+        app.mark_printed(aid, b.id, "model");
+
+        let posted = app.observe_change(
+            aid,
+            &ContextChange::ExcludedChanged {
+                block_id: b.id,
+                excluded: true,
+            },
+        );
+        assert!(posted);
+        assert_eq!(app.notice(), Some("block #12 changed after print"));
+    }
+
+    #[test]
+    fn a_change_to_a_block_still_in_the_viewport_posts_nothing() {
+        let (mut app, aid, _) = app_with_two();
+        app.views
+            .insert(aid, ContextView::new(ContextMirror::new(aid)));
+        let b = block(aid, 7, BlockKind::Text, Role::Model);
+
+        let posted = app.observe_change(
+            aid,
+            &ContextChange::TextAppended {
+                block_id: b.id,
+                suffix: " more".to_string(),
+            },
+        );
+        assert!(!posted);
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn a_late_collapse_of_a_printed_block_also_posts() {
+        let (mut app, aid, _) = app_with_two();
+        app.views
+            .insert(aid, ContextView::new(ContextMirror::new(aid)));
+        let b = block(aid, 3, BlockKind::ToolResult, Role::Tool);
+        app.mark_printed(aid, b.id, "shell");
+        assert!(app.observe_change(
+            aid,
+            &ContextChange::CollapsedChanged {
+                block_id: b.id,
+                collapsed: false,
+            }
+        ));
+        assert_eq!(app.notice(), Some("block #3 changed after print"));
+    }
+
+    #[test]
+    fn a_new_block_is_never_a_late_change() {
+        let (mut app, aid, _) = app_with_two();
+        app.views
+            .insert(aid, ContextView::new(ContextMirror::new(aid)));
+        let b = block(aid, 1, BlockKind::Text, Role::Model);
+        assert!(!app.observe_change(
+            aid,
+            &ContextChange::BlockInserted {
+                block: Box::new(b),
+                after_id: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_twice_inside_the_window_quits() {
+        let (mut app, _, _) = app_with_two();
+        let t0 = Instant::now();
+        assert!(!app.press_ctrl_c(t0));
+        assert!(!app.quit);
+        assert!(app.press_ctrl_c(t0 + Duration::from_millis(400)));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn ctrl_c_twice_outside_the_window_does_not_quit() {
+        let (mut app, _, _) = app_with_two();
+        let t0 = Instant::now();
+        assert!(!app.press_ctrl_c(t0));
+        assert!(!app.press_ctrl_c(t0 + Duration::from_millis(900)));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn tool_blocks_arrive_collapsed_and_stay_expanded_once_expanded() {
+        let (_, aid, _) = app_with_two();
+        let mut mirror = ContextMirror::new(aid);
+        let call = block(aid, 1, BlockKind::ToolCall, Role::Model);
+        let text = block(aid, 2, BlockKind::Text, Role::Model);
+        mirror
+            .apply_snapshot(vec![call.clone(), text.clone()], 1)
+            .expect("snapshot applies");
+        let mut view = ContextView::new(mirror);
+        assert!(view.is_collapsed(&call));
+        assert!(!view.is_collapsed(&text));
+
+        view.collapsed.insert(call.id, false);
+        view.seed_collapse();
+        assert!(!view.is_collapsed(&call), "a user's expand is carried forward");
+    }
+
+    #[test]
+    fn the_divider_names_the_local_user_for_their_own_text() {
+        let (app, aid, _) = app_with_two();
+        let b = block(aid, 1, BlockKind::Text, Role::User);
+        assert_eq!(app.speaker_for(&b, app.info(aid)), "amy");
+    }
+
+    #[test]
+    fn the_divider_names_the_model_for_a_reply() {
+        let (app, aid, _) = app_with_two();
+        let b = block(aid, 1, BlockKind::Text, Role::Model);
+        assert_eq!(app.speaker_for(&b, app.info(aid)), "deepseek-v4");
+    }
+
+    #[test]
+    fn the_divider_names_the_tool_for_a_tool_result() {
+        let (app, aid, _) = app_with_two();
+        let mut b = block(aid, 1, BlockKind::ToolResult, Role::Tool);
+        b.tool_name = Some("shell".to_string());
+        assert_eq!(app.speaker_for(&b, app.info(aid)), "shell");
+    }
+}
