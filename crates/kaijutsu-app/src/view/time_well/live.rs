@@ -29,7 +29,7 @@
 //!   slice 2).
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bevy::prelude::*;
 use kaijutsu_audio::{RefDisposition, RENDER_FLUSH_MIME};
@@ -440,6 +440,7 @@ pub fn sync_selected_card_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use kaijutsu_audio::BeatRef;
     use kaijutsu_types::BlockId;
     use kaijutsu_types::{PrincipalId, ToolKind, TrackId};
