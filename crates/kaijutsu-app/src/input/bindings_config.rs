@@ -26,7 +26,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use super::action::Action;
+use super::Action;
 use super::binding::{Binding, Modifiers};
 use super::context::InputContext;
 use super::defaults::default_bindings;

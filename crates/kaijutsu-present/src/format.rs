@@ -1,75 +1,124 @@
-//! Pure formatting functions for block rendering.
+//! Block → display text, and block → semantic tone.
 //!
-//! All functions in this module are stateless — they map block data to
-//! display strings. No ECS, no systems, just data transforms.
+//! Every function here is stateless: it maps block data to display strings
+//! and to the [`BlockTone`] a client resolves against its own theme. No ECS,
+//! no toolkit, no systems — just data transforms.
 
-use crate::ui::theme::Theme;
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, DriftKind, ErrorCategory, Role, Status};
 use kaijutsu_types::{ContextId, OutputData, OutputEntryType, OutputNode};
+use strum::EnumIter;
 
-/// Looks up a sibling block by id within the same document, for resolving an
-/// `Error` block's provenance (parent ToolResult/ToolCall, interrupted turn).
-/// The render buffer (`RenderBlockStore`) already indexes blocks by id, so
-/// this is an O(1) lookup, not a document scan — see `render.rs`'s call site.
-pub type BlockLookup<'a> = &'a dyn Fn(&BlockId) -> Option<BlockSnapshot>;
-
-/// Map a block to its semantic text color based on BlockKind and Role.
+/// The color role a block asks its client's theme for.
 ///
-/// This enables visual distinction between different block types:
-/// - User messages: soft white
-/// - Assistant messages: light blue
-/// - Thinking: dim gray (de-emphasized)
-/// - Tool calls: amber
-/// - Tool results: green (error: red)
-/// - Shell: cyan for commands, gray for output
-pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color {
+/// One variant per color a client's theme names for block text, so the
+/// resolver on the client side is a total function with no default arm: a
+/// tone added here fails that match rather than silently painting a
+/// fallback color. Which tone a block carries is [`block_tone`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter)]
+pub enum BlockTone {
+    /// A human's own text, and the shell they ran by hand.
+    User,
+    /// A model's reply.
+    Assistant,
+    /// Inner voice — de-emphasized.
+    Thinking,
+    /// A tool call still running.
+    ToolCall,
+    /// A tool result, or a tool-role block carrying one.
+    ToolResult,
+    /// A tool result that failed.
+    ToolError,
+    /// An `Error` block whose severity is `Warning`.
+    ErrorWarning,
+    /// An `Error` block whose severity is `Error` (the unremarkable case).
+    ErrorSeverity,
+    /// An `Error` block whose severity is `Fatal`.
+    ErrorFatal,
+    /// Drift pushed out of a context.
+    DriftPush,
+    /// Drift pulled in — distill and notification ride this one.
+    DriftPull,
+    /// A drift merge, and fork's structural edge.
+    DriftMerge,
+    /// A notification block.
+    Notification,
+    /// A resource block.
+    Resource,
+    /// Plain body text: a finished tool call reads as ordinary output.
+    Foreground,
+    /// Dimmed body text: system prose, traces, drift with no kind recorded.
+    Dim,
+}
+
+impl BlockTone {
+    /// Every tone, derived from the enum itself — a client's exhaustiveness
+    /// test cannot fall behind a variant added here.
+    pub fn all() -> impl Iterator<Item = BlockTone> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+}
+
+/// The tone a block asks for, from its kind, role and status.
+///
+/// - User text and a human's own shell: [`BlockTone::User`]
+/// - A model's reply: [`BlockTone::Assistant`]
+/// - Thinking: [`BlockTone::Thinking`] (de-emphasized)
+/// - A running tool call: [`BlockTone::ToolCall`]; a finished one reads as
+///   ordinary output ([`BlockTone::Foreground`])
+/// - A tool result: [`BlockTone::ToolResult`], or [`BlockTone::ToolError`]
+///   when it failed
+pub fn block_tone(block: &BlockSnapshot) -> BlockTone {
     match block.kind {
         // Task rendering deliberately trails this slice (docs/tasks.md) —
         // role-based coloring is the same honest placeholder Text/File get,
         // not a dedicated task palette.
         BlockKind::Text | BlockKind::File | BlockKind::Task => match block.role {
-            Role::User => theme.block_user,
-            Role::Model => theme.block_assistant,
-            Role::System => theme.fg_dim,
-            Role::Tool | Role::Asset => theme.block_tool_result,
+            Role::User => BlockTone::User,
+            Role::Model => BlockTone::Assistant,
+            Role::System => BlockTone::Dim,
+            Role::Tool | Role::Asset => BlockTone::ToolResult,
         },
-        BlockKind::Thinking => theme.block_thinking,
+        BlockKind::Thinking => BlockTone::Thinking,
         BlockKind::ToolCall => {
             if block.role == Role::User {
-                theme.block_user // user-initiated shell — same color as user text
+                BlockTone::User // user-initiated shell — same tone as user text
             } else if block.status == Status::Done {
-                theme.fg
+                BlockTone::Foreground
             } else {
-                theme.block_tool_call
+                BlockTone::ToolCall
             }
         }
         BlockKind::ToolResult => {
             if block.is_error {
-                theme.block_tool_error
+                BlockTone::ToolError
             } else {
-                theme.block_tool_result
+                BlockTone::ToolResult
             }
         }
-        BlockKind::Error => {
-            match block.error.as_ref().map(|e| e.severity) {
-                Some(kaijutsu_types::ErrorSeverity::Warning) => theme.block_error_warning,
-                Some(kaijutsu_types::ErrorSeverity::Fatal) => theme.block_error_fatal,
-                _ => theme.block_error_severity,
-            }
-        }
-        BlockKind::Notification => theme.block_notification,
-        BlockKind::Resource => theme.block_resource,
-        BlockKind::Trace => theme.fg_dim,
+        BlockKind::Error => match block.error.as_ref().map(|e| e.severity) {
+            Some(kaijutsu_types::ErrorSeverity::Warning) => BlockTone::ErrorWarning,
+            Some(kaijutsu_types::ErrorSeverity::Fatal) => BlockTone::ErrorFatal,
+            _ => BlockTone::ErrorSeverity,
+        },
+        BlockKind::Notification => BlockTone::Notification,
+        BlockKind::Resource => BlockTone::Resource,
+        BlockKind::Trace => BlockTone::Dim,
         BlockKind::Drift => match block.drift_kind {
-            Some(DriftKind::Push) => theme.block_drift_push,
-            Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
-            Some(DriftKind::Merge) => theme.block_drift_merge,
-            Some(DriftKind::Notification) => theme.block_drift_pull,
-            Some(DriftKind::Fork) => theme.block_drift_merge,
-            None => theme.fg_dim,
+            Some(DriftKind::Push) => BlockTone::DriftPush,
+            Some(DriftKind::Pull) | Some(DriftKind::Distill) => BlockTone::DriftPull,
+            Some(DriftKind::Merge) => BlockTone::DriftMerge,
+            Some(DriftKind::Notification) => BlockTone::DriftPull,
+            Some(DriftKind::Fork) => BlockTone::DriftMerge,
+            None => BlockTone::Dim,
         },
     }
 }
+
+/// Looks up a sibling block by id within the same document, for resolving an
+/// `Error` block's provenance (parent ToolResult/ToolCall, interrupted turn).
+/// A client passes a closure over whatever index it already keeps, so this is
+/// an O(1) lookup rather than a document scan.
+pub type BlockLookup<'a> = &'a dyn Fn(&BlockId) -> Option<BlockSnapshot>;
 
 /// Strip provider prefix from model name for compact display.
 ///
@@ -135,17 +184,17 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
 /// Number of detail lines shown in a collapsed Error block's stub preview.
 const ERROR_STUB_DETAIL_LINES: usize = 3;
 
-/// Total line budget a collapsed Error stub can occupy: provenance + summary
-/// + up to `ERROR_STUB_DETAIL_LINES` detail lines + a trailing "N more
-/// lines" hint. Used by `geometry::estimate_block_height` so a freshly
-/// seeded row isn't sized for the single line a `Thinking` stub gets.
+/// Total line budget a collapsed Error stub can occupy: provenance line,
+/// summary line, up to `ERROR_STUB_DETAIL_LINES` detail lines, and a trailing
+/// "N more lines" hint. A client sizing a row before it has the text reads
+/// this, so a freshly seeded Error row isn't sized for the single line a
+/// `Thinking` stub gets.
 pub const ERROR_STUB_MAX_LINES: usize = 2 + ERROR_STUB_DETAIL_LINES + 1;
 
 /// The key that toggles block collapse, for the stub's "N more lines" hint.
-/// Mirrors `input::defaults`'s `Action::CollapseToggle` binding (plain `c`
-/// in the Navigation context) — this module can't read the binding table
-/// (pure formatting, no ECS resources), so keep this in sync by hand if
-/// that binding ever moves.
+/// Mirrors the default `Action::CollapseToggle` binding (plain `c` in the
+/// Navigation context) — this module cannot read a client's binding table,
+/// so keep this in sync by hand if that binding ever moves.
 const COLLAPSE_TOGGLE_KEY_HINT: &str = "c";
 
 /// Format a `BlockKind::Error` block: a provenance line (what failed) always
@@ -1153,23 +1202,98 @@ mod tests {
         assert_eq!(result, "cargo check");
     }
 
-    #[test]
-    fn test_user_shell_tool_call_color() {
-        let theme = Theme::default();
-        let block = BlockSnapshot::tool_call(
+    // ------------------------------------------------------------------
+    // BlockTone — the color role a block asks its client's theme for
+    // ------------------------------------------------------------------
+
+    fn shell_call(role: Role) -> BlockSnapshot {
+        BlockSnapshot::tool_call(
             test_block_id(),
             None,
             ToolKind::Shell,
             "shell",
             serde_json::json!({"code": "ls"}),
-            Role::User,
+            role,
+            None,
+        )
+    }
+
+    /// A human's own shell reads as the human's own text, not as a tool call.
+    #[test]
+    fn user_shell_tool_call_takes_the_user_tone() {
+        assert_eq!(block_tone(&shell_call(Role::User)), BlockTone::User);
+    }
+
+    /// A model's tool call is only "in flight" colored while it is running;
+    /// once it is `Done` its output is ordinary body text.
+    #[test]
+    fn model_tool_call_tone_follows_status() {
+        let mut block = shell_call(Role::Model);
+        assert_eq!(block_tone(&block), BlockTone::ToolCall, "still running");
+        block.status = Status::Done;
+        assert_eq!(block_tone(&block), BlockTone::Foreground, "finished");
+    }
+
+    #[test]
+    fn text_block_tone_follows_role() {
+        let id = test_block_id();
+        for (role, tone) in [
+            (Role::User, BlockTone::User),
+            (Role::Model, BlockTone::Assistant),
+            (Role::System, BlockTone::Dim),
+            (Role::Tool, BlockTone::ToolResult),
+        ] {
+            let block = BlockSnapshot::text(id, None, role, "hi");
+            assert_eq!(block_tone(&block), tone, "role {role:?}");
+        }
+    }
+
+    #[test]
+    fn failed_tool_result_takes_the_error_tone() {
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let call_id = BlockId::new(ctx, agent, 0);
+        let mut block = BlockSnapshot::tool_result(
+            BlockId::new(ctx, agent, 1),
+            call_id,
+            ToolKind::Shell,
+            "boom",
+            true,
+            Some(1),
             None,
         );
-        let color = block_color(&block, &theme);
-        assert_eq!(
-            color, theme.block_user,
-            "user shell should use block_user color"
-        );
+        assert_eq!(block_tone(&block), BlockTone::ToolError);
+        block.is_error = false;
+        assert_eq!(block_tone(&block), BlockTone::ToolResult);
+    }
+
+    #[test]
+    fn error_block_tone_follows_severity() {
+        let (_, _, mut block) = tool_error_chain();
+        assert_eq!(block_tone(&block), BlockTone::ErrorSeverity);
+        block.error.as_mut().unwrap().severity = kaijutsu_types::ErrorSeverity::Warning;
+        assert_eq!(block_tone(&block), BlockTone::ErrorWarning);
+        block.error.as_mut().unwrap().severity = kaijutsu_types::ErrorSeverity::Fatal;
+        assert_eq!(block_tone(&block), BlockTone::ErrorFatal);
+    }
+
+    #[test]
+    fn drift_tone_splits_push_pull_and_merge() {
+        let mut block = BlockSnapshot::text(test_block_id(), None, Role::Model, "d");
+        block.kind = BlockKind::Drift;
+        for (kind, tone) in [
+            (DriftKind::Push, BlockTone::DriftPush),
+            (DriftKind::Pull, BlockTone::DriftPull),
+            (DriftKind::Distill, BlockTone::DriftPull),
+            (DriftKind::Notification, BlockTone::DriftPull),
+            (DriftKind::Merge, BlockTone::DriftMerge),
+            (DriftKind::Fork, BlockTone::DriftMerge),
+        ] {
+            block.drift_kind = Some(kind);
+            assert_eq!(block_tone(&block), tone, "drift kind {kind:?}");
+        }
+        block.drift_kind = None;
+        assert_eq!(block_tone(&block), BlockTone::Dim, "no kind recorded");
     }
 
     #[test]

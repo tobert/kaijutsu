@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use super::action::Action;
+use super::Action;
 use super::events::ActionFired;
 use super::focus::FocusArea;
 

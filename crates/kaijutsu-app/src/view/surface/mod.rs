@@ -109,7 +109,7 @@ pub struct WindowKey {
     /// [`shape_cache::ShapedBlockCache::generation`] — the cache itself
     /// mutated: a shape landed (sync or async), a block was evicted, a
     /// status-driven recolor ran, a placement refreshed. The theme epoch
-    /// cannot stand in for this — `block_color` also encodes *status* (a
+    /// cannot stand in for this — `block_tone` also encodes *status* (a
     /// tool call finishing goes amber→fg with no theme write), and an async
     /// landing whose height exactly matched its estimate moves neither the
     /// geometry epoch nor anything else here (found by review, 2026-08-18).

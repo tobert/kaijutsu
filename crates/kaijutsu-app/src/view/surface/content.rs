@@ -2,7 +2,7 @@
 //!
 //! [`BlockContentCache`] is the entity-free replacement for the deleted
 //! per-block-cell path's formatting step: the same `format_single_block` /
-//! `block_color` / rich-detection flow, but the answer lands in a resource
+//! `Theme::block_color` / rich-detection flow, but the answer lands in a resource
 //! keyed by block id rather than on a spawned per-block entity. That is the
 //! whole point — the surface has no per-block entities to hang the result on.
 //!
@@ -34,7 +34,7 @@ use crate::cell::block_border::BorderInputs;
 use crate::cell::{CellEditor, ConversationScrollState, EditorEntities, MainCell};
 use crate::text::rich::{RichContentKind, SpanBrush};
 use crate::ui::theme::Theme;
-use crate::view::format::{block_color, format_single_block};
+use kaijutsu_present::format::format_single_block;
 use crate::view::geometry::{ConversationGeometry, RowKey};
 
 /// How many screens of slack, on each side of the viewport, keep a block's
@@ -136,7 +136,7 @@ pub struct FormattedBlock {
     /// The text to shape — `format_single_block`'s output, or markdown's
     /// `plain_text` where detection produced spans for it.
     pub text: String,
-    /// Base text color (`block_color`).
+    /// Base text color (`Theme::block_color`).
     pub color: Color,
     /// Per-byte-range brushes for the text above. Empty for everything but
     /// markdown, Output and diff.
@@ -423,7 +423,7 @@ pub fn sync_block_content(
 
         let text = format_single_block(&block, local_ctx, &|pid| editor.block_snapshot(pid));
 
-        let color = block_color(&block, &theme);
+        let color = theme.block_color(&block);
         let fingerprint = crate::text::rich::rich_input_fingerprint(&text, &block);
 
         // Detection is the expensive half. Reuse the previous answer when the
@@ -604,14 +604,8 @@ fn detect(
     let kind = RichPayload(std::sync::Arc::new(rich.kind));
     let (text, spans) = match kind.kind() {
         RichContentKind::Markdown { spans, plain_text } => {
-            let md_colors = crate::text::markdown::MarkdownColors {
-                heading: theme.md_heading_color,
-                code: theme.md_code_fg,
-                strong: theme.md_strong_color,
-                code_block: theme.md_code_block_fg,
-            };
             let brushes =
-                crate::text::rich::build_span_brushes(spans, theme.block_assistant, &md_colors);
+                crate::text::rich::build_span_brushes(spans, theme.block_assistant, theme);
             (plain_text.clone(), brushes)
         }
         RichContentKind::Output { layout, plain_text } => (

@@ -34,8 +34,8 @@ kaijutsu-server / kernel
 3. **Beat timing lives in `kaijutsu-audio`.** Already true: `LocalBeat`,
    `BeatRef`, the stale ladder and the deadband are in
    `crates/kaijutsu-audio/src/timebase.rs`. Only the per-track map
-   (`WellBeats`, `kaijutsu-app/src/view/time_well/live.rs`) is app-side, and
-   it moves down with its `Resource` derive removed.
+   (`WellBeats`) was app-side and now lives in `kaijutsu-present`
+   (`beats.rs`), with the `Resource` derive replaced by an app-side newtype.
 4. **One `bindings.toml` for both clients**, keyed by vim key notation. The
    TUI ships it first; subagents convert the app after. *"I'll want the
    commentary in that toml to be clinical and reviewed by a couple flash tier
@@ -265,18 +265,16 @@ we have"*):
   `cache_read / input`. `⟳ —` when the provider reported no cache
   accounting.
 
-The kernel already holds all of it durably, per context, in
-`ContextUsageRow` (`kaijutsu-kernel/src/kernel_db.rs`): `input_tokens`,
-`cache_read_tokens`, `cache_write_tokens`, `updated_at`. Only
-`context_window` / `context_used_tokens` reach the wire today
-(`kaijutsu-server/src/rpc.rs`, `resolve_usage_wire_fields`). The projection
-lane in `docs/issues.md` adds `lastCallAt`, `cacheReadTokens`,
-`cacheWriteTokens` and `cacheTtlSecs` to `ContextHandleInfo`; the TTL is the
-`CacheTtl` the request builder chose (`llm/stream.rs`: `Ephemeral` = 5 min,
-`Extended` = 1 h), recorded on the usage row at call completion, `0` when
-the provider declares none. Until that lands the TUI stamps `TurnCompleted`
-receipt locally and shows the age for contexts it has watched, `⏱ —` for
-the rest.
+The wire carries all of it on `ContextHandleInfo`, beside `contextWindow` /
+`contextUsedTokens`: `lastCallAt` (unix milliseconds of the last completed
+call), `cacheReadTokens`, `cacheWriteTokens` and `cacheTtlSecs`. The TTL is
+the longest `CacheTtl` among the request's cache breakpoints
+(`llm/stream.rs`: `Ephemeral` = 300, `Extended` = 3600), recorded on the
+usage row at call completion; it is `0` when the provider path never emits
+a `cache_control` (DeepSeek, a local model) or the request had no
+breakpoints. `0` on any field means unknown, and `kaijutsu_client::ContextInfo`
+decodes it as `None`. The TUI reads `list_contexts`; nothing is stamped
+locally.
 
 Estimators — a per-provider model of when a cache actually expires, learned
 from `cache_read` falling to zero — come later and build on these fields;
@@ -381,11 +379,22 @@ Reused unchanged: `kaijutsu-client` (22k lines, no Bevy dependency; ACP is the
 proof it is toolkit-agnostic), `kaijutsu-editor`, `kaijutsu-diff`,
 `kaijutsu-viz::layout`, `kaijutsu-audio::timebase`.
 
-Lifted with a small de-Bevy (each has one `bevy::Color` leak):
-`kaijutsu-app/src/view/format.rs` (block → text), `text/markdown.rs`
-(pulldown-cmark → `RichSpan`), `kaish/mod.rs` (syntax validation, already
-Bevy-free), the `Action` enum, `WellBeats`. These land in a small presentation
-crate both clients consume — the thin-client move that falls out of this work.
+Lifted with a small de-Bevy into `kaijutsu-present`, the presentation crate
+both clients consume — the thin-client move that falls out of this work:
+`view/format.rs` (block → text), `text/markdown.rs` (pulldown-cmark →
+`RichSpan`), `kaish/mod.rs` (syntax validation, already Bevy-free), the
+`Action` enum, `WellBeats`.
+
+**Color is the seam, and it is semantic.** A block resolves to a `BlockTone`
+and a markdown span to a `SpanTone` — one variant per color a theme has a name
+for, `BlockTone::User` through `BlockTone::Dim` — and each client turns a tone
+into its own color type (`Theme::color_for` in the app, a ratatui `Style` in
+the TUI). The resolver is a total function with no default arm, so a tone
+added to the crate fails the client's match instead of painting a placeholder
+nobody notices. The other three leaks were smaller: `Action` keeps `Reflect`
+behind an off-by-default `bevy` feature (the app's `Binding` and `ActionFired`
+nest it in their own reflected types), and `WellBeats` sheds its `Resource`
+derive for an app-side newtype.
 
 New, in ratatui: event loop and actor wiring, the transcript printer with a
 per-block wrap cache keyed `(block, version, width)`, compose, shell surface,

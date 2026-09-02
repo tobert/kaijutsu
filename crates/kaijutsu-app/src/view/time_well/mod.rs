@@ -85,7 +85,7 @@ impl Plugin for TimeWellPlugin {
             .init_resource::<scene::TimeWellState>()
             .init_resource::<activity::RingActivity>()
             .init_resource::<live::ContextTails>()
-            .init_resource::<live::WellBeats>()
+            .init_resource::<live::WellBeatsRes>()
             .init_resource::<rays::WellTracks>()
             // Go-to-well runs on every screen (prefix/gamepad reach it from
             // anywhere); it consumes ActionFired, so it follows dispatch.

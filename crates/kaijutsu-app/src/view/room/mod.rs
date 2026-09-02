@@ -117,7 +117,7 @@ use crate::ui::screen::Screen;
 use crate::view::scene_geometry;
 use crate::view::patch_bay;
 use crate::view::scene_palette::{ScenePalette, lin_scaled};
-use crate::view::time_well::live::WellBeats;
+use crate::view::time_well::live::WellBeatsRes;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use peniko::Brush;
 
@@ -1762,7 +1762,7 @@ fn ingest_room_activity(
 /// (`Bearing::Center` itself stays for room geometry, just unfed).
 fn sync_room_glow(
     room_activity: Res<BearingActivity>,
-    beats: Res<WellBeats>,
+    beats: Res<WellBeatsRes>,
     room: Res<RoomState>,
     palette: Res<ScenePalette>,
     mut mats: ResMut<Assets<StandardMaterial>>,

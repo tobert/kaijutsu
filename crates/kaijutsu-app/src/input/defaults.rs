@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use super::action::Action;
+use super::Action;
 use super::binding::{Binding, Modifiers};
 use super::context::InputContext;
 use bevy::input::gamepad::GamepadButton;

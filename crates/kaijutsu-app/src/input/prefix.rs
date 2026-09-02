@@ -16,7 +16,7 @@
 use bevy::prelude::*;
 use std::time::Instant;
 
-use super::action::Action;
+use super::Action;
 
 /// How long an armed prefix waits for its second key (milliseconds).
 pub const PREFIX_TIMEOUT_MS: u128 = 1000;

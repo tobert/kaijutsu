@@ -21,6 +21,11 @@ kaijutsu-cas.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-diff = { workspace = true, features = ["viewer"] }
 kaijutsu-kernel.workspace = true
+# The shared presentation layer (block → text, markdown spans, kaish syntax,
+# the Action vocabulary, beat phasors). The `bevy` feature only adds
+# `Reflect` to `Action` so it can be registered and nested in this crate's
+# own reflected types; the crate itself stays Bevy-free by default.
+kaijutsu-present = { workspace = true, features = ["bevy"] }
 crossbeam-channel = "0.5"
 kaijutsu-types.workspace = true
 kaijutsu-viz.workspace = true

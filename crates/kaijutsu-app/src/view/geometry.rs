@@ -132,9 +132,9 @@ impl Default for EstimateParams {
 /// the spawn band (before it becomes visible).
 ///
 /// Collapsed is a flat `line_height` for every kind except `Error`: a
-/// collapsed `Error` block renders `format::ERROR_STUB_MAX_LINES` lines
+/// collapsed `Error` block renders `present::format::ERROR_STUB_MAX_LINES` lines
 /// (provenance, summary, up to 3 detail lines, a hint line — see
-/// `format::format_error_stub`), not the single-line `Thinking [collapsed]`
+/// `present::format::format_error_stub`), not the single-line `Thinking [collapsed]`
 /// stub, so sizing it like `Thinking` would under-reserve space and cause a
 /// visible jump when the row is first measured.
 pub fn estimate_block_height(
@@ -146,7 +146,7 @@ pub fn estimate_block_height(
 ) -> f32 {
     if collapsed {
         let lines = if kind == BlockKind::Error {
-            crate::view::format::ERROR_STUB_MAX_LINES
+            kaijutsu_present::format::ERROR_STUB_MAX_LINES
         } else {
             1
         };
@@ -730,7 +730,7 @@ mod tests {
         // `Thinking [collapsed]` stub would under-reserve space.
         assert_eq!(
             estimate_block_height(10_000, 99, true, BlockKind::Error, &params()),
-            crate::view::format::ERROR_STUB_MAX_LINES as f32 * 30.0
+            kaijutsu_present::format::ERROR_STUB_MAX_LINES as f32 * 30.0
         );
     }
 

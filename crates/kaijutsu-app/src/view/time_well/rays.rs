@@ -457,7 +457,7 @@ fn quantize(v: f32) -> f32 {
 /// writing.
 pub fn animate_track_rays(
     state: Res<WellTracks>,
-    beats: Res<super::live::WellBeats>,
+    beats: Res<super::live::WellBeatsRes>,
     activity: Res<super::activity::RingActivity>,
     mut materials: ResMut<Assets<TrackRayMaterial>>,
     rays: Query<(&TrackRay, &MeshMaterial3d<TrackRayMaterial>)>,

@@ -30,7 +30,6 @@
 //! - `InputMap` — all bindings (readable + mutable)
 //! - `ActiveInputContexts` — which contexts are active
 
-pub mod action;
 pub mod binding;
 pub mod context;
 pub mod defaults;
@@ -50,7 +49,7 @@ pub mod vim;
 // FocusArea is consumed by cell, dock, timeline, conversation, frame_assembly.
 // others are pub API for future external consumers.
 #[allow(unused_imports)]
-pub use action::Action;
+pub use kaijutsu_present::action::Action;
 #[allow(unused_imports)]
 pub use context::InputContext;
 #[allow(unused_imports)]
@@ -197,7 +196,7 @@ impl Plugin for InputPlugin {
             .register_type::<events::AnalogInput>()
             .register_type::<events::ActionFired>()
             .register_type::<events::TextInputReceived>()
-            .register_type::<action::Action>()
+            .register_type::<Action>()
             .register_type::<binding::Binding>()
             .register_type::<binding::InputSource>()
             .register_type::<binding::Modifiers>()

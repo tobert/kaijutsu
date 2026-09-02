@@ -1,0 +1,33 @@
+[package]
+name = "kaijutsu-present"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Toolkit-free presentation logic shared by kaijutsu's clients: block → text, markdown → spans, kaish syntax, the action vocabulary, beat phasors"
+
+[lints]
+workspace = true
+
+[features]
+# Adds `bevy_reflect::Reflect` to `Action` so the Bevy client can
+# `register_type::<Action>()` and carry it inside its own reflected types
+# (`Binding`, `ActionFired`). Off by default: the default feature set must
+# stay free of Bevy so a terminal client can link this crate.
+bevy = ["dep:bevy_reflect"]
+
+[dependencies]
+kaijutsu-types.workspace = true
+kaijutsu-audio.workspace = true
+pulldown-cmark.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+
+# kaish syntax validation runs in-process against the real lexer and parser —
+# same grammar the kernel executes, no subprocess.
+kaish-kernel.workspace = true
+logos = "0.16"
+
+# Version-locked to the `bevy` the app depends on: `register_type` only
+# accepts a registration built by the same bevy_reflect.
+bevy_reflect = { version = "0.19", optional = true }

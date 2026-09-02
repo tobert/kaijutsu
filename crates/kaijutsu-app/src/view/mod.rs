@@ -30,7 +30,6 @@ pub mod components;
 pub mod document;
 pub mod diff_view;
 pub mod editor;
-pub mod format;
 pub mod fsn;
 pub mod geometry;
 pub mod lifecycle;

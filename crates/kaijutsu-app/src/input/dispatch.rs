@@ -20,7 +20,7 @@ use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
-use super::action::Action;
+use super::Action;
 use super::binding::{InputSource, Modifiers};
 use super::context::{ActiveInputContexts, InputContext, KeyboardGrab};
 use super::events::{ActionFired, AnalogInput, GrabbedKey, LiteralPrefix};

@@ -5,6 +5,9 @@
 
 use bevy::math::Vec4;
 use bevy::prelude::*;
+use kaijutsu_present::format::{BlockTone, block_tone};
+use kaijutsu_present::markdown::SpanTone;
+use kaijutsu_types::BlockSnapshot;
 
 /// ANSI 16-color palette for terminal/syntax rendering.
 ///
@@ -512,6 +515,54 @@ pub struct Theme {
     pub label_pad: f32,
 }
 
+impl Theme {
+    /// The color for a block's semantic tone.
+    ///
+    /// Exhaustive on purpose: a tone added to `kaijutsu_present` fails this
+    /// match at compile time rather than falling through to a placeholder
+    /// color nobody notices is wrong.
+    pub fn color_for(&self, tone: BlockTone) -> Color {
+        match tone {
+            BlockTone::User => self.block_user,
+            BlockTone::Assistant => self.block_assistant,
+            BlockTone::Thinking => self.block_thinking,
+            BlockTone::ToolCall => self.block_tool_call,
+            BlockTone::ToolResult => self.block_tool_result,
+            BlockTone::ToolError => self.block_tool_error,
+            BlockTone::ErrorWarning => self.block_error_warning,
+            BlockTone::ErrorSeverity => self.block_error_severity,
+            BlockTone::ErrorFatal => self.block_error_fatal,
+            BlockTone::DriftPush => self.block_drift_push,
+            BlockTone::DriftPull => self.block_drift_pull,
+            BlockTone::DriftMerge => self.block_drift_merge,
+            BlockTone::Notification => self.block_notification,
+            BlockTone::Resource => self.block_resource,
+            BlockTone::Foreground => self.fg,
+            BlockTone::Dim => self.fg_dim,
+        }
+    }
+
+    /// A block's text color: its tone (`kaijutsu_present::format::block_tone`)
+    /// resolved against this theme.
+    pub fn block_color(&self, block: &BlockSnapshot) -> Color {
+        self.color_for(block_tone(block))
+    }
+
+    /// The color for a markdown span's tone. `SpanTone::Strong` has no
+    /// dedicated color unless the theme names one, so it falls back to the
+    /// block's own `base` color — which is why `base` is a parameter and not
+    /// a theme field.
+    pub fn span_color(&self, tone: SpanTone, base: Color) -> Color {
+        match tone {
+            SpanTone::Heading => self.md_heading_color,
+            SpanTone::CodeBlock => self.md_code_block_fg,
+            SpanTone::Code => self.md_code_fg,
+            SpanTone::Strong => self.md_strong_color.unwrap_or(base),
+            SpanTone::Plain => base,
+        }
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self {
@@ -994,5 +1045,74 @@ pub fn agent_color_for_provider(theme: &Theme, provider: Option<&str>) -> Color 
         theme.agent_color_local
     } else {
         theme.agent_color_default
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `BlockTone` resolves to the theme field it is named for. The
+    /// match in `color_for` is exhaustive, so a new tone fails to compile;
+    /// this catches the other half — a tone wired to the wrong field.
+    #[test]
+    fn every_block_tone_resolves_to_its_named_field() {
+        let t = Theme::default();
+        for tone in BlockTone::all() {
+            let expected = match tone {
+                BlockTone::User => t.block_user,
+                BlockTone::Assistant => t.block_assistant,
+                BlockTone::Thinking => t.block_thinking,
+                BlockTone::ToolCall => t.block_tool_call,
+                BlockTone::ToolResult => t.block_tool_result,
+                BlockTone::ToolError => t.block_tool_error,
+                BlockTone::ErrorWarning => t.block_error_warning,
+                BlockTone::ErrorSeverity => t.block_error_severity,
+                BlockTone::ErrorFatal => t.block_error_fatal,
+                BlockTone::DriftPush => t.block_drift_push,
+                BlockTone::DriftPull => t.block_drift_pull,
+                BlockTone::DriftMerge => t.block_drift_merge,
+                BlockTone::Notification => t.block_notification,
+                BlockTone::Resource => t.block_resource,
+                BlockTone::Foreground => t.fg,
+                BlockTone::Dim => t.fg_dim,
+            };
+            assert_eq!(t.color_for(tone), expected, "{tone:?}");
+        }
+    }
+
+    /// A human's own shell keeps the human's own color, end to end through
+    /// `block_tone` — the one case where kind and role disagree.
+    #[test]
+    fn user_shell_tool_call_keeps_the_user_color() {
+        let t = Theme::default();
+        let block = kaijutsu_types::BlockSnapshot::tool_call(
+            kaijutsu_types::BlockId::new(
+                kaijutsu_types::ContextId::new(),
+                kaijutsu_types::PrincipalId::new(),
+                0,
+            ),
+            None,
+            kaijutsu_types::ToolKind::Shell,
+            "shell",
+            serde_json::json!({"code": "ls"}),
+            kaijutsu_types::Role::User,
+            None,
+        );
+        assert_eq!(t.block_color(&block), t.block_user);
+    }
+
+    #[test]
+    fn span_tones_resolve_and_strong_falls_back_to_the_base_color() {
+        let t = Theme::default();
+        let base = t.block_assistant;
+        assert_eq!(t.span_color(SpanTone::Heading, base), t.md_heading_color);
+        assert_eq!(t.span_color(SpanTone::CodeBlock, base), t.md_code_block_fg);
+        assert_eq!(t.span_color(SpanTone::Code, base), t.md_code_fg);
+        assert_eq!(t.span_color(SpanTone::Plain, base), base);
+        assert_eq!(
+            t.span_color(SpanTone::Strong, base),
+            t.md_strong_color.unwrap_or(base),
+        );
     }
 }

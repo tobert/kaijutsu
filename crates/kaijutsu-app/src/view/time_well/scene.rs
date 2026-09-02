@@ -2194,7 +2194,7 @@ pub fn tick_ring_activity(time: Res<Time>, mut activity: ResMut<super::activity:
 /// moved to [`tick_ring_activity`] (ungated).
 pub fn sync_deck_material(
     activity: Res<super::activity::RingActivity>,
-    beats: Res<super::live::WellBeats>,
+    beats: Res<super::live::WellBeatsRes>,
     mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
     deck: Query<&MeshMaterial3d<crate::shaders::WellRingsMaterial>, With<EventHorizonDeck>>,
 ) {

@@ -23,12 +23,12 @@ use std::sync::Arc;
 use kaijutsu_types::{BlockSnapshot, ContentType, OutputData, OutputEntryType, OutputNode};
 
 use super::components::{bevy_color_to_brush, color_to_rgba8 as rgba8};
-use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
+use kaijutsu_present::markdown::{RichSpan, parse_to_rich_spans};
 use super::sparkline::{
     SparklineData, try_parse_sparkline,
 };
 
-use crate::view::format::{OutputLayout, compute_output_layout, format_output_data};
+use kaijutsu_present::format::{OutputLayout, compute_output_layout, format_output_data};
 
 /// Per-span brush mapping: byte range → Brush.
 ///
@@ -118,17 +118,15 @@ pub enum RichContentKind {
     },
 }
 
-/// Build a `Vec<SpanBrush>` from parsed spans + theme colors.
+/// Build a `Vec<SpanBrush>` from parsed spans + the theme.
 ///
-/// Maps each span's byte range to a Brush based on its formatting:
-/// - Headings → `md_heading_color`
-/// - Code/code blocks → `md_code_fg` / `md_code_block_fg`
-/// - Bold → `md_strong_color` or base_color
-/// - Plain text → `base_color`
+/// Each span's byte range gets the brush its `SpanTone` resolves to
+/// (`Theme::span_color`); `base_color` is the block's own text color, which
+/// plain text and un-themed bold both fall back to.
 pub fn build_span_brushes(
     spans: &[RichSpan],
     base_color: Color,
-    md_colors: &MarkdownColors,
+    theme: &crate::ui::theme::Theme,
 ) -> Vec<SpanBrush> {
     let mut result = Vec::with_capacity(spans.len());
     let mut byte_offset = 0usize;
@@ -137,22 +135,10 @@ pub fn build_span_brushes(
         let start = byte_offset;
         let end = start + span.text.len();
 
-        let color = if span.heading_level.is_some() {
-            md_colors.heading
-        } else if span.code_block {
-            md_colors.code_block
-        } else if span.code {
-            md_colors.code
-        } else if span.bold {
-            md_colors.strong.unwrap_or(base_color)
-        } else {
-            base_color
-        };
-
         result.push(SpanBrush {
             start,
             end,
-            brush: bevy_color_to_brush(color),
+            brush: bevy_color_to_brush(theme.span_color(span.tone(), base_color)),
         });
 
         byte_offset = end;

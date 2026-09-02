@@ -177,7 +177,7 @@ fn importance_of(attrs: StyleAttrs) -> f32 {
 
 /// Map a block's kernel-side [`StyleSpan`]s onto this surface and this theme.
 ///
-/// `default_fg` is the block's own text color (`view::format::block_color`) and
+/// `default_fg` is the block's own text color (`ui::theme::Theme::block_color`) and
 /// `default_bg` the surface background behind it — both already resolved to
 /// RGBA8. `palette` is `Theme::ansi.palette_256()`.
 ///

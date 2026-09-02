@@ -207,7 +207,7 @@ fn handle_open_diff_viewer(
 ) {
     let mut asked = false;
     for ActionFired { action, .. } in actions.read() {
-        if matches!(action, crate::input::action::Action::OpenDiffViewer) {
+        if matches!(action, crate::input::Action::OpenDiffViewer) {
             asked = true;
         }
     }

@@ -1,7 +1,7 @@
-//! Markdown to rich-text span conversion for Vello rendering.
+//! Markdown source to styled spans.
 //!
-//! Uses pulldown-cmark (the same parser as rustdoc) to convert markdown into
-//! styled spans that can drive Vello text rendering.
+//! Uses pulldown-cmark (the same parser as rustdoc) to turn markdown into
+//! spans a client paints with its own colors.
 //!
 //! ```text
 //! "**bold** and *italic*"
@@ -10,37 +10,33 @@
 //!  RichSpan { text: " and " },
 //!  RichSpan { italic: true, text: "italic" }]
 //! ```
+//!
+//! Spans carry formatting flags, and [`RichSpan::tone`] collapses those flags
+//! into the one [`SpanTone`] a client resolves to a color. The precedence
+//! among overlapping flags lives there, so both clients paint a bold heading
+//! the same way.
 
-use bevy::prelude::Color;
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use strum::EnumIter;
 
-/// Theme colors for markdown rendering using Bevy Color.
-#[derive(Clone, Debug)]
-pub struct MarkdownColors {
-    /// Heading text color (bright accent).
-    pub heading: Color,
-    /// Inline `code` color.
-    pub code: Color,
-    /// Bold/strong emphasis color (None = inherit base color).
-    pub strong: Option<Color>,
-    /// Fenced code block color.
-    pub code_block: Color,
-}
-
-/// Mirrors the `md_heading_color`/`md_code_fg`/`md_code_block_fg`/`md_strong_color`
-/// fields of `Theme::default()` (`ui::theme::Theme`) — kept in sync by
-/// `markdown_colors_default_matches_theme_default` below. Production always
-/// builds `MarkdownColors` from the live theme (`view/block_render.rs`); this
-/// default only serves tests and standalone use of this module.
-impl Default for MarkdownColors {
-    fn default() -> Self {
-        Self {
-            heading: Color::srgb_u8(0xBB, 0x9A, 0xF7), // Purple accent
-            code: Color::srgb_u8(0x9E, 0xCE, 0x6A),    // Green
-            strong: None,                              // Inherit
-            code_block: Color::srgb_u8(0x7A, 0xA2, 0xF7), // Blue
-        }
-    }
+/// The color role a markdown span asks its client's theme for.
+///
+/// A span can carry several formatting flags at once (a bold heading, inline
+/// code inside a list item); [`RichSpan::tone`] applies one precedence order
+/// and this enum is its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter)]
+pub enum SpanTone {
+    /// Any heading level.
+    Heading,
+    /// Text inside a fenced code block.
+    CodeBlock,
+    /// Inline `code`.
+    Code,
+    /// Bold / strong emphasis. A client with no distinct strong color paints
+    /// this as the surrounding body text.
+    Strong,
+    /// Body text.
+    Plain,
 }
 
 /// A styled text span parsed from markdown.
@@ -63,6 +59,23 @@ impl RichSpan {
             code: false,
             heading_level: None,
             code_block: false,
+        }
+    }
+
+    /// The span's color role, most specific flag first: heading, then code
+    /// block, then inline code, then bold, then body text. Italic carries no
+    /// tone of its own — it is a face change, not a color change.
+    pub fn tone(&self) -> SpanTone {
+        if self.heading_level.is_some() {
+            SpanTone::Heading
+        } else if self.code_block {
+            SpanTone::CodeBlock
+        } else if self.code {
+            SpanTone::Code
+        } else if self.bold {
+            SpanTone::Strong
+        } else {
+            SpanTone::Plain
         }
     }
 }
@@ -346,39 +359,35 @@ mod tests {
     }
 
     #[test]
-    fn markdown_colors_default() {
-        let colors = MarkdownColors::default();
-        // Verify the defaults are reasonable Bevy colors
-        assert_ne!(colors.heading, Color::BLACK);
-        assert_ne!(colors.code, Color::BLACK);
-        assert!(colors.strong.is_none());
-        assert_ne!(colors.code_block, Color::BLACK);
+    fn tone_precedence_is_heading_then_code_block_then_code_then_bold() {
+        let mut span = RichSpan::new("x");
+        assert_eq!(span.tone(), SpanTone::Plain);
+        span.italic = true;
+        assert_eq!(span.tone(), SpanTone::Plain, "italic is a face, not a color");
+        span.bold = true;
+        assert_eq!(span.tone(), SpanTone::Strong);
+        span.code = true;
+        assert_eq!(span.tone(), SpanTone::Code);
+        span.code_block = true;
+        assert_eq!(span.tone(), SpanTone::CodeBlock);
+        span.heading_level = Some(2);
+        assert_eq!(span.tone(), SpanTone::Heading);
     }
 
-    /// `srgb_u8` (this file) and `srgb` with a rounded 3-decimal literal
-    /// (`Theme::default()`) round-trip the same color to slightly different
-    /// floats, so compare channel-wise within a tolerance rather than by
-    /// exact equality.
-    fn color_approx_eq(a: Color, b: Color) -> bool {
-        let a = a.to_srgba();
-        let b = b.to_srgba();
-        const EPS: f32 = 0.001;
-        (a.red - b.red).abs() < EPS
-            && (a.green - b.green).abs() < EPS
-            && (a.blue - b.blue).abs() < EPS
-            && (a.alpha - b.alpha).abs() < EPS
-    }
-
-    /// `MarkdownColors::default()` mirrors `Theme::default()`'s md_* fields
-    /// (see `view/block_render.rs` for the production construction path).
-    /// If this fails, one side drifted — update whichever is stale.
+    /// Headings parse bold, and must still ask for the heading color rather
+    /// than the strong one.
     #[test]
-    fn markdown_colors_default_matches_theme_default() {
-        let colors = MarkdownColors::default();
-        let theme = crate::ui::theme::Theme::default();
-        assert!(color_approx_eq(colors.heading, theme.md_heading_color));
-        assert!(color_approx_eq(colors.code, theme.md_code_fg));
-        assert!(color_approx_eq(colors.code_block, theme.md_code_block_fg));
-        assert_eq!(colors.strong, theme.md_strong_color);
+    fn parsed_heading_tone_beats_its_own_bold_flag() {
+        let spans = parse_to_rich_spans("# Title");
+        let heading = spans.iter().find(|s| s.text == "Title").unwrap();
+        assert!(heading.bold);
+        assert_eq!(heading.tone(), SpanTone::Heading);
+    }
+
+    #[test]
+    fn parsed_code_block_text_asks_for_the_code_block_tone() {
+        let spans = parse_to_rich_spans("```\nfn main() {}\n```");
+        let code = spans.iter().find(|s| s.text.contains("fn main")).unwrap();
+        assert_eq!(code.tone(), SpanTone::CodeBlock);
     }
 }

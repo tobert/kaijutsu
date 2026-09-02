@@ -5949,6 +5949,7 @@ dependencies = [
  "kaijutsu-client",
  "kaijutsu-diff",
  "kaijutsu-kernel",
+ "kaijutsu-present",
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "kaijutsu-viz",
@@ -6197,6 +6198,20 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "whoami",
+]
+
+[[package]]
+name = "kaijutsu-present"
+version = "0.1.0"
+dependencies = [
+ "bevy_reflect",
+ "kaijutsu-audio",
+ "kaijutsu-types",
+ "kaish-kernel",
+ "logos",
+ "pulldown-cmark",
+ "serde_json",
+ "strum 0.26.3",
 ]
 
 [[package]]

@@ -20,7 +20,7 @@ use super::keyconv::bevy_to_terminal_key;
 use super::motion::{self, MotionContext};
 use super::textutil;
 use super::{KaijutsuInfo, VimMachineResource};
-use crate::input::action::Action;
+use crate::input::Action;
 use crate::input::events::{ActionFired, TextInputReceived};
 
 /// Per-overlay vim editing state.

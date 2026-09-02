@@ -9,6 +9,7 @@ members = [
     "crates/kaijutsu-server",
     "crates/kaijutsu-app",
     "crates/kaijutsu-mcp",
+    "crates/kaijutsu-present",
     "crates/kaijutsu-acp",
     "crates/kaijutsu-telemetry",
     "crates/kaijutsu-agent-tools",
@@ -49,6 +50,7 @@ kaijutsu-cas = { path = "crates/kaijutsu-cas" }
 kaijutsu-audio = { path = "crates/kaijutsu-audio" }
 kaijutsu-hyoushigi = { path = "crates/kaijutsu-hyoushigi" }
 kaijutsu-viz = { path = "crates/kaijutsu-viz" }
+kaijutsu-present = { path = "crates/kaijutsu-present" }
 kaijutsu-types = { path = "crates/kaijutsu-types" }
 kaijutsu-editor = { path = "crates/kaijutsu-editor" }
 kaijutsu-diff = { path = "crates/kaijutsu-diff" }

@@ -4,7 +4,7 @@
 
 use bevy::prelude::*;
 
-use super::action::Action;
+use super::Action;
 
 /// A resolved action from the input dispatcher.
 ///

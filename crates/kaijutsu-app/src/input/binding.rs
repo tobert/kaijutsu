@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 
-use super::action::Action;
+use super::Action;
 use super::context::InputContext;
 
 /// What physical input triggered this binding.

@@ -50,7 +50,7 @@ use crate::view::scene_geometry;
 use crate::view::room::nav::Station;
 use crate::view::room::{PLATE_TEX_H, PLATE_TEX_W, RoomState, layout_plate_text};
 use crate::view::scene_palette::{ScenePalette, lin, lin_scaled};
-use crate::view::time_well::live::WellBeats;
+use crate::view::time_well::live::WellBeatsRes;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use crate::view::time_well::rays::WellTracks;
 use crate::view::time_well::scene::accent_color;
@@ -810,7 +810,7 @@ fn spawn_column(
 /// that has never rolled) skips the column entirely — the exact freeze
 /// [`TrackerColumn::last_position`] holds.
 fn animate_tracker_scroll(
-    beats: Res<WellBeats>,
+    beats: Res<WellBeatsRes>,
     mut state: ResMut<TrackerState>,
     mut columns: Query<(&mut TrackerColumn, &Children)>,
     mut rows: Query<(&TrackerRow, &mut Transform, &mut Visibility)>,
@@ -862,7 +862,7 @@ fn quantize(v: f32) -> f32 {
 /// envelope. Quantized + change-guarded so a quiet playhead never touches
 /// `Assets<StandardMaterial>` (`room::set_glow`'s own discipline).
 fn pulse_tracker_playheads(
-    beats: Res<WellBeats>,
+    beats: Res<WellBeatsRes>,
     palette: Res<ScenePalette>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     columns: Query<&TrackerColumn>,

@@ -1,15 +1,18 @@
 //! Action enum — the universal vocabulary for user intent.
 //!
 //! Every input (key, gamepad button, MIDI CC, touch gesture) maps to an Action.
-//! Domain systems consume `ActionFired` messages and never read raw input directly.
-
-use bevy::prelude::*;
+//! Domain systems consume the action and never read raw input directly.
+//!
+//! The `bevy` feature adds `bevy_reflect::Reflect` so the Bevy client can
+//! register the type and carry it inside its own reflected types; the default
+//! build has no toolkit dependency.
 
 /// A discrete user action. Flat enum — no nesting, no ambiguity.
 ///
 /// Actions are the bridge between input devices and domain logic.
 /// The dispatcher maps raw input → Action; domain systems match on Action variants.
-#[derive(Clone, Debug, PartialEq, Reflect)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "bevy", derive(bevy_reflect::Reflect))]
 pub enum Action {
     // ========================================================================
     // Focus management
@@ -220,7 +223,7 @@ pub enum Action {
     /// clears, and promote it from the translucent peek to a solid panel.
     /// Firing it again releases the hold. The overlay itself needs no chord
     /// to *appear*: it peeks for as long as the prefix is armed
-    /// (`ui::quick_context`, docs/input.md).
+    /// (docs/input.md).
     HoldQuickContext,
     /// Esc while the quick-context overlay is held — release it, and only
     /// it. A distinct action rather than [`Action::PopLevel`] on purpose:

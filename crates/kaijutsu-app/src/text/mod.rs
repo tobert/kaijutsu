@@ -14,7 +14,6 @@ pub mod abc;
 pub mod ansi;
 pub mod components;
 pub mod diff;
-pub mod markdown;
 pub mod msdf;
 mod plugin;
 mod resources;
