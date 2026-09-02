@@ -407,6 +407,14 @@ pub struct ContextUsageRow {
     /// Informational — reasoning/thinking tokens the provider billed
     /// separately from `output_tokens` (0 when not reported/applicable).
     pub reasoning_tokens: i64,
+    /// The `CacheTtl` (`llm/stream.rs`) actually chosen for this call's
+    /// cache breakpoints, in seconds: 300 (`Ephemeral`), 3600 (`Extended`),
+    /// or the longest of the two when a request mixed both. 0 when the
+    /// request built no breakpoints (a provider that ignores them, or none
+    /// configured) — never a guess.
+    pub cache_ttl_secs: i64,
+    /// Unix MILLISECONDS (matches `kaijutsu_types::now_millis`, not
+    /// `unixepoch()`'s seconds) of this snapshot's write.
     pub updated_at: i64,
 }
 
@@ -742,6 +750,7 @@ CREATE TABLE IF NOT EXISTS context_usage (
     cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_ttl_secs     INTEGER NOT NULL DEFAULT 0,
     updated_at         INTEGER NOT NULL
 );
 
@@ -1963,6 +1972,7 @@ impl KernelDb {
             "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
+            "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
         ];
         for sql in alters {
             if let Err(e) = conn.execute(sql, []) {
@@ -4399,8 +4409,9 @@ impl KernelDb {
         self.conn.execute(
             "INSERT INTO context_usage (
                 context_id, provider, model, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reasoning_tokens, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                cache_ttl_secs, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(context_id) DO UPDATE SET
                 provider = excluded.provider,
                 model = excluded.model,
@@ -4409,6 +4420,7 @@ impl KernelDb {
                 cache_read_tokens = excluded.cache_read_tokens,
                 cache_write_tokens = excluded.cache_write_tokens,
                 reasoning_tokens = excluded.reasoning_tokens,
+                cache_ttl_secs = excluded.cache_ttl_secs,
                 updated_at = excluded.updated_at",
             params![
                 blob_param(row.context_id.as_bytes()),
@@ -4419,6 +4431,7 @@ impl KernelDb {
                 row.cache_read_tokens,
                 row.cache_write_tokens,
                 row.reasoning_tokens,
+                row.cache_ttl_secs,
                 row.updated_at,
             ],
         )?;
@@ -4432,7 +4445,8 @@ impl KernelDb {
     pub fn get_context_usage(&self, context_id: ContextId) -> KernelDbResult<Option<ContextUsageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, provider, model, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, reasoning_tokens, updated_at
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    cache_ttl_secs, updated_at
              FROM context_usage WHERE context_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
@@ -4445,7 +4459,8 @@ impl KernelDb {
                 cache_read_tokens: row.get(5)?,
                 cache_write_tokens: row.get(6)?,
                 reasoning_tokens: row.get(7)?,
-                updated_at: row.get(8)?,
+                cache_ttl_secs: row.get(8)?,
+                updated_at: row.get(9)?,
             })
         })?;
         match rows.next() {
@@ -4462,7 +4477,8 @@ impl KernelDb {
     pub fn list_all_context_usage(&self) -> KernelDbResult<Vec<ContextUsageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, provider, model, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, reasoning_tokens, updated_at
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    cache_ttl_secs, updated_at
              FROM context_usage",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -4475,7 +4491,8 @@ impl KernelDb {
                 cache_read_tokens: row.get(5)?,
                 cache_write_tokens: row.get(6)?,
                 reasoning_tokens: row.get(7)?,
-                updated_at: row.get(8)?,
+                cache_ttl_secs: row.get(8)?,
+                updated_at: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -7882,6 +7899,73 @@ mod tests {
         );
     }
 
+    /// `context_usage.cache_ttl_secs` must land on a DB created before the
+    /// column existed, via `apply_additive_migrations`'s guarded `ALTER
+    /// TABLE ... ADD COLUMN`, not just on a fresh `SCHEMA`. Simulates a
+    /// pre-existing DB by dropping the column back off a freshly-opened
+    /// (already-migrated) table, then re-running the migration and
+    /// confirming a full `set_context_usage`/`get_context_usage` round trip
+    /// carries the value through.
+    #[test]
+    fn cache_ttl_secs_migrates_onto_a_pre_existing_context_usage_table() {
+        let db = KernelDb::temporary().unwrap();
+        db.conn
+            .execute_batch("ALTER TABLE context_usage DROP COLUMN cache_ttl_secs")
+            .unwrap();
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-ttl-migration"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        db.set_context_usage(&ContextUsageRow {
+            context_id: ctx.context_id,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 50,
+            cache_write_tokens: 10,
+            reasoning_tokens: 0,
+            cache_ttl_secs: 3600,
+            updated_at: 1,
+        })
+        .unwrap();
+
+        let loaded = db.get_context_usage(ctx.context_id).unwrap().unwrap();
+        assert_eq!(loaded.cache_ttl_secs, 3600);
+    }
+
+    /// Re-running the migration against an already-migrated DB (the normal
+    /// case on every `open()`) must be a no-op, not clobber an existing
+    /// non-default value with the column's `DEFAULT 0` — the ADD COLUMN
+    /// guard (`is_duplicate_column_error`) exists exactly for this.
+    #[test]
+    fn cache_ttl_secs_migration_is_idempotent_and_preserves_existing_value() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-ttl-idempotent"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        db.set_context_usage(&ContextUsageRow {
+            context_id: ctx.context_id,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 50,
+            cache_write_tokens: 10,
+            reasoning_tokens: 0,
+            cache_ttl_secs: 300,
+            updated_at: 1,
+        })
+        .unwrap();
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        let loaded = db.get_context_usage(ctx.context_id).unwrap().unwrap();
+        assert_eq!(loaded.cache_ttl_secs, 300);
+    }
+
     // ── Track D: context model rollover + preset cast narrowing ─────────
 
     /// Surviving backend names (`anthropic`/`deepseek`/`ollama`/`gpt`,
@@ -9276,6 +9360,7 @@ mod tests {
             cache_read_tokens: 800,
             cache_write_tokens: 100,
             reasoning_tokens: 0,
+            cache_ttl_secs: 3600,
             updated_at: now_millis(),
         };
         db.set_context_usage(&row).unwrap();
@@ -9304,6 +9389,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 1,
         })
         .unwrap();
@@ -9316,6 +9402,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 2,
         })
         .unwrap();
@@ -9352,6 +9439,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 1,
         })
         .unwrap();
@@ -9376,6 +9464,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 1,
         };
         assert_eq!(context_used_pct(&usage, Some(200_000)), Some(25.0));
@@ -9392,6 +9481,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 1,
         };
         assert_eq!(context_used_pct(&usage, None), None);
@@ -9412,6 +9502,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 1,
         };
         assert_eq!(context_used_pct(&usage, Some(200_000)), Some(0.0));
@@ -9434,6 +9525,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 1,
         };
         // 0/0 would be NaN — and NaN slips past every `< 0.0` sentinel test.

@@ -4878,6 +4878,17 @@ impl kernel::Server for KernelImpl {
                     c.set_context_used_tokens(wire_used_tokens);
                     c.set_context_used_pct(wire_used_pct);
 
+                    // Cache health (docs/tui.md "Cache health") — same usage
+                    // row, the fields `resolve_usage_wire_fields` above
+                    // doesn't need. `resolve_cache_health_wire_fields` is
+                    // unit tested directly (`cache_health_wire_tests` below).
+                    let (last_call_at, cache_read_tokens, cache_write_tokens, cache_ttl_secs) =
+                        resolve_cache_health_wire_fields(usage);
+                    c.set_last_call_at(last_call_at);
+                    c.set_cache_read_tokens(cache_read_tokens);
+                    c.set_cache_write_tokens(cache_write_tokens);
+                    c.set_cache_ttl_secs(cache_ttl_secs);
+
                     // Background-process ambient state — app visibility into
                     // `background_exec.rs` (kaijutsu.capnp ContextHandleInfo
                     // doc comment). `resolve_background_wire_fields` is unit
@@ -11482,6 +11493,84 @@ fn resolve_usage_wire_fields(
     }
 }
 
+/// Resolve the cache-health wire quadruple (`ContextHandleInfo.lastCallAt`/
+/// `cacheReadTokens`/`cacheWriteTokens`/`cacheTtlSecs`, `kaijutsu.capnp`
+/// @31-@34) straight off the usage row — docs/tui.md "Cache health". Unlike
+/// `resolve_usage_wire_fields`, every field here is already a durable
+/// `context_usage` column, so this is a pass-through, not a derived
+/// computation — but it stays a named function so the "no row = every field
+/// 0" sentinel is unit-tested independent of the capnp builder, same as its
+/// sibling above.
+fn resolve_cache_health_wire_fields(usage: Option<&ContextUsageRow>) -> (u64, u64, u64, u64) {
+    match usage {
+        Some(u) => (
+            u.updated_at as u64,
+            u.cache_read_tokens as u64,
+            u.cache_write_tokens as u64,
+            u.cache_ttl_secs as u64,
+        ),
+        None => (0, 0, 0, 0),
+    }
+}
+
+#[cfg(test)]
+mod cache_health_wire_tests {
+    //! `resolve_cache_health_wire_fields` — the exact plumbing `list_contexts`
+    //! uses to fill `ContextHandleInfo.lastCallAt`/`cacheReadTokens`/
+    //! `cacheWriteTokens`/`cacheTtlSecs`. Pins the "no usage row = every
+    //! field is the honest 0, not a guess" sentinel, same convention as
+    //! `resolve_usage_wire_fields`'s `context_usage_wire_tests`.
+    use super::{resolve_cache_health_wire_fields, ContextUsageRow};
+    use kaijutsu_types::ContextId;
+
+    fn usage_with_cache(
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        cache_ttl_secs: i64,
+        updated_at: i64,
+    ) -> ContextUsageRow {
+        ContextUsageRow {
+            context_id: ContextId::new(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 40_000,
+            output_tokens: 10_000,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens: 0,
+            cache_ttl_secs,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn no_usage_row_is_every_field_zero() {
+        assert_eq!(resolve_cache_health_wire_fields(None), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn usage_present_passes_every_field_through() {
+        let u = usage_with_cache(800, 100, 3600, 1_725_000_000_000);
+        assert_eq!(
+            resolve_cache_health_wire_fields(Some(&u)),
+            (1_725_000_000_000, 800, 100, 3600)
+        );
+    }
+
+    /// A completed call that reported no cache accounting at all (e.g. a
+    /// provider extra of `None`) must round-trip as real zeros, not be
+    /// confused with the "no usage row" case above — both decode the same
+    /// way on the wire (0), and that collision is the honest answer: a
+    /// context that completed a call with zero cache hit looks identical to
+    /// one that never completed a call, on this quadruple alone. The
+    /// distinguishing signal is `contextUsedTokens` (0 only in the latter).
+    #[test]
+    fn zero_cache_accounting_is_zero_not_a_missing_row() {
+        let u = usage_with_cache(0, 0, 0, 1);
+        assert_eq!(resolve_cache_health_wire_fields(Some(&u)), (1, 0, 0, 0));
+    }
+}
+
 #[cfg(test)]
 mod context_usage_wire_tests {
     //! `resolve_usage_wire_fields` — the exact plumbing `list_contexts` uses
@@ -11502,6 +11591,7 @@ mod context_usage_wire_tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             reasoning_tokens: 0,
+            cache_ttl_secs: 0,
             updated_at: 1,
         }
     }

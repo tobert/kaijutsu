@@ -358,6 +358,27 @@ pub enum CacheTtl {
     Extended,
 }
 
+impl CacheTtl {
+    /// Duration in seconds — the value recorded on `ContextUsageRow::cache_ttl_secs`.
+    pub fn as_secs(&self) -> i64 {
+        match self {
+            Self::Ephemeral => 300,
+            Self::Extended => 3600,
+        }
+    }
+}
+
+/// The TTL actually chosen for a request's cache breakpoints, in seconds —
+/// the longest of the set when breakpoints carry mixed TTLs, 0 when there
+/// are none. This is what a provider path that HONORS `cache_breakpoints`
+/// (Claude's `build()`; see `llm/claude/build.rs`) actually applied; a path
+/// that ignores the carrier (DeepSeek, Gemini) must not call this — the
+/// breakpoints existing in `BuildOpts` there is not the same as a TTL being
+/// live on the wire.
+pub fn longest_cache_ttl_secs(breakpoints: &[CacheTarget]) -> i64 {
+    breakpoints.iter().map(|b| b.ttl().as_secs()).max().unwrap_or(0)
+}
+
 /// Token usage from a completed stream.
 ///
 /// `extra` carries provider-specific richness so we don't lose cache /
@@ -484,6 +505,33 @@ mod tests {
         );
         assert!(StreamEvent::Error("oops".into()).is_terminal());
         assert!(!StreamEvent::TextStart.is_terminal());
+    }
+
+    #[test]
+    fn cache_ttl_as_secs_matches_anthropic_durations() {
+        assert_eq!(CacheTtl::Ephemeral.as_secs(), 300);
+        assert_eq!(CacheTtl::Extended.as_secs(), 3600);
+    }
+
+    #[test]
+    fn longest_cache_ttl_secs_is_zero_with_no_breakpoints() {
+        assert_eq!(longest_cache_ttl_secs(&[]), 0);
+    }
+
+    #[test]
+    fn longest_cache_ttl_secs_picks_the_longest_of_mixed_ttls() {
+        let breakpoints = vec![
+            CacheTarget::Tools(CacheTtl::Ephemeral),
+            CacheTarget::System(CacheTtl::Extended),
+            CacheTarget::MessageIndex(3, CacheTtl::Ephemeral),
+        ];
+        assert_eq!(longest_cache_ttl_secs(&breakpoints), 3600);
+    }
+
+    #[test]
+    fn longest_cache_ttl_secs_single_ephemeral_breakpoint() {
+        let breakpoints = vec![CacheTarget::Tools(CacheTtl::Ephemeral)];
+        assert_eq!(longest_cache_ttl_secs(&breakpoints), 300);
     }
 
     #[test]

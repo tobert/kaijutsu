@@ -103,6 +103,10 @@ mod tests {
             cast_label: None,
             origin_host: None,
             cwd: None,
+            last_call_at: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_ttl_secs: None,
         }
     }
 

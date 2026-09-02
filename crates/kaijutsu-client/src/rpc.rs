@@ -482,6 +482,24 @@ pub struct ContextInfo {
     /// `get_context_cwd` reads, carried here so a listing caller never has
     /// to loop a per-context RPC just to learn it (`ContextHandleInfo.cwd`).
     pub cwd: Option<std::path::PathBuf>,
+    /// Cache health (docs/tui.md "Cache health"): Unix MILLISECONDS of the
+    /// last completed LLM call's usage snapshot (`context_usage.updated_at`),
+    /// or `None` when this context has never completed a call (0 on the wire).
+    pub last_call_at: Option<u64>,
+    /// Cache read tokens on the last completed call, or `None` when it never
+    /// completed a call (0 on the wire) — same absent-vs-genuinely-zero
+    /// ambiguity as `context_used_tokens`: a call that reported real zero
+    /// cache accounting is indistinguishable from no call at all on this
+    /// field alone.
+    pub cache_read_tokens: Option<u64>,
+    /// Cache write (creation) tokens on the last completed call, or `None`
+    /// on the same 0-on-the-wire convention as `cache_read_tokens`.
+    pub cache_write_tokens: Option<u64>,
+    /// TTL the last call's cache breakpoints actually chose, in seconds
+    /// (300 ephemeral, 3600 extended, longest wins when mixed), or `None`
+    /// when the provider/request declared none (0 on the wire) — DeepSeek, a
+    /// local model, or a request with no breakpoints configured.
+    pub cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3622,6 +3640,26 @@ fn parse_context_info(
         Some(std::path::PathBuf::from(cwd_str))
     };
 
+    // Cache health (docs/tui.md "Cache health") — 0 on the wire = None for
+    // all four; none is a legitimate non-absent zero the way
+    // `context_used_pct`'s 0.0% is, so no dedicated sentinel is needed.
+    let last_call_at = match reader.get_last_call_at() {
+        0 => None,
+        ts => Some(ts),
+    };
+    let cache_read_tokens = match reader.get_cache_read_tokens() {
+        0 => None,
+        t => Some(t),
+    };
+    let cache_write_tokens = match reader.get_cache_write_tokens() {
+        0 => None,
+        t => Some(t),
+    };
+    let cache_ttl_secs = match reader.get_cache_ttl_secs() {
+        0 => None,
+        s => Some(s),
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -3653,6 +3691,10 @@ fn parse_context_info(
         cast_label,
         origin_host,
         cwd,
+        last_call_at,
+        cache_read_tokens,
+        cache_write_tokens,
+        cache_ttl_secs,
     })
 }
 
@@ -5778,6 +5820,47 @@ mod tests {
         assert_eq!(parsed3.context_window, Some(200_000));
         assert_eq!(parsed3.context_used_tokens, Some(50_000));
         assert_eq!(parsed3.context_used_pct, Some(25.0));
+    }
+
+    /// Cache health (docs/tui.md "Cache health"): `lastCallAt`/
+    /// `cacheReadTokens`/`cacheWriteTokens`/`cacheTtlSecs` round-trip through
+    /// `parse_context_info`, with the same "0 on the wire = None" convention
+    /// as `context_window`/`context_used_tokens` above — no dedicated
+    /// sentinel needed since 0 is never a legitimate non-absent value for
+    /// any of these four fields (unlike `context_used_pct`'s 0.0%).
+    #[test]
+    fn test_parse_context_info_cache_health_roundtrip() {
+        // Unset: an old server, or a context that never completed a call.
+        let mut message = MessageBuilder::new_default();
+        let mut builder =
+            message.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder.set_id(&[11u8; 16]);
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed = parse_context_info(&reader).unwrap();
+        assert_eq!(parsed.last_call_at, None);
+        assert_eq!(parsed.cache_read_tokens, None);
+        assert_eq!(parsed.cache_write_tokens, None);
+        assert_eq!(parsed.cache_ttl_secs, None);
+
+        // Set: a completed Claude call with an Extended-TTL breakpoint.
+        let mut message2 = MessageBuilder::new_default();
+        let mut builder2 =
+            message2.init_root::<crate::kaijutsu_capnp::context_handle_info::Builder>();
+        builder2.set_id(&[11u8; 16]);
+        builder2.set_last_call_at(1_725_000_000_000);
+        builder2.set_cache_read_tokens(800);
+        builder2.set_cache_write_tokens(100);
+        builder2.set_cache_ttl_secs(3600);
+        let reader2 = message2
+            .get_root_as_reader::<crate::kaijutsu_capnp::context_handle_info::Reader>()
+            .unwrap();
+        let parsed2 = parse_context_info(&reader2).unwrap();
+        assert_eq!(parsed2.last_call_at, Some(1_725_000_000_000));
+        assert_eq!(parsed2.cache_read_tokens, Some(800));
+        assert_eq!(parsed2.cache_write_tokens, Some(100));
+        assert_eq!(parsed2.cache_ttl_secs, Some(3600));
     }
 
     /// Background-process ambient-state wire spine (`ContextHandleInfo`

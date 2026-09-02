@@ -20,6 +20,7 @@ use kaijutsu_kernel::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_kernel::llm::stream::{
     BuildOpts, CacheTarget, InlineToolResult, StreamEvent, apply_slot_tunables,
+    longest_cache_ttl_secs,
 };
 use kaijutsu_kernel::llm::SlotTunables;
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
@@ -2051,12 +2052,21 @@ async fn process_llm_stream(
                              arrived); keeping the previous snapshot"
                         );
                     } else {
+                        let is_claude = matches!(extra, Some(UsageExtra::Claude(_)));
                         let total_input_tokens = input_tokens.unwrap_or(0)
-                            + if matches!(extra, Some(UsageExtra::Claude(_))) {
-                                cache_read + cache_write
-                            } else {
-                                0
-                            };
+                            + if is_claude { cache_read + cache_write } else { 0 };
+                        // The TTL actually applied to this request's cache
+                        // breakpoints. Only Claude's `build()` (`llm/claude/
+                        // build.rs`) turns `BuildOpts::cache_breakpoints` into
+                        // a real `cache_control` on the wire — every other
+                        // provider's `build()` ignores the carrier, so a
+                        // breakpoint sitting unused in `build_opts` there
+                        // would be a TTL claim the request never made.
+                        let cache_ttl_secs = if is_claude {
+                            longest_cache_ttl_secs(&build_opts.cache_breakpoints)
+                        } else {
+                            0
+                        };
                         let usage_row = kaijutsu_kernel::ContextUsageRow {
                             context_id,
                             provider: provider.name().to_string(),
@@ -2066,6 +2076,7 @@ async fn process_llm_stream(
                             cache_read_tokens: cache_read as i64,
                             cache_write_tokens: cache_write as i64,
                             reasoning_tokens: reasoning as i64,
+                            cache_ttl_secs,
                             updated_at: kaijutsu_types::now_millis() as i64,
                         };
                         if let Err(e) = kernel_db.lock().set_context_usage(&usage_row) {
@@ -3476,6 +3487,24 @@ mod usage_tests {
         PrincipalId,
         Arc<parking_lot::Mutex<KernelDb>>,
     ) {
+        drive_turn_with_breakpoints(provider, pre_seed_blocks, kernel, &[]).await
+    }
+
+    /// Like `drive_turn_with`, but seeds `breakpoints` as this context's
+    /// `cache_breakpoints` before driving the turn — the TTL-selection tests
+    /// need a real breakpoint row for `process_llm_stream` to read via
+    /// `list_cache_breakpoints`, same as the rc-populated production path.
+    async fn drive_turn_with_breakpoints(
+        provider: Provider,
+        pre_seed_blocks: usize,
+        kernel: Arc<Kernel>,
+        breakpoints: &[CacheTarget],
+    ) -> (
+        SharedBlockStore,
+        ContextId,
+        PrincipalId,
+        Arc<parking_lot::Mutex<KernelDb>>,
+    ) {
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let documents: SharedBlockStore =
             Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
@@ -3566,6 +3595,9 @@ mod usage_tests {
                 origin_host: None,
             })
             .unwrap();
+            for bp in breakpoints {
+                db.add_cache_breakpoint(ctx, bp).unwrap();
+            }
         }
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
@@ -3644,6 +3676,102 @@ mod usage_tests {
                 assert_eq!(usage.cache_write_tokens, 5);
                 assert_eq!(usage.provider, "mock");
                 assert_eq!(usage.model, "mock-model");
+                assert_eq!(
+                    usage.cache_ttl_secs, 0,
+                    "no cache breakpoints configured for this context — 0, not a guess"
+                );
+            })
+            .await;
+    }
+
+    /// The TTL-selection path: a Claude-shaped `Done` with cache breakpoints
+    /// of MIXED ttls configured on the context must record the LONGEST one,
+    /// not the first, the last, or a sum.
+    #[tokio::test]
+    async fn claude_call_with_mixed_ttl_breakpoints_records_the_longest() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-ttl-mixed").await);
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
+                    vec![vec![
+                        StreamEvent::TextStart,
+                        StreamEvent::TextDelta("ok".into()),
+                        StreamEvent::TextEnd,
+                        StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(42),
+                            output_tokens: Some(7),
+                            extra: Some(UsageExtra::Claude(ClaudeUsageExtra {
+                                cache_read_input_tokens: 10,
+                                cache_creation_input_tokens: 5,
+                            })),
+                        },
+                    ]],
+                ));
+
+                let (_documents, ctx, _player, kernel_db) = drive_turn_with_breakpoints(
+                    provider,
+                    0,
+                    kernel.clone(),
+                    &[
+                        CacheTarget::Tools(kaijutsu_kernel::llm::CacheTtl::Ephemeral),
+                        CacheTarget::System(kaijutsu_kernel::llm::CacheTtl::Extended),
+                    ],
+                )
+                .await;
+
+                let usage = kernel_db.lock().get_context_usage(ctx).unwrap().unwrap();
+                assert_eq!(
+                    usage.cache_ttl_secs, 3600,
+                    "Extended (3600s) must win over Ephemeral (300s) when mixed"
+                );
+            })
+            .await;
+    }
+
+    /// A provider path that never builds breakpoints (anything but Claude's
+    /// `build()`) must record 0 even when the context has breakpoints
+    /// configured — a breakpoint sitting unused in storage is not a TTL the
+    /// request actually applied.
+    #[tokio::test]
+    async fn non_claude_call_with_breakpoints_configured_records_zero_ttl() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-ttl-non-claude").await);
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
+                    vec![vec![
+                        StreamEvent::TextStart,
+                        StreamEvent::TextDelta("ok".into()),
+                        StreamEvent::TextEnd,
+                        StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(100),
+                            output_tokens: Some(20),
+                            extra: Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+                                prompt_cache_hit_tokens: 80,
+                                prompt_cache_miss_tokens: 20,
+                                reasoning_tokens: 0,
+                            })),
+                        },
+                    ]],
+                ));
+
+                let (_documents, ctx, _player, kernel_db) = drive_turn_with_breakpoints(
+                    provider,
+                    0,
+                    kernel.clone(),
+                    &[CacheTarget::Tools(kaijutsu_kernel::llm::CacheTtl::Extended)],
+                )
+                .await;
+
+                let usage = kernel_db.lock().get_context_usage(ctx).unwrap().unwrap();
+                assert_eq!(
+                    usage.cache_ttl_secs, 0,
+                    "DeepSeek/OpenAI-compat build() ignores cache_breakpoints — a \
+                     configured breakpoint here is dead storage, not an applied TTL"
+                );
             })
             .await;
     }

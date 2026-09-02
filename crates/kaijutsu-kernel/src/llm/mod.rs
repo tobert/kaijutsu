@@ -50,6 +50,7 @@ pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
     InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_slot_tunables,
+    longest_cache_ttl_secs,
 };
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
 
@@ -1773,6 +1774,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: 0,
+                cache_ttl_secs: 0,
                 updated_at: 1,
             };
             let pct = crate::kernel_db::context_used_pct(&usage, window);

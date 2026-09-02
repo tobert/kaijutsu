@@ -551,6 +551,10 @@ mod tests {
             background_last_exit_code: None,
             cast_label: None,
             cwd: None,
+            last_call_at: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_ttl_secs: None,
         }
     }
 

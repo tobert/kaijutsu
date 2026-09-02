@@ -3546,6 +3546,7 @@ mod tests {
                 cache_read_tokens: 800,
                 cache_write_tokens: 100,
                 reasoning_tokens: 0,
+                cache_ttl_secs: 0,
                 updated_at: kaijutsu_types::now_millis() as i64,
             })
             .unwrap();
@@ -3626,6 +3627,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: 0,
+                cache_ttl_secs: 0,
                 updated_at: kaijutsu_types::now_millis() as i64,
             })
             .unwrap();
@@ -3779,6 +3781,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: 0,
+                cache_ttl_secs: 0,
                 updated_at: kaijutsu_types::now_millis() as i64,
             })
             .unwrap();
@@ -3814,6 +3817,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 reasoning_tokens: 0,
+                cache_ttl_secs: 0,
                 updated_at: kaijutsu_types::now_millis() as i64,
             })
             .unwrap();

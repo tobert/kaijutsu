@@ -1097,6 +1097,19 @@ struct ContextHandleInfo {
   # absence-is-the-wire-sentinel convention as `castLabel`/`originHost`
   # above.
   cwd @30 :Text;
+
+  # Cache health (docs/tui.md "Cache health") — the rest of `ContextUsageRow`
+  # (`kernel_db.rs`) not already carried by `contextWindow`/`contextUsedTokens`
+  # above. Resolved from the SAME `KernelDb::get_context_usage` row, so a
+  # listing caller never has to loop a per-context RPC for it. 0 = unknown/
+  # none on every field below — never a guessed value.
+  lastCallAt @31 :UInt64;       # Unix MILLISECONDS `context_usage.updated_at` of the last completed call; 0 = never
+  cacheReadTokens @32 :UInt64;  # `context_usage.cache_read_tokens` of the last completed call
+  cacheWriteTokens @33 :UInt64; # `context_usage.cache_write_tokens` of the last completed call
+  cacheTtlSecs @34 :UInt64;     # TTL the last call's cache breakpoints actually chose, in seconds
+                                 # (300 ephemeral, 3600 extended, longest wins when mixed); 0 = the
+                                 # provider/request declared no cache TTL (DeepSeek, a local model,
+                                 # or a request with no breakpoints)
 }
 
 struct PresetInfo {
