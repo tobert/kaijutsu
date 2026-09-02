@@ -166,71 +166,57 @@ Measure a normal day's WAL high-water mark before picking one.
 **Do not switch to `wal_checkpoint(TRUNCATE)` on a timer as the fix** — it
 blocks writers, and the limit does the same job at checkpoint time for free.
 
-## The terminal client — `kaijutsu-tui` (RULED 2026-08-30, prerequisites landing)
+## The terminal client — `kaijutsu-tui` (first cut SHIPPED 2026-09-02; follow-ups)
 
-Design: [`tui.md`](tui.md). Standalone ratatui binary on `kaijutsu-client`, the
-`kaijutsu-acp` shape minus the protocol; inline viewport; one process is the
-mux; `docs/ssh-shell.md` retired into it.
+Design: [`tui.md`](tui.md). The skeleton and all five surface lanes landed
+on 2026-09-02 (`16f48dd7` … `19859c3b`): transcript printer, vi compose
+over the kernel draft + the `Ctrl+Z` shell surface with real suspend,
+picker + tracks + beat timer, ask card + ledger view + slash completion,
+editor + diff alternate screens. 207 unit tests in the crate; every lane
+ran live against zorak. `cargo build -p kaijutsu-tui && target/debug/kaijutsu-tui
+--context <label>`.
 
-Shipped 2026-09-02: `rank.rs` and the ledger ask poll live in
-`kaijutsu-client` (`rank`, `ledger`; ACP consumes them), and cache health
-rides `ContextHandleInfo` (`lastCallAt` in unix ms, `cacheReadTokens`,
-`cacheWriteTokens`, `cacheTtlSecs`; 0 = unknown, never a guess). The
-`docs/tui.md` "Cache health" paragraph that says "until that lands" is
-stale and reads as shipped once the presentation lane's edit to that file
-is in.
+What the lanes left open, in rough priority:
 
-Also shipped 2026-09-02: `kaijutsu-present` (format, markdown, kaish
-validation, `Action`, `WellBeats`; `BlockTone`/`SpanTone` are the color
-seam) and the `kaijutsu-tui` skeleton (`crates/kaijutsu-tui`): pure
-`present.rs` + `WrapCache`, `app.rs` state, `Backend`-generic inline
-viewport with `insert_before`, status line with rank/cache health/legend,
-`Ctrl+A` switching, a plain compose line, `Ctrl+C` twice to quit. Ran live
-against zorak. Two findings from that run are fixed in the crate and worth
-knowing: crossterm's `EventStream` holds the single internal reader and
-starves the viewport's cursor query (a blocking reader thread behind a
-shared terminal lock replaces it), and a timer-driven ask poll authors
-blocks into the transcript (`kaijutsu_client::ledger` docs now say so;
-the TUI polls on `subscribe_ledger_events` only).
-
-Lanes, now parallel — each names the seam it replaces:
-
-1. **Transcript printer + wrap cache** — `present.rs::render_block` /
-   `WrapCache::lines`; `render.rs::take_settled_prints` builds the print
-   groups.
-2. **Compose (modalkit over the input block) + shell surface** —
-   `compose.rs`, `shell.rs`; replaces `render::compose_line` + the
-   `App::compose` string; submit stays `bridge::KernelBridge::send_prompt`;
-   `Ctrl+Z` is `keys.rs` `Intent::NotYet`.
-3. **Picker + status line + beat timer** — `picker.rs`; `Ctrl+A "` is
-   `Intent::NotYet`; `status::StatusModel::right_figures` takes bar.beat;
-   `render::VIEWPORT_LINES` is where viewport growth lands.
-4. **Asks + ledger view + slash completion** — `asks.rs`; `App::pending_asks`
-   is a count today and `SeatCell::ask` is always false; `Ctrl+A l` is
-   `Intent::NotYet`.
-5. **Editor + diff screens** — `render::draw_live` / `run::draw` are the two
-   call sites an alternate-screen mode displaces.
+1. **Grown views onto one growth seam.** The picker grows the viewport for
+   real by recreating the terminal at a new height (`run.rs`
+   `set_viewport_height`, `render::viewport_lines`); the ask card and the
+   ledger view still substitute content inside the fixed budget. Move them
+   onto the picker's seam so "grows the viewport" means one thing.
+2. **`inputTokens` on the wire** (kernel + client, one small lane): the
+   status line's `⟳` is `cacheReadTokens / contextUsedTokens` because the
+   row's `input_tokens` is not projected; add it beside `cacheReadTokens`.
+3. **Editor wire gaps** (recorded in `docs/tui.md`, "Editor and diff"):
+   `Kernel::editor_open_as` publishes no `EditorFlow`, so the `open_editor`
+   peer invocation is the only open detection; that fan-out is by
+   submitter principal, so a model-run `vi` reaches the app fallback, not
+   a terminal; `ActorHandle` exposes only `editor_keys`; `EditorState`
+   carries no selection anchor, so visual mode has no band anywhere.
+4. **`kj ledger show` `.data` lacks `created_at` / `decided_at` /
+   `decided_by` / `decided_option` / `remember_scope`**, so the ledger
+   view's age and ANSWERED columns read `—`. Add them to the row's data.
+5. **Picker tails see only whole-block events.** A streaming reply in an
+   unwatched context shows nothing until a block lands — the kernel-wide
+   `ServerEvent` stream's limitation, shared with the app's tails.
 6. `theme.toml` → ratatui palette: replaces `Palette::builtin()` only; both
    resolvers are exhaustive and a test iterates `BlockTone::all()`.
 7. `bindings.toml` keyed by vim notation, commentary reviewed by two
    flash-tier kaibo casts; then a lane to convert the app to the same file.
-8. **Images (post-skeleton, additive).** Render `Svg`/`Image` blocks in the
-   transcript: resvg raster at cell-derived pixel size, OSC 1337 emission
-   (wezterm + iTerm2) with a unicode half-block fallback, in-band detection
-   only. Rules: `docs/tui.md`, "Images". `Abc` needs no new emitter —
+8. **Images (additive).** Render `Svg`/`Image` blocks in the transcript:
+   resvg raster at cell-derived pixel size, OSC 1337 emission (wezterm +
+   iTerm2) with a unicode half-block fallback, in-band detection only.
+   Rules: `docs/tui.md`, "Images". `Abc` needs no new emitter —
    `engrave::engrave_to_svg` (`engrave/svg.rs`) is complete and tested, and
    `font.rs:230` already caches a `path_d` string per glyph, so `BezPath` is
    not on this path. Its only callers are tests: the wiring from a
    `ContentType::Abc` block to the rasterizer is the whole sub-lane.
+9. Bar/beat in the picker and status line assume 4/4; the wire carries no
+   time signature (`picker::BEATS_PER_BAR`).
 
-Small wire follow-up (kernel + client, one Sonnet lane): an `inputTokens`
-field on `ContextHandleInfo` beside `cacheReadTokens`, so `⟳` is the prompt
-share exactly instead of `cacheReadTokens / contextUsedTokens` (the row
-already holds `input_tokens`). Also seen live: `ContextInfo.label` and
-`.model` are routinely empty on real rows, so every client falls back to
-`ContextId::short()` and the cast; and `ActorHandle::subscribe_events` warns
-per dropped event until someone subscribes (`actor.rs`), so subscribe before
-the first hydrate.
+Two client facts every TUI-shaped consumer needs: `ContextInfo.label` and
+`.model` are routinely empty on real rows (fall back to `ContextId::short()`
+and the cast), and `ActorHandle::subscribe_events` warns per dropped event
+until someone subscribes, so subscribe before the first hydrate.
 
 ## RESOLVED — the ask WAS redeemed; `allow_once` was working (2026-08-30)
 
