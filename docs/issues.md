@@ -359,9 +359,8 @@ Shape B slice 5 shipped (`f4494cce`, hook gate carrying source the same
 morning): every shell ask executes on approval. Still retry-shaped, by
 design: `kj cc send` and non-shell hook asks. `find_redeemable`'s digest
 match is deletable only when those execute too, not before
-(`docs/gate-shape-b.md`, "The rest, settled"). The executor wire tests
-synthesize the block link because the harness installs no hook; a test
-that installs one and drives `shellExecute` end to end is owed.
+(`docs/gate-shape-b.md`, "The rest, settled"). The `shellExecute` path is
+driven end to end by the `shell_box_*` cases in `gate_executes_wire.rs`.
 
 Also open from the same lane: `archive_context` stamps `archived_at` and
 leaves `context_state` at `live`. The two checks that matter now read both
