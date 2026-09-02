@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long)]
     insecure: bool,
 
+    /// SSH private key file. Without this, keys come from the SSH agent.
+    #[arg(long)]
+    key: Option<std::path::PathBuf>,
+
     /// Context to attach to, by id or label. Creates it when the label names
     /// nothing live. Without this, the highest-ranked live context is used.
     #[arg(long)]
@@ -95,7 +99,7 @@ async fn run(cli: Cli) -> Result<()> {
         host: cli.host.clone(),
         port: cli.port,
         username: cli.user.clone().unwrap_or_else(whoami::username),
-        key_source: KeySource::Agent,
+        key_source: cli.key.clone().map(KeySource::from_file).unwrap_or(KeySource::Agent),
         insecure: cli.insecure,
     };
     let identity = config.username.clone();

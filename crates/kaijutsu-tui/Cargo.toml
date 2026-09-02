@@ -56,3 +56,19 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # way a shell job does, so the raise is a real signal, not an emulation.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Terminal-fit integration harness (tests/terminal_fit.rs): the real binary
+# runs inside a pty against an in-process ephemeral kernel, and its output
+# is parsed with a second terminal emulator.
+[dev-dependencies]
+kaijutsu-server.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true
+tempfile.workspace = true
+# For writing an ephemeral SSH key to a file in OpenSSH format
+# (`ssh_key::PrivateKey::random` / `to_openssh`, re-exported through
+# `russh::keys`) — the same generation `KeySource::ephemeral()` does, just
+# on disk so `--key <path>` has something to load.
+russh.workspace = true
+rand_v10 = { package = "rand", version = "0.10" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "time"] }

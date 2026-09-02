@@ -57,6 +57,7 @@ kaijutsu-editor = { path = "crates/kaijutsu-editor" }
 kaijutsu-diff = { path = "crates/kaijutsu-diff" }
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 kaijutsu-client = { path = "crates/kaijutsu-client" }
+kaijutsu-server = { path = "crates/kaijutsu-server" }
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 approval-ledger = { path = "crates/approval-ledger" }
@@ -166,6 +167,11 @@ pulldown-cmark = "0.13"
 # (a full terminal-semantics layer) is deliberately NOT enabled.
 vte = "0.15"
 
+# Independent terminal emulator (vt100.net) — used as a second implementation
+# to check kaijutsu-ansi's span assembly against, and by kaijutsu-tui's pty
+# harness to parse the real binary's screen output.
+vt100 = "0.16"
+
 # Diff engine (Apache-2.0) — the engine inside gitoxide and Helix. Histogram +
 # Myers over *arbitrary* token streams, so word-level refinement is the same
 # engine with a different tokenizer. `kaijutsu-diff` writes no diff algorithm.
@@ -191,6 +197,10 @@ editor-types = "0.0.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache", "underline-color", "scrolling-regions"] }
 crossterm = { version = "0.29" }
 unicode-width = "0.2"
+
+# Cross-platform PTY spawning — the real `kaijutsu-tui` binary runs inside
+# one of these for the terminal-fit integration harness (`tests/support/`).
+portable-pty = "0.9"
 
 # System clipboard
 arboard = { version = "3", features = ["wayland-data-control"] }
