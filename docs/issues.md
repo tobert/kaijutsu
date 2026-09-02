@@ -180,21 +180,41 @@ rides `ContextHandleInfo` (`lastCallAt` in unix ms, `cacheReadTokens`,
 stale and reads as shipped once the presentation lane's edit to that file
 is in.
 
-Lanes, in order:
+Also shipped 2026-09-02: `kaijutsu-present` (format, markdown, kaish
+validation, `Action`, `WellBeats`; `BlockTone`/`SpanTone` are the color
+seam) and the `kaijutsu-tui` skeleton (`crates/kaijutsu-tui`): pure
+`present.rs` + `WrapCache`, `app.rs` state, `Backend`-generic inline
+viewport with `insert_before`, status line with rank/cache health/legend,
+`Ctrl+A` switching, a plain compose line, `Ctrl+C` twice to quit. Ran live
+against zorak. Two findings from that run are fixed in the crate and worth
+knowing: crossterm's `EventStream` holds the single internal reader and
+starves the viewport's cursor query (a blocking reader thread behind a
+shared terminal lock replaces it), and a timer-driven ask poll authors
+blocks into the transcript (`kaijutsu_client::ledger` docs now say so;
+the TUI polls on `subscribe_ledger_events` only).
 
-1. **Presentation crate `kaijutsu-present`** (in flight): lift
-   `view/format.rs`, `text/markdown.rs`, `kaish/mod.rs`, the `Action` enum
-   and `WellBeats` out of `kaijutsu-app` with the `bevy::Color`, `Reflect`
-   and `Resource` leaks replaced by a semantic color enum and app-side
-   wrappers.
-2. Skeleton: event loop, `Backend`-generic renderer, `present.rs`, the actor
-   wiring. Then five parallel lanes: transcript printer + wrap cache, compose
-   (modalkit over the input block) + shell surface, picker + status line +
-   beat timer, asks + the ledger view + slash completion, editor + diff
-   screens. Paste rule throughout: nothing you would paste is inside a box.
-3. `bindings.toml` keyed by vim notation, commentary reviewed by two
+Lanes, now parallel — each names the seam it replaces:
+
+1. **Transcript printer + wrap cache** — `present.rs::render_block` /
+   `WrapCache::lines`; `render.rs::take_settled_prints` builds the print
+   groups.
+2. **Compose (modalkit over the input block) + shell surface** —
+   `compose.rs`, `shell.rs`; replaces `render::compose_line` + the
+   `App::compose` string; submit stays `bridge::KernelBridge::send_prompt`;
+   `Ctrl+Z` is `keys.rs` `Intent::NotYet`.
+3. **Picker + status line + beat timer** — `picker.rs`; `Ctrl+A "` is
+   `Intent::NotYet`; `status::StatusModel::right_figures` takes bar.beat;
+   `render::VIEWPORT_LINES` is where viewport growth lands.
+4. **Asks + ledger view + slash completion** — `asks.rs`; `App::pending_asks`
+   is a count today and `SeatCell::ask` is always false; `Ctrl+A l` is
+   `Intent::NotYet`.
+5. **Editor + diff screens** — `render::draw_live` / `run::draw` are the two
+   call sites an alternate-screen mode displaces.
+6. `theme.toml` → ratatui palette: replaces `Palette::builtin()` only; both
+   resolvers are exhaustive and a test iterates `BlockTone::all()`.
+7. `bindings.toml` keyed by vim notation, commentary reviewed by two
    flash-tier kaibo casts; then a lane to convert the app to the same file.
-4. **Images (post-skeleton, additive).** Render `Svg`/`Image` blocks in the
+8. **Images (post-skeleton, additive).** Render `Svg`/`Image` blocks in the
    transcript: resvg raster at cell-derived pixel size, OSC 1337 emission
    (wezterm + iTerm2) with a unicode half-block fallback, in-band detection
    only. Rules: `docs/tui.md`, "Images". `Abc` needs no new emitter —
@@ -202,6 +222,15 @@ Lanes, in order:
    `font.rs:230` already caches a `path_d` string per glyph, so `BezPath` is
    not on this path. Its only callers are tests: the wiring from a
    `ContentType::Abc` block to the rasterizer is the whole sub-lane.
+
+Small wire follow-up (kernel + client, one Sonnet lane): an `inputTokens`
+field on `ContextHandleInfo` beside `cacheReadTokens`, so `⟳` is the prompt
+share exactly instead of `cacheReadTokens / contextUsedTokens` (the row
+already holds `input_tokens`). Also seen live: `ContextInfo.label` and
+`.model` are routinely empty on real rows, so every client falls back to
+`ContextId::short()` and the cast; and `ActorHandle::subscribe_events` warns
+per dropped event until someone subscribes (`actor.rs`), so subscribe before
+the first hydrate.
 
 ## RESOLVED — the ask WAS redeemed; `allow_once` was working (2026-08-30)
 

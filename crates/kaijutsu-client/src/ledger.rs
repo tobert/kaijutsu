@@ -17,6 +17,15 @@
 //! outgoing round trip to a *player* (a client waiting on a human) is each
 //! caller's own concern, not this module's.
 //!
+//! # Every call here authors blocks
+//!
+//! `kj ledger list` and `show` run through [`ActorHandle::execute_kj`], and a
+//! `kj` run in a context leaves a tool-call/tool-result pair in that context's
+//! block log. Poll on a timer and the transcript fills with the client's own
+//! bookkeeping. Drive [`poll_new_asks`] from
+//! `ActorHandle::subscribe_ledger_events` (one poll per generation bump) plus
+//! one poll at startup, never from a clock.
+//!
 //! # Racing is fine and expected
 //!
 //! A human can answer the same ask with `kj ledger allow` from a shell while
