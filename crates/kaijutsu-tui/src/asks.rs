@@ -76,6 +76,19 @@ pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec
     lines
 }
 
+/// Lines [`render_ask_card`] needs at `width` — [`render::viewport_lines`]
+/// asks this before the resize that makes room for the card, so the count
+/// must be the exact render `draw_live` will draw. Counted at `width`
+/// itself, not `u16::MAX` the way [`crate::picker::viewport_lines`] counts:
+/// the statement wraps by width, so a wider count would be smaller than
+/// what a narrower terminal actually needs, and the growth would undercount.
+///
+/// [`render::viewport_lines`]: crate::render::viewport_lines
+pub fn ask_card_viewport_lines(card: &AskCard<'_>, width: u16) -> u16 {
+    let body = render_ask_card(card, width, &Palette::builtin()).len();
+    u16::try_from(body).unwrap_or(u16::MAX)
+}
+
 /// One row of the ledger view's PENDING section.
 pub struct PendingRow {
     pub request_id: String,
@@ -255,6 +268,15 @@ pub fn render_ledger(
         palette.divider(),
     )));
     lines
+}
+
+/// Lines [`render_ledger`] needs — width-independent, [`crate::picker`]'s
+/// own pattern (`docs/tui.md`, "The picker"): counted at `u16::MAX` because
+/// every row is truncated to width (`truncate_plain`), never wrapped into
+/// more lines, so a narrower width needs the same row count.
+pub fn ledger_viewport_lines(rows: &[LedgerRow], filter: &str, selected: usize) -> u16 {
+    let body = render_ledger(rows, filter, selected, u16::MAX, &Palette::builtin()).len();
+    u16::try_from(body).unwrap_or(u16::MAX)
 }
 
 /// What one key does inside the ledger view (`Ctrl+A l`). Mode-dependent:
@@ -487,13 +509,10 @@ pub fn context_facts(app: &crate::app::App, ctx: kaijutsu_types::ContextId) -> (
 
 /// The grown-view content that replaces the live region's block stream when
 /// an ask card or the ledger view is open (`docs/tui.md`'s "grows the
-/// viewport" treatment). Budget-truncated to the current fixed viewport
-/// height rather than actually resizing the terminal: `ratatui`'s
-/// `Viewport::Inline` height is fixed at `Terminal::with_options` and has no
-/// public setter in 0.30 (`ratatui-core::terminal::resize`), so growing the
-/// real viewport needs a terminal-recreation mechanism this pass does not
-/// build — a follow-up shared with whichever lane owns the picker, which
-/// wants the same growth.
+/// viewport" treatment, the same one the picker gets). The real resize is
+/// [`crate::render::viewport_lines`] plus `run.rs`'s `set_viewport_height` —
+/// this fn only builds the render; [`active_view_viewport_lines`] is the
+/// matching height, counted from the same construction.
 pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'static>>> {
     if let Some(card) = &app.ask_card {
         let (context_label, context_type) = context_facts(app, card.context_id);
@@ -514,6 +533,33 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
     }
     if let Some(view) = &app.ledger_view {
         return Some(render_ledger(&view.rows, &view.filter, view.selected, width, &app.palette));
+    }
+    None
+}
+
+/// The height an open ask card or ledger view needs at `width` — `None`
+/// when neither is open. [`crate::render::viewport_lines`] takes this as
+/// one of its `max()` arms, the same growth the picker already gets.
+pub fn active_view_viewport_lines(app: &crate::app::App, width: u16) -> Option<u16> {
+    if let Some(card) = &app.ask_card {
+        let (context_label, context_type) = context_facts(app, card.context_id);
+        let statement = card
+            .detail
+            .statements
+            .first()
+            .map(String::as_str)
+            .unwrap_or(card.detail.description.as_str());
+        let view = AskCard {
+            request_id: &card.request_id,
+            hook: card.detail.tool.as_deref().unwrap_or("-"),
+            context_label: &context_label,
+            context_type: &context_type,
+            statement,
+        };
+        return Some(ask_card_viewport_lines(&view, width));
+    }
+    if let Some(view) = &app.ledger_view {
+        return Some(ledger_viewport_lines(&view.rows, &view.filter, view.selected));
     }
     None
 }
@@ -570,6 +616,44 @@ mod tests {
         let lines = render_ask_card(&card, 24, &Palette::builtin());
         // Header, N wrapped statement lines, key line.
         assert!(lines.len() > 3, "expected the statement to wrap: {lines:?}");
+    }
+
+    /// [`ask_card_viewport_lines`] must count the same wrapped render
+    /// `draw_live` will actually draw at that width — a count taken at
+    /// `u16::MAX` (the picker's pattern) would undercount, because the
+    /// statement wraps by width and a wider width wraps less.
+    #[test]
+    fn ask_card_viewport_lines_matches_the_render_at_width() {
+        let card = AskCard {
+            request_id: "id",
+            hook: "shell_write",
+            context_label: "kaijutsu",
+            context_type: "coder",
+            statement: "one two three four five six seven eight nine ten eleven twelve",
+        };
+        let narrow_rendered = render_ask_card(&card, 16, &Palette::builtin()).len();
+        assert_eq!(usize::from(ask_card_viewport_lines(&card, 16)), narrow_rendered);
+        let wide_rendered = render_ask_card(&card, u16::MAX, &Palette::builtin()).len();
+        assert!(
+            narrow_rendered > wide_rendered,
+            "a narrow width should wrap into more lines than u16::MAX: narrow {narrow_rendered} wide {wide_rendered}"
+        );
+    }
+
+    /// [`ledger_viewport_lines`] is width-independent — the picker's own
+    /// pattern (`docs/tui.md`, "The picker") — because rows are truncated
+    /// to width, never wrapped into more lines.
+    #[test]
+    fn ledger_viewport_lines_is_width_independent() {
+        let rows = vec![
+            pending("p1", "kaijutsu"),
+            pending("p2", "lfm2d"),
+            answered("a1", "kaijutsu", RedeemedMark::Never),
+        ];
+        let rendered_40 = render_ledger(&rows, "", 0, 40, &Palette::builtin()).len();
+        let rendered_200 = render_ledger(&rows, "", 0, 200, &Palette::builtin()).len();
+        assert_eq!(rendered_40, rendered_200, "row count should not depend on width");
+        assert_eq!(usize::from(ledger_viewport_lines(&rows, "", 0)), rendered_40);
     }
 
     fn pending(id: &str, ctx: &str) -> LedgerRow {

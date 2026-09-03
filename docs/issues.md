@@ -34,10 +34,10 @@ Three ways to close the rest, in increasing cost:
    clause's text, so the corpus and the measured escalation rates move
    with it — re-run `contrib/kj-corpus.json` expectations and the probe
    family before trusting the new numbers.
-2. **A standing rule on redirect targets.** Precise about the thing that
+1. **A standing rule on redirect targets.** Precise about the thing that
    matters (writing outside a workspace) and invisible to classifier
    churn, but it is a second policy surface next to the score.
-3. **Refuse the exemption AND the auto-allow band for any redirect**, i.e.
+2. **Refuse the exemption AND the auto-allow band for any redirect**, i.e.
    treat `has_redirect` as escalate-worthy on its own. Safest, and it
    would prompt on `kj block list > out.txt`, which is ordinary. Probably
    too blunt without (1) to inform it.
@@ -178,12 +178,7 @@ ran live against zorak. `cargo build -p kaijutsu-tui && target/debug/kaijutsu-tu
 
 What the lanes left open, in rough priority:
 
-1. **Grown views onto one growth seam.** The picker grows the viewport for
-   real by recreating the terminal at a new height (`run.rs`
-   `set_viewport_height`, `render::viewport_lines`); the ask card and the
-   ledger view still substitute content inside the fixed budget. Move them
-   onto the picker's seam so "grows the viewport" means one thing.
-2. **`inputTokens` on the wire** (kernel + client, one small lane): the
+1. **`inputTokens` on the wire** (kernel + client, one small lane): the
    status line's `⟳` is `cacheReadTokens / contextUsedTokens` because the
    row's `input_tokens` is not projected; add it beside `cacheReadTokens`.
 3. **Editor wire gaps** (recorded in `docs/tui.md`, "Editor and diff"):
@@ -192,17 +187,17 @@ What the lanes left open, in rough priority:
    submitter principal, so a model-run `vi` reaches the app fallback, not
    a terminal; `ActorHandle` exposes only `editor_keys`; `EditorState`
    carries no selection anchor, so visual mode has no band anywhere.
-4. **`kj ledger show` `.data` lacks `created_at` / `decided_at` /
+3. **`kj ledger show` `.data` lacks `created_at` / `decided_at` /
    `decided_by` / `decided_option` / `remember_scope`**, so the ledger
    view's age and ANSWERED columns read `—`. Add them to the row's data.
-5. **Picker tails see only whole-block events.** A streaming reply in an
+4. **Picker tails see only whole-block events.** A streaming reply in an
    unwatched context shows nothing until a block lands — the kernel-wide
    `ServerEvent` stream's limitation, shared with the app's tails.
-6. `theme.toml` → ratatui palette: replaces `Palette::builtin()` only; both
+5. `theme.toml` → ratatui palette: replaces `Palette::builtin()` only; both
    resolvers are exhaustive and a test iterates `BlockTone::all()`.
-7. `bindings.toml` keyed by vim notation, commentary reviewed by two
+6. `bindings.toml` keyed by vim notation, commentary reviewed by two
    flash-tier kaibo casts; then a lane to convert the app to the same file.
-8. **Images (additive).** Render `Svg`/`Image` blocks in the transcript:
+7. **Images (additive).** Render `Svg`/`Image` blocks in the transcript:
    resvg raster at cell-derived pixel size, OSC 1337 emission (wezterm +
    iTerm2) with a unicode half-block fallback, in-band detection only.
    Rules: `docs/tui.md`, "Images". `Abc` needs no new emitter —
@@ -210,7 +205,7 @@ What the lanes left open, in rough priority:
    `font.rs:230` already caches a `path_d` string per glyph, so `BezPath` is
    not on this path. Its only callers are tests: the wiring from a
    `ContentType::Abc` block to the rasterizer is the whole sub-lane.
-9. Bar/beat in the picker and status line assume 4/4; the wire carries no
+8. Bar/beat in the picker and status line assume 4/4; the wire carries no
    time signature (`picker::BEATS_PER_BAR`).
 
 **Terminal-fit harness** (`tests/terminal_fit.rs`, shipped 2026-09-02): the
@@ -260,8 +255,7 @@ and Amy's second morning, in rough priority:
   unreachable and the card cannot be put aside. A gate must be decided, but
   `Esc` doing nothing is a surprise — ruling wanted: `Esc` returns the ask
   to the ledger (still pending), or stays a no-op with the hint line saying
-  so. Sharper until the growth lane lands, because the truncated card can
-  drop its own hint line.
+  so.
 - **`LedgerAction::Show` is a stub** (*"full detail view not yet wired"*)
   while `render_ask_detail` is complete and unreachable. Wire it, on the
   same growth seam as the card.

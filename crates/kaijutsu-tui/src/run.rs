@@ -359,7 +359,7 @@ async fn event_loop(
                 dirty = true;
             }
             _ = tick.tick() => {
-                let want = render::viewport_lines(app);
+                let want = render::viewport_lines(app, terminal.size()?.width);
                 if want != viewport_height {
                     set_viewport_height(&wires.term_lock, terminal, want)?;
                     viewport_height = want;

@@ -214,6 +214,42 @@ fn the_picker_grows_and_shrinks_the_viewport_cleanly() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// c2. The ledger view grows the viewport and keeps its key line on screen
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The ledger view gets the same grown-viewport treatment as the picker
+/// (`docs/tui.md`, "The ledger"): its key-hints line — `a allow once ...
+/// Esc back`, the only way to answer a pending ask — must be on screen,
+/// never truncated off the bottom the way a long ask or a crowded ledger
+/// used to lose it (kaibo review, 2026-09-03).
+#[test]
+fn the_ledger_view_keeps_its_key_hints_line_on_screen() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    // Ctrl+A, then `l` — opens the ledger (`crates/kaijutsu-tui/src/keys.rs`
+    // `ctrl_a_l_opens_the_ledger`).
+    session.send("\x01l");
+    let opened = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "LEDGER"));
+    assert!(opened, "ledger never opened: {}", session.dump("ledger open"));
+
+    let rows = session.screen_text();
+    assert!(
+        rows.iter().any(|l| l.contains("a allow once") && l.contains("Esc back")),
+        "the ledger's key-hints line is not on screen:\n{}",
+        session.dump("ledger open")
+    );
+
+    // Esc closes it, the same as the picker (`asks::LedgerAction::Back`).
+    session.send("\x1b");
+    let closed = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen_contains_str(screen, "LEDGER") && screen_contains(screen, '❯')
+    });
+    assert!(closed, "ledger never closed: {}", session.dump("ledger close"));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // d. Resize keeps the live region intact and on screen
 // ────────────────────────────────────────────────────────────────────────────
 

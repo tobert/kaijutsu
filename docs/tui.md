@@ -313,13 +313,24 @@ Rules the figure carries:
 
 An ask arrives through `subscribeLedgerEvents` and is answered through
 `kj ledger allow|deny`. It renders in the viewport, never as a modal that
-steals the transcript:
+steals the transcript. Same grown-viewport treatment as the picker: the
+viewport grows to hold the whole card, key line included, so a long
+statement never pushes `[a]llow once ...` off the bottom.
 
 ```text
   ⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)
     rm -rf ~/src/wt/kaish-arith
     [a]llow once  [A]llow always  [d]eny  [v]iew ledger
 ```
+
+The card's line count is measured at the terminal's own width — the
+statement wraps by width, so a wider count would say fewer lines than a
+narrower terminal actually needs. The ledger's row count does not need
+this: its rows truncate rather than wrap, so it is measured once at
+`u16::MAX`, the picker's own pattern. Only a terminal shorter than the
+grown view — smaller than the whole card or ledger needs — falls back to
+cropping, and it crops from the top: the key line is the last thing
+either view renders, so it is the last thing to disappear.
 
 ### The ledger (`Ctrl+A l`, proposed chord)
 

@@ -28,8 +28,8 @@ pub const LIVE_CHROME_LINES: u16 = 2;
 ///
 /// Small on purpose: the viewport is what the terminal gives up, and the
 /// transcript is in scrollback where the terminal's own scrolling, search
-/// and copy reach it. A grown view (picker, ledger) is a later lane and is
-/// what changes this.
+/// and copy reach it. A grown view (the picker, an ask card, the ledger)
+/// changes this — [`viewport_lines`] is where.
 pub const VIEWPORT_LINES: u16 = 6;
 
 /// `1756819331000` → `14:02:11`, in the terminal's own timezone.
@@ -159,13 +159,12 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
 
     // The ask card and the ledger view replace the block stream and compose
     // line entirely while open — `docs/tui.md`'s "grows the viewport"
-    // treatment (`asks.rs`'s doc names why this stays budget-truncated
-    // rather than a real terminal resize for now).
+    // treatment. The full render is returned untruncated: `viewport_lines`
+    // sizes the real viewport to hold it before this ever draws, so there is
+    // nothing to budget here in the common case. A terminal too short to
+    // hold what it asked for is `draw_live`'s problem, not this fn's — it
+    // is the one place that actually knows the terminal's real height.
     if let Some(mut lines) = crate::asks::active_view_lines(app, width) {
-        let budget = usize::from(VIEWPORT_LINES.saturating_sub(1));
-        if lines.len() > budget {
-            lines.truncate(budget);
-        }
         lines.push(if armed {
             legend_line(width, &palette)
         } else {
@@ -274,7 +273,16 @@ pub fn draw_live<B: Backend>(
             height,
             ..area
         };
-        frame.render_widget(Paragraph::new(lines), bottom);
+        // The common case never reaches the crop below: `viewport_lines`
+        // already grew the real viewport to hold every line, so `height`
+        // equals `lines.len()`. When the terminal itself is shorter than
+        // that (too small a window, or a resize still catching up), crop
+        // from the FRONT and keep the tail — the tail is where a grown
+        // view's key-hints line lives (`asks.rs`'s ask card and ledger),
+        // and showing everything but the way to answer is the bug this
+        // closes.
+        let start = lines.len().saturating_sub(usize::from(height));
+        frame.render_widget(Paragraph::new(lines[start..].to_vec()), bottom);
     })?;
     Ok(())
 }
@@ -297,16 +305,25 @@ pub fn draw_full<B: Backend>(
         frame.render_widget(Paragraph::new(live.to_vec()), bottom);
     })?;
     Ok(())
-}/// Rows the inline viewport should occupy right now — [`VIEWPORT_LINES`]
-/// ordinarily, or a grown view's own height while one is open. The one place
-/// viewport growth lands (`docs/tui.md`, "grows the viewport and shrinks on
-/// dismiss"): a future grown view (ledger, asks) adds its own arm here rather
-/// than each surface picking its own resize path.
-pub fn viewport_lines(app: &App) -> u16 {
-    match &app.picker {
-        Some(picker) => VIEWPORT_LINES.max(crate::picker::viewport_lines(picker)),
-        None => VIEWPORT_LINES,
+}
+
+/// Rows the inline viewport should occupy right now — [`VIEWPORT_LINES`]
+/// ordinarily, or a grown view's own height while one is open: the picker's
+/// (width-independent), the ask card's (wraps by width, so counted at
+/// `width` — the same width `draw_live` will render at), or the ledger's
+/// (width-independent, same as the picker). The one place viewport growth
+/// lands (`docs/tui.md`, "grows the viewport and shrinks on dismiss"): a
+/// future grown view adds its own arm here rather than each surface picking
+/// its own resize path.
+pub fn viewport_lines(app: &App, width: u16) -> u16 {
+    let mut want = VIEWPORT_LINES;
+    if let Some(picker) = &app.picker {
+        want = want.max(crate::picker::viewport_lines(picker));
     }
+    if let Some(active) = crate::asks::active_view_viewport_lines(app, width) {
+        want = want.max(active);
+    }
+    want
 }
 
 #[cfg(test)]
@@ -679,6 +696,172 @@ mod tests {
         assert!(text.last().unwrap().starts_with("0 kaijutsu*"), "status line still renders: {text:?}");
     }
 
+    /// A long ask statement at a narrow width wraps past the old fixed
+    /// `VIEWPORT_LINES - 1` budget; the key-hints line — the only way to
+    /// answer the ask — must be the last content line, not the header or a
+    /// middle row of the wrapped statement (kaibo review, 2026-09-03).
+    #[test]
+    fn a_long_ask_statement_keeps_the_key_hints_line_last() {
+        let (mut app, id) = fixture();
+        let statement =
+            "one two three four five six seven eight nine ten eleven twelve thirteen".to_string();
+        app.ask_card = Some(crate::asks::AskCardState {
+            request_id: "01a04eb6".to_string(),
+            context_id: id,
+            detail: kaijutsu_client::AskDetail {
+                request_id: "01a04eb6".to_string(),
+                context_id: Some(id),
+                status: "pending".to_string(),
+                origin: "shell_gate".to_string(),
+                tool: Some("shell_write".to_string()),
+                hook_id: None,
+                instance: None,
+                description: statement.clone(),
+                authorized_label: None,
+                statements: vec![statement],
+                exec_source: None,
+                cwd: None,
+                env: Vec::new(),
+                redeemed_at: None,
+            },
+        });
+        let live = live_lines(&mut app, 16, 0, false);
+        let last_content: String = live[live.len() - 2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            last_content.contains("[a]llow"),
+            "key hints must be the last content line before the status line, got {last_content:?} in {live:?}"
+        );
+    }
+
+    /// A ledger with more rows than the old fixed budget loses the same
+    /// key-hints line the same way — `a allow once ... Esc back` must stay
+    /// visible.
+    #[test]
+    fn a_long_ledger_keeps_the_key_hints_line_last() {
+        let (mut app, _id) = fixture();
+        let ledger_rows = (0..10)
+            .map(|i| {
+                crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
+                    request_id: format!("p{i}"),
+                    age: Some("1s".to_string()),
+                    context_label: "kaijutsu".to_string(),
+                    context_type: "coder".to_string(),
+                    hook: "shell_write".to_string(),
+                    statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
+                })
+            })
+            .collect();
+        app.ledger_view = Some(crate::asks::LedgerViewState {
+            rows: ledger_rows,
+            filter: String::new(),
+            selected: 0,
+            filtering: false,
+        });
+        let live = live_lines(&mut app, 96, 0, false);
+        let last_content: String = live[live.len() - 2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            last_content.starts_with("a allow once"),
+            "key hints must be the last content line before the status line, got {last_content:?}"
+        );
+    }
+
+    /// [`viewport_lines`] must grow to fit an open ask card's full render,
+    /// the same treatment the picker already gets — a long statement at a
+    /// narrow width needs more than [`VIEWPORT_LINES`].
+    #[test]
+    fn viewport_lines_grows_for_an_open_ask_card() {
+        let (mut app, id) = fixture();
+        let statement =
+            "one two three four five six seven eight nine ten eleven twelve thirteen".to_string();
+        app.ask_card = Some(crate::asks::AskCardState {
+            request_id: "01a04eb6".to_string(),
+            context_id: id,
+            detail: kaijutsu_client::AskDetail {
+                request_id: "01a04eb6".to_string(),
+                context_id: Some(id),
+                status: "pending".to_string(),
+                origin: "shell_gate".to_string(),
+                tool: Some("shell_write".to_string()),
+                hook_id: None,
+                instance: None,
+                description: statement.clone(),
+                authorized_label: None,
+                statements: vec![statement],
+                exec_source: None,
+                cwd: None,
+                env: Vec::new(),
+                redeemed_at: None,
+            },
+        });
+        assert!(viewport_lines(&app, 16) > VIEWPORT_LINES);
+    }
+
+    /// Same for the ledger, and its growth must not depend on width — its
+    /// rows never wrap, they truncate (`ledger_viewport_lines`).
+    #[test]
+    fn viewport_lines_grows_for_an_open_ledger() {
+        let (mut app, _id) = fixture();
+        let ledger_rows = (0..10)
+            .map(|i| {
+                crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
+                    request_id: format!("p{i}"),
+                    age: Some("1s".to_string()),
+                    context_label: "kaijutsu".to_string(),
+                    context_type: "coder".to_string(),
+                    hook: "shell_write".to_string(),
+                    statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
+                })
+            })
+            .collect();
+        app.ledger_view = Some(crate::asks::LedgerViewState {
+            rows: ledger_rows,
+            filter: String::new(),
+            selected: 0,
+            filtering: false,
+        });
+        assert!(viewport_lines(&app, 96) > VIEWPORT_LINES);
+    }
+
+    /// A terminal shorter than the grown view crops from the FRONT, keeping
+    /// the tail — the key-hints line is the last thing an ask card or the
+    /// ledger renders, so it is the last thing that should disappear, not
+    /// the first (`docs/tui.md`, "The picker").
+    #[test]
+    fn a_terminal_shorter_than_the_grown_view_keeps_the_tail() {
+        let (mut app, _id) = fixture();
+        let ledger_rows = (0..10)
+            .map(|i| {
+                crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
+                    request_id: format!("p{i}"),
+                    age: Some("1s".to_string()),
+                    context_label: "kaijutsu".to_string(),
+                    context_type: "coder".to_string(),
+                    hook: "shell_write".to_string(),
+                    statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
+                })
+            })
+            .collect();
+        app.ledger_view = Some(crate::asks::LedgerViewState {
+            rows: ledger_rows,
+            filter: String::new(),
+            selected: 0,
+            filtering: false,
+        });
+        // The full view needs more than 4 rows; hand draw_live a terminal
+        // that only has 4.
+        let mut terminal = Terminal::new(TestBackend::new(96, 4)).expect("test backend builds");
+        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
+        let text = rows(&terminal);
+        assert!(
+            text.last().unwrap().starts_with("0 kaijutsu*"),
+            "status line still last: {text:?}"
+        );
+        assert!(
+            text[text.len() - 2].starts_with("a allow once"),
+            "key hints must be the row above status when the terminal is short: {text:?}"
+        );
+    }
+
     /// The ledger view replaces the live region the same way, both sections
     /// visible (`docs/tui.md`, "The ledger").
     #[test]
@@ -697,7 +880,12 @@ mod tests {
             selected: 0,
             filtering: false,
         });
-        let mut terminal = Terminal::new(TestBackend::new(96, 4)).expect("test backend builds");
+        // LEDGER header + PENDING + one row + key line + status: 5 lines,
+        // the full render `viewport_lines` would grow the real viewport to
+        // hold (`a_terminal_shorter_than_the_grown_view_keeps_the_tail`
+        // covers the undersized case on purpose; this test wants the
+        // ordinary one).
+        let mut terminal = Terminal::new(TestBackend::new(96, 5)).expect("test backend builds");
         draw_live(&mut terminal, &mut app, 0, false).expect("draw");
         let text = rows(&terminal);
         assert!(text[0].starts_with("LEDGER"), "got {text:?}");
