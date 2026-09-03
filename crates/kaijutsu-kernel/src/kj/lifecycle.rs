@@ -1824,9 +1824,9 @@ mod tests {
         );
     }
 
-    /// `context_type = "nonexistent"` has no `/config/rc/nonexistent/` directory
-    /// at all — not even the type-level ancestor — under `test_dispatcher()`'s
-    /// host-backed `LocalBackend` mount. `dispatch`'s own `Ok` and an empty
+    /// `context_type = "nonexistent"` has an rc bucket (`/config/rc/nonexistent/`,
+    /// which `context create` requires) but no `create/` verb directory under
+    /// `test_dispatcher()`'s host-backed `LocalBackend` mount. `dispatch`'s own `Ok` and an empty
     /// context alone don't distinguish "load_rc_scripts correctly saw zero
     /// scripts" from "load_rc_scripts errored and `context.rs` swallowed it"
     /// (`context create` logs-and-continues on an rc-lifecycle `Err`, per the
@@ -1835,7 +1835,13 @@ mod tests {
     /// actually tells them apart, so assert on it directly.
     #[tokio::test]
     async fn rc_no_scripts_for_type_is_noop() {
+        use crate::vfs::VfsOps;
         let d = test_dispatcher().await;
+        d.kernel
+            .vfs()
+            .mkdir(std::path::Path::new("/config/rc/nonexistent"), 0o755)
+            .await
+            .expect("an rc bucket with no verbs");
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -1894,7 +1900,15 @@ mod tests {
     /// before the script list loaded should read as having no count at all.
     #[tokio::test]
     async fn rc_empty_verb_records_zero_script_count() {
+        use crate::vfs::VfsOps;
         let d = test_dispatcher().await;
+        let vfs = d.kernel.vfs();
+        vfs.mkdir(std::path::Path::new("/config/rc/nothinghere"), 0o755)
+            .await
+            .expect("an rc bucket");
+        vfs.mkdir(std::path::Path::new("/config/rc/nothinghere/create"), 0o755)
+            .await
+            .expect("an empty create verb");
         let caller = unjoined_caller();
         let result = d
             .dispatch(
