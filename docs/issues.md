@@ -244,12 +244,25 @@ From the 2026-09-03 kaibo review of the `:` lane (cast crusoe: GLM-5.2
 synth, DeepSeek-V4-Flash explorer; the stuck turn flag it found is fixed)
 and Amy's second morning, in rough priority:
 
-- **No expand gesture.** `ToolCall`, `ToolResult` and `Error` blocks arrive
-  collapsed to one `▸` line (`present::collapses_by_default`) and nothing in
-  the tui expands one — Amy: *"an `ls` doesn't seem to get its vertical
-  space to display? is it autocollapsed?"* Yes; `:!ls` lands a `ToolResult`.
-  Collapse is kernel state (`CollapsedChanged`), so the gesture is a
-  binding plus the kernel call, not a client flag. Amy picks the key.
+- **Tool results print whole in the tui.** `ToolCall`, `ToolResult` and
+  `Error` arrive collapsed to one `▸` line (`present::collapses_by_default`)
+  and nothing in the tui expands one — Amy: *"an `ls` doesn't seem to get
+  its vertical space to display?"* Expand-in-place is impossible over
+  scrollback, so the answer is not a gesture: drop the collapse default for
+  `ToolCall`/`ToolResult` (keep `Error`'s one-line stub), and past a
+  screenful print the head with a footer saying how many more lines. One
+  change plus a test.
+- **`Ctrl+A [` copy mode** (`docs/tui.md`, guidance 7): the transcript as a
+  buffer on the alternate screen under vi motions and `/` search, `q`/`Esc`
+  leaves; `v` `y` to the clipboard later, over ssh via OSC 52. This is how a
+  long result is read whole, and how the conversation is scrolled from the
+  keyboard. Reuse the editor's alternate-screen plumbing (`editor.rs`,
+  `AltScreen`).
+- **Longer-term, Amy's: a formatter over a result's kaish `.data`**, keyed
+  by producing verb, run before print, living under `/config/client` as a
+  plain file — a print-time decision, never a redraw. *"we work on adding
+  ways to flow the data better, esp since we have kaish .data. Maybe tui
+  could have some kaish scripts fire for formatting?"*
 - **The ask card swallows `Esc` and `Ctrl+C`.** `ask_key_to_decision`
   answers only `a`/`A`/`d`/`v`; while an ask is up the interrupt ladder is
   unreachable and the card cannot be put aside. A gate must be decided, but

@@ -397,6 +397,29 @@ a collision appears in real prose, not in advance.
 | sequence | verb, noun | What the kernel does to every accepted mutation. There is exactly one sequencer. |
 | fail loudly | verb phrase | An error is explicit and immediate. We never continue on a wrong assumption, and we prefer crashing to corrupting. |
 
+## Proprioception
+
+The tui and the app are where the hands Amy has trained on the tools she
+already plays become the written language of this shared space. The theme
+is combining tools that are already great at a deeper level, never
+reinventing them: **screen/tmux → context navigation** (the `Ctrl+A`
+prefix, `[` for copy mode, windows are contexts), **vi/vim → editing modes**
+(compose, the `:` line, the editor, copy mode's motions). Match the original
+where it lines up. Where it does not, name the difference in `docs/tui.md`
+or `docs/input.md`, and leave room to trip on a new combination — Amy's
+statements are guidance, not rulings.
+
+The standard is a power user's: roll with defaults plus a few earned
+preferences, and never overhaul a tool from the state its developers ship
+it in. A powerful subset of a few powertools, played really well. Amy
+(2026-09-03): *"Claude Code is pretty good but also I am an expert and it is
+increasingly a consumer tool, and it should be, that's its promise.
+Kaijutsu is a first generation mecha for us to make music and build with
+whatever and whoever we meet."* A kaijutsu surface is judged against the
+instrument a player already knows, not against what a consumer tool does.
+Proprioception is the pilot feeling the machine as her own body; the muscle
+memory she brings is what the machine must not fight.
+
 ## App Input
 
 All keyboard/gamepad/mouse input in `kaijutsu-app` flows through the central

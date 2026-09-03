@@ -1,9 +1,9 @@
 # The terminal client — `kaijutsu-tui`
 
-**Status:** design, ruled 2026-08-30 (Amy + Fable), unbuilt. Mockups and
-two flash-cast takes on them are in the design artifact linked from
-`signoff.md` while it is live; the decided shapes are the ASCII figures
-below.
+**Status:** built; first cut shipped 2026-09-02, and Amy plays it. The
+shapes are the ASCII figures below; the direction is `AGENTS.md`,
+"Proprioception". Amy's statements here are guidance, not rulings — there
+is room to trip on a new combination.
 
 `kaijutsu-tui` is a standalone binary that dials the kernel over the existing
 `kaijutsu-rpc` SSH subsystem and renders a terminal UI with ratatui. It is the
@@ -18,7 +18,7 @@ kaijutsu-tui            ratatui inline viewport; modalkit for the vi surfaces
 kaijutsu-server / kernel
 ```
 
-## Rulings (Amy, 2026-08-30)
+## Guidance (Amy, 2026-08-30)
 
 1. **Inline viewport.** *"I tend not to like the fullscreen modes."* The
    transcript flows into the terminal's own scrollback; the live UI is a
@@ -44,6 +44,23 @@ kaijutsu-server / kernel
    into this document ("Melted from the ssh shell design").
 6. **codex's look is fine.** Lean into modalkit; the key pidgin is
    screen/tmux/vi/vim, the one the app already speaks.
+
+7. **Match the tool the hand already knows** (2026-09-03; `AGENTS.md`,
+   "Proprioception"). The `:` line draws as vim's does: no gap, `:!` as
+   typed. There is no state past normal mode. **`Ctrl+A [` is tmux's copy
+   mode** — Amy's `.tmux.conf` has `mode-keys vi`, `bind [ copy-mode`,
+   `bind ] paste-buffer` — and it means the same thing here: from the
+   conversation, switch so that movement goes up and down the transcript.
+   The transcript becomes a buffer on the alternate screen under vi
+   motions (`j`/`k`, `Ctrl+U`/`Ctrl+D`, `gg`/`G`, `/` and `?` search),
+   `v` then `y` yanks to the clipboard (OSC 52 over ssh), `q` or `Esc`
+   leaves. Fullscreen exists only where vim and tmux themselves go
+   fullscreen: the editor, the diff, copy mode. Amy: *"I almost hit ctrl-a
+   [ to start scrolling up in this window so what if we put that in?"*
+   Tool output is never collapsed in the tui; a block is read whole, and
+   reading it better is a print-time problem (a formatter over kaish
+   `.data`, longer-term), never a redraw — copy mode is how a long result
+   is read, the way `less` would be.
 
 ## Shape: the ACP bridge minus the protocol
 
@@ -92,7 +109,7 @@ grammar, and a new surface arrives in the same shape:
 - **Exactly one viewport claim**, from a closed set of three: *flows to
   scrollback* (conversation), *grows the viewport* and shrinks on dismiss
   (picker, ledger, asks), or *takes the alternate screen* (vi and diff only,
-  ruling 1). There is no fourth mode.
+  guidance 1). There is no fourth mode.
 
 Two sanctioned deviations: compose's figure is the `❯` line inside the
 conversation figure — it is part of that frame, not a grown view — and
@@ -127,7 +144,7 @@ Rules the figure carries:
 - A block that completes leaves the viewport for scrollback. A late edit,
   exclude or collapse of a block already in scrollback **cannot redraw it**;
   the change is real in the kernel and the next hydrate, and the TUI says so
-  in the status line rather than pretending. This is the price of ruling 1,
+  in the status line rather than pretending. This is the price of guidance 1,
   paid knowingly.
 - `Thinking` renders dim and collapses when its turn completes.
 
@@ -174,7 +191,7 @@ Rules the figure carries:
 ### The `:` line and the `Ctrl+C` ladder
 
 Amy, after an evening on the first cut: *"let's think through MVP for :,
-reclaim ctrl-c for interrupts."* Ruled the same evening: *"all three rulings
+reclaim ctrl-c for interrupts."* Her guidance the same evening: *"all three rulings
 yes"* (`/` retires from compose, `:!` shares the shell history, `:q` is the
 only quit); *":q should warn if there's still active turns, :q! exits and
 leaves them going in the kernel"*; *"Ctrl-Z can probably go away in favor of
@@ -252,7 +269,7 @@ client submits (`compose_key`'s own submit) or when
 *another* client or peer announces no start this client can see unless it is
 already watching that context, so `nothing to interrupt` and a clean `:q`
 can both be wrong about a turn someone else started. That gap is what Amy's
-"fine to do simple `:q`" ruling accepted rather than building a
+"fine to do simple `:q`" guidance accepted rather than building a
 cross-client turn ledger for it. The flag is forgotten wholesale when the
 event stream is known broken — a broadcast lag (`RecvError::Lagged`) or the
 connection leaving `Connected` — with a notice saying so, because the
@@ -367,7 +384,7 @@ Rules the figure carries:
   "was this consumed" is the question the redemption incident taught us to
   ask (`docs/issues.md`, the resolved redemption entry).
 - `Ctrl+A l` is not in the app's table today; it is proposed here and lands
-  in the shared `bindings.toml` (ruling 4), where the app inherits it.
+  in the shared `bindings.toml` (guidance 4), where the app inherits it.
 
 ### Status line
 
@@ -492,7 +509,7 @@ lane; nothing new rides the wire.
   fields in pty-req and window-change), with a `CSI 16 t` query as the
   fallback; protocol support is probed with terminal queries at startup. When
   no protocol answers, half-blocks render.
-- **Write-once emission, riding ruling 1.** An image renders when its block
+- **Write-once emission, riding guidance 1.** An image renders when its block
   completes and prints into scrollback: reserve N lines in the
   `insert_before`, emit the image sized in cell units (so N is exact), and
   never touch it again. Both target terminals keep inline images in
@@ -517,7 +534,8 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
 `Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a`, `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`,
-`h`, and the armed-prefix legend line. The legend replaces the status line
+`h`, and the armed-prefix legend line; `Ctrl+A [` is copy mode (guidance 7,
+unbuilt). The legend replaces the status line
 while a prefix is pending; there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
 `Ctrl+Z` is a single-press suspend (`raise SIGTSTP`; `fg` or `SIGCONT`
@@ -533,7 +551,7 @@ parses. The app's file today is keyed by Bevy `KeyCode` names
 (`kaijutsu-app/src/input/bindings_config.rs`, `parse_key_code`). The TUI ships
 the vim-notation schema first; converting the app is a follow-up lane. The
 file's commentary is technical and reviewed by two flash-tier kaibo casts for
-clarity before it lands (ruling 4).
+clarity before it lands (guidance 4).
 
 ## Time features
 
@@ -645,5 +663,5 @@ subsystem.
 - Scrollback staleness: the skeleton posts `block #12 changed after print`
   in the status line and never redraws. Whether a change also earns its own
   line in the transcript is still open.
-- Internal splits. Ruled out for v1; wezterm splits with
+- Internal splits. Set aside for v1; wezterm splits with
   `kaijutsu-tui --context <id>` cover it. Revisit when the itch is real.
