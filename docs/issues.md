@@ -34,10 +34,10 @@ Three ways to close the rest, in increasing cost:
    clause's text, so the corpus and the measured escalation rates move
    with it — re-run `contrib/kj-corpus.json` expectations and the probe
    family before trusting the new numbers.
-1. **A standing rule on redirect targets.** Precise about the thing that
+2. **A standing rule on redirect targets.** Precise about the thing that
    matters (writing outside a workspace) and invisible to classifier
    churn, but it is a second policy surface next to the score.
-2. **Refuse the exemption AND the auto-allow band for any redirect**, i.e.
+3. **Refuse the exemption AND the auto-allow band for any redirect**, i.e.
    treat `has_redirect` as escalate-worthy on its own. Safest, and it
    would prompt on `kj block list > out.txt`, which is ordinary. Probably
    too blunt without (1) to inform it.
@@ -181,7 +181,7 @@ What the lanes left open, in rough priority:
 1. **`inputTokens` on the wire** (kernel + client, one small lane): the
    status line's `⟳` is `cacheReadTokens / contextUsedTokens` because the
    row's `input_tokens` is not projected; add it beside `cacheReadTokens`.
-3. **Editor wire gaps** (recorded in `docs/tui.md`, "Editor and diff"):
+2. **Editor wire gaps** (recorded in `docs/tui.md`, "Editor and diff"):
    `Kernel::editor_open_as` publishes no `EditorFlow`, so the `open_editor`
    peer invocation is the only open detection; that fan-out is by
    submitter principal, so a model-run `vi` reaches the app fallback, not
