@@ -223,14 +223,15 @@ pub struct BlockView<'a> {
 
 /// Whether a block of this kind renders collapsed the first time it is seen.
 ///
-/// The kernel's `collapsed` field has no per-kind default, so the default is
-/// the client's to apply — once, on first arrival, then carried forward per
-/// block id so a later expand is not wiped by the next redraw.
+/// Only `Error`. Tool calls and results print whole: the transcript lives
+/// in scrollback and is never redrawn, so a collapsed result is one nobody
+/// can open — reading a long one is copy mode's job (`docs/tui.md`,
+/// guidance 7). The kernel's `collapsed` field has no per-kind default, so
+/// the default is the client's to apply — once, on first arrival, then
+/// carried forward per block id so a later change is not wiped by the next
+/// redraw.
 pub fn collapses_by_default(kind: BlockKind) -> bool {
-    matches!(
-        kind,
-        BlockKind::ToolCall | BlockKind::ToolResult | BlockKind::Error
-    )
+    matches!(kind, BlockKind::Error)
 }
 
 /// A block's wrap-cache version: every field whose change alters the
@@ -680,10 +681,13 @@ mod tests {
         assert!(!text.contains("14:02:11"), "got {text:?}");
     }
 
+    /// Tool output prints whole: scrollback can never be redrawn, so a
+    /// collapsed result is one nobody can open. Only `Error` keeps its
+    /// one-line stub.
     #[test]
-    fn tool_calls_and_results_and_errors_collapse_by_default() {
-        assert!(collapses_by_default(BlockKind::ToolCall));
-        assert!(collapses_by_default(BlockKind::ToolResult));
+    fn only_errors_collapse_by_default() {
+        assert!(!collapses_by_default(BlockKind::ToolCall));
+        assert!(!collapses_by_default(BlockKind::ToolResult));
         assert!(collapses_by_default(BlockKind::Error));
         assert!(!collapses_by_default(BlockKind::Text));
         assert!(!collapses_by_default(BlockKind::Thinking));

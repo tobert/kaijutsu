@@ -772,21 +772,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_blocks_arrive_collapsed_and_stay_expanded_once_expanded() {
+    fn tool_blocks_arrive_whole_and_a_collapse_is_carried_forward() {
         let (_, aid, _) = app_with_two();
         let mut mirror = ContextMirror::new(aid);
         let call = block(aid, 1, BlockKind::ToolCall, Role::Model);
-        let text = block(aid, 2, BlockKind::Text, Role::Model);
+        let result = block(aid, 2, BlockKind::ToolResult, Role::Model);
+        let error = block(aid, 3, BlockKind::Error, Role::Model);
         mirror
-            .apply_snapshot(vec![call.clone(), text.clone()], 1)
+            .apply_snapshot(vec![call.clone(), result.clone(), error.clone()], 1)
             .expect("snapshot applies");
         let mut view = ContextView::new(mirror);
-        assert!(view.is_collapsed(&call));
-        assert!(!view.is_collapsed(&text));
+        assert!(!view.is_collapsed(&call), "tool output prints whole");
+        assert!(!view.is_collapsed(&result), "tool output prints whole");
+        assert!(view.is_collapsed(&error), "an error keeps its stub");
 
-        view.collapsed.insert(call.id, false);
+        view.collapsed.insert(call.id, true);
         view.seed_collapse();
-        assert!(!view.is_collapsed(&call), "a user's expand is carried forward");
+        assert!(view.is_collapsed(&call), "a collapse is carried forward");
     }
 
     #[test]
@@ -839,8 +841,8 @@ mod tests {
         );
     }
 
-    /// `ContextChange::CollapsedChanged` is what makes a sibling's expand (or
-    /// the turn-end auto-collapse) visible on a still-live block —
+    /// `ContextChange::CollapsedChanged` is what makes a sibling's collapse
+    /// (or the turn-end auto-collapse) visible on a still-live block —
     /// `docs/tui.md`: "Collapse is kernel state ... so a sibling's expand is
     /// yours too."
     #[test]
@@ -852,17 +854,17 @@ mod tests {
             .apply_snapshot(vec![call.clone()], 1)
             .expect("snapshot applies");
         let view = ContextView::new(mirror);
-        assert!(view.is_collapsed(&call), "ToolCall collapses by default");
+        assert!(!view.is_collapsed(&call), "ToolCall arrives whole");
         app.views.insert(aid, view);
 
         app.apply_collapse_change(
             aid,
             &ContextChange::CollapsedChanged {
                 block_id: call.id,
-                collapsed: false,
+                collapsed: true,
             },
         );
-        assert!(!app.views[&aid].is_collapsed(&call), "the sibling's expand landed");
+        assert!(app.views[&aid].is_collapsed(&call), "the sibling's collapse landed");
     }
 
     /// A `CollapsedChanged` for a context with no watched view is not a bug

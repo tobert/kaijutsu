@@ -145,7 +145,8 @@ is the terminal's; search, copy and split are the terminal's.
 Rules the figure carries:
 
 - The role divider names principal, `context_type` and the block's wallclock.
-- `▸` is a collapsed block; `ToolCall`/`ToolResult` collapse by default and
+- `▸` is a collapsed block; only `Error` collapses by default (tool output
+  prints whole, guidance 7) and
   `Error` is a one-line stub, per the app's error-render policy. Collapse is
   kernel state (`CollapsedChanged`), so a sibling's expand is yours too.
 - A block that completes leaves the viewport for scrollback. A late edit,
