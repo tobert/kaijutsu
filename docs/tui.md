@@ -159,7 +159,11 @@ Rules the figure carries:
   the change is real in the kernel and the next hydrate, and the TUI says so
   in the status line rather than pretending. This is the price of guidance 1,
   paid knowingly.
-- `Thinking` renders dim and collapses when its turn completes.
+- `Thinking` prints whole, dim and italic, and nothing collapses it: it
+  completes before the reply starts, so a turn-end collapse could never
+  reach scrollback anyway (Amy: *"start by removing any collapse, and just
+  show it"*). A thinking pane that grows the viewport while reasoning
+  streams and leaves a stub behind is the open design, "Roads not taken".
 - A `ToolResult` with structured output (`OutputData` — headers, a flat list,
   a tree, `rich_json`) lays out at the terminal's real width in the tui: a
   table, `ls -C` columns, or an indented tree (`layout::layout_output`).
@@ -285,8 +289,7 @@ longer quits — `:q` is the only quit. `Ctrl+A q` stays close-and-demote
 **Turn liveness is a partial signal.** `App::turns_running` is set when this
 client submits (`compose_key`'s own submit) or when
 `ServerEvent::TurnStarted` names a context, and cleared on
-`TurnCompleted`/`TurnFailed` for that context — the same two events
-`collapse_thinking_on_turn_end` already matches. An interactive submit from
+`TurnCompleted`/`TurnFailed` for that context. An interactive submit from
 *another* client or peer announces no start this client can see unless it is
 already watching that context, so `nothing to interrupt` and a clean `:q`
 can both be wrong about a turn someone else started. That gap is what Amy's
@@ -714,6 +717,17 @@ that must not play the turn. Today `pty_request`, `shell_request`,
 `ConnectionHandler` (`kaijutsu-server/src/ssh.rs`) and stay that way. The
 `Backend`-generic renderer keeps the door unlocked; the loopback `ActorHandle`
 is what would keep a kernel-served variant honest.
+
+**A thinking pane, not yet.** Reasoning could stream in a view that grows
+the viewport while a turn runs (the third viewport claim, as the ask card
+and the ledger grow it) and leave a one-line `▸` stub in scrollback when
+the block completes, with the whole text still findable in copy mode and
+`kj block read`. It fits the three claims without a fourth, and the print
+path already has the seam: `take_settled_prints` would print a stub for a
+completed `Thinking` block instead of the block, and `live_lines` would
+hold the streaming one at a larger budget. Not built, because Amy is torn
+between reading reasoning as it runs and having it get out of the way;
+today it prints whole, and the pane waits on her playing with that.
 
 **Bevy with a terminal frontend.** `bevy_ratatui` exists. Of the app's ~90k
 lines, ~65k are vello/MSDF/Bevy-UI/3D and cannot render in a terminal; the
