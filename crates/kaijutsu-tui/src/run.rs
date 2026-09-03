@@ -538,7 +538,7 @@ fn draw_alternate(alt: &mut AltScreen, app: &mut App) -> Result<()> {
             alt.draw(lines, None)?;
         }
         ScreenMode::Copy(screen) => {
-            let lines = screen.frame(size.height, &palette);
+            let lines = screen.frame(size.height, size.width, &palette);
             let cursor = screen.frame_cursor(size.height);
             alt.draw(lines, cursor)?;
         }

@@ -280,7 +280,7 @@ impl CopyScreen {
     /// line (or the search prompt, while one is being typed) — the same
     /// "every grown view renders its own keys" rule the picker and the
     /// ledger follow (`docs/tui.md`, "Keys").
-    pub fn frame(&mut self, height: u16, palette: &Palette) -> Vec<Line<'static>> {
+    pub fn frame(&mut self, height: u16, width: u16, palette: &Palette) -> Vec<Line<'static>> {
         let body_h = height.saturating_sub(CHROME_LINES).max(1) as usize;
         self.body_h = body_h;
         self.follow_cursor();
@@ -306,7 +306,7 @@ impl CopyScreen {
                 format!("{}{}", prompt.direction.glyph(), prompt.text),
                 palette.status(),
             )),
-            None => self.hint_line(palette),
+            None => self.hint_line(width, palette),
         });
         out
     }
@@ -319,19 +319,21 @@ impl CopyScreen {
         Some((col, height.saturating_sub(1)))
     }
 
-    fn hint_line(&self, palette: &Palette) -> Line<'static> {
+    /// The bottom line: position, context label, keys. The key list
+    /// shortens to fit `width` so `q leave` is never the part that falls
+    /// off the right edge, the way `status::legend_line` shortens.
+    fn hint_line(&self, width: u16, palette: &Palette) -> Line<'static> {
         let position = if self.lines.is_empty() {
             "line 0/0".to_string()
         } else {
             format!("line {}/{}", self.cursor + 1, self.lines.len())
         };
-        // Kept under 80 columns beside a position and a short label, so
-        // `q leave` is never the part that falls off the right edge.
-        let keys = "j/k  ^D/^U  gg/G  / search  Space mark  Enter copy  q leave";
-        Line::from(Span::styled(
-            format!("{position}   {}   {keys}", self.context_label),
-            palette.status(),
-        ))
+        let lead = format!("{position}   {}   ", self.context_label);
+        let full = "j/k  ^D/^U  gg/G  / search  Space mark  Enter copy  q leave";
+        let short = "Space mark  Enter copy  q leave";
+        let room = usize::from(width).saturating_sub(lead.chars().count());
+        let keys = if full.chars().count() <= room { full } else { short };
+        Line::from(Span::styled(format!("{lead}{keys}"), palette.status()))
     }
 }
 
@@ -837,11 +839,29 @@ mod tests {
     fn the_hint_line_carries_the_position_and_the_label() {
         let mut screen = fixture(50);
         screen.set_cursor(10);
-        let frame = screen.frame(6, &Palette::builtin());
+        let frame = screen.frame(6, 80, &Palette::builtin());
         let hint: String = frame.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(hint.contains("line 11/50"), "got {hint:?}");
         assert!(hint.contains("kaijutsu"), "got {hint:?}");
         assert!(hint.contains("q leave"), "got {hint:?}");
+    }
+
+    /// A narrow screen or a long position shortens the key list rather
+    /// than clipping it: `q leave` is always the last thing on the line.
+    #[test]
+    fn the_hint_line_shortens_to_keep_q_leave_on_screen() {
+        let palette = Palette::builtin();
+        let mut screen = fixture(1207);
+        for width in [40u16, 60, 80, 120] {
+            let frame = screen.frame(10, width, &palette);
+            let hint: String = frame.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(hint.ends_with("q leave"), "width {width}: {hint:?}");
+            assert!(
+                hint.chars().count() <= usize::from(width) || width < 50,
+                "width {width}: hint is {} wide: {hint:?}",
+                hint.chars().count()
+            );
+        }
     }
 
     #[test]
@@ -849,7 +869,7 @@ mod tests {
         let mut screen = fixture(10);
         handle_key(&mut screen, &press(KeyCode::Char('/')), 10);
         handle_key(&mut screen, &press(KeyCode::Char('a')), 10);
-        let frame = screen.frame(6, &Palette::builtin());
+        let frame = screen.frame(6, 80, &Palette::builtin());
         let bottom: String = frame.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(bottom, "/a");
     }
