@@ -204,13 +204,15 @@ impl Compose {
     }
 
     /// The mode banner drawn at the right of the `❯` line: `-- INSERT --`,
-    /// `-- VISUAL --`, and nothing in normal mode. An unfocused compose shows
-    /// how to get back rather than a mode it is not in.
+    /// `-- VISUAL --`, `-- NORMAL --`. Vim leaves normal mode blank; this
+    /// names it, because a blank was the one mode a player could not tell
+    /// apart. An unfocused compose shows how to get back rather than a mode
+    /// it is not in.
     pub fn mode_banner(&self) -> String {
         if !self.focused {
             return "i to type, : for a command".to_string();
         }
-        self.editor.mode().unwrap_or_default()
+        self.editor.mode().unwrap_or_else(|| "-- NORMAL --".to_string())
     }
 
     /// Record the context version an `edit_input` acknowledged.
@@ -516,7 +518,7 @@ mod tests {
         let mut compose = Compose::new();
         typed(&mut compose, "one two", now);
         compose.press(press(KeyCode::Esc), now);
-        assert_eq!(compose.mode_banner(), "", "Esc lands in normal mode");
+        assert_eq!(compose.mode_banner(), "-- NORMAL --", "Esc lands in normal mode");
         // `db` deletes back a word.
         let ops = typed(&mut compose, "db", now);
         assert_eq!(compose.text(), "one o");
@@ -696,6 +698,22 @@ mod tests {
         assert_eq!(compose.text(), "", "the bar never touches the draft");
     }
 
+    /// Every focused mode names itself at the right, normal mode included —
+    /// vim leaves normal mode blank, and that is the mode a player could not
+    /// tell apart from the others.
+    #[test]
+    fn normal_mode_shows_its_own_banner() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        assert_eq!(compose.mode_banner(), "-- INSERT --");
+        compose.press(press(KeyCode::Esc), now);
+        assert_eq!(compose.mode_banner(), "-- NORMAL --");
+        compose.press(press(KeyCode::Char('v')), now);
+        assert_eq!(compose.mode_banner(), "-- VISUAL --");
+        compose.press(press(KeyCode::Esc), now);
+        assert_eq!(compose.mode_banner(), "-- NORMAL --");
+    }
+
     /// `:` reaches the bar from an unfocused compose too — the state
     /// `Esc Esc` leaves behind — so a command is one key away from every
     /// mode the draft can be in, not only normal mode.
@@ -717,7 +735,7 @@ mod tests {
         // The bar handed the keyboard back to compose in normal mode, the
         // same place `:` from normal mode returns to.
         assert!(compose.focused());
-        assert_eq!(compose.mode_banner(), "");
+        assert_eq!(compose.mode_banner(), "-- NORMAL --");
     }
 
     /// `Esc` aborts the bar and returns typing to the draft, discarding

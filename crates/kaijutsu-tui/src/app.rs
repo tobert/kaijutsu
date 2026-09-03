@@ -120,10 +120,11 @@ pub struct App {
     /// Contexts this client currently believes have a turn running: set on
     /// this client's own submit (`compose_key`) and on
     /// `ServerEvent::TurnStarted`, cleared on `TurnCompleted`/`TurnFailed`
-    /// for that context. **Partial**: an interactive submit from another
-    /// client or peer names no start this client observes unless it is
-    /// already watching that context (`docs/tui.md`, "Ctrl+C reclaimed") —
-    /// it is what `Ctrl+C`'s ladder and `:q`'s warning read, not a
+    /// for that context, and forgotten wholesale when events are known lost
+    /// (`forget_turn_liveness`). **Partial**: an interactive submit from
+    /// another client or peer names no start this client observes unless it
+    /// is already watching that context (`docs/tui.md`, "Ctrl+C reclaimed")
+    /// — it is what `Ctrl+C`'s ladder and `:q`'s warning read, not an
     /// authoritative turn registry.
     pub turns_running: HashSet<ContextId>,
     /// What has displaced the inline viewport, when anything has. Only the
@@ -345,6 +346,17 @@ impl App {
     /// Mark `context_id`'s turn as ended. Returns whether the set changed.
     pub fn mark_turn_ended(&mut self, context_id: ContextId) -> bool {
         self.turns_running.remove(&context_id)
+    }
+
+    /// Forget every turn this client believed was running. The event stream
+    /// is the only thing that clears the set, so once events are known to
+    /// be lost (a broadcast lag, a dropped connection) a flag left set would
+    /// never clear and `:q` would refuse forever. Returns whether anything
+    /// was forgotten.
+    pub fn forget_turn_liveness(&mut self) -> bool {
+        let had = !self.turns_running.is_empty();
+        self.turns_running.clear();
+        had
     }
 
     /// Whether this client believes `context_id` has a turn running right
@@ -741,6 +753,21 @@ mod tests {
         assert!(!app.any_turn_running());
         app.mark_turn_running(bid);
         assert!(app.any_turn_running(), "scoped to the whole client, not the context on screen");
+        assert!(!app.turn_running(aid));
+    }
+
+    /// A lost event stream (a broadcast lag, a dropped connection) leaves
+    /// this client with no idea which turns are still running, and a flag
+    /// nothing will ever clear would make `:q` refuse forever — so the set
+    /// is forgotten, not carried.
+    #[test]
+    fn forgetting_turn_liveness_clears_every_context() {
+        let (mut app, aid, bid) = app_with_two();
+        assert!(!app.forget_turn_liveness(), "nothing to forget yet");
+        app.mark_turn_running(aid);
+        app.mark_turn_running(bid);
+        assert!(app.forget_turn_liveness());
+        assert!(!app.any_turn_running());
         assert!(!app.turn_running(aid));
     }
 

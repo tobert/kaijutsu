@@ -152,7 +152,9 @@ Rules the figure carries:
   `EditorCore::apply_key_event` — the vim-notation string cannot carry a
   literal `<`.
 - A fresh draft opens in insert mode, which is what the banner at the right
-  reports; normal mode shows nothing there.
+  reports; normal mode says `-- NORMAL --`. Vim leaves normal mode blank,
+  and a blank was the one mode a player could not tell apart (Amy: *"I
+  can't tell which mode I'm in besides INSERT"*).
 - **The sibling's edit wins only when it is newer.** The draft is redrawn from
   the change feed, and `edit_input` acknowledges the same context version the
   feed speaks, so a mirror older than this client's last ack is refused rather
@@ -247,7 +249,11 @@ client submits (`compose_key`'s own submit) or when
 already watching that context, so `nothing to interrupt` and a clean `:q`
 can both be wrong about a turn someone else started. That gap is what Amy's
 "fine to do simple `:q`" ruling accepted rather than building a
-cross-client turn ledger for it.
+cross-client turn ledger for it. The flag is forgotten wholesale when the
+event stream is known broken — a broadcast lag (`RecvError::Lagged`) or the
+connection leaving `Connected` — with a notice saying so, because the
+stream is the only thing that clears it and a flag nothing clears would
+make `:q` refuse forever.
 
 **The `Ctrl+Z` shell surface retired in favor of `:!`.** `shell.rs`,
 `Intent::ShellToggle`, `CtrlZ::Toggled` and `app.shell` are gone — deleted,

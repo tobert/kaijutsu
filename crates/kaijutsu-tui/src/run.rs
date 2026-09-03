@@ -255,7 +255,21 @@ async fn event_loop(
                 dirty = true;
                 apply_feed(bridge, app, context_id, event).await;
             }
-            Ok(event) = wires.server_events.recv() => {
+            received = wires.server_events.recv() => {
+                let event = match received {
+                    Ok(event) => event,
+                    // A lag drops events unseen, and among them may be the
+                    // `TurnCompleted` that would have cleared a turn flag.
+                    // The client no longer knows what is running; say so and
+                    // forget rather than carry a flag nothing will clear.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        app.forget_turn_liveness();
+                        app.note(format!("{n} kernel events lost; turn liveness reset"));
+                        dirty = true;
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => continue,
+                };
                 if mark_activity(app, &event) {
                     dirty = true;
                 }
@@ -286,6 +300,14 @@ async fn event_loop(
             Ok(()) = status.changed() => {
                 let connection = status.borrow().clone();
                 editor::leave_on_disconnect(app, &connection);
+                // Leaving `Connected` means the event stream is broken: any
+                // turn end that happens before the next subscribe is never
+                // seen, so what this client believed is forgotten with it.
+                if !matches!(connection, kaijutsu_client::ConnectionStatus::Connected { .. })
+                    && app.forget_turn_liveness()
+                {
+                    app.note("kernel connection lost; turn liveness reset");
+                }
                 app.connection = Some(connection);
                 dirty = true;
             }
