@@ -197,6 +197,18 @@ impl Palette {
             .fg(Color::LightRed)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     }
+
+    /// Copy mode's search: the line the cursor sits on when it holds the
+    /// active match. Layered over the line's own styled spans (`patch`), so
+    /// the text keeps its color and only gains the reverse.
+    pub fn copy_match(&self) -> Style {
+        Style::new().add_modifier(Modifier::REVERSED)
+    }
+
+    /// Copy mode's `v` linewise selection, before `y` yanks it.
+    pub fn copy_selection(&self) -> Style {
+        Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+    }
 }
 
 /// What a block needs from outside itself to render.

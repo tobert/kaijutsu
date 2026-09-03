@@ -34,6 +34,7 @@ use crate::render;
 use crossterm::event::KeyEvent;
 use kaijutsu_client::{PeerConfig, PeerInvocation};
 
+use crate::copy::{self, CopyOutcome};
 use crate::diff::{self, DiffKey};
 use crate::editor::{self, AltScreen, EditorOpen, ScreenMode};
 
@@ -243,8 +244,14 @@ async fn event_loop(
                         dirty = true;
                         if app.picker.is_some() {
                             handle_picker_key(bridge, app, key, &wires.feed_tx).await?;
-                        } else if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &wires.feed_tx).await? == Acted::Suspend {
-                            suspend(terminal, &wires.term_lock)?;
+                        } else {
+                            let width = terminal.size()?.width;
+                            if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &wires.feed_tx, &wires.term_lock, width)
+                                .await?
+                                == Acted::Suspend
+                            {
+                                suspend(terminal, &wires.term_lock)?;
+                            }
                         }
                     }
                     Event::Resize(..) => dirty = true,
@@ -530,6 +537,11 @@ fn draw_alternate(alt: &mut AltScreen, app: &mut App) -> Result<()> {
             let lines = screen.frame(size.height, &palette);
             alt.draw(lines, None)?;
         }
+        ScreenMode::Copy(screen) => {
+            let lines = screen.frame(size.height, &palette);
+            let cursor = screen.frame_cursor(size.height);
+            alt.draw(lines, cursor)?;
+        }
         // Unreachable: the caller checked. Drawing nothing beats a panic in a
         // frame path.
         ScreenMode::Inline => {}
@@ -552,13 +564,15 @@ async fn act(
     interrupt_ladder: &mut interrupt::Ladder,
     key: crossterm::event::KeyEvent,
     feed_tx: &mpsc::Sender<TaggedFeed>,
+    term_lock: &TermLock,
+    width: u16,
 ) -> Result<Acted> {
     // The editor is the sanctioned raw key reader (`docs/input.md`): while a
-    // vi surface holds the alternate screen every key belongs to it, so the
-    // `Ctrl+A` prefix and the `Ctrl+C` double-tap are bypassed here rather
-    // than being taught to stand aside.
+    // vi surface — including copy mode — holds the alternate screen every
+    // key belongs to it, so the `Ctrl+A` prefix and the `Ctrl+C` double-tap
+    // are bypassed here rather than being taught to stand aside.
     if editor::route_key(app) == editor::KeyRoute::AlternateScreen {
-        act_alternate(bridge, app, key).await?;
+        act_alternate(bridge, app, key, term_lock).await?;
         return Ok(Acted::Continue);
     }
     // The ask card and the ledger view capture every key while open — their
@@ -612,6 +626,13 @@ async fn act(
                 app.clear_notice();
             }
             None => app.note("no diff block in this context"),
+        },
+        Intent::CopyMode => match render::copy_buffer_lines(app, width) {
+            Some((label, lines)) => {
+                app.screen = ScreenMode::Copy(copy::CopyScreen::new(label, lines));
+                app.clear_notice();
+            }
+            None => app.note("no context to read"),
         },
         Intent::NotYet(message) => app.note(message),
         Intent::OpenLedger => open_ledger(bridge, app).await,
@@ -1221,7 +1242,12 @@ async fn observe_editor_event(bridge: &KernelBridge, app: &mut App, event: &Serv
 }
 
 /// A key while the alternate screen is up.
-async fn act_alternate(bridge: &KernelBridge, app: &mut App, key: KeyEvent) -> Result<()> {
+async fn act_alternate(
+    bridge: &KernelBridge,
+    app: &mut App,
+    key: KeyEvent,
+    term_lock: &TermLock,
+) -> Result<()> {
     if let Some(session) = app.screen.editor().map(|s| s.session) {
         // A key with no notation is refused rather than sent: the kernel's
         // `parse_keys` drops an unknown `<...>` token silently, so forwarding
@@ -1265,7 +1291,34 @@ async fn act_alternate(bridge: &KernelBridge, app: &mut App, key: KeyEvent) -> R
             app.screen = ScreenMode::Inline;
         }
     }
+
+    if let ScreenMode::Copy(screen) = &mut app.screen {
+        let body_h = screen.body_h();
+        match copy::handle_key(screen, &key, body_h) {
+            CopyOutcome::Close => app.screen = ScreenMode::Inline,
+            CopyOutcome::Yanked(text) => {
+                app.screen = ScreenMode::Inline;
+                match write_osc52(term_lock, &text) {
+                    Ok(()) => app.note(format!("yanked {} lines", text.lines().count())),
+                    Err(e) => app.note(format!("clipboard write failed: {e}")),
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(())
+}
+
+/// Write copy mode's OSC 52 clipboard sequence (`copy::osc52_sequence`)
+/// directly to stdout, under the same lock every other terminal write takes
+/// — `y` after a `v` selection is the only caller (`docs/tui.md`, "Copy
+/// mode").
+fn write_osc52(term_lock: &TermLock, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    let _guard = term_lock.lock();
+    let mut stdout = io::stdout();
+    stdout.write_all(copy::osc52_sequence(text).as_bytes())?;
+    stdout.flush()
 }
 
 /// `Ctrl+A v` — the newest block of the current context the diff viewer opens

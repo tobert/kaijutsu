@@ -52,6 +52,10 @@ pub enum Intent {
     /// routed to it directly rather than through [`Keys::interpret`] — see
     /// `run.rs`.
     TogglePicker,
+    /// `Ctrl+A [` — tmux's own copy-mode chord (`docs/tui.md`, "Copy mode"):
+    /// freeze the current context's transcript into a buffer on the
+    /// alternate screen, under vi motions.
+    CopyMode,
 }
 
 /// The prefix state machine.
@@ -91,6 +95,7 @@ impl Keys {
                 KeyCode::Char('"') | KeyCode::Char('w') => Intent::TogglePicker,
                 KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
+                KeyCode::Char('[') => Intent::CopyMode,
                 KeyCode::Char('\'') | KeyCode::Char('A') | KeyCode::Char('q')
                 | KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char('d')
                 | KeyCode::Char('h') => Intent::NotYet("chord: later lane"),
@@ -203,6 +208,16 @@ mod tests {
         let mut keys = Keys::new();
         keys.interpret(ctrl('a'));
         assert_eq!(keys.interpret(press(KeyCode::Char('l'))), Intent::OpenLedger);
+    }
+
+    /// tmux's own copy-mode chord (`.tmux.conf`'s `bind [ copy-mode`),
+    /// `docs/tui.md` "Copy mode".
+    #[test]
+    fn ctrl_a_bracket_opens_copy_mode() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('['))), Intent::CopyMode);
+        assert!(!keys.armed());
     }
 
     #[test]

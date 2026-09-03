@@ -309,6 +309,64 @@ not quit; `Ctrl+Z` suspends and `SIGCONT` leaves a responsive client (the
 stopped state itself is not observable in every sandbox — the probe's own
 doc comment says why).
 
+### Copy mode (`Ctrl+A [`)
+
+tmux's own copy-mode chord (`.tmux.conf`'s `mode-keys vi`, `bind [
+copy-mode`), and it means the same thing here: the current context's
+transcript becomes a buffer on the alternate screen, under vi motions —
+how a long tool result is read whole now that tool output no longer
+collapses by default (`present::collapses_by_default`), and how the
+conversation is scrolled from the keyboard.
+
+```text
+  ─ claude · coder ──────────────────────────────────────────────  14:02:11
+  The unlink bug was in resolve(): it canonicalized the final component,
+  so the symlink's target was removed instead of the link. resolve_nofollow
+  fixes unlink; rename and getattr share the cause and are deliberately ▍
+  ▸ shell  cargo test -p kaijutsu-kernel vfs::                     running 4s
+  line 1204/1207   kaijutsu   j/k move  ^D/^U page  gg/G top/bottom  / search  q leave
+```
+
+Rules the figure carries:
+
+- **Entry position is the bottom** — the newest block — the way tmux enters
+  copy mode at the current screen.
+- **The buffer is the whole context, frozen on open.** It is built from
+  `ContextView`'s mirror, the same source the transcript printer reads, run
+  through `render_block` (`present.rs`) so copy mode shows exactly what
+  scrollback showed — dividers and stamps included, wrapped at the width the
+  screen opened at (`render::copy_buffer_lines`). "Freeze on open" is the
+  same contract the diff viewer keeps (`diff.rs`): a block still streaming
+  when `Ctrl+A [` is pressed does not grow under the reader while they
+  scroll. The buffer being the tui's own — holding the whole context, so
+  search crosses all of it, not only what was printed since attach — is one
+  of the two things guidance 7 names as different from tmux; the other is
+  that the mouse wheel stays the terminal's, since scrollback is still where
+  the transcript lives.
+- **Motions are vi's, and linewise only** — there is no column cursor.
+  `j`/`k`/`Down`/`Up` move one line; `Ctrl+D`/`Ctrl+U` move half a page;
+  `Ctrl+F`/`Ctrl+B`/`PageDown`/`PageUp` move a full page; `gg` goes to the
+  top, `G` to the bottom.
+- `/` and `?` open a search prompt on the bottom line — case-insensitive
+  substring is enough. `Enter` commits and jumps to the nearest match in
+  that direction; `n`/`N` step to the next/previous match, wrapping around
+  the whole buffer once it runs out. The active match's line is highlighted.
+- `q` and `Esc` leave copy mode and restore the inline viewport with a
+  redraw. Leaving never prints into scrollback — the buffer is read-only, and
+  closing it is a screen change, not a transcript event
+  (`tests/terminal_fit.rs`'s `copy_mode_opens_and_q_restores_the_inline_viewport`).
+- `v` starts a linewise selection; `y` yanks the selected lines to the
+  clipboard over OSC 52 (`ESC ] 52 ; c ; <base64> BEL`, written straight to
+  stdout under the same `term_lock` every other terminal write takes) and
+  leaves copy mode, the way tmux does. `Esc` with a selection active cancels
+  the selection instead of leaving — a second `Esc` is what leaves.
+- **The machinery, named.** Nothing on the wire opens copy mode: it is a
+  local decision over the `ContextMirror` this client already holds, the
+  same source `render::live_lines`/`take_settled_prints` read — there is no
+  RPC round trip to enter it.
+- **Viewport claim: takes the alternate screen** (ruling 1), the same as the
+  editor and the diff viewer — `ScreenMode::Copy`.
+
 ### The picker (`Ctrl+A "`)
 
 The well, flattened. The viewport grows to hold it and shrinks on dismiss.
@@ -542,8 +600,8 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
 `Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a`, `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`,
-`h`, and the armed-prefix legend line; `Ctrl+A [` is copy mode (guidance 7,
-unbuilt). The legend replaces the status line
+`h`, and the armed-prefix legend line; `Ctrl+A [` is copy mode ("Copy mode",
+guidance 7). The legend replaces the status line
 while a prefix is pending; there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
 `Ctrl+Z` is a single-press suspend (`raise SIGTSTP`; `fg` or `SIGCONT`

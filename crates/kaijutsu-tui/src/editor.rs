@@ -29,8 +29,10 @@ use crate::present::Palette;
 /// What has displaced the inline viewport.
 ///
 /// The closed set is ruling 1's: the conversation flows to scrollback, a grown
-/// view grows the viewport, and only the editor and the diff viewer take the
-/// alternate screen. A fourth variant is a design conversation, not a patch.
+/// view grows the viewport, and the editor, the diff viewer and copy mode take
+/// the alternate screen. A fourth *kind* of surface — one that is neither a
+/// grown view nor a vim-shaped fullscreen occupant — is a design
+/// conversation, not a patch.
 #[derive(Default)]
 pub enum ScreenMode {
     /// The inline viewport (`docs/tui.md`, "Conversation").
@@ -40,6 +42,9 @@ pub enum ScreenMode {
     Editor(EditorScreen),
     /// A frozen diff.
     Diff(crate::diff::DiffScreen),
+    /// `Ctrl+A [` — the frozen transcript under vi motions
+    /// (`docs/tui.md`, "Copy mode").
+    Copy(crate::copy::CopyScreen),
 }
 
 impl ScreenMode {

@@ -250,6 +250,55 @@ fn the_ledger_view_keeps_its_key_hints_line_on_screen() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// c3. Copy mode (`Ctrl+A [`) opens on the alternate screen and `q` restores
+// the inline viewport without touching scrollback
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `Ctrl+A [` — tmux's own copy-mode chord — freezes the transcript onto the
+/// alternate screen; `q` gives the inline viewport back exactly the way the
+/// diff viewer does (`docs/tui.md`, "Copy mode").
+#[test]
+fn copy_mode_opens_and_q_restores_the_inline_viewport() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    // Ctrl+A, then `[` — opens copy mode
+    // (`crates/kaijutsu-tui/src/keys.rs`, `ctrl_a_bracket_opens_copy_mode`).
+    session.send("\x01[");
+    let opened = session.wait_until(Duration::from_secs(5), |screen| {
+        screen_contains_str(screen, "q leave") && screen_contains_str(screen, "line ")
+    });
+    assert!(opened, "copy mode never opened: {}", session.dump("copy mode open"));
+
+    let rows = session.screen_text();
+    assert!(
+        rows.iter().any(|l| l.contains("line ") && l.contains('/')),
+        "the position figure is not on screen:\n{}",
+        session.dump("copy mode open")
+    );
+
+    // `q` closes it, the same as the diff viewer (`diff::DiffKey::Close`).
+    session.send("q");
+    let closed = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen_contains_str(screen, "q leave") && screen_contains(screen, '❯')
+    });
+    assert!(closed, "copy mode never closed: {}", session.dump("copy mode close"));
+
+    // Leaving copy mode must not have printed its own UI into scrollback —
+    // the frozen buffer is read-only, and `q`/`Esc` restore the inline
+    // viewport with a redraw, never a new transcript line. (Byte-identical
+    // scrollback before/after is not asserted — background housekeeping, the
+    // ledger poll on `REFRESH`, can land a real block in the same wall-clock
+    // gap, same caveat as the picker probe above.)
+    let scrollback = session.scrollback_text();
+    assert!(
+        !scrollback.iter().any(|l| l.contains("q leave")),
+        "copy mode's own hint line leaked into scrollback: {scrollback:?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // d. Resize keeps the live region intact and on screen
 // ────────────────────────────────────────────────────────────────────────────
 

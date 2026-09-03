@@ -307,6 +307,51 @@ pub fn draw_full<B: Backend>(
     Ok(())
 }
 
+/// Build copy mode's buffer for the context on screen: every block in
+/// document order, rendered exactly as the transcript printer would
+/// ([`crate::present::render_block`]) — the whole context, not only what
+/// scrollback has already shown (`docs/tui.md`, "Copy mode"). The draft is
+/// excluded — it is the compose line, not the transcript.
+///
+/// Frozen at the moment `Ctrl+A [` is pressed, the same "freeze on open"
+/// contract the diff screen keeps (`diff.rs`): a still-streaming block's
+/// later growth does not move the reader's place inside a buffer already
+/// open. `None` with no context on screen.
+pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'static>>)> {
+    let context_id = app.current?;
+    let view = app.views.get(&context_id)?;
+    let info = app.info(context_id);
+    let context_type = info
+        .map(|c| c.context_type.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let label = info
+        .map(|c| c.label.clone())
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| context_id.short());
+
+    let mut lines = Vec::new();
+    let mut last_speaker: Option<String> = None;
+    for block in view.mirror.blocks() {
+        if block.status == Status::Draft {
+            continue;
+        }
+        let speaker = app.speaker_for(block, info);
+        let show_divider = last_speaker.as_deref() != Some(speaker.as_str());
+        let stamp = wallclock(block.created_at);
+        let block_view = crate::present::BlockView {
+            speaker: &speaker,
+            context_type: &context_type,
+            stamp: &stamp,
+            show_divider,
+            collapsed: view.is_collapsed(block),
+            local_ctx: Some(context_id),
+        };
+        lines.extend(crate::present::render_block(block, &block_view, width, &app.palette));
+        last_speaker = Some(speaker);
+    }
+    Some((label, lines))
+}
+
 /// Rows the inline viewport should occupy right now — [`VIEWPORT_LINES`]
 /// ordinarily, or a grown view's own height while one is open: the picker's
 /// (width-independent), the ask card's (wraps by width, so counted at
@@ -857,6 +902,54 @@ mod tests {
             text[text.len() - 2].starts_with("a allow once"),
             "key hints must be the row above status when the terminal is short: {text:?}"
         );
+    }
+
+    /// Copy mode's buffer holds the whole context — including a block
+    /// already printed to scrollback, which `live_plan`/`take_settled_prints`
+    /// deliberately exclude — and excludes the draft, which is compose's
+    /// line, not the transcript.
+    #[test]
+    fn copy_buffer_lines_covers_the_whole_context_but_not_the_draft() {
+        let (mut app, id) = fixture();
+        // `fixture` already settled two blocks; print them so they would be
+        // invisible to `live_plan`.
+        let _ = take_settled_prints(&mut app, 80);
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(
+                vec![
+                    block(id, 1, BlockKind::Text, Role::User, Status::Done, "and getattr?"),
+                    block(
+                        id,
+                        2,
+                        BlockKind::Text,
+                        Role::Model,
+                        Status::Done,
+                        "rename and getattr share the cause.",
+                    ),
+                    BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 3), BlockKind::Text)
+                        .role(Role::User)
+                        .status(Status::Draft)
+                        .content("still typing")
+                        .build(),
+                ],
+                1,
+            )
+            .expect("snapshot applies");
+        app.views.get_mut(&id).expect("a view").mirror = mirror;
+
+        let (label, lines) = copy_buffer_lines(&app, 80).expect("a context is on screen");
+        assert_eq!(label, "kaijutsu");
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(text.iter().any(|l| l.contains("and getattr?")), "got {text:?}");
+        assert!(text.iter().any(|l| l.contains("rename and getattr")), "got {text:?}");
+        assert!(!text.iter().any(|l| l.contains("still typing")), "the draft is not the transcript: {text:?}");
+    }
+
+    #[test]
+    fn copy_buffer_lines_is_none_with_no_context_on_screen() {
+        let app = App::new("amy");
+        assert!(copy_buffer_lines(&app, 80).is_none());
     }
 
     /// The ledger view replaces the live region the same way, both sections

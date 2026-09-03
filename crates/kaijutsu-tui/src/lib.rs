@@ -33,7 +33,7 @@
 //! | [`asks`] | the ask card, the ledger view (`Ctrl+A l`) |
 //! | [`completion`] | `:kj ` completion over the `kj` command catalog |
 //! | [`picker`] | later lane |
-//! | [`editor`], [`diff`] | the two alternate-screen surfaces |
+//! | [`editor`], [`diff`], [`copy`] | the three alternate-screen surfaces |
 
 pub mod app;
 pub mod asks;
@@ -41,6 +41,7 @@ pub mod bridge;
 pub mod cmdline;
 pub mod compose;
 pub mod completion;
+pub mod copy;
 pub mod interrupt;
 pub mod keys;
 pub mod picker;
