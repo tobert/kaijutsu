@@ -407,7 +407,10 @@ pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'sta
             context_type: &context_type,
             stamp: &stamp,
             show_divider,
-            collapsed: view.is_collapsed(block),
+            // Copy mode is where reasoning stays findable, so a `Thinking`
+            // block renders whole here even when a sibling collapsed it
+            // (`docs/tui.md`, "The thinking pane").
+            collapsed: view.is_collapsed(block) && block.kind != BlockKind::Thinking,
             local_ctx: Some(context_id),
         };
         if speaker_gap(show_divider, last_speaker.as_deref()) {
@@ -1120,7 +1123,11 @@ mod tests {
                 1,
             )
             .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        let thinking_id = mirror.blocks()[0].id;
+        let mut view = ContextView::new(mirror);
+        // Even a collapse a sibling sent for it does not hide it here.
+        view.collapsed.insert(thinking_id, true);
+        app.views.insert(id, view);
         let (_, lines) = copy_buffer_lines(&app, 80).expect("a buffer");
         let rows = text_of(&lines);
         assert!(rows.iter().any(|r| r == "then rename"), "got {rows:?}");

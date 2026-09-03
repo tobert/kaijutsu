@@ -298,7 +298,14 @@ pub fn render_block(
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     let base = palette.block(block_tone(block));
-    let text = format_single_block(block, view.local_ctx, &|_| None);
+    // A `Thinking` block is its raw content: the divider names the speaker
+    // and the tone says what it is, so the formatter's `Thinking` header
+    // line (`kaijutsu_present::format`) would only cost the pane a row.
+    let text = if block.kind == BlockKind::Thinking {
+        block.content.trim_end().to_string()
+    } else {
+        format_single_block(block, view.local_ctx, &|_| None)
+    };
 
     let mut lines = Vec::new();
     if view.show_divider {
@@ -311,9 +318,7 @@ pub fn render_block(
     }
     if view.collapsed {
         if block.kind == BlockKind::Thinking {
-            // The raw content, not `text`: the formatter's `Thinking` header
-            // line would otherwise be the stub's "first line".
-            lines.push(thinking_stub_line(block.content.trim(), width, base));
+            lines.push(thinking_stub_line(text.trim(), width, base));
         } else {
             lines.push(stub_line(COLLAPSED_MARK, &text, width, base));
         }
@@ -488,13 +493,15 @@ fn stub_line(mark: &str, text: &str, width: u16, style: Style) -> Line<'static> 
 /// stub stands for; the first line says what it was about.
 fn thinking_stub_line(text: &str, width: u16, style: Style) -> Line<'static> {
     let count = text.lines().count();
-    let noun = if count == 1 { "line" } else { "lines" };
-    let first = text.lines().next().unwrap_or("").trim_end();
-    let body = truncate(
-        &format!("{COLLAPSED_MARK} thinking · {count} {noun} · {first}"),
-        usize::from(width),
-    );
-    Line::from(Span::styled(body, style))
+    let body = match text.lines().next().map(str::trim_end) {
+        // A provider can return a thinking block with no text to show.
+        None | Some("") => format!("{COLLAPSED_MARK} thinking · nothing to show"),
+        Some(first) => {
+            let noun = if count == 1 { "line" } else { "lines" };
+            format!("{COLLAPSED_MARK} thinking · {count} {noun} · {first}")
+        }
+    };
+    Line::from(Span::styled(truncate(&body, usize::from(width)), style))
 }
 
 /// Greedy word wrap over a styled character stream.
@@ -794,6 +801,29 @@ mod tests {
         let style = lines[0].spans[0].style;
         assert!(style.add_modifier.contains(Modifier::ITALIC));
         assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    /// The formatter's `Thinking` header line stays out of the tui: the
+    /// divider and the tone already say what the block is, and the pane
+    /// shows a short block whole (kaibo review, 2026-09-03).
+    #[test]
+    fn thinking_renders_without_the_formatters_header_line() {
+        let b = block(BlockKind::Thinking, Role::Model, "considering");
+        let lines = render_block(&b, &view(), 60, &Palette::builtin());
+        let rows: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert_eq!(rows, vec!["considering"]);
+    }
+
+    /// A thinking block with nothing to show stubs as such, not as
+    /// `0 lines · `.
+    #[test]
+    fn an_empty_thinking_block_stubs_as_nothing_to_show() {
+        let b = block(BlockKind::Thinking, Role::Model, "  \n");
+        let mut v = view();
+        v.collapsed = true;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(row, "▸ thinking · nothing to show");
     }
 
     #[test]
