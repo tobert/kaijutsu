@@ -327,7 +327,7 @@ pub fn status_line(model: &StatusModel, width: u16, palette: &Palette) -> Line<'
 /// pending. `docs/input.md`, "The prefix table" — the chords this client
 /// answers today, in that table's order.
 pub fn legend_line(width: u16, palette: &Palette) -> Line<'static> {
-    let full = "Ctrl+A: 0-9 seat · Ctrl+A last · \" picker · l ledger · [ copy · Esc cancel";
+    let full = "Ctrl+A: 0-9 seat · n/p next/prev · Ctrl+A last · \" picker · l ledger · [ copy · Esc cancel";
     let short = "Ctrl+A: 0-9 seat · Ctrl+A last · \" picker";
     let width = usize::from(width.max(1));
     let text = if full.chars().count() <= width { full } else { short };

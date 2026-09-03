@@ -602,17 +602,12 @@ async fn act(
             return Ok(Acted::Suspend);
         }
         Intent::SwitchSeat(n) => match app.seat_context(n) {
-            Some(id) => {
-                watch_context(bridge, app, id, feed_tx).await?;
-                app.switch_to(id);
-                // The draft is per context, so the compose buffer follows the
-                // switch rather than carrying the old context's text along —
-                // `load_draft` keeps the `:` line's own history, which is
-                // this session's, not this draft's.
-                app.compose.load_draft(&bridge.read_input(id).await.unwrap_or_default());
-                app.clear_notice();
-            }
+            Some(id) => switch_seat(bridge, app, id, feed_tx).await?,
             None => app.note(format!("no context on seat {n}")),
+        },
+        Intent::StepSeat(step) => match app.seat_neighbor(step) {
+            Some(id) => switch_seat(bridge, app, id, feed_tx).await?,
+            None => app.note("no seats"),
         },
         Intent::LastContext => match app.switch_to_previous() {
             Some(id) => {
@@ -656,6 +651,23 @@ async fn act(
         }
     }
     Ok(Acted::Continue)
+}
+
+/// Switch the screen to `id`: watch it, make it current, and load its draft.
+/// The draft is per context, so the compose buffer follows the switch rather
+/// than carrying the old context's text along — `load_draft` keeps the `:`
+/// line's own history, which is this session's, not this draft's.
+async fn switch_seat(
+    bridge: &KernelBridge,
+    app: &mut App,
+    id: ContextId,
+    feed_tx: &mpsc::Sender<TaggedFeed>,
+) -> Result<()> {
+    watch_context(bridge, app, id, feed_tx).await?;
+    app.switch_to(id);
+    app.compose.load_draft(&bridge.read_input(id).await.unwrap_or_default());
+    app.clear_notice();
+    Ok(())
 }
 
 /// One keystroke on the compose surface: mirror what the vi engine did onto

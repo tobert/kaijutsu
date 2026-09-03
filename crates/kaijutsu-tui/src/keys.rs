@@ -18,6 +18,9 @@ pub enum Intent {
     SwitchSeat(usize),
     /// `Ctrl+A Ctrl+A` — toggle to the previous context.
     LastContext,
+    /// `Ctrl+A n` / `Ctrl+A p` — the next or previous seat on the rank,
+    /// wrapping, screen's next/previous window.
+    StepSeat(isize),
     /// `Ctrl+C` — the caller decides whether this is the second press.
     Interrupt,
     /// A key for compose's `VimMachine`, which owns both the draft and the
@@ -96,9 +99,10 @@ impl Keys {
                 KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
                 KeyCode::Char('[') => Intent::CopyMode,
+                KeyCode::Char('n') => Intent::StepSeat(1),
+                KeyCode::Char('p') => Intent::StepSeat(-1),
                 KeyCode::Char('\'') | KeyCode::Char('A') | KeyCode::Char('q')
-                | KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char('d')
-                | KeyCode::Char('h') => Intent::NotYet("chord: later lane"),
+                | KeyCode::Char('d') | KeyCode::Char('h') => Intent::NotYet("chord: later lane"),
                 KeyCode::Esc => Intent::LegendChanged,
                 _ => Intent::NotYet("unbound chord"),
             };
@@ -153,6 +157,15 @@ mod tests {
         assert!(keys.armed());
         assert_eq!(keys.interpret(press(KeyCode::Char('3'))), Intent::SwitchSeat(3));
         assert!(!keys.armed(), "the prefix disarms after one chord");
+    }
+
+    #[test]
+    fn ctrl_a_n_and_p_step_the_rank() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('n'))), Intent::StepSeat(1));
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('p'))), Intent::StepSeat(-1));
     }
 
     #[test]

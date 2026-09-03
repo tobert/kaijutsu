@@ -228,6 +228,27 @@ impl App {
         self.seats.get(digit).map(|s| s.context_id)
     }
 
+    /// The seat one step from the context on screen, wrapping at either end
+    /// — `Ctrl+A n` (`+1`) and `Ctrl+A p` (`-1`), screen's next/previous
+    /// window. A context not on the rank (nothing on screen, or an
+    /// unranked one) steps from the top for `n` and the bottom for `p`.
+    /// `None` only when there are no seats at all.
+    pub fn seat_neighbor(&self, step: isize) -> Option<ContextId> {
+        let len = self.seats.len();
+        if len == 0 {
+            return None;
+        }
+        let here = self
+            .current
+            .and_then(|id| self.seats.iter().position(|s| s.context_id == id));
+        let next = match here {
+            Some(i) => (i as isize + step).rem_euclid(len as isize) as usize,
+            None if step > 0 => 0,
+            None => len - 1,
+        };
+        self.seat_context(next)
+    }
+
     /// Switch to a context, remembering where we came from. Switching to the
     /// context already on screen is a no-op, so `Ctrl+A Ctrl+A` never
     /// collapses onto itself.
@@ -745,6 +766,23 @@ mod tests {
         assert!(app.mark_turn_ended(aid), "the set changed");
         assert!(!app.turn_running(aid));
         assert!(!app.any_turn_running());
+    }
+
+    /// `Ctrl+A n`/`p` walk the rank and wrap at both ends.
+    #[test]
+    fn seat_neighbor_steps_the_rank_and_wraps() {
+        let (mut app, aid, bid) = app_with_two();
+        let first = app.seat_context(0).expect("seat 0");
+        let second = app.seat_context(1).expect("seat 1");
+        assert!(first != second && [aid, bid].contains(&first));
+        app.current = Some(first);
+        assert_eq!(app.seat_neighbor(1), Some(second));
+        assert_eq!(app.seat_neighbor(-1), Some(second), "wraps backward");
+        app.current = Some(second);
+        assert_eq!(app.seat_neighbor(1), Some(first), "wraps forward");
+        app.current = None;
+        assert_eq!(app.seat_neighbor(1), Some(first), "nothing on screen: n starts at the top");
+        assert_eq!(app.seat_neighbor(-1), Some(second), "nothing on screen: p starts at the bottom");
     }
 
     #[test]
