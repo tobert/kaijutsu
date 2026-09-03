@@ -215,9 +215,9 @@ What the lanes left open, in rough priority:
 
 **Terminal-fit harness** (`tests/terminal_fit.rs`, shipped 2026-09-02): the
 real binary in a portable-pty against an ephemeral kernel, parsed by vt100.
-Fifteen probes pass, including a mid-screen start reaching the bottom band, a
-partial `:` line never repeating into the transcript, and the `Ctrl+C` rungs
-that must not quit. What Amy saw as "the status line a third of the way up"
+Sixteen probes pass, including a mid-screen start reaching the bottom band, a
+partial `:` line never repeating into the transcript, `:kj` from an unfocused
+compose, and the `Ctrl+C` rungs that must not quit. What Amy saw as "the status line a third of the way up"
 in wezterm and "a few rows above bottom" in konsole was the live band drawing
 top-aligned in its six reserved rows, fixed by bottom-aligning `draw_live`
 (`ebc84e9c`), not a terminal difference. **Still open:** her report of partial
@@ -244,6 +244,41 @@ From Amy's first evening on it (2026-09-02), in her order:
   falls through to `Intent::NotYet("unbound chord")`, which only posts a
   notice and awaits nothing) that probe says nothing about. A harness probe
   that presses it and then types is still the next step.
+
+From the 2026-09-03 kaibo review of the `:` lane (cast crusoe: GLM-5.2
+synth, DeepSeek-V4-Flash explorer; the stuck turn flag it found is fixed)
+and Amy's second morning, in rough priority:
+
+- **No expand gesture.** `ToolCall`, `ToolResult` and `Error` blocks arrive
+  collapsed to one `▸` line (`present::collapses_by_default`) and nothing in
+  the tui expands one — Amy: *"an `ls` doesn't seem to get its vertical
+  space to display? is it autocollapsed?"* Yes; `:!ls` lands a `ToolResult`.
+  Collapse is kernel state (`CollapsedChanged`), so the gesture is a
+  binding plus the kernel call, not a client flag. Amy picks the key.
+- **The ask card swallows `Esc` and `Ctrl+C`.** `ask_key_to_decision`
+  answers only `a`/`A`/`d`/`v`; while an ask is up the interrupt ladder is
+  unreachable and the card cannot be put aside. A gate must be decided, but
+  `Esc` doing nothing is a surprise — ruling wanted: `Esc` returns the ask
+  to the ledger (still pending), or stays a no-op with the hint line saying
+  so. Sharper until the growth lane lands, because the truncated card can
+  drop its own hint line.
+- **`LedgerAction::Show` is a stub** (*"full detail view not yet wired"*)
+  while `render_ask_detail` is complete and unreachable. Wire it, on the
+  same growth seam as the card.
+- **Beat wake past due redraws every select cycle.** `rearm` steps by one
+  period; when the loop falls behind the tempo `sleep(0)` fires each pass
+  until the 5 s refresh re-anchors. Re-anchor on the wake itself.
+- **The refresh tick awaits three RPCs inside the select loop**
+  (`list_contexts`, `poll_new_asks`, `list_tracks`), so keys stall while a
+  slow kernel answers — the same symptom as the reconnect item above, and
+  the same fix: never await the kernel in the input path.
+- **`set_command_body` rewrites the `:` bar by replaying keystrokes**
+  (`End`, N × `Backspace`, then the body) because `EditorCore` has no
+  cmdline setter. Correct today; a setter in `kaijutsu-editor` is the
+  robust shape.
+- **Harness: the 3-byte tail hold reassembles only `ESC[6n`.** A longer
+  CSI split across reads relies on vt100 buffering its own partial
+  sequence, which it does, and nothing asserts.
 
 Two client facts every TUI-shaped consumer needs: `ContextInfo.label` and
 `.model` are routinely empty on real rows (fall back to `ContextId::short()`
