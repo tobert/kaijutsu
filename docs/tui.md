@@ -601,8 +601,10 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
 `Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a`, `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`,
 `h`, and the armed-prefix legend line; `Ctrl+A [` is copy mode ("Copy mode",
-guidance 7). The legend replaces the status line
-while a prefix is pending; there is no separate `?` overlay. `Ctrl+C` is the
+guidance 7). The legend takes the compose row
+while a prefix is pending — never the status line, whose seat digits are
+what the player is about to press (Amy: *"by the time I read that, the
+number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
 `Ctrl+Z` is a single-press suspend (`raise SIGTSTP`; `fg` or `SIGCONT`
 brings it back), not a toggle. `:q` (warns first if a turn is known

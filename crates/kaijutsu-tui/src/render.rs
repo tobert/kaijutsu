@@ -225,12 +225,15 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
         lines.extend(crate::completion::render_popup(completion, width, &palette));
     }
 
-    lines.extend(input);
-    lines.push(if armed {
-        legend_line(width, &palette)
+    // While `Ctrl+A` is pending the legend takes the compose row, not the
+    // status line: the status line's seat digits are what the player is
+    // about to press, and covering them was the bug Amy hit.
+    if armed {
+        lines.push(legend_line(width, &palette));
     } else {
-        status_line(&app.status_model(now_millis), width, &palette)
-    });
+        lines.extend(input);
+    }
+    lines.push(status_line(&app.status_model(now_millis), width, &palette));
     lines
 }
 
@@ -581,17 +584,25 @@ mod tests {
     }
 
     #[test]
-    fn the_armed_prefix_legend_replaces_the_status_line() {
+    /// The legend takes the compose row while `Ctrl+A` is pending; the
+    /// status line stays, because its seat digits are what the player is
+    /// about to press.
+    fn the_armed_prefix_legend_takes_the_compose_row_and_the_status_line_stays() {
         let (mut app, _) = fixture();
-        let live = live_lines(&mut app, 96, 0, true);
-        let last: String = live
-            .last()
-            .expect("a last line")
-            .spans
+        let idle: Vec<String> = live_lines(&mut app, 96, 0, false)
             .iter()
-            .map(|s| s.content.as_ref())
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(last.starts_with("Ctrl+A:"), "got {last:?}");
+        let status = idle.last().expect("a status line").clone();
+        assert!(idle.iter().any(|l| l.starts_with(crate::compose::PROMPT)), "idle draws the compose row");
+
+        let armed: Vec<String> = live_lines(&mut app, 96, 0, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(armed.last(), Some(&status), "the status line is untouched");
+        assert!(armed.iter().any(|l| l.starts_with("Ctrl+A:")), "the legend is drawn: {armed:?}");
+        assert!(!armed.iter().any(|l| l.starts_with(crate::compose::PROMPT)), "the compose row is hidden: {armed:?}");
     }
 
     /// Nothing you would paste is inside a box: no border glyph opens any

@@ -252,20 +252,6 @@ and Amy's second morning, in rough priority:
   `ToolCall`/`ToolResult` (keep `Error`'s one-line stub), and past a
   screenful print the head with a footer saying how many more lines. One
   change plus a test.
-- **The armed legend covers the seat list.** `live_lines` swaps the status
-  line for `legend_line` while `Ctrl+A` is pending, and the status line is
-  where the seat digits live — Amy: *"when I hit Ctrl+A with intent to
-  switch to another context, the help text pops up over the window list and
-  by the time I read that, the number was gone."* Her fix is the right one:
-  hide the compose row while armed and draw the legend there; the status
-  line stays. Flip `the_armed_prefix_legend_replaces_the_status_line`.
-  Queued behind the copy-mode lane, which owns `render.rs`.
-- **`Ctrl+A [` copy mode** (`docs/tui.md`, guidance 7): the transcript as a
-  buffer on the alternate screen under vi motions and `/` search, `q`/`Esc`
-  leaves; `v` `y` to the clipboard later, over ssh via OSC 52. This is how a
-  long result is read whole, and how the conversation is scrolled from the
-  keyboard. Reuse the editor's alternate-screen plumbing (`editor.rs`,
-  `AltScreen`).
 - **Longer-term, Amy's: a formatter over a result's kaish `.data`**, keyed
   by producing verb, run before print, living under `/config/client` as a
   plain file — a print-time decision, never a redraw. *"we work on adding
