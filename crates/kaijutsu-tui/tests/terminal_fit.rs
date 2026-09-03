@@ -88,20 +88,20 @@ fn startup_fits_inside_the_viewport_at_80x24() {
     assert_eq!(rows.len(), 24, "{}", session.dump("startup"));
 
     // With nothing streaming, the live region is just compose + status: two
-    // lines, top-aligned inside the reserved `VIEWPORT_LINES`-row band
-    // (`render::live_lines` pushes `[input_line, status_line]` and the
-    // `Paragraph` draws them starting at the band's first row, not the
-    // terminal's last row — see probe (d) for where this bites).
+    // lines, bottom-aligned inside the reserved `VIEWPORT_LINES`-row band so
+    // the status line is the terminal's last row (`docs/tui.md`, ruling 1:
+    // "a viewport at the bottom"). The band's unused rows are the blank gap
+    // above compose, never a gap under the status line.
     let band_start = 24 - usize::from(VIEWPORT_LINES);
     let band = &rows[band_start..];
     assert_eq!(
-        compose_row(band),
-        Some(0),
-        "expected compose to be the first row of the reserved {VIEWPORT_LINES}-row band (row {band_start}):\n{}",
+        compose_row(&rows),
+        Some(22),
+        "expected compose on the second-to-last row, directly above the status line:\n{}",
         session.dump("startup")
     );
-    assert!(!band[1].trim().is_empty(), "expected a status line under compose:\n{}", session.dump("startup"));
-    for (offset, line) in band.iter().enumerate().skip(2) {
+    assert!(!rows[23].trim().is_empty(), "expected the status line on the last row:\n{}", session.dump("startup"));
+    for (offset, line) in band.iter().enumerate().take(band.len() - 2) {
         assert!(
             line.trim().is_empty(),
             "row {} in the live band was unexpectedly non-blank: {line:?}\n{}",
@@ -263,6 +263,10 @@ fn resize_keeps_the_live_region_intact_and_on_screen() {
             "expected the status line directly under compose:\n{}",
             session.dump(&label)
         );
+        // A grow leaves the viewport where it was, like a shell prompt. Where
+        // a shrink lands it is not asserted: `vt100` drops rows from the
+        // bottom on a shrink, where a real terminal scrolls the top rows into
+        // scrollback, so the re-anchor here does not match a terminal's.
         for line in &text {
             assert!(line.chars().count() <= cols as usize, "row spilled past {cols} cols: {line:?}");
         }
@@ -324,14 +328,13 @@ fn starting_from_a_prompt_mid_screen_reaches_the_bottom_band() {
     wait_for_attach(&session);
 
     // The rc trace blocks print as they settle; give the last one a moment.
-    let band_start = 24 - usize::from(VIEWPORT_LINES);
     let reached = session.wait_until(Duration::from_secs(5), |screen| {
         let rows: Vec<String> = screen.rows(0, 80).collect();
-        compose_row(&rows) == Some(band_start)
+        compose_row(&rows) == Some(22)
     });
     assert!(
         reached,
-        "the viewport never reached the bottom band (row {band_start}) after starting mid-screen:\n{}",
+        "the viewport never reached the bottom (compose on row 22) after starting mid-screen:\n{}",
         session.dump("mid-screen start")
     );
 

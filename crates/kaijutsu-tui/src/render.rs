@@ -13,7 +13,7 @@
 use chrono::{Local, TimeZone};
 use kaijutsu_types::{BlockSnapshot, ContextId, Status};
 use ratatui::backend::Backend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal};
@@ -254,7 +254,10 @@ pub fn print_scrollback<B: Backend>(
     Ok(())
 }
 
-/// Redraw the live region.
+/// Redraw the live region, bottom-aligned in the viewport: the status line
+/// is the viewport's last row and the band's unused rows are the gap above
+/// compose, never a gap under the status line (`docs/tui.md`, ruling 1: "a
+/// viewport at the bottom"). A grown view that fills its band is unmoved.
 pub fn draw_live<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -264,7 +267,14 @@ pub fn draw_live<B: Backend>(
     let width = terminal.size()?.width;
     let lines = live_lines(app, width, now_millis, armed);
     terminal.draw(|frame| {
-        frame.render_widget(Paragraph::new(lines), frame.area());
+        let area = frame.area();
+        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).min(area.height);
+        let bottom = Rect {
+            y: area.y + area.height - height,
+            height,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(lines), bottom);
     })?;
     Ok(())
 }
