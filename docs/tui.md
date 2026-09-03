@@ -60,7 +60,14 @@ kaijutsu-server / kernel
    Tool output is never collapsed in the tui; a block is read whole, and
    reading it better is a print-time problem (a formatter over kaish
    `.data`, longer-term), never a redraw — copy mode is how a long result
-   is read, the way `less` would be.
+   is read, the way `less` would be. Two things differ from tmux, named:
+   the buffer is the tui's own (the context mirror, so it holds the whole
+   context and search crosses all of it, not only what was printed), and
+   the mouse wheel stays the terminal's — scrollback is still where the
+   transcript lives. The tui is not run under tmux; the targets are
+   iTerm2 and the Linux terminals (Amy: *"my loyalty to wezterm is the
+   scrolling with mux + claude code is so damn good, otherwise I like
+   trying new terms"*), which is also the OSC 52 clipboard's target set.
 
 ## Shape: the ACP bridge minus the protocol
 
