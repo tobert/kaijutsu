@@ -280,65 +280,80 @@ and Amy's second morning, in rough priority:
 - **Harness: the 3-byte tail hold reassembles only `ESC[6n`.** A longer
   CSI split across reads relies on vt100 buffering its own partial
   sequence, which it does, and nothing asserts.
+- **The thinking pane is a 400 ms flap on a fast model.** A pty probe
+  against the live kernel (tui `RUST_LOG=kaijutsu_tui=debug`, the
+  `viewport resized` trace) shows `7→12` and `12→7` 400 ms apart on
+  deepseek-v4-flash; the afternoon's real turns held a Thinking block
+  `Running` for 1–4 s. Each open and close rebuilds the inline viewport.
+  Two shapes on the table: hold the pane for the whole turn as its own
+  sub-band above the stream (latest reasoning's tail, close and stub at
+  turn end; one rebuild per turn), or a minimum dwell after a block
+  completes. Amy picks.
+- **Rolling the newer chords into the app** is its own entry: "The tui and
+  the app disagree on a few chords".
 
 Two client facts every TUI-shaped consumer needs: `ContextInfo.label` and
 `.model` are routinely empty on real rows (fall back to `ContextId::short()`
 and the cast), and `ActorHandle::subscribe_events` warns per dropped event
 until someone subscribes, so subscribe before the first hydrate.
 
-## RESOLVED — the ask WAS redeemed; `allow_once` was working (2026-08-30)
+## The tui and the app disagree on a few chords (2026-09-03)
 
-The 08-29 entry claimed an allowed ask was not redeemed on retry and that a
-second ask was minted instead. **Both asks carry redemption stamps, and their
-principals are identical**, which kills the leading hypothesis (a per-connection
-principal moving across the kernel restart) outright.
+Survey of both clients' bindings against `AGENTS.md`, "Proprioception" —
+one `Ctrl+A` table, the same vi conventions, differences named. Sources:
+`crates/kaijutsu-tui/src/keys.rs` (`Keys::interpret`),
+`crates/kaijutsu-app/src/input/prefix.rs` (`resolve_chord`), `docs/input.md`
+prefix table, `docs/tui.md` "Keys".
 
-```
-01a04eaa  redeemed 2026-08-29 13:58:31   principal 019c86a7-...-d66a45d6b370
-01a04eb6  redeemed 2026-08-30 06:15:52   principal 019c86a7-...-d66a45d6b370
-```
+Aligned today: `Ctrl+A 0-9`, `Ctrl+A Ctrl+A`, `Ctrl+A n`/`p`, `Ctrl+A "`/`w`,
+the picker's placement verbs (`p`/`d`/`z`/`a`/`c`, `h`) match the well's, and
+the `Ctrl+C` ladder has the same three steps on both.
 
-The original was redeemed four minutes after the fixed kernel came up. The
-second ask was then minted **correctly**: `allow_once` authorizes exactly once,
-so a third invocation after the answer was spent has no redeemable answer and
-must raise a fresh one. That is the documented contract, and the gate honored
-it the whole time.
+Where they differ:
 
-**What actually went wrong was observability, not the gate.** The `redeemed:`
-field did not exist on 08-29 — `approval_ledger::ask::redeemed_at` was the read
-side `approval_redemptions` never had, and it shipped in `cccd4afa` *after* the
-observation. Without it, "the same command raised a new ask" is
-indistinguishable from "the answer was never consumed", and we filed the wrong
-one as a P1.
+- **App ahead.** `Ctrl+A '` (switch by prompt), `Ctrl+A A` (rename), `Ctrl+A
+  q` (close and demote), `Ctrl+A d` (detach) are implemented in
+  `prefix.rs` and are `NotYet` placeholders in the tui. The app's `Action`
+  semantics port directly.
+- **Tui ahead.** `Ctrl+A l` (ledger; the app has no ledger surface at all),
+  `Ctrl+A [` (copy mode), `Ctrl+A ]` (the tui's own yank buffer, not the OS
+  clipboard — the app's `Ctrl+V` is a different concept). None of `l`, `[`,
+  `]` is claimed in the app's table, so rolling them in conflicts with
+  nothing. The GUI shape of copy mode is an open question.
+- **`Ctrl+A a`** (send a literal `Ctrl+A`) is in the app and is not even
+  reserved in the tui: it falls to `NotYet("unbound chord")`.
+- **`Ctrl+Z`** is suspend in the tui and `ToggleSurface` (chat/shell) in the
+  app. The tui retired the shell surface in favor of `:!`; the app still
+  has the toggle. Name this in `docs/input.md` or retire the app's toggle.
+- **Diff.** Bare `v` on a focused block in the app, `Ctrl+A v` in the tui —
+  already named in `docs/tui.md`, "Editor and diff". Fine as is.
+- `docs/tui.md`, "Keys" summarizes the prefix table without `v`, `l`, `]`;
+  each has its own subsection, so the summary line is the stale part.
 
-So `362661d7` (dropping the value-enum CHECK) is confirmed correct and
-sufficient end to end on a live kernel. The lesson worth keeping is the one
-that cost two days: **a state machine whose transitions are invisible will be
-diagnosed from its symptoms, and the diagnosis will be wrong.** The fix was to
-ship the read side, and it paid for itself the first time it was queried.
+Direction on record (`docs/tui.md`, guidance 4): the shared `bindings.toml`
+carries the table and the app inherits it. The first lane is the four
+app-ahead chords into the tui and `Ctrl+A a` on both; the ledger and copy
+mode in the app are surfaces, not chords, and wait for a design pass.
 
-## The rc half of `invalidate_config_file_cache` may be dead weight (2026-08-29)
+## The /config melt's leftovers (2026-08-29/30; rewritten 2026-09-03)
 
-Found by mutation testing during the `kj rc` shrink, not by reading. Dropping
-`RcCommand::Add` from the `write_path` match in `kj/rc.rs` — the arm that
-fires `Kernel::invalidate_config_file_cache` after a successful write — leaves
-`an_rc_add_is_visible_to_a_later_kaish_read` **passing**. The shadow
-self-heals, because `/etc/rc` is host files now and the file's stat changed.
+The rc half of `invalidate_config_file_cache` is still live: `kj rc add` and
+`kj rc rm` both call it through the shared `write_path` match in `kj/rc.rs`.
+Mutation testing shows the `Add` call is redundant — the shadow self-heals
+because `/config/rc` is host files and the stat changes on its own — while
+dropping the `Rm` call fails a test, since a removed file leaves no stat
+behind to disagree with the shadow. The function's doc comment now states
+this rc-specific rationale directly; what remains open is whether the
+redundant `Add` call is worth deleting.
 
-Dropping `RcCommand::Rm` does fail its test, and that asymmetry is the whole
-finding: a removed file has no stat left to disagree with the shadow, so the
-hook is load-bearing on delete and belt-and-braces on write.
-
-`invalidate_config_file_cache`'s own doc says the shadow "can't self-heal"
-from an lstat mtime. That was written for the document-backed trees, where it
-is still true. It stopped being true for rc when rc melted onto disk, and
-nothing said so.
-
-Small, and not a bug — an unnecessary invalidation is cheap and correct.
-Worth resolving deliberately rather than leaving a comment that is half
-right: either narrow the hook to the roots that still need it (which is the
-`ConfigDocFs` three, and they melt too), or keep it and say why. Do it when
-the other three roots melt, since that is when the answer changes again.
+The melt also left orphaned documents behind. The tool that used to track
+which roots still needed cleanup, `config_export::MOUNT_ROOTS`, is gone along
+with the rest of the document-backed config machinery, but the ask it was
+built to answer still stands and now covers all four melted roots: nothing
+deletes the block-store documents that used to back `/config`, and there is
+no `delete_document` call site for them. Measured against the pre-melt
+backup, the orphans are small — under 1 MB total — so the hazard is a stale
+document shadowing a live file, not database size.
 
 ## Per-client config write-target defaulting has no owner (2026-08-30)
 
@@ -351,75 +366,6 @@ with the migration it existed for. Nothing has taken over the
 defaulting. Either the file tools (or something above them) need to reproduce
 it from the caller's client-id, or the policy is simply gone and every
 per-client write names its full path by hand. Undecided.
-
-## The rc melt orphaned its documents and nothing deletes them (2026-08-29)
-
-`/etc/rc` moved from `ConfigDocFs` to a `LocalBackend` over a host directory,
-but the documents that used to back it were never removed from the block
-store. They are still in `kernel.db`, unreachable through the VFS, and **stale
-the moment a script is edited on disk**.
-
-Found while wiring `kj config export`: `config_export::MOUNT_ROOTS` still
-listed `RC_ROOT`, so the migration tool would have walked those dead documents
-and materialized a dead copy of the rc tree over a live one. `MOUNT_ROOTS` is
-now the three document-backed roots and a test asserts no exported path starts
-with `rc/`.
-
-Two things follow.
-
-**A cleanup pass belongs in the `/config` melt** (`docs/config-namespace.md`).
-Once the other three roots melt, every document under all four roots is an
-orphan.
-
-**Measured 2026-08-30, and it is not a space story.** Read-only against the
-08-29 backup copy: the 84 documents under `/etc/*` hold **under 1 MB** between
-them. The 933 MB is 2378 conversation documents — `doc_snapshots` is 859 MB of
-it, one row per document (`document_id` is the PRIMARY KEY, so there is no
-retention leak), split 669 MB of `state` to 186 MB of `content`.
-`freelist_count` is **0**, so `VACUUM` reclaims nothing. Delete the orphans
-for correctness — a stale document that shadows a live file is the hazard —
-but do not expect the database to shrink.
-
-**The general rule this is an instance of:** melting a tree off the block store
-leaves its documents behind, because the melt changes what is *mounted*, not
-what is *stored*. Whoever melts the remaining three roots must delete the
-documents in the same change or file the same entry again.
-
-Found while answering "how much of kernel.db is reclaimable" (answer: none —
-`freelist_count` is 0).
-
-## `LocalBackend::resolve` follows the final symlink component (2026-08-30)
-
-`resolve` (`crates/kaijutsu-kernel/src/vfs/backends/local.rs`) canonicalizes
-the **whole** path, so any operation routed through it acts on a symlink's
-target rather than on the link. The file already knows this — `read_all` says
-so in a comment and works around it — but the workaround was never generalized.
-
-**`unlink` is FIXED** (this commit): it deletes the link now, via a new
-`resolve_nofollow` that canonicalizes only the parent. The bug was real and
-reproduced — `unlink_removes_the_link_not_its_target` fails when `unlink` is
-routed back through `resolve()`, leaving the link in place and the target
-gone. This was data loss on the composed rc tree, where many per-type names
-link to one shared script: removing one link deleted the script every other
-context type depends on.
-
-**Two siblings are NOT fixed**, same root cause, both verified by reading:
-
-- **`rename`** (`local.rs:390`) resolves `from` through `resolve()`, so
-  renaming a symlink moves its target instead.
-- **`getattr`** (`local.rs:225-226`) calls `symlink_metadata` — correct by
-  itself — on a path `resolve()` already canonicalized, so it lstats the
-  target and never reports `FileType::Symlink` for a resolvable link. A
-  dangling link reports correctly, which is why this hid.
-
-Both want `resolve_nofollow`. `getattr` is the riskier change: callers may
-depend on a symlink reporting as its target, so it needs its own pass with
-tests rather than a one-line swap. `readdir` is already correct — it reads
-file types from the directory iterator, not through `resolve`.
-
-Found while migrating the rc test fixtures off `ConfigDocFs`: the old
-document-backed fixtures never ran a real resolvable symlink through a real
-filesystem, so this whole class was invisible to the suite.
 
 ## kaish `ln -s` with an absolute /config path creates a dangling link (2026-08-30)
 
@@ -541,64 +487,6 @@ Whichever wins, the failure contract is already set by the file and env
 sources: an unresolvable value fails that one server with a reason, never
 launches it blank, and never quotes the value into a log line.
 
-## `register_session` lets a caller pick an ungated seat (2026-08-28)
-
-**Mostly closed 2026-09-02 (`5f0066d5`).** An unknown context type is
-refused at both creation points when the rc tree lists any type
-(`kj::rc::check_context_type`), and `default` and `toolie` now ship
-`S50-lfm2d.kai` like `coder` and `mcp`, with a seed test that every
-binding granting `*`, `exec` or `facade:shell` ships both S45 and S50.
-**Owed to Amy:** `director` grants exec and `facade:shell` and ships no
-scorer. It is the operator's console; scoring it means the operator's own
-commands need a second seat to answer (no self-approval). The seed test
-defers it by name rather than exempting it. The original analysis follows.
-
-`context_type` on `register_session` is caller-chosen free text with no
-allow-list: `kaijutsu-mcp/src/lib.rs:1986` defaults it to `"mcp"` and hands it
-straight to `createContext @26 (label :Text, contextType :Text)`. Only
-`coder`, `lib` and `mcp` symlink `S50-lfm2d.kai`; `default`, `director` and
-`assistant` do not. So any MCP client reaches an unscored seat in one
-parameter — `register_session {"context_type": "default"}` — and the switch
-leaves no ledger row.
-
-**The cost is measurement, not authority.** Capabilities are ergonomic nudges
-here and a player choosing a narrower seat is ordinary. What is not ordinary
-is that choosing a *wider* one is invisible: the escalation rate we quote to
-the lfm2d lane counts asks raised, so a seat that never raises any is
-indistinguishable from a seat that never needed to. Same shape as the alias
-bypass below — a second spelling of the same act that the ledger cannot see.
-
-Found while trying to answer a pending rc ask from a gated seat.
-
-**What the wide seat actually costs, measured 2026-08-28.** `default`,
-`coder` and `mcp` all symlink the *same* `lib/create/S10-binding.kai`, which
-grants `*`, `facade:*`, `operator`, `exec` and `editor`. So a `default` seat
-is not less capable than a `coder` one — it is exactly as capable. What it
-lacks is everything layered above the binding: no `S00-stance`, no
-`S15-governance`, and no `S50-lfm2d`, the advisory classifier that raises
-asks. It keeps `S45-shell-guard`, which denies outright and never escalates.
-Full authority, no stance, and the one gate that produces ledger rows absent.
-
-And it is reached without choosing it: `kj context create` with no `--type`
-falls back to `"default"` (`crates/kaijutsu-kernel/src/kj/context.rs:1149`).
-The single `default` run in 215 is almost certainly that, not a client
-picking a wide seat on purpose. The least-configured path is the
-least-observed one, which is the ordinary version of this problem and the
-one worth fixing first.
-
-**Not obviously a hole to close by refusing.** Two smaller moves are
-available and neither needs a policy: record the requested `context_type` on
-the context row so a wide seat is at least *countable*, and have the ask
-description carry the seat's `context_type` so a reader sees which gate the
-statement passed through. Refusing an unrecognized `context_type` is worth
-doing on its own merits — today a typo silently creates a bucket with no rc
-at all — but it does not address this, because `default` is not a typo.
-
-**Human authentication is not the answer and is not a goal** (Amy,
-2026-08-28): *"if we ever decide to do actual human auth thing, it'll likely
-be some kind of yubikey or passkey thing, and it's not a goal right now."*
-Do not design toward a principal check that separates human from model.
-
 ## The `attach` verb fires and no type ships a script (2026-08-28)
 
 `attach` is wired end to end — `kj/attach.rs:75` runs the lifecycle before
@@ -624,26 +512,6 @@ Queued for the app/UI session, not the kernel lane. Start at the
 `ActiveSurface`/`FocusArea` duplication already filed in
 `tech_debt_state_flags` — two pieces of state that must agree and are set in
 different places is the shape this bug has.
-
----
-
-## `kaijutsu-mcp`'s five e2e_shell tests panic in teardown (2026-08-26)
-
-`cargo test -p kaijutsu-mcp --test e2e_shell` fails all five
-(`shell_returns_stdout`, `shell_returns_nonzero_exit_code`,
-`shell_returns_full_nontrivial_stdout`, `shell_sequential_commands`,
-`shell_survives_dead_event_feed`). The panic is a `TryCurrentError` inside
-`russh-0.61.1/src/channels/io/mod.rs:37` reached through capnp's write-queue
-drop glue — a channel dropped with no tokio runtime on the current thread, so
-it is teardown, not the path under test.
-
-**Pre-existing, verified**: identical failures at `HEAD~2`, before the
-no-self-approval work, run in a worktree against the same target dir. Nothing
-in the ledger change is implicated.
-
-These are the only faithful e2e for the MCP store-replica + shell-poll path,
-so `cargo test --workspace` is red until this is fixed and the whole class of
-replication/ordering regression they exist to catch is uncovered meanwhile.
 
 ---
 
@@ -720,28 +588,6 @@ up. The two mechanisms are complements: quiesce saves the work that was
 running, and the boot-time abandon sweep honestly buries the asks that were
 waiting. That is the argument that made restart-surviving gate actions
 unnecessary (`docs/gate-resume.md`).
-
-## Two silent kaish 0.16 behavior changes, adapted (2026-08-23)
-
-The bump shipped (`10d80f63`). Recorded because the shape generalizes to
-every future kaish bump: **it compiled clean and five behavior tests broke.**
-The kaish lead predicted exactly this — about a dozen `Changed` entries no
-compiler can see.
-
-- **`$(cmd)` binds `.data` only when the tool declares it.** A tool that
-  prints text *and* attaches data must now call `.with_typed_substitution()`;
-  otherwise the substitution binds the printed text. kj renders a human table
-  and attaches the id array, so `for h in $(kj context list)` silently
-  iterated rendered rows instead of ids. **A conclusion from another repo does
-  not transfer**: kaish-extras checked the same change and correctly found
-  curl unaffected, because their results leave `.data` at `None`.
-- **`PlannedStatement::index` now means "position in the returned list."** It
-  used to number before empty statements were dropped. Our gate tests pinned
-  the old rule; kaish ships a test pinning the new one.
-
-**The lesson for the next bump: a clean build proves nothing.** Run the
-behavior suite and read the changelog's `Changed` section against the tools
-we register, especially anything that sets `.data`.
 
 ## The wire drops kaish's output line anchor (2026-08-23)
 
@@ -845,45 +691,6 @@ event volume actually shows up in a profile — the firehose is a known cost, no
 a known problem, and the 2026-06-17 starvation it caused was on the MCP's
 single-threaded LocalSet, not the app's.
 
-## The gate stops blocking (RULED 2026-08-22, RESCOPED 2026-08-23)
-
-**Design: `docs/gate-resume.md`.** Amy ruled that a gated tool call must not
-hold an RPC open while a human thinks — the kernel announces, the client may
-block locally, and the answer is redeemed on the caller's next attempt.
-Supersedes the blocking wait that shipped in Slice 4.6. **Slice 1 shipped**
-(`d8d45d39`).
-
-**Rescoped 2026-08-23, and it got much smaller.** The original design had the
-kernel resume an approved action itself, across a kernel restart, from a
-durable `gate_actions` table. Amy: *"Why put all this effort into resume? I
-almost feel we should just fail tool calls across restarts. the kernel is
-really reliable and the only reason it restarts a lot right now is because
-we're actively advancing it."*
-
-The accounting that settled it: not blocking the wire and running the action
-when the answer lands are ~90% of the value and need no durability. Surviving
-a restart was ~90% of the cost and ~100% of the risk — exactly-once across a
-crash, the unresolvable `claimed`-at-boot row, staleness rules for a context
-that may be archived by now — and the worst outcome the whole design can
-produce, an approved destructive action running twice, exists only on that
-path. Slice 2's durable table was deleted the day after it landed.
-
-What replaced it: pending asks are swept to `Abandoned` at boot, so a human is
-told the truth instead of answering into a void; cwd is pinned in memory at ask
-time and passed through `ExecuteOptions.cwd` at redemption; and a quiesce flag
-(entry above) covers the work that *can* be drained.
-
-**Corrects the entry this replaces**, which claimed an expired ask reached the
-model with "nothing informative." It does not, and has not since the
-2026-08-17 gate/shell split: expiry returns `McpError::GateUnavailable`
-carrying the request id, distinct from `Denied`, proven by
-`an_unanswered_hook_ask_expires_as_gate_unavailable` (`mcp/broker.rs`), and
-`format_error_for_llm()` hands the model the whole text. Two of that entry's
-three points were already satisfied; the third — per-ask bounds, some of them
-eternal — turned out to be unreachable by tuning, because `timeout::gate::
-CLIENT_CALL` is a compile-time constant in a process that cannot read kernel
-config. That is what forced the redesign rather than a bigger number.
-
 ## The escalation seat: a small model that prepares the ask (2026-08-21)
 
 Direction, not a spec — Amy, 2026-08-21: *"we'll use a standard model, like
@@ -949,26 +756,6 @@ partially-applied `set`, with no error path that says which half landed. Now
 reachable on purpose: `--env` validates its key at write time as of today, so a
 `kj context set --model x --env 1BAD=y` commits the model and then fails. One
 transaction or nothing. Found by the lane that added the env validation. S.
-
-## rc moves to real files on disk (RULED 2026-08-21, unbuilt)
-
-Amy ruled the shape; `docs/rc-on-disk.md` carries the design, the evidence, and
-five slices. The short version: rc scripts become host files under
-`~/.config/kaijutsu/etc/rc/` mounted at `/etc/rc` via `LocalBackend`, bodies
-keep being stored on use in `script_bodies`, `rc-write` is dropped, and hook
-bodies become path references read at call time.
-
-> *"if we're doing a cas of the script bodies anyways it's fine, let's store 'em
-> on use… Users can always use git there, or they can remap. defaults should
-> just work with or without git."*
-
-This is mostly deletion, not construction — `load_rc_scripts` is already
-backend-agnostic and `LocalBackend` is already what the broadly-used test
-dispatcher mounts. It retired `kj rc reseed --overwrite`'s diff machinery
-along with the verb: on disk, `git diff` is the diff.
-
-Not ruled: whether `/etc/config`, `/etc/client` and `/etc/midi` follow, which
-would delete `ConfigDocFs` entirely. Ask before building it.
 
 ## Tech-debt audits, 2026-08-20 — what is still open (lead-verified)
 
@@ -1217,110 +1004,6 @@ script testing `$?` would believe it had.
 
 ---
 
-## kaish loses a command substitution in a non-last pipeline stage (2026-08-18, via kaish-lead)
-
-**Silent zero bytes at exit 0.** Confirmed against the kernel's embedded kaish
-today:
-
-    echo $(echo sub) | cat      # kaish: nothing.  bash: "sub"
-
-Not new — it shipped in 0.14.1, so every kaish revision kaijutsu has run
-carries it. A function as a non-last stage fails the same way.
-
-**Measured scope in this repo: zero occurrences.** rc scripts, Rust string
-literals, and `contrib/` were all checked. The forms we actually use are safe,
-and the distinction is worth keeping straight because it is narrow:
-
-| form | result |
-|---|---|
-| `a="$(echo A)"`, then use `$a` — assignment | **works** |
-| `echo "x:[$(echo B)]"` — substitution, no pipe | **works** |
-| `echo "x:[$(echo C)]" \| cat` — quoted, piped | **empty** |
-| `echo $(echo C) \| cat` — unquoted, piped | **empty** |
-| `echo "plain" \| cat` — piped, no substitution | **works** |
-
-**Quoting does not save it, and the whole stage's output is lost — not just the
-substituted part.** In row 3 the literal `x:[` disappears along with `C`. The
-rule is simply: a command substitution anywhere in a non-last pipeline stage
-destroys that stage's entire output.
-
-**Assign first, then pipe the variable.** rc's
-`fleet_total="$(grep … \| sed … \| grep -c .)"` is the safe form because it is
-an *assignment*, not a pipeline stage — the earlier framing of "pipeline inside
-the substitution" was the wrong distinction.
-
-**The exposure is not bounded by our source.** "Zero occurrences" covers rc
-scripts, Rust literals and `contrib/` — code we control. It does not cover
-shell that a *model writes at runtime* through `shell`/`shell_write`, which is
-unbounded and where `echo $(git rev-parse HEAD) \| cut -c1-8` is an entirely
-natural thing to type. Verified against the live kernel: that exact command
-returns nothing, and a model reasoning on the result sees an empty string with
-exit 0. Every model driving kaijutsu today is exposed to this, and no audit of
-our repo can close it — only the kaish fix can.
-
-**The fix is merged; our tree is stale.** Kaish #367
-(`fix/pipeline-stage-stdout-loss`) and #368 are on kaish `main` as of
-2026-08-19 (via kaish-lead). Our remaining exposure is entirely the pin —
-`~/src/wt/kaish-integration` sits at `cf106d62`, 62 commits back. This is no
-longer "wait for kaish"; it is "advance the pin", and it is ours to do.
-Historical framing follows. `~/src/wt/kaish-integration` — the path-dep this
-repo builds against — is 62 commits behind main and does not contain it, so the
-embedded kernel is still losing that output today. "Zero occurrences" above
-means we do not *use* the broken form, not that the shell is fixed.
-
-Root cause, recorded because it may rhyme with something here: kaish's
-`exec_ctx` is **one shared slot**. A pipeline stage moves its `pipe_stdout`
-writer into that slot and leaves it there for the whole dispatch, so any
-dispatch that begins *while that command is still running* — a `$(…)` in its
-own argv, a function body — snapshots the same writer and drops it along with
-its own context. That is why a nested *pipeline* survives (it runs on its own
-stage contexts and never touches the shared slot) while a nested *single
-command* dispatches straight onto it.
-
-Worth a canary that fails loudly if the broken behavior is still present when
-we next bump — the pattern from "Pin a divergence WITH instructions".
-
-Two related notes from the same source: `~/src/wt/kaish-integration`, which
-this repo path-deps, is **62 commits behind kaish main**, so do not rebase onto
-it expecting 0.15. And kaish #366 (merged to kaish main as `8c86c41d`, shipping in 0.15) moves
-the `[N]` background-job announcement from stdout to stderr — breaking for
-embedders that parse it off stdout.
-Kaijutsu is unaffected today because `background_exec.rs` runs its own
-`JobManager` rather than reading kaish's announcement, but that is exactly the
-code the open "Background exec → kaish's job system" item would replace. Check
-this before doing that migration, not after.
-
----
-
-## Three `kj fork` findings recovered from a clobbered backlog (2026-07-04, recovered 2026-08-18)
-
-Recovered from a stale whole-file `write` that overwrote `docs/issues.md` with
-a 2026-06-29 vintage (see the entry below on `write` having no staleness
-guard). These three were the only genuinely new content in that copy and would
-have been lost with it. Not re-verified since 2026-07-04 — confirm before
-working them.
-
-- **`kj fork --compact` label conflict says nothing useful.** The error is a
-  bare `label conflict: label 'X' already in use`. It does not name the
-  existing context, does not suggest `kj context list --tree` to find it, and
-  does not hint at a rename. The caller cannot tell a partial success (the
-  context exists and is usable) from "pick a new name". Fix: name the existing
-  context id in the error and point at `kj context switch` or a rename.
-- **`kj fork --include` rejects the range forms its own help documents.**
-  `--include "end-2:"` and `--include "0:1"` both fail with `is not a valid
-  endpoint — expected an integer, 'end', or 'end-N'`. `end-N` is documented in
-  `--help` and the parser refuses it; bare integer ranges fail too, which
-  suggests the problem is deeper than the `end-N` case. While this holds there
-  is no working way to fork a near-empty child via `--include`.
-- **`kj fork --compact` cannot cross providers.** `kj fork --compact --model
-  deepseek/deepseek-v4-pro` from a haiku context fails with `LLM summarization
-  failed: invalid request: not_found_error: model: deepseek-v4-pro` — the
-  distillation appears to run on the *target* model rather than the *calling*
-  context's. Fix: default `--distill-model` to the calling context's model, or
-  detect the cross-provider case and say so, naming `--distill-model`.
-
----
-
 ## `write` has no staleness guard, and it cost the backlog 115 entries (2026-08-18)
 
 `docs/issues.md` was overwritten in the working tree with its 2026-06-29
@@ -1515,92 +1198,6 @@ are being split after it — worth finding out which before patching hydrate.
 **Remediation for a poisoned context today**: exclude the offending blocks,
 then fork (the documented path — exclusions land at the next hydrate
 boundary).
-
----
-
-## The Claude Code Stop hook blocks a turn when the kernel is unreachable (2026-08-18)
-
-Hit within minutes of shipping the wire handshake. The hook is
-`target/debug/kaijutsu-mcp hook claude` (`~/.claude/settings.json`, five
-entries). With a version mismatch it failed hard, and Claude Code reported:
-
-    Stop hook feedback: [kaijutsu-mcp mirror error] failed to author text
-    block: permanently failed: bind_kernel: ... client wire version 0,
-    kernel wire version 1 ...
-
-    A hook blocked the turn from ending 9 consecutive times — overriding and
-    ending turn.
-
-**The diagnosis was perfect and the behaviour was wrong.** The block mirror
-is ambient observability: it records a session's turns into the kernel. It is
-not on the critical path of the user's work, and `kaijutsu-types::timeout`
-already says so in the doc for `tiers::HOOK_PATH` — *"if our budget expires
-first we return a permissive response with a note, which is the behaviour the
-hook path already commits to elsewhere — the mirror is ambient, and its
-slowness must not block the user's action any more than its failure does."*
-
-Slowness honours that. **Failure does not**: a `PermanentlyFailed` bind
-retried nine times and blocked the turn each time. The stated policy is
-already right; the failure path just does not implement it.
-
-Fix: any bind/connect failure in the hook path should emit its diagnosis once
-and return a permissive response. A permanent failure especially — retrying
-cannot help, and repeating it nine times converts one clear line into noise
-that buries it. Check `stop_hook_active` in the input as Claude Code's own
-message suggests.
-
-Related: **`target/debug/kaijutsu-mcp` is a fifth kernel-binding artifact**,
-distinct from the installed `~/bin/kaijutsu-mcp` that serves the MCP tools.
-Both must be rebuilt on a wire flag day. The full set is `kaijutsu-server`,
-`kaijutsu-acp`, `kaijutsu-app`, `target/debug/kaijutsu-mcp` (hooks) and
-`~/bin/kaijutsu-mcp` (MCP) — a `cargo build --workspace` covers the four in
-`target/`, the installed one needs its own copy.
-
----
-
-## The ACP binary can silently outlive a wire change (2026-08-18)
-
-**This is what actually cost a morning**, and it is not a gate bug.
-
-Amy: *"I didn't see any gates in the ACP."* toad launches
-`target/debug/kaijutsu-acp` — a **build artifact**, not an installed binary.
-Hers was built 09:44; the wire retirement of `PermissionEvents` landed at
-09:46:45 and the kernel restarted onto it at 10:14. So the ACP process was
-still subscribing to a wire the kernel no longer served, its permission pump
-waiting on a channel nothing could feed. A gate could fire, post a real
-ledger row, and never reach the editor.
-
-Cap'n Proto made it quiet rather than loud: `subscribePermissionEvents @93`
-became `retired93 @93 ()`, and calling a retired method with extra params is
-tolerated. The feature just goes missing. Nothing logs "your client is
-older than this kernel."
-
-Worse, the resulting failure blamed the wrong component — toad reported
-*"Agent failed to run — check that the agent is installed... some agents
-require an ACP adapter"*, sending you to reinstall something that was fine.
-
-**Wanted: a version handshake at ACP connect that refuses a mismatched
-kernel, loudly, naming both sides.** We have the precedent — the kaish canary
-that fails loudly on a downgrade rather than letting silent-wrong behavior
-back in (`assets/defaults/rc/...`, and the `deps(kaish)` commits). One error
-line would have replaced a morning of ghost-hunting.
-
-Second-order: because it is a `target/debug` artifact, *any* `cargo build` in
-this checkout changes what toad launches next. Which ACP you get depends on
-when the editor last spawned versus what was last compiled. An installed
-binary with a version stamp would fix both halves.
-
-**Resolved on the way past — the gate DOES run from the LLM turn path.** The
-earlier worry that `shell_write` executed ungated was wrong. Reading the
-session's block log back found a real pending row for that exact canary
-(`origin: shell_gate`, `tool: builtin.shell_write.shell_write`) which Amy
-answered herself with `kj ledger allow`. The model's own `kj ledger list`
-probe came back empty moments earlier — run either before the ask posted or
-after she had answered it — and it wrote that silence down as *"verified no
-gate on the MCP write path"*, which the transcript does not support. Still
-unpinned: the exact ordering between the tool call returning and the ask
-appearing, since block sequence numbers order per-writer rather than by
-wall clock. Full reconstruction in `docs/kaijutsu-feedback.md`.
 
 ---
 
@@ -1932,19 +1529,7 @@ Two consequences worth acting on:
   existing contexts never, since their system block was already written. Old
   contexts keep the old primer until they fork.
 
-### 5. One real bug, unrelated to the rest
-
-```
-stream error: Failed after 3 attempts: invalid request: An assistant message
-with 'tool_calls' must be followed by tool messages responding to each
-'tool_call_id'. (insufficient tool messages following tool_calls message)
-```
-
-A hydrated conversation went to the provider with a `tool_call` whose
-`tool_result` was missing. Keeping those pairs together is the stated job of
-`ConversationMailbox` (the atomicity gate, per `CLAUDE.md`), so this is either
-a gap in that gate or a path that bypasses it. Retried 3× and failed 3×, so
-it was not transient. Needs its own investigation — file/line unknown.
+5. (folded into "P1: hydration's tool-pairing repair can poison a live ACP turn" above)
 
 ---
 
@@ -2452,32 +2037,6 @@ status) — the `getContextVersion` RPC already exists and is what it would read
 It also gives the "did the version resume?" check a one-line answer after any
 restart.
 
-## `kaijutsu-mcp --connect serve` silently runs local (2026-08-15)
-
-`kaijutsu-mcp --connect` attaches to the server. `kaijutsu-mcp --connect serve`
-— the same flag with the subcommand spelled out — **silently ignores it and runs
-in local mode**. `whoami` then answers `{"mode":"local"}` and `register_session`
-replies "requires --connect to kaijutsu-server", while the caller believes it
-passed exactly that.
-
-**Confirmed and diagnosed 2026-08-22** — this entry previously carried
-conflicting evidence (one pass called it fixed, another reproduced it). It is
-real, and the cause is a **duplicate flag**: `serve` declares its own
-`-c/--connect` (see `kaijutsu-mcp serve --help`) alongside the identical
-top-level one. `kaijutsu-mcp --connect serve` therefore sets the *top-level*
-flag, which `run_serve` never reads — it reads `ServeArgs.connect`. Same for
-`--host`, `--port`, `--kernel`, `--context-name`, `--hook-socket`, which are
-all declared twice.
-
-**The working invocation is `kaijutsu-mcp serve --connect`** (flag AFTER the
-subcommand). Verified live: with it, `register_session` returns a real context
-id; without it, "requires --connect to kaijutsu-server".
-
-It is a silent fallback of the kind we treat as a defect: it should either
-honour the flag under `serve` or refuse the combination. The fix is a design
-call rather than a patch — which of the two declarations wins, or whether the
-top-level copies are deleted outright — so it is recorded rather than changed.
-
 ## `rc reseed` seeds from the BINARY, not the repo (2026-08-22)
 
 `assets/defaults/rc/` is the in-repo seed, but a reseed installs the defaults
@@ -2505,55 +2064,6 @@ context with no stance is worse than a stance that reads a little ragged.
 
 Unknown and worth establishing: what the rc shell's tool set actually is, and
 whether the difference is deliberate (a narrower rc loadout) or incidental.
-
-## The config git worktree has no index — `git status` will lie to an operator
-
-Lane B's seam (`crates/kaijutsu-configgit`) writes commits straight from the
-worktree: it walks the live files, builds the tree, commits. It never touches a
-`.git/index`, because the aligned gitoxide plumbing pin set has no stage-all
-helper and staging through an index would be a second copy of the truth.
-
-Consequence, and it matters because Lane B's stated point is that the directory
-is **an operator-visible recovery surface**: someone who cds into
-`<data_dir>/config` and runs real `git status` sees **everything as untracked**,
-while the history is complete and correct. `git log`, `git show` and
-`git checkout` all work; only the index-derived views are wrong.
-
-Decide before the kernel wiring slice, not after someone is confused at 2am:
-
-- write an index alongside each commit (more gitoxide plumbing we then own), or
-- leave it and **say so in the directory** — a README committed at init
-  explaining that this worktree is kernel-written, that `git status` is
-  meaningless here, and which commands do work.
-
-The second is cheaper and honest, and it fits the "no watcher, no implicit
-import" ruling: an operator is a reader here, not a committer. Related: ruling 3
-wants unexpected dirtiness detected and failed loud, which is still doable
-without an index (compare the worktree walk against the HEAD tree), just
-hand-rolled.
-
-Also from the same slice: `init_or_open` hand-writes `HEAD` and a minimal
-`config`, because the pin set has no plumbing `init` (that lives in
-`gix-repository`, deliberately outside the aligned set). Two `fs::write` calls,
-but it is one more piece of git's on-disk format this crate now owns and must
-keep correct by hand.
-
-## `kaijutsu-crdt` is a block store now, not a CRDT (2026-08-16)
-
-diamond-types-extended left the crate, and the build graph, on 2026-08-16
-(`fc616aa6`, `133b5814`): block text is a plain `String`, and concurrent
-merge into a kernel document is structurally impossible (the sole-sequencer
-ruling; `pushOps`'s deletion removed `merge_ops`'s only concurrent caller).
-What is left in `kaijutsu-crdt` is a Lamport-clocked, fractional-index,
-DAG-validating block store with document/snapshot/oplog persistence — a
-real thing, just not a conflict-free replicated data type.
-
-The name now promises merge semantics the crate does not have and will not
-need again. Only `kaijutsu-kernel` and `kaijutsu-server` still depend on it
-(client, acp, mcp, and app all dropped it during the melt). Renaming the
-crate — `kaijutsu-blockstore` is the obvious candidate — is open work: pure
-churn with no behavior change across two dependents, which is exactly why
-it has stayed a name change rather than a priority.
 
 ## The well's activity glow wants a derived signal (2026-08-15)
 
@@ -2608,35 +2118,6 @@ the two sites should get one answer, not two ports. (Deliberately NOT in this
 bucket: `update_event_pulse`, switchboard, editor, fsn/heat, room/activity —
 those consume `TurnEvents`/`EditorEvents`/`VfsActivityEvents`/directive-only
 members the change feed deliberately excludes; see docs/change-feed.md.)
-
-## Two findings from the change-feed step-1 review (2026-08-15, kaibo/DeepSeek)
-
-Both pre-existing; the change feed is what makes them matter. A third — the
-context version resetting on restart — was **fixed** the same day: Amy ruled
-*"persist & restore the version, it'll come in handy when we need repair
-replays"*.
-
-### 1. `BlockContent::append_text` materializes the whole block per token
-
-The streaming path's O(n²) is **not** gone. `append_text` computes
-`self.text().chars().count()` on every call (`kaijutsu-crdt/src/content.rs`), so
-each streamed token materializes the entire block. `08793e71` removed a
-*different* one (per-op re-materialization while journaling), and the kernel's
-classification deliberately avoids adding a *third* — but the per-token cost
-remains, inside the CRDT layer. The fix belongs there: get the DTE text length
-without building a `String`. **Resolved by the representation change** (2026-08-16): block text is a
-plain `String`, so a character count no longer requires materializing one.
-
-### 2. kaish VFS write passes a byte length as a character count
-## kaish VFS write passes a byte length as a character count (2026-08-15, kaibo/DeepSeek)
-
-`kaish_backend.rs`'s write path computes `current_len` as `b.content.len()`
-(bytes) and passes it to `edit_text` as the `delete` **character** count. On a
-block containing any non-ASCII text this fails with `PositionOutOfBounds` rather
-than corrupting — loud, which is why nobody has hit it quietly — but it means
-writing to a multibyte block through `/docs/<ctx>/<block>` simply does not work.
-The sibling `patch` path already has the byte→char projection
-(`wire_byte_to_char`); `write` never got it.
 
 ## Model names via hooks — the plumbing exists, the data mostly does not arrive (2026-08-15, Amy)
 
@@ -3321,66 +2802,6 @@ waypoint that unpins `kaish-help`, and target the gate at 0.15. A hypothetical
 0.14.2 would be a patch and would not carry this surface, so that risk does not
 change the plan.
 
-## Three findings from the slice-3 cross-model review (2026-08-13, gemini-pro + deepseek)
-
-Both models independently confirmed the read-replica invariant holds (three
-writers to `RemoteState.synced`, all server-sourced; zero `push_ops` callers in
-the crate), so the flush/frontier deletions are sound. These are what they
-found *around* it. The two hook-path defects they found are already fixed
-(drop-guard for cancellation, `isError` consistency check); these three are not.
-
-**1. MED — the shell poll's stall backoff is defeated by the doc task's own
-resync bump.** `execute_and_poll_shell` treats any `change` bump as "the event
-feed is alive," but `do_coalesced_resync` bumps `change` unconditionally when it
-finishes — including the resync the fallback itself just requested
-(`doc_task.rs`, end of `do_coalesced_resync`; `lib.rs`, the `watch_progressed`
-arm). So the loop reads its own resync as delivery progress, resets
-`stall_window` to the 5 s initial value and clears `stall_resubscribed`. The
-documented 5/10/20/30 backoff never accumulates past its first step, and
-`resubscribe_blocks` re-fires every ~5 s instead of once per episode. Net cost
-on a dead bridge during a long command: a **full `get_context_sync` snapshot
-every 5 s** for the command's whole runtime — precisely the tight poll the
-backoff exists to prevent, on top of the already-filed per-call snapshot cost.
-Wasted work, not wrong data.
-
-*Attribution corrected by probe:* deepseek blamed slice 3's "uniform bump."
-Wrong — `git show 7b1e288b:…/doc_task.rs` has the same unconditional
-`bump(change)` in `do_coalesced_resync`. It arrived with the sole-writer doc
-task (`be7b8b63`, 2026-07-17), whose own doc comment advertises the uniform bump
-as the *fix* for the old listener not bumping. It fixed one thing and broke
-another, and nothing noticed for four weeks. Fix shape: have the fallback
-compare the `change` generation across its own resync, or give resync-origin
-bumps a distinguishable marker.
-
-**2. MED — `ResyncReason::StallFallback` sits outside `do_coalesced_resync`'s
-staleness safety argument.** That argument (see the function's doc comment)
-says an `ApplyEvent` processed after a swap is causally at-or-after the
-snapshot, because every resync trigger *comes from* the ordered event stream.
-`StallFallback` does not: it fires on a local timeout, exactly when the feed is
-suspected slow or dead. An event delivered during the fetch may therefore
-reflect **older** server state than the snapshot, and applying it afterward
-regresses the field — silently, because the header setters stamp a fresh local
-tick rather than doing LWW against the event's own timestamp. Pre-dates slice 3;
-the code comment now carries the caveat. Real fix wants a server-side ordering
-token on events, not a guess.
-
-**3. LOW — rejoin race: an old doc task can clobber a fresh seed.**
-`finish_join` writes the new snapshot into `remote.synced` *before* the old
-`JoinedContext` drops and aborts the old doc task. In that window the old task
-can apply a queued `Resync`/`ApplyEvent` to the same `Arc<Mutex<…>>`, and
-`apply_sync_state` sets `context_id` from the payload — so the just-seeded
-document is replaced by the *old context's* snapshot. Reachable via
-`stabilize_context_label`'s reattach path calling `finish_join` a second time.
-Does not violate the read-replica invariant (the clobbering content is still
-server-sourced), but it is a wrong-context race: the seed write and the abort
-are not ordered by any lock. Fix shape: abort the old task before seeding.
-
-**Also noted, not filed as a defect:** `completeBlock`'s `isError` is redundant
-with `status` by construction. It is now read as a consistency check (a
-contradiction is refused) rather than ignored. If a future schema revision is
-happening anyway, dropping the field is the cleaner end state — but it is not
-worth a bounce of three binaries on its own.
-
 ## Theme changes never reach a running app — there is no live config push (2026-08-13, revised)
 
 The 2026-08-12 version of this entry blamed raster-time gates in the app for
@@ -3409,26 +2830,6 @@ Related smaller finds from the same session: block text colors
 theme file can change conversation text colors at all. And `Theme` derives
 neither `Reflect` nor registers with BRP, so it cannot be poked remotely for
 testing.
-
-## `kj config show` output is not round-trippable, and a corrupt theme falls back silently (2026-08-12)
-
-Two contributing factors that compounded into an hour of phantom results:
-
-1. `kj config show <file>` prints a human header (`path:`, `length:`, blank
-   line, ` ```toml ` fence, closing fence). Piping it into `kj config set`
-   — the obvious sed-tweak idiom, which the shell happily accepts — embeds
-   the header into the stored file; each roundtrip nests another copy.
-   Wants a `--raw`/`--body` flag (or: `set` could refuse content whose first
-   line matches its own `show` header — it is never intentional). Even the
-   "safe" strip idiom below accretes one trailing `\n` per roundtrip
-   (measured 2026-08-13: 6502 → 6503 → 6504 … bytes) — harmless to TOML,
-   but the length check must expect +1, not equality.
-2. When the stored theme TOML fails to parse, the app falls back to
-   compiled-in defaults **silently** (no dock indicator, nothing in the
-   conversation). Every subsequent theme experiment silently tested the
-   defaults instead. Doctrine says crash > corruption; here at minimum the
-   parse error should surface loudly (drift notification / dock error glyph).
-   Repro: any `show | sed | set` roundtrip before (1) is fixed.
 
 ## Dock RTT sizes skip physical-px rounding (2026-08-12, kaibo find)
 
@@ -3666,34 +3067,6 @@ this file: **hook self-lockout has no recovery path** (third independent
 reason to fix it — it gates the constraint-hook seam), and the
 **external-drive gate** is a prerequisite for the resident-assistant seat.
 
-## Two seeds from the rc-create lockout fix (2026-08-12, `788fb0d7`)
-
-Found while closing that item; recorded rather than folded in, because
-neither is that bug.
-
-- **`test_dispatcher` leaves the broker's DB handle unset**, so
-  `broker.set_binding` (and therefore `kj binding allow`) lands only in the
-  in-memory cache — which `require_cap` and `has_usable_loadout` never read,
-  by design: they read KernelDb, the authoritative store the broker
-  write-through targets in production. The rebind repair test hit this the
-  loud way: the rc script reported `allowed operator on context …` and the
-  loadout stayed empty. Fixed *in that one test* with
-  `broker().set_db(kernel_db.clone())`. **Open question: which other binding
-  tests on this fixture are asserting against the cache instead of the
-  store?** `kj::drive`'s gate tests already know (they write straight to the
-  DB with a comment explaining why) — so the knowledge exists and is applied
-  ad hoc per test. Candidate fix: wire the DB in `test_dispatcher` itself, so
-  the fixture matches production and the per-test workaround stops being
-  something each author has to know.
-- **Sweep the authz-shaped `.ok().flatten()` / `unwrap_or(false)` sites.**
-  The "errors that were only strings" pass (Aug 3–4, devlog) fixed this
-  collapse in `Broker::binding_checked`; `require_cap` held an untouched copy
-  for months, where a KernelDb read failure was indistinguishable from a
-  missing grant. The family is "a fault silently becomes a policy decision" —
-  worth grepping deliberately in gate/predicate paths rather than waiting for
-  the next one to surface. Note the direction of the risk: deny-by-default
-  makes the *safe* wrong answer easy to ship and hard to notice.
-
 ## Summaries drift stronger than what they summarise (2026-08-11, three instances in one day)
 
 Not a code bug — a writing failure mode worth naming, because it cost real
@@ -3722,69 +3095,6 @@ tell pinned from observed at a glance. Three instances is a pattern; a rule
 wants her word.
 
 ---
-
-## rmcp protocol-version fallback drops us to 2025-11-25 (2026-08-11, via kaibo lead; re-verified against our own version)
-
-**Trigger has a date, not a probability: the day a client requests a protocol
-version newer than `2026-07-28`.** Claude Code is the client that will do it.
-
-kaibo lead flagged this as a latent bug across rmcp-based servers. It applies
-to us, but **two of the relayed specifics are wrong for rmcp 3.0.1, which is
-what we pin** (`Cargo.toml:141`; kaibo is on 3.1.2) — and the difference
-matters because the recommended fix does not fix the actual failure.
-
-Read from `~/.cargo/registry/.../rmcp-3.0.1/`:
-
-- **`supported_protocol_versions` is NOT 3.1.0+**, and is not our problem. It
-  exists in 3.0.1 (`src/handler/server.rs:328`) and its trait default already
-  returns `ProtocolVersion::KNOWN_VERSIONS`, which **includes**
-  `V_2026_07_28` (`src/model.rs:186`). So the "strict client rejects
-  tools/list" path (`src/handler/server.rs:65-71`) does not fire for
-  2026-07-28. We do not override it, and we should not need to.
-- **A client asking for `2026-07-28` is honored, not downgraded.**
-  `negotiate_protocol_version` (`src/service/server.rs:464-478`) returns the
-  client's requested version whenever it is in `KNOWN_VERSIONS`.
-
-The real exposure is narrower and worse:
-
-- For a version rmcp 3.0.1 does **not** know — i.e. anything newer than
-  `2026-07-28` — negotiation falls back to `server_fallback`, which is
-  `get_info().protocol_version`. Our `get_info` (`crates/kaijutsu-mcp/src/lib.rs:2130`)
-  uses `ServerInfo::new(...)` and never calls `with_protocol_version`, so it
-  takes `ProtocolVersion::default()` → `LATEST` → **`V_2025_11_25`**
-  (`src/model.rs:175`). We would not fall back one step to 2026-07-28; we
-  would fall back **two**, past a version we fully support.
-- Not fully silent: it emits `tracing::warn!("client requested unsupported
-  protocol version; falling back to server default")`. Whether we would *see*
-  that in a stdio server's log is a separate question worth answering.
-
-**The fix is `with_protocol_version`.** Setting
-`ServerInfo::new(...).with_protocol_version(ProtocolVersion::V_2026_07_28)`
-makes the fallback land on the newest version we actually implement. Cheap,
-and it converts a two-step silent-ish regression into a one-step one.
-
-**Version-qualified, and this is the part that will bite on a bump:** *on
-3.0.1*, overriding `supported_protocol_versions` cannot help, because
-`negotiate_protocol_version` never consults it — it reads the hardcoded
-`KNOWN_VERSIONS` (`src/service/server.rs:468`). **That mechanism is fixed
-upstream in 3.1.2**, where negotiation *does* consult the server's supported
-set (kaibo lead's read of their own vendored 3.1.2: `service/server.rs:587-591`,
-with a `server_supported.contains` check at `:474`). So the *lever* is
-correct on both, but the *reason it works* differs — do not carry this
-paragraph's reasoning across an rmcp bump without re-reading the source.
-
-Re-check on any rmcp bump generally: the constants (`LATEST`,
-`KNOWN_VERSIONS`, `STANDARD_HEADERS = V_2026_07_28`) and the negotiation path
-both move underneath us. Related: the SEP-2577 deprecations papered over in
-the 1.7 → 3.0.1 bump are still open above.
-
-**Practice this produced** (kaibo lead, after each of us read our own pinned
-copy and reached different true answers): *"neither of us should have
-inherited the other's read of a differently-pinned crate."* A dependency
-analysis is a claim about a version, not about a crate.
-
-Skew note: `~/bin/kaijutsu-mcp` is a **separately built binary** — a fix here
-does not reach a running client until that binary is rebuilt and relaunched.
 
 ## MCP 2026-07-28 adoption — four slices, in priority order (2026-08-11, post rmcp 3.1.2 bump)
 
@@ -3899,6 +3209,15 @@ reports reachability + model list. Verified absent: no `doctor`/`check` verb in
 ---
 
 ## Background exec → kaish's job system (2026-08-07, Amy: "we should do the work and set the rule")
+
+**Flag for Amy (2026-09-03).** `background_exec.rs`'s module header now
+argues the migration cannot be done as things stand — every `shell` call
+materializes a throwaway `EmbeddedKaish`, so a kaish job would die with the
+call and its streams are in-process only — while `CLAUDE.md` ("Host exec
+has one owner") still says this site is being retired. The two statements
+contradict; the header cites `kaish-kernel-0.15.0` and kaish is at 0.17.
+Either the migration is redesigned around a longer-lived kaish, or the rule
+gets its exception named. Her call; nothing here decides it.
 
 An audit of every spawn site found exactly one ad-hoc host exec left in
 production: `spawn_background` (`crates/kaijutsu-kernel/src/background_exec.rs:552`,
@@ -4191,39 +3510,6 @@ folded). Two things changed today:
   here and in python-player.md "Open" only. **Awaiting Amy:** first
   consumer (notebook/MIDI player vs a second vendor seat over MCP/ACP,
   which needs no wheel), and whether direction (B) gets a policy read.
-
-## kaish-help and kaish-kernel must be bumped together (2026-08-07, adoption)
-
-Now that prompts are composed from `kaish-help`, the guidance kaijutsu ships
-describes the shell it *runs* — so the two pins have to move as a pair:
-
-- `kaish-kernel` (crates.io "0.13") is the shell that actually executes.
-- `kaish-help` (git rev, pending release) is the prose describing it.
-
-They agree today. They will not after kaish PR #300, which makes `,`
-significant only inside `[]`/`{}` — the composed tool description still
-carries the `comma-splits-word` rule (a `Concept::Foundations` fragment, and
-Foundations is exactly what the tool description selects). Bump `kaish-help`
-alone and models are told to quote commas the runtime now accepts; bump
-`kaish-kernel` alone and they are not told about a rule that still bites.
-
-Neither direction fails loudly — a prompt that mildly misdescribes the shell
-produces worse agent behavior, not an error — which is what makes it worth
-writing down. When the release lands, move both pins in one commit and drop
-the git dep TODO in `Cargo.toml` at the same time.
-
-## rc seed assets have no rebuild tracking (2026-08-07)
-
-`assets/defaults/rc/` is embedded via `include_dir!`
-(`kaijutsu-kernel/src/seed_scripts.rs:54`) and `kaijutsu-kernel` has no
-`build.rs`, so nothing emits `cargo:rerun-if-changed` for the seed tree.
-Editing a stance or lifecycle script may not trigger a rebuild, and a test
-run can silently exercise a stale embedded copy. Bit us during stance tuning:
-a mutation test looked green until `strings` on the test binary proved which
-version was actually compiled in. Wants a small `build.rs` walking the asset
-dir. Until then, verify with:
-
-    strings -a target/debug/deps/<test-binary> | grep -o "<a distinctive string>"
 
 ## Ambient command center — trace packets, switchboard follow-ups (2026-08-10)
 
@@ -4557,63 +3843,6 @@ these are the ones that block *using* the thing.
 - **External MCP servers don't load at all** — see the dedicated *MCP subsystem*
   section immediately below. This also closes the "BYO a scraper MCP" escape
   hatch for the missing web tools.
-
-## TurnEvents + register upsert — deepseek review findings (2026-08-04/05, post-merge) — P2 tier SHIPPED
-
-DeepSeek V4 pass (dpal, whole files, no diff) over the merged foundations at
-`29529ded`. Eight keepers explicitly endorsed (single-terminal-publish,
-origin-on-the-event, beat's three Act guards, resolveContextLabel honesty,
-loud attach warning, subject⊆TOPICS gates, unknown-enumerant hard error,
-hasOutputBlock zeroing). All six P2 findings landed 2026-08-05:
-
-1. `⛔ Interrupted` marker → `(Role::System, BlockKind::Text)` + ephemeral,
-   no longer folds into assistant_text on the model's next turn
-   (`llm_stream.rs`). Checked the review's `BlockKind::Notification`
-   alternative against `hydrate.rs` before picking — Notification is NOT
-   hydration-skipped (it formats into a *user* message,
-   `format_notification_for_llm`), which would have been worse.
-2. Post-cancel drain's idle timeout no longer constructs `StreamEvent::Error`
-   on a hung provider — breaks the loop with `stream_cancelled` already set,
-   so the outcome stays `Cancelled`, not `Failed` (`llm_stream.rs`).
-3. `refusal`/`stop_sequence` now log distinctly (`warn`/`info`) before
-   falling through to `EndTurn` (`llm_stream.rs`). Still open: a dedicated
-   wire `Refusal` stop reason — a capnp change, and capnp is owned by a
-   parallel lane right now.
-4. beat.rs's OODA-Act gate is now `BeatScheduler::turn_should_crystallize`,
-   with the soft-cancel-crystallizes / hard-cancel-skips decision stated
-   explicitly and pinned by tests, replacing a comment that explained the
-   hard-cancel exclusion but left the soft-cancel inclusion unstated.
-5. `register_session`'s suffix TOCTOU (concurrent registers racing one
-   concluded label) now retries on a real label-conflict, bounded at 5
-   attempts (`kaijutsu-mcp/src/lib.rs`).
-6. `flows.rs`'s `TurnFlow` doc no longer claims the block log covers a missed
-   push — true for the text a turn wrote, false for `TurnStopReason` (no
-   block-log shadow; `EndTurn`/`MaxTokens`/soft-cancel all leave an identical
-   `Done` block). Points at the already-tracked bus catch-up story below
-   ("TurnFlow bus lossy + in-memory") instead.
-
-**Two review claims turned out wrong on inspection** (worth recording — this
-repo has now caught this reviewer wrong more than once): the
-`BlockKind::Notification` hydration-skip claim in (1) above, and the
-"wire e2e for onTurnFailed" test-gap — `subscriptions.rs`'s
-`turn_events_tests::failed_round_trips` already exercised `on_turn_failed`
-through the real generated capnp client/server pair, and predates the
-review (landed in `0564b334`, an ancestor of the reviewed `29529ded`). The
-remaining test-gap item (concurrent register race) got the review's own
-fallback: `kaijutsu-mcp`'s retry classification is unit-tested directly
-rather than raced end-to-end, since this crate's RPC path needs a live SSH
-connection to a `kaijutsu-server` and the project steers `--lib` runs away
-from that harness.
-
-P3 tier, recorded not urgent: subscribe-happens-in-spawned-task window
-(`rpc.rs:3522-3633` — subscribe synchronously or document ordering);
-stream-start retry backoff ignores a pending hard cancel (`llm_stream.rs:
-1300-1320`); no turnId/endedAt on onTurnCompleted (correlation by ordering
-only — matters for a stateless ACP frontend, revisit with the adapter);
-suffix-orphan residue on crash between create and join;
-`publish_with_sender` drops silently where `publish` warns (`flows.rs:
-664-680`); archived-context re-listing via joinContext heal is documented
-but surprising (heal re-registers without clearing `archived_at`).
 
 ## Coder stance tuning — proportionality + kaish primer (Amy, 2026-08-05, first toad day)
 
@@ -5581,14 +4810,6 @@ script uses is load-bearing, not style.
   scored clause as signals) and the ask a human answers are separate rows; the
   exit-3 stderr names the first so `kj ledger show` reaches the signals. The
   structured return path collapses them — see "The escalation seat" above.
-
-## Doc drift: `block exclude` in CLAUDE.md, awaiting Amy (found 2026-08-25)
-
-The `docs/` sweep for the wrong verb (`block exclude` → `kj stage exclude`,
-alias `ex`, stage.rs:47) shipped 2026-08-30. Two lines are Amy's file and
-still carry the old name, hers to change: `CLAUDE.md:367`/`:370` (the
-writing-style section's own worked example) and `CLAUDE.md:183`
-("Conversation vs Context").
 
 ## LFM2.5 encoder family — routing, boundary guards, embedding swap (seeded 2026-08-03, Amy: "tempted to go deep on this model family for a while")
 
@@ -6736,16 +5957,6 @@ honest fix — any parley user rendering CJK hits this), or take line breaking
 over ourselves with `icu_segmenter` directly (big: parley owns line breaking
 internally and exposes no segmenter hook, so this means displacing it).
 
-## Test leaks a pidfile into `/tmp` (2026-08-12, via kaish's /tmp audit)
-
-`background_exec.rs:1609` builds a pidfile at
-`std::env::temp_dir().join("bg-exec-test-childpid-{uuid}")` and never removes
-it — one leftover confirmed on zorak from 08-10. Not implicated in the 4.9G
-that audit was chasing (that was cc session storage); flagged so it is fixed
-at the source rather than misattributed later. The kernel test harness already
-has the right pattern — `Kernel::with_temp_cleanup(root)`, which drops a temp
-root when the dispatcher drops. Small.
-
 ## Drift UX — cross-session ergonomics (2026-08-12)
 
 Design record + full gap list: **`docs/drift-ux.md`**. Slice 1 (`push`
@@ -7017,13 +6228,6 @@ key-value store demolished 2026-07-04.*
   stale across tool iterations (`:403`), dual-layer timeout semantics
   (`:603-634`) are all inlined in one ~1,235-line file.
 
-## Cleanup — June 2026 audit
-
-- **App-side ABC parse failure renders `Tune::default()` silently**
-  (`kaijutsu-app/src/text/rich.rs:413-423`) — render the kernel's
-  structured ABC error spans instead. Also: the app re-parses ABC on every
-  view; consider a cached AST keyed on block content version.
-
 ## Persistence & Sync
 
 - **Backup shipped 2026-08-03; export/import round-trip still open.**
@@ -7039,9 +6243,6 @@ key-value store demolished 2026-07-04.*
   `kaijutsu-types/src/codec.rs`) — today they must live forever, because
   compaction is threshold-triggered and a quiet document may never be
   re-snapshotted.
-- **Config and rc are host files now (`docs/config-namespace.md`,
-  `docs/rc-on-disk.md`) — shipped and long since exercised live** (editing an
-  rc file is the daily surface). Remaining: the deferred scratch mount.
 - **rc cutover follow-ups (from slice 1):**
   - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_rc`
 
@@ -7052,11 +6253,6 @@ key-value store demolished 2026-07-04.*
     works there, so it's likely test-harness-specific — but worth a look (could flag
     a real reentrancy risk). Until fixed, the global rc test tree is still host-disk
     (`ensure_rc_seed_files` + LocalBackend), inconsistent with production.
-  - **Teach `FileDocumentCache` to pass through kernel-owned mounts.** `ConfigDocFs`
-    carries an in-memory advancing mtime purely so the cache (used by agent
-    `builtin.file:read /etc/rc/…`) reloads after a `kj rc` write. Cleaner: the cache
-    skips mirroring `real_path()==None` mounts entirely (read straight through),
-    dropping the mtime workaround. Touches all cache consumers — separate slice.
 - **Graceful-shutdown WAL checkpoint on SIGTERM:** `SharedKernelState::drop`
   checkpoints only on clean exit, but the server `run()` loop never returns and
   dies on SIGKILL/SIGTERM without unwinding, so systemd `stop` skips it.
@@ -7084,10 +6280,6 @@ key-value store demolished 2026-07-04.*
   them up.
 - **`kj config` help doc:** add `crates/kaijutsu-kernel/docs/help/kj-config.md`
   (parallel to the rc/cache help docs) once the surface settles.
-- **`blocks_ordered()` allocation churn + sort:** `block_store.rs:185-188` calls `order_key().to_string()` for *every block*, then `sort_by` on the strings — so it's O(N log N) **plus a String allocation per block per call**. It runs on per-frame hot paths (`kaijutsu-app/src/ui/card_stack/sync.rs:48`, `view/components.rs:163`), so the allocation churn is likely the bigger cost than the asymptotics. Fixes: compare `order_key` without stringifying, and/or cache the ordering and invalidate on block change. Add a secondary sorted index when scale demands.
-- **Latch state should persist with the context:** 
-  - `set -o latch` mode is per-shell and lost on restart.
-  - Latch nonces should eventually live in a SQLite table rather than in-memory.
 
 ## User Interface (kaijutsu-app) & UX
 
@@ -7340,16 +6532,6 @@ key-value store demolished 2026-07-04.*
   design pass; `project_shadow_context_shell` memory).
 - **User presence (novel surface):** The compose input is a shared draft block. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
-- **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.
-- **Card-stack texture quality (3D direction):** the renderer presents vello/MSDF
-  content as textures on cards, so the 3D move brings (a) **mipmaps** on block/card
-  textures — cards receding in perspective shimmer without them; (b) **reading-mode
-  hi-res re-render** — promoting a card close to the camera re-renders its content at
-  higher resolution (discrete, debounced — same machinery as re-render-on-change);
-  (c) **MSDF live-quad escape hatch** — MSDF's scale-independence is spent at bake
-  time, so if reading-mode text quality disappoints, render MSDF as live quads in the
-  3D scene (the atlas + shaping pipeline already support it; a renderer change, not
-  architectural). Arbitrary zoom over vector content is explicitly declined.
 - **Text rendering (MSDF / 次):** TAA temporal super-resolution, glyph spacing per-font tuning, 1-frame blank flash on texture resize, large-context Vello "paint too large" crash.
 - **MSDF whole-document settle window (residual, after the 2026-07-03 atlas
   fixes `a6734cbf`).** The silent failure modes are gone (atlas grows to 4096,
@@ -7359,14 +6541,6 @@ key-value store demolished 2026-07-04.*
   re-composites. If it still reads as jank, the polish is presentation-side:
   hold a block's texture (or fade it in) until its first *complete* composite
   — every glyph region present — instead of showing partial bakes.
-- **Live-verify the error-block ordering fix (view-order holes, fixed
-  2026-07-03, `a47c9a18`).** The three diagnosed mechanisms are fixed with
-  unit + headless-App tests (see devlog), but the original "errors pinned at
-  the bottom" symptom (2026-06-17, session `019ed674`) was never reproduced
-  live before the fix landed. Next time an agentic session produces mid-turn
-  error blocks, watch for the new fail-loud `error!` logs from
-  `reorder_conversation_children` — if they fire, the upstream
-  container-entry gap they point at is the remaining bug to chase.
 - **Verify the interrupt ladder actually cancels an in-flight drive**
   (originally observed 2026-06-17 as "triple-Esc doesn't interrupt";
   reframed 2026-07-16 by the input rework: Esc is vi's/PopLevel now,
@@ -7540,22 +6714,6 @@ key-value store demolished 2026-07-04.*
   ride in the MCP binary and are covered by `e2e_shell` until a session whose MCP
   binary is rebuilt confirms them in situ. Related: P3 above +
   `project_mcp_synceddocument_sync`.
-- **Live-kernel follow-up: any long-lived kernel may still be serving a stale
-  mcp-default model id (verified 2026-07-17).** Re-checked the "mcp-context
-  default model is an invalid id" bug filed 2026-06-17: the bad ids
-  (`…-20250101`, `…-20250929`) don't exist anywhere in tracked source or
-  history except this doc's own bug report — `models.toml`'s
-  `default_model`/aliases and `DEFAULT_MODEL` have always read the valid
-  `claude-haiku-4-5-20251001` since the TOML config was introduced. But
-  `/etc/config/models.toml` is kernel-owned and seeded absent-only
-  (`config_seed.rs`, `config_doc_fs.rs:349-378`) — a kernel whose
-  config predates whatever earlier fix corrected this would still be
-  serving the stale value, since a context's model is baked in at creation
-  time from the live registry (`rpc.rs` `create_context_inner`) and restarts
-  never re-seed an already-present file. **2026-08-03: this whole failure
-  class is structurally dead** — models.toml no longer exists; defaults live
-  in the `llm_defaults` table. If a stale default ever recurs, the remedy is
-  `kj backend default show` / `set` (or `kj backend reseed`), all live-reload.
 - **`builtin.file` hardening — remaining (small; the byte→char corruption fix +
   hashline addressing shipped 2026-06-17, story in devlog +
   `project_file_tools_hashline`):** the in-context recovery affordance
@@ -7628,9 +6786,6 @@ key-value store demolished 2026-07-04.*
   errs → kernel degrades to no-index, and recovery is a manual file delete.
   Arguably should treat unopenable-like-mismatched: wipe + start fresh (it's
   a derived cache). Low likelihood (WAL), low cost to leave.
-- **ort 2.0 stable watch** (2026-07-12): pinned `2.0.0-rc.12` (latest; no
-  stable 2.0 published). Re-check occasionally; rc-series has broken API
-  before. ort arena never shrinks — chunked embed_batch keeps its peak ~1GB.
 - **ABC multi-tune files vs blocks:** Split tunes across sibling blocks or stack inside one block.
 - **ABC file-header inheritance:** `M:`/`L:`/`Q:` defaults prevent proper inheritance.
 - **ABC features:** `I:linebreak`, `m:` macro expansion, `%%` directives, Unicode escapes/fonts.
@@ -7846,11 +7001,6 @@ key-value store demolished 2026-07-04.*
   the `now + period` re-arm random walk — grid is scheduled-periodic now — and
   the capture-`now`-close-to-the-send gap in `publish_render_cues`. This is the
   still-open remainder):
-    2. **Bevy has no audio-scheduling primitive** — the real PCM build risk.
-       `AudioPlayer` plays on spawn (`audio.rs` ignores nonzero `cue.lead`);
-       honoring `lead` for samples is net-new substrate (delayed-spawn at ~16ms
-       frame granularity, or pierce to the `rodio` Sink — `docs/pcm.md` R5,
-       open decision 3). MIDI delegates sub-ms timing to the ALSA seq queue.
     4. **Multi-sink flam + whole-queue flush** (`midi.rs` flushes the *whole*
        ALSA queue regardless of track) — future; per-track flush + shared-clock
        scheduling are the eventual answer.
@@ -7964,11 +7114,6 @@ key-value store demolished 2026-07-04.*
   `BeatCommand::SetMeter`. Home is `kj/transport.rs`, and it gets the first
   bars→beats translation test (the kernel only ever sees beats; bars live in the
   human-facing arg). Pairs with the cadence-knob item above.
-- **`ooda_every` stays beat-denominated (Chameleon batch 1, F2):** the OODA
-  cadence field is kept in beats even though its default is *expressed* in
-  phrases (`8 * 16`); a phrase-typed `ooda_every` is deliberately deferred —
-  revisit once irregular phrases (per-phrase beat counts) make the beat
-  denomination awkward.
 - **Transport surface beyond `kj`:** app transport buttons / spacebar + a capnp
   transport surface (today
   `kj transport attach|detach|play|pause|stop|tempo|ooda|rotate|render` only —
@@ -8072,15 +7217,6 @@ key-value store demolished 2026-07-04.*
   long-running iterating player (the `window`/`spawn` factory presets per
   `docs/fork-filters.md`). Copy cost is a non-issue (storage cheap); the axis is
   KV-cache strategy. Remaining open primitives:
-  - **Retire the `max_blocks` fork field (slice 4):** `fork_filtered` now builds
-    its positional universe in document (`order_key`) order, so `max_blocks`
-    indexes the timeline correctly in the interim (test
-    `fork_filtered_max_blocks_keeps_most_recent_by_timeline`), but the field is
-    only deprecated, not removed. Fold `--depth N` into the selection engine as
-    `--include end-N:` over the `block_ids_ordered()` snapshot and delete the
-    field. (BlockId order is `(context, principal, seq)` — principal-major; it
-    only coincides with timeline order for a single principal, so a multi-principal
-    `max_blocks` over raw BTreeMap iteration was the original bug.)
   - **A snapshot/savepoint marker verb (speculative, not-now — direction set
     2026-06-12).** Absorbed by the fork-filters range grammar as a future
     **label endpoint** (`docs/fork-filters.md`): a savepoint is a colon-free
@@ -8100,20 +7236,6 @@ key-value store demolished 2026-07-04.*
     sharing) deserves its own design session.
 
   **Remaining follow-ups (deferred — from the same review):**
-  - **P1 ×2 — absorbed into the shared SEAM MODULE (re-prioritized
-    2026-06-12: FIRST in the fork-filters build order).** The tool-pair /
-    turn-boundary tail snap (orphan `tool_result` silently dropped by the
-    snapshot repair; a marker on a `tool_call` injects a synthetic
-    "interrupted" result every turn forever) and the missing archive seam
-    (prefix+tail concatenate with no "[N blocks archived]" signal; cross-gap
-    `Model/Text` fragments can merge into false continuity) were "latent
-    until musician gets tools" as hydration bugs — but fork-filters' hand-cut
-    ranges make both reachable immediately. One first-class module owns every
-    keep-set cut edge: turn-boundary snapping (never start an interval on
-    `ToolResult`/`Model`-continuation), synthetic user-role seam injection
-    (after the prefix, cache-stable), tool-pair integrity. Consumers:
-    `rehydrate_windowed`, fork selection, the pull primitive. Contract in
-    `docs/fork-filters.md`.
   - **`window` counts RAW blocks, not turns/phrases** (~2-3 blocks per OODA turn,
     and musician score/Trace blocks are hydration-silent so the *visible* tail is
     smaller still) — revisit if a phrase/turn-denominated window reads cleaner.
@@ -8339,31 +7461,6 @@ dropped-stdout bug and the content/exit_code completion race are fixed (poll now
 does an authoritative `get_context_sync` read after terminal status); these are
 the *remaining* findings, triaged.
 
-- **Sole-writer command channel SHIPPED 2026-07-17** (`doc_task.rs`; the old
-  HIGH hook-authoring-vs-resync entry is RESOLVED — sole writer, dedicated
-  pushed frontier, flush→apply window closed by construction, resyncs
-  coalesce, flush-failure aborts the swap).
-  **SUPERSEDED 2026-08-13** (`docs/crdt-position-2026-08.md`): the hook path
-  authors over
-  `authorBlock`/`completeBlock`, so the mirror has no local writer and the
-  pushed frontier, the flush, and the flush-failure abort are all *deleted*
-  rather than fixed. The guarantees above still hold; they are now structural.
-  Keep the entry for the reasoning, not the mechanism. Remaining follow-ups
-  from its kaibo review:
-  - ~~**Hook-ack latency under a long fetch (watch item)**~~ — **moot.**
-    Authoring no longer queues behind a resync fetch at all. The latency
-    concern did not disappear, it *moved*: the hook now waits on three
-    sequential RPCs instead of a local ack, bounded by `tiers::HOOK_PATH`
-    under Claude Code's 5 s deadline (`af45445e`). Same 5 s ceiling, a
-    different thing pressing against it.
-  - **`ContextResynced` events ride `ApplyEvent` and are ignored**; the
-    bridge could convert them into a direct apply_sync_state and save one
-    fetch on reconnect. Optimization, unclaimed.
-  - **`pending_events` on FullSync are CLEARED, not replayed** (decided:
-    replay is unsafe — header setters stamp fresh local ticks, so a stale
-    replay would overwrite newer data; comment on `apply_sync_state`).
-  - **resubscribe-acks-before-subscription-active** leaves a narrow
-    incremental-event gap; the stall resync covers it for shell state.
 - **LOW — `renameContext` RPC has no structured result channel.** The 2026-07-17
   server-side handler (`kaijutsu-server/src/rpc.rs`) returns errors via
   `Promise::err` because `renameContext @29` declares no results — a caller can't
@@ -8405,25 +7502,6 @@ the *remaining* findings, triaged.
   generalizes).
 
 ## Testing & Tooling
-
-- **Clippy has no floor, and a warning backlog behind it (2026-08-14).** The
-  repo has no `[lints]` table, no `clippy.toml`, and no CI, so clippy is red
-  only when someone runs it by hand with `-D warnings` — which is how the
-  reconnect lane tripped over a `reversed_empty_ranges` error in a test whose
-  reversed range was the assertion (fixed with a commented `#[allow]`,
-  `b103f8b1`). Underneath it, `cargo clippy -p kaijutsu-app --all-targets`
-  reports **51 warnings (31 duplicates)**, ~20 real: `field_reassign_with_default`
-  in `view/time_well/scene.rs` tests, items-after-test-module, and 4 with
-  machine-applicable fixes. **Amy 2026-08-14: a subagent cleans this up on the
-  morning of 08-15.** Two things for whoever briefs it. (1) Do it *after* the
-  in-flight lanes merge — a `--fix` sweep across three branches is how you get
-  a bad merge, and the warnings are not going anywhere. (2) **A cleanup without
-  a floor rots**: 20 warnings come back the same way they arrived. Land a
-  workspace `[lints.clippy]` floor with the sweep, or the next lane re-files
-  this entry. Which lints belong in that floor is still Amy's call — the
-  cleanup is decided, the standard is not. Note `rustfmt` is disabled repo-wide
-  on purpose (README "Code Style"); clippy is a separate question and the
-  rustfmt rationale does not carry over.
 
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
 - **`vfs::backends::local::tests::test_normal_paths_succeed` is flaky under
@@ -8467,8 +7545,6 @@ existing entry are marked *(confirms above)*.
   (`kaijutsu-crdt/src/block_store.rs:390`); the bench exposing it is `#[ignore]`d.
 - Tombstones aren't a first-class `BlockSnapshot` field — they ride a side
   `deleted_blocks` list re-applied by hand (`block_store.rs:1637`).
-- `StoreSnapshot` has a breaking-format note with no migration path ("delete
-  existing databases when upgrading", `block_store.rs:1680`).
 
 **`kj` single-source guarantee is manual** — `dispatch()` routing and
 `kj_command()` schema tree must be hand-kept in sync; a subcommand added to one
@@ -8477,12 +7553,6 @@ but not the other is unreflectable (`kaijutsu-kernel/src/kj/mod.rs:589`).
 **Types-crate layering** — `ThemeData` (~60 visual fields + `include_str!` of
 `assets/defaults/theme.toml`) lives in the foundational `kaijutsu-types`
 (`theme.rs:59`). Belongs in a UI/config crate.
-
-**`kaijutsu-index`:**
-- Metadata lock held across ONNX `embed()` (`lib.rs:160`) serializes all
-  `index_context` calls.
-- `ort` uses `download-binaries` — fetches ONNX Runtime at build time, breaks
-  air-gapped builds.
 
 **`kaijutsu-cas`** — no refcounting/GC (`remove` is unconditional,
 `store.rs:330`); object+metadata write isn't atomic (crash between leaves a
@@ -8508,9 +7578,6 @@ leaked runtime outliving the guard.
 **`kaijutsu-abc`** — `to_abc()` round-trip silently drops
 `InlineField`/`Decoration`/`VoiceSwitch` (`lib.rs:406`); tuplet writer omits the
 optional `:r` count (`lib.rs:366`).
-
-**Server `unwrap()`** — `create_shared_kernel` panics on workspace-insert failure
-(`rpc.rs:1092`) instead of `?`-propagating like its neighbors.
 
 **Cap'n Proto evolution is comment-only** — no `@version`; removed-method ordinals
 are renumbered/reused with a "safe because all clients updated" comment
