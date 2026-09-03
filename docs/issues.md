@@ -225,6 +225,22 @@ drives `insert_before` with DECSTBM + SD/SU) and `set_viewport_height`
 re-anchoring at the cursor row on every picker toggle. A probe that fails
 under a second emulator (`termwiz` is in the lock) would settle which.
 
+From Amy's first evening on it (2026-09-02), in her order:
+
+- **No way to stop a turn.** A single `Ctrl+C` only arms the quit and
+  `Ctrl+C Ctrl+C` quits. The wire has `interruptContext(immediate)` and the
+  app's ladder is soft → hard → hard+clear (`app/src/input/interrupt.rs`).
+  Ruling needed: which chord interrupts in the tui, and where quit moves if
+  `Ctrl+C Ctrl+C` becomes the hard interrupt.
+- **Show the reconnect when it is what blocks the client.** Amy: *"we should
+  get some UX in for displaying the ssh reconnect when it's what's blocking
+  the client, but not a rush."* The status line has `app.connection`; a
+  keystroke that stalls on a reconnecting actor should say so instead of
+  looking hung.
+- **`Ctrl+A a` locked the client.** The chord is unbound and only posts a
+  notice; nothing on that path awaits. A harness probe that presses it and
+  then types is the next step.
+
 Two client facts every TUI-shaped consumer needs: `ContextInfo.label` and
 `.model` are routinely empty on real rows (fall back to `ContextId::short()`
 and the cast), and `ActorHandle::subscribe_events` warns per dropped event
