@@ -164,53 +164,62 @@ Rules the figure carries:
 - Unfocused, compose answers only `i`/`a`/`o`; every other key is left for
   another surface to claim, and the banner says `i to type`.
 
-### The `:` line and the `Ctrl+C` ladder (writeup, 2026-09-02; unbuilt)
+### The `:` line and the `Ctrl+C` ladder
 
 Amy, after an evening on the first cut: *"let's think through MVP for :,
-reclaim ctrl-c for interrupts."* This is the writeup; nothing here is built.
+reclaim ctrl-c for interrupts."* Ruled the same evening: *"all three rulings
+yes"* (`/` retires from compose, `:!` shares the shell history, `:q` is the
+only quit); *":q should warn if there's still active turns, :q! exits and
+leaves them going in the kernel"*; *"Ctrl-Z can probably go away in favor of
+the :!"*; and on the turn-liveness signal, *"fine to do simple :q if we
+don't have a clear signal."* Built the same lane.
 
 **What exists.** Compose runs `kaijutsu_editor::EditorCore`, and the core
 already has the command bar: `:` in normal mode focuses it, `command_line()`
 returns the text to draw (`":wq"`), Enter parses into `CommandRequest`s that
 `take_commands()` hands back, and an unknown command comes back as `Err`
 (vim's "Not an editor command"). The core's own dialect is the editor's:
-`:w :q :wq :x` with `!`, `:s`, `:r`. Compose draws none of this and drains
-none of it, so today `:` in normal mode focuses a bar nobody can see and
-every key after it goes there. Verify with a harness probe before anything
-else; it is a plausible shape for the "locked up" report.
-
-Slash completion (`completion.rs`) completes a leading `/` over the `kj`
-catalog, but submit always sends the draft as chat
-(`bridge.submit_input` passes `shell = false`), so `/kj fork` is a message,
-never a command. `/` is completion with no executor.
-
-**MVP.**
+`:w :q :wq :x` with `!`, `:s`, `:r` — that dialect answers the
+alternate-screen editor's own `:` bar; this parse is a different one, over
+compose's bar.
 
 ```text
-  :kj fork --name alt              run kj, blocks land like the shell's
+  :kj fork --name alt              run kj, blocks land like a player's own
   :!git status                     one kaish statement, the gated human path
-  :q                               quit the client
+  :q                               quit, unless a turn is known running
   ❯ :kj con█                       the bar draws on the compose row
 ```
 
 - `:` in compose normal mode draws the bar on the compose row from
-  `command_line()`; `Esc` aborts, `Enter` submits. No new state: the core
-  owns the bar, the tui draws it and drains it.
-- The tui parses the submitted line itself, before the core's dialect sees
-  it, because the core's verbs are the editor's. Three verbs:
+  `command_line()`; `Esc` aborts, `Enter` submits, discarding what was
+  typed. The seam: `Compose::press` peeks `command_line()` **before**
+  feeding the key to the core's own `apply_key_event` on `Enter` — the raw
+  line as typed, ahead of the core's own ex-command dialect parsing it. The
+  core still runs its own parse on the same keystroke (closing the bar the
+  way it always did); its `Ok`/`Err` is drained via `take_commands()` and
+  never surfaced — the core's `Err("Not an editor command")` for a line like
+  `:kj fork` is not this parse's failure.
+- Three verbs, whitespace-split (no shell-style quoting — MVP):
   `:kj <argv>` runs through `execute_kj` (a player's command, so it authors
-  its block pair); `:!<statement>` runs through `shell_execute`, the same
-  gated path as the shell surface, and joins that surface's history;
-  `:q` quits. Anything else is a status-line notice naming the line, and
-  the draft is untouched.
-- Completion moves from `/` to `:kj `, over the same catalog, driven by the
-  same `Tab`. `/` retires from compose: a draft is always chat, and there
-  is one command syntax.
-- The alternate-screen editor keeps its own `:` dialect; the kernel session
-  answers those and this parse never sees them.
+  its block pair); `:!<statement>` runs through `shell_execute`, the gated
+  path a key press already took on the old shell surface, and joins its
+  history; `:q` quits unless this client knows of a turn still running,
+  which warns instead (`:q!` quits regardless — the turn keeps running in
+  the kernel). Anything else is a status-line notice naming the line
+  verbatim, and the draft is untouched.
+- The bar keeps a local history (`compose.rs`'s `ColonHistory` — the core
+  surfaces no history hook of its own, so this is hand-rolled the way
+  `shell.rs`'s used to be), walked by `Up`/`Down`. `:kj` and `:!` lines
+  share it, and it survives a chat submit and a context switch — a session
+  fact, not a per-draft one.
+- Completion moved from `/` to `:kj `, over the same catalog, driven by the
+  same `Tab`. `/` retired from compose: a draft is always chat, and there is
+  one command syntax.
 
-**`Ctrl+C` reclaimed.** The app's ladder (`app/src/input/interrupt.rs`, one
-`TapCounter` with a 500 ms window) ports as is, and quit leaves the key:
+**`Ctrl+C` reclaimed.** `interrupt::Ladder` ports the app's escalation
+(`kaijutsu-app/src/input/interrupt.rs`'s `TapCounter`), reimplemented rather
+than pulled in as a dependency — the terminal client does not otherwise carry
+the app's Bevy stack. One ladder per client, 500 ms window:
 
 | presses within 500 ms | call | notice |
 |---|---|---|
@@ -218,52 +227,44 @@ never a command. `/` is completion with no executor.
 | 2 | `interrupt_context(ctx, immediate = true)` | `aborted` |
 | 3 | the above, then `edit_input` clears the draft | `aborted, draft cleared` |
 
-With nothing running the first press says `nothing to interrupt — :q quits`.
-While the shell surface is up the same ladder applies to the context; a
-per-exec `interrupt(exec_id)` needs the exec id the shell path does not keep
-yet, so it is not in the MVP. Quit is `:q` only. `Ctrl+A q` stays
-close-and-demote (`docs/input.md`, "The prefix table"), so it is not a quit.
+With no turn known running in the context on screen, the first press posts
+`nothing to interrupt — :q quits` and calls nothing. `Ctrl+C Ctrl+C` no
+longer quits — `:q` is the only quit. `Ctrl+A q` stays close-and-demote
+(`docs/input.md`, "The prefix table"), so it is not a quit either.
 
-**Probes** (`tests/terminal_fit.rs`): `:` shows the bar and `Esc` returns
-typing to compose; `:q` exits 0; `:kj context list` lands a block pair;
-`:!echo hi` lands a block; one `Ctrl+C` does not quit and posts its notice;
-two do not quit either.
+**Turn liveness is a partial signal.** `App::turns_running` is set when this
+client submits (`compose_key`'s own submit) or when
+`ServerEvent::TurnStarted` names a context, and cleared on
+`TurnCompleted`/`TurnFailed` for that context — the same two events
+`collapse_thinking_on_turn_end` already matches. An interactive submit from
+*another* client or peer announces no start this client can see unless it is
+already watching that context, so `nothing to interrupt` and a clean `:q`
+can both be wrong about a turn someone else started. That gap is what Amy's
+"fine to do simple `:q`" ruling accepted rather than building a
+cross-client turn ledger for it.
 
-**Rulings wanted from Amy** before the lane: that `/` retires; that `:!`
-shares the shell surface's history; that `:q` is the only quit.
+**The `Ctrl+Z` shell surface retired in favor of `:!`.** `shell.rs`,
+`Intent::ShellToggle`, `CtrlZ::Toggled` and `app.shell` are gone — deleted,
+not deprecated (`CLAUDE.md`, "Kaijutsu is the learning space"). `:kj` and
+`:!` both always act on the context on screen, the same context the old
+shell surface always acted on too, so there is no separate "acting context"
+cursor left to show — the bar draws no context label at all. `Ctrl+Z` is a
+single-press suspend now, not a toggle: leave raw mode, raise `SIGTSTP` on
+ourselves; on `SIGCONT` re-enter raw mode and redraw the viewport. Nothing
+else needs restoring — the inline viewport leaves the transcript in
+scrollback and the host shell's prompt appears under it; `fg` brings the
+instrument back. Over `ssh -t zorak kaijutsu-tui` that puts zorak's login
+shell one keystroke and one `fg` away.
 
-### Shell (`Ctrl+Z`)
-
-The shell surface runs kaish through `shell_execute` — the gated path a human's
-shell already takes (`docs/gate-and-shell-split.md`). Its prompt renders both
-cursors:
-
-```text
-  kaijutsu ▸ /v/ctx/7f/kaish-arith $ kj stage exclude 019c…#12 && kj fork
-```
-
-`kaijutsu` is the acting context; the path is cwd. They move independently —
-see "Melted from the ssh shell design". Both are resolved live: cwd is read
-from `get_context_cwd` when the surface comes up and after every line, so a
-`cd` moves that cursor and nothing else. A context the kernel has no cwd
-recorded for renders the label and `$` alone rather than a guessed path.
-
-A line runs through `shell_execute` with `user_initiated`, and its output
-arrives as blocks on the context feed — the transcript prints it like any
-other block, so the surface itself echoes nothing. `Up`/`Down` walk the
-commands run this process, oldest entry ending the walk and past-the-newest
-restoring the line that was being typed; `Ctrl+U` kills the line.
-
-**`Ctrl+Z` once toggles the shell surface; `Ctrl+Z Ctrl+Z` suspends the
-process.** The second press inside the 500 ms double-tap window (the app's
-`Esc Esc` / `Ctrl+A Ctrl+A` pattern, `docs/input.md`) undoes the toggle and
-suspends for real: leave raw mode, raise `SIGTSTP` on ourselves; on `SIGCONT`
-re-enter raw mode and redraw the viewport. Nothing else needs restoring —
-the inline viewport leaves the transcript in scrollback and the host shell's
-prompt appears under it; `fg` brings the instrument back. Over
-`ssh -t zorak kaijutsu-tui` that puts zorak's login shell two keystrokes away
-and one `fg` back. (Amy, 2026-08-30: *"could the tui catch ctrl-z and drop to
-a kaish repl? ctrl-z twice to background it?"*)
+**Probes** (`tests/terminal_fit.rs`): `:` draws the bar visibly while
+typing, and `Esc` discards it without reaching the draft (the receipt for
+the pre-lane "a bar nobody can see and every key after it goes there" bug);
+`:q` and `:q!` exit 0; `:kj context list` and `:!echo hi` land real blocks;
+a partial `:` line never repeats into scrollback; one `Ctrl+C` posts
+`nothing to interrupt` and does not quit, two within the window still do
+not quit; `Ctrl+Z` suspends and `SIGCONT` leaves a responsive client (the
+stopped state itself is not observable in every sandbox — the probe's own
+doc comment says why).
 
 ### The picker (`Ctrl+A "`)
 
@@ -488,9 +489,11 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
 `Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a`, `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`,
 `h`, and the armed-prefix legend line. The legend replaces the status line
-while a prefix is pending; there is no separate `?` overlay. `Ctrl+C` is
-the interrupt ladder and `:q` quits once "The `:` line" above is built;
-until then `Ctrl+C Ctrl+C` quits. Amy, on the
+while a prefix is pending; there is no separate `?` overlay. `Ctrl+C` is the
+interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
+`Ctrl+Z` is a single-press suspend (`raise SIGTSTP`; `fg` or `SIGCONT`
+brings it back), not a toggle. `:q` (warns first if a turn is known
+running) and `:q!` (quits regardless) are the only quits. Amy, on the
 mockup: *"the legend in the status line is awesome, that'll help me a lot, I
 tend to forget keys outside the core stuff I use."* Every grown view (picker,
 ledger) ends with its own key line for the same reason.

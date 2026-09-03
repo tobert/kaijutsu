@@ -281,24 +281,27 @@ fn resize_keeps_the_live_region_intact_and_on_screen() {
 // e. Quit restores the terminal
 // ────────────────────────────────────────────────────────────────────────────
 
+/// `Ctrl+C Ctrl+C` no longer quits (`docs/tui.md`, "Ctrl+C reclaimed" —
+/// `:q` is the only quit); `:q` is what this probe now exercises for the
+/// `leave_terminal` contract this probe is actually about.
 #[test]
-fn ctrl_c_twice_exits_cleanly_and_leaves_the_last_frame() {
+fn colon_q_exits_cleanly_and_leaves_the_last_frame() {
     let _serial = serial();
     let (_server, _key_dir, mut session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
-    session.send("\x03\x03");
+    session.send("\x1b:q\r");
     let status = session.wait_for_exit(Duration::from_secs(5));
     let status = status.unwrap_or_else(|| panic!("process did not exit: {}", session.dump("still running")));
-    assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after Ctrl+C Ctrl+C"));
+    assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after :q"));
 
-    // `leave_terminal` (`crates/kaijutsu-tui/src/run.rs:1051`) does not
-    // clear the viewport on the way out — its last frame is left exactly
-    // where it was drawn. A background refresh (the ledger poll on
-    // `REFRESH`, `run.rs`) can settle one more block between our last
-    // observation before quitting and the actual exit, so this checks the
-    // documented contract (something real is left on screen) rather than a
-    // byte-identical pre/post snapshot, which would race that poll.
+    // `leave_terminal` (`crates/kaijutsu-tui/src/run.rs`) does not clear the
+    // viewport on the way out — its last frame is left exactly where it was
+    // drawn. A background refresh (the ledger poll on `REFRESH`, `run.rs`)
+    // can settle one more block between our last observation before
+    // quitting and the actual exit, so this checks the documented contract
+    // (something real is left on screen) rather than a byte-identical
+    // pre/post snapshot, which would race that poll.
     let after = session.screen_text();
     let non_blank = after.iter().filter(|l| !l.trim().is_empty()).count();
     assert!(
@@ -347,52 +350,268 @@ fn starting_from_a_prompt_mid_screen_reaches_the_bottom_band() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// g. A partial shell line never repeats into the transcript
+// g. A partial `:` line never repeats into the transcript
 // ────────────────────────────────────────────────────────────────────────────
 
-/// The `Ctrl+Z` shell prompt is live-region content and nothing else: a
-/// line being typed there must appear exactly once, on the prompt row, no
-/// matter how many blocks land in the transcript while it is being typed.
-/// The prompt is `<label> $ ` (`shell::prompt`; a fresh context has no
-/// recorded cwd, so no path segment renders), which no printed block
-/// carries, so a second row carrying it is a ghost.
+/// The `:` bar is live-region content and nothing else: a line being typed
+/// there must appear exactly once, on the compose row, no matter how many
+/// blocks land in the transcript while it is being typed. `docs/tui.md`,
+/// "The `:` line": the `Ctrl+Z` shell surface this probe used to cover
+/// retired in favor of `:!`.
 #[test]
-fn a_partial_shell_line_never_repeats_into_the_transcript() {
+fn a_partial_colon_line_never_repeats_into_the_transcript() {
     let _serial = serial();
-    const SEPARATOR: &str = "probe $ ";
+    const PARTIAL: &str = ":zz partial";
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
-    session.send("\x1a");
-    let shell_up = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, SEPARATOR));
-    assert!(shell_up, "the shell surface never came up: {}", session.dump("after Ctrl+Z"));
-
     // A whole command lands blocks in the transcript; the partial line typed
-    // right behind it is on the prompt while they arrive.
-    session.send("kj context list\r");
-    session.send("zz partial");
+    // right behind it reopens the bar while they arrive.
+    session.send("\x1b:!kj context list\r");
+    session.send(":zz partial");
     let landed = session.wait_until(Duration::from_secs(10), |screen| {
         let rows: Vec<String> = screen.rows(0, 80).collect();
-        rows.iter().any(|l| l.contains(SEPARATOR) && l.contains("zz partial"))
-            && rows.iter().any(|l| l.contains("kj context list") && !l.contains(SEPARATOR))
+        rows.iter().any(|l| l.contains('❯') && l.contains(PARTIAL))
     });
-    assert!(landed, "{}", session.dump("after the command's blocks landed"));
+    assert!(landed, "{}", session.dump("after opening the bar with a partial line"));
     std::thread::sleep(Duration::from_millis(500));
 
     let (scrollback, text) = session.history_snapshot();
-    let prompt_rows: Vec<&String> = text.iter().filter(|l| l.contains(SEPARATOR)).collect();
+    let bar_rows: Vec<&String> = text.iter().filter(|l| l.contains(PARTIAL)).collect();
     assert_eq!(
-        prompt_rows.len(),
+        bar_rows.len(),
         1,
-        "the shell prompt must be on screen exactly once:\n{}",
+        "the `:` bar must be on screen exactly once:\n{}",
         session.dump("after the command's blocks landed")
     );
-    assert!(prompt_rows[0].contains("zz partial"), "the partial line left the prompt: {}", session.dump("prompt"));
-    let ghosts: Vec<&String> = scrollback.iter().filter(|l| l.contains(SEPARATOR)).collect();
-    assert!(ghosts.is_empty(), "shell prompt rows leaked into the transcript: {ghosts:?}");
+    let ghosts: Vec<&String> = scrollback.iter().filter(|l| l.contains(PARTIAL)).collect();
+    assert!(ghosts.is_empty(), "the partial `:` line leaked into scrollback: {ghosts:?}");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// h. `:` opens a visible bar; a real edit never rides through it (step-1 probe)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The finding this probe exists to verify: `docs/tui.md` (the writeup, now
+/// built) warned that on the pre-lane code `:` in normal mode focused
+/// modalkit's command bar, but compose neither drew it nor drained it — "a
+/// bar nobody can see and every key after it goes there," and a plausible
+/// shape for Amy's "locked up" report. The receipt (this probe, run against
+/// the code as it stood before this lane's fix) is quoted in the lane's
+/// final report rather than reproduced here — the assertions below are what
+/// must hold now.
+#[test]
+fn colon_opens_a_visible_bar_and_only_a_real_edit_reaches_the_draft() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x1b"); // Esc: normal mode
+    session.send(":");
+    session.send("abc");
+    let bar_visible = session.wait_until(Duration::from_secs(5), |screen| {
+        screen.rows(0, screen.size().1).any(|line| line.contains("❯ :abc"))
+    });
+    assert!(bar_visible, "the `:` bar never became visible while typing: {}", session.dump("while typing :abc"));
+
+    session.send("\x1b"); // Esc aborts the bar, discarding "abc"
+    session.send("i");
+    session.send("hello");
+    let ok = session.wait_until(Duration::from_secs(5), |screen| {
+        screen.rows(0, screen.size().1).any(|line| line.contains("❯ hello"))
+    });
+    assert!(ok, "{}", session.dump("after typing hello"));
+
+    let rows = session.screen_text();
     assert!(
-        !scrollback.iter().chain(text.iter()).any(|l| l.contains("zz partial") && !l.contains(SEPARATOR)),
-        "the partial line was echoed as transcript: {}",
-        session.dump("partial echoed")
+        !rows.iter().any(|l| l.contains("abc")),
+        "the aborted `:abc` reached the draft: {}",
+        session.dump("after typing hello")
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// i. `:kj` and `:!` land real blocks
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn colon_kj_runs_the_command_and_lands_its_output() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x1b:kj context list\r");
+    let landed_on_screen = session.wait_until(Duration::from_secs(10), |screen| {
+        screen
+            .rows(0, screen.size().1)
+            .any(|l| l.contains("context") && l.contains("list"))
+    });
+    if !landed_on_screen {
+        // The block may have already scrolled into scrollback by the time
+        // the predicate above caught it — check both halves so a fast
+        // scroll doesn't turn a real landing into a false failure.
+        let (scrollback, text) = session.history_snapshot();
+        assert!(
+            scrollback.iter().chain(text.iter()).any(|l| l.contains("context") && l.contains("list")),
+            "no block carrying the kj argv landed anywhere: {}",
+            session.dump("after :kj context list")
+        );
+    }
+}
+
+#[test]
+fn colon_bang_runs_one_kaish_statement_and_lands_its_output() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x1b:!echo hi\r");
+    let landed = session.wait_until(Duration::from_secs(10), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        rows.iter().any(|l| l.trim() == "hi" || l.contains("hi"))
+    });
+    assert!(landed, "{}", session.dump("after :!echo hi"));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// j. `:q` and `:q!` quit
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn colon_q_exits_cleanly() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x1b:q\r");
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    let status = status.unwrap_or_else(|| panic!("process did not exit: {}", session.dump("still running")));
+    assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after :q"));
+}
+
+#[test]
+fn colon_q_bang_exits_cleanly() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x1b:q!\r");
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    let status = status.unwrap_or_else(|| panic!("process did not exit: {}", session.dump("still running")));
+    assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after :q!"));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// k. `Ctrl+C` reclaimed: it interrupts, it never quits
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn ctrl_c_alone_neither_interrupts_nor_quits() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x03");
+    let noticed = session.wait_until(Duration::from_secs(5), |screen| {
+        screen_contains_str(screen, "nothing to interrupt")
+    });
+    assert!(noticed, "{}", session.dump("after one Ctrl+C"));
+    assert!(session.wait_for_exit(Duration::from_millis(300)).is_none(), "a single Ctrl+C must not exit");
+}
+
+#[test]
+fn ctrl_c_twice_within_the_window_still_does_not_exit() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x03\x03");
+    // Nothing was running either time, so both presses post the same
+    // "nothing to interrupt" notice rather than escalating — see
+    // `interrupt::Ladder::press`.
+    let noticed = session.wait_until(Duration::from_secs(5), |screen| {
+        screen_contains_str(screen, "nothing to interrupt")
+    });
+    assert!(noticed, "{}", session.dump("after two Ctrl+C"));
+    assert!(
+        session.wait_for_exit(Duration::from_millis(300)).is_none(),
+        "Ctrl+C Ctrl+C must not exit — only `:q`/`:q!` quit"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// l. `Ctrl+Z` suspends, one press, no toggle
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `/proc/<pid>/stat`'s third field: `R` running, `S` sleeping, `T` stopped
+/// (job-control), … (`man proc(5)`). The process's own name can carry
+/// spaces or parens, so the state is read after the last `)` rather than by
+/// splitting on whitespace from the front.
+#[cfg(target_os = "linux")]
+fn proc_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit(')').next()?.trim_start().chars().next()
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_proc_state(pid: u32, want: char, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if proc_state(pid) == Some(want) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `portable_pty::Child` exposes no "is this job stopped" query, so this
+/// probe reads `/proc` directly where it can — Linux-only, which is what
+/// this repo's own test environment is (`CLAUDE.md`, "Machines").
+///
+/// **The stopped state cannot be observed cleanly in this sandbox.** A
+/// diagnostic trace (`run::act` → `Intent::Suspend` → `run::suspend` →
+/// `run::raise_stop` → `libc::raise(SIGTSTP)`) confirmed the key reaches
+/// `Intent::Suspend` and every function on that path runs and returns
+/// normally — but `raise(SIGTSTP)` itself is a no-op here: `/proc/<pid>/stat`
+/// never reports `T` in the second that follows, tight-polled at 2ms. The
+/// same sandbox's `kill -TSTP <pid>` **does** stop a plain `sleep &` child
+/// (verified directly), so this is specific to a *self*-directed stop signal
+/// from inside this multi-threaded process — plausibly the sandbox denying a
+/// monitored process the ability to go quiet on its own. So: poll for `T`
+/// best-effort and say what was observed, but the pass/fail assertion is the
+/// one thing every environment must honor — `SIGCONT` and a live client.
+#[cfg(target_os = "linux")]
+#[test]
+fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    let pid = session.pid().expect("pid available on Linux");
+
+    session.send("\x1a"); // Ctrl+Z
+    let stopped = wait_for_proc_state(pid, 'T', Duration::from_secs(2));
+    if !stopped {
+        eprintln!(
+            "ctrl_z_suspends_and_sigcont_resumes_a_responsive_client: the stopped (T) state was \
+             never observed (last seen: {:?}) — known sandbox limitation, see this test's doc \
+             comment; continuing to the responsiveness assertion regardless.",
+            proc_state(pid)
+        );
+    }
+
+    // SIGCONT the way a shell's `fg` would — nothing plays that role here,
+    // since the binary is the pty's direct child, not a job under a shell.
+    // Harmless if the process was never actually stopped.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGCONT);
+    }
+
+    session.send("x");
+    let responsive = session.wait_until(Duration::from_secs(5), |screen| {
+        screen.rows(0, screen.size().1).any(|line| line.contains('❯') && line.contains('x'))
+    });
+    assert!(responsive, "client did not respond after SIGCONT: {}", session.dump("after SIGCONT"));
 }

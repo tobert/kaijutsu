@@ -297,6 +297,13 @@ impl TuiSession {
         }
     }
 
+    /// The child process's pid, for a probe that needs to inspect its OS
+    /// process state directly (`Ctrl+Z`'s suspend: `portable_pty` has no
+    /// "is this job stopped" query of its own).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     /// Block until the child exits or `timeout` elapses.
     pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<portable_pty::ExitStatus> {
         let deadline = Instant::now() + timeout;

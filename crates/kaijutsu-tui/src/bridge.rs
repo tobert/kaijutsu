@@ -262,8 +262,9 @@ impl KernelBridge {
     }
 
     /// Run one kaish statement as the human — the gated path
-    /// (`docs/gate-and-shell-split.md`). Output arrives as blocks on the
-    /// context feed; nothing is returned here to print.
+    /// (`docs/gate-and-shell-split.md`), what `:!<statement>` runs through.
+    /// Output arrives as blocks on the context feed; nothing is returned
+    /// here to print.
     pub async fn shell_execute(&self, context_id: ContextId, code: &str) -> Result<BlockId> {
         self.actor
             .shell_execute(code, context_id, true)
@@ -271,13 +272,14 @@ impl KernelBridge {
             .context("shell execute")
     }
 
-    /// The context's cwd — the second of the shell prompt's two cursors.
-    /// `None` when the kernel has none recorded.
-    pub async fn context_cwd(&self, context_id: ContextId) -> Result<Option<String>> {
+    /// `Ctrl+C`'s escalation ladder (`docs/tui.md`, "Ctrl+C reclaimed").
+    /// `immediate = false` lets the in-flight model call finish before the
+    /// agentic loop stops; `immediate = true` aborts mid-stream.
+    pub async fn interrupt_context(&self, context_id: ContextId, immediate: bool) -> Result<bool> {
         self.actor
-            .get_context_cwd(context_id)
+            .interrupt_context(context_id, immediate)
             .await
-            .context("read context cwd")
+            .context("interrupt context")
     }
 
     /// Execute structured `kj` argv against a context without changing the

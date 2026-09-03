@@ -6,7 +6,7 @@
 //! unit-testable without a kernel and without a terminal.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
@@ -15,7 +15,6 @@ use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, 
 
 use crate::compose::Compose;
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
-use crate::shell::Shell;
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 
 /// The double-tap window, shared by `Ctrl+C Ctrl+C` and the prefix's
@@ -108,11 +107,8 @@ pub struct App {
     /// Pending asks across every context (`asks.rs` answers them).
     pub pending_asks: usize,
     /// The compose surface — a modalkit `VimMachine` over the context's
-    /// kernel-owned draft block (`compose.rs`).
+    /// kernel-owned draft block, and the `:` bar (`compose.rs`).
     pub compose: Compose,
-    /// The shell surface (`Ctrl+Z`), and the `Ctrl+Z Ctrl+Z` suspend gesture
-    /// (`shell.rs`).
-    pub shell: Shell,
     pub palette: Palette,
     pub wrap: WrapCache,
     pub quit: bool,
@@ -121,7 +117,15 @@ pub struct App {
     /// (context, principal).
     pub principal: Option<PrincipalId>,
     notice: Option<String>,
-    last_ctrl_c: Option<Instant>,
+    /// Contexts this client currently believes have a turn running: set on
+    /// this client's own submit (`compose_key`) and on
+    /// `ServerEvent::TurnStarted`, cleared on `TurnCompleted`/`TurnFailed`
+    /// for that context. **Partial**: an interactive submit from another
+    /// client or peer names no start this client observes unless it is
+    /// already watching that context (`docs/tui.md`, "Ctrl+C reclaimed") —
+    /// it is what `Ctrl+C`'s ladder and `:q`'s warning read, not a
+    /// authoritative turn registry.
+    pub turns_running: HashSet<ContextId>,
     /// What has displaced the inline viewport, when anything has. Only the
     /// editor and the diff viewer take the alternate screen (`docs/tui.md`,
     /// ruling 1), and the key path early-returns on it, which is what makes
@@ -141,10 +145,10 @@ pub struct App {
     /// The ledger view (`Ctrl+A l`), when open.
     pub ledger_view: Option<crate::asks::LedgerViewState>,
     /// The `kj` command catalog (`get_kj_command_catalog`), fetched once at
-    /// connect and cached for slash completion (`completion.rs`).
+    /// connect and cached for `:kj ` completion (`completion.rs`).
     pub kj_catalog: Vec<kaijutsu_client::rpc::KjCommandInfo>,
-    /// The slash-completion popup, when `Tab` has one open.
-    pub completion: Option<crate::completion::SlashCompletion>,
+    /// The `:kj ` completion popup, when `Tab` has one open.
+    pub completion: Option<crate::completion::KjCompletion>,
     /// The last `listTracks` answer, refreshed on [`crate::run`]'s
     /// [`REFRESH`](crate::run) cadence — feeds the picker's TRACKS section
     /// and the status line's `bar.beat` figure (`docs/tui.md`, "TRACKS +
@@ -179,13 +183,12 @@ impl App {
             connection: None,
             pending_asks: 0,
             compose: Compose::new(),
-            shell: Shell::new(),
             palette: Palette::builtin(),
             wrap: WrapCache::new(),
             quit: false,
             principal: None,
             notice: None,
-            last_ctrl_c: None,
+            turns_running: HashSet::new(),
             screen: crate::editor::ScreenMode::Inline,
             ask_owners: HashMap::new(),
             ask_card: None,
@@ -333,19 +336,30 @@ impl App {
         true
     }
 
-    /// `Ctrl+C`. The second press inside [`DOUBLE_TAP`] quits.
-    pub fn press_ctrl_c(&mut self, now: Instant) -> bool {
-        let quit = self
-            .last_ctrl_c
-            .is_some_and(|prev| now.duration_since(prev) <= DOUBLE_TAP);
-        if quit {
-            self.quit = true;
-            self.last_ctrl_c = None;
-        } else {
-            self.last_ctrl_c = Some(now);
-            self.note("Ctrl+C again to quit");
-        }
-        quit
+    /// Mark `context_id` as having a turn running. Returns whether the set
+    /// changed, so a caller only redraws when it must.
+    pub fn mark_turn_running(&mut self, context_id: ContextId) -> bool {
+        self.turns_running.insert(context_id)
+    }
+
+    /// Mark `context_id`'s turn as ended. Returns whether the set changed.
+    pub fn mark_turn_ended(&mut self, context_id: ContextId) -> bool {
+        self.turns_running.remove(&context_id)
+    }
+
+    /// Whether this client believes `context_id` has a turn running right
+    /// now — the ladder's own gate for whether a fresh `Ctrl+C` press starts
+    /// interrupting or just says there is nothing to interrupt.
+    pub fn turn_running(&self, context_id: ContextId) -> bool {
+        self.turns_running.contains(&context_id)
+    }
+
+    /// Whether any context this client knows about has a turn running —
+    /// `:q`'s warning ("still running") is scoped to the whole client, not
+    /// just the context on screen, because quitting abandons every one of
+    /// them.
+    pub fn any_turn_running(&self) -> bool {
+        !self.turns_running.is_empty()
     }
 
     /// The current context's draft block for this client's principal, and the
@@ -705,23 +719,29 @@ mod tests {
         ));
     }
 
+    /// `Ctrl+C`'s own escalation is `interrupt::Ladder`'s job now
+    /// (`docs/tui.md`, "Ctrl+C reclaimed"); `App` just tracks which contexts
+    /// have a turn known running.
     #[test]
-    fn ctrl_c_twice_inside_the_window_quits() {
-        let (mut app, _, _) = app_with_two();
-        let t0 = Instant::now();
-        assert!(!app.press_ctrl_c(t0));
-        assert!(!app.quit);
-        assert!(app.press_ctrl_c(t0 + Duration::from_millis(400)));
-        assert!(app.quit);
+    fn turn_running_tracks_mark_and_clear() {
+        let (mut app, aid, _) = app_with_two();
+        assert!(!app.turn_running(aid));
+        assert!(app.mark_turn_running(aid), "the set changed");
+        assert!(!app.mark_turn_running(aid), "marking twice changes nothing");
+        assert!(app.turn_running(aid));
+        assert!(app.any_turn_running());
+        assert!(app.mark_turn_ended(aid), "the set changed");
+        assert!(!app.turn_running(aid));
+        assert!(!app.any_turn_running());
     }
 
     #[test]
-    fn ctrl_c_twice_outside_the_window_does_not_quit() {
-        let (mut app, _, _) = app_with_two();
-        let t0 = Instant::now();
-        assert!(!app.press_ctrl_c(t0));
-        assert!(!app.press_ctrl_c(t0 + Duration::from_millis(900)));
-        assert!(!app.quit);
+    fn any_turn_running_is_true_when_any_context_has_one() {
+        let (mut app, aid, bid) = app_with_two();
+        assert!(!app.any_turn_running());
+        app.mark_turn_running(bid);
+        assert!(app.any_turn_running(), "scoped to the whole client, not the context on screen");
+        assert!(!app.turn_running(aid));
     }
 
     #[test]

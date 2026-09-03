@@ -27,24 +27,26 @@
 //! | [`render`] | the `Backend`-generic renderer and the inline viewport |
 //! | [`keys`] | key events → intents, including the `Ctrl+A` prefix |
 //! | [`run`] | the event loop |
-//! | [`compose`] | the vi surface over the context's kernel-owned draft |
-//! | [`shell`] | the `Ctrl+Z` shell surface and the suspend gesture |
+//! | [`compose`] | the vi surface over the context's kernel-owned draft, and the `:` bar |
+//! | [`cmdline`] | the `:` line's own dialect: `:kj`, `:!`, `:q` |
+//! | [`interrupt`] | the `Ctrl+C` escalation ladder |
 //! | [`asks`] | the ask card, the ledger view (`Ctrl+A l`) |
-//! | [`completion`] | slash completion over the `kj` command catalog |
+//! | [`completion`] | `:kj ` completion over the `kj` command catalog |
 //! | [`picker`] | later lane |
 //! | [`editor`], [`diff`] | the two alternate-screen surfaces |
 
 pub mod app;
 pub mod asks;
 pub mod bridge;
+pub mod cmdline;
 pub mod compose;
 pub mod completion;
+pub mod interrupt;
 pub mod keys;
 pub mod picker;
 pub mod present;
 pub mod render;
 pub mod run;
-pub mod shell;
 pub mod status;
 pub mod diff;
 pub mod editor;

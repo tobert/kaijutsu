@@ -216,12 +216,12 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
         lines.drain(..lines.len() - budget);
     }
 
-    // The slash-completion popup rides above the compose line, only while
-    // the draft is actually a `/` command in progress — a stale popup left
-    // over from an earlier `Tab` press does not reappear once the draft has
-    // moved past it (`completion.rs`).
+    // The `:kj ` completion popup rides above the compose line, only while
+    // the bar is actually mid-`:kj ` — a stale popup left over from an
+    // earlier `Tab` press does not reappear once the bar has moved past it
+    // (`completion.rs`).
     if let Some(completion) = &app.completion
-        && app.compose.text().starts_with('/')
+        && app.compose.kj_typed().is_some()
     {
         lines.extend(crate::completion::render_popup(completion, width, &palette));
     }
@@ -611,25 +611,28 @@ mod tests {
         assert!(text.iter().any(|l| l.trim() == "b"), "the second draft row: {text:?}");
     }
 
-    /// `Ctrl+Z` swaps the compose line for the shell prompt, and the prompt
-    /// carries both cursors.
+    /// `:` swaps the compose row for the `:` bar, and the bar rides behind
+    /// the same `❯` prompt (`docs/tui.md`, "The `:` line").
     #[test]
-    fn the_shell_surface_replaces_the_compose_line() {
+    fn the_colon_bar_replaces_the_compose_line() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let (mut app, _) = fixture();
-        app.shell.press_ctrl_z(std::time::Instant::now());
-        app.shell.set_cwd(Some("/v/ctx/7f/kaish-arith".to_string()));
+        let now = std::time::Instant::now();
+        let press = |app: &mut App, code: KeyCode| {
+            app.compose.press(KeyEvent::new(code, KeyModifiers::NONE), now);
+        };
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char(':'));
+        for c in "kj con".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
 
         let live = live_lines(&mut app, 96, 0, false);
         let text: Vec<String> = live
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(
-            text.iter()
-                .any(|l| l.starts_with("kaijutsu ▸ /v/ctx/7f/kaish-arith $ ")),
-            "got {text:?}"
-        );
-        assert!(!text.iter().any(|l| l.starts_with("❯ ")), "compose stepped aside");
+        assert!(text.iter().any(|l| l.starts_with("❯ :kj con")), "got {text:?}");
     }
 
     #[test]

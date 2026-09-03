@@ -20,16 +20,16 @@ pub enum Intent {
     LastContext,
     /// `Ctrl+C` — the caller decides whether this is the second press.
     Interrupt,
-    /// A key for whichever surface holds the input region — the compose
-    /// `VimMachine`, or the shell line when `Ctrl+Z` toggled it on. The event
-    /// rides through undecoded because modalkit reads it directly
-    /// (`kaijutsu-editor` drives modalkit on `crossterm::event::KeyEvent`) and
-    /// because what `Enter` or `Esc` means depends on the vi mode, which this
-    /// module deliberately does not know.
+    /// A key for compose's `VimMachine`, which owns both the draft and the
+    /// `:` bar. The event rides through undecoded because modalkit reads it
+    /// directly (`kaijutsu-editor` drives modalkit on
+    /// `crossterm::event::KeyEvent`) and because what `Enter` or `Esc` means
+    /// depends on the vi mode, which this module deliberately does not know.
     InputKey(KeyEvent),
-    /// `Ctrl+Z` — toggle the shell surface, or suspend on the second press.
-    /// The caller times the double tap (`crate::shell::Shell::press_ctrl_z`).
-    ShellToggle,
+    /// `Ctrl+Z` — suspend the process the way a shell job does (`docs/tui.md`,
+    /// "The `:` line": the `Ctrl+Z` shell surface retired in favor of `:!`,
+    /// so this is now a single-press suspend, not a toggle).
+    Suspend,
     /// A chord a later lane owns. The text is what the status line says, so
     /// a key is never swallowed silently.
     NotYet(&'static str),
@@ -105,7 +105,7 @@ impl Keys {
                 Intent::LegendChanged
             }
             KeyCode::Char('c') if ctrl => Intent::Interrupt,
-            KeyCode::Char('z') if ctrl => Intent::ShellToggle,
+            KeyCode::Char('z') if ctrl => Intent::Suspend,
             // Everything else belongs to the input region. Control chords go
             // too: `<C-w>` and `<C-r>` are vi keys, and the two this client
             // reserves are already claimed above.
@@ -183,12 +183,11 @@ mod tests {
     }
 
 
-    /// `Ctrl+Z` is never compose text, and its double-tap window is the
-    /// caller's to time.
+    /// `Ctrl+Z` is never compose text — it suspends, one press, no toggle.
     #[test]
-    fn ctrl_z_toggles_the_shell_surface() {
+    fn ctrl_z_is_a_suspend_intent() {
         let mut keys = Keys::new();
-        assert_eq!(keys.interpret(ctrl('z')), Intent::ShellToggle);
+        assert_eq!(keys.interpret(ctrl('z')), Intent::Suspend);
     }
 
     #[test]

@@ -23,12 +23,13 @@ use tokio::sync::mpsc;
 use crate::app::{App, ContextView};
 use crate::asks;
 use crate::bridge::KernelBridge;
+use crate::cmdline::{self, ColonVerb};
 use crate::compose::Compose;
 use crate::completion;
+use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
 use crate::picker::{self, Outcome as PickerOutcome};
 use crate::render;
-use crate::shell::{CtrlZ, ShellAction};
 
 use crossterm::event::KeyEvent;
 use kaijutsu_client::{PeerConfig, PeerInvocation};
@@ -210,6 +211,7 @@ async fn event_loop(
     wires: &mut Wires,
 ) -> Result<()> {
     let mut keys = Keys::new();
+    let mut interrupt_ladder = interrupt::Ladder::new();
     let mut status = bridge.actor().watch_status();
     // Ask polling is driven by the ledger's own change stream, not by the
     // refresh timer: `poll_new_asks` runs `kj ledger list` in the context,
@@ -241,7 +243,7 @@ async fn event_loop(
                         dirty = true;
                         if app.picker.is_some() {
                             handle_picker_key(bridge, app, key, &wires.feed_tx).await?;
-                        } else if act(bridge, app, &mut keys, key, &wires.feed_tx).await? == Acted::Suspend {
+                        } else if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &wires.feed_tx).await? == Acted::Suspend {
                             suspend(terminal, &wires.term_lock)?;
                         }
                     }
@@ -258,6 +260,9 @@ async fn event_loop(
                     dirty = true;
                 }
                 if collapse_thinking_on_turn_end(app, &event) {
+                    dirty = true;
+                }
+                if mark_turn_liveness(app, &event) {
                     dirty = true;
                 }
                 if observe_editor_event(bridge, app, &event).await {
@@ -522,6 +527,7 @@ async fn act(
     bridge: &KernelBridge,
     app: &mut App,
     keys: &mut Keys,
+    interrupt_ladder: &mut interrupt::Ladder,
     key: crossterm::event::KeyEvent,
     feed_tx: &mpsc::Sender<TaggedFeed>,
 ) -> Result<Acted> {
@@ -551,49 +557,30 @@ async fn act(
     match keys.interpret(key) {
         Intent::Ignored | Intent::LegendChanged => {}
         Intent::Interrupt => {
-            app.press_ctrl_c(std::time::Instant::now());
+            interrupt_ctrl_c(bridge, app, interrupt_ladder).await;
         }
         Intent::InputKey(key) => {
-            if app.shell.active {
-                shell_key(bridge, app, key).await?;
-            } else {
-                compose_key(bridge, app, key).await?;
-            }
+            compose_key(bridge, app, key).await?;
         }
-        Intent::ShellToggle => {
-            let gesture = app.shell.press_ctrl_z(std::time::Instant::now());
-            if app.shell.active {
-                // Both prompt cursors are resolved live, so the cwd is read
-                // when the surface comes up rather than cached from startup.
-                // Read before the suspend, so the frame `fg` returns to is
-                // the frame that was there.
-                if let Some(ctx) = app.current {
-                    app.shell.set_cwd(bridge.context_cwd(ctx).await.unwrap_or(None));
-                }
-                app.note("shell surface — Ctrl+Z leaves, Ctrl+Z Ctrl+Z suspends");
-            } else {
-                app.clear_notice();
-            }
-            if gesture == CtrlZ::Suspend {
-                return Ok(Acted::Suspend);
-            }
+        Intent::Suspend => {
+            return Ok(Acted::Suspend);
         }
         Intent::SwitchSeat(n) => match app.seat_context(n) {
             Some(id) => {
                 watch_context(bridge, app, id, feed_tx).await?;
                 app.switch_to(id);
                 // The draft is per context, so the compose buffer follows the
-                // switch rather than carrying the old context's text along.
-                app.compose = Compose::over(&bridge.read_input(id).await.unwrap_or_default());
-                app.shell.set_cwd(bridge.context_cwd(id).await.unwrap_or(None));
+                // switch rather than carrying the old context's text along —
+                // `load_draft` keeps the `:` line's own history, which is
+                // this session's, not this draft's.
+                app.compose.load_draft(&bridge.read_input(id).await.unwrap_or_default());
                 app.clear_notice();
             }
             None => app.note(format!("no context on seat {n}")),
         },
         Intent::LastContext => match app.switch_to_previous() {
             Some(id) => {
-                app.compose = Compose::over(&bridge.read_input(id).await.unwrap_or_default());
-                app.shell.set_cwd(bridge.context_cwd(id).await.unwrap_or(None));
+                app.compose.load_draft(&bridge.read_input(id).await.unwrap_or_default());
             }
             None => app.note("no previous context"),
         },
@@ -607,15 +594,11 @@ async fn act(
         Intent::NotYet(message) => app.note(message),
         Intent::OpenLedger => open_ledger(bridge, app).await,
         Intent::Tab => {
-            if !app.shell.active && app.compose.text().starts_with('/') {
-                apply_tab_completion(bridge, app).await;
+            if app.compose.kj_typed().is_some() {
+                apply_kj_completion(app);
             } else {
                 let tab = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab);
-                if app.shell.active {
-                    shell_key(bridge, app, tab).await?;
-                } else {
-                    compose_key(bridge, app, tab).await?;
-                }
+                compose_key(bridge, app, tab).await?;
             }
         }
         Intent::TogglePicker => {
@@ -659,6 +642,10 @@ async fn compose_key(
     if action.unfocus {
         app.note("compose unfocused — i to type");
     }
+    if let Some(line) = action.command {
+        handle_colon_line(bridge, app, ctx, line).await;
+        return Ok(());
+    }
     if action.submit {
         if app.compose.text().trim().is_empty() {
             return Ok(());
@@ -667,6 +654,11 @@ async fn compose_key(
             Ok(_) => {
                 app.compose.reset();
                 app.clear_notice();
+                // The partial turn-liveness signal (`docs/tui.md`, "Ctrl+C
+                // reclaimed"): our own submit is one of the two ways this
+                // client learns a turn started, the other being
+                // `ServerEvent::TurnStarted` (`mark_turn_liveness`).
+                app.mark_turn_running(ctx);
             }
             Err(e) => app.note(format!("submit failed: {e}")),
         }
@@ -674,34 +666,123 @@ async fn compose_key(
     Ok(())
 }
 
-/// One keystroke on the shell surface. A line runs through `shell_execute`,
-/// the gated human path; its output arrives as blocks on the context feed and
-/// the transcript prints it, so nothing is echoed here.
-async fn shell_key(
-    bridge: &KernelBridge,
-    app: &mut App,
-    key: crossterm::event::KeyEvent,
-) -> Result<()> {
-    let Some(ctx) = app.current else {
-        app.note("no context attached");
-        return Ok(());
-    };
-    if let ShellAction::Run(line) = app.shell.press(key) {
-        match bridge.shell_execute(ctx, &line).await {
+/// Dispatch one submitted `:` line (`docs/tui.md`, "The `:` line"). The tui
+/// parses it itself (`cmdline::parse`) — the core's own `:w`/`:q` ex-command
+/// dialect answers the alternate-screen editor, not this bar.
+async fn handle_colon_line(bridge: &KernelBridge, app: &mut App, ctx: ContextId, line: String) {
+    match cmdline::parse(&line) {
+        ColonVerb::Kj(argv) => match bridge.execute_kj(ctx, argv).await {
+            Ok(result) if result.latch.is_some() => {
+                app.note(result.latch.map(|l| l.message).unwrap_or_default());
+            }
+            Ok(result) => app.note(result.stdout.lines().next().unwrap_or("done").to_string()),
+            Err(e) => app.note(format!(":kj failed: {e}")),
+        },
+        ColonVerb::Shell(statement) => match bridge.shell_execute(ctx, &statement).await {
             Ok(_) => app.clear_notice(),
             Err(e) => app.note(format!("shell failed: {e}")),
+        },
+        ColonVerb::Quit { force } => {
+            if force || !app.any_turn_running() {
+                app.quit = true;
+            } else {
+                app.note("a turn this client started is still running — :q! quits anyway");
+            }
         }
-        // `cd` moves one of the two cursors, so re-read it after every line
-        // rather than modeling kaish's own state here.
-        app.shell.set_cwd(bridge.context_cwd(ctx).await.unwrap_or(None));
+        ColonVerb::Unknown => app.note(format!("not a tui command: {line}")),
     }
-    Ok(())
+}
+
+/// `Ctrl+C`: the escalation ladder (`docs/tui.md`, "Ctrl+C reclaimed"). The
+/// call is fire-and-forget the way the app's own `handle_interrupt` treats
+/// it — the notice already says what was asked for, and a failed RPC here
+/// would just repeat what `interrupt_context`'s own `Err` already logs.
+async fn interrupt_ctrl_c(bridge: &KernelBridge, app: &mut App, ladder: &mut interrupt::Ladder) {
+    let Some(ctx) = app.current else {
+        app.note("no context attached");
+        return;
+    };
+    let running = app.turn_running(ctx);
+    match ladder.press(std::time::Instant::now(), running) {
+        InterruptStep::Nothing => app.note("nothing to interrupt — :q quits"),
+        InterruptStep::Soft => {
+            let _ = bridge.interrupt_context(ctx, false).await;
+            app.note("interrupting after this tool call — Ctrl+C again to abort");
+        }
+        InterruptStep::Hard => {
+            let _ = bridge.interrupt_context(ctx, true).await;
+            app.note("aborted");
+        }
+        InterruptStep::HardAndClear => {
+            let _ = bridge.interrupt_context(ctx, true).await;
+            clear_draft(bridge, app, ctx).await;
+            app.note("aborted, draft cleared");
+        }
+    }
+}
+
+/// The 3rd `Ctrl+C` press: clear the draft both locally and on the kernel's
+/// copy — `edit_input` deletes the whole text, then `reset` puts compose
+/// back in its fresh-draft shape (`docs/tui.md`, "Ctrl+C reclaimed").
+async fn clear_draft(bridge: &KernelBridge, app: &mut App, ctx: ContextId) {
+    let len = app.compose.text().chars().count() as u64;
+    if len > 0
+        && let Ok(version) = bridge.edit_input(ctx, 0, "", len).await
+    {
+        app.compose.record_ack(version);
+    }
+    app.compose.reset();
+}
+
+/// `Tab` while `:kj ` is being typed in the bar: recompute candidates for
+/// the current text, cycling the selection when it's the same prefix as
+/// last time (repeated `Tab` walks the list, the way a shell's does), and
+/// rewrite the bar to the selected candidate. Purely local — the bar is not
+/// a kernel-mirrored block, unlike the compose draft, so no RPC is needed.
+fn apply_kj_completion(app: &mut App) {
+    let Some(typed) = app.compose.kj_typed() else {
+        return;
+    };
+    let fresh = completion::complete(&typed, &app.kj_catalog);
+    app.completion = match (app.completion.take(), fresh) {
+        (Some(mut prev), Some(next)) if prev.prefix == next.prefix => {
+            prev.cycle();
+            Some(prev)
+        }
+        (_, next) => next,
+    };
+    let Some(candidate) = app.completion.as_ref().and_then(|c| c.current()) else {
+        return;
+    };
+    let takes_input = !app
+        .kj_catalog
+        .iter()
+        .find(|k| k.name == candidate.name)
+        .is_some_and(|k| k.input_hint.is_empty());
+    let body = completion::accept(&candidate.name, !takes_input);
+    app.compose.set_command_body(&body);
+}
+
+/// Track which contexts this client believes have a turn running — the
+/// partial signal `App::turns_running` documents: it is set here on
+/// `ServerEvent::TurnStarted` (the other setter is `compose_key`'s own
+/// submit) and cleared on `TurnCompleted`/`TurnFailed`, the same two events
+/// [`collapse_thinking_on_turn_end`] already matches.
+fn mark_turn_liveness(app: &mut App, event: &ServerEvent) -> bool {
+    match event {
+        ServerEvent::TurnStarted { context_id, .. } => app.mark_turn_running(*context_id),
+        ServerEvent::TurnCompleted { context_id, .. } | ServerEvent::TurnFailed { context_id, .. } => {
+            app.mark_turn_ended(*context_id)
+        }
+        _ => false,
+    }
 }
 
 /// Hand the terminal back to the host shell: leave raw mode, stop ourselves
 /// the way a shell job does, and re-anchor the inline viewport when `SIGCONT`
 /// brings us back. The transcript stays in scrollback either way, so nothing
-/// else needs restoring (`docs/tui.md`, "Shell (`Ctrl+Z`)").
+/// else needs restoring (`docs/tui.md`, "The `:` line": `Ctrl+Z` is a single
+/// suspend now, not a toggle).
 fn suspend(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     term_lock: &TermLock,
@@ -738,45 +819,6 @@ fn raise_stop() {
 #[cfg(not(unix))]
 fn raise_stop() {
     tracing::warn!("suspend is a unix gesture; nothing to raise here");
-}
-
-/// `Tab` on a `/`-prefixed draft: recompute candidates for the current
-/// draft, cycling the selection when it's the same prefix as last time
-/// (repeated `Tab` walks the list, the way a shell's does), and write the
-/// selected candidate straight into the compose line.
-async fn apply_tab_completion(bridge: &KernelBridge, app: &mut App) {
-    let Some(ctx) = app.current else {
-        app.note("no context attached");
-        return;
-    };
-    let draft = app.compose.text();
-    let fresh = completion::complete(&draft, &app.kj_catalog);
-    app.completion = match (app.completion.take(), fresh) {
-        (Some(mut prev), Some(next)) if prev.prefix == next.prefix => {
-            prev.cycle();
-            Some(prev)
-        }
-        (_, next) => next,
-    };
-    let Some(candidate) = app.completion.as_ref().and_then(|c| c.current()) else {
-        return;
-    };
-    let takes_input = !app
-        .kj_catalog
-        .iter()
-        .find(|k| k.name == candidate.name)
-        .is_some_and(|k| k.input_hint.is_empty());
-    // The draft is the kernel's; the completed text goes through the same
-    // edit path a keystroke takes, then the local buffer reconciles to it.
-    let accepted = completion::accept(&candidate.name, !takes_input);
-    let old_len = draft.chars().count() as u64;
-    match bridge.edit_input(ctx, 0, &accepted, old_len).await {
-        Ok(version) => {
-            app.compose.record_ack(version);
-            app.compose.reconcile(&accepted, version);
-        }
-        Err(e) => app.note(format!("draft edit failed: {e}")),
-    }
 }
 
 /// Open the ledger view (`Ctrl+A l`): every pending and answered ask for the
@@ -1366,5 +1408,72 @@ mod tests {
         app.views.insert(id, ContextView::new(ContextMirror::new(id)));
         let event = ServerEvent::ContextSwitched { context_id: id };
         assert!(!collapse_thinking_on_turn_end(&mut app, &event));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Turn liveness (docs/tui.md, "Ctrl+C reclaimed")
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn turn_started_marks_the_context_running() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        let event = ServerEvent::TurnStarted { context_id: id, principal_id: PrincipalId::new() };
+        assert!(mark_turn_liveness(&mut app, &event));
+        assert!(app.turn_running(id));
+    }
+
+    #[test]
+    fn turn_completed_clears_a_running_context() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        app.mark_turn_running(id);
+        let event = ServerEvent::TurnCompleted {
+            context_id: id,
+            principal_id: PrincipalId::new(),
+            output_block_id: None,
+            stop_reason: TurnCompletedStopReason::EndTurn,
+            origin: TurnOrigin::Interactive,
+        };
+        assert!(mark_turn_liveness(&mut app, &event));
+        assert!(!app.turn_running(id));
+    }
+
+    #[test]
+    fn turn_failed_also_clears_a_running_context() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        app.mark_turn_running(id);
+        let event = ServerEvent::TurnFailed {
+            context_id: id,
+            principal_id: PrincipalId::new(),
+            error: "provider stream error".to_string(),
+            origin: TurnOrigin::Autonomous,
+        };
+        assert!(mark_turn_liveness(&mut app, &event));
+        assert!(!app.turn_running(id));
+    }
+
+    /// A completion for a context nobody marked running is not a bug — the
+    /// set just has nothing to remove.
+    #[test]
+    fn turn_completed_for_a_context_with_no_known_running_turn_is_a_no_op() {
+        let mut app = App::new("amy");
+        let event = ServerEvent::TurnCompleted {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            output_block_id: None,
+            stop_reason: TurnCompletedStopReason::EndTurn,
+            origin: TurnOrigin::Interactive,
+        };
+        assert!(!mark_turn_liveness(&mut app, &event));
+    }
+
+    #[test]
+    fn an_unrelated_event_carries_no_turn_liveness_either() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        let event = ServerEvent::ContextSwitched { context_id: id };
+        assert!(!mark_turn_liveness(&mut app, &event));
     }
 }

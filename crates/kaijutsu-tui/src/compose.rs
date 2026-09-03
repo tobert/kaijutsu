@@ -27,13 +27,15 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, DOUBLE_TAP};
 use crate::present::Palette;
 
-/// The compose prompt. The shell surface has its own (`shell.rs`).
+/// The compose prompt, also the `:` bar's lead-in (`docs/tui.md`, "The `:`
+/// line").
 pub const PROMPT: &str = "❯ ";
 
 /// What one keystroke asked the rest of the client to do.
 ///
-/// A keystroke produces edits *or* a submit *or* an unfocus, never a mix: a
-/// submit is `Enter` in normal mode, which the vi engine never sees.
+/// A keystroke produces edits *or* a submit *or* an unfocus *or* a `:` line,
+/// never a mix: a submit is `Enter` in normal mode and a `:` line is `Enter`
+/// with the bar focused, which the vi engine never sees as a submit.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ComposeAction {
     /// Edits to mirror onto the draft block, in order, through `edit_input`.
@@ -42,12 +44,75 @@ pub struct ComposeAction {
     pub submit: bool,
     /// `Esc Esc` in normal mode — compose releases the keyboard.
     pub unfocus: bool,
+    /// A `:` line submitted from the bar, `:` prefix included (`":kj fork"`,
+    /// `":!ls"`, `":q"`). Compose stays pure and hands the raw text back —
+    /// `run.rs` (`cmdline::parse`) decides what it means and runs it
+    /// (`docs/tui.md`, "The `:` line").
+    pub command: Option<String>,
 }
 
 impl ComposeAction {
     /// Whether this keystroke asked for nothing at all.
     pub fn is_empty(&self) -> bool {
-        self.ops.is_empty() && !self.submit && !self.unfocus
+        self.ops.is_empty() && !self.submit && !self.unfocus && self.command.is_none()
+    }
+}
+
+/// Local `:` line history — modalkit's command bar surfaces no history hook
+/// (`kaijutsu-editor::EditorCore` has no accessor for one), so this keeps
+/// the same shape `shell.rs` kept before the `Ctrl+Z` shell surface retired
+/// in favor of `:!` (`docs/tui.md`, "The `:` line"). `:kj` and `:!` lines
+/// share one history — every line submitted from the bar is recorded here,
+/// valid or not, the way vim's own `:` history works.
+#[derive(Debug, Default)]
+pub struct ColonHistory {
+    entries: Vec<String>,
+    /// Where `Up`/`Down` have walked to, as an index into `entries`.
+    browsing: Option<usize>,
+    /// The line being typed when browsing started, restored by walking back
+    /// down past the newest entry.
+    stashed: Option<String>,
+}
+
+impl ColonHistory {
+    /// Record a submitted line. Consecutive duplicates are one entry.
+    fn record(&mut self, line: String) {
+        self.browsing = None;
+        self.stashed = None;
+        if self.entries.last() != Some(&line) {
+            self.entries.push(line);
+        }
+    }
+
+    /// Step one entry older, stashing `current` on the first step. `None` at
+    /// the oldest entry or an empty history — nothing to redraw.
+    fn older(&mut self, current: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let next = match self.browsing {
+            None => {
+                self.stashed = Some(current.to_string());
+                self.entries.len() - 1
+            }
+            Some(0) => return None,
+            Some(n) => n - 1,
+        };
+        self.browsing = Some(next);
+        Some(self.entries[next].clone())
+    }
+
+    /// Step one entry newer, past the newest entry back to the stashed line.
+    /// `None` when not currently browsing — nothing to redraw.
+    fn newer(&mut self) -> Option<String> {
+        let n = self.browsing?;
+        if n + 1 < self.entries.len() {
+            self.browsing = Some(n + 1);
+            Some(self.entries[n + 1].clone())
+        } else {
+            self.browsing = None;
+            Some(self.stashed.take().unwrap_or_default())
+        }
     }
 }
 
@@ -64,6 +129,11 @@ pub struct Compose {
     /// acknowledged. A mirror older than this does not yet carry our
     /// keystrokes, and reconciling against it would delete them.
     acked: u64,
+    /// The `:` line's local history — a session fact, not a per-draft one,
+    /// so it survives [`Self::reset`] and [`Self::load_draft`] (both go
+    /// through the same path) rather than being wiped every submit or
+    /// context switch.
+    colon_history: ColonHistory,
 }
 
 impl Default for Compose {
@@ -83,17 +153,31 @@ impl Compose {
     /// end. Used at startup, where the kernel may already hold a draft this
     /// or another client left behind.
     pub fn over(text: &str) -> Self {
-        let mut editor = EditorCore::new(text);
-        // `A` rather than `i`: land the cursor past the last character, which
-        // is where someone resuming a draft expects to type.
-        editor.apply_keys("A");
-        Self {
-            editor,
+        let mut compose = Self {
+            editor: EditorCore::new(""),
             focused: true,
             esc_taps: 0,
             last_esc: None,
             acked: 0,
-        }
+            colon_history: ColonHistory::default(),
+        };
+        compose.load_draft(text);
+        compose
+    }
+
+    /// Load a new draft in place — a context switch, or the fresh line
+    /// [`Self::reset`] leaves behind — keeping the `:` line's history, which
+    /// is this session's, not this draft's.
+    pub fn load_draft(&mut self, text: &str) {
+        let mut editor = EditorCore::new(text);
+        // `A` rather than `i`: land the cursor past the last character, which
+        // is where someone resuming a draft expects to type.
+        editor.apply_keys("A");
+        self.editor = editor;
+        self.focused = true;
+        self.esc_taps = 0;
+        self.last_esc = None;
+        self.acked = 0;
     }
 
     /// The draft's text.
@@ -144,13 +228,61 @@ impl Compose {
     /// Start over on an empty draft — what `submit_input` leaves behind, since
     /// the kernel snapshots the draft into a block and clears it.
     pub fn reset(&mut self) {
-        *self = Self::new();
+        self.load_draft("");
+    }
+
+    /// The `:` bar's text, prefix included (`":kj con"`), while it is
+    /// focused; `None` in every other mode.
+    pub fn command_line(&self) -> Option<String> {
+        self.editor.command_line()
+    }
+
+    /// The text typed after `:kj ` in the bar, when that is what is being
+    /// typed: `None` before `kj` is fully typed, once a space ends the verb
+    /// position for something else (completion only ever proposes the verb),
+    /// or when the bar is not open at all.
+    pub fn kj_typed(&self) -> Option<String> {
+        let line = self.command_line()?;
+        let rest = line.strip_prefix(":kj")?;
+        let after_space = match rest.strip_prefix(' ') {
+            Some(r) => r,
+            None if rest.is_empty() => return Some(String::new()),
+            None => return None,
+        };
+        // A second space means the verb position is behind us — completion
+        // only ever proposes the verb, never its arguments.
+        if after_space.contains(' ') { None } else { Some(after_space.to_string()) }
+    }
+
+    /// Rewrite the `:` bar's body to `body` (no `:` prefix) — `Tab`
+    /// completion and the history walk both need to replace what is typed,
+    /// and `EditorCore` exposes no direct setter for the cmdline buffer,
+    /// only the typed-key surface `command_line()` renders from. A no-op
+    /// when the bar is not focused.
+    pub fn set_command_body(&mut self, body: &str) {
+        if self.editor.command_line().is_none() {
+            return;
+        }
+        self.editor.apply_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        // The prefix (`:`) is always exactly one char, so the body length is
+        // the line's char count minus one.
+        let body_len = self
+            .editor
+            .command_line()
+            .map(|line| line.chars().count().saturating_sub(1))
+            .unwrap_or(0);
+        for _ in 0..body_len {
+            self.editor
+                .apply_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in body.chars() {
+            self.editor
+                .apply_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
     }
 
     /// Interpret one keystroke.
     pub fn press(&mut self, key: KeyEvent, now: Instant) -> ComposeAction {
-        let normal = self.editor.mode().is_none();
-
         if !self.focused {
             // Unfocused, compose answers only the keys that mean "start
             // typing"; everything else is left for another surface to claim.
@@ -162,6 +294,16 @@ impl Compose {
                 return ComposeAction::default();
             }
         }
+
+        // The `:` bar (modalkit's command line) intercepts every key while
+        // focused. The tui parses the raw line itself once `Enter` submits
+        // it — never the core's own `:w`/`:q` ex-command dialect, which
+        // answers the alternate-screen editor, not this bar.
+        if let Some(raw) = self.editor.command_line() {
+            return self.press_cmdline(key, raw);
+        }
+
+        let normal = self.editor.mode().is_none();
 
         if key.code == KeyCode::Esc {
             if self.tap_escape(now) && normal {
@@ -192,6 +334,48 @@ impl Compose {
         }
     }
 
+    /// One keystroke while the `:` bar holds the keyboard. `raw` is the
+    /// bar's text (`:` prefix included) *before* this key is applied — the
+    /// seam that hands `run.rs` the line as typed, ahead of the core's own
+    /// ex-command dialect parsing it on `Enter` (`take_commands`'s `Err`
+    /// for a line like `:kj fork` is drained and discarded here, never
+    /// surfaced: the tui owns `:kj`/`:!`/`:q` dispatch).
+    fn press_cmdline(&mut self, key: KeyEvent, raw: String) -> ComposeAction {
+        match key.code {
+            KeyCode::Enter => {
+                let ops = self.editor.apply_key_event(key);
+                let _ = self.editor.take_commands();
+                // History stores the body alone (no `:` prefix) — the one
+                // shape both `older`/`newer` and `set_command_body` agree on.
+                let body = raw.get(1..).unwrap_or("").to_string();
+                self.colon_history.record(body);
+                ComposeAction { ops, command: Some(raw), ..ComposeAction::default() }
+            }
+            KeyCode::Esc => {
+                let ops = self.editor.apply_key_event(key);
+                let _ = self.editor.take_commands();
+                ComposeAction { ops, ..ComposeAction::default() }
+            }
+            KeyCode::Up => {
+                let body = raw.get(1..).unwrap_or("").to_string();
+                if let Some(entry) = self.colon_history.older(&body) {
+                    self.set_command_body(&entry);
+                }
+                ComposeAction::default()
+            }
+            KeyCode::Down => {
+                if let Some(entry) = self.colon_history.newer() {
+                    self.set_command_body(&entry);
+                }
+                ComposeAction::default()
+            }
+            _ => ComposeAction {
+                ops: self.editor.apply_key_event(key),
+                ..ComposeAction::default()
+            },
+        }
+    }
+
     /// Bump the consecutive-`Esc` count and report whether it has reached the
     /// dismiss threshold. Saturates, so it stays armed until a press lands in
     /// normal mode.
@@ -209,21 +393,25 @@ impl Compose {
     }
 }
 
-/// The input region of the live viewport: the shell prompt when the shell
-/// surface is toggled on, the `❯` compose line otherwise.
+/// The input region of the live viewport: the `❯` compose line, or the `:`
+/// bar while it holds the keyboard.
 ///
 /// Multi-line drafts grow this region — the caller gives the transcript
 /// whatever rows are left (`crate::render::live_lines`).
 pub fn input_lines(app: &App, width: u16, palette: &Palette) -> Vec<Line<'static>> {
-    if app.shell.active {
-        return crate::shell::prompt_lines(app, width, palette);
-    }
     compose_lines(&app.compose, width, palette)
 }
 
 /// The `❯` line, one row per draft line, with the mode banner right-aligned
-/// on the first row.
+/// on the first row — or, while the `:` bar is focused, the bar itself
+/// (`❯ :kj con`, `docs/tui.md`, "The `:` line").
 pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Line<'static>> {
+    if let Some(cmdline) = compose.command_line() {
+        return vec![Line::from(vec![
+            Span::styled(PROMPT.to_string(), palette.status()),
+            Span::styled(cmdline, palette.compose()),
+        ])];
+    }
     let text = compose.text();
     let banner = compose.mode_banner();
     let mut out = Vec::new();
@@ -465,5 +653,158 @@ mod tests {
                 assert!(!text.contains(glyph), "{text:?} carries {glyph}");
             }
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // The `:` bar (docs/tui.md, "The `:` line")
+    // ────────────────────────────────────────────────────────────────────
+
+    /// `:` in normal mode focuses the bar; typing there never reaches the
+    /// draft, and the bar's own text is `command_line()`, not `text()`.
+    #[test]
+    fn colon_in_normal_mode_focuses_the_bar_not_the_draft() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":"));
+        typed(&mut compose, "kj fork", now);
+        assert_eq!(compose.command_line().as_deref(), Some(":kj fork"));
+        assert_eq!(compose.text(), "", "the bar never touches the draft");
+    }
+
+    /// `Esc` aborts the bar and returns typing to the draft, discarding
+    /// nothing that was there before.
+    #[test]
+    fn esc_aborts_the_bar_and_returns_to_the_draft() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        typed(&mut compose, "hello", now);
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "abc", now);
+        let action = compose.press(press(KeyCode::Esc), now);
+        assert!(action.command.is_none(), "an abort submits no command");
+        assert_eq!(compose.command_line(), None, "the bar closed");
+        assert_eq!(compose.text(), "hello", "the draft is untouched");
+        // The abort leaves normal mode; `a` takes typing back to the draft.
+        compose.press(press(KeyCode::Char('a')), now);
+        typed(&mut compose, "!", now);
+        assert_eq!(compose.text(), "hello!");
+    }
+
+    /// `Enter` submits the raw line, `:` prefix included, and never the
+    /// core's own parsed `CommandRequest` — that dialect answers the
+    /// alternate-screen editor, not this bar.
+    #[test]
+    fn enter_submits_the_raw_colon_line() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "kj context list", now);
+        let action = compose.press(press(KeyCode::Enter), now);
+        assert_eq!(action.command.as_deref(), Some(":kj context list"));
+        assert_eq!(compose.command_line(), None, "the bar closed on submit");
+    }
+
+    /// The core's own ex-command dialect has no idea what `:kj` means and
+    /// would answer `Err("Not an editor command")` — that Err must be
+    /// drained, never returned to the caller as this action's own failure.
+    #[test]
+    fn a_line_the_editor_dialect_rejects_still_submits_cleanly() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "kj fork", now);
+        let action = compose.press(press(KeyCode::Enter), now);
+        assert_eq!(action.command.as_deref(), Some(":kj fork"));
+    }
+
+    /// The figure: `❯ :kj con` — the bar rides the compose row behind the
+    /// same prompt.
+    #[test]
+    fn the_bar_draws_on_the_compose_row() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "kj con", now);
+        let lines = compose_lines(&compose, 40, &Palette::builtin());
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("❯ :kj con"), "got {text:?}");
+    }
+
+    /// `:kj ` is where `Tab` completion looks; `kj_typed` reports `None`
+    /// before `kj` is fully typed, past its argv position, or with the bar
+    /// closed.
+    #[test]
+    fn kj_typed_reports_the_text_after_kj_space() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        assert_eq!(compose.kj_typed(), None, "the bar isn't open");
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        assert_eq!(compose.kj_typed(), None, "`kj` isn't typed yet");
+        typed(&mut compose, "kj", now);
+        assert_eq!(compose.kj_typed().as_deref(), Some(""), "bare `:kj` is the empty verb prefix");
+        typed(&mut compose, " sta", now);
+        assert_eq!(compose.kj_typed().as_deref(), Some("sta"));
+        typed(&mut compose, " arg", now);
+        assert_eq!(compose.kj_typed(), None, "a space past the verb ends completion");
+    }
+
+    /// Both `:kj` and `:!` lines land in the same history, and `Up`/`Down`
+    /// walk it the way a shell's history does — oldest at the end of the
+    /// walk, past-the-newest restoring what was being typed.
+    #[test]
+    fn up_and_down_walk_one_shared_colon_history() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "kj context list", now);
+        compose.press(press(KeyCode::Enter), now);
+
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "!echo hi", now);
+        compose.press(press(KeyCode::Enter), now);
+
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "half", now);
+        compose.press(press(KeyCode::Up), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":!echo hi"));
+        compose.press(press(KeyCode::Up), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":kj context list"));
+        compose.press(press(KeyCode::Up), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":kj context list"), "the oldest entry ends the walk");
+        compose.press(press(KeyCode::Down), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":!echo hi"));
+        compose.press(press(KeyCode::Down), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":half"), "past the newest is the line being typed");
+    }
+
+    /// The history is a session fact: it survives `reset()` (what a chat
+    /// submit does) and `load_draft()` (what a context switch does), not
+    /// just repeated `:` opens on the same `Compose`.
+    #[test]
+    fn the_colon_history_survives_reset_and_load_draft() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        typed(&mut compose, "kj fork", now);
+        compose.press(press(KeyCode::Enter), now);
+
+        compose.reset();
+        compose.load_draft("some other context's draft");
+
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        compose.press(press(KeyCode::Up), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":kj fork"));
     }
 }
