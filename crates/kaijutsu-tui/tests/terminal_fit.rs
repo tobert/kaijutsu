@@ -132,7 +132,7 @@ fn typing_lands_on_the_compose_row() {
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
-    session.send("hello");
+    session.send("ihello"); // `i`: a fresh draft rests in normal mode
 
     let ok = session.wait_until(Duration::from_secs(5), |screen| {
         screen.rows(0, screen.size().1).any(|line| line.contains('❯') && line.contains("hello"))
@@ -733,7 +733,7 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
         libc::kill(pid as i32, libc::SIGCONT);
     }
 
-    session.send("x");
+    session.send("ix"); // `i`: a fresh draft rests in normal mode
     let responsive = session.wait_until(Duration::from_secs(5), |screen| {
         screen.rows(0, screen.size().1).any(|line| line.contains('❯') && line.contains('x'))
     });

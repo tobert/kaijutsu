@@ -139,15 +139,16 @@ impl Default for Compose {
 }
 
 impl Compose {
-    /// A fresh draft, in insert mode — the resting state the conversation
-    /// figure draws (`-- INSERT --` at the right of the `❯` line).
+    /// A fresh draft, in normal mode — the resting state, as vim opens a
+    /// buffer (`-- NORMAL --` at the right of the `❯` line; `i`, `a`, `o`
+    /// start typing).
     pub fn new() -> Self {
         Self::over("")
     }
 
-    /// A draft already holding `text`, in insert mode with the cursor at the
-    /// end. Used at startup, where the kernel may already hold a draft this
-    /// or another client left behind.
+    /// A draft already holding `text`, in normal mode with the cursor on its
+    /// last character. Used at startup, where the kernel may already hold a
+    /// draft this or another client left behind.
     pub fn over(text: &str) -> Self {
         let mut compose = Self {
             editor: EditorCore::new(""),
@@ -163,9 +164,9 @@ impl Compose {
     /// is this session's, not this draft's.
     pub fn load_draft(&mut self, text: &str) {
         let mut editor = EditorCore::new(text);
-        // `A` rather than `i`: land the cursor past the last character, which
-        // is where someone resuming a draft expects to type.
-        editor.apply_keys("A");
+        // The core opens in normal mode at the top; `G$` lands the cursor on
+        // the last character, so `a` resumes a draft where it left off.
+        editor.apply_keys("G$");
         self.editor = editor;
         self.acked = 0;
     }
@@ -408,11 +409,21 @@ mod tests {
         ops
     }
 
+    /// `i` into insert mode — what every test that types a draft presses
+    /// first, because a fresh draft rests in normal mode.
+    fn insert(compose: &mut Compose) {
+        compose.press(press(KeyCode::Char('i')));
+    }
+
+    /// A fresh draft rests in normal mode, as vim opens a buffer; `i` starts
+    /// typing (Amy: *"default it to normal mode instead of insert"*).
     #[test]
-    fn a_fresh_draft_opens_in_insert_mode() {
-        let compose = Compose::new();
-        assert_eq!(compose.mode_banner(), "-- INSERT --");
+    fn a_fresh_draft_opens_in_normal_mode() {
+        let mut compose = Compose::new();
+        assert_eq!(compose.mode_banner(), "-- NORMAL --");
         assert_eq!(compose.text(), "");
+        insert(&mut compose);
+        assert_eq!(compose.mode_banner(), "-- INSERT --");
     }
 
     /// Every keystroke is an `edit_input`, char-indexed the way the kernel
@@ -420,6 +431,7 @@ mod tests {
     #[test]
     fn typing_produces_one_char_indexed_edit_per_keystroke() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         let ops = typed(&mut compose, "hi");
         assert_eq!(
             ops,
@@ -436,6 +448,7 @@ mod tests {
     #[test]
     fn an_edit_after_a_multibyte_char_is_addressed_in_chars() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         let ops = typed(&mut compose, "café!");
         assert_eq!(ops.last().expect("an op").offset, 4);
     }
@@ -443,6 +456,7 @@ mod tests {
     #[test]
     fn vi_motions_and_operators_reach_the_draft() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "one two");
         compose.press(press(KeyCode::Esc));
         assert_eq!(compose.mode_banner(), "-- NORMAL --", "Esc lands in normal mode");
@@ -456,6 +470,7 @@ mod tests {
     #[test]
     fn a_literal_less_than_reaches_the_draft() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "a < b");
         assert_eq!(compose.text(), "a < b");
     }
@@ -463,6 +478,7 @@ mod tests {
     #[test]
     fn enter_in_normal_mode_submits() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "and getattr?");
         assert!(!compose.press(press(KeyCode::Enter)).submit, "insert mode types");
         compose.press(press(KeyCode::Esc));
@@ -474,6 +490,7 @@ mod tests {
     #[test]
     fn enter_in_insert_mode_grows_the_draft() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "one");
         let action = compose.press(press(KeyCode::Enter));
         assert!(!action.submit);
@@ -488,6 +505,7 @@ mod tests {
     #[test]
     fn a_second_esc_changes_nothing_and_vi_keys_still_reach_the_draft() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "hi");
         compose.press(press(KeyCode::Esc));
         compose.press(press(KeyCode::Esc));
@@ -502,6 +520,7 @@ mod tests {
     #[test]
     fn paste_inserts_text_at_the_cursor_as_one_edit() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "ab");
         let ops = compose.paste("xy\nz");
         assert_eq!(ops.len(), 1, "one op, not one per char: {ops:?}");
@@ -527,6 +546,7 @@ mod tests {
     #[test]
     fn a_mirror_behind_our_own_acks_never_rewinds_the_draft() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "ab");
         compose.record_ack(9);
         assert!(!compose.reconcile("a", 8), "a stale mirror is refused");
@@ -536,32 +556,42 @@ mod tests {
     #[test]
     fn our_own_echo_is_not_a_change() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "ab");
         compose.record_ack(3);
         assert!(!compose.reconcile("ab", 3), "identical text is no change at all");
     }
 
+    /// A submit leaves the resting state behind: an empty line, normal
+    /// mode, the same as a fresh start.
     #[test]
-    fn a_submitted_draft_resets_to_an_empty_insert_mode_line() {
+    fn a_submitted_draft_resets_to_an_empty_normal_mode_line() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "sent");
         compose.reset();
         assert_eq!(compose.text(), "");
-        assert_eq!(compose.mode_banner(), "-- INSERT --");
+        assert_eq!(compose.mode_banner(), "-- NORMAL --");
     }
 
+    /// A resumed draft opens in normal mode with the cursor on its last
+    /// character, so `a` appends where the draft left off — `$` on the last
+    /// line, as vim would land it.
     #[test]
-    fn resuming_a_draft_puts_the_cursor_past_its_last_char() {
-        let mut compose = Compose::over("half a thought");
-        assert_eq!(compose.cursor(), 14);
+    fn resuming_a_draft_puts_the_cursor_on_its_last_char() {
+        let mut compose = Compose::over("half a\nthought");
+        assert_eq!(compose.mode_banner(), "-- NORMAL --");
+        assert_eq!(compose.cursor(), 13);
+        compose.press(press(KeyCode::Char('a')));
         typed(&mut compose, "!");
-        assert_eq!(compose.text(), "half a thought!");
+        assert_eq!(compose.text(), "half a\nthought!");
     }
 
     /// The figure: `❯ and getattr? _` with `-- INSERT --` at the right.
     #[test]
     fn the_compose_line_carries_the_mode_banner_at_the_right() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "and getattr?");
         let lines = compose_lines(&compose, 40, &Palette::builtin());
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -574,6 +604,7 @@ mod tests {
     #[test]
     fn the_compose_region_carries_no_border_glyphs() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "cargo test -p kaijutsu-tui");
         for line in compose_lines(&compose, 40, &Palette::builtin()) {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -606,6 +637,8 @@ mod tests {
     #[test]
     fn normal_mode_shows_its_own_banner() {
         let mut compose = Compose::new();
+        assert_eq!(compose.mode_banner(), "-- NORMAL --");
+        insert(&mut compose);
         assert_eq!(compose.mode_banner(), "-- INSERT --");
         compose.press(press(KeyCode::Esc));
         assert_eq!(compose.mode_banner(), "-- NORMAL --");
@@ -620,6 +653,7 @@ mod tests {
     #[test]
     fn colon_opens_the_bar_after_a_second_esc() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "draft");
         compose.press(press(KeyCode::Esc));
         compose.press(press(KeyCode::Esc));
@@ -639,6 +673,7 @@ mod tests {
     #[test]
     fn esc_aborts_the_bar_and_returns_to_the_draft() {
         let mut compose = Compose::new();
+        insert(&mut compose);
         typed(&mut compose, "hello");
         compose.press(press(KeyCode::Esc));
         compose.press(press(KeyCode::Char(':')));
