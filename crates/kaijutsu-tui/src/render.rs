@@ -646,7 +646,7 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(text.iter().any(|l| l.starts_with(": kj con")), "got {text:?}");
+        assert!(text.iter().any(|l| l.starts_with(":kj con")), "got {text:?}");
         assert!(!text.iter().any(|l| l.contains("❯")), "the draft prompt left with the draft: {text:?}");
     }
 

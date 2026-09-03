@@ -29,13 +29,10 @@ use crate::present::Palette;
 /// The compose prompt, drawn while the draft has the row (`docs/tui.md`,
 /// "The `:` line").
 pub const PROMPT: &str = "❯ ";
-/// The prompt while the `:` bar holds a command line. The glyph says which
-/// line this is, so the typed `:` is not drawn twice.
-pub const COLON_PROMPT: &str = ": ";
-/// The prompt while the `:` bar holds a shell line (`:!…`). The `:!` prefix
-/// is what the glyph replaces. Same width as [`PROMPT`], so the body column
-/// never moves.
-pub const SHELL_PROMPT: &str = "$ ";
+/// The prompt while the `:` bar is open: the typed `:` itself, with the
+/// line drawn directly after it as vim draws its own — `:kj con`,
+/// `:!git status`. There is no shell glyph; `:!` is drawn as typed.
+pub const COLON_PROMPT: &str = ":";
 
 /// What one keystroke asked the rest of the client to do.
 ///
@@ -346,8 +343,7 @@ pub fn input_lines(app: &App, width: u16, palette: &Palette) -> Vec<Line<'static
 
 /// The `❯` line, one row per draft line, with the mode banner right-aligned
 /// on the first row — or, while the `:` bar is focused, the bar itself
-/// behind the glyph for its kind: `: kj con` for a command, `$ echo hi` for
-/// a shell line (`docs/tui.md`, "The `:` line").
+/// as vim draws it: `:kj con`, `:!echo hi` (`docs/tui.md`, "The `:` line").
 pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Line<'static>> {
     if let Some(cmdline) = compose.command_line() {
         let (glyph, body) = bar_prompt(&cmdline);
@@ -382,15 +378,11 @@ pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Li
     out
 }
 
-/// Split a raw bar line (`:` prefix included) into the prompt glyph to draw
-/// and the body to draw after it. The prefix the glyph stands for is
-/// stripped: `:kj con` → (`: `, `kj con`); `:!echo hi` → (`$ `, `echo hi`).
+/// Split a raw bar line (`:` prefix included) into the prompt to draw and
+/// the body after it: `:kj con` → (`:`, `kj con`); `:!echo hi` → (`:`,
+/// `!echo hi`).
 fn bar_prompt(raw: &str) -> (&'static str, &str) {
-    let body = raw.strip_prefix(':').unwrap_or(raw);
-    match body.strip_prefix('!') {
-        Some(statement) => (SHELL_PROMPT, statement),
-        None => (COLON_PROMPT, body),
-    }
+    (COLON_PROMPT, raw.strip_prefix(':').unwrap_or(raw))
 }
 
 #[cfg(test)]
@@ -665,46 +657,30 @@ mod tests {
         assert_eq!(action.command.as_deref(), Some(":kj fork"));
     }
 
-    /// The figure: `: kj con` — the bar rides the compose row, and the
-    /// prompt glyph itself says which line this is: `:` for a command.
+    /// The figure: `:kj con` — the bar rides the compose row and draws the
+    /// line as vim draws it, the `:` and then the text, no gap.
     #[test]
-    fn the_bar_draws_on_the_compose_row_behind_a_colon_prompt() {
+    fn the_bar_draws_on_the_compose_row_as_vim_does() {
         let mut compose = Compose::new();
         compose.press(press(KeyCode::Esc));
         compose.press(press(KeyCode::Char(':')));
-        let bare = bar_text(&compose);
-        assert_eq!(bare, ": ", "a bare `:` shows the glyph and an empty body");
+        assert_eq!(bar_text(&compose), ":", "a bare `:` is just the colon");
         typed(&mut compose, "kj con");
         let lines = compose_lines(&compose, 40, &Palette::builtin());
         assert_eq!(lines.len(), 1);
-        assert_eq!(bar_text(&compose), ": kj con");
-        assert_eq!(compose.command_line().as_deref(), Some(":kj con"), "the model keeps the raw line");
+        assert_eq!(bar_text(&compose), ":kj con");
+        assert!(!bar_text(&compose).contains('❯'), "the draft prompt left with the draft");
     }
 
-    /// `:!` is the shell line, and the glyph swaps to `$` the moment the
-    /// `!` is typed — the `:!` prefix is never drawn, the glyph replaces it.
+    /// `:!` is drawn as typed — vim swaps no shell glyph in, and neither do
+    /// we.
     #[test]
-    fn a_shell_line_draws_behind_a_shell_prompt() {
+    fn a_shell_line_draws_as_typed() {
         let mut compose = Compose::new();
         compose.press(press(KeyCode::Esc));
         compose.press(press(KeyCode::Char(':')));
-        compose.press(press(KeyCode::Char('!')));
-        assert_eq!(bar_text(&compose), "$ ");
-        typed(&mut compose, "echo hi");
-        assert_eq!(bar_text(&compose), "$ echo hi");
-        // Backspacing the `!` away returns the command glyph.
-        for _ in 0.."echo hi!".len() {
-            compose.press(press(KeyCode::Backspace));
-        }
-        assert_eq!(bar_text(&compose), ": ");
-    }
-
-    /// Every prompt glyph is the same width, so the body column never moves
-    /// between the draft, the command line and the shell line.
-    #[test]
-    fn every_prompt_glyph_has_the_same_width() {
-        assert_eq!(PROMPT.width(), COLON_PROMPT.width());
-        assert_eq!(PROMPT.width(), SHELL_PROMPT.width());
+        typed(&mut compose, "!echo hi");
+        assert_eq!(bar_text(&compose), ":!echo hi");
     }
 
     fn bar_text(compose: &Compose) -> String {

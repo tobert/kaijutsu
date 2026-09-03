@@ -408,7 +408,7 @@ fn a_partial_colon_line_never_repeats_into_the_transcript() {
     let landed = session.wait_until(Duration::from_secs(10), |screen| {
         let rows: Vec<String> = screen.rows(0, 80).collect();
         // The bar's own row: the `:` glyph, then the body without its prefix.
-        rows.iter().any(|l| l.contains(": zz partial"))
+        rows.iter().any(|l| l.contains(":zz partial"))
     });
     assert!(landed, "{}", session.dump("after opening the bar with a partial line"));
     std::thread::sleep(Duration::from_millis(500));
@@ -447,7 +447,7 @@ fn colon_opens_a_visible_bar_and_only_a_real_edit_reaches_the_draft() {
     session.send(":");
     session.send("abc");
     let bar_visible = session.wait_until(Duration::from_secs(5), |screen| {
-        screen.rows(0, screen.size().1).any(|line| line.contains(": abc"))
+        screen.rows(0, screen.size().1).any(|line| line.contains(":abc"))
     });
     assert!(bar_visible, "the `:` bar never became visible while typing: {}", session.dump("while typing :abc"));
 

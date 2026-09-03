@@ -194,16 +194,17 @@ compose's bar.
   :kj fork --name alt              run kj, blocks land like a player's own
   :!git status                     one kaish statement, the gated human path
   :q                               quit, unless a turn is known running
-  : kj con█                        the bar draws on the compose row
-  $ git status█                    a shell line swaps the glyph again
+  :kj con█                         the bar draws on the compose row
+  :!git status█                    a shell line, drawn as typed
 ```
 
 - `:` in compose normal mode draws the bar on the compose row from
   `command_line()`; `Esc` aborts, `Enter` submits, discarding what was
-  typed. The prompt glyph names the line: `❯` while the draft has the row,
-  `:` for a command line, `$` once `:!` is typed (the glyph stands in for
-  the prefix, which is not drawn). All three are two columns wide, so the
-  body never shifts. The seam: `Compose::press` peeks `command_line()` **before**
+  typed. The bar draws the line as vim draws its own: the `:` and then the
+  text, no gap, `:!` as typed, no shell glyph. The `❯` prompt leaves with
+  the draft row. (A first cut drew `: kj con` and `$ git status`; Amy: *"go
+  with pure vim, no space and no $"*, and *"I'd like to mostly match it
+  where it lines up."*) The seam: `Compose::press` peeks `command_line()` **before**
   feeding the key to the core's own `apply_key_event` on `Enter` — the raw
   line as typed, ahead of the core's own ex-command dialect parsing it. The
   core still runs its own parse on the same keystroke (closing the bar the
