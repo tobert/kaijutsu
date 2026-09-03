@@ -164,6 +164,74 @@ Rules the figure carries:
 - Unfocused, compose answers only `i`/`a`/`o`; every other key is left for
   another surface to claim, and the banner says `i to type`.
 
+### The `:` line and the `Ctrl+C` ladder (writeup, 2026-09-02; unbuilt)
+
+Amy, after an evening on the first cut: *"let's think through MVP for :,
+reclaim ctrl-c for interrupts."* This is the writeup; nothing here is built.
+
+**What exists.** Compose runs `kaijutsu_editor::EditorCore`, and the core
+already has the command bar: `:` in normal mode focuses it, `command_line()`
+returns the text to draw (`":wq"`), Enter parses into `CommandRequest`s that
+`take_commands()` hands back, and an unknown command comes back as `Err`
+(vim's "Not an editor command"). The core's own dialect is the editor's:
+`:w :q :wq :x` with `!`, `:s`, `:r`. Compose draws none of this and drains
+none of it, so today `:` in normal mode focuses a bar nobody can see and
+every key after it goes there. Verify with a harness probe before anything
+else; it is a plausible shape for the "locked up" report.
+
+Slash completion (`completion.rs`) completes a leading `/` over the `kj`
+catalog, but submit always sends the draft as chat
+(`bridge.submit_input` passes `shell = false`), so `/kj fork` is a message,
+never a command. `/` is completion with no executor.
+
+**MVP.**
+
+```text
+  :kj fork --name alt              run kj, blocks land like the shell's
+  :!git status                     one kaish statement, the gated human path
+  :q                               quit the client
+  ❯ :kj con█                       the bar draws on the compose row
+```
+
+- `:` in compose normal mode draws the bar on the compose row from
+  `command_line()`; `Esc` aborts, `Enter` submits. No new state: the core
+  owns the bar, the tui draws it and drains it.
+- The tui parses the submitted line itself, before the core's dialect sees
+  it, because the core's verbs are the editor's. Three verbs:
+  `:kj <argv>` runs through `execute_kj` (a player's command, so it authors
+  its block pair); `:!<statement>` runs through `shell_execute`, the same
+  gated path as the shell surface, and joins that surface's history;
+  `:q` quits. Anything else is a status-line notice naming the line, and
+  the draft is untouched.
+- Completion moves from `/` to `:kj `, over the same catalog, driven by the
+  same `Tab`. `/` retires from compose: a draft is always chat, and there
+  is one command syntax.
+- The alternate-screen editor keeps its own `:` dialect; the kernel session
+  answers those and this parse never sees them.
+
+**`Ctrl+C` reclaimed.** The app's ladder (`app/src/input/interrupt.rs`, one
+`TapCounter` with a 500 ms window) ports as is, and quit leaves the key:
+
+| presses within 500 ms | call | notice |
+|---|---|---|
+| 1 | `interrupt_context(ctx, immediate = false)` | `interrupting after this tool call — Ctrl+C again to abort` |
+| 2 | `interrupt_context(ctx, immediate = true)` | `aborted` |
+| 3 | the above, then `edit_input` clears the draft | `aborted, draft cleared` |
+
+With nothing running the first press says `nothing to interrupt — :q quits`.
+While the shell surface is up the same ladder applies to the context; a
+per-exec `interrupt(exec_id)` needs the exec id the shell path does not keep
+yet, so it is not in the MVP. Quit is `:q` only. `Ctrl+A q` stays
+close-and-demote (`docs/input.md`, "The prefix table"), so it is not a quit.
+
+**Probes** (`tests/terminal_fit.rs`): `:` shows the bar and `Esc` returns
+typing to compose; `:q` exits 0; `:kj context list` lands a block pair;
+`:!echo hi` lands a block; one `Ctrl+C` does not quit and posts its notice;
+two do not quit either.
+
+**Rulings wanted from Amy** before the lane: that `/` retires; that `:!`
+shares the shell surface's history; that `:q` is the only quit.
+
 ### Shell (`Ctrl+Z`)
 
 The shell surface runs kaish through `shell_execute` — the gated path a human's
@@ -420,7 +488,9 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
 `Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a`, `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`,
 `h`, and the armed-prefix legend line. The legend replaces the status line
-while a prefix is pending; there is no separate `?` overlay. Amy, on the
+while a prefix is pending; there is no separate `?` overlay. `Ctrl+C` is
+the interrupt ladder and `:q` quits once "The `:` line" above is built;
+until then `Ctrl+C Ctrl+C` quits. Amy, on the
 mockup: *"the legend in the status line is awesome, that'll help me a lot, I
 tend to forget keys outside the core stuff I use."* Every grown view (picker,
 ledger) ends with its own key line for the same reason.
