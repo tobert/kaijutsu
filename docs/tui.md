@@ -325,7 +325,7 @@ conversation is scrolled from the keyboard.
   so the symlink's target was removed instead of the link. resolve_nofollow
   fixes unlink; rename and getattr share the cause and are deliberately ▍
   ▸ shell  cargo test -p kaijutsu-kernel vfs::                     running 4s
-  line 1204/1207   kaijutsu   j/k move  ^D/^U page  gg/G  / search  Space mark  Enter copy  q leave
+  line 1204/1207   kaijutsu   j/k  ^D/^U  gg/G  / search  Space mark  Enter copy  q leave
 ```
 
 Rules the figure carries:

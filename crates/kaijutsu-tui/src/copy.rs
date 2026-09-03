@@ -325,7 +325,9 @@ impl CopyScreen {
         } else {
             format!("line {}/{}", self.cursor + 1, self.lines.len())
         };
-        let keys = "j/k move  ^D/^U page  gg/G top/bottom  / search  Space mark  Enter copy  q leave";
+        // Kept under 80 columns beside a position and a short label, so
+        // `q leave` is never the part that falls off the right edge.
+        let keys = "j/k  ^D/^U  gg/G  / search  Space mark  Enter copy  q leave";
         Line::from(Span::styled(
             format!("{position}   {}   {keys}", self.context_label),
             palette.status(),
