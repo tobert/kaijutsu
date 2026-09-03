@@ -110,6 +110,13 @@ pub struct App {
     /// — it is what `Ctrl+C`'s ladder and `:q`'s warning read, not an
     /// authoritative turn registry.
     pub turns_running: HashSet<ContextId>,
+    /// The draft block this client last submitted. A submit promotes the
+    /// draft in place — the kernel flips its status to `Done` rather than
+    /// deleting it — and a keystroke echo still on the feed can arrive before
+    /// that flip, still `Draft` and still holding the sent text. Read as a
+    /// draft again it would refill the compose line the reset just cleared,
+    /// so [`Self::current_draft`] skips this one block by id.
+    submitted_draft: Option<BlockId>,
     /// The last copy-mode yank, for `Ctrl+A ]` — tmux's paste buffer. The
     /// tui's own, so it never needs aligning with vim's registers or the OS
     /// clipboard (the yank also goes to the clipboard over OSC 52, but that
@@ -178,6 +185,7 @@ impl App {
             principal: None,
             notice: None,
             turns_running: HashSet::new(),
+            submitted_draft: None,
             paste_buffer: None,
             screen: crate::editor::ScreenMode::Inline,
             ask_owners: HashMap::new(),
@@ -399,9 +407,19 @@ impl App {
             .mirror
             .blocks()
             .iter()
-            .find(|b| b.status == Status::Draft && b.id.principal_id == principal)
+            .find(|b| {
+                b.status == Status::Draft
+                    && b.id.principal_id == principal
+                    && Some(b.id) != self.submitted_draft
+            })
             .map(|b| b.content.clone())?;
         Some((text, view.mirror.version()))
+    }
+
+    /// Record that `block_id` was just submitted, so a stale echo of it is
+    /// never read back as the draft.
+    pub fn mark_submitted(&mut self, block_id: BlockId) {
+        self.submitted_draft = Some(block_id);
     }
 
     /// Cache health for the context on screen.
@@ -895,5 +913,28 @@ mod tests {
             },
         );
         assert!(!app.views.contains_key(&aid));
+    }
+
+    /// A submitted draft is promoted in place, and an echo of it that still
+    /// reads `Draft` must not come back as the draft to type into.
+    #[test]
+    fn a_submitted_draft_is_no_longer_the_current_draft() {
+        let (mut app, a, _b) = app_with_two();
+        let principal = PrincipalId::new();
+        app.principal = Some(principal);
+        let id = BlockId::new(a, principal, 7);
+        let draft = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::User)
+            .status(Status::Draft)
+            .content("why is the sky blue")
+            .build();
+        let mut mirror = ContextMirror::new(a);
+        mirror.apply_snapshot(vec![draft], 3).expect("snapshot applies");
+        app.views.insert(a, ContextView::new(mirror));
+        app.switch_to(a);
+        assert_eq!(app.current_draft().map(|(t, _)| t).as_deref(), Some("why is the sky blue"));
+
+        app.mark_submitted(id);
+        assert_eq!(app.current_draft(), None, "the promoted block is not a draft to refill from");
     }
 }

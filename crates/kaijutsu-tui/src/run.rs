@@ -759,7 +759,8 @@ async fn compose_key(
         }
         tracing::debug!(context = %ctx.short(), "submitting the draft");
         match bridge.submit_input(ctx).await {
-            Ok(_) => {
+            Ok(block_id) => {
+                app.mark_submitted(block_id);
                 app.compose.reset();
                 app.clear_notice();
                 // The partial turn-liveness signal (`docs/tui.md`, "Ctrl+C
