@@ -161,8 +161,10 @@ Rules the figure carries:
 - Enter in insert mode is a newline: that is how a multi-line draft is
   written, and the compose region grows inside the viewport, taking rows from
   the transcript.
-- Unfocused, compose answers only `i`/`a`/`o`; every other key is left for
-  another surface to claim, and the banner says `i to type`.
+- Unfocused, compose answers only `i`/`a`/`o` and `:`; every other key is
+  left for another surface to claim, and the banner says `i to type, : for a
+  command`. `:` from any state opens the bar, and the bar closes into normal
+  mode.
 
 ### The `:` line and the `Ctrl+C` ladder
 
@@ -187,12 +189,16 @@ compose's bar.
   :kj fork --name alt              run kj, blocks land like a player's own
   :!git status                     one kaish statement, the gated human path
   :q                               quit, unless a turn is known running
-  ❯ :kj con█                       the bar draws on the compose row
+  : kj con█                        the bar draws on the compose row
+  $ git status█                    a shell line swaps the glyph again
 ```
 
 - `:` in compose normal mode draws the bar on the compose row from
   `command_line()`; `Esc` aborts, `Enter` submits, discarding what was
-  typed. The seam: `Compose::press` peeks `command_line()` **before**
+  typed. The prompt glyph names the line: `❯` while the draft has the row,
+  `:` for a command line, `$` once `:!` is typed (the glyph stands in for
+  the prefix, which is not drawn). All three are two columns wide, so the
+  body never shifts. The seam: `Compose::press` peeks `command_line()` **before**
   feeding the key to the core's own `apply_key_event` on `Enter` — the raw
   line as typed, ahead of the core's own ex-command dialect parsing it. The
   core still runs its own parse on the same keystroke (closing the bar the
@@ -259,7 +265,9 @@ shell one keystroke and one `fg` away.
 **Probes** (`tests/terminal_fit.rs`): `:` draws the bar visibly while
 typing, and `Esc` discards it without reaching the draft (the receipt for
 the pre-lane "a bar nobody can see and every key after it goes there" bug);
-`:q` and `:q!` exit 0; `:kj context list` and `:!echo hi` land real blocks;
+`:q` and `:q!` exit 0; `:kj context list` and `:!echo hi` land real blocks,
+and `:kj context list` lands from an unfocused compose too (the state
+`Esc Esc` leaves, where the first live test stalled);
 a partial `:` line never repeats into scrollback; one `Ctrl+C` posts
 `nothing to interrupt` and does not quit, two within the window still do
 not quit; `Ctrl+Z` suspends and `SIGCONT` leaves a responsive client (the
@@ -585,18 +593,18 @@ intended shape.
 ## Melted from the ssh shell design
 
 `docs/ssh-shell.md` designed a `kaijutsu-shell` SSH subsystem: a line-mode
-kaish loop starting in a lobby context. The TUI absorbs it — its shell surface
-is that loop over the RPC path that already exists, and its picker needs no
-lobby because `list_contexts` is contextless. Two paragraphs survive:
+kaish loop starting in a lobby context. The TUI absorbs it — `:!` is that
+loop, one statement at a time, over the RPC path that already exists, and
+its picker needs no lobby because `list_contexts` is contextless. One
+paragraph survives.
 
-**Two cursors, never mixed.** The shell has an *acting context* (set by
-`kj context switch` / `kj attach`, drives capabilities and what `/v/docs`
-points at) and a *cwd* (set by `cd`, where you are looking). They move
-independently: `cd /v/ctx/<shard>/<ctx>` browses another context read-only
-without acting as it. The invariant: resolve both live per statement, or bake
-both per line — never one of each. Live is the target, so `kj attach X ; mv …`
-runs `mv` as `X`, the way `cd /foo ; ls` lists `/foo`. The prompt renders the
-acting context because it must be legible before you act.
+The design's other paragraph, *two cursors never mixed* (an acting context
+set by `kj attach`, a cwd set by `cd`, each resolved live per statement),
+retired with the `Ctrl+Z` shell surface: `:kj` and `:!` always act on the
+context on screen, so there is no acting-context cursor to keep separate from
+the cwd, and nothing for a prompt to render ("The `:` line and the `Ctrl+C`
+ladder"). The cwd half still holds — `cd` inside `:!` moves the context's
+durable cwd, the same one every other kaish path in that context sees.
 
 **Principal is the Unix model.** The authorship lane (`BlockId.principal_id`)
 is the authenticated user's principal. Two logins by one user are two ttys for

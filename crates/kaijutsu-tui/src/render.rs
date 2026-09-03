@@ -611,8 +611,8 @@ mod tests {
         assert!(text.iter().any(|l| l.trim() == "b"), "the second draft row: {text:?}");
     }
 
-    /// `:` swaps the compose row for the `:` bar, and the bar rides behind
-    /// the same `❯` prompt (`docs/tui.md`, "The `:` line").
+    /// `:` swaps the compose row for the `:` bar, and the prompt glyph
+    /// swaps with it (`docs/tui.md`, "The `:` line").
     #[test]
     fn the_colon_bar_replaces_the_compose_line() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -632,7 +632,8 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(text.iter().any(|l| l.starts_with("❯ :kj con")), "got {text:?}");
+        assert!(text.iter().any(|l| l.starts_with(": kj con")), "got {text:?}");
+        assert!(!text.iter().any(|l| l.contains("❯")), "the draft prompt left with the draft: {text:?}");
     }
 
     #[test]

@@ -640,7 +640,7 @@ async fn compose_key(
         }
     }
     if action.unfocus {
-        app.note("compose unfocused — i to type");
+        app.note("compose unfocused — i to type, : for a command");
     }
     if let Some(line) = action.command {
         handle_colon_line(bridge, app, ctx, line).await;

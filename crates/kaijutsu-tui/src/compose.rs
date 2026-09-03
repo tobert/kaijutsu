@@ -27,9 +27,16 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, DOUBLE_TAP};
 use crate::present::Palette;
 
-/// The compose prompt, also the `:` bar's lead-in (`docs/tui.md`, "The `:`
-/// line").
+/// The compose prompt, drawn while the draft has the row (`docs/tui.md`,
+/// "The `:` line").
 pub const PROMPT: &str = "❯ ";
+/// The prompt while the `:` bar holds a command line. The glyph says which
+/// line this is, so the typed `:` is not drawn twice.
+pub const COLON_PROMPT: &str = ": ";
+/// The prompt while the `:` bar holds a shell line (`:!…`). The `:!` prefix
+/// is what the glyph replaces. Same width as [`PROMPT`], so the body column
+/// never moves.
+pub const SHELL_PROMPT: &str = "$ ";
 
 /// What one keystroke asked the rest of the client to do.
 ///
@@ -191,7 +198,7 @@ impl Compose {
     }
 
     /// Whether compose holds the keyboard. `Esc Esc` in normal mode releases
-    /// it; `i`, `a` or `o` take it back.
+    /// it; `i`, `a`, `o` or `:` take it back.
     pub fn focused(&self) -> bool {
         self.focused
     }
@@ -201,7 +208,7 @@ impl Compose {
     /// how to get back rather than a mode it is not in.
     pub fn mode_banner(&self) -> String {
         if !self.focused {
-            return "i to type".to_string();
+            return "i to type, : for a command".to_string();
         }
         self.editor.mode().unwrap_or_default()
     }
@@ -285,8 +292,11 @@ impl Compose {
     pub fn press(&mut self, key: KeyEvent, now: Instant) -> ComposeAction {
         if !self.focused {
             // Unfocused, compose answers only the keys that mean "start
-            // typing"; everything else is left for another surface to claim.
-            if matches!(key.code, KeyCode::Char('i' | 'a' | 'o' | 'I' | 'A' | 'O'))
+            // typing" and `:`, which opens the bar; everything else is left
+            // for another surface to claim. Unfocus happens only from normal
+            // mode, so the key that takes focus back lands in normal mode
+            // and means what it means there.
+            if matches!(key.code, KeyCode::Char('i' | 'a' | 'o' | 'I' | 'A' | 'O' | ':'))
                 && !key.modifiers.contains(KeyModifiers::CONTROL)
             {
                 self.focused = true;
@@ -404,12 +414,14 @@ pub fn input_lines(app: &App, width: u16, palette: &Palette) -> Vec<Line<'static
 
 /// The `❯` line, one row per draft line, with the mode banner right-aligned
 /// on the first row — or, while the `:` bar is focused, the bar itself
-/// (`❯ :kj con`, `docs/tui.md`, "The `:` line").
+/// behind the glyph for its kind: `: kj con` for a command, `$ echo hi` for
+/// a shell line (`docs/tui.md`, "The `:` line").
 pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Line<'static>> {
     if let Some(cmdline) = compose.command_line() {
+        let (glyph, body) = bar_prompt(&cmdline);
         return vec![Line::from(vec![
-            Span::styled(PROMPT.to_string(), palette.status()),
-            Span::styled(cmdline, palette.compose()),
+            Span::styled(glyph.to_string(), palette.status()),
+            Span::styled(body.to_string(), palette.compose()),
         ])];
     }
     let text = compose.text();
@@ -436,6 +448,17 @@ pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Li
         out.push(Line::from(spans));
     }
     out
+}
+
+/// Split a raw bar line (`:` prefix included) into the prompt glyph to draw
+/// and the body to draw after it. The prefix the glyph stands for is
+/// stripped: `:kj con` → (`: `, `kj con`); `:!echo hi` → (`$ `, `echo hi`).
+fn bar_prompt(raw: &str) -> (&'static str, &str) {
+    let body = raw.strip_prefix(':').unwrap_or(raw);
+    match body.strip_prefix('!') {
+        Some(statement) => (SHELL_PROMPT, statement),
+        None => (COLON_PROMPT, body),
+    }
 }
 
 #[cfg(test)]
@@ -572,7 +595,7 @@ mod tests {
         compose.press(press(KeyCode::Esc), now);
         compose.press(press(KeyCode::Esc), now);
         assert!(!compose.focused());
-        assert_eq!(compose.mode_banner(), "i to type");
+        assert_eq!(compose.mode_banner(), "i to type, : for a command");
 
         assert!(compose.press(press(KeyCode::Char('x')), now).is_empty());
         assert_eq!(compose.text(), "");
@@ -673,6 +696,30 @@ mod tests {
         assert_eq!(compose.text(), "", "the bar never touches the draft");
     }
 
+    /// `:` reaches the bar from an unfocused compose too — the state
+    /// `Esc Esc` leaves behind — so a command is one key away from every
+    /// mode the draft can be in, not only normal mode.
+    #[test]
+    fn colon_opens_the_bar_from_an_unfocused_compose() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        typed(&mut compose, "draft", now);
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Esc), now);
+        assert!(!compose.focused());
+
+        compose.press(press(KeyCode::Char(':')), now);
+        assert_eq!(compose.command_line().as_deref(), Some(":"));
+        typed(&mut compose, "kj context list", now);
+        let action = compose.press(press(KeyCode::Enter), now);
+        assert_eq!(action.command.as_deref(), Some(":kj context list"));
+        assert_eq!(compose.text(), "draft", "the bar never touches the draft");
+        // The bar handed the keyboard back to compose in normal mode, the
+        // same place `:` from normal mode returns to.
+        assert!(compose.focused());
+        assert_eq!(compose.mode_banner(), "");
+    }
+
     /// `Esc` aborts the bar and returns typing to the draft, discarding
     /// nothing that was there before.
     #[test]
@@ -722,19 +769,53 @@ mod tests {
         assert_eq!(action.command.as_deref(), Some(":kj fork"));
     }
 
-    /// The figure: `❯ :kj con` — the bar rides the compose row behind the
-    /// same prompt.
+    /// The figure: `: kj con` — the bar rides the compose row, and the
+    /// prompt glyph itself says which line this is: `:` for a command.
     #[test]
-    fn the_bar_draws_on_the_compose_row() {
+    fn the_bar_draws_on_the_compose_row_behind_a_colon_prompt() {
         let now = Instant::now();
         let mut compose = Compose::new();
         compose.press(press(KeyCode::Esc), now);
         compose.press(press(KeyCode::Char(':')), now);
+        let bare = bar_text(&compose);
+        assert_eq!(bare, ": ", "a bare `:` shows the glyph and an empty body");
         typed(&mut compose, "kj con", now);
         let lines = compose_lines(&compose, 40, &Palette::builtin());
         assert_eq!(lines.len(), 1);
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("❯ :kj con"), "got {text:?}");
+        assert_eq!(bar_text(&compose), ": kj con");
+        assert_eq!(compose.command_line().as_deref(), Some(":kj con"), "the model keeps the raw line");
+    }
+
+    /// `:!` is the shell line, and the glyph swaps to `$` the moment the
+    /// `!` is typed — the `:!` prefix is never drawn, the glyph replaces it.
+    #[test]
+    fn a_shell_line_draws_behind_a_shell_prompt() {
+        let now = Instant::now();
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Esc), now);
+        compose.press(press(KeyCode::Char(':')), now);
+        compose.press(press(KeyCode::Char('!')), now);
+        assert_eq!(bar_text(&compose), "$ ");
+        typed(&mut compose, "echo hi", now);
+        assert_eq!(bar_text(&compose), "$ echo hi");
+        // Backspacing the `!` away returns the command glyph.
+        for _ in 0.."echo hi!".len() {
+            compose.press(press(KeyCode::Backspace), now);
+        }
+        assert_eq!(bar_text(&compose), ": ");
+    }
+
+    /// Every prompt glyph is the same width, so the body column never moves
+    /// between the draft, the command line and the shell line.
+    #[test]
+    fn every_prompt_glyph_has_the_same_width() {
+        assert_eq!(PROMPT.width(), COLON_PROMPT.width());
+        assert_eq!(PROMPT.width(), SHELL_PROMPT.width());
+    }
+
+    fn bar_text(compose: &Compose) -> String {
+        let lines = compose_lines(compose, 40, &Palette::builtin());
+        lines[0].spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     /// `:kj ` is where `Tab` completion looks; `kj_typed` reports `None`

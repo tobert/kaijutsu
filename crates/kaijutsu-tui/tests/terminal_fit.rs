@@ -361,7 +361,7 @@ fn starting_from_a_prompt_mid_screen_reaches_the_bottom_band() {
 #[test]
 fn a_partial_colon_line_never_repeats_into_the_transcript() {
     let _serial = serial();
-    const PARTIAL: &str = ":zz partial";
+    const PARTIAL: &str = "zz partial";
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
@@ -371,7 +371,8 @@ fn a_partial_colon_line_never_repeats_into_the_transcript() {
     session.send(":zz partial");
     let landed = session.wait_until(Duration::from_secs(10), |screen| {
         let rows: Vec<String> = screen.rows(0, 80).collect();
-        rows.iter().any(|l| l.contains('❯') && l.contains(PARTIAL))
+        // The bar's own row: the `:` glyph, then the body without its prefix.
+        rows.iter().any(|l| l.contains(": zz partial"))
     });
     assert!(landed, "{}", session.dump("after opening the bar with a partial line"));
     std::thread::sleep(Duration::from_millis(500));
@@ -410,7 +411,7 @@ fn colon_opens_a_visible_bar_and_only_a_real_edit_reaches_the_draft() {
     session.send(":");
     session.send("abc");
     let bar_visible = session.wait_until(Duration::from_secs(5), |screen| {
-        screen.rows(0, screen.size().1).any(|line| line.contains("❯ :abc"))
+        screen.rows(0, screen.size().1).any(|line| line.contains(": abc"))
     });
     assert!(bar_visible, "the `:` bar never became visible while typing: {}", session.dump("while typing :abc"));
 
@@ -455,6 +456,43 @@ fn colon_kj_runs_the_command_and_lands_its_output() {
             scrollback.iter().chain(text.iter()).any(|l| l.contains("context") && l.contains("list")),
             "no block carrying the kj argv landed anywhere: {}",
             session.dump("after :kj context list")
+        );
+    }
+}
+
+/// `:` from an unfocused compose — the state `Esc Esc` leaves behind, and
+/// where the first live test stalled — opens the bar and runs the line.
+#[test]
+fn colon_kj_runs_from_an_unfocused_compose() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("\x1b"); // Esc: normal mode
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| !screen_contains_str(screen, "INSERT")),
+        "the INSERT banner never cleared: {}",
+        session.dump("after Esc")
+    );
+    session.send("\x1b"); // Esc again: unfocus
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "i to type")),
+        "compose never unfocused: {}",
+        session.dump("after Esc Esc")
+    );
+
+    session.send(":kj context list\r");
+    let landed_on_screen = session.wait_until(Duration::from_secs(10), |screen| {
+        screen
+            .rows(0, screen.size().1)
+            .any(|l| l.contains("context") && l.contains("list"))
+    });
+    if !landed_on_screen {
+        let (scrollback, text) = session.history_snapshot();
+        assert!(
+            scrollback.iter().chain(text.iter()).any(|l| l.contains("context") && l.contains("list")),
+            "no block carrying the kj argv landed from unfocused compose: {}",
+            session.dump("after :kj context list from unfocused")
         );
     }
 }
