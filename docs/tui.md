@@ -139,6 +139,7 @@ is the terminal's; search, copy and split are the terminal's.
   │ fixes unlink; rename and getattr share the cause and are deliberately ▍  │
   ▸ shell  cargo test -p kaijutsu-kernel vfs::                     running 4s
   ╰──────────────────────────────────────────────────────────────────────────╯
+
   ❯ and getattr? _                                                  -- INSERT --
   0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        coder/deepseek-v4  ▮ 42%  ● ok
 ```
@@ -146,6 +147,9 @@ is the terminal's; search, copy and split are the terminal's.
 Rules the figure carries:
 
 - The role divider names principal, `context_type` and the block's wallclock.
+  One blank row sits above it when the speaker changes (none above the first
+  speaker), and one blank row sits above the `❯` line: air between what is
+  read and what is typed, never a border.
 - `▸` is a collapsed block; only `Error` collapses by default (tool output
   prints whole, guidance 7) and
   `Error` is a one-line stub, per the app's error-render policy. Collapse is
@@ -183,10 +187,12 @@ Rules the figure carries:
   reach it as `crossterm::event::KeyEvent` through
   `EditorCore::apply_key_event` — the vim-notation string cannot carry a
   literal `<`.
-- A fresh draft opens in insert mode, which is what the banner at the right
-  reports; normal mode says `-- NORMAL --`. Vim leaves normal mode blank,
-  and a blank was the one mode a player could not tell apart (Amy: *"I
-  can't tell which mode I'm in besides INSERT"*).
+- A fresh draft rests in normal mode, as vim opens a buffer; `i`, `a` or
+  `o` start typing, and a submit returns to normal mode. A resumed draft
+  opens with the cursor on its last character, so `a` continues it. The
+  banner at the right names every mode, normal included: vim leaves normal
+  mode blank, and a blank was the one mode a player could not tell apart
+  (Amy: *"I can't tell which mode I'm in besides INSERT"*).
 - **The sibling's edit wins only when it is newer.** The draft is redrawn from
   the change feed, and `edit_input` acknowledges the same context version the
   feed speaks, so a mirror older than this client's last ack is refused rather

@@ -30,7 +30,7 @@ pub const LIVE_CHROME_LINES: u16 = 2;
 /// transcript is in scrollback where the terminal's own scrolling, search
 /// and copy reach it. A grown view (the picker, an ask card, the ledger)
 /// changes this — [`viewport_lines`] is where.
-pub const VIEWPORT_LINES: u16 = 6;
+pub const VIEWPORT_LINES: u16 = 7;
 
 /// `1756819331000` → `14:02:11`, in the terminal's own timezone.
 ///
@@ -88,11 +88,16 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
     for block in pending {
         let speaker = app.speaker_for(&block, info.as_ref());
         let show_divider = last_speaker.as_deref() != Some(speaker.as_str());
+        let gap = speaker_gap(show_divider, last_speaker.as_deref());
         let stamp = wallclock(block.created_at);
-        let lines = {
+        let mut lines = Vec::new();
+        if gap {
+            lines.push(Line::default());
+        }
+        {
             let view = app.block_view(&block, &speaker, &stamp, show_divider);
-            crate::present::render_block(&block, &view, width, &app.palette)
-        };
+            lines.extend(crate::present::render_block(&block, &view, width, &app.palette));
+        }
         app.mark_printed(context_id, block.id, &speaker);
         last_speaker = Some(speaker);
         prints.push(Print {
@@ -104,12 +109,21 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
     prints
 }
 
+/// Whether a blank row goes above a block's divider: one row of air between
+/// speakers, and none above the first speaker of a transcript or a copy
+/// buffer, where there is nothing to separate from (`docs/tui.md`,
+/// "Conversation").
+pub fn speaker_gap(show_divider: bool, last_speaker: Option<&str>) -> bool {
+    show_divider && last_speaker.is_some()
+}
+
 /// What one live block needs to render, resolved before the wrap cache is
 /// borrowed mutably.
 struct BlockPlan {
     speaker: String,
     stamp: String,
     show_divider: bool,
+    gap: bool,
     collapsed: bool,
 }
 
@@ -131,6 +145,7 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
         }
         let speaker = app.speaker_for(block, info);
         let show_divider = last_speaker.as_deref() != Some(speaker.as_str());
+        let gap = speaker_gap(show_divider, last_speaker.as_deref());
         last_speaker = Some(speaker.clone());
         out.push((
             block.clone(),
@@ -138,6 +153,7 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
                 speaker,
                 stamp: wallclock(block.created_at),
                 show_divider,
+                gap,
                 collapsed: view.is_collapsed(block),
             },
         ));
@@ -192,6 +208,9 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
             collapsed: item.collapsed,
             local_ctx: Some(block.id.context_id),
         };
+        if item.gap {
+            lines.push(Line::default());
+        }
         lines.extend(
             app.wrap
                 .lines(block, &block_view, width, &palette)
@@ -208,8 +227,9 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
     // Keep the tail: a long stream shows its newest lines, not its oldest.
     // The budget is the viewport's own height, so a line this function emits
     // is a line the terminal actually shows.
-    // One status line, plus however many rows the input region takes.
-    let chrome = 1 + u16::try_from(input.len()).unwrap_or(u16::MAX);
+    // One status line, one blank row above the input region, plus however
+    // many rows the input region takes.
+    let chrome = 2 + u16::try_from(input.len()).unwrap_or(u16::MAX);
     let budget = usize::from(VIEWPORT_LINES.saturating_sub(chrome));
     if lines.len() > budget {
         lines.drain(..lines.len() - budget);
@@ -224,6 +244,10 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
     {
         lines.extend(crate::completion::render_popup(completion, width, &palette));
     }
+
+    // One blank row separates what is being read from what is being typed
+    // (`docs/tui.md`, "Conversation").
+    lines.push(Line::default());
 
     // While `Ctrl+A` is pending the legend takes the compose row, not the
     // status line: the status line's seat digits are what the player is
@@ -349,6 +373,9 @@ pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'sta
             collapsed: view.is_collapsed(block),
             local_ctx: Some(context_id),
         };
+        if speaker_gap(show_divider, last_speaker.as_deref()) {
+            lines.push(Line::default());
+        }
         lines.extend(crate::present::render_block(block, &block_view, width, &app.palette));
         last_speaker = Some(speaker);
     }
@@ -568,11 +595,12 @@ mod tests {
             "the user's divider leads: {rows:?}"
         );
         assert_eq!(rows[1], "and getattr?");
+        assert_eq!(rows[2], "", "one blank row of air above the next speaker");
         assert!(
-            rows[2].starts_with("─ deepseek-v4 · coder ─"),
+            rows[3].starts_with("─ deepseek-v4 · coder ─"),
             "the model's divider follows: {rows:?}"
         );
-        assert_eq!(rows[3], "rename and getattr share the cause.");
+        assert_eq!(rows[4], "rename and getattr share the cause.");
 
         let status = rows.last().expect("a status line");
         assert!(status.starts_with("0 kaijutsu*"), "got {status:?}");
@@ -660,7 +688,9 @@ mod tests {
         app.views.insert(id, ContextView::new(mirror));
 
         let one_line = live_lines(&mut app, 80, 0, false).len();
+        // `i` first: a fresh draft rests in normal mode.
         for code in [
+            ratatui::crossterm::event::KeyCode::Char('i'),
             ratatui::crossterm::event::KeyCode::Char('a'),
             ratatui::crossterm::event::KeyCode::Enter,
             ratatui::crossterm::event::KeyCode::Char('b'),
