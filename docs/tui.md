@@ -116,8 +116,13 @@ grammar, and a new surface arrives in the same shape:
   cannot name its kernel path is not designed yet.
 - **Exactly one viewport claim**, from a closed set of three: *flows to
   scrollback* (conversation), *grows the viewport* and shrinks on dismiss
-  (picker, ledger, asks), or *takes the alternate screen* (vi and diff only,
-  guidance 1). There is no fourth mode.
+  (picker, ledger, asks, the thinking pane), or *takes the alternate
+  screen* (vi and diff only, guidance 1). There is no fourth mode. A grow
+  or shrink rebuilds the inline viewport anchored at the old band's top
+  row (`run::set_viewport_height`): a grow scrolls the transcript up by
+  exactly the rows it adds, and a shrink leaves its freed rows blank below
+  the band until the next print sinks the band back to the screen bottom —
+  never a gap in the transcript, never a whole-band jump.
 
 Two sanctioned deviations: compose's figure is the `❯` line inside the
 conversation figure — it is part of that frame, not a grown view — and

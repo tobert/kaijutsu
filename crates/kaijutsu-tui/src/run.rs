@@ -447,6 +447,7 @@ fn set_viewport_height(
     height: u16,
 ) -> Result<()> {
     let _guard = term_lock.lock();
+    let top = terminal.get_frame().area().y;
     // A freshly constructed `Terminal` has no memory of what the OLD one
     // painted, so it diffs against an empty buffer and never emits the
     // blanks needed to erase what is still on screen. Blank the current
@@ -457,6 +458,15 @@ fn set_viewport_height(
         .draw(|frame| frame.render_widget(ratatui::widgets::Clear, frame.area()))
         .context("clear the viewport before resizing it")?;
     let _ = terminal.flush();
+    // An inline viewport anchors at the cursor row and reserves its rows
+    // below that. The clear leaves the cursor on the OLD viewport's last
+    // row, so anchoring there scrolls the transcript up by a whole band on
+    // every resize. Anchor at the old top instead: a grow scrolls by
+    // exactly the rows added, and a shrink leaves its freed rows blank
+    // below the band, where the next `insert_before` sinks the viewport
+    // back down into them (`docs/tui.md`, "Conversation").
+    crossterm::execute!(io::stdout(), crossterm::cursor::MoveTo(0, top))
+        .context("anchor the resized viewport")?;
     *terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions { viewport: Viewport::Inline(height) },

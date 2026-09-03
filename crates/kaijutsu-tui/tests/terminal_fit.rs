@@ -147,11 +147,35 @@ fn typing_lands_on_the_compose_row() {
 #[test]
 fn the_picker_grows_and_shrinks_the_viewport_cleanly() {
     let _serial = serial();
-    let (_server, _key_dir, session) = spawn_session(24, 80);
+    // Start with the band at the screen bottom, the way a session that has
+    // printed a transcript sits: only there does a grow have to scroll, and
+    // a resize anchored on the wrong row scrolls by a whole band.
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let session = TuiSession::spawn_after_newlines(server.addr, &key_path, 24, 80, 20);
     wait_for_attach(&session);
+    let at_bottom = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, 80).collect();
+        compose_row(&rows) == Some(22)
+    });
+    assert!(at_bottom, "the band never reached the bottom: {}", session.dump("startup"));
+    // Put a row worth losing right above the band: blank rows above it
+    // would make a wrong scroll invisible.
+    session.send(":!echo marker-row\r");
+    let marked = session.wait_until(Duration::from_secs(10), |screen| {
+        let rows: Vec<String> = screen.rows(0, 80).collect();
+        compose_row(&rows) == Some(22) && rows[16].contains("marker-row")
+    });
+    assert!(marked, "no transcript row landed above the band: {}", session.dump("marker"));
 
     let baseline_rows = session.screen_text();
     let baseline_top = compose_row(&baseline_rows).expect("compose row is drawn at startup");
+    // The transcript's last row sits right above the 7-row viewport: the
+    // compose row is the band's second-to-last row, so five rows above it
+    // is the band's top and the row above that is the transcript's.
+    let above_viewport = baseline_top.checked_sub(6).expect("the viewport is not at the screen top");
+    let last_transcript_row = baseline_rows[above_viewport].clone();
 
     // Ctrl+A, then `"` — opens the picker (`crates/kaijutsu-tui/src/keys.rs`
     // `ctrl_a_quote_opens_the_picker`).
@@ -177,9 +201,20 @@ fn the_picker_grows_and_shrinks_the_viewport_cleanly() {
 
     let closed_rows = session.screen_text();
     let closed_top = compose_row(&closed_rows).expect("compose row is drawn again after closing");
+    // The grow scrolled the transcript up by exactly the rows it added and
+    // the shrink anchored at the grown band's top, so the transcript's
+    // last row still sits right above the 7-row band — no gap, nothing
+    // lost. The band itself is not back at the screen bottom yet: its
+    // freed rows stay blank below it until the next print sinks it.
+    let closed_above = closed_top.checked_sub(6).expect("the viewport is not at the screen top");
     assert_eq!(
-        closed_top, baseline_top,
-        "the viewport did not return to its original height after closing the picker:\n{}",
+        closed_rows[closed_above], last_transcript_row,
+        "the transcript's last row is no longer right above the band:\n{}",
+        session.dump("after closing picker")
+    );
+    assert!(
+        closed_top <= baseline_top,
+        "the band moved down after the picker closed (closed_top={closed_top}, baseline_top={baseline_top}):\n{}",
         session.dump("after closing picker")
     );
 
