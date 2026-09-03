@@ -205,6 +205,16 @@ Rules the figure carries:
 - Enter in insert mode is a newline: that is how a multi-line draft is
   written, and the compose region grows inside the viewport, taking rows from
   the transcript.
+- **The cursor is the terminal's own.** The tui puts the real cursor on the
+  draft's vi cursor — past the `❯` prompt, past the matching indent on a
+  continuation row — or after the `:` bar's text, and shapes it by mode as
+  vim does in a terminal (`DECSCUSR`, `t_SI`/`t_EI`): a steady block in
+  normal mode, a bar while inserting and on the `:` bar, an underline while
+  replacing; the editor's alternate screen shapes it by its own buffer's
+  mode. No painted cell stands in for it, so the terminal's own cursor
+  color applies. The armed legend, the picker, an ask card and the ledger
+  hide it. The shape goes back to the terminal's default on `:q` and on
+  `Ctrl+Z`.
 - There is no state past normal mode. The app's `Esc Esc` hands the
   keyboard to its block list; the tui prints its transcript into scrollback
   and never redraws it, so a block cursor would have nothing to act on, and
@@ -393,6 +403,9 @@ Rules the figure carries:
 
 - **Entry position is the bottom** — the newest block — the way tmux enters
   copy mode at the current screen.
+- **The terminal cursor rides the reader's line**, at column 0, as tmux
+  keeps its real cursor on the copy cursor; the search prompt row takes it
+  while `/` is being typed. The shape is a block: copy mode reads.
 - **The buffer is the whole context, frozen on open.** It is built from
   `ContextView`'s mirror, the same source the transcript printer reads, run
   through `render_block` (`present.rs`) so copy mode shows exactly what

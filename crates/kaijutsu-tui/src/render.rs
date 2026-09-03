@@ -195,14 +195,28 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     out
 }
 
+/// One frame of the live region: its rows, and where the terminal's cursor
+/// sits among them as `(row, col)` indexed into `lines`. `None` while
+/// nothing is being typed — the picker, an ask card, the ledger and the
+/// armed legend have no cursor, and the terminal hides it.
+pub struct LiveFrame {
+    pub lines: Vec<Line<'static>>,
+    pub cursor: Option<(u16, u16)>,
+}
+
+/// The live region's rows alone — [`live_frame`] without the cursor.
+pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Vec<Line<'static>> {
+    live_frame(app, width, now_millis, armed).lines
+}
+
 /// The live region: still-streaming blocks, the compose line, the status
 /// line (or the armed-prefix legend in its place).
-pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Vec<Line<'static>> {
+pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> LiveFrame {
     // The picker grows the viewport and replaces the live region entirely
     // while open — its own key line is the view's key line, the same
     // contract every grown view (`docs/tui.md`, "The picker") follows.
     if let Some(picker) = &app.picker {
-        return crate::picker::render(picker, width, &app.palette);
+        return LiveFrame { lines: crate::picker::render(picker, width, &app.palette), cursor: None };
     }
 
     let palette = app.palette;
@@ -220,7 +234,7 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
         } else {
             status_line(&app.status_model(now_millis), width, &palette)
         });
-        return lines;
+        return LiveFrame { lines, cursor: None };
     }
 
     let mut lines = Vec::new();
@@ -289,13 +303,19 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
     // While `Ctrl+A` is pending the legend takes the compose row, not the
     // status line: the status line's seat digits are what the player is
     // about to press, and covering them was the bug Amy hit.
-    if armed {
+    let cursor = if armed {
         lines.push(legend_line(width, &palette));
+        None
     } else {
+        // The terminal's own cursor, on the draft's vi cursor: the row is
+        // the compose region's first line plus the draft row it is on.
+        let (row, col) = app.compose.cursor_cell();
+        let first = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         lines.extend(input);
-    }
+        Some((first.saturating_add(row), col))
+    };
     lines.push(status_line(&app.status_model(now_millis), width, &palette));
-    lines
+    LiveFrame { lines, cursor }
 }
 
 /// Print completed blocks into the terminal's scrollback, above the inline
@@ -328,7 +348,7 @@ pub fn draw_live<B: Backend>(
     armed: bool,
 ) -> Result<(), B::Error> {
     let width = terminal.size()?.width;
-    let lines = live_lines(app, width, now_millis, armed);
+    let LiveFrame { lines, cursor } = live_frame(app, width, now_millis, armed);
     terminal.draw(|frame| {
         let area = frame.area();
         let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).min(area.height);
@@ -347,6 +367,13 @@ pub fn draw_live<B: Backend>(
         // closes.
         let start = lines.len().saturating_sub(usize::from(height));
         frame.render_widget(Paragraph::new(lines[start..].to_vec()), bottom);
+        // A cursor on a row the crop dropped stays hidden with the row.
+        if let Some((row, col)) = cursor
+            && let Some(y) = usize::from(row).checked_sub(start)
+        {
+            let y = u16::try_from(y).unwrap_or(u16::MAX);
+            frame.set_cursor_position((bottom.x + col, bottom.y + y));
+        }
     })?;
     Ok(())
 }
@@ -618,6 +645,29 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert!(text.iter().any(|l| l.contains("still going")), "got {text:?}");
+    }
+
+    /// The terminal's own cursor rests on the compose row, past the prompt
+    /// and the draft — no painted cell stands in for it — and the armed
+    /// legend, which takes that row, leaves no cursor at all.
+    #[test]
+    fn the_cursor_sits_on_the_compose_row_after_the_draft() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _id) = fixture();
+        for c in ['i', 'h', 'i'] {
+            app.compose.press(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 7)).expect("test terminal");
+        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
+        let compose_row = rows(&terminal)
+            .iter()
+            .position(|r| r.starts_with("❯ hi"))
+            .expect("the compose row is drawn");
+        let at = terminal.get_cursor_position().expect("cursor position");
+        assert_eq!((at.x, at.y), (4, compose_row as u16), "past `❯ hi`");
+
+        let armed = live_frame(&mut app, 80, 0, true);
+        assert_eq!(armed.cursor, None, "the legend row has no cursor");
     }
 
     #[test]

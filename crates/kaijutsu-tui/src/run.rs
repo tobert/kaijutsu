@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::Event;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use kaijutsu_audio::RefDisposition;
@@ -24,7 +25,7 @@ use crate::app::{App, ContextView};
 use crate::asks;
 use crate::bridge::KernelBridge;
 use crate::cmdline::{self, ColonVerb};
-use crate::compose::Compose;
+use crate::compose::{Compose, CursorShape};
 use crate::completion;
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
@@ -231,6 +232,10 @@ async fn event_loop(
     // runtime resize — see `set_viewport_height`) and the beat-driven redraw
     // wake, both `None`/base until a track is found playing.
     let mut viewport_height = render::VIEWPORT_LINES;
+    // The cursor shape last sent to the terminal; `None` until the first
+    // frame and again after a suspend, since the host shell may have set
+    // its own.
+    let mut cursor_shape: Option<CursorShape> = None;
     let mut beat_wake: Option<Instant> = None;
     let mut beat_tempo_bps: f64 = 0.0;
 
@@ -251,6 +256,7 @@ async fn event_loop(
                                 == Acted::Suspend
                             {
                                 suspend(terminal, &wires.term_lock)?;
+                                cursor_shape = None;
                             }
                         }
                     }
@@ -365,12 +371,22 @@ async fn event_loop(
             _ = tick.tick() => {
                 let want = render::viewport_lines(app, terminal.size()?.width);
                 if want != viewport_height {
+                    tracing::debug!(from = viewport_height, to = want, "viewport resized");
                     set_viewport_height(&wires.term_lock, terminal, want)?;
                     viewport_height = want;
                 }
                 if dirty {
                     dirty = false;
+                    let was_alternate = alt.is_some();
                     draw(terminal, &mut alt, &wires.term_lock, app, keys.armed())?;
+                    // A terminal may keep a cursor shape per screen buffer, so
+                    // crossing into or out of the alternate screen forgets
+                    // what was sent and the next frame says it again.
+                    if alt.is_some() != was_alternate {
+                        cursor_shape = None;
+                    }
+                    let _guard = wires.term_lock.lock();
+                    set_cursor_shape(&mut cursor_shape, wanted_cursor_shape(app))?;
                 }
             }
         }
@@ -518,6 +534,34 @@ fn draw(
         .playing_track()
         .is_some_and(|t| app.beats.envelope(&t.score_context_id, Instant::now()) > 0.5);
     render::draw_live(terminal, app, kaijutsu_types::now_millis(), armed)?;
+    Ok(())
+}
+
+/// The cursor shape a frame of `app` wants: the draft's mode on the inline
+/// surface, the buffer's mode in the editor, and a block on the screens
+/// that read rather than type (`docs/tui.md`, "Compose").
+fn wanted_cursor_shape(app: &App) -> CursorShape {
+    match &app.screen {
+        ScreenMode::Inline => app.compose.cursor_shape(),
+        ScreenMode::Editor(screen) => CursorShape::for_mode(screen.state.mode.as_deref()),
+        ScreenMode::Diff(_) | ScreenMode::Copy(_) => CursorShape::Block,
+    }
+}
+
+/// Send `want` to the terminal when it differs from what was last sent —
+/// vim's `t_SI`/`t_EI`, as DECSCUSR. Steady shapes: blink is the terminal's
+/// own preference and it keeps it for the default shape restored on exit.
+fn set_cursor_shape(sent: &mut Option<CursorShape>, want: CursorShape) -> Result<()> {
+    if *sent == Some(want) {
+        return Ok(());
+    }
+    let style = match want {
+        CursorShape::Block => SetCursorStyle::SteadyBlock,
+        CursorShape::Bar => SetCursorStyle::SteadyBar,
+        CursorShape::Underline => SetCursorStyle::SteadyUnderScore,
+    };
+    crossterm::execute!(io::stdout(), style).context("set the cursor shape")?;
+    *sent = Some(want);
     Ok(())
 }
 
@@ -713,6 +757,7 @@ async fn compose_key(
         if app.compose.text().trim().is_empty() {
             return Ok(());
         }
+        tracing::debug!(context = %ctx.short(), "submitting the draft");
         match bridge.submit_input(ctx).await {
             Ok(_) => {
                 app.compose.reset();
@@ -853,6 +898,7 @@ fn suspend(
     // so the cursor query on the way back has crossterm's reader to itself.
     let _guard = term_lock.lock();
     let _ = terminal.flush();
+    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
     let _ = disable_raw_mode();
     println!();
 
@@ -1155,6 +1201,7 @@ fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, term_lock: &TermLock) {
     let _guard = term_lock.lock();
     let _ = terminal.flush();
+    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
     let _ = disable_raw_mode();
     println!();
 }

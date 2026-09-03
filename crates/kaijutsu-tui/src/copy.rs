@@ -312,11 +312,19 @@ impl CopyScreen {
     }
 
     /// Where the terminal's cursor goes: after the typed text on the search
-    /// prompt row, or hidden while the hint line owns the bottom row.
+    /// prompt row while `/` is being typed, otherwise on the reader's line —
+    /// tmux keeps the real cursor on the copy cursor, so the terminal draws
+    /// it in its own shape. Call after [`Self::frame`], which settles `top`.
     pub fn frame_cursor(&self, height: u16) -> Option<(u16, u16)> {
-        let prompt = self.search.prompt.as_ref()?;
-        let col = 1 + prompt.text.chars().count() as u16;
-        Some((col, height.saturating_sub(1)))
+        if let Some(prompt) = &self.search.prompt {
+            let col = 1 + prompt.text.chars().count() as u16;
+            return Some((col, height.saturating_sub(1)));
+        }
+        if self.lines.is_empty() {
+            return None;
+        }
+        let row = self.cursor.saturating_sub(self.top);
+        Some((0, u16::try_from(row).unwrap_or(u16::MAX)))
     }
 
     /// The bottom line: position, context label, keys. The key list
@@ -879,5 +887,24 @@ mod tests {
     #[test]
     fn osc52_encodes_the_known_base64_of_a_short_string() {
         assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    /// The terminal cursor rides the reader's line: the bottom row of the
+    /// body on entry, one row up after `k`, and the search prompt row while
+    /// `/` is being typed.
+    #[test]
+    fn the_terminal_cursor_rides_the_reader_line() {
+        let mut screen = fixture(20);
+        let palette = Palette::builtin();
+        let _ = screen.frame(10, 80, &palette);
+        let body = screen.body_h() as u16;
+        assert_eq!(screen.frame_cursor(10), Some((0, body - 1)), "entered at the bottom");
+        handle_key(&mut screen, &press(KeyCode::Char('k')), 10);
+        let _ = screen.frame(10, 80, &palette);
+        assert_eq!(screen.frame_cursor(10), Some((0, body - 2)));
+        handle_key(&mut screen, &press(KeyCode::Char('/')), 10);
+        handle_key(&mut screen, &press(KeyCode::Char('a')), 10);
+        let _ = screen.frame(10, 80, &palette);
+        assert_eq!(screen.frame_cursor(10), Some((2, 9)), "after `/a` on the bottom row");
     }
 }

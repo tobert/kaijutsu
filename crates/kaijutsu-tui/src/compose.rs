@@ -118,6 +118,31 @@ impl ColonHistory {
     }
 }
 
+/// The terminal cursor's shape, one per vi mode, as vim shapes it in a
+/// terminal (`docs/tui.md`, "Compose").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorShape {
+    /// Normal mode, and every surface that reads rather than types.
+    Block,
+    /// Insert mode and the `:` bar.
+    Bar,
+    /// Replace mode.
+    Underline,
+}
+
+impl CursorShape {
+    /// The shape for a vi mode banner as `EditorCore::mode` names it
+    /// (`None` is normal mode) — shared by the compose line and the editor's
+    /// alternate screen, which carry the same banners.
+    pub fn for_mode(mode: Option<&str>) -> Self {
+        match mode {
+            Some(mode) if mode.contains("INSERT") => CursorShape::Bar,
+            Some(mode) if mode.contains("REPLACE") => CursorShape::Underline,
+            _ => CursorShape::Block,
+        }
+    }
+}
+
 /// The compose surface.
 pub struct Compose {
     editor: EditorCore,
@@ -187,6 +212,41 @@ impl Compose {
     /// apart.
     pub fn mode_banner(&self) -> String {
         self.editor.mode().unwrap_or_else(|| "-- NORMAL --".to_string())
+    }
+
+    /// Where the terminal's cursor sits in the compose region, as `(row,
+    /// col)` in cells from the region's first line: after the typed text on
+    /// the `:` bar, and on the draft's vi cursor — past the `❯` prompt on the
+    /// first row, past the matching indent on a continuation row.
+    pub fn cursor_cell(&mut self) -> (u16, u16) {
+        if let Some(raw) = self.editor.command_line() {
+            let (glyph, body) = bar_prompt(&raw);
+            return (0, cells(glyph.width() + body.width()));
+        }
+        let text = self.text();
+        let offset = self.cursor();
+        let mut row = 0usize;
+        let mut line_start = 0usize;
+        for (seen, ch) in text.chars().enumerate() {
+            if seen >= offset {
+                break;
+            }
+            if ch == '\n' {
+                row += 1;
+                line_start = seen + 1;
+            }
+        }
+        let before: String = text.chars().skip(line_start).take(offset - line_start).collect();
+        (cells(row), cells(PROMPT.width() + before.width()))
+    }
+
+    /// The cursor's shape for the mode the draft is in: a bar while inserting
+    /// and on the `:` bar, an underline while replacing, a block otherwise.
+    pub fn cursor_shape(&self) -> CursorShape {
+        if self.editor.command_line().is_some() {
+            return CursorShape::Bar;
+        }
+        CursorShape::for_mode(self.editor.mode().as_deref())
     }
 
     /// Record the context version an `edit_input` acknowledged.
@@ -384,6 +444,12 @@ pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Li
         out.push(Line::from(spans));
     }
     out
+}
+
+/// A cell count as the terminal addresses it. A draft wider than `u16`
+/// cannot be typed on any terminal; saturating keeps the arithmetic honest.
+fn cells(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
 }
 
 /// Split a raw bar line (`:` prefix included) into the prompt to draw and
@@ -812,5 +878,52 @@ mod tests {
         compose.press(press(KeyCode::Char(':')));
         compose.press(press(KeyCode::Up));
         assert_eq!(compose.command_line().as_deref(), Some(":kj fork"));
+    }
+
+    /// The terminal's cursor follows the vi cursor: after the typed text
+    /// while inserting, back on the last character once `Esc` returns to
+    /// normal mode — and its shape names the mode, a bar then a block.
+    #[test]
+    fn the_cursor_cell_and_shape_follow_the_mode() {
+        let mut compose = Compose::new();
+        assert_eq!(compose.cursor_shape(), CursorShape::Block, "a fresh draft rests in normal");
+        insert(&mut compose);
+        typed(&mut compose, "hi");
+        assert_eq!(compose.cursor_cell(), (0, cells(PROMPT.width() + 2)));
+        assert_eq!(compose.cursor_shape(), CursorShape::Bar);
+        compose.press(press(KeyCode::Esc));
+        assert_eq!(compose.cursor_cell(), (0, cells(PROMPT.width() + 1)), "normal mode sits on `i`");
+        assert_eq!(compose.cursor_shape(), CursorShape::Block);
+    }
+
+    /// A continuation row counts its own characters after the indent, not
+    /// the whole draft's.
+    #[test]
+    fn the_cursor_cell_lands_on_a_continuation_row() {
+        let mut compose = Compose::new();
+        insert(&mut compose);
+        typed(&mut compose, "ab");
+        compose.press(press(KeyCode::Enter));
+        typed(&mut compose, "c");
+        assert_eq!(compose.cursor_cell(), (1, cells(PROMPT.width() + 1)));
+    }
+
+    /// One mapping serves both the compose line and the editor screen.
+    #[test]
+    fn a_mode_banner_names_its_cursor_shape() {
+        assert_eq!(CursorShape::for_mode(None), CursorShape::Block);
+        assert_eq!(CursorShape::for_mode(Some("-- INSERT --")), CursorShape::Bar);
+        assert_eq!(CursorShape::for_mode(Some("-- REPLACE --")), CursorShape::Underline);
+        assert_eq!(CursorShape::for_mode(Some("-- VISUAL --")), CursorShape::Block);
+    }
+
+    /// The `:` bar keeps the cursor after what was typed, in the bar's shape.
+    #[test]
+    fn the_colon_bar_puts_the_cursor_after_its_text() {
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Char(':')));
+        typed(&mut compose, "kj");
+        assert_eq!(compose.cursor_cell(), (0, cells(COLON_PROMPT.width() + 2)));
+        assert_eq!(compose.cursor_shape(), CursorShape::Bar);
     }
 }
