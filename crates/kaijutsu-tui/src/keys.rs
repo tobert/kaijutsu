@@ -21,6 +21,9 @@ pub enum Intent {
     /// `Ctrl+A n` / `Ctrl+A p` — the next or previous seat on the rank,
     /// wrapping, screen's next/previous window.
     StepSeat(isize),
+    /// `Ctrl+A ]` — paste the last copy-mode yank into the draft, tmux's
+    /// `paste-buffer`. The buffer is the tui's own, never the OS clipboard.
+    Paste,
     /// `Ctrl+C` — the caller decides whether this is the second press.
     Interrupt,
     /// A key for compose's `VimMachine`, which owns both the draft and the
@@ -99,6 +102,7 @@ impl Keys {
                 KeyCode::Char('l') => Intent::OpenLedger,
                 KeyCode::Char('v') => Intent::OpenDiff,
                 KeyCode::Char('[') => Intent::CopyMode,
+                KeyCode::Char(']') => Intent::Paste,
                 KeyCode::Char('n') => Intent::StepSeat(1),
                 KeyCode::Char('p') => Intent::StepSeat(-1),
                 KeyCode::Char('\'') | KeyCode::Char('A') | KeyCode::Char('q')
@@ -157,6 +161,13 @@ mod tests {
         assert!(keys.armed());
         assert_eq!(keys.interpret(press(KeyCode::Char('3'))), Intent::SwitchSeat(3));
         assert!(!keys.armed(), "the prefix disarms after one chord");
+    }
+
+    #[test]
+    fn ctrl_a_close_bracket_pastes() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char(']'))), Intent::Paste);
     }
 
     #[test]

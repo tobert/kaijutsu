@@ -127,6 +127,11 @@ pub struct App {
     /// — it is what `Ctrl+C`'s ladder and `:q`'s warning read, not an
     /// authoritative turn registry.
     pub turns_running: HashSet<ContextId>,
+    /// The last copy-mode yank, for `Ctrl+A ]` — tmux's paste buffer. The
+    /// tui's own, so it never needs aligning with vim's registers or the OS
+    /// clipboard (the yank also goes to the clipboard over OSC 52, but that
+    /// is a one-way emission the tui cannot read back).
+    pub paste_buffer: Option<String>,
     /// What has displaced the inline viewport, when anything has. Only the
     /// editor and the diff viewer take the alternate screen (`docs/tui.md`,
     /// ruling 1), and the key path early-returns on it, which is what makes
@@ -190,6 +195,7 @@ impl App {
             principal: None,
             notice: None,
             turns_running: HashSet::new(),
+            paste_buffer: None,
             screen: crate::editor::ScreenMode::Inline,
             ask_owners: HashMap::new(),
             ask_card: None,

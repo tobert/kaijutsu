@@ -263,6 +263,13 @@ impl Compose {
         }
     }
 
+    /// Insert `text` at the cursor as one edit — `Ctrl+A ]`, the paste
+    /// buffer. Text, not keystrokes: a normal-mode draft never reads it as
+    /// commands, and one op keeps it one `edit_input`.
+    pub fn paste(&mut self, text: &str) -> Vec<EditOp> {
+        self.editor.insert_at_cursor(text)
+    }
+
     /// Interpret one keystroke. Compose always holds the keyboard: there is
     /// no state past normal mode, so a second `Esc` is harmless and the vi
     /// keys after it act on the draft.
@@ -487,6 +494,22 @@ mod tests {
         assert_eq!(compose.mode_banner(), "-- NORMAL --");
         compose.press(press(KeyCode::Char('x')));
         assert_eq!(compose.text(), "h", "`x` deletes under the cursor");
+    }
+
+    /// `Ctrl+A ]` — the paste buffer lands at the cursor as one edit, in
+    /// whatever mode the draft is in; it is text, not keystrokes, so a
+    /// normal-mode draft does not read it as commands.
+    #[test]
+    fn paste_inserts_text_at_the_cursor_as_one_edit() {
+        let mut compose = Compose::new();
+        typed(&mut compose, "ab");
+        let ops = compose.paste("xy\nz");
+        assert_eq!(ops.len(), 1, "one op, not one per char: {ops:?}");
+        assert_eq!(compose.text(), "abxy\nz");
+        compose.press(press(KeyCode::Esc));
+        let ops = compose.paste("dd");
+        assert!(!ops.is_empty());
+        assert!(compose.text().contains("dd"), "pasted as text in normal mode: {:?}", compose.text());
     }
 
     /// The draft is a shared block: a sibling's typing shows.

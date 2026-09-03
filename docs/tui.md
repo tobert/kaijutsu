@@ -156,6 +156,12 @@ Rules the figure carries:
   in the status line rather than pretending. This is the price of guidance 1,
   paid knowingly.
 - `Thinking` renders dim and collapses when its turn completes.
+- A `ToolResult` with structured output (`OutputData` — headers, a flat list,
+  a tree, `rich_json`) lays out at the terminal's real width in the tui: a
+  table, `ls -C` columns, or an indented tree (`layout::layout_output`).
+  kaish owns the data, the tui owns the layout; `kaijutsu_present::format`'s
+  one-name-per-line string is the fallback for plain text and for any client
+  that has no width to lay out against.
 
 ### Compose
 
@@ -356,6 +362,12 @@ Rules the figure carries:
   redraw. Leaving never prints into scrollback — the buffer is read-only, and
   closing it is a screen change, not a transcript event
   (`tests/terminal_fit.rs`'s `copy_mode_opens_and_q_restores_the_inline_viewport`).
+- **`Ctrl+A ]` pastes the last yank into the draft** at the cursor, as
+  one edit, in whatever mode the draft is in — tmux's `paste-buffer`. The
+  buffer is the tui's own, so it never needs aligning with vim's registers
+  or the OS clipboard (Amy: *"I always disliked trying to align copy
+  buffers between vim/tmux/os"*). The same yank also goes out over OSC 52,
+  one way; the tui never reads the OS clipboard back.
 - `Space` starts a linewise selection and `Enter` copies it and leaves —
   GNU screen's copy mode and tmux's vi mode agree, and those are the hands
   this answers (Amy: *"spacebar to start a grab, then enter to get it into

@@ -609,6 +609,14 @@ async fn act(
             Some(id) => switch_seat(bridge, app, id, feed_tx).await?,
             None => app.note("no seats"),
         },
+        Intent::Paste => match (app.current, app.paste_buffer.clone()) {
+            (Some(ctx), Some(text)) => {
+                let ops = app.compose.paste(&text);
+                mirror_ops(bridge, app, ctx, &ops).await;
+            }
+            (None, _) => app.note("no context attached"),
+            (_, None) => app.note("paste buffer empty — Ctrl+A [ then Space, Enter to fill it"),
+        },
         Intent::LastContext => match app.switch_to_previous() {
             Some(id) => {
                 app.compose.load_draft(&bridge.read_input(id).await.unwrap_or_default());
@@ -670,6 +678,23 @@ async fn switch_seat(
     Ok(())
 }
 
+/// Mirror what the vi engine did to the draft onto the context's draft
+/// block, one `edit_input` per op.
+async fn mirror_ops(bridge: &KernelBridge, app: &mut App, ctx: ContextId, ops: &[kaijutsu_editor::EditOp]) {
+    for op in ops {
+        match bridge
+            .edit_input(ctx, op.offset as u64, &op.insert, op.delete as u64)
+            .await
+        {
+            Ok(version) => app.compose.record_ack(version),
+            // The draft is the kernel's copy; a failed edit means the two have
+            // diverged, and saying so beats typing into a line that is no
+            // longer going anywhere.
+            Err(e) => app.note(format!("draft edit failed: {e}")),
+        }
+    }
+}
+
 /// One keystroke on the compose surface: mirror what the vi engine did onto
 /// the context's draft block, and submit when it asks.
 async fn compose_key(
@@ -682,18 +707,7 @@ async fn compose_key(
         return Ok(());
     };
     let action = app.compose.press(key);
-    for op in &action.ops {
-        match bridge
-            .edit_input(ctx, op.offset as u64, &op.insert, op.delete as u64)
-            .await
-        {
-            Ok(version) => app.compose.record_ack(version),
-            // The draft is the kernel's copy; a failed edit means the two have
-            // diverged, and saying so beats typing into a line that is no
-            // longer going anywhere.
-            Err(e) => app.note(format!("draft edit failed: {e}")),
-        }
-    }
+    mirror_ops(bridge, app, ctx, &action.ops).await;
     if let Some(line) = action.command {
         handle_colon_line(bridge, app, ctx, line).await;
         return Ok(());
@@ -1311,9 +1325,10 @@ async fn act_alternate(
             CopyOutcome::Yanked(text) => {
                 app.screen = ScreenMode::Inline;
                 match write_osc52(term_lock, &text) {
-                    Ok(()) => app.note(format!("yanked {} lines", text.lines().count())),
+                    Ok(()) => app.note(format!("yanked {} lines — Ctrl+A ] pastes", text.lines().count())),
                     Err(e) => app.note(format!("clipboard write failed: {e}")),
                 }
+                app.paste_buffer = Some(text);
             }
             _ => {}
         }
