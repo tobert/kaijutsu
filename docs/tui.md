@@ -153,17 +153,17 @@ Rules the figure carries:
 - `▸` is a collapsed block; only `Error` collapses by default (tool output
   prints whole, guidance 7) and
   `Error` is a one-line stub, per the app's error-render policy. Collapse is
-  kernel state (`CollapsedChanged`), so a sibling's expand is yours too.
+  kernel state (`CollapsedChanged`), so a sibling's expand is yours too. A
+  completed `Thinking` block is the one block that prints as a `▸` stub
+  regardless ("The thinking pane").
 - A block that completes leaves the viewport for scrollback. A late edit,
   exclude or collapse of a block already in scrollback **cannot redraw it**;
   the change is real in the kernel and the next hydrate, and the TUI says so
   in the status line rather than pretending. This is the price of guidance 1,
   paid knowingly.
-- `Thinking` prints whole, dim and italic, and nothing collapses it: it
-  completes before the reply starts, so a turn-end collapse could never
-  reach scrollback anyway (Amy: *"start by removing any collapse, and just
-  show it"*). A thinking pane that grows the viewport while reasoning
-  streams and leaves a stub behind is the open design, "Roads not taken".
+- `Thinking` streams dim and italic in the thinking pane and leaves a
+  `▸ thinking · N lines · …` stub in scrollback when it completes; the
+  whole text stays in copy mode and `kj block read` ("The thinking pane").
 - A `ToolResult` with structured output (`OutputData` — headers, a flat list,
   a tree, `rich_json`) lays out at the terminal's real width in the tui: a
   table, `ls -C` columns, or an indented tree (`layout::layout_output`).
@@ -212,6 +212,52 @@ Rules the figure carries:
   don't think we need the unfocused mode at all"*). Vi motions in normal
   mode act on the draft. `:` opens the bar from normal mode, and the bar
   closes into normal mode.
+
+### The thinking pane
+
+```text
+  ─ claude · coder ─────────────────────────────────────────────── 14:02:11
+  The unlink bug: resolve() canonicalizes the final component, so the
+  symlink's target is what gets removed. Check resolve_nofollow first,
+  then whether rename and getattr share the cause. The test that would
+  show it is vfs::unlink_symlink; run that before touching rename ▍
+
+  ❯                                                                -- NORMAL --
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        coder/deepseek-v4  ▮ 42%  ● ok
+```
+
+…and once the block completes, scrollback holds one line in its place:
+
+```text
+  ▸ thinking · 14 lines · The unlink bug: resolve() canonicalizes the final…
+```
+
+Reasoning pops up while it runs and gets out of the way when it is done,
+without ceasing to be findable (Amy: *"those would pop up while thinking
+runs then get out of the way, but still be findable"*).
+
+Rules the figure carries:
+
+- The pane opens when a `Thinking` block is streaming in the current
+  context **and** this client knows the turn is running (`turns_running`,
+  the partial signal under "The `:` line"): the band grows to
+  `THINKING_PANE_LINES` (12) and the live region shows the reasoning's tail
+  at that budget, dim and italic. It is one size, taken once and given back
+  once — growing with every streamed line would recreate the viewport each
+  frame.
+- The turn-liveness half is what closes a pane a lost turn would otherwise
+  hold open: a block left `Running` by a dropped stream shows in the
+  ordinary band, never in a stuck pane.
+- The block completing is the dismiss. It prints into scrollback as one
+  `▸ thinking · N lines · <first line>` stub, in document order, before the
+  reply it led to. Interleaved thinking (between tool calls) opens and
+  closes the pane again.
+- The stub is not a toggle: scrollback is never redrawn (guidance 1). The
+  whole reasoning is in copy mode (`Ctrl+A [` renders the block expanded)
+  and `kj block read <id>`.
+- The machinery: `render::thinking_pane_open` decides, `render::viewport_lines`
+  grows, `take_settled_prints` prints the stub through
+  `present::thinking_stub_line`. Grows the viewport and shrinks on dismiss.
 
 ### The `:` line and the `Ctrl+C` ladder
 
@@ -717,17 +763,6 @@ that must not play the turn. Today `pty_request`, `shell_request`,
 `ConnectionHandler` (`kaijutsu-server/src/ssh.rs`) and stay that way. The
 `Backend`-generic renderer keeps the door unlocked; the loopback `ActorHandle`
 is what would keep a kernel-served variant honest.
-
-**A thinking pane, not yet.** Reasoning could stream in a view that grows
-the viewport while a turn runs (the third viewport claim, as the ask card
-and the ledger grow it) and leave a one-line `▸` stub in scrollback when
-the block completes, with the whole text still findable in copy mode and
-`kj block read`. It fits the three claims without a fourth, and the print
-path already has the seam: `take_settled_prints` would print a stub for a
-completed `Thinking` block instead of the block, and `live_lines` would
-hold the streaming one at a larger budget. Not built, because Amy is torn
-between reading reasoning as it runs and having it get out of the way;
-today it prints whole, and the pane waits on her playing with that.
 
 **Bevy with a terminal frontend.** `bevy_ratatui` exists. Of the app's ~90k
 lines, ~65k are vello/MSDF/Bevy-UI/3D and cannot render in a terminal; the

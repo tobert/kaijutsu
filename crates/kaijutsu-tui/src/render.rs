@@ -11,7 +11,7 @@
 //! the same frames a real terminal gets.
 
 use chrono::{Local, TimeZone};
-use kaijutsu_types::{BlockSnapshot, ContextId, Status};
+use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Status};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
@@ -31,6 +31,32 @@ pub const LIVE_CHROME_LINES: u16 = 2;
 /// and copy reach it. A grown view (the picker, an ask card, the ledger)
 /// changes this — [`viewport_lines`] is where.
 pub const VIEWPORT_LINES: u16 = 7;
+
+/// Rows the inline viewport holds while a `Thinking` block streams in the
+/// current context — the thinking pane (`docs/tui.md`, "The thinking
+/// pane"). One size, taken when the block starts and given back when it
+/// completes: growing with every streamed line would recreate the viewport
+/// each frame.
+pub const THINKING_PANE_LINES: u16 = 12;
+
+/// Whether the thinking pane is open: the current context has a `Thinking`
+/// block still streaming *and* this client knows the turn is running. The
+/// second half is what keeps a block left `Running` by a lost turn from
+/// holding the band open forever (`App::forget_turn_liveness`).
+pub fn thinking_pane_open(app: &App) -> bool {
+    let Some(context_id) = app.current else {
+        return false;
+    };
+    if !app.turn_running(context_id) {
+        return false;
+    }
+    app.views.get(&context_id).is_some_and(|view| {
+        view.mirror
+            .blocks()
+            .iter()
+            .any(|b| b.kind == BlockKind::Thinking && b.status == Status::Running)
+    })
+}
 
 /// `1756819331000` → `14:02:11`, in the terminal's own timezone.
 ///
@@ -95,7 +121,15 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
             lines.push(Line::default());
         }
         {
-            let view = app.block_view(&block, &speaker, &stamp, show_divider);
+            let mut view = app.block_view(&block, &speaker, &stamp, show_divider);
+            // A completed `Thinking` block leaves one `▸` stub in scrollback,
+            // whatever its collapse state: the reasoning was read as it
+            // streamed in the thinking pane, and the whole text stays in
+            // copy mode and `kj block read` (`docs/tui.md`, "The thinking
+            // pane").
+            if block.kind == BlockKind::Thinking {
+                view.collapsed = true;
+            }
             lines.extend(crate::present::render_block(&block, &view, width, &app.palette));
         }
         app.mark_printed(context_id, block.id, &speaker);
@@ -190,6 +224,9 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
     }
 
     let mut lines = Vec::new();
+    // The band this frame is drawn into — [`VIEWPORT_LINES`], or the
+    // thinking pane's height while one is open.
+    let band = viewport_lines(app, width);
 
     // Resolve everything the wrap needs while `app` is only borrowed
     // immutably; the cache itself is a mutable borrow and cannot overlap.
@@ -230,7 +267,7 @@ pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ve
     // One status line, one blank row above the input region, plus however
     // many rows the input region takes.
     let chrome = 2 + u16::try_from(input.len()).unwrap_or(u16::MAX);
-    let budget = usize::from(VIEWPORT_LINES.saturating_sub(chrome));
+    let budget = usize::from(band.saturating_sub(chrome));
     if lines.len() > budget {
         lines.drain(..lines.len() - budget);
     }
@@ -398,6 +435,9 @@ pub fn viewport_lines(app: &App, width: u16) -> u16 {
     if let Some(active) = crate::asks::active_view_viewport_lines(app, width) {
         want = want.max(active);
     }
+    if thinking_pane_open(app) {
+        want = want.max(THINKING_PANE_LINES);
+    }
     want
 }
 
@@ -533,7 +573,7 @@ mod tests {
         app.switch_to(id);
         let first = take_settled_prints(&mut app, 80);
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].lines.len(), 3, "divider plus the two thinking lines");
+        assert_eq!(first[0].lines.len(), 2, "divider plus the thinking stub");
 
         let mut mirror = ContextMirror::new(id);
         mirror
@@ -1021,5 +1061,109 @@ mod tests {
         let text = rows(&terminal);
         assert!(text[0].starts_with("LEDGER"), "got {text:?}");
         assert!(text.iter().any(|l| l.contains("p1") && l.contains("shell_write")), "got {text:?}");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // The thinking pane (docs/tui.md, "The thinking pane")
+    // ────────────────────────────────────────────────────────────────────
+
+    fn text_of(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// A completed `Thinking` block prints as one `▸` stub naming its size
+    /// and first line, whatever its collapse state.
+    #[test]
+    fn a_completed_thinking_block_prints_as_a_stub() {
+        let (mut app, id) = fixture();
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(
+                vec![block(
+                    id,
+                    9,
+                    BlockKind::Thinking,
+                    Role::Model,
+                    Status::Done,
+                    "first the unlink path\nthen rename\nthen getattr",
+                )],
+                1,
+            )
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        let prints = take_settled_prints(&mut app, 80);
+        let rows = text_of(&prints.last().expect("a print").lines);
+        let stub = rows.last().expect("a stub row");
+        assert!(stub.starts_with("▸ thinking · 3 lines · first the unlink path"), "got {stub:?}");
+        assert!(!rows.iter().any(|r| r.contains("then rename")), "the body stays out: {rows:?}");
+    }
+
+    /// Copy mode is where the whole reasoning stays findable: the copy
+    /// buffer renders the same block expanded.
+    #[test]
+    fn the_copy_buffer_keeps_thinking_whole() {
+        let (mut app, id) = fixture();
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(
+                vec![block(
+                    id,
+                    9,
+                    BlockKind::Thinking,
+                    Role::Model,
+                    Status::Done,
+                    "first the unlink path\nthen rename",
+                )],
+                1,
+            )
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        let (_, lines) = copy_buffer_lines(&app, 80).expect("a buffer");
+        let rows = text_of(&lines);
+        assert!(rows.iter().any(|r| r == "then rename"), "got {rows:?}");
+        assert!(!rows.iter().any(|r| r.starts_with("▸ thinking")), "no stub here: {rows:?}");
+    }
+
+    fn streaming_thinking(app: &mut App, id: ContextId, lines: usize) {
+        let body = (0..lines).map(|n| format!("thought {n}")).collect::<Vec<_>>().join("\n");
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(
+                vec![block(id, 9, BlockKind::Thinking, Role::Model, Status::Running, &body)],
+                1,
+            )
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+    }
+
+    /// The pane opens while a `Thinking` block streams in a running turn,
+    /// and only then: a completed block, or one whose turn this client
+    /// cannot see running, leaves the band at its ordinary height.
+    #[test]
+    fn the_pane_opens_for_a_streaming_thinking_block_in_a_running_turn() {
+        let (mut app, id) = fixture();
+        streaming_thinking(&mut app, id, 3);
+        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "no known turn: no pane");
+        app.mark_turn_running(id);
+        assert_eq!(viewport_lines(&app, 80), THINKING_PANE_LINES);
+        app.mark_turn_ended(id);
+        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "the turn's end closes it");
+    }
+
+    /// While the pane is open the live region shows the reasoning's tail
+    /// at the pane's budget, not the ordinary band's four rows.
+    #[test]
+    fn the_open_pane_shows_more_of_the_streaming_reasoning() {
+        let (mut app, id) = fixture();
+        streaming_thinking(&mut app, id, 30);
+        app.mark_turn_running(id);
+        let live = live_lines(&mut app, 80, 0, false);
+        assert_eq!(live.len(), usize::from(THINKING_PANE_LINES));
+        let rows = text_of(&live);
+        assert!(rows.iter().any(|r| r == "thought 29"), "the newest line: {rows:?}");
+        assert!(rows.iter().any(|r| r == "thought 22"), "and more of the tail: {rows:?}");
     }
 }

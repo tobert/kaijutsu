@@ -286,9 +286,10 @@ pub fn divider_line(view: &BlockView<'_>, width: u16, palette: &Palette) -> Line
 
 /// One block as styled lines, wrapped to `width`.
 ///
-/// A collapsed `ToolCall`/`ToolResult` is one `▸` line; an `Error` block is
-/// one `✗` stub line; `Thinking` renders dim through its tone. Everything
-/// else is the block's formatted text, word-wrapped, flush-left.
+/// A collapsed `ToolCall`/`ToolResult` is one `▸` line; a collapsed
+/// `Thinking` block is one `▸ thinking · N lines · …` line; an `Error`
+/// block is one `✗` stub line; `Thinking` renders dim through its tone.
+/// Everything else is the block's formatted text, word-wrapped, flush-left.
 pub fn render_block(
     block: &BlockSnapshot,
     view: &BlockView<'_>,
@@ -309,7 +310,13 @@ pub fn render_block(
         return lines;
     }
     if view.collapsed {
-        lines.push(stub_line(COLLAPSED_MARK, &text, width, base));
+        if block.kind == BlockKind::Thinking {
+            // The raw content, not `text`: the formatter's `Thinking` header
+            // line would otherwise be the stub's "first line".
+            lines.push(thinking_stub_line(block.content.trim(), width, base));
+        } else {
+            lines.push(stub_line(COLLAPSED_MARK, &text, width, base));
+        }
         return lines;
     }
 
@@ -471,6 +478,20 @@ fn stub_line(mark: &str, text: &str, width: u16, style: Style) -> Line<'static> 
     let first = text.lines().next().unwrap_or("").trim_end();
     let body = truncate(
         &format!("{mark} {first}"),
+        usize::from(width),
+    );
+    Line::from(Span::styled(body, style))
+}
+
+/// The thinking pane's stub: `▸ thinking · 14 lines · The unlink bug…`,
+/// cut with `…` rather than wrapped. The size says how much reasoning the
+/// stub stands for; the first line says what it was about.
+fn thinking_stub_line(text: &str, width: u16, style: Style) -> Line<'static> {
+    let count = text.lines().count();
+    let noun = if count == 1 { "line" } else { "lines" };
+    let first = text.lines().next().unwrap_or("").trim_end();
+    let body = truncate(
+        &format!("{COLLAPSED_MARK} thinking · {count} {noun} · {first}"),
         usize::from(width),
     );
     Line::from(Span::styled(body, style))
