@@ -325,7 +325,7 @@ impl CopyScreen {
         } else {
             format!("line {}/{}", self.cursor + 1, self.lines.len())
         };
-        let keys = "j/k move  ^D/^U page  gg/G top/bottom  / search  q leave";
+        let keys = "j/k move  ^D/^U page  gg/G top/bottom  / search  Space mark  Enter copy  q leave";
         Line::from(Span::styled(
             format!("{position}   {}   {keys}", self.context_label),
             palette.status(),
@@ -494,13 +494,20 @@ pub fn handle_key(
                 CopyOutcome::Ignored
             }
         }
-        KeyCode::Char('v') => {
+        // `Space` marks and `Enter` copies: GNU screen's copy mode and
+        // tmux's vi mode agree, and those are the hands this answers.
+        // `v`/`y` are the vim spelling of the same two acts.
+        KeyCode::Char('v') | KeyCode::Char(' ') => {
             screen.toggle_selection();
             CopyOutcome::Moved
         }
         KeyCode::Char('y') => match screen.yank() {
             Some(text) => CopyOutcome::Yanked(text),
             None => CopyOutcome::Ignored,
+        },
+        KeyCode::Enter => match screen.yank() {
+            Some(text) => CopyOutcome::Yanked(text),
+            None => CopyOutcome::Close,
         },
         _ => CopyOutcome::Ignored,
     }
@@ -792,6 +799,28 @@ mod tests {
         let outcome = handle_key(&mut screen, &press(KeyCode::Char('y')), 10);
         assert_eq!(outcome, CopyOutcome::Yanked("line 2\nline 3\nline 4".to_string()));
         assert!(screen.selection.is_none(), "yanking clears the selection");
+    }
+
+    /// GNU screen and tmux's vi mode both mark with `Space` and copy with
+    /// `Enter` — the keys Amy's hands know. `v`/`y` stay as the vim
+    /// spelling of the same two acts.
+    #[test]
+    fn space_marks_and_enter_copies_and_leaves() {
+        let mut screen = fixture(10);
+        screen.set_cursor(2);
+        handle_key(&mut screen, &press(KeyCode::Char(' ')), 10);
+        assert!(screen.selection.is_some(), "Space starts the selection");
+        handle_key(&mut screen, &press(KeyCode::Char('j')), 10);
+        let outcome = handle_key(&mut screen, &press(KeyCode::Enter), 10);
+        assert_eq!(outcome, CopyOutcome::Yanked("line 2\nline 3".to_string()));
+    }
+
+    /// `Enter` with nothing marked leaves copy mode, as tmux's
+    /// copy-selection-and-cancel does with an empty selection.
+    #[test]
+    fn enter_with_no_selection_leaves() {
+        let mut screen = fixture(10);
+        assert_eq!(handle_key(&mut screen, &press(KeyCode::Enter), 10), CopyOutcome::Close);
     }
 
     #[test]

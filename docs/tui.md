@@ -53,7 +53,8 @@ kaijutsu-server / kernel
    conversation, switch so that movement goes up and down the transcript.
    The transcript becomes a buffer on the alternate screen under vi
    motions (`j`/`k`, `Ctrl+U`/`Ctrl+D`, `gg`/`G`, `/` and `?` search),
-   `v` then `y` yanks to the clipboard (OSC 52 over ssh), `q` or `Esc`
+   `Space` marks and `Enter` copies to the clipboard (OSC 52 over ssh; `v`
+   and `y` are the vim spelling of the same two acts), `q` or `Esc`
    leaves. Fullscreen exists only where vim and tmux themselves go
    fullscreen: the editor, the diff, copy mode. Amy: *"I almost hit ctrl-a
    [ to start scrolling up in this window so what if we put that in?"*
@@ -324,7 +325,7 @@ conversation is scrolled from the keyboard.
   so the symlink's target was removed instead of the link. resolve_nofollow
   fixes unlink; rename and getattr share the cause and are deliberately ▍
   ▸ shell  cargo test -p kaijutsu-kernel vfs::                     running 4s
-  line 1204/1207   kaijutsu   j/k move  ^D/^U page  gg/G top/bottom  / search  q leave
+  line 1204/1207   kaijutsu   j/k move  ^D/^U page  gg/G  / search  Space mark  Enter copy  q leave
 ```
 
 Rules the figure carries:
@@ -355,7 +356,13 @@ Rules the figure carries:
   redraw. Leaving never prints into scrollback — the buffer is read-only, and
   closing it is a screen change, not a transcript event
   (`tests/terminal_fit.rs`'s `copy_mode_opens_and_q_restores_the_inline_viewport`).
-- `v` starts a linewise selection; `y` yanks the selected lines to the
+- `Space` starts a linewise selection and `Enter` copies it and leaves —
+  GNU screen's copy mode and tmux's vi mode agree, and those are the hands
+  this answers (Amy: *"spacebar to start a grab, then enter to get it into
+  the buffer"*; her `.screenrc` and `.tmux.conf` carry no custom copy
+  bindings, so these are the defaults she learned). `Enter` with nothing
+  marked leaves. `v` and `y` are the vim spelling of the same two acts:
+  `v` starts a linewise selection; `y` yanks the selected lines to the
   clipboard over OSC 52 (`ESC ] 52 ; c ; <base64> BEL`, written straight to
   stdout under the same `term_lock` every other terminal write takes) and
   leaves copy mode, the way tmux does. `Esc` with a selection active cancels
