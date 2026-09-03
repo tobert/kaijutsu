@@ -280,15 +280,6 @@ and Amy's second morning, in rough priority:
 - **Harness: the 3-byte tail hold reassembles only `ESC[6n`.** A longer
   CSI split across reads relies on vt100 buffering its own partial
   sequence, which it does, and nothing asserts.
-- **The thinking pane is a 400 ms flap on a fast model.** A pty probe
-  against the live kernel (tui `RUST_LOG=kaijutsu_tui=debug`, the
-  `viewport resized` trace) shows `7→12` and `12→7` 400 ms apart on
-  deepseek-v4-flash; the afternoon's real turns held a Thinking block
-  `Running` for 1–4 s. Each open and close rebuilds the inline viewport.
-  Two shapes on the table: hold the pane for the whole turn as its own
-  sub-band above the stream (latest reasoning's tail, close and stub at
-  turn end; one rebuild per turn), or a minimum dwell after a block
-  completes. Amy picks.
 - **Rolling the newer chords into the app** is its own entry: "The tui and
   the app disagree on a few chords".
 

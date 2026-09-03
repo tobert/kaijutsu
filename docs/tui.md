@@ -226,11 +226,13 @@ Rules the figure carries:
 ### The thinking pane
 
 ```text
-  ─ claude · coder ─────────────────────────────────────────────── 14:02:11
   The unlink bug: resolve() canonicalizes the final component, so the
   symlink's target is what gets removed. Check resolve_nofollow first,
   then whether rename and getattr share the cause. The test that would
-  show it is vfs::unlink_symlink; run that before touching rename ▍
+  show it is vfs::unlink_symlink; run that before touching rename.
+
+  ─ claude · coder ─────────────────────────────────────────────── 14:02:11
+  The unlink bug was in resolve(): it canonicalized the final ▍
 
   ❯                                                                -- NORMAL --
   0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        coder/deepseek-v4  ▮ 42%  ● ok
@@ -242,32 +244,41 @@ Rules the figure carries:
   ▸ thinking · 14 lines · The unlink bug: resolve() canonicalizes the final…
 ```
 
-Reasoning pops up while it runs and gets out of the way when it is done,
-without ceasing to be findable (Amy: *"those would pop up while thinking
-runs then get out of the way, but still be findable"*).
+Reasoning pops up while the turn runs and gets out of the way when the
+turn is done, without ceasing to be findable (Amy: *"those would pop up
+while thinking runs then get out of the way, but still be findable"*).
 
 Rules the figure carries:
 
-- The pane opens when a `Thinking` block is streaming in the current
-  context **and** this client knows the turn is running (`turns_running`,
-  the partial signal under "The `:` line"): the band grows to
-  `THINKING_PANE_LINES` (12) and the live region shows the reasoning's tail
-  at that budget, dim and italic. It is one size, taken once and given back
-  once — growing with every streamed line would recreate the viewport each
-  frame.
+- **The pane is the turn's, not the block's.** It opens at the first
+  `Thinking` block of a turn this client knows is running (`turns_running`,
+  the partial signal under "The `:` line") and holds until that turn ends.
+  A fast model thinks for 400 ms; a pane that closed with the block was a
+  flap that rebuilt the viewport twice per block, measured on
+  deepseek-v4-flash (`App::observe_thinking` is the latch, cleared by
+  `mark_turn_ended`; a block that completed inside one delivery latches
+  too, as long as its stub has not printed).
+- **The band is its own rows.** The viewport grows to `THINKING_PANE_LINES`
+  (14 = the ordinary 7 + `THINKING_BAND_LINES` 6 + one blank row) and the
+  latest reasoning's tail takes the top six rows, dim and italic, above
+  the stream — so the answer streaming in never scrolls the reasoning out
+  of the pane, and a later thinking block in the same turn replaces the
+  earlier one in place. One size, taken once and given back once.
 - The turn-liveness half is what closes a pane a lost turn would otherwise
   hold open: a block left `Running` by a dropped stream shows in the
-  ordinary band, never in a stuck pane.
-- The block completing is the dismiss. It prints into scrollback as one
-  `▸ thinking · N lines · <first line>` stub, in document order, before the
-  reply it led to. Interleaved thinking (between tool calls) opens and
-  closes the pane again.
-- The stub is not a toggle: scrollback is never redrawn (guidance 1). The
-  whole reasoning is in copy mode (`Ctrl+A [` renders the block expanded)
-  and `kj block read <id>`.
-- The machinery: `render::thinking_pane_open` decides, `render::viewport_lines`
-  grows, `take_settled_prints` prints the stub through
-  `present::thinking_stub_line`. Grows the viewport and shrinks on dismiss.
+  ordinary band, never in a stuck pane (`forget_turn_liveness` clears the
+  latch with the flags).
+- **The block completing prints the stub**, in document order, so
+  scrollback reads in sequence while the pane still holds the text: one
+  `▸ thinking · N lines · <first line>` line
+  (`present::thinking_stub_line`, from raw content). Thinking blocks leave
+  the stream while the pane holds them, so nothing draws twice.
+- **Copy mode renders the block whole**, collapse state ignored for
+  `Thinking`, so the reasoning stays findable after the pane closes; so
+  does `kj block read`.
+- No tui-side truncation, no kernel budget: what prints is what the
+  provider sent (Claude's adaptive summarized thinking is the API's own
+  summary; DeepSeek gets `reasoning_effort`).
 
 ### The `:` line and the `Ctrl+C` ladder
 

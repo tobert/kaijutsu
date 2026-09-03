@@ -1120,6 +1120,7 @@ async fn apply_feed(
                 view.seed_collapse();
             }
             reconcile_draft(app, context_id);
+            app.observe_thinking(context_id);
         }
         FeedEvent::Resubscribed => {
             // The actor already re-subscribed on this receiver's behalf;
@@ -1132,6 +1133,7 @@ async fn apply_feed(
                         view.seed_collapse();
                     }
                     reconcile_draft(app, context_id);
+                    app.observe_thinking(context_id);
                     app.note("reconnected; context rehydrated");
                 }
                 Err(e) => app.note(format!("rehydrate failed: {e}")),

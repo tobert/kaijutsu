@@ -11,7 +11,7 @@ use std::time::Duration;
 use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
 };
-use kaijutsu_types::{BlockId, BlockSnapshot, ContextId, PrincipalId, Role, Status};
+use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 
 use crate::compose::Compose;
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
@@ -110,6 +110,10 @@ pub struct App {
     /// — it is what `Ctrl+C`'s ladder and `:q`'s warning read, not an
     /// authoritative turn registry.
     pub turns_running: HashSet<ContextId>,
+    /// Contexts whose running turn has shown a `Thinking` block — the
+    /// thinking pane's latch (`docs/tui.md`, "The thinking pane"). Set by
+    /// [`Self::observe_thinking`] as the feed lands, cleared with the turn.
+    thinking_turns: HashSet<ContextId>,
     /// The draft block this client last submitted. A submit promotes the
     /// draft in place — the kernel flips its status to `Done` rather than
     /// deleting it — and a keystroke echo still on the feed can arrive before
@@ -185,6 +189,7 @@ impl App {
             principal: None,
             notice: None,
             turns_running: HashSet::new(),
+            thinking_turns: HashSet::new(),
             submitted_draft: None,
             paste_buffer: None,
             screen: crate::editor::ScreenMode::Inline,
@@ -362,8 +367,37 @@ impl App {
     }
 
     /// Mark `context_id`'s turn as ended. Returns whether the set changed.
+    /// The thinking pane's latch ends with the turn.
     pub fn mark_turn_ended(&mut self, context_id: ContextId) -> bool {
+        self.thinking_turns.remove(&context_id);
         self.turns_running.remove(&context_id)
+    }
+
+    /// Latch the thinking pane for `context_id` when its turn is running and
+    /// its mirror holds a `Thinking` block not yet printed — a block that
+    /// completed inside one delivery counts, so a fast model's reasoning
+    /// opens the pane as surely as a slow one's. Returns whether it latched
+    /// now.
+    pub fn observe_thinking(&mut self, context_id: ContextId) -> bool {
+        if !self.turn_running(context_id) || self.thinking_turns.contains(&context_id) {
+            return false;
+        }
+        let seen = self.views.get(&context_id).is_some_and(|view| {
+            view.mirror
+                .blocks()
+                .iter()
+                .any(|b| b.kind == BlockKind::Thinking && !view.printed.contains(&b.id))
+        });
+        if seen {
+            self.thinking_turns.insert(context_id);
+        }
+        seen
+    }
+
+    /// Whether the thinking pane is latched open for `context_id`: its
+    /// turn is running and has shown reasoning.
+    pub fn thinking_pane_latched(&self, context_id: ContextId) -> bool {
+        self.turn_running(context_id) && self.thinking_turns.contains(&context_id)
     }
 
     /// Forget every turn this client believed was running. The event stream
@@ -374,6 +408,7 @@ impl App {
     pub fn forget_turn_liveness(&mut self) -> bool {
         let had = !self.turns_running.is_empty();
         self.turns_running.clear();
+        self.thinking_turns.clear();
         had
     }
 

@@ -32,30 +32,37 @@ pub const LIVE_CHROME_LINES: u16 = 2;
 /// changes this — [`viewport_lines`] is where.
 pub const VIEWPORT_LINES: u16 = 7;
 
-/// Rows the inline viewport holds while a `Thinking` block streams in the
-/// current context — the thinking pane (`docs/tui.md`, "The thinking
-/// pane"). One size, taken when the block starts and given back when it
-/// completes: growing with every streamed line would recreate the viewport
-/// each frame.
-pub const THINKING_PANE_LINES: u16 = 12;
+/// Rows of the thinking band: the tail of the turn's latest reasoning,
+/// drawn above the stream while the thinking pane is open (`docs/tui.md`,
+/// "The thinking pane").
+pub const THINKING_BAND_LINES: u16 = 6;
 
-/// Whether the thinking pane is open: the current context has a `Thinking`
-/// block still streaming *and* this client knows the turn is running. The
-/// second half is what keeps a block left `Running` by a lost turn from
-/// holding the band open forever (`App::forget_turn_liveness`).
+/// Rows the inline viewport holds while the thinking pane is open: the
+/// ordinary band plus the thinking band and one blank row between them.
+/// One size, taken at the turn's first reasoning and given back at the
+/// turn's end: growing with every streamed line would recreate the
+/// viewport each frame, and a fast model's pane would flap.
+pub const THINKING_PANE_LINES: u16 = VIEWPORT_LINES + THINKING_BAND_LINES + 1;
+
+/// Whether the thinking pane is open: the current context's turn is running
+/// and has shown a `Thinking` block (`App::thinking_pane_latched`). The
+/// turn-liveness half is what keeps a block left `Running` by a lost turn
+/// from holding the band open forever (`App::forget_turn_liveness`).
 pub fn thinking_pane_open(app: &App) -> bool {
-    let Some(context_id) = app.current else {
-        return false;
-    };
-    if !app.turn_running(context_id) {
-        return false;
-    }
-    app.views.get(&context_id).is_some_and(|view| {
-        view.mirror
-            .blocks()
-            .iter()
-            .any(|b| b.kind == BlockKind::Thinking && b.status == Status::Running)
-    })
+    app.current.is_some_and(|context_id| app.thinking_pane_latched(context_id))
+}
+
+/// The turn's latest `Thinking` block, in document order, whatever its
+/// status — the band shows the newest reasoning until the turn ends.
+fn latest_thinking(app: &App) -> Option<BlockSnapshot> {
+    let context_id = app.current?;
+    let view = app.views.get(&context_id)?;
+    view.mirror
+        .blocks()
+        .iter()
+        .rev()
+        .find(|b| b.kind == BlockKind::Thinking)
+        .cloned()
 }
 
 /// `1756819331000` → `14:02:11`, in the terminal's own timezone.
@@ -241,6 +248,7 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
     // The band this frame is drawn into — [`VIEWPORT_LINES`], or the
     // thinking pane's height while one is open.
     let band = viewport_lines(app, width);
+    let pane_open = thinking_pane_open(app);
 
     // Resolve everything the wrap needs while `app` is only borrowed
     // immutably; the cache itself is a mutable borrow and cannot overlap.
@@ -250,7 +258,32 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
         .and_then(|id| app.info(id))
         .map(|c| c.context_type.clone())
         .unwrap_or_else(|| "default".to_string());
+
+    // The thinking band: the tail of the turn's latest reasoning, its own
+    // rows above the stream so the answer streaming in never scrolls it
+    // away, then one blank row. Thinking blocks leave the stream while the
+    // pane holds them.
+    let mut thinking = Vec::new();
+    if pane_open && let Some(block) = latest_thinking(app) {
+        let stamp = wallclock(block.created_at);
+        let block_view = crate::present::BlockView {
+            speaker: "",
+            context_type: &context_type,
+            stamp: &stamp,
+            show_divider: false,
+            collapsed: false,
+            local_ctx: Some(block.id.context_id),
+        };
+        let rendered = app.wrap.lines(&block, &block_view, width, &palette);
+        let keep = usize::from(THINKING_BAND_LINES).min(rendered.len());
+        thinking.extend(rendered[rendered.len() - keep..].iter().cloned());
+        thinking.push(Line::default());
+    }
+
     for (block, item) in &plan {
+        if pane_open && block.kind == BlockKind::Thinking {
+            continue;
+        }
         let block_view = crate::present::BlockView {
             speaker: &item.speaker,
             context_type: &context_type,
@@ -281,9 +314,13 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
     // One status line, one blank row above the input region, plus however
     // many rows the input region takes.
     let chrome = 2 + u16::try_from(input.len()).unwrap_or(u16::MAX);
-    let budget = usize::from(band.saturating_sub(chrome));
+    let budget = usize::from(band.saturating_sub(chrome)).saturating_sub(thinking.len());
     if lines.len() > budget {
         lines.drain(..lines.len() - budget);
+    }
+    if !thinking.is_empty() {
+        thinking.append(&mut lines);
+        lines = thinking;
     }
 
     // The `:kj ` completion popup rides above the compose line, only while
@@ -1196,31 +1233,74 @@ mod tests {
         app.views.insert(id, ContextView::new(mirror));
     }
 
-    /// The pane opens while a `Thinking` block streams in a running turn,
-    /// and only then: a completed block, or one whose turn this client
-    /// cannot see running, leaves the band at its ordinary height.
+    /// A turn whose reasoning already completed and whose answer is now
+    /// streaming: a `Done` Thinking block of `lines` rows, then a `Running`
+    /// Text block.
+    fn thinking_then_answer(app: &mut App, id: ContextId, lines: usize) {
+        let body = (0..lines).map(|n| format!("thought {n}")).collect::<Vec<_>>().join("\n");
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(
+                vec![
+                    block(id, 9, BlockKind::Thinking, Role::Model, Status::Done, &body),
+                    block(id, 10, BlockKind::Text, Role::Model, Status::Running, "The unlink bug"),
+                ],
+                1,
+            )
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+    }
+
+    /// The pane opens at a running turn's first `Thinking` block and holds
+    /// until the turn ends — not until the block does, which on a fast
+    /// model is 400 ms later. A turn this client cannot see running never
+    /// opens it.
     #[test]
-    fn the_pane_opens_for_a_streaming_thinking_block_in_a_running_turn() {
+    fn the_pane_latches_at_the_turns_first_thinking_and_holds_to_its_end() {
         let (mut app, id) = fixture();
         streaming_thinking(&mut app, id, 3);
+        assert!(!app.observe_thinking(id), "no known turn: nothing to latch");
         assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "no known turn: no pane");
         app.mark_turn_running(id);
+        assert!(app.observe_thinking(id));
         assert_eq!(viewport_lines(&app, 80), THINKING_PANE_LINES);
+
+        thinking_then_answer(&mut app, id, 3);
+        assert_eq!(viewport_lines(&app, 80), THINKING_PANE_LINES, "the block completing is not the dismiss");
         app.mark_turn_ended(id);
         assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "the turn's end closes it");
     }
 
-    /// While the pane is open the live region shows the reasoning's tail
-    /// at the pane's budget, not the ordinary band's four rows.
+    /// A completed thinking block seen only after it completed — one
+    /// delivery carried the whole thing — still opens the pane, as long as
+    /// its stub has not printed yet.
     #[test]
-    fn the_open_pane_shows_more_of_the_streaming_reasoning() {
+    fn a_thinking_block_that_completed_inside_one_delivery_still_latches() {
         let (mut app, id) = fixture();
-        streaming_thinking(&mut app, id, 30);
         app.mark_turn_running(id);
+        thinking_then_answer(&mut app, id, 3);
+        assert!(app.observe_thinking(id));
+    }
+
+    /// The band above the stream keeps the reasoning's tail while the
+    /// answer streams below it, so the answer never scrolls the reasoning
+    /// out of the pane.
+    #[test]
+    fn the_band_holds_the_latest_reasoning_above_the_streaming_answer() {
+        let (mut app, id) = fixture();
+        app.mark_turn_running(id);
+        thinking_then_answer(&mut app, id, 30);
+        assert!(app.observe_thinking(id));
         let live = live_lines(&mut app, 80, 0, false);
-        assert_eq!(live.len(), usize::from(THINKING_PANE_LINES));
+        // A short answer leaves the frame under the viewport's height;
+        // `draw_live` bottom-aligns it. What must hold is the band's shape.
+        assert!(live.len() <= usize::from(THINKING_PANE_LINES), "{}", live.len());
         let rows = text_of(&live);
-        assert!(rows.iter().any(|r| r == "thought 29"), "the newest line: {rows:?}");
-        assert!(rows.iter().any(|r| r == "thought 22"), "and more of the tail: {rows:?}");
+        let newest = rows.iter().position(|r| r == "thought 29").expect("the newest line");
+        let oldest = rows.iter().position(|r| r == "thought 24").expect("six rows of tail");
+        assert!(!rows.iter().any(|r| r == "thought 23"), "the band is six rows: {rows:?}");
+        let answer = rows.iter().position(|r| r.contains("The unlink bug")).expect("the answer streams");
+        assert!(oldest < newest && newest < answer, "band above the stream: {rows:?}");
+        assert_eq!(rows[newest + 1], "", "one blank row between them: {rows:?}");
     }
 }
