@@ -140,7 +140,7 @@ Rules the figure carries:
 Compose is a modalkit `VimMachine` over the kernel-owned input block
 (`edit_input` / `submit_input`), as the app's compose overlay is. The draft is
 a shared block: a sibling's typing shows. `Enter` in normal mode submits;
-`Esc Esc` in normal mode clears focus (`docs/input.md`, "Escape").
+A second `Esc` is harmless: compose always holds the keyboard.
 
 Rules the figure carries:
 
@@ -163,10 +163,13 @@ Rules the figure carries:
 - Enter in insert mode is a newline: that is how a multi-line draft is
   written, and the compose region grows inside the viewport, taking rows from
   the transcript.
-- Unfocused, compose answers only `i`/`a`/`o` and `:`; every other key is
-  left for another surface to claim, and the banner says `i to type, : for a
-  command`. `:` from any state opens the bar, and the bar closes into normal
-  mode.
+- There is no state past normal mode. The app's `Esc Esc` hands the
+  keyboard to its block list; the tui prints its transcript into scrollback
+  and never redraws it, so a block cursor would have nothing to act on, and
+  the unfocused state that reserved room for one was deleted (Amy: *"I
+  don't think we need the unfocused mode at all"*). Vi motions in normal
+  mode act on the draft. `:` opens the bar from normal mode, and the bar
+  closes into normal mode.
 
 ### The `:` line and the `Ctrl+C` ladder
 
@@ -272,8 +275,8 @@ shell one keystroke and one `fg` away.
 typing, and `Esc` discards it without reaching the draft (the receipt for
 the pre-lane "a bar nobody can see and every key after it goes there" bug);
 `:q` and `:q!` exit 0; `:kj context list` and `:!echo hi` land real blocks,
-and `:kj context list` lands from an unfocused compose too (the state
-`Esc Esc` leaves, where the first live test stalled);
+and `:kj context list` lands after a second `Esc` too (where the first live
+test stalled, when a second `Esc` still meant something);
 a partial `:` line never repeats into scrollback; one `Ctrl+C` posts
 `nothing to interrupt` and does not quit, two within the window still do
 not quit; `Ctrl+Z` suspends and `SIGCONT` leaves a responsive client (the

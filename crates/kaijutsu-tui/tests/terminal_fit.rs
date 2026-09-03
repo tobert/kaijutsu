@@ -496,10 +496,11 @@ fn colon_kj_runs_the_command_and_lands_its_output() {
     }
 }
 
-/// `:` from an unfocused compose — the state `Esc Esc` leaves behind, and
-/// where the first live test stalled — opens the bar and runs the line.
+/// `:` after a second `Esc` — the keystroke a player reaching for normal
+/// mode from anywhere types, and where the first live test stalled when a
+/// second `Esc` still meant something — opens the bar and runs the line.
 #[test]
-fn colon_kj_runs_from_an_unfocused_compose() {
+fn colon_kj_runs_after_a_second_esc() {
     let _serial = serial();
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
@@ -510,10 +511,10 @@ fn colon_kj_runs_from_an_unfocused_compose() {
         "the INSERT banner never cleared: {}",
         session.dump("after Esc")
     );
-    session.send("\x1b"); // Esc again: unfocus
+    session.send("\x1b"); // Esc again: still normal mode
     assert!(
-        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "i to type")),
-        "compose never unfocused: {}",
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "NORMAL")),
+        "normal mode never showed: {}",
         session.dump("after Esc Esc")
     );
 
@@ -527,8 +528,8 @@ fn colon_kj_runs_from_an_unfocused_compose() {
         let (scrollback, text) = session.history_snapshot();
         assert!(
             scrollback.iter().chain(text.iter()).any(|l| l.contains("context") && l.contains("list")),
-            "no block carrying the kj argv landed from unfocused compose: {}",
-            session.dump("after :kj context list from unfocused")
+            "no block carrying the kj argv landed after Esc Esc: {}",
+            session.dump("after :kj context list after Esc Esc")
         );
     }
 }

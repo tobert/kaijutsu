@@ -604,7 +604,6 @@ mod tests {
         app.views.insert(id, ContextView::new(mirror));
 
         let one_line = live_lines(&mut app, 80, 0, false).len();
-        let now = std::time::Instant::now();
         for code in [
             ratatui::crossterm::event::KeyCode::Char('a'),
             ratatui::crossterm::event::KeyCode::Enter,
@@ -615,7 +614,6 @@ mod tests {
                     code,
                     ratatui::crossterm::event::KeyModifiers::NONE,
                 ),
-                now,
             );
         }
         let grown = live_lines(&mut app, 80, 0, false);
@@ -634,9 +632,8 @@ mod tests {
     fn the_colon_bar_replaces_the_compose_line() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let (mut app, _) = fixture();
-        let now = std::time::Instant::now();
         let press = |app: &mut App, code: KeyCode| {
-            app.compose.press(KeyEvent::new(code, KeyModifiers::NONE), now);
+            app.compose.press(KeyEvent::new(code, KeyModifiers::NONE));
         };
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char(':'));

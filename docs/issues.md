@@ -211,8 +211,8 @@ What the lanes left open, in rough priority:
 **Terminal-fit harness** (`tests/terminal_fit.rs`, shipped 2026-09-02): the
 real binary in a portable-pty against an ephemeral kernel, parsed by vt100.
 Sixteen probes pass, including a mid-screen start reaching the bottom band, a
-partial `:` line never repeating into the transcript, `:kj` from an unfocused
-compose, and the `Ctrl+C` rungs that must not quit. What Amy saw as "the status line a third of the way up"
+partial `:` line never repeating into the transcript, `:kj` after a second
+`Esc`, and the `Ctrl+C` rungs that must not quit. What Amy saw as "the status line a third of the way up"
 in wezterm and "a few rows above bottom" in konsole was the live band drawing
 top-aligned in its six reserved rows, fixed by bottom-aligning `draw_live`
 (`ebc84e9c`), not a terminal difference. **Still open:** her report of partial

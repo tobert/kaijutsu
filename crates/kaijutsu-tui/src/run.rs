@@ -648,7 +648,7 @@ async fn compose_key(
         app.note("no context attached");
         return Ok(());
     };
-    let action = app.compose.press(key, std::time::Instant::now());
+    let action = app.compose.press(key);
     for op in &action.ops {
         match bridge
             .edit_input(ctx, op.offset as u64, &op.insert, op.delete as u64)
@@ -660,9 +660,6 @@ async fn compose_key(
             // longer going anywhere.
             Err(e) => app.note(format!("draft edit failed: {e}")),
         }
-    }
-    if action.unfocus {
-        app.note("compose unfocused — i to type, : for a command");
     }
     if let Some(line) = action.command {
         handle_colon_line(bridge, app, ctx, line).await;
