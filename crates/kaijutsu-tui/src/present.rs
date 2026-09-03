@@ -23,6 +23,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+use crate::layout::layout_output;
+
 /// Marks a block rendered collapsed.
 pub const COLLAPSED_MARK: &str = "▸";
 /// Marks an `Error` block's one-line stub.
@@ -308,6 +310,34 @@ pub fn render_block(
     }
     if view.collapsed {
         lines.push(stub_line(COLLAPSED_MARK, &text, width, base));
+        return lines;
+    }
+
+    // A tool result with structured output lays out at the real width
+    // (columns, a table, a tree) instead of `format_output_data`'s
+    // no-width fallback — kaish owns the data, the tui owns the layout
+    // (`docs/tui.md`, guidance 7). `layout_output` carries no color of its
+    // own besides an entry-type hint, so the block's base tone is patched
+    // underneath every span, the same way markdown span tones layer over it
+    // below.
+    if block.kind == BlockKind::ToolResult
+        && let Some(output) = block.output.as_ref()
+        && let Some(body) = layout_output(output, width, palette)
+    {
+        lines.extend(body.into_iter().map(|line| {
+            let spans = line
+                .spans
+                .into_iter()
+                .map(|s| Span::styled(s.content, base.patch(s.style)))
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        }));
+        if let Some(stderr) = block.stderr.as_deref() {
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                lines.extend(wrap_styled(&[(base, stderr.to_string())], width));
+            }
+        }
         return lines;
     }
 
@@ -927,6 +957,30 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(text.contains("warning: deprecated"), "got {text:?}");
+    }
+
+    /// An `ls`-shaped `ToolResult` renders through `layout::layout_output`
+    /// instead of `format_output_data`'s one-name-per-line fallback: at a
+    /// wide-enough terminal, several short names share a row.
+    #[test]
+    fn a_tool_result_with_structured_output_lays_out_in_columns() {
+        let mut b = block(BlockKind::ToolResult, Role::Tool, "");
+        b.status = Status::Done;
+        b.output = Some(kaijutsu_types::OutputData::nodes(
+            (0..12)
+                .map(|i| kaijutsu_types::OutputNode::new(format!("f{i}")))
+                .collect(),
+        ));
+        let mut v = view();
+        v.collapsed = false;
+        let lines = render_block(&b, &v, 40, &Palette::builtin());
+        assert!(
+            lines.len() < 12,
+            "12 short names at width 40 should share rows, got {} lines: {:?}",
+            lines.len(),
+            plain(&lines)
+        );
+        assert!(plain(&lines)[0].contains("f0") && plain(&lines)[0].contains("f1"));
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! |---|---|
 //! | [`bridge`] | connect, hydrate a context, submit a turn |
 //! | [`present`] | `BlockSnapshot` → styled lines, the wrap cache, the palette |
+//! | [`layout`] | structured tool output (`OutputData`) → width-aware lines: tables, `ls -C` columns, trees |
 //! | [`app`] | contexts, mirrors, rank, asks, cache health, notices |
 //! | [`status`] | the status line's figures and its layout |
 //! | [`render`] | the `Backend`-generic renderer and the inline viewport |
@@ -44,6 +45,7 @@ pub mod completion;
 pub mod copy;
 pub mod interrupt;
 pub mod keys;
+pub mod layout;
 pub mod picker;
 pub mod present;
 pub mod render;
