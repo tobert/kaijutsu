@@ -190,9 +190,16 @@ pub struct BackendConfig {
     /// never checked downstream.
     pub key_optional: bool,
 
-    /// Per-request timeout. Stored and exposed; wiring it into the provider
-    /// clients is Track B.
+    /// Per-request timeout: the HTTP client's bound and the stream's total
+    /// wall-clock cap for this backend. `None` takes the kernel-wide
+    /// `TimeoutPolicy::llm_request_timeout` for the stream and
+    /// `DEFAULT_REQUEST_TIMEOUT_SECS` for the client.
     pub request_timeout_secs: Option<u64>,
+
+    /// Per-chunk idle timeout for this backend's streams: how long a stream
+    /// may deliver nothing before the kernel gives up on it. `None` takes
+    /// the kernel-wide `TimeoutPolicy::llm_idle_timeout`.
+    pub idle_timeout_secs: Option<u64>,
 
     /// Per-model metadata keyed by model id. Absent entries — and entries
     /// present with no `context_window` — both resolve to `None` via
@@ -211,6 +218,7 @@ impl BackendConfig {
             api_key_file: None,
             key_optional: false,
             request_timeout_secs: None,
+            idle_timeout_secs: None,
             models: HashMap::new(),
         }
     }
@@ -307,6 +315,14 @@ impl BackendConfig {
         {
             return Err(format!(
                 "backend '{}': --request-timeout must be a positive number of seconds",
+                self.name
+            ));
+        }
+        if let Some(secs) = self.idle_timeout_secs
+            && secs == 0
+        {
+            return Err(format!(
+                "backend '{}': --idle-timeout must be a positive number of seconds",
                 self.name
             ));
         }

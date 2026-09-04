@@ -75,6 +75,7 @@ pub fn load_backends(db: &KernelDb) -> LlmResult<Vec<BackendConfig>> {
             api_key_file: row.api_key_file,
             key_optional: row.key_optional,
             request_timeout_secs: row.request_timeout_secs.and_then(|s| u64::try_from(s).ok()),
+            idle_timeout_secs: row.idle_timeout_secs.and_then(|s| u64::try_from(s).ok()),
             models,
         });
     }
@@ -408,6 +409,7 @@ mod tests {
             api_key_file: None,
             key_optional: true,
             request_timeout_secs: None,
+            idle_timeout_secs: None,
             created_at: 0,
             created_by: PrincipalId::system(),
         })
@@ -425,6 +427,7 @@ mod tests {
                 api_key_file: None,
                 key_optional: true,
                 request_timeout_secs: None,
+                idle_timeout_secs: None,
                 created_at: 0,
                 created_by: PrincipalId::system(),
             })

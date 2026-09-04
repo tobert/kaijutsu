@@ -437,7 +437,7 @@ pub(crate) async fn spawn_llm_for_prompt(
             }
         }
     };
-    let provider_resolution: Result<(Arc<Provider>, String, u64, Option<SlotTunables>), String> = {
+    let provider_resolution: Result<(Arc<Provider>, String, u64, Option<SlotTunables>, StreamTimeouts), String> = {
         let registry = kernel_arc.llm().read().await;
         let max_tokens = registry.max_output_tokens();
 
@@ -460,7 +460,11 @@ pub(crate) async fn spawn_llm_for_prompt(
                         resolved.model,
                         resolved.source
                     );
-                    Ok((p, resolved.model, max_tokens, resolved.tunables))
+                    let timeouts = StreamTimeouts::resolve(
+                        kernel_arc.timeouts(),
+                        registry.backend_config(&resolved.backend),
+                    );
+                    Ok((p, resolved.model, max_tokens, resolved.tunables, timeouts))
                 }
                 // The backend name resolved but nothing registered under it
                 // (missing key, failed init). The old code silently fell
@@ -475,7 +479,7 @@ pub(crate) async fn spawn_llm_for_prompt(
             None => Err("No LLM backend configured (see `kj backend list`)".to_string()),
         }
     };
-    let (provider, model_name, max_output_tokens, slot_tunables) = match provider_resolution {
+    let (provider, model_name, max_output_tokens, slot_tunables, stream_timeouts) = match provider_resolution {
         Ok(v) => v,
         Err(detail) => {
             log::error!("LLM resolution failed for context {context_id}: {detail}");
@@ -558,6 +562,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         after_block_id,
         system_prompt,
         max_output_tokens,
+        stream_timeouts,
         slot_tunables,
         conversation_cache,
         user_principal_id,
@@ -571,6 +576,36 @@ pub(crate) async fn spawn_llm_for_prompt(
     Ok(())
 }
 
+/// The two guards on one streaming completion, resolved per backend: the
+/// total wall-clock cap and the per-chunk idle limit. A backend's own
+/// `request_timeout_secs` / `idle_timeout_secs` (`kj backend set`) win;
+/// the kernel-wide `TimeoutPolicy` fills whichever it leaves unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamTimeouts {
+    pub request: std::time::Duration,
+    pub idle: std::time::Duration,
+}
+
+impl StreamTimeouts {
+    pub fn resolve(
+        policy: &kaijutsu_types::TimeoutPolicy,
+        backend: Option<&kaijutsu_kernel::BackendConfig>,
+    ) -> Self {
+        let secs = |v: Option<u64>, fallback: std::time::Duration| {
+            v.map(std::time::Duration::from_secs).unwrap_or(fallback)
+        };
+        Self {
+            request: secs(backend.and_then(|b| b.request_timeout_secs), policy.llm_request_timeout),
+            idle: secs(backend.and_then(|b| b.idle_timeout_secs), policy.llm_idle_timeout),
+        }
+    }
+
+    /// The kernel-wide defaults alone — a caller with no backend in hand.
+    pub fn from_policy(policy: &kaijutsu_types::TimeoutPolicy) -> Self {
+        Self::resolve(policy, None)
+    }
+}
+
 /// Agentic-loop iteration cap by consent mode (M1-A6).
 ///
 /// Both modes leave enough headroom for real chained tool work; the cap
@@ -582,6 +617,29 @@ fn iteration_cap_for_consent(mode: ConsentMode) -> u32 {
     match mode {
         ConsentMode::Collaborative => COLLABORATIVE_MAX_ITERATIONS,
         ConsentMode::Autonomous => AUTONOMOUS_MAX_ITERATIONS,
+    }
+}
+
+#[cfg(test)]
+mod stream_timeout_tests {
+    use super::*;
+
+    /// A backend's own timeouts win; the policy fills what it leaves unset.
+    #[test]
+    fn stream_timeouts_take_the_backends_own_values_over_the_policy() {
+        use std::time::Duration;
+        let policy = kaijutsu_types::TimeoutPolicy::default();
+        let none = StreamTimeouts::from_policy(&policy);
+        assert_eq!(none.idle, policy.llm_idle_timeout);
+        assert_eq!(none.request, policy.llm_request_timeout);
+        let mut slow = kaijutsu_kernel::BackendConfig::new("tenchi", kaijutsu_kernel::BackendKind::OpenAi);
+        slow.idle_timeout_secs = Some(600);
+        let t = StreamTimeouts::resolve(&policy, Some(&slow));
+        assert_eq!(t.idle, Duration::from_secs(600), "the backend's idle limit");
+        assert_eq!(t.request, policy.llm_request_timeout, "request stays the policy's when unset");
+        slow.request_timeout_secs = Some(1200);
+        let t = StreamTimeouts::resolve(&policy, Some(&slow));
+        assert_eq!(t.request, Duration::from_secs(1200));
     }
 }
 
@@ -1295,6 +1353,8 @@ async fn process_llm_stream(
     after_block_id: kaijutsu_types::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
+    // This backend's total and idle guards (`StreamTimeouts::resolve`).
+    stream_timeouts: StreamTimeouts,
     // The context's resolved cast-seat tunables (`resolve_context_model`),
     // already cascaded onto `llm_defaults`; `None` when no cast seat answered
     // (the floor then applies at the `apply_slot_tunables` seam below).
@@ -1656,9 +1716,9 @@ async fn process_llm_stream(
         let mut stream_cancelled = false;
         // Two-layer timeout: total wall-clock cap on the entire completion,
         // and a per-chunk idle guard for providers that open the connection
-        // but stop sending tokens.
-        let idle_timeout = kernel.timeouts().llm_idle_timeout;
-        let request_timeout = kernel.timeouts().llm_request_timeout;
+        // but stop sending tokens — both the backend's own when it set them.
+        let idle_timeout = stream_timeouts.idle;
+        let request_timeout = stream_timeouts.request;
         let total_deadline =
             tokio::time::sleep(request_timeout);
         tokio::pin!(total_deadline);
@@ -2611,6 +2671,7 @@ mod publish_tests {
             after,
             "system".to_string(),
             1024,
+            StreamTimeouts::from_policy(kernel.timeouts()),
             None,
             conversation_cache,
             player,
@@ -3015,6 +3076,7 @@ mod publish_tests {
             after,
             "system".to_string(),
             1024,
+            StreamTimeouts::from_policy(kernel.timeouts()),
             None,
             conversation_cache,
             player,
@@ -3621,6 +3683,7 @@ mod usage_tests {
             after,
             "system".to_string(),
             1024,
+            StreamTimeouts::from_policy(kernel.timeouts()),
             None,
             conversation_cache,
             player,

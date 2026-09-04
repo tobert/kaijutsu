@@ -74,9 +74,15 @@ enum BackendCommand {
         /// gateways where auth is network identity, not a bearer token.
         #[arg(long = "key-optional")]
         key_optional: bool,
-        /// Per-request timeout in seconds (stored; wiring is Track B)
+        /// Total seconds one call may take, HTTP and stream alike. Unset
+        /// takes the kernel default (300).
         #[arg(long = "request-timeout")]
         request_timeout: Option<u64>,
+        /// Seconds a stream may deliver nothing before the kernel gives up
+        /// on it. Unset takes the kernel default (120). Raise it for a local
+        /// box whose prefill takes minutes.
+        #[arg(long = "idle-timeout")]
+        idle_timeout: Option<u64>,
     },
     /// Remove a backend. Refused while a cast slot or alias still points at it.
     #[command(alias = "rm")]
@@ -204,6 +210,7 @@ impl KjDispatcher {
                 api_key_file,
                 key_optional,
                 request_timeout,
+                idle_timeout,
             } => {
                 newly_set_backend = Some(name.clone());
                 self.backend_set(
@@ -214,6 +221,7 @@ impl KjDispatcher {
                     api_key_file,
                     key_optional,
                     request_timeout,
+                    idle_timeout,
                     caller,
                 )
             }
@@ -370,6 +378,9 @@ impl KjDispatcher {
         if let Some(t) = backend.request_timeout_secs {
             lines.push(format!("Request timeout: {t}s"));
         }
+        if let Some(t) = backend.idle_timeout_secs {
+            lines.push(format!("Idle timeout: {t}s"));
+        }
         if models.is_empty() {
             lines.push("Models: (none pinned — context windows resolve as unknown)".to_string());
         } else {
@@ -391,6 +402,7 @@ impl KjDispatcher {
             "api_key_file": backend.api_key_file,
             "key_optional": backend.key_optional,
             "request_timeout_secs": backend.request_timeout_secs,
+            "idle_timeout_secs": backend.idle_timeout_secs,
             "models": models.iter().map(|m| serde_json::json!({
                 "model": m.model_id,
                 "context_window": m.context_window,
@@ -411,6 +423,7 @@ impl KjDispatcher {
         api_key_file: Option<String>,
         key_optional: bool,
         request_timeout: Option<u64>,
+        idle_timeout: Option<u64>,
         caller: &KjCaller,
     ) -> KjResult {
         // Unknown kind fails here, naming the closed set — never a silent
@@ -423,6 +436,7 @@ impl KjDispatcher {
         let mut probe = crate::llm::BackendConfig::new(name, parsed_kind);
         probe.base_url = base_url.clone();
         probe.request_timeout_secs = request_timeout;
+        probe.idle_timeout_secs = idle_timeout;
         if let Err(msg) = probe.validate() {
             return KjResult::Err(format!("kj backend set: {msg}"));
         }
@@ -437,6 +451,7 @@ impl KjDispatcher {
             api_key_file,
             key_optional,
             request_timeout_secs: request_timeout.map(|t| t as i64),
+            idle_timeout_secs: idle_timeout.map(|t| t as i64),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: caller.principal_id,
         });
@@ -913,6 +928,37 @@ mod tests {
             KjResult::Err(msg) => assert!(msg.contains("does not exist"), "{msg}"),
             other => panic!("a dangling default must be refused at write time: {other:?}"),
         }
+    }
+
+    /// `--idle-timeout` is stored, shown, and refused at zero — the same
+    /// discipline as `--request-timeout`. The stream reads it per backend
+    /// (`kaijutsu-server`'s `StreamTimeouts`).
+    #[tokio::test]
+    async fn set_stores_the_idle_timeout_and_show_reports_it() {
+        let d = seeded().await;
+        let c = test_caller();
+        let r = d
+            .dispatch(
+                &argv(&["backend", "set", "tenchi", "--kind", "openai", "--base-url", "http://tenchi:8000/v1", "--key-optional", "--idle-timeout", "600"]),
+                &c,
+            )
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        let shown = d.dispatch(&argv(&["backend", "show", "tenchi"]), &c).await;
+        let (text, data) = match &shown {
+            KjResult::Ok { message, data: Some(data), .. } => (message.clone(), data.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert!(text.contains("Idle timeout: 600s"), "{text}");
+        assert_eq!(data["idle_timeout_secs"].as_u64(), Some(600), "{data}");
+        let zero = d
+            .dispatch(
+                &argv(&["backend", "set", "tenchi", "--kind", "openai", "--base-url", "http://tenchi:8000/v1", "--key-optional", "--idle-timeout", "0"]),
+                &c,
+            )
+            .await;
+        assert!(!zero.is_ok(), "zero is refused: {zero:?}");
+        assert!(zero.message().contains("--idle-timeout must be a positive number"), "{}", zero.message());
     }
 
     #[tokio::test]

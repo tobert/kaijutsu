@@ -284,6 +284,7 @@ fn insert_factory_backend(
         api_key_file: fb.api_key_file.map(str::to_string),
         key_optional: fb.key_optional,
         request_timeout_secs: None,
+        idle_timeout_secs: None,
         created_at: kaijutsu_types::now_millis() as i64,
         created_by,
     })
@@ -461,6 +462,7 @@ mod tests {
             api_key_file: None,
             key_optional: true,
             request_timeout_secs: Some(600),
+            idle_timeout_secs: None,
             created_at: 0,
             created_by: who,
         })

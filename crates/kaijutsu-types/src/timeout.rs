@@ -213,13 +213,18 @@ pub struct TimeoutPolicy {
     pub init_script_timeout: Duration,
 
     /// Total wall-clock bound on a single LLM streaming completion. Wraps the
-    /// rig stream consumption loop; on elapse, the assistant turn ends with a
-    /// `BlockKind::Error`.
+    /// stream consumption loop; on elapse, the assistant turn ends with a
+    /// `BlockKind::Error`. The kernel-wide default: a backend's
+    /// `request_timeout_secs` (`kj backend set --request-timeout`) overrides
+    /// it for that backend's calls.
     pub llm_request_timeout: Duration,
 
-    /// No-progress guard between successive `stream.next()` chunks. Catches
+    /// No-progress guard between successive stream chunks. Catches
     /// providers that open the connection but stop sending tokens. Distinct
-    /// from `llm_request_timeout`, which is the total wall-clock cap.
+    /// from `llm_request_timeout`, which is the total wall-clock cap. The
+    /// kernel-wide default: a backend's `idle_timeout_secs` (`kj backend set
+    /// --idle-timeout`) overrides it — a local box that prefills for
+    /// minutes says so there, instead of every hosted API waiting longer.
     pub llm_idle_timeout: Duration,
 
     /// Bound on external MCP server spawn + handshake + initial `list_tools`.
@@ -274,7 +279,7 @@ impl Default for TimeoutPolicy {
             hook_body_timeout: Duration::from_secs(15),
             init_script_timeout: Duration::from_secs(10),
             llm_request_timeout: Duration::from_secs(300),
-            llm_idle_timeout: Duration::from_secs(30),
+            llm_idle_timeout: Duration::from_secs(120),
             mcp_connect_timeout: Duration::from_secs(10),
             mcp_call_timeout_default: Duration::from_secs(120),
             // A human answering from another surface (a different shell,

@@ -482,8 +482,10 @@ impl Kernel {
             .as_deref()
     }
 
-    /// Kernel-wide timeout policy. Read-only today; future revisions will
-    /// load this from config and expose RPC mutation via the kj CLI.
+    /// Kernel-wide timeout policy: the defaults. The LLM pair
+    /// (`llm_request_timeout`, `llm_idle_timeout`) is overridden per backend
+    /// by `kj backend set --request-timeout/--idle-timeout`; the rest is
+    /// read-only today.
     pub fn timeouts(&self) -> &kaijutsu_types::TimeoutPolicy {
         &self.timeouts
     }
@@ -494,8 +496,8 @@ impl Kernel {
     /// `&mut`, so a setter method would be unreachable in practice and
     /// misleading to future maintainers).
     ///
-    /// Used today by `KjDispatcher::test_dispatcher_with_timeouts`; once the
-    /// config load lands, it will use the same construction shape.
+    /// Used today by `KjDispatcher::test_dispatcher_with_timeouts`; a config
+    /// load for the non-LLM timeouts would use the same construction shape.
     pub fn with_timeouts(mut self, policy: kaijutsu_types::TimeoutPolicy) -> Self {
         self.timeouts = policy;
         self

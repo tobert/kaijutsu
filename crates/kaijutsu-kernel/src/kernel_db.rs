@@ -1049,6 +1049,7 @@ CREATE TABLE IF NOT EXISTS backends (
     api_key_file         TEXT,
     key_optional         INTEGER NOT NULL DEFAULT 0,
     request_timeout_secs INTEGER CHECK (request_timeout_secs IS NULL OR request_timeout_secs > 0),
+    idle_timeout_secs    INTEGER CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0),
     created_at           INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by           BLOB NOT NULL
 );
@@ -1973,6 +1974,8 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
+                 CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0)",
         ];
         for sql in alters {
             if let Err(e) = conn.execute(sql, []) {
@@ -2099,11 +2102,13 @@ impl KernelDb {
                  key_optional         INTEGER NOT NULL DEFAULT 0,
                  request_timeout_secs INTEGER
                      CHECK (request_timeout_secs IS NULL OR request_timeout_secs > 0),
+                 idle_timeout_secs    INTEGER
+                     CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0),
                  created_at           INTEGER NOT NULL
                      DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
                  created_by           BLOB NOT NULL",
                 "backend_id, name, kind, base_url, api_key_env, api_key_file, \
-                 key_optional, request_timeout_secs, created_at, created_by",
+                 key_optional, request_timeout_secs, idle_timeout_secs, created_at, created_by",
             )?;
             rebuilt |= Self::rebuild_table_dropping_check(
                 conn,
@@ -6205,6 +6210,7 @@ pub struct BackendRow {
     pub api_key_file: Option<String>,
     pub key_optional: bool,
     pub request_timeout_secs: Option<i64>,
+    pub idle_timeout_secs: Option<i64>,
     pub created_at: i64,
     pub created_by: PrincipalId,
 }
@@ -6308,7 +6314,8 @@ fn read_cast_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<CastId> {
 }
 
 const BACKEND_COLS: &str = "backend_id, name, kind, base_url, api_key_env, api_key_file, \
-                            key_optional, request_timeout_secs, created_at, created_by";
+                            key_optional, request_timeout_secs, idle_timeout_secs, created_at, \
+                            created_by";
 
 fn row_to_backend(row: &rusqlite::Row<'_>) -> SqliteResult<BackendRow> {
     Ok(BackendRow {
@@ -6320,8 +6327,9 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> SqliteResult<BackendRow> {
         api_key_file: row.get(5)?,
         key_optional: row.get::<_, i64>(6)? != 0,
         request_timeout_secs: row.get(7)?,
-        created_at: row.get(8)?,
-        created_by: read_principal_id(row, 9)?,
+        idle_timeout_secs: row.get(8)?,
+        created_at: row.get(9)?,
+        created_by: read_principal_id(row, 10)?,
     })
 }
 
@@ -6370,8 +6378,9 @@ impl KernelDb {
         let created_at = existing.as_ref().map(|b| b.created_at).unwrap_or(row.created_at);
         self.conn.execute(
             "INSERT INTO backends (backend_id, name, kind, base_url, api_key_env, api_key_file,
-                                   key_optional, request_timeout_secs, created_at, created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                   key_optional, request_timeout_secs, idle_timeout_secs,
+                                   created_at, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(backend_id) DO UPDATE SET
                  name = excluded.name,
                  kind = excluded.kind,
@@ -6379,7 +6388,8 @@ impl KernelDb {
                  api_key_env = excluded.api_key_env,
                  api_key_file = excluded.api_key_file,
                  key_optional = excluded.key_optional,
-                 request_timeout_secs = excluded.request_timeout_secs",
+                 request_timeout_secs = excluded.request_timeout_secs,
+                 idle_timeout_secs = excluded.idle_timeout_secs",
             params![
                 blob_param(backend_id.as_bytes()),
                 row.name,
@@ -6389,6 +6399,7 @@ impl KernelDb {
                 row.api_key_file,
                 row.key_optional as i64,
                 row.request_timeout_secs,
+                row.idle_timeout_secs,
                 created_at,
                 blob_param(row.created_by.as_bytes()),
             ],
@@ -7683,6 +7694,7 @@ mod tests {
             api_key_file: None,
             key_optional: false,
             request_timeout_secs: None,
+            idle_timeout_secs: None,
             created_at: now_millis(),
             created_by: PrincipalId::system(),
         };
