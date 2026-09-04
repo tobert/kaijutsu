@@ -38,6 +38,10 @@ pub struct ContextView {
     /// by one speaker carries one divider even when they print on separate
     /// frames.
     pub last_printed_speaker: Option<String>,
+    /// The last block printed, so a tool result printed on a later frame
+    /// than its call still joins the pair under one header
+    /// (`present::continues_pair`).
+    pub last_printed: Option<(BlockId, BlockKind)>,
 }
 
 impl ContextView {
@@ -48,6 +52,7 @@ impl ContextView {
             collapsed: HashMap::new(),
             activity: false,
             last_printed_speaker: None,
+            last_printed: None,
         };
         view.seed_collapse();
         view
@@ -297,12 +302,13 @@ impl App {
     /// formatted at the edge (see [`crate::render::wallclock`]).
     pub fn block_view<'a>(
         &'a self,
-        block: &BlockSnapshot,
+        block: &'a BlockSnapshot,
         speaker: &'a str,
         stamp: &'a str,
         show_divider: bool,
     ) -> BlockView<'a> {
         let ctx = block.id.context_id;
+        let (tool, arg) = tool_header(block);
         BlockView {
             speaker,
             context_type: self
@@ -311,6 +317,8 @@ impl App {
                 .unwrap_or("default"),
             stamp,
             show_divider,
+            tool,
+            arg,
             collapsed: self
                 .views
                 .get(&ctx)
@@ -336,10 +344,11 @@ impl App {
 
     /// Record that a block has been printed into scrollback and can never be
     /// redrawn, and remember who spoke it.
-    pub fn mark_printed(&mut self, context_id: ContextId, block_id: BlockId, speaker: &str) {
+    pub fn mark_printed(&mut self, context_id: ContextId, block_id: BlockId, kind: BlockKind, speaker: &str) {
         if let Some(view) = self.views.get_mut(&context_id) {
             view.printed.insert(block_id);
             view.last_printed_speaker = Some(speaker.to_string());
+            view.last_printed = Some((block_id, kind));
         }
         self.wrap.forget(&block_id);
     }
@@ -494,7 +503,9 @@ impl App {
         StatusModel {
             seats,
             mode: self.compose.mode_banner(),
-            occupancy: info.and_then(|c| c.context_used_pct).map(|p| p as u32),
+            tokens: info.and_then(|c| {
+                c.context_used_tokens.map(|used| crate::status::TokenFigure { used, window: c.context_window })
+            }),
             cache: self.cache_health(now_millis),
             pending_asks: self.pending_asks,
             connection: self.connection.clone(),
@@ -610,6 +621,17 @@ fn changed_block(change: &ContextChange) -> Option<BlockId> {
 }
 
 /// `"deepseek/deepseek-v4"` → `"deepseek-v4"`.
+/// A tool call's header parts — its tool name and its one-line argument —
+/// or `(None, None)` for any other block (`present::BlockView::tool`).
+pub fn tool_header(block: &BlockSnapshot) -> (Option<&str>, Option<String>) {
+    if block.kind != BlockKind::ToolCall {
+        return (None, None);
+    }
+    let tool = block.tool_name.as_deref().filter(|t| !t.is_empty()).or(Some("call"));
+    let input = block.tool_input.as_deref().unwrap_or(block.content.as_str());
+    (tool, crate::inflight::one_line_arg(input))
+}
+
 fn model_leaf(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
@@ -753,7 +775,7 @@ mod tests {
         app.views
             .insert(aid, ContextView::new(ContextMirror::new(aid)));
         let b = block(aid, 12, BlockKind::Text, Role::Model);
-        app.mark_printed(aid, b.id, "model");
+        app.mark_printed(aid, b.id, b.kind, "model");
 
         let posted = app.observe_change(
             aid,
@@ -790,7 +812,7 @@ mod tests {
         app.views
             .insert(aid, ContextView::new(ContextMirror::new(aid)));
         let b = block(aid, 3, BlockKind::ToolResult, Role::Tool);
-        app.mark_printed(aid, b.id, "shell");
+        app.mark_printed(aid, b.id, b.kind, "shell");
         assert!(app.observe_change(
             aid,
             &ContextChange::CollapsedChanged {

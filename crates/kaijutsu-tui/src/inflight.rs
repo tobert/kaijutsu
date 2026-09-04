@@ -172,6 +172,29 @@ fn tool_label(block: &BlockSnapshot) -> String {
     }
 }
 
+/// The one argument a call's input amounts to, when it amounts to one: the
+/// input is a JSON object whose only member is a string (`{"command": …}`,
+/// `{"path": …}`), or a bare string. Whitespace is folded so a heredoc
+/// reads on one line. `None` for anything with more shape than that — a
+/// pair header then names the tool alone and the body prints whole
+/// (`docs/tui.md`, "Conversation", the pair header).
+pub fn one_line_arg(input: &str) -> Option<String> {
+    let text = single_arg(input)?;
+    let folded: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!folded.is_empty()).then_some(folded)
+}
+
+/// [`one_line_arg`]'s source string, unfolded — a caller that must know
+/// whether the argument spans lines (a heredoc) reads this.
+pub fn single_arg(input: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    match value {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Object(map) if map.len() == 1 => map.into_iter().next()?.1.as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
 /// The first `MAX_ARG` characters of the call's argument on one line: a
 /// shell command as typed when the input is `{"command": …}`, else the
 /// raw input with its whitespace folded.
@@ -336,6 +359,22 @@ mod tests {
         assert_eq!(phase(0), 0);
         assert_eq!(phase(PHASE_MILLIS), 1);
         assert_eq!(phase(PHASE_MILLIS * u64::from(PHASES)), 0);
+    }
+
+    #[test]
+    fn one_line_arg_is_the_single_string_member_or_nothing() {
+        assert_eq!(one_line_arg(r#"{"command":"kj ledger list"}"#).as_deref(), Some("kj ledger list"));
+        assert_eq!(one_line_arg(r#"{"path":"a.rs"}"#).as_deref(), Some("a.rs"));
+        assert_eq!(one_line_arg("\"bare\"").as_deref(), Some("bare"));
+        assert_eq!(
+            one_line_arg("{\"command\":\"cat <<'EOF'\\nline one\\nEOF\"}").as_deref(),
+            Some("cat <<'EOF' line one EOF"),
+            "a heredoc folds onto one line"
+        );
+        assert_eq!(one_line_arg(r#"{"path":"a.rs","range":"1:4"}"#), None, "two members is a shape, not an arg");
+        assert_eq!(one_line_arg(r#"{"n":3}"#), None);
+        assert_eq!(one_line_arg("not json"), None);
+        assert_eq!(one_line_arg(r#"{"command":"   "}"#), None);
     }
 
     #[test]

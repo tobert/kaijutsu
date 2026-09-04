@@ -135,10 +135,14 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
 
     let mut prints = Vec::new();
     let mut last_speaker = view.last_printed_speaker.clone();
+    let mut last_printed = view.last_printed;
     for block in pending {
         let speaker = app.speaker_for(&block, info.as_ref());
-        let show_divider = last_speaker.as_deref() != Some(speaker.as_str());
-        let gap = speaker_gap(show_divider, last_speaker.as_deref());
+        // A result directly after its call shares the call's header: no
+        // divider, no gap (`docs/tui.md`, "Conversation").
+        let pair = crate::present::continues_pair(last_printed, &block);
+        let show_divider = !pair && last_speaker.as_deref() != Some(speaker.as_str());
+        let gap = !pair && speaker_gap(show_divider, last_speaker.as_deref());
         let stamp = wallclock(block.created_at);
         let mut lines = Vec::new();
         if gap {
@@ -156,7 +160,8 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
             }
             lines.extend(crate::present::render_block(&block, &view, width, &app.palette));
         }
-        app.mark_printed(context_id, block.id, &speaker);
+        app.mark_printed(context_id, block.id, block.kind, &speaker);
+        last_printed = Some((block.id, block.kind));
         last_speaker = Some(speaker);
         prints.push(Print {
             context_id,
@@ -197,14 +202,17 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     let info = app.info(context_id);
     let mut out = Vec::new();
     let mut last_speaker = view.last_printed_speaker.clone();
+    let mut last_block = view.last_printed;
     for block in view.mirror.blocks() {
         if view.printed.contains(&block.id) || block.status == Status::Draft {
             continue;
         }
         let speaker = app.speaker_for(block, info);
-        let show_divider = last_speaker.as_deref() != Some(speaker.as_str());
-        let gap = speaker_gap(show_divider, last_speaker.as_deref());
+        let pair = crate::present::continues_pair(last_block, block);
+        let show_divider = !pair && last_speaker.as_deref() != Some(speaker.as_str());
+        let gap = !pair && speaker_gap(show_divider, last_speaker.as_deref());
         last_speaker = Some(speaker.clone());
+        last_block = Some((block.id, block.kind));
         out.push((
             block.clone(),
             BlockPlan {
@@ -288,6 +296,8 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
             context_type: &context_type,
             stamp: &stamp,
             show_divider: false,
+            tool: None,
+            arg: None,
             collapsed: false,
             local_ctx: Some(block.id.context_id),
         };
@@ -308,11 +318,14 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
         if crate::inflight::takes_from_stream(block) {
             continue;
         }
+        let (tool, arg) = crate::app::tool_header(block);
         let block_view = crate::present::BlockView {
             speaker: &item.speaker,
             context_type: &context_type,
             stamp: &item.stamp,
             show_divider: item.show_divider,
+            tool,
+            arg,
             collapsed: item.collapsed,
             local_ctx: Some(block.id.context_id),
         };
@@ -501,11 +514,14 @@ pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'sta
         let speaker = app.speaker_for(block, info);
         let show_divider = last_speaker.as_deref() != Some(speaker.as_str());
         let stamp = wallclock(block.created_at);
+        let (tool, arg) = crate::app::tool_header(block);
         let block_view = crate::present::BlockView {
             speaker: &speaker,
             context_type: &context_type,
             stamp: &stamp,
             show_divider,
+            tool,
+            arg,
             // Copy mode is where reasoning stays findable, so a `Thinking`
             // block renders whole here even when a sibling collapsed it
             // (`docs/tui.md`, "The thinking pane").
@@ -783,9 +799,11 @@ mod tests {
         let status = rows.last().expect("a status line");
         assert!(status.starts_with("0 kaijutsu*"), "got {status:?}");
         assert!(status.contains("-- NORMAL --"), "the vi mode is the status line's figure: {status:?}");
-        assert!(status.contains("▮ 42%"), "got {status:?}");
-        assert!(status.contains("⟳ 91%"), "got {status:?}");
-        assert!(status.contains("⏱ 1m00s/5m"), "got {status:?}");
+        // Tokens over window, the cache share, the age in whole minutes —
+        // no icons, the separator left of the mode (`docs/tui.md`, "Status
+        // line").
+        assert!(status.contains("│  -- NORMAL --  1.0/1.0k  91%  1m"), "got {status:?}");
+        assert!(!status.contains('▮') && !status.contains('⟳') && !status.contains('⏱'), "got {status:?}");
         assert!(status.ends_with("○ offline"), "got {status:?}");
     }
 
@@ -890,6 +908,49 @@ mod tests {
         let text: String = strip.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, " ".repeat(40), "an empty strip is a full-width row of ground");
         assert!(strip.spans.iter().all(|s| s.style.bg.is_some()), "the strip's ground is painted");
+    }
+
+    /// A tool call and its result print as one unit: the pair header
+    /// (`─ caller · tool ─ arg ─… stamp`), then the result's body with no
+    /// second divider and no gap; the model's next words get their own
+    /// divider again (`docs/tui.md`, "Conversation").
+    #[test]
+    fn a_tool_pair_prints_under_one_header() {
+        let (mut app, id) = fixture();
+        let _ = take_settled_prints(&mut app, 96);
+        let principal = PrincipalId::new();
+        let call = BlockSnapshotBuilder::new(BlockId::new(id, principal, 9), BlockKind::ToolCall)
+            .role(Role::Model)
+            .status(Status::Done)
+            .tool_name("shell")
+            .tool_input(r#"{"command":"kj ledger list"}"#)
+            .content(r#"{"command":"kj ledger list"}"#)
+            .created_at(1_000)
+            .build();
+        let result = BlockSnapshotBuilder::new(BlockId::new(id, principal, 10), BlockKind::ToolResult)
+            .role(Role::Tool)
+            .status(Status::Done)
+            .tool_call_id(call.id)
+            .content("(no pending approvals)")
+            .created_at(2_000)
+            .build();
+        let after = block(id, 11, BlockKind::Text, Role::Model, Status::Done, "Nothing pending.");
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(vec![call, result, after], 1).expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+
+        let prints = take_settled_prints(&mut app, 96);
+        let rows: Vec<String> = prints
+            .iter()
+            .flat_map(|p| p.lines.iter())
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        let header = rows.iter().position(|r| r.starts_with("─ deepseek-v4 · shell ─ kj ledger list ─")).expect("the pair header");
+        assert_eq!(rows[header + 1], "(no pending approvals)", "the result follows the header directly: {rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.contains("· shell")).count(), 1, "one header for the pair: {rows:?}");
+        assert!(!rows.iter().any(|r| r.contains(r#"{"command""#)), "the call body folded into the header: {rows:?}");
+        let next = rows.iter().position(|r| r == "Nothing pending.").expect("the model's next words");
+        assert!(rows[next - 1].starts_with("─ deepseek-v4 · coder ─"), "the model's words get their divider back: {rows:?}");
     }
 
     #[test]

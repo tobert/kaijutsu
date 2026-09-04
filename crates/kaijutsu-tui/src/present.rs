@@ -245,7 +245,7 @@ impl Palette {
 }
 
 /// What a block needs from outside itself to render.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BlockView<'a> {
     /// Who is speaking, for the role divider — a principal's display name,
     /// the model, or the tool. Resolved by the caller, which is the only
@@ -259,6 +259,12 @@ pub struct BlockView<'a> {
     /// Draw the role divider above this block. A caller suppresses it when
     /// the previous printed block had the same speaker.
     pub show_divider: bool,
+    /// For a `ToolCall`: the tool's name and, when the input amounts to one
+    /// string, that string — the pair header's `· shell ─ kj ledger list`
+    /// ([`crate::inflight::one_line_arg`]). `tool: None` for every other
+    /// block.
+    pub tool: Option<&'a str>,
+    pub arg: Option<String>,
     /// Render collapsed. Kernel state (`CollapsedChanged`) after first
     /// arrival; [`collapses_by_default`] supplies the first-arrival value.
     pub collapsed: bool,
@@ -295,24 +301,57 @@ pub fn block_version(block: &BlockSnapshot, collapsed: bool) -> u64 {
     v
 }
 
-/// The role divider: `─ claude · coder ────────────────── 14:02:11`.
+/// The role divider: `─ claude · coder ────────────────── 14:02:11`, or for
+/// a tool call the pair header `─ claude · shell ─ kj ledger list ─── 14:02:11`
+/// — who called, the tool, and the one-line argument when the input is one.
 ///
 /// One ruled line, never a box: a selection of the text under it pastes
 /// clean.
 pub fn divider_line(view: &BlockView<'_>, width: u16, palette: &Palette) -> Line<'static> {
-    let width = usize::from(width.max(1));
-    let head = format!("─ {} · {} ", view.speaker, view.context_type);
-    let tail = format!(" {}", view.stamp);
-    let head_w = display_width(&head);
-    let tail_w = display_width(&tail);
-    let rule = width.saturating_sub(head_w + tail_w);
-    let text = if rule == 0 {
-        // Too narrow for the stamp — the identity is what must survive.
-        truncate(&head, width)
-    } else {
-        format!("{head}{}{tail}", "─".repeat(rule))
-    };
+    let (text, _) = divider_text(view, width);
     Line::from(Span::styled(text, palette.divider()))
+}
+
+/// [`divider_line`]'s text, and whether the header carried the whole
+/// argument. `false` when the argument was clipped to fit or the block has
+/// none — the call body then prints, so nothing is lost to the header.
+pub fn divider_text(view: &BlockView<'_>, width: u16) -> (String, bool) {
+    let width = usize::from(width.max(1));
+    let tail = format!(" {}", view.stamp);
+    let tail_w = display_width(&tail);
+    let (head, whole) = match (view.tool, view.arg.as_deref()) {
+        (Some(tool), Some(arg)) => {
+            let lead = format!("─ {} · {} ─ ", view.speaker, tool);
+            // Leave a rule of at least two cells before the stamp.
+            let room = width.saturating_sub(display_width(&lead) + tail_w + 3);
+            if display_width(arg) <= room {
+                (format!("{lead}{arg} "), true)
+            } else {
+                let clipped: String = arg.chars().take(room.saturating_sub(1)).collect();
+                (format!("{lead}{clipped}… "), false)
+            }
+        }
+        (Some(tool), None) => (format!("─ {} · {} ", view.speaker, tool), false),
+        (None, _) => (format!("─ {} · {} ", view.speaker, view.context_type), false),
+    };
+    let head_w = display_width(&head);
+    let rule = width.saturating_sub(head_w + tail_w);
+    if rule == 0 {
+        // Too narrow for the stamp — the identity is what must survive.
+        (truncate(&head, width), false)
+    } else {
+        (format!("{head}{}{tail}", "─".repeat(rule)), whole)
+    }
+}
+
+/// Whether `block` is the result of the tool call printed directly before
+/// it, so the pair shares one header: a `ToolResult` following a `ToolCall`
+/// it names through `tool_call_id`, or one that names no call at all.
+pub fn continues_pair(last: Option<(BlockId, BlockKind)>, block: &BlockSnapshot) -> bool {
+    let Some((last_id, last_kind)) = last else { return false };
+    block.kind == BlockKind::ToolResult
+        && last_kind == BlockKind::ToolCall
+        && block.tool_call_id.is_none_or(|call| call == last_id)
 }
 
 /// One block as styled lines, wrapped to `width`.
@@ -340,7 +379,17 @@ pub fn render_block(
 
     let mut lines = Vec::new();
     if view.show_divider {
-        lines.push(divider_line(view, width, palette));
+        let (header, whole_arg) = divider_text(view, width);
+        lines.push(Line::from(Span::styled(header, palette.divider())));
+        // A call whose whole one-line argument sits in its header has
+        // nothing left to say: the body would repeat the header as JSON. A
+        // heredoc's lines still print whole.
+        if block.kind == BlockKind::ToolCall
+            && whole_arg
+            && crate::inflight::single_arg(&block.content).is_some_and(|raw| !raw.contains('\n'))
+        {
+            return lines;
+        }
     }
 
     if block.kind == BlockKind::Error {
@@ -709,9 +758,81 @@ mod tests {
             context_type: "coder",
             stamp: "14:02:11",
             show_divider: false,
+            tool: None,
+            arg: None,
             collapsed: false,
             local_ctx: None,
         }
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The pair header: caller, tool, the one-line argument, the stamp at
+    /// the edge. A call whose whole argument fits prints no body; one that
+    /// is clipped, or has more shape than one string, prints it whole.
+    #[test]
+    fn a_tool_call_prints_as_one_header_when_its_argument_fits() {
+        let palette = Palette::builtin();
+        let ctx = ContextId::new();
+        let call = |input: &str| {
+            BlockSnapshotBuilder::new(BlockId::new(ctx, PrincipalId::new(), 4), BlockKind::ToolCall)
+                .role(Role::Model)
+                .status(Status::Done)
+                .tool_name("shell")
+                .tool_input(input)
+                .content(input)
+                .build()
+        };
+        let one = call(r#"{"command":"kj ledger list"}"#);
+        let hdr = BlockView {
+            speaker: "deepseek-v4-flash",
+            tool: Some("shell"),
+            arg: Some("kj ledger list".to_string()),
+            show_divider: true,
+            ..view()
+        };
+        let lines = render_block(&one, &hdr, 80, &palette);
+        assert_eq!(lines.len(), 1, "the header is the whole call: {:?}", lines.iter().map(line_text).collect::<Vec<_>>());
+        let text = line_text(&lines[0]);
+        assert!(text.starts_with("─ deepseek-v4-flash · shell ─ kj ledger list ─"), "got {text:?}");
+        assert!(text.ends_with(" 14:02:11"), "got {text:?}");
+        assert_eq!(text.chars().count(), 80);
+
+        // Too narrow: the argument clips and the body prints whole.
+        let lines = render_block(&one, &hdr, 44, &palette);
+        assert!(lines.len() > 1, "a clipped argument keeps the body");
+        assert!(line_text(&lines[0]).contains('…'), "got {:?}", line_text(&lines[0]));
+
+        // Two members: no argument in the header, the body prints.
+        let two = call(r#"{"path":"a.rs","range":"1:4"}"#);
+        let hdr = BlockView { tool: Some("read"), arg: None, show_divider: true, ..view() };
+        let lines = render_block(&two, &hdr, 80, &palette);
+        assert!(line_text(&lines[0]).starts_with("─ claude · read ─"), "got {:?}", line_text(&lines[0]));
+        assert!(lines.len() > 1);
+    }
+
+    #[test]
+    fn a_result_continues_its_call_and_nothing_else() {
+        let ctx = ContextId::new();
+        let call_id = BlockId::new(ctx, PrincipalId::new(), 4);
+        let result = |tool_call_id: Option<BlockId>| {
+            let mut b = BlockSnapshotBuilder::new(BlockId::new(ctx, PrincipalId::new(), 5), BlockKind::ToolResult)
+                .role(Role::Tool)
+                .status(Status::Done)
+                .content("ok");
+            if let Some(id) = tool_call_id {
+                b = b.tool_call_id(id);
+            }
+            b.build()
+        };
+        assert!(continues_pair(Some((call_id, BlockKind::ToolCall)), &result(Some(call_id))));
+        assert!(continues_pair(Some((call_id, BlockKind::ToolCall)), &result(None)), "a result naming no call joins the call before it");
+        let other = BlockId::new(ctx, PrincipalId::new(), 2);
+        assert!(!continues_pair(Some((call_id, BlockKind::ToolCall)), &result(Some(other))), "another call's result gets its own header");
+        assert!(!continues_pair(Some((call_id, BlockKind::Text)), &result(Some(call_id))));
+        assert!(!continues_pair(None, &result(Some(call_id))));
     }
 
     fn block(kind: BlockKind, role: Role, content: &str) -> BlockSnapshot {

@@ -147,7 +147,7 @@ is the terminal's; search, copy and split are the terminal's.
   ╰──────────────────────────────────────────────────────────────────────────╯
 
   ❯ and getattr? _                                                  -- INSERT --
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        -- NORMAL --  ▮ 42%
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
 ```
 
 Rules the figure carries:
@@ -156,6 +156,24 @@ Rules the figure carries:
   One blank row sits above it when the speaker changes (none above the first
   speaker), and one blank row sits above the `❯` line: air between what is
   read and what is typed, never a border.
+- **A tool call and its result are one unit under one header:**
+  `─ deepseek-v4-flash · shell ─ kj ledger list ─────── 07:27:12`, then the
+  result's body with no second divider and no gap. The header is who
+  called (the cast for a model's call, you for a `:!` or `:kj` line), the
+  tool, and the call's one-line argument when its input amounts to one
+  string (`inflight::one_line_arg`: a bare string or a one-member object
+  such as `{"command": …}`); the argument clips with `…` to keep the
+  stamp at the edge. A call whose whole one-line argument is in its header
+  prints no body — the body would repeat the header as JSON; a clipped
+  argument, a heredoc, or an input with more shape than one string prints
+  the body whole under the header. A result joins the call printed
+  directly before it when it names that call through `tool_call_id`, or
+  names none (`present::continues_pair`); any other result carries its own
+  divider. Tool names print as the kernel sends them (`shell`,
+  `shell_write`, `read`); a shortening table is a later, one-place change.
+  (Amy, 2026-09-04: *"could `tool` be the actual tool name? maybe
+  principal name far left … possibly some args inline?"* — option 2 of
+  three.)
 - `▸` is a collapsed block; only `Error` collapses by default (tool output
   prints whole, guidance 7) and
   `Error` is a one-line stub, per the app's error-render policy. Collapse is
@@ -183,7 +201,7 @@ Rules the figure carries:
   ❯ and getattr? the symlink case too, and whether rename shares the
     cause — run vfs::unlink_symlink before touching rename_
 
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo                 -- INSERT --  ▮ 42%
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        │  -- INSERT --  17.3/128k  91%  4m
 ```
 
 Compose is a modalkit `VimMachine` over the kernel-owned input block
@@ -258,7 +276,7 @@ Rules the figure carries:
   The unlink bug was in resolve(): it canonicalized the final ▍
 
   ❯                                                                -- NORMAL --
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        -- NORMAL --  ▮ 42%
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
 ```
 
 …and once the block completes, scrollback holds one line in its place:
@@ -313,7 +331,7 @@ Rules the figure carries:
    ◐ shell cargo test -p kaijutsu-kernel · 4s   ⏳ shell_write · waiting on ask 01a0686d · 17h
 
   ❯                                                          -- NORMAL --
-  0 ROOT  1 cc-exomemory  2 0de73794  3 tui-testing   -- NORMAL --  ▮ 13%
+  0 ROOT  1 cc-exomemory  2 0de73794  3 tui-testing   │  -- NORMAL --  17.3/128k  99%  0m
 ```
 
 One row, always present, directly above the blank row over `❯`: every
@@ -651,17 +669,23 @@ Rules the figure carries:
 Screen's window list, with kaijutsu's facts on the right:
 
 ```text
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo  -- NORMAL --  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m  17.3 ●
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo  │  -- NORMAL --  17.3/128k  91%  4m  17.3 ●
 ```
 
 Left to right: the rank (ring 0, seat digits, `*` current, `@` activity, `!`
 an ask waiting in that seat, `!n` the pending count across all contexts);
-the vi mode (`-- NORMAL --`, `-- INSERT --`, vim's spelling); context-window
-occupancy; cache health (next); bar.beat and pulse for the playing track;
-and connection state from `ConnectionStatus` only while it is not
-`Connected` — a healthy connection says nothing, `◐ connecting`,
-`◐ retrying` and `○ offline` do (Amy: *"where 'ok' is, that's not super
-useful"*).
+`│`, the one separator, always left of the mode so the eye finds it in
+the same place; the vi mode (`-- NORMAL --`, `-- INSERT --`, vim's
+spelling); the last completed call's tokens over the model's window,
+`17.3/128k` — both in thousands, the unit once, trailing by one call and
+never an estimate (the kernel does not tokenize locally), warning at 75%
+of the window and alarm at 90%; cache health (next); bar.beat and pulse
+for the playing track; and connection state from `ConnectionStatus` only
+while it is not `Connected` — a healthy connection says nothing,
+`◐ connecting`, `◐ retrying` and `○ offline` do (Amy: *"where 'ok' is,
+that's not super useful"*). No icons on the right half (Amy, 2026-09-04:
+*"let's try without for now"*); the `▮ 42%` occupancy figure is gone,
+the token count says the same thing in the units we think in.
 
 ### Cache health
 
@@ -670,13 +694,14 @@ context (Amy, 2026-08-30: *"how long since the last api turn; a proxy for KV
 health when we have no other info … for now let's focus on exposing the data
 we have"*):
 
-- **`⏱ 4m12s`** — age of the last completed call, ticking. When the cache
-  TTL of that call is known it follows as `/5m` or `/1h`; the segment turns
-  warning color past 80% of the TTL and reads `⏱ 6m01s ✗5m` once past it.
-  With no TTL known (DeepSeek, a local model) the age stands alone — an age
-  is never dressed up as an expiry.
-- **`⟳ 91%`** — the cached share of the last call,
-  `cacheReadTokens / contextUsedTokens`. `⟳ —` when either is unknown. The
+- **`4m`** — age of the last completed call, in whole minutes (Amy,
+  2026-09-04: seconds ticking beside the prompt were *"a lil
+  distracting"*). When the cache TTL of that call is known the segment
+  turns warning color past 80% of it and reads `6m ✗` once past it. With
+  no TTL known (DeepSeek, a local model) the age stands alone — an age is
+  never dressed up as an expiry. No icon; the position says what it is.
+- **`91%`** — the cached share of the last call,
+  `cacheReadTokens / contextUsedTokens`. `—` when either is unknown. The
   denominator is the last call's whole fill (input + output) because the wire
   carries no separate input-token count; an `inputTokens` field beside
   `cacheReadTokens` is what would make it the prompt share exactly.

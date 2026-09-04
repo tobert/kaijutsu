@@ -2,12 +2,12 @@
 //! right.
 //!
 //! ```text
-//! 0 kaijutsu*  1 kaish@  2 lfm2d  3 exo   -- NORMAL --  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m
+//! 0 kaijutsu*  1 kaish@  2 lfm2d  3 exo   │  -- NORMAL --  17.3/128k  91%  4m
 //! ```
 //!
 //! Left to right: the rank (seat digits, `*` current, `@` activity, `!` an
 //! ask waiting in that seat, `!n` the pending count across all contexts);
-//! cast and model; context-window occupancy; cache health; connection state.
+//! the vi mode; the last call's tokens; cache health; connection trouble.
 //! The armed-prefix legend replaces the whole line while `Ctrl+A` is pending.
 //! `docs/tui.md`, "Status line" and "Cache health".
 //!
@@ -101,36 +101,44 @@ pub fn cache_health(info: &ContextInfo, now_millis: u64) -> CacheHealth {
 }
 
 impl CacheHealth {
-    /// `⏱ 4m12s`, `⏱ 4m12s/5m`, `⏱ 6m01s ✗5m`, or `⏱ —`.
+    /// `4m`, `1h04m`, `6m ✗` past the TTL, or `—` before any call. Whole
+    /// minutes: seconds ticking beside the prompt were a distraction.
     ///
     /// The segment warns past 80% of the TTL and alarms past it. With no TTL
     /// known the age stands alone and never warns — there is nothing to be
     /// past.
     pub fn age_figure(&self) -> Figure {
         let Some(age) = self.age else {
-            return Figure::ok("⏱ —");
+            return Figure::ok("—");
         };
-        let age_text = format_age(age);
+        let age_text = format_minutes(age);
         match self.ttl {
-            None => Figure::ok(format!("⏱ {age_text}")),
-            Some(ttl) if age > ttl => Figure::at(
-                Severity::Alarm,
-                format!("⏱ {age_text} ✗{}", format_ttl(ttl)),
-            ),
+            None => Figure::ok(age_text),
+            Some(ttl) if age > ttl => Figure::at(Severity::Alarm, format!("{age_text} ✗")),
             Some(ttl) => {
                 let warn = age.as_secs() * 100 >= ttl.as_secs() * 80;
                 let severity = if warn { Severity::Warning } else { Severity::Ok };
-                Figure::at(severity, format!("⏱ {age_text}/{}", format_ttl(ttl)))
+                Figure::at(severity, age_text)
             }
         }
     }
 
-    /// `⟳ 91%`, or `⟳ —` when the provider reported no cache accounting.
+    /// `91%`, or `—` when the provider reported no cache accounting.
     pub fn share_figure(&self) -> Figure {
         match self.cached_share {
-            Some(pct) => Figure::ok(format!("⟳ {pct}%")),
-            None => Figure::ok("⟳ —"),
+            Some(pct) => Figure::ok(format!("{pct}%")),
+            None => Figure::ok("—"),
         }
+    }
+}
+
+/// `0m`, `4m`, `1h04m` — whole minutes, for the status line.
+fn format_minutes(age: Duration) -> String {
+    let mins = age.as_secs() / 60;
+    if mins >= 60 {
+        format!("{}h{:02}m", mins / 60, mins % 60)
+    } else {
+        format!("{mins}m")
     }
 }
 
@@ -144,18 +152,6 @@ pub(crate) fn format_age(age: Duration) -> String {
         format!("{m}m{s:02}s")
     } else {
         format!("{s}s")
-    }
-}
-
-/// `5m`, `1h`, `90s` — the TTL as the shortest exact unit.
-fn format_ttl(ttl: Duration) -> String {
-    let secs = ttl.as_secs();
-    if secs > 0 && secs.is_multiple_of(3600) {
-        format!("{}h", secs / 3600)
-    } else if secs > 0 && secs.is_multiple_of(60) {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
     }
 }
 
@@ -196,8 +192,9 @@ pub struct StatusModel {
     /// `-- NORMAL --`. The model name used to sit here; the mode is what a
     /// hand needs to know, the model is `kj context info`'s.
     pub mode: String,
-    /// Context-window occupancy in whole percent.
-    pub occupancy: Option<u32>,
+    /// The last completed call's tokens against the model's window —
+    /// trailing, never an estimate (`docs/tui.md`, "Status line").
+    pub tokens: Option<TokenFigure>,
     pub cache: CacheHealth,
     /// Pending asks across every context. Rendered `!n`.
     pub pending_asks: usize,
@@ -208,6 +205,42 @@ pub struct StatusModel {
     /// `bar.beat` + pulse for the playing track (`docs/tui.md`, "TRACKS +
     /// beat" / "Status line"). `None` when nothing is playing.
     pub track: Option<TrackFigure>,
+}
+
+/// Tokens the last completed call used, and the window it ran against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenFigure {
+    pub used: u64,
+    /// `None` when the model's window is unconfigured.
+    pub window: Option<u64>,
+}
+
+impl TokenFigure {
+    /// `17.3/128k`, or `17.3k` with no window known. Both in thousands, the
+    /// unit once. Warns past 75% of the window, alarms past 90%.
+    pub fn figure(&self) -> Figure {
+        let text = match self.window {
+            Some(window) => format!("{}/{}", format_k(self.used, false), format_k(window, true)),
+            None => format_k(self.used, true),
+        };
+        let severity = match self.window {
+            Some(window) if window > 0 && self.used * 100 >= window * 90 => Severity::Alarm,
+            Some(window) if window > 0 && self.used * 100 >= window * 75 => Severity::Warning,
+            _ => Severity::Ok,
+        };
+        Figure::at(severity, text)
+    }
+}
+
+/// `17.3` / `128` / `1.2M`-free: thousands with one decimal under 100k,
+/// whole thousands above; `unit` appends the `k`.
+fn format_k(n: u64, unit: bool) -> String {
+    let k = if unit { "k" } else { "" };
+    if n < 100_000 {
+        format!("{:.1}{k}", n as f64 / 1000.0)
+    } else {
+        format!("{}{k}", n / 1000)
+    }
 }
 
 /// The status line's `17.3 ●` figure: bar.beat from the last `listTracks`
@@ -257,18 +290,18 @@ impl StatusModel {
         figures
     }
 
-    /// The right half: cast/model, occupancy, cache health, connection.
+    /// The right half: separator, vi mode, tokens, cache health, connection trouble.
     pub fn right_figures(&self) -> Vec<Figure> {
         let mut figures = Vec::new();
+        // The separator stands left of the mode whatever else is shown,
+        // so the eye finds the mode in the same place every time.
+        figures.push(Figure::ok("│"));
         if !self.mode.is_empty() {
             figures.push(Figure::ok(self.mode.clone()));
         }
-        figures.push(match self.occupancy {
-            Some(pct) if pct >= 90 => Figure::at(Severity::Alarm, format!("▮ {pct}%")),
-            Some(pct) if pct >= 75 => Figure::at(Severity::Warning, format!("▮ {pct}%")),
-            Some(pct) => Figure::ok(format!("▮ {pct}%")),
-            None => Figure::ok("▮ —"),
-        });
+        if let Some(tokens) = &self.tokens {
+            figures.push(tokens.figure());
+        }
         figures.push(self.cache.share_figure());
         figures.push(self.cache.age_figure());
         if let Some(track) = &self.track {
@@ -417,8 +450,8 @@ mod tests {
     #[test]
     fn a_context_that_never_called_a_model_shows_both_dashes() {
         let health = cache_health(&info(), 10_000);
-        assert_eq!(health.age_figure().text, "⏱ —");
-        assert_eq!(health.share_figure().text, "⟳ —");
+        assert_eq!(health.age_figure().text, "—");
+        assert_eq!(health.share_figure().text, "—");
     }
 
     #[test]
@@ -428,7 +461,7 @@ mod tests {
         // 252 seconds later, in milliseconds.
         let health = cache_health(&c, 1_252_000);
         assert_eq!(health.age, Some(Duration::from_secs(252)));
-        assert_eq!(health.age_figure().text, "⏱ 4m12s");
+        assert_eq!(health.age_figure().text, "4m");
     }
 
     #[test]
@@ -437,7 +470,7 @@ mod tests {
         c.last_call_at = Some(0);
         let health = cache_health(&c, 3_600_000);
         assert_eq!(health.age_figure().severity, Severity::Ok);
-        assert_eq!(health.age_figure().text, "⏱ 1h00m");
+        assert_eq!(health.age_figure().text, "1h00m");
     }
 
     #[test]
@@ -446,7 +479,7 @@ mod tests {
         c.last_call_at = Some(0);
         c.cache_ttl_secs = Some(300);
         let health = cache_health(&c, 60_000);
-        assert_eq!(health.age_figure().text, "⏱ 1m00s/5m");
+        assert_eq!(health.age_figure().text, "1m");
         assert_eq!(health.age_figure().severity, Severity::Ok);
     }
 
@@ -457,7 +490,7 @@ mod tests {
         c.cache_ttl_secs = Some(300);
         let health = cache_health(&c, 240_000);
         assert_eq!(health.age_figure().severity, Severity::Warning);
-        assert_eq!(health.age_figure().text, "⏱ 4m00s/5m");
+        assert_eq!(health.age_figure().text, "4m");
     }
 
     #[test]
@@ -466,7 +499,7 @@ mod tests {
         c.last_call_at = Some(0);
         c.cache_ttl_secs = Some(300);
         let health = cache_health(&c, 361_000);
-        assert_eq!(health.age_figure().text, "⏱ 6m01s ✗5m");
+        assert_eq!(health.age_figure().text, "6m ✗");
         assert_eq!(health.age_figure().severity, Severity::Alarm);
     }
 
@@ -476,7 +509,7 @@ mod tests {
         c.last_call_at = Some(0);
         c.cache_ttl_secs = Some(3600);
         let health = cache_health(&c, 60_000);
-        assert_eq!(health.age_figure().text, "⏱ 1m00s/1h");
+        assert_eq!(health.age_figure().text, "1m");
     }
 
     #[test]
@@ -484,7 +517,7 @@ mod tests {
         let mut c = info();
         c.cache_read_tokens = Some(910);
         c.context_used_tokens = Some(1000);
-        assert_eq!(cache_health(&c, 0).share_figure().text, "⟳ 91%");
+        assert_eq!(cache_health(&c, 0).share_figure().text, "91%");
     }
 
     #[test]
@@ -492,7 +525,7 @@ mod tests {
         let mut c = info();
         c.cache_read_tokens = Some(910);
         c.context_used_tokens = Some(0);
-        assert_eq!(cache_health(&c, 0).share_figure().text, "⟳ —");
+        assert_eq!(cache_health(&c, 0).share_figure().text, "—");
     }
 
     #[test]
@@ -528,7 +561,7 @@ mod tests {
                 },
             ],
             mode: "-- NORMAL --".to_string(),
-            occupancy: Some(42),
+            tokens: Some(TokenFigure { used: 17_300, window: Some(128_000) }),
             cache: CacheHealth {
                 age: Some(Duration::from_secs(252)),
                 ttl: Some(Duration::from_secs(300)),
@@ -544,7 +577,7 @@ mod tests {
         assert_eq!(rendered.chars().count(), 100);
         assert!(rendered.starts_with("0 kaijutsu*  1 kaish@"), "got {rendered:?}");
         assert!(
-            rendered.ends_with("-- NORMAL --  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m  ○ offline"),
+            rendered.ends_with("│  -- NORMAL --  17.3/128k  91%  4m  ○ offline"),
             "got {rendered:?}"
         );
     }
@@ -571,10 +604,25 @@ mod tests {
         };
         let figures: Vec<String> = connected.right_figures().into_iter().map(|f| f.text).collect();
         assert!(!figures.iter().any(|f| f.contains("ok")), "{figures:?}");
-        assert_eq!(figures[0], "-- INSERT --", "the vi mode leads the facts: {figures:?}");
+        assert_eq!(figures[0], "│", "the separator stands left of the mode: {figures:?}");
+        assert_eq!(figures[1], "-- INSERT --", "the vi mode leads the facts: {figures:?}");
         let offline = StatusModel { connection: None, ..Default::default() };
         let figures: Vec<String> = offline.right_figures().into_iter().map(|f| f.text).collect();
         assert_eq!(figures.last().map(String::as_str), Some("○ offline"));
+    }
+
+    /// `17.3/128k` — both in thousands, the unit once; whole thousands
+    /// past 100k; the window absent when unconfigured. Warns at 75% and
+    /// alarms at 90% of the window.
+    #[test]
+    fn the_token_figure_reads_used_over_window_in_thousands() {
+        let f = TokenFigure { used: 17_300, window: Some(128_000) }.figure();
+        assert_eq!((f.text.as_str(), f.severity), ("17.3/128k", Severity::Ok));
+        let f = TokenFigure { used: 131_000, window: Some(200_000) }.figure();
+        assert_eq!(f.text, "131/200k");
+        assert_eq!(TokenFigure { used: 900, window: None }.figure().text, "0.9k");
+        assert_eq!(TokenFigure { used: 96_100, window: Some(128_000) }.figure().severity, Severity::Warning);
+        assert_eq!(TokenFigure { used: 120_000, window: Some(128_000) }.figure().severity, Severity::Alarm);
     }
 
     #[test]
@@ -633,7 +681,7 @@ mod tests {
                 seat(3, "score-cap2-musician-e1"),
             ],
             mode: "-- NORMAL --".to_string(),
-            occupancy: Some(42),
+            tokens: Some(TokenFigure { used: 17_300, window: Some(128_000) }),
             ..Default::default()
         };
         let rendered = text(&status_line(&model, 80, &palette));
