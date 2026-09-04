@@ -3065,11 +3065,10 @@ impl BlockStore {
     pub fn abandon_running_blocks_on_restart(&self, reason: &str) -> usize {
         let mut swept = 0usize;
         for context_id in self.list_ids() {
-            let running: Vec<(BlockId, BlockKind)> = match self.block_snapshots(context_id) {
+            let running: Vec<BlockSnapshot> = match self.block_snapshots(context_id) {
                 Ok(snaps) => snaps
                     .into_iter()
                     .filter(|s| matches!(s.status, Status::Running | Status::Waiting))
-                    .map(|s| (s.id, s.kind))
                     .collect(),
                 Err(e) => {
                     tracing::warn!(
@@ -3080,43 +3079,77 @@ impl BlockStore {
                     continue;
                 }
             };
-            for (block_id, kind) in running {
-                if let Err(e) = self.set_status(context_id, &block_id, Status::Error) {
+            let mut failed: Vec<BlockSnapshot> = Vec::new();
+            for snap in running {
+                if let Err(e) = self.set_status(context_id, &snap.id, Status::Error) {
                     tracing::warn!(
                         context_id = %context_id.to_hex(),
-                        block_id = %block_id,
+                        block_id = %snap.id,
                         error = %e,
                         "abandon_running_blocks_on_restart: failed to set Error status"
                     );
                     continue;
                 }
+                // A swept tool result carries the reason as its own stderr,
+                // so it prints as what happened rather than as an empty body.
+                if snap.kind == BlockKind::ToolResult
+                    && let Err(e) = self.set_stderr(context_id, &snap.id, Some(reason.to_string()))
+                {
+                    tracing::warn!(
+                        context_id = %context_id.to_hex(),
+                        block_id = %snap.id,
+                        error = %e,
+                        "abandon_running_blocks_on_restart: failed to record the reason on the result"
+                    );
+                }
+                failed.push(snap);
+            }
+            // One Error block per context per restart, off the last block
+            // swept, naming every one — not one block per swept block, which
+            // stacked a fresh row of identical errors on every bounce.
+            if let Some(last) = failed.last() {
+                let names = failed.iter().map(describe_swept_block).collect::<Vec<_>>().join(", ");
+                let content = format!(
+                    "{reason} — {} block(s) left open by the restart: {names}",
+                    failed.len()
+                );
                 let payload = kaijutsu_types::ErrorPayload {
                     category: kaijutsu_types::ErrorCategory::Kernel,
                     severity: kaijutsu_types::ErrorSeverity::Fatal,
                     code: Some("kernel.restart_orphan".to_string()),
-                    detail: Some(reason.to_string()),
+                    detail: Some(content.clone()),
                     span: None,
-                    source_kind: Some(kind),
+                    source_kind: Some(last.kind),
                 };
                 if let Err(e) = self.insert_error_block_as(
                     context_id,
-                    &block_id,
+                    &last.id,
                     &payload,
-                    reason,
+                    &content,
                     Some(self.principal_id()),
                 ) {
                     tracing::warn!(
                         context_id = %context_id.to_hex(),
-                        block_id = %block_id,
+                        block_id = %last.id,
                         error = %e,
                         "abandon_running_blocks_on_restart: failed to attach error detail"
                     );
                 }
-                swept += 1;
             }
+            swept += failed.len();
         }
         swept
     }
+}
+
+/// `shell (#586)` for a tool call, `tool_result (#587)` / `text (#12)` for
+/// the rest — how the restart sweep's summary names each block it failed.
+fn describe_swept_block(snap: &BlockSnapshot) -> String {
+    let name = match (snap.kind, snap.tool_name.as_deref()) {
+        (BlockKind::ToolCall, Some(tool)) if !tool.is_empty() => tool.to_string(),
+        (kind, _) => format!("{kind:?}").to_lowercase(),
+    };
+    format!("{name} (#{})", snap.id.seq)
 }
 
 /// Derive a context's *live* status from its block statuses in timeline order
@@ -6974,6 +7007,65 @@ mod tests {
             "error child content must carry the reason text back, got: {}",
             error_child.content
         );
+    }
+
+    /// Several blocks left open in one context get ONE error block between
+    /// them, off the last one swept and naming every one — a bounce adds a
+    /// line, not a stack. A swept tool result carries the reason as its
+    /// stderr so it does not print as an empty body.
+    #[test]
+    fn abandon_running_blocks_writes_one_summary_per_context() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let call = store
+            .insert_tool_call(ctx, None, None, "shell", serde_json::json!({"command": "ls"}), None)
+            .unwrap();
+        store.set_status(ctx, &call, Status::Waiting).unwrap();
+        let result = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::ToolResult,
+                "",
+                Status::Waiting,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let text = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "partial",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let swept = store.abandon_running_blocks_on_restart("restarted");
+        assert_eq!(swept, 3);
+        let blocks = store.block_snapshots(ctx).unwrap();
+        let errors: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Error).collect();
+        assert_eq!(errors.len(), 1, "one summary, not one per block: {errors:?}");
+        let summary = errors[0];
+        assert_eq!(summary.parent_id, Some(text), "off the last block swept");
+        assert!(summary.content.contains("3 block(s) left open"), "{}", summary.content);
+        assert!(
+            summary.content.contains(&format!("shell (#{})", call.seq))
+                && summary.content.contains(&format!("toolresult (#{})", result.seq))
+                && summary.content.contains(&format!("text (#{})", text.seq)),
+            "names every swept block: {}",
+            summary.content
+        );
+        let swept_result = store.get_block_snapshot(ctx, &result).unwrap().unwrap();
+        assert_eq!(swept_result.stderr.as_deref(), Some("restarted"), "the result says what happened");
     }
 
     /// The most important test here: a completed block must never be
