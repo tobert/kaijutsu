@@ -461,6 +461,29 @@ impl SharedKernelState {
 /// Server-wide state. Shared via Arc across all SSH connections.
 pub struct ServerRegistry {
     pub kernel: SharedKernel,
+    /// The auth database, for naming a principal to a model — who answered
+    /// an ask. `None` in tests that build a registry without one; names
+    /// then fall back to the principal's short id.
+    pub auth_db: Option<Arc<parking_lot::Mutex<crate::auth_db::AuthDb>>>,
+}
+
+/// Who a principal is, as a model should read it: the auth db's display
+/// name (`atobey@zorak`, a key's comment), else its username, else the id's
+/// short form. `None` — a rule's auto-decision, or a row with no answerer —
+/// reads as `a human`, which is all the ledger knows then.
+pub fn answerer_name(
+    auth_db: Option<&Arc<parking_lot::Mutex<crate::auth_db::AuthDb>>>,
+    decided_by: Option<&[u8]>,
+) -> String {
+    let Some(id) = decided_by.and_then(PrincipalId::try_from_slice) else {
+        return "a human".to_string();
+    };
+    let known = auth_db.and_then(|db| db.lock().get_principal(id).ok().flatten());
+    match known {
+        Some(p) if !p.display_name.trim().is_empty() => p.display_name,
+        Some(p) if !p.username.trim().is_empty() => p.username,
+        _ => id.short(),
+    }
 }
 
 /// Spawn the server-lifetime turn driver.
@@ -759,6 +782,7 @@ async fn act_on_executable_answer(
     principal_id: PrincipalId,
     answer: &kaijutsu_kernel::UndeliveredAnswer,
     ask: &ExecutableAsk,
+    who: &str,
 ) -> ExecAction {
     let source = ask.source.as_str();
     let linked = ask.pair;
@@ -901,7 +925,7 @@ async fn act_on_executable_answer(
         );
         return if authored {
             ExecAction::Tell(format!(
-                "A human approved the action you were waiting on: {}\n\n\
+                "{who} approved the action you were waiting on: {}\n\n\
                  It did NOT run: {cwd} — the directory it was raised in — no longer \
                  resolves. Block {} carries the same message. Ask again from a \
                  directory that exists.",
@@ -924,7 +948,7 @@ async fn act_on_executable_answer(
         );
         return if authored {
             ExecAction::Tell(format!(
-                "A human approved the action you were waiting on: {}\n\n\
+                "{who} approved the action you were waiting on: {}\n\n\
                  It did NOT run: {why}. Block {} carries the same message. Ask again.",
                 answer.description,
                 output_block_id.to_key()
@@ -958,11 +982,11 @@ async fn act_on_executable_answer(
     .await;
 
     if authored {
+        // The output blocks reach the model as new blocks in its context;
+        // the seed only has to say who approved and that it ran.
         ExecAction::Tell(format!(
-            "A human approved the action you were waiting on: {}\n\n\
-             It has already run — do NOT call it again. The output is in block {}.",
-            answer.description,
-            output_block_id.to_key()
+            "{who} approved the action you were waiting on: {}\n\nIt has run.",
+            answer.description
         ))
     } else {
         ExecAction::Settled
@@ -1198,18 +1222,16 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                     // — `docs/gate-shape-b.md`, "Slice 5: approval
                     // executes". Everything else keeps the wake below,
                     // where the caller retries and the retry redeems.
+                    // Who answered, by name: the seed a model reads should
+                    // say `atobey@zorak approved`, not `a human approved` —
+                    // it will not always be the same person.
+                    let who = answerer_name(registry.auth_db.as_ref(), row.decided_by.as_deref());
                     let executable = row.exec_source.clone().map(|source| {
                         let pair = row
                             .command_block_id
                             .as_deref()
                             .and_then(BlockId::from_key)
                             .zip(row.output_block_id.as_deref().and_then(BlockId::from_key));
-                        let who = row
-                            .decided_by
-                            .as_deref()
-                            .and_then(|b| <[u8; 16]>::try_from(b).ok())
-                            .map(|b| PrincipalId::from(uuid::Uuid::from_bytes(b)).short())
-                            .unwrap_or_else(|| "a human".to_string());
                         let denial = match row.decided_option.as_deref() {
                             Some(option) => format!("denied by {who} ({option}) — nothing was run"),
                             None => format!("denied by {who} — nothing was run"),
@@ -1231,6 +1253,7 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                                 principal_id,
                                 &answer,
                                 &ask,
+                                &who,
                             )
                             .await
                             {
@@ -1272,7 +1295,7 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                         // — an approval authorizes the retry, it does not
                         // perform it.
                         format!(
-                            "A human {decision} the action you were waiting on: {}\n\n\
+                            "{who} {decision} the action you were waiting on: {}\n\n\
                              Nothing has run yet. Try the same call again — an approval \
                              authorizes it exactly once. If it was denied, do not retry it; \
                              say so and continue with the rest of your work.",
@@ -2143,6 +2166,25 @@ fn bootstrap_discovered_context(
 #[cfg(test)]
 mod context_bootstrap_tests {
     use super::*;
+
+    /// The seed a model reads names its answerer: the auth db's display
+    /// name first (a key's comment, `atobey@zorak`), the username when
+    /// there is no display name, the short id for a principal the auth db
+    /// does not know, and `a human` only when the row names nobody.
+    #[test]
+    fn answerer_name_prefers_display_name_then_username_then_short_id() {
+        let db = crate::auth_db::AuthDb::temporary().expect("temp auth db");
+        let named = db.create_principal("amy", "atobey@zorak").expect("principal");
+        let bare = db.create_principal("kaish", "").expect("principal");
+        let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
+        assert_eq!(super::answerer_name(Some(&db), Some(named.as_bytes())), "atobey@zorak");
+        assert_eq!(super::answerer_name(Some(&db), Some(bare.as_bytes())), "kaish");
+        let stranger = PrincipalId::new();
+        assert_eq!(super::answerer_name(Some(&db), Some(stranger.as_bytes())), stranger.short());
+        assert_eq!(super::answerer_name(None, Some(stranger.as_bytes())), stranger.short());
+        assert_eq!(super::answerer_name(Some(&db), None), "a human");
+        assert_eq!(super::answerer_name(Some(&db), Some(&[1, 2, 3])), "a human", "a malformed id names nobody");
+    }
 
     fn db() -> KernelDb {
         KernelDb::temporary().expect("temporary KernelDb")

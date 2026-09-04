@@ -384,8 +384,10 @@ impl SshServer {
         // (see `rpc::start_external_mcp_servers`).
         crate::rpc::start_external_mcp_servers(&shared_kernel.kernel).await;
 
+        let auth_db = Arc::new(Mutex::new(auth_db));
         let registry = Arc::new(ServerRegistry {
             kernel: shared_kernel,
+            auth_db: Some(auth_db.clone()),
         });
 
         log::info!("Shared kernel created: {}", registry.kernel.name);
@@ -413,7 +415,7 @@ impl SshServer {
         log::info!("Max connections: {}", self.config.max_connections);
 
         let mut server = Server {
-            auth_db: Arc::new(Mutex::new(auth_db)),
+            auth_db,
             allow_anonymous,
             registry,
             active_connections,

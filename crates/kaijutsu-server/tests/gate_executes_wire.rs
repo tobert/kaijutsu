@@ -513,11 +513,14 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
         );
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "fresh-pair\n");
 
-        wait_for("the seed block naming the output", || {
+        // The seed says who approved and that it ran — no block id and no
+        // "do NOT call it again": the output blocks reach the model as new
+        // blocks in its own context.
+        wait_for("the seed block saying it ran", || {
             s.worker_blocks().iter().any(|b| {
                 b.kind == kaijutsu_types::BlockKind::Text
-                    && b.content.contains("It has already run")
-                    && b.content.contains(&output.id.to_key())
+                    && b.content.contains("approved the action")
+                    && b.content.contains("It has run.")
             })
         })
         .await;
@@ -525,11 +528,21 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
         let seed = s
             .worker_blocks()
             .into_iter()
-            .find(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("already run"))
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("It has run."))
             .expect("the seed block");
         assert!(
             !seed.content.contains("Nothing has run yet"),
             "the executed case must not tell the model to retry, got: {}",
+            seed.content
+        );
+        assert!(
+            !seed.content.starts_with("A human"),
+            "the seed names the answerer, got: {}",
+            seed.content
+        );
+        assert!(
+            !seed.content.contains("do NOT"),
+            "no shouting at the model, got: {}",
             seed.content
         );
     });
@@ -746,7 +759,7 @@ fn shell_box_pair_fills_when_its_own_ask_is_allowed() {
             "a run into the pair the caller authored must author nothing else"
         );
         assert!(
-            !blocks.iter().any(|b| b.content.contains("It has already run")),
+            !blocks.iter().any(|b| b.content.contains("It has run.")),
             "a run into a caller-authored pair tells nobody"
         );
     });
