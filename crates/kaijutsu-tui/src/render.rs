@@ -14,7 +14,7 @@ use chrono::{Local, TimeZone};
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Status};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
@@ -104,6 +104,63 @@ pub fn is_settled(block: &BlockSnapshot) -> bool {
     matches!(block.status, Status::Done | Status::Error)
 }
 
+/// The most body rows a tool result prints into scrollback before it is cut
+/// to a head plus a footer: one screenful, the transcript rows a reader can
+/// see at once (`app.screen_rows` less the live band).
+///
+/// A coder turn is mostly tool output, and a `cargo build` or a wide `grep`
+/// runs to thousands of lines. Scrollback is never redrawn, so an uncut
+/// result cannot be collapsed after the fact — it has already pushed the
+/// turn that produced it out of view. Cutting at print time is the only
+/// moment the choice exists.
+///
+/// The floor keeps the cut sane on a tiny terminal: below it the footer
+/// would cost more than it saves.
+const TOOL_RESULT_FLOOR: u16 = 6;
+
+pub fn tool_result_budget(app: &App) -> usize {
+    usize::from(
+        app.screen_rows
+            .saturating_sub(VIEWPORT_LINES)
+            .max(TOOL_RESULT_FLOOR),
+    )
+}
+
+/// Cut an over-long tool result to its head and say what was dropped.
+///
+/// Only `ToolResult`, and only on the scrollback path: `copy_buffer_lines`
+/// renders the same block through `render_block` untouched, which is what
+/// makes the footer's promise true. Capping inside `render_block` would cut
+/// copy mode too and leave the rest reachable nowhere.
+///
+/// The divider is kept — it names the caller and the command, which is what
+/// makes a cut result identifiable at all — and the footer replaces the last
+/// row of the budget, so the whole print is exactly one screenful.
+fn cap_tool_result(
+    block: &BlockSnapshot,
+    lines: Vec<Line<'static>>,
+    has_divider: bool,
+    budget: usize,
+    palette: &crate::present::Palette,
+) -> Vec<Line<'static>> {
+    if block.kind != BlockKind::ToolResult || lines.len() <= budget {
+        return lines;
+    }
+    let head_rows = usize::from(has_divider);
+    // `budget` covers the divider and the footer as well as the body, and
+    // `budget >= TOOL_RESULT_FLOOR` keeps this from going negative.
+    let keep = budget.saturating_sub(1);
+    let dropped = lines.len() - keep;
+    let mut out: Vec<Line<'static>> = lines.into_iter().take(keep).collect();
+    let plural = if dropped == 1 { "" } else { "s" };
+    out.push(Line::from(Span::styled(
+        format!("… {dropped} more line{plural} — Ctrl+A [ for copy mode"),
+        palette.divider(),
+    )));
+    debug_assert!(out.len() >= head_rows, "the divider is inside the budget");
+    out
+}
+
 /// One block's lines, ready for `insert_before`.
 pub struct Print {
     pub context_id: ContextId,
@@ -133,6 +190,7 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
         .cloned()
         .collect();
 
+    let budget = tool_result_budget(app);
     let mut prints = Vec::new();
     let mut last_speaker = view.last_printed_speaker.clone();
     let mut last_printed = view.last_printed;
@@ -158,7 +216,14 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
             if block.kind == BlockKind::Thinking {
                 view.collapsed = true;
             }
-            lines.extend(crate::present::render_block(&block, &view, width, &app.palette));
+            let rendered = crate::present::render_block(&block, &view, width, &app.palette);
+            lines.extend(cap_tool_result(
+                &block,
+                rendered,
+                show_divider,
+                budget,
+                &app.palette,
+            ));
         }
         app.mark_printed(context_id, block.id, block.kind, &speaker);
         last_printed = Some((block.id, block.kind));
@@ -770,6 +835,190 @@ mod tests {
 
         let armed = live_frame(&mut app, 80, 0, true);
         assert_eq!(armed.cursor, None, "the legend row has no cursor");
+    }
+
+    /// Build a settled tool-result block whose body is `rows` lines.
+    fn long_result(id: ContextId, rows: usize) -> Vec<BlockSnapshot> {
+        let call = BlockSnapshotBuilder::new(
+            BlockId::new(id, PrincipalId::new(), 9),
+            BlockKind::ToolCall,
+        )
+        .role(Role::Model)
+        .status(Status::Done)
+        .tool_name("builtin.shell.shell")
+        .tool_input(r#"{"command":"cargo build"}"#)
+        .content(r#"{"command":"cargo build"}"#)
+        .created_at(1_000)
+        .build();
+        let body: String = (0..rows)
+            .map(|n| format!("line {n}\n"))
+            .collect::<String>();
+        let result = BlockSnapshotBuilder::new(
+            BlockId::new(id, PrincipalId::new(), 10),
+            BlockKind::ToolResult,
+        )
+        .role(Role::Tool)
+        .status(Status::Done)
+        .tool_call_id(call.id)
+        .content(body)
+        .created_at(2_000)
+        .build();
+        vec![call, result]
+    }
+
+    fn printed_rows(app: &mut App, width: u16) -> Vec<String> {
+        take_settled_prints(app, width)
+            .into_iter()
+            .flat_map(|p| p.lines)
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect()
+    }
+
+    /// A `cargo build`'s worth of output is cut to one screenful with a
+    /// footer that counts what was dropped. Scrollback is never redrawn, so
+    /// an uncut result has already pushed the turn that produced it out of
+    /// view by the time anyone could collapse it.
+    #[test]
+    fn a_long_tool_result_is_cut_to_a_head_and_a_footer() {
+        let (mut app, id) = fixture();
+        app.screen_rows = 30;
+        let _ = printed_rows(&mut app, 80); // drain the fixture's blocks
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(long_result(id, 500), 1)
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        app.switch_to(id);
+
+        let rows = printed_rows(&mut app, 80);
+        let budget = tool_result_budget(&app);
+        assert_eq!(budget, 22, "30 rows less the 8-row band");
+
+        let footer = rows.last().expect("a footer");
+        assert!(
+            footer.starts_with("… ") && footer.contains("more lines"),
+            "the footer counts what was dropped: {footer:?}"
+        );
+        assert!(
+            footer.contains("Ctrl+A ["),
+            "the footer names where the rest is: {footer:?}"
+        );
+        // The head is real output, and the divider naming the command
+        // survives the cut — a result you cannot attribute is worse than a
+        // long one.
+        assert!(
+            rows.iter().any(|r| r.contains("cargo build")),
+            "the call's divider survives: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("line 0")), "{rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.contains("line 499")),
+            "the tail is cut: {rows:?}"
+        );
+    }
+
+    /// The whole print is one screenful — the point of the cut. A print that
+    /// merely got shorter would still push the turn off the screen.
+    #[test]
+    fn a_cut_result_prints_exactly_one_screenful() {
+        for screen_rows in [24u16, 30, 50, 120] {
+            let (mut app, id) = fixture();
+            app.screen_rows = screen_rows;
+            let _ = printed_rows(&mut app, 80);
+            let mut mirror = ContextMirror::new(id);
+            mirror
+                .apply_snapshot(long_result(id, 4_000), 1)
+                .expect("snapshot applies");
+            app.views.insert(id, ContextView::new(mirror));
+            app.switch_to(id);
+
+            let rows = printed_rows(&mut app, 80);
+            let budget = tool_result_budget(&app);
+            // The call block prints its own row(s) too; the result's own
+            // print is what the budget governs.
+            let result_rows = take_settled_prints(&mut app, 80);
+            assert!(result_rows.is_empty(), "everything printed once");
+            assert!(
+                rows.len() <= budget + 4,
+                "screen_rows={screen_rows}: {} rows for a budget of {budget}",
+                rows.len()
+            );
+        }
+    }
+
+    /// A short result is untouched — the cut must not tax ordinary output.
+    #[test]
+    fn a_short_tool_result_keeps_every_line_and_gains_no_footer() {
+        let (mut app, id) = fixture();
+        app.screen_rows = 40;
+        let _ = printed_rows(&mut app, 80);
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(long_result(id, 3), 1)
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        app.switch_to(id);
+
+        let rows = printed_rows(&mut app, 80);
+        for n in 0..3 {
+            assert!(
+                rows.iter().any(|r| r.contains(&format!("line {n}"))),
+                "line {n} must survive: {rows:?}"
+            );
+        }
+        assert!(
+            !rows.iter().any(|r| r.contains("more lines")),
+            "no footer on a short result: {rows:?}"
+        );
+    }
+
+    /// The footer's promise has to be true: copy mode renders the same
+    /// block through `render_block` with no cut, so the dropped tail is
+    /// reachable exactly where the footer says it is.
+    #[test]
+    fn copy_mode_still_holds_the_lines_the_footer_promised() {
+        let (mut app, id) = fixture();
+        app.screen_rows = 24;
+        let _ = printed_rows(&mut app, 80);
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(long_result(id, 300), 1)
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        app.switch_to(id);
+
+        let printed = printed_rows(&mut app, 80);
+        assert!(
+            !printed.iter().any(|r| r.contains("line 299")),
+            "scrollback is cut: {printed:?}"
+        );
+
+        let (_, copy) = copy_buffer_lines(&app, 80).expect("copy mode builds");
+        let copy_rows: Vec<String> = copy
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            copy_rows.iter().any(|r| r.contains("line 299")),
+            "copy mode keeps the tail the footer pointed at"
+        );
+        assert!(
+            !copy_rows.iter().any(|r| r.contains("more lines")),
+            "copy mode carries no footer: it was never cut"
+        );
+    }
+
+    /// A tiny terminal still gets a usable head rather than a footer alone.
+    #[test]
+    fn the_budget_never_falls_below_the_floor() {
+        let (mut app, _) = fixture();
+        for screen_rows in [0u16, 1, 8, 9, 12] {
+            app.screen_rows = screen_rows;
+            assert!(
+                tool_result_budget(&app) >= usize::from(TOOL_RESULT_FLOOR),
+                "screen_rows={screen_rows} fell below the floor"
+            );
+        }
     }
 
     #[test]

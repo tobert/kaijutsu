@@ -255,17 +255,14 @@ What the lanes left open, in rough priority:
    submitter principal, so a model-run `vi` reaches the app fallback, not
    a terminal; `ActorHandle` exposes only `editor_keys`; `EditorState`
    carries no selection anchor, so visual mode has no band anywhere.
-3. **`kj ledger show` `.data` lacks `created_at` / `decided_at` /
-   `decided_by` / `decided_option` / `remember_scope`**, so the ledger
-   view's age and ANSWERED columns read `—`. Add them to the row's data.
-4. **Picker tails see only whole-block events.** A streaming reply in an
+3. **Picker tails see only whole-block events.** A streaming reply in an
    unwatched context shows nothing until a block lands — the kernel-wide
    `ServerEvent` stream's limitation, shared with the app's tails.
-5. `theme.toml` → ratatui palette: replaces `Palette::builtin()` only; both
+4. `theme.toml` → ratatui palette: replaces `Palette::builtin()` only; both
    resolvers are exhaustive and a test iterates `BlockTone::all()`.
-6. `bindings.toml` keyed by vim notation, commentary reviewed by two
+5. `bindings.toml` keyed by vim notation, commentary reviewed by two
    flash-tier kaibo casts; then a lane to convert the app to the same file.
-7. **Images (additive).** Render `Svg`/`Image` blocks in the transcript:
+6. **Images (additive).** Render `Svg`/`Image` blocks in the transcript:
    resvg raster at cell-derived pixel size, OSC 1337 emission (wezterm +
    iTerm2) with a unicode half-block fallback, in-band detection only.
    Rules: `docs/tui.md`, "Images". `Abc` needs no new emitter —
@@ -273,7 +270,7 @@ What the lanes left open, in rough priority:
    `font.rs:230` already caches a `path_d` string per glyph, so `BezPath` is
    not on this path. Its only callers are tests: the wiring from a
    `ContentType::Abc` block to the rasterizer is the whole sub-lane.
-8. Bar/beat in the picker and status line assume 4/4; the wire carries no
+7. Bar/beat in the picker and status line assume 4/4; the wire carries no
    time signature (`picker::BEATS_PER_BAR`).
 
 **Terminal-fit harness** (`tests/terminal_fit.rs`, shipped 2026-09-02): the
@@ -312,14 +309,6 @@ From the 2026-09-03 kaibo review of the `:` lane (cast crusoe: GLM-5.2
 synth, DeepSeek-V4-Flash explorer; the stuck turn flag it found is fixed)
 and Amy's second morning, in rough priority:
 
-- **Tool results print whole in the tui.** `ToolCall`, `ToolResult` and
-  `Error` arrive collapsed to one `▸` line (`present::collapses_by_default`)
-  and nothing in the tui expands one — Amy: *"an `ls` doesn't seem to get
-  its vertical space to display?"* Expand-in-place is impossible over
-  scrollback, so the answer is not a gesture: drop the collapse default for
-  `ToolCall`/`ToolResult` (keep `Error`'s one-line stub), and past a
-  screenful print the head with a footer saying how many more lines. One
-  change plus a test.
 - **Longer-term, Amy's: a formatter over a result's kaish `.data`**, keyed
   by producing verb, run before print, living under `/config/client` as a
   plain file — a print-time decision, never a redraw. *"we work on adding

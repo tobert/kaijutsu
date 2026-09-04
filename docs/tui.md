@@ -174,6 +174,20 @@ Rules the figure carries:
   (Amy, 2026-09-04: *"could `tool` be the actual tool name? maybe
   principal name far left … possibly some args inline?"* — option 2 of
   three.)
+- **A tool result prints its head and says what it dropped past one
+  screenful:** `… 1,847 more lines — Ctrl+A [ for copy mode`. A coder turn
+  is mostly tool output and a `cargo build` runs to thousands of lines;
+  scrollback is never redrawn, so an uncut result has already pushed the
+  turn that produced it out of view by the time anyone could collapse it.
+  Print time is the only moment the choice exists. The budget is
+  `app.screen_rows` less the live band, floored so a small terminal still
+  gets a usable head, and the whole print is exactly one screenful. The
+  divider survives the cut — a result you cannot attribute is worse than a
+  long one. **The cut is on the scrollback path only**
+  (`render::cap_tool_result`); copy mode renders the same block through
+  `render_block` untouched, which is what makes the footer's promise true.
+  Capping inside `render_block` would cut copy mode too and leave the tail
+  reachable nowhere.
 - `▸` is a collapsed block; only `Error` collapses by default (tool output
   prints whole, guidance 7) and
   `Error` is a one-line stub, per the app's error-render policy. Collapse is
