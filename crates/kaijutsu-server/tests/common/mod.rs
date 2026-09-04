@@ -78,6 +78,7 @@ pub fn seed_mock_backend_with_model(data_dir: &std::path::Path, default_model: &
         api_key_file: None,
         key_optional: true,
         request_timeout_secs: None,
+        idle_timeout_secs: None,
         created_at: 0,
         created_by: PrincipalId::system(),
     })
