@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock as TokioRwLock;
 
+use kaijutsu_types::shell_envelope::ShellEnvelope;
 use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use kaijutsu_kernel::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::kernel_db::KernelDb;
@@ -1033,17 +1034,27 @@ fn map_tool_dispatch_result(
             ToolDispatch { content: r.stdout, is_error: false, status: Status::Done, payload: None }
         }
         Ok(r) => {
-            log::warn!("Tool {} failed: {}", tool_name, r.stderr);
+            // A tool that wrote a body already said what went wrong, and that
+            // body is passed through untouched — prefixing "Error: " onto a
+            // structured body (the shell envelope, `docs/shell-envelope.md`)
+            // makes it unparseable and reports the failure twice. The prefix
+            // is for a tool that failed with nothing but stderr to show.
+            let content = if r.stdout.is_empty() {
+                format!("Error: {}", r.stderr)
+            } else {
+                r.stdout.clone()
+            };
+            log::warn!("Tool {} failed: {}", tool_name, content);
             let payload = kaijutsu_types::ErrorPayload {
                 category: kaijutsu_types::ErrorCategory::Tool,
                 severity: kaijutsu_types::ErrorSeverity::Error,
                 code: None,
-                detail: Some(r.stderr.clone()),
+                detail: Some(content.clone()),
                 span: None,
                 source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
             };
             ToolDispatch {
-                content: format!("Error: {}", r.stderr),
+                content,
                 is_error: true,
                 status: Status::Error,
                 payload: Some(payload),
@@ -2404,28 +2415,49 @@ async fn process_llm_stream(
                     )
                     .await;
 
+                    // Step 4a: split the two readers. A `shell` result is a
+                    // JSON envelope (`docs/shell-envelope.md`) — that is what
+                    // the MODEL reads. The durable block is read by people and
+                    // replayed by hydration, so it holds the command's output,
+                    // not the envelope around it. Every other tool has one
+                    // text and both readers get it.
+                    let shell_envelope = ShellEnvelope::from_tool_result(&result_content);
+                    let block_source = match shell_envelope {
+                        Some(ref env) => env.readable_output(),
+                        None => result_content.clone(),
+                    };
+
                     // Step 4b: ANSI ingest (docs/ansi-and-beyond.md). A tool
                     // that shells out hands back escape codes; the model must
                     // not see them (they burn tokens and, worse, poison the
                     // byte-offset arithmetic every edit/exclusion range uses).
-                    // So the projection replaces the content for BOTH the
-                    // block and the conversation message below — one text, one
-                    // set of offsets, every player.
-                    let ansi = kaijutsu_kernel::ansi_ingest::project(result_content.as_bytes());
-                    let raw_result = ansi.as_ref().map(|_| result_content.clone());
-                    let result_content = match ansi {
+                    // The projection runs on the command's real output — an
+                    // envelope's JSON has no raw ESC bytes to find, only the
+                    // six characters `\u001b`, so projecting the envelope
+                    // would strip nothing and hand the model the escapes it
+                    // exists to remove.
+                    let ansi = kaijutsu_kernel::ansi_ingest::project(block_source.as_bytes());
+                    let raw_result = ansi.as_ref().map(|_| block_source.clone());
+                    let block_content = match ansi {
                         Some(ref p) => p.text.clone(),
-                        None => result_content,
+                        None => block_source,
+                    };
+                    // The model's copy is the envelope carrying the SAME
+                    // cleaned text, so both readers see one output with one
+                    // set of offsets.
+                    let result_content = match shell_envelope {
+                        Some(env) => env.with_clean_output(&block_content).to_value().to_string(),
+                        None => block_content.clone(),
                     };
 
                     // Step 5: Write result content via a block edit
                     if let Some(ref rb_id) = result_block_id {
-                        if !result_content.is_empty()
+                        if !block_content.is_empty()
                             && let Err(e) = documents.edit_text_as(
                                 context_id,
                                 rb_id,
                                 0,
-                                &result_content,
+                                &block_content,
                                 0,
                                 Some(PrincipalId::system()),
                             )
@@ -3174,6 +3206,108 @@ mod tool_dispatch_timeout_tests {
 
     // ─────────────────────────────────────────────────────────────────
     // map_tool_dispatch_result — pure mapping, no I/O
+
+    /// A failing tool that wrote a structured body must hand the model that
+    /// body verbatim. Prefixing "Error: " onto the shell envelope made it
+    /// unparseable and reported the failure twice — once in the prefix, once
+    /// in the envelope's own `status`/`exit_code`.
+    #[test]
+    fn a_failing_tool_body_reaches_the_model_verbatim() {
+        let envelope = kaijutsu_types::shell_envelope::ShellEnvelope {
+            exit_code: Some(1),
+            stderr: "boom".into(),
+            ..kaijutsu_types::shell_envelope::ShellEnvelope::new(
+                kaijutsu_types::shell_envelope::ShellStatus::Error,
+            )
+        };
+        let body = envelope.to_value().to_string();
+        let failed = kaijutsu_kernel::ExecResult {
+            stdout: body.clone(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+            output: None,
+        };
+
+        let out = map_tool_dispatch_result("shell", Ok(failed));
+        assert!(out.is_error, "a nonzero exit is still an error");
+        assert_eq!(out.content, body, "the body must not be editorialized");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out.content).expect("the model must receive parseable JSON");
+        assert_eq!(parsed["exit_code"], 1);
+        assert_eq!(parsed["status"], "error");
+    }
+
+    /// The ANSI regression this split closed: escape codes must not survive
+    /// into either reader. Projecting the ENVELOPE finds nothing — its JSON
+    /// spells an escape as the six characters `\u001b`, not a raw 0x1b — so
+    /// the projection has to run on the command's real output, which is what
+    /// step 4a extracts. Composed here exactly as the agentic loop composes
+    /// it.
+    #[test]
+    fn ansi_escapes_survive_into_neither_the_block_nor_the_model() {
+        let mut env = kaijutsu_types::shell_envelope::ShellEnvelope::new(
+            kaijutsu_types::shell_envelope::ShellStatus::Done,
+        );
+        env.stdout = "\u{1b}[32mgreen\u{1b}[0m text".into();
+        env.exit_code = Some(0);
+        let tool_body = env.to_value().to_string();
+
+        // Projecting the envelope directly is the no-op that made this a bug.
+        assert!(
+            kaijutsu_kernel::ansi_ingest::project(tool_body.as_bytes()).is_none(),
+            "the envelope's JSON has no raw ESC to find — this is why 4a exists"
+        );
+
+        // Step 4a → 4b, as the loop does it.
+        let recovered = ShellEnvelope::from_tool_result(&tool_body).expect("a shell envelope");
+        let block_source = recovered.readable_output();
+        let ansi = kaijutsu_kernel::ansi_ingest::project(block_source.as_bytes());
+        let block_content = match ansi {
+            Some(ref p) => p.text.clone(),
+            None => block_source,
+        };
+        let model_content = recovered.with_clean_output(&block_content).to_value().to_string();
+
+        assert_eq!(block_content, "green text", "the block holds clean output");
+        assert!(
+            !block_content.contains('\u{1b}'),
+            "no raw escapes in the durable block"
+        );
+        assert!(
+            !model_content.contains("\\u001b") && !model_content.contains('\u{1b}'),
+            "no escapes, raw or spelled, reach the model: {model_content}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&model_content).expect("the model still gets an envelope");
+        assert_eq!(parsed["stdout"], "green text");
+        assert_eq!(parsed["exit_code"], 0);
+    }
+
+    /// A tool that is NOT the shell keeps one text for both readers — the
+    /// split must not change anything for the rest of the tool surface.
+    #[test]
+    fn a_non_shell_tool_body_reaches_the_block_verbatim() {
+        let body = "some ordinary tool output";
+        assert!(
+            ShellEnvelope::from_tool_result(body).is_none(),
+            "ordinary output is not an envelope, so block and model stay one text"
+        );
+    }
+
+    /// The "Error: " prefix still exists for a tool that failed with nothing
+    /// but stderr to show — removing it there would leave a bare message with
+    /// no indication it was a failure.
+    #[test]
+    fn a_failing_tool_with_only_stderr_still_gets_the_prefix() {
+        let out = map_tool_dispatch_result(
+            "something",
+            Ok(kaijutsu_kernel::ExecResult::failure(1, "it broke")),
+        );
+        assert!(out.is_error);
+        assert_eq!(out.content, "Error: it broke");
+    }
+
     // ─────────────────────────────────────────────────────────────────
 
     #[test]

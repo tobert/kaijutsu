@@ -55,6 +55,7 @@ pub mod paths;
 pub mod principal;
 pub mod refusal;
 pub mod session;
+pub mod shell_envelope;
 pub mod share;
 pub mod theme;
 pub mod tick;

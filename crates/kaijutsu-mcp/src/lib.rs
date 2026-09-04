@@ -88,6 +88,7 @@ use kaijutsu_client::{
     TurnCompletedStopReason, connect_ssh, spawn_actor,
 };
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, ConversationDAG, PrincipalId};
+use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,38 +201,46 @@ enum ShellCompletion {
 }
 
 impl ShellCompletion {
-    /// Render this completion as the JSON envelope returned by `shell`.
-    /// The shape is documented on the tool description —
-    /// agents parse this to extract `stdout`, `exit_code`, structured `data`,
-    /// and the result block id for follow-up reads.
+    /// Wrap the envelope as a tool result.
     ///
-    /// Callers get it via `to_tool_result`, which ships it as both text and
-    /// `structuredContent`.
-    /// Wrap the envelope as a 2026-07-28 tool result.
+    /// `CallToolResult::structured` puts the JSON in **both** places:
+    /// `content` as text and `structuredContent` as a real object. Clients
+    /// that understand the structured field stop re-parsing a string; clients
+    /// that don't still read the text.
     ///
-    /// `CallToolResult::structured` puts the JSON in **both** places: `content`
-    /// as text (byte-identical to what `to_json` returned before, so every
-    /// existing consumer is unaffected) and `structuredContent` as a real
-    /// object. Clients that understand the new field stop re-parsing a string;
-    /// clients that don't see no change at all. Purely additive on the wire.
-    ///
-    /// Error envelopes (`timeout`, `stream_closed`) deliberately do NOT use
-    /// `structured_error`: `isError` is for "the tool failed to run", and here
-    /// the tool ran fine and is reporting a command outcome. Callers detect
-    /// failure via `exit_code` / `status`, exactly as the tool description
-    /// says — flipping `isError` would make well-formed results look like tool
-    /// faults.
+    /// A command that exits nonzero sets `isError`, matching the in-kernel
+    /// `shell` tool — one tool name, one error rule. The envelope still says
+    /// what happened in `exit_code` and `status`, so a caller that wants the
+    /// finer distinction (a program kaish refused vs. one that ran and
+    /// failed) reads the field rather than the flag.
     fn to_tool_result(&self) -> CallToolResult {
-        CallToolResult::structured(self.to_value())
+        let env = self.to_envelope();
+        let value = env.to_value();
+        if env.is_error() {
+            CallToolResult::structured_error(value)
+        } else {
+            CallToolResult::structured(value)
+        }
     }
 
     /// The envelope as a real `serde_json::Value`.
     ///
-    /// This is the single source of truth for the shape; `to_json` stringifies
-    /// it and the `shell` tool hands it to `CallToolResult::structured` so the
-    /// same object rides both as text (back-compat) and as
-    /// `structuredContent` (2026-07-28).
+    /// The shape is `kaijutsu_types::shell_envelope::ShellEnvelope`, shared
+    /// with the in-kernel `shell` tool so the same tool name returns the same
+    /// keys whichever path served the call. Fields this path cannot know stay
+    /// `null` — `did_spill` and `latch` ride kaish's `ExecResult`, which does
+    /// not survive the trip out to a block snapshot.
+    ///
+    /// `cfg(test)`: production reaches the envelope through `to_tool_result`,
+    /// which needs the typed value to decide the error flag. The tests read
+    /// the JSON a caller sees.
+    #[cfg(test)]
     fn to_value(&self) -> serde_json::Value {
+        self.to_envelope().to_value()
+    }
+
+    /// The shared envelope this completion describes.
+    fn to_envelope(&self) -> ShellEnvelope {
         match self {
             Self::Done {
                 snapshot,
@@ -243,96 +252,75 @@ impl ShellCompletion {
                 // success and masks a replication gap. `null` is self-
                 // announcing; callers detect failure via a non-zero code OR a
                 // status of "error"/"timeout"/"stream_closed".
-                let exit_code = match snapshot.exit_code {
-                    Some(c) => serde_json::Value::from(c),
-                    None => serde_json::Value::Null,
+                let exit_code = snapshot.exit_code.map(i64::from);
+                // The exit code decides the status when there is one, so the
+                // status and the exit code can never disagree. Without a code
+                // the block's own status is the best available answer.
+                let status = match exit_code {
+                    Some(code) => ShellEnvelope::status_for_exit(code),
+                    None => match snapshot.status {
+                        kaijutsu_types::Status::Error => ShellStatus::Error,
+                        _ => ShellStatus::Done,
+                    },
                 };
-                // stdout lives in content; stderr is its own field (split at
-                // the source — see shell_execute). Empty string when unset.
-                let stdout = snapshot.content.clone();
-                let stderr = snapshot.stderr.clone().unwrap_or_default();
+                let mut env = ShellEnvelope::new(status);
+                // stdout lives in the block content; stderr is its own field
+                // (split at the source — see shell_execute). Empty string
+                // when unset.
+                env.stdout = snapshot.content.clone();
+                env.stderr = snapshot.stderr.clone().unwrap_or_default();
+                env.exit_code = exit_code;
+                env.block_id = Some(snapshot.id.to_key());
+                env.content_type = Some(snapshot.content_type.as_mime().to_string());
+                env.ephemeral = Some(snapshot.ephemeral);
+                env.elapsed_ms = Some(*elapsed_ms);
                 // `to_json()` is OutputData's semantic form — rich_json
                 // verbatim when the producer set one (e.g. `kj` structured
                 // payloads), else inferred from the node tree. The raw
                 // `serde_json::to_value(o)` struct shape (`{headers,root,
                 // rich_json}`) is an internal wire representation, not what
                 // agents want to consume.
-                let data = snapshot.output.as_ref().map(|o| o.to_json());
-                serde_json::json!({
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "exit_code": exit_code,
-                    "status": snapshot.status.as_str(),
-                    "block_id": snapshot.id.to_key(),
-                    "content_type": snapshot.content_type.as_mime(),
-                    "ephemeral": snapshot.ephemeral,
-                    "data": data,
-                    "elapsed_ms": elapsed_ms,
-                })
+                env.data = snapshot.output.as_ref().map(|o| o.to_json());
+                env
             }
             Self::Timeout {
                 cmd_block_id,
                 timeout_secs,
                 elapsed_ms,
-            } => serde_json::json!({
-                "stdout": "",
-                "exit_code": -1,
-                "status": "timeout",
-                "block_id": cmd_block_id.to_key(),
-                "elapsed_ms": elapsed_ms,
-                "error": format!("Timeout after {}s waiting for command", timeout_secs),
-            }),
+            } => {
+                let mut env = ShellEnvelope::new(ShellStatus::Timeout);
+                env.exit_code = Some(-1);
+                env.block_id = Some(cmd_block_id.to_key());
+                env.elapsed_ms = Some(*elapsed_ms);
+                env.error = Some(format!(
+                    "Timeout after {timeout_secs}s waiting for command"
+                ));
+                env
+            }
             Self::StreamClosed {
                 cmd_block_id,
                 elapsed_ms,
-            } => serde_json::json!({
-                "stdout": "",
-                "exit_code": -1,
-                "status": "stream_closed",
-                "block_id": cmd_block_id.to_key(),
-                "elapsed_ms": elapsed_ms,
-                "error": "Event stream closed before completion",
-            }),
+            } => {
+                let mut env = ShellEnvelope::new(ShellStatus::StreamClosed);
+                env.exit_code = Some(-1);
+                env.block_id = Some(cmd_block_id.to_key());
+                env.elapsed_ms = Some(*elapsed_ms);
+                env.error = Some("Event stream closed before completion".into());
+                env
+            }
         }
     }
 }
 
-/// Declared result shape for `shell` (`Tool.outputSchema`, 2026-07-28).
+/// Declared result shape for `shell` (`Tool.outputSchema`).
 ///
-/// Hand-written rather than derived: the envelope is assembled with
-/// `serde_json::json!` from several sources (`BlockSnapshot`, `OutputData`,
-/// timing) and has no single Rust struct to `#[derive(JsonSchema)]` from.
-/// Inventing one purely to derive a schema would put a second definition of
-/// the shape next to the first and let them drift — the exact failure this
-/// codebase keeps finding. Keep this in step with
-/// `ShellCompletion::to_value` by hand; the round-trip test below fails if a
-/// key goes missing.
-///
-/// `exit_code` is `["integer", "null"]` on purpose: null means "hasn't
-/// replicated yet", which is deliberately distinct from 0.
+/// The schema and the envelope are one definition in `kaijutsu-types`, which
+/// is what keeps this tool's declared shape in step with what it actually
+/// returns — and with what the in-kernel `shell` tool returns.
 fn shell_output_schema() -> std::sync::Arc<rmcp::model::JsonObject> {
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "stdout": { "type": "string" },
-            "stderr": { "type": "string" },
-            "exit_code": {
-                "type": ["integer", "null"],
-                "description": "null = not yet replicated; treat as unknown, not success"
-            },
-            "status": { "type": "string" },
-            "block_id": { "type": "string" },
-            "content_type": { "type": "string" },
-            "ephemeral": { "type": "boolean" },
-            "data": { "description": "kj structured payload when present" },
-            "elapsed_ms": { "type": "integer" },
-            "error": { "type": "string", "description": "why the command's outcome never reached the tool; present only when exit_code is -1" }
-        },
-        "required": ["stdout", "exit_code", "status", "block_id", "elapsed_ms"]
-    });
-    let obj = match schema {
+    let obj = match ShellEnvelope::output_schema() {
         serde_json::Value::Object(m) => m,
-        _ => unreachable!("literal above is an object"),
+        other => unreachable!("the envelope schema is an object, got {other}"),
     };
     std::sync::Arc::new(obj)
 }
@@ -1797,7 +1785,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 rather than text-matching. exit_code is null when it has not replicated yet — treat null as unknown, not success — and -1 when the command's outcome never reached the tool, where `status` and `error` say what went wrong. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). Output also lands as kernel blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
+        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns one JSON object, always the same keys: {stdout, stderr, exit_code, status, did_spill, data, latch, block_id, background_id, content_type, ephemeral, elapsed_ms, error} — the same shape the in-kernel `shell` tool returns. `stdout` and `stderr` are separate and are empty strings when the command wrote none. Detect failure via exit_code != 0 rather than text-matching. exit_code is null when it has not replicated yet — treat null as unknown, not success — and -1 when the command's outcome never reached the tool, where `status` and `error` say what went wrong. `status` is done, error, rejected, running, timeout or stream_closed. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). A key this path cannot fill is null, never absent. Output also lands as kernel blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
         annotations(open_world_hint = true),
         output_schema = shell_output_schema()
     )]
@@ -3438,10 +3426,8 @@ mod tests {
         assert_eq!(json["elapsed_ms"], 42);
     }
 
-    /// The 2026-07-28 shape: the envelope must ride as BOTH `content` text and
-    /// `structuredContent`. The text half is what every existing consumer
-    /// reads, so it must stay byte-identical to the old `to_json()` output —
-    /// this change is additive on the wire or it is a breaking one.
+    /// The envelope must ride as BOTH `content` text and `structuredContent`:
+    /// a client that reads only the text half still gets the whole result.
     #[test]
     fn tool_result_carries_the_envelope_as_text_and_structured() {
         let snap = make_result_snapshot("hello\n", Some(0));
@@ -3470,15 +3456,15 @@ mod tests {
         assert_eq!(
             result.is_error,
             Some(false),
-            "a command that ran is not a tool failure, whatever its exit code"
+            "this command exited 0 — see nonzero_exit_is_a_tool_error for the other half"
         );
     }
 
-    /// A non-zero exit is a *command* outcome, not a *tool* failure. If this
-    /// ever flips to `isError: true`, every failing build would look to a
-    /// client like the shell tool itself broke.
+    /// A nonzero exit sets `isError`, matching the in-kernel `shell` tool.
+    /// One tool name, one error rule — the two builders disagreeing about
+    /// this is what the shared envelope exists to end.
     #[test]
-    fn nonzero_exit_is_not_a_tool_error() {
+    fn nonzero_exit_is_a_tool_error() {
         let snap = make_result_snapshot("boom\n", Some(127));
         let result = ShellCompletion::Done {
             snapshot: Box::new(snap),
@@ -3486,11 +3472,88 @@ mod tests {
         }
         .to_tool_result();
 
-        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.is_error, Some(true));
+        let body = result.structured_content.as_ref().unwrap();
+        assert_eq!(body["exit_code"], 127);
         assert_eq!(
-            result.structured_content.as_ref().unwrap()["exit_code"],
-            127
+            body["status"], "error",
+            "the flag and the status field must never disagree"
         );
+    }
+
+    /// Exit 0 is not an error, and neither is a `null` exit code — a code
+    /// that has not replicated is unknown, and flagging unknown as failure
+    /// would make every slow replication look like a broken command.
+    #[test]
+    fn zero_exit_is_not_a_tool_error() {
+        let result = ShellCompletion::Done {
+            snapshot: Box::new(make_result_snapshot("fine\n", Some(0))),
+            elapsed_ms: 1,
+        }
+        .to_tool_result();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.structured_content.as_ref().unwrap()["status"], "done");
+    }
+
+    /// A timeout is an error: the tool has no outcome to report, and a
+    /// caller that reads it as success acts on output that never arrived.
+    #[test]
+    fn a_timeout_is_a_tool_error() {
+        let result = ShellCompletion::Timeout {
+            cmd_block_id: make_result_snapshot("", None).id,
+            timeout_secs: 30,
+            elapsed_ms: 30_000,
+        }
+        .to_tool_result();
+        assert_eq!(result.is_error, Some(true));
+        let body = result.structured_content.as_ref().unwrap();
+        assert_eq!(body["status"], "timeout");
+        assert_eq!(body["exit_code"], -1);
+        assert!(body["error"].as_str().unwrap().contains("Timeout"));
+    }
+
+    /// Both builders answer the same tool name, so both must emit the same
+    /// keys. This is the assertion that fails if either side grows a field
+    /// the other does not have.
+    #[test]
+    fn the_envelope_carries_every_shared_key() {
+        let cases = vec![
+            ShellCompletion::Done {
+                snapshot: Box::new(make_result_snapshot("x", Some(0))),
+                elapsed_ms: 1,
+            },
+            ShellCompletion::Timeout {
+                cmd_block_id: make_result_snapshot("", None).id,
+                timeout_secs: 5,
+                elapsed_ms: 5_000,
+            },
+            ShellCompletion::StreamClosed {
+                cmd_block_id: make_result_snapshot("", None).id,
+                elapsed_ms: 7,
+            },
+        ];
+        for case in cases {
+            let value = case.to_value();
+            let obj = value.as_object().expect("an object");
+            for key in ShellEnvelope::KEYS {
+                assert!(obj.contains_key(*key), "key {key} missing from {value}");
+            }
+        }
+    }
+
+    /// This path polls a block snapshot, which does not carry kaish's
+    /// `ExecResult`. Those two fields must read `null` — "this path cannot
+    /// know" — never a fabricated `false`/empty that would read as fact.
+    #[test]
+    fn fields_this_path_cannot_know_are_null_not_invented() {
+        let value = ShellCompletion::Done {
+            snapshot: Box::new(make_result_snapshot("x", Some(0))),
+            elapsed_ms: 1,
+        }
+        .to_value();
+        assert_eq!(value["did_spill"], serde_json::Value::Null);
+        assert_eq!(value["latch"], serde_json::Value::Null);
+        assert_eq!(value["background_id"], serde_json::Value::Null);
     }
 
     /// The declared schema and the envelope must not drift. Every `required`

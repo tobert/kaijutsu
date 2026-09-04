@@ -6,6 +6,52 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The MCP `shell` path applies no size limit to its envelope (2026-09-04)
+
+The in-kernel `shell` result is bounded by the broker's per-instance
+`max_result_bytes` (`crates/kaijutsu-kernel/src/mcp/broker.rs:1745`, shrinking
+the strings inside the envelope so it stays parseable). The external stdio
+path has no equivalent: `ShellCompletion::to_tool_result` hands
+`CallToolResult::structured` the whole envelope
+(`crates/kaijutsu-mcp/src/lib.rs`), so a command with 10 MB of stdout ships
+10 MB. The `truncate_at_char_boundary` nearby is for progress lines
+(`PROGRESS_LINE_MAX_BYTES = 200`), not the result.
+
+Found by kaibo review of the envelope unification, 2026-09-04. The shared
+shape is the same on both paths; the size handling is not, and "one shape"
+does not currently extend to it. Whether the MCP path should carry the same
+budget — and where it would read one from, having no per-instance policy — is
+the open question.
+
+---
+
+## A tool result's model-facing shape still depends on whether its body is empty (2026-09-04)
+
+`Kernel::call_tool` (`crates/kaijutsu-kernel/src/kernel.rs:668`) substitutes
+the pretty-printed `structured` payload when the flattened text body comes out
+empty:
+
+```rust
+if let Some(s) = &result.structured && text.is_empty() {
+    text = serde_json::to_string_pretty(s).unwrap_or_default();
+}
+```
+
+Any tool that returns BOTH a text body and a structured payload, where the body
+can be empty, therefore hands the model two different shapes depending on its
+output. That was the `shell` shape flip worknote entry 4 reported; `shell` is
+fixed by returning `ToolContent::Json` unconditionally
+(`docs/shell-envelope.md`), so nothing keys on emptiness there any more.
+
+The fallback itself is still in place and is correct for a structured-only
+tool, which is why it was left. No other tool has the sometimes-empty-text
+property today — `bindings_builtin`, `hooks_builtin` and `resources_builtin`
+all return `ToolContent::Json` unconditionally — so this is latent, not live.
+The fix, if a tool ever grows the property: decide the shape from the tool's
+declared output, not from whether the body happens to be empty.
+
+---
+
 ## A recovered document's first op races for seq 1 (2026-09-04)
 
 `BlockStore::create_document_with_block` writes the documents row and the

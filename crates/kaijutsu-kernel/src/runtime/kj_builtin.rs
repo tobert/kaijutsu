@@ -2454,7 +2454,7 @@ mod tests {
         );
 
         // The structured gate survives so the MCP shell layer
-        // (`shell_result_to_kernel`) still reads it from the returned result.
+        // (`shell_result_to_envelope`) still reads it from the returned result.
         let latch = latch_from_result(&res)
             .expect("the kj latch baggage must survive kaish's --json formatting");
         assert_eq!(latch.command, "kj context remove");

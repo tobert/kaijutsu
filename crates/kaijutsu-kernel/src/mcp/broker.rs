@@ -4175,7 +4175,16 @@ fn estimate_result_size(result: &KernelToolResult) -> usize {
         }
     }
     if let Some(v) = &result.structured {
-        total += v.to_string().len();
+        // A result whose body IS its structured payload (the shell envelope
+        // sets both to one value) is one payload, not two. Counting it twice
+        // would trip truncation at half the configured `max_result_bytes`.
+        let mirrored = matches!(
+            result.content.as_slice(),
+            [super::types::ToolContent::Json(body)] if body == v
+        );
+        if !mirrored {
+            total += v.to_string().len();
+        }
     }
     total
 }
@@ -4241,6 +4250,20 @@ fn elision_marker(n: usize) -> String {
 fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize) {
     use super::types::ToolContent;
 
+    // A lone JSON object body is the model's entire reading of the call, so
+    // it must stay parseable: shrink the strings inside it and keep every key
+    // (`shrink_json_to_budget`). Cutting the serialization head+tail would
+    // take the exit code and status along with the output that overflowed.
+    // `structured` mirrors the shrunk body rather than being dropped, because
+    // for these results the two are one value and a consumer reading the
+    // envelope structurally should see the same truncation the model saw.
+    if let [ToolContent::Json(v)] = result.content.as_mut_slice() {
+        if v.is_object() && shrink_json_to_budget(v, budget) {
+            result.structured = Some(v.clone());
+            return;
+        }
+    }
+
     // Flatten into one string — head+tail truncation needs to look across
     // item boundaries, which the old per-item prefix walk couldn't do.
     result.structured = None;
@@ -4291,6 +4314,101 @@ fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize) {
     out.push_str(&marker);
     out.push_str(tail);
     result.content = vec![ToolContent::Text(out)];
+}
+
+/// Shrink `s` to at most `budget` bytes, keeping a head and a tail with the
+/// elision marker between them. The same 30/70 split and char-boundary rules
+/// `truncate_result_to_budget` uses on a text body; extracted so a JSON body
+/// can elide the strings *inside* it by the same rule.
+fn elide_middle(s: &str, budget: usize) -> String {
+    let total = s.len();
+    if total <= budget {
+        return s.to_string();
+    }
+    let placeholder_marker = elision_marker(total);
+    let marker_reserve = placeholder_marker.len();
+    if marker_reserve >= budget {
+        let cut = char_boundary_floor(&placeholder_marker, budget);
+        return placeholder_marker[..cut].to_string();
+    }
+    let body_budget = budget - marker_reserve;
+    let head_budget = body_budget * 3 / 10;
+    let tail_budget = body_budget - head_budget;
+
+    let head_cut = char_boundary_floor(s, head_budget);
+    let tail_start_raw = total.saturating_sub(tail_budget).max(head_cut);
+    let tail_start = char_boundary_ceil(s, tail_start_raw);
+
+    let mut out = String::new();
+    out.push_str(&s[..head_cut]);
+    out.push_str(&elision_marker(tail_start - head_cut));
+    out.push_str(&s[tail_start..]);
+    out
+}
+
+/// Shrink a JSON object body until its serialization fits `budget`, by
+/// eliding the middle of its longest string value and repeating.
+///
+/// A JSON body is the model's whole reading of the call (the `shell` envelope
+/// is one — `docs/shell-envelope.md`), so cutting its *serialization* head+tail
+/// the way a text body is cut leaves the model unparseable text: it loses the
+/// exit code and the status along with the output that overflowed. Eliding
+/// inside the strings keeps every key readable and costs only the output that
+/// did not fit, which is the part truncation was always meant to take.
+///
+/// Returns false when the object cannot be made to fit even with every string
+/// emptied — its own keys and structure exceed the budget — and the caller
+/// falls back to text truncation, because at that budget nothing readable
+/// survives either way.
+fn shrink_json_to_budget(value: &mut serde_json::Value, budget: usize) -> bool {
+    // Each pass empties or shortens the single longest string, so the
+    // serialized length strictly decreases while any non-empty string
+    // remains. The bound is the number of string fields.
+    loop {
+        let len = value.to_string().len();
+        if len <= budget {
+            return true;
+        }
+        let over = len - budget;
+        let Some(obj) = value.as_object_mut() else {
+            return false;
+        };
+        // The longest string value, by serialized cost. Ties go to the first
+        // key in iteration order — arbitrary but deterministic.
+        let Some(key) = obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.len())))
+            .filter(|(_, n)| *n > 0)
+            .max_by_key(|(_, n)| *n)
+            .map(|(k, _)| k)
+        else {
+            // Nothing left to shrink and it still does not fit.
+            return false;
+        };
+        let current = obj[&key].as_str().unwrap_or_default().to_string();
+        // Escaping only ever adds bytes, so cutting `over` bytes out of the
+        // raw string removes at least `over` from the serialization. The
+        // marker is charged for here so the loop converges instead of
+        // trading one overflow for another — at its SERIALIZED cost, not its
+        // raw one: the marker carries four newlines, and a newline inside a
+        // JSON string is the two bytes `\n`. Charging the raw length left a
+        // pass four bytes short of its target.
+        let marker = elision_marker(current.len());
+        let marker_cost = serde_json::Value::String(marker).to_string().len();
+        let target = current.len().saturating_sub(over + marker_cost);
+        let shrunk = if target == 0 {
+            String::new()
+        } else {
+            elide_middle(&current, target)
+        };
+        // Defensive: if a pass fails to shrink the string, empty it rather
+        // than spin. Reaching this means the arithmetic above is wrong.
+        if shrunk.len() >= current.len() {
+            obj[&key] = serde_json::Value::String(String::new());
+        } else {
+            obj[&key] = serde_json::Value::String(shrunk);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4793,6 +4911,135 @@ mod tests {
             !result.is_error,
             "truncation must not flip is_error — model still gets data"
         );
+    }
+
+    /// An oversize `shell` envelope must stay parseable. This is the whole
+    /// reason a JSON body gets its own truncation path: cutting the
+    /// serialization head+tail leaves the model text it cannot read, losing
+    /// the exit code and status along with the output that overflowed.
+    #[test]
+    fn oversize_json_body_stays_parseable_and_keeps_every_key() {
+        use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
+
+        let mut env = ShellEnvelope::new(ShellStatus::Error);
+        env.stdout = "x".repeat(50_000);
+        env.stderr = "e".repeat(4_000);
+        env.exit_code = Some(42);
+        let value = env.to_value();
+        let mut result = KernelToolResult {
+            is_error: true,
+            content: vec![crate::mcp::ToolContent::Json(value.clone())],
+            structured: Some(value),
+        };
+
+        truncate_result_to_budget(&mut result, 2_000);
+
+        let body = match result.content.as_slice() {
+            [crate::mcp::ToolContent::Json(v)] => v.clone(),
+            other => panic!("a JSON body must stay JSON, got {other:?}"),
+        };
+        assert!(
+            body.to_string().len() <= 2_000,
+            "must fit the budget, got {} bytes",
+            body.to_string().len()
+        );
+        let obj = body.as_object().expect("still an object");
+        for key in ShellEnvelope::KEYS {
+            assert!(obj.contains_key(*key), "truncation dropped key {key}");
+        }
+        assert_eq!(
+            obj["exit_code"], 42,
+            "the exit code must survive truncation — it is how failure is detected"
+        );
+        assert_eq!(obj["status"], "error");
+        assert!(
+            obj["stdout"].as_str().expect("stdout is a string").len() < 50_000,
+            "the overflowing output is what truncation should take"
+        );
+        assert_eq!(
+            result.structured.as_ref().expect("structured mirrors the body"),
+            &body,
+            "structured and the model-facing body are one value here"
+        );
+    }
+
+    /// A body that IS its structured payload is one payload. Counting it
+    /// twice tripped truncation at half the configured `max_result_bytes`.
+    #[test]
+    fn a_mirrored_payload_is_measured_once() {
+        use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
+
+        let mut env = ShellEnvelope::new(ShellStatus::Done);
+        env.stdout = "x".repeat(1_000);
+        env.exit_code = Some(0);
+        let value = env.to_value();
+        let one = value.to_string().len();
+
+        let mirrored = KernelToolResult {
+            is_error: false,
+            content: vec![crate::mcp::ToolContent::Json(value.clone())],
+            structured: Some(value.clone()),
+        };
+        assert_eq!(
+            estimate_result_size(&mirrored),
+            one,
+            "the body and its structured mirror are one payload"
+        );
+
+        // A result whose structured payload is genuinely a SECOND thing is
+        // still counted as two — the fix must not hide real size.
+        let distinct = KernelToolResult {
+            is_error: false,
+            content: vec![crate::mcp::ToolContent::Json(value.clone())],
+            structured: Some(serde_json::json!({"different": true})),
+        };
+        assert!(
+            estimate_result_size(&distinct) > one,
+            "a distinct structured payload still adds to the size"
+        );
+    }
+
+    /// Property check for the JSON path: whatever the budget, the emitted
+    /// body parses and fits, or the result fell back to text.
+    #[test]
+    fn shrunk_json_never_exceeds_budget_or_falls_back_to_text() {
+        use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
+
+        for out_len in [0usize, 10, 1_000, 100_000] {
+            for budget in [0usize, 1, 50, 200, 500, 5_000, 200_000] {
+                let mut env = ShellEnvelope::new(ShellStatus::Done);
+                env.stdout = "z".repeat(out_len);
+                env.exit_code = Some(0);
+                let value = env.to_value();
+                let mut result = KernelToolResult {
+                    is_error: false,
+                    content: vec![crate::mcp::ToolContent::Json(value.clone())],
+                    structured: Some(value),
+                };
+                truncate_result_to_budget(&mut result, budget);
+                let combined: String = result
+                    .content
+                    .iter()
+                    .map(|c| match c {
+                        crate::mcp::ToolContent::Text(s) => s.clone(),
+                        crate::mcp::ToolContent::Json(v) => v.to_string(),
+                    })
+                    .collect();
+                assert!(
+                    combined.len() <= budget.max(combined.len().min(0)) || combined.len() <= budget,
+                    "out_len={out_len} budget={budget}: emitted {} bytes",
+                    combined.len()
+                );
+                // A JSON body that survived as JSON must parse.
+                if let [crate::mcp::ToolContent::Json(v)] = result.content.as_slice() {
+                    assert!(v.is_object(), "out_len={out_len} budget={budget}");
+                    assert!(
+                        combined.len() <= budget,
+                        "out_len={out_len} budget={budget}: JSON body over budget"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

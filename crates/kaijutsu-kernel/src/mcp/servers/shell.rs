@@ -52,6 +52,7 @@ use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
 use kaijutsu_types::RefusalKind;
+use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult, ToolContent};
 
@@ -113,18 +114,32 @@ pub(crate) fn composed_tool_description() -> &'static str {
 
 // The kaijutsu-specific half kaish-help can't know: what this tool IS here
 // (runs in the caller's current kernel context), that `kj` is in scope for
-// context/drift/fork management, and the return contract (combined stdout,
-// stderr appended, nonzero exit reported as an error). Kept as an intro
-// paragraph, separated from the composed kaish-language rules by a blank
-// line, so the two sources stay visibly distinct rather than blurring into
-// one hand-tuned paragraph the way the old static file did.
+// context/drift/fork management, and the return contract (one JSON envelope,
+// every key always present). Kept as an intro paragraph, separated from the
+// composed kaish-language rules by a blank line, so the two sources stay
+// visibly distinct rather than blurring into one hand-tuned paragraph the way
+// the old static file did.
+//
+// RETURN_CONTRACT is the one statement of the envelope, shared by both
+// flavours — two copies of a shape description drift, and this one is read by
+// every model that calls the tool.
+const RETURN_CONTRACT: &str = "Returns one JSON object, always the same \
+     keys: {stdout, stderr, exit_code, status, did_spill, data, latch, \
+     block_id, background_id, content_type, ephemeral, elapsed_ms, error}. \
+     `stdout` and `stderr` are separate and are empty strings when the \
+     command wrote none. Detect failure with `exit_code != 0` rather than \
+     matching text. `status` is done, error, rejected, running, timeout or \
+     stream_closed — `rejected` means kaish refused the program and nothing \
+     ran, so fix the command text and retry. `exit_code` is null exactly \
+     when there is no code to report; null is never evidence of success. \
+     `did_spill` true means output was capped and the tail dropped. `data` \
+     is the kj structured payload when present.";
+
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Run a command in your current kernel context using kaish (会sh). \
-         `kj` is in scope for context/drift/fork management. Returns \
-         combined stdout (stderr appended when present); a nonzero exit \
-         code is reported as an error.\n\n{}",
-        &*COMPOSED_TOOL_DESCRIPTION
+         `kj` is in scope for context/drift/fork management. {}\n\n{}",
+        RETURN_CONTRACT, &*COMPOSED_TOOL_DESCRIPTION
     )
 });
 
@@ -147,10 +162,8 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
          run one, rather than concluding it is missing. Use this tool to \
          inspect — read files, `grep`, `find`, walk the tree, and read the \
          kernel document/input views under `/v/docs` and `/v/input`; `kj` is \
-         in scope for read-only context introspection. Returns combined \
-         stdout (stderr appended when present); a nonzero exit code is \
-         reported as an error.\n\n{}",
-        &*COMPOSED_TOOL_DESCRIPTION
+         in scope for read-only context introspection. {}\n\n{}",
+        RETURN_CONTRACT, &*COMPOSED_TOOL_DESCRIPTION
     )
 });
 
@@ -348,20 +361,21 @@ impl ShellServer {
         )
         .map_err(|e| McpError::Protocol(format!("failed to start background process: {e}")))?;
 
-        Ok(KernelToolResult {
-            is_error: false,
-            content: vec![ToolContent::Text(format!(
-                "started background process {bg_id}; output streams into block {}. \
-                 Poll with read_background_output, list with list_background_processes, \
-                 stop with kill_background_process (builtin.background).",
-                block_id.to_key()
-            ))],
-            structured: Some(serde_json::json!({
-                "background_id": bg_id.to_string(),
-                "block_id": block_id.to_key(),
-                "status": "running",
-            })),
-        })
+        // A started background command reports through the same envelope as
+        // every other `shell` return. `stdout` is empty because the output has
+        // not happened yet — it streams into `block_id`, which is why the
+        // instruction for reaching it rides `stderr` rather than being the
+        // whole body.
+        let mut env = ShellEnvelope::new(ShellStatus::Running);
+        env.background_id = Some(bg_id.to_string());
+        env.block_id = Some(block_id.to_key());
+        env.stderr = format!(
+            "started background process {bg_id}; output streams into block {}. \
+             Poll with read_background_output, list with list_background_processes, \
+             stop with kill_background_process (builtin.background).",
+            block_id.to_key()
+        );
+        Ok(envelope_result(env))
     }
 }
 
@@ -458,11 +472,9 @@ impl McpServerLike for ShellServer {
             let spec = match crate::kj::shell_gate::build_shell_gate_spec(&parsed.command) {
                 Ok(spec) => spec,
                 Err(e) => {
-                    return Ok(KernelToolResult {
-                        is_error: true,
-                        content: vec![ToolContent::Text(format!("{e} — nothing was run"))],
-                        structured: None,
-                    });
+                    let mut env = ShellEnvelope::new(ShellStatus::Rejected);
+                    env.error = Some(format!("{e} — nothing was run"));
+                    return Ok(envelope_result(env));
                 }
             };
             let caller = crate::kj::KjCaller {
@@ -587,21 +599,22 @@ impl McpServerLike for ShellServer {
         // something under it broke, which is not a rejection the model can
         // fix by rewriting the command. `is_rejected()` is kaish's own
         // predicate for the split; do not re-derive it from the message text.
+        let started = std::time::Instant::now();
         let result = match kaish.execute_with_options(&parsed.command, opts).await {
             Ok(result) => result,
             Err(e) if e.is_rejected() => {
-                return Ok(KernelToolResult {
-                    is_error: true,
-                    content: vec![ToolContent::Text(e.to_string())],
-                    structured: None,
-                });
+                let mut env = ShellEnvelope::new(ShellStatus::Rejected);
+                env.error = Some(e.to_string());
+                env.elapsed_ms = Some(started.elapsed().as_millis() as u64);
+                return Ok(envelope_result(env));
             }
             Err(e) => {
                 return Err(McpError::Protocol(format!("shell execution failed: {e}")));
             }
         };
 
-        Ok(shell_result_to_kernel(result))
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        Ok(envelope_result(shell_result_to_envelope(result, elapsed_ms)))
     }
 
     fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
@@ -609,81 +622,76 @@ impl McpServerLike for ShellServer {
     }
 }
 
-/// Collapse a kaish `ExecResult` onto the D-28 `is_error` channel. stdout is
-/// the model-facing body; stderr is appended when present so a
-/// successful-with-warnings command (exit 0 + stderr) still surfaces it, and a
-/// nonzero exit is both flagged (`is_error`) and labelled in the body. A
-/// structured envelope carries the exit code + raw streams for programmatic
-/// consumers, plus any confirmation-latch request so a caller can fulfill it
-/// structurally rather than parsing the prose.
+/// Wrap a `ShellEnvelope` as the tool result. The envelope is the
+/// model-facing body — `ToolContent::Json`, not text, so the broker's
+/// oversize truncation shrinks the strings inside it and re-serializes
+/// instead of cutting the serialization in half.
+///
+/// `is_error` comes from the envelope's status, so the flag and the `status`
+/// field can never disagree.
+fn envelope_result(env: kaijutsu_types::shell_envelope::ShellEnvelope) -> KernelToolResult {
+    let value = env.to_value();
+    KernelToolResult {
+        is_error: env.is_error(),
+        content: vec![ToolContent::Json(value.clone())],
+        structured: Some(value),
+    }
+}
+
+/// Collapse a kaish `ExecResult` into the shared `ShellEnvelope`.
+///
+/// Every `shell` return travels this shape — `docs/shell-envelope.md` is
+/// canonical. The body used to be prose (stdout, with
+/// stderr and `[exit N]` appended) and the envelope a side channel, which made
+/// the model-facing shape depend on whether the body came out empty: a command
+/// with no output fell through to the pretty-printed envelope while every
+/// other command produced text.
 ///
 /// A capped result (kaish `did_spill`: exit remapped to 3, real exit stashed
 /// in `original_code`) is judged by the command's REAL exit — truncation is
-/// not failure, and an `is_error` here tempts a model into re-running a
-/// command that already succeeded. The truncation itself stays unmissable:
-/// `[output truncated]` in the body, `did_spill` in the envelope.
-fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> KernelToolResult {
-    let stdout = result.text_out().into_owned();
-    let stderr = result.err.clone();
+/// not failure, and an error here tempts a model into re-running a command
+/// that already succeeded. The truncation stays unmissable as `did_spill`.
+fn shell_result_to_envelope(
+    result: kaish_kernel::interpreter::ExecResult,
+    elapsed_ms: u64,
+) -> kaijutsu_types::shell_envelope::ShellEnvelope {
+    use kaijutsu_types::shell_envelope::ShellEnvelope;
+
     let exit_code = if result.did_spill {
         result.original_code.unwrap_or(result.code)
     } else {
         result.code
     };
-    let is_error = exit_code != 0;
+    let mut env = ShellEnvelope::new(ShellEnvelope::status_for_exit(exit_code));
+    env.stdout = result.text_out().into_owned();
+    env.stderr = result.err.clone();
+    env.exit_code = Some(exit_code);
+    env.did_spill = Some(result.did_spill);
+    env.elapsed_ms = Some(elapsed_ms);
     // kj verbs (and any builtin that opts in) attach a structured `.data`
     // payload — context-id arrays for list commands, records for inspect. Carry
-    // it into the structured envelope so programmatic consumers don't scrape
-    // stdout. `null` when the command set no data (external commands, echo, …).
-    let data = result
+    // it so consumers don't scrape stdout. `null` when the command set no data
+    // (external commands, echo, …).
+    env.data = result
         .data
         .as_ref()
         .map(kaish_kernel::interpreter::value_to_json);
     // A `kj` confirmation gate (exit 2, e.g. `kj context remove`) rides
     // kaish's opaque `baggage` channel, distinct from the data-plane `.data`.
-    // Surface it so a batch loop reads `structured.latch.hint` and re-runs
-    // with `--confirm`, instead of scraping the confirmation prose out of the
-    // body. `null` when the command didn't latch. kaish's own latch — the one
-    // that used to hold `rm` here on a typed `.latch` field — is gone as of
-    // 0.14, and was never enabled in kaijutsu anyway (`KaishConfig::named`
-    // defaults `latch_enabled` off, and we never called `with_latch`).
-    let latch = crate::runtime::kj_builtin::latch_from_result(&result).map(|l| {
+    // Surface it so a batch loop reads `latch.hint` and re-runs with
+    // `--confirm`, instead of scraping the confirmation prose out of stdout.
+    // `null` when the command didn't latch. kaish's own latch — the one that
+    // used to hold `rm` here on a typed `.latch` field — is gone as of 0.14,
+    // and was never enabled in kaijutsu anyway (`KaishConfig::named` defaults
+    // `latch_enabled` off, and we never called `with_latch`).
+    env.latch = crate::runtime::kj_builtin::latch_from_result(&result).map(|l| {
         serde_json::json!({
             "command": l.command,
             "target": l.target,
             "hint": l.hint,
         })
     });
-
-    let mut body = stdout.clone();
-    let mut push_line = |s: &str| {
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push_str(s);
-    };
-    if !stderr.is_empty() {
-        push_line(&stderr);
-    }
-    if result.did_spill {
-        push_line("[output truncated]");
-    }
-    if is_error {
-        push_line(&format!("[exit {exit_code}]"));
-    }
-
-    KernelToolResult {
-        is_error,
-        content: vec![ToolContent::Text(body)],
-        structured: Some(serde_json::json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code,
-            "did_spill": result.did_spill,
-            "data": data,
-            "latch": latch,
-        })),
-    }
+    env
 }
 
 #[cfg(test)]
@@ -734,7 +742,8 @@ mod tests {
         assert!(text.contains("current kernel context"), "{text}");
         assert!(text.contains("`kj` is in scope"), "{text}");
         assert!(
-            text.contains("combined stdout") && text.contains("nonzero exit"),
+            text.contains("one JSON object, always the same keys")
+                && text.contains("exit_code != 0"),
             "return contract must survive: {text}"
         );
 
@@ -748,7 +757,8 @@ mod tests {
             "read-only document views must survive: {ro_text}"
         );
         assert!(
-            ro_text.contains("combined stdout") && ro_text.contains("nonzero exit"),
+            ro_text.contains("one JSON object, always the same keys")
+                && ro_text.contains("exit_code != 0"),
             "return contract must survive on the read-only variant too: {ro_text}"
         );
         // The runtime refusal names its condition and stops, by design, so
@@ -875,12 +885,8 @@ mod tests {
             .expect("shell call should succeed");
 
         assert!(!result.is_error, "echo should not be an error");
-        match result.content.first().expect("content") {
-            ToolContent::Text(s) => {
-                assert!(s.contains("hello-shell"), "stdout missing, got: {s:?}")
-            }
-            other => panic!("expected text content, got {other:?}"),
-        }
+        let out = body_of(&result)["stdout"].as_str().unwrap_or_default().to_string();
+        assert!(out.contains("hello-shell"), "stdout missing, got: {out:?}");
     }
 
     /// The mirror on the hot side: `facade:shell_write` alone must let the
@@ -920,12 +926,8 @@ mod tests {
             .expect("shell_write call should succeed once the pending ask is answered");
 
         assert!(!result.is_error, "echo should not be an error");
-        match result.content.first().expect("content") {
-            ToolContent::Text(s) => {
-                assert!(s.contains("hello-shell-write"), "stdout missing, got: {s:?}")
-            }
-            other => panic!("expected text content, got {other:?}"),
-        }
+        let out = body_of(&result)["stdout"].as_str().unwrap_or_default().to_string();
+        assert!(out.contains("hello-shell-write"), "stdout missing, got: {out:?}");
     }
 
     /// The gate's deadline must be ordered under the broker's, so an
@@ -1003,10 +1005,16 @@ mod tests {
             .expect("a validator rejection must come back as a result, not an Err");
 
         assert!(result.is_error, "a rejected program must set is_error");
-        let body = match result.content.first() {
-            Some(ToolContent::Text(t)) => t.clone(),
-            other => panic!("expected text content, got {other:?}"),
-        };
+        let envelope = body_of(&result);
+        assert_eq!(
+            envelope["status"],
+            serde_json::json!("rejected"),
+            "a refused program is `rejected`, distinct from a command that ran and failed"
+        );
+        let body = envelope["error"]
+            .as_str()
+            .expect("a rejection names why in `error`")
+            .to_string();
         assert!(
             !body.contains("mcp protocol error"),
             "broker-internal vocabulary must not reach the model; got: {body}"
@@ -1045,10 +1053,16 @@ mod tests {
             .expect("a refused program must come back as a result, not an Err");
 
         assert!(result.is_error, "a rejected program must set is_error");
-        let body = match result.content.first() {
-            Some(ToolContent::Text(t)) => t.clone(),
-            other => panic!("expected text content, got {other:?}"),
-        };
+        let envelope = body_of(&result);
+        assert_eq!(
+            envelope["status"],
+            serde_json::json!("rejected"),
+            "a refused program is `rejected`, distinct from a command that ran and failed"
+        );
+        let body = envelope["error"]
+            .as_str()
+            .expect("a rejection names why in `error`")
+            .to_string();
         assert!(
             !body.contains("mcp protocol error"),
             "broker-internal vocabulary must not reach the model; got: {body}"
@@ -1192,12 +1206,8 @@ mod tests {
             .await
             .expect("shell_write call should succeed once kj ledger allows it");
         assert!(!result.is_error);
-        match result.content.first().expect("content") {
-            ToolContent::Text(s) => {
-                assert!(s.contains("answered-like-cc-send"), "stdout missing, got: {s:?}")
-            }
-            other => panic!("expected text content, got {other:?}"),
-        }
+        let out = body_of(&result)["stdout"].as_str().unwrap_or_default().to_string();
+        assert!(out.contains("answered-like-cc-send"), "stdout missing, got: {out:?}");
     }
 
     /// **The unresolvable-pin refusal.** The context's cwd at ask time is a
@@ -1374,38 +1384,145 @@ mod tests {
         );
     }
 
+    /// Helper: the envelope a completed `ExecResult` produces.
+    fn envelope_of(r: kaish_kernel::interpreter::ExecResult) -> serde_json::Value {
+        shell_result_to_envelope(r, 0).to_value()
+    }
+
+    /// Helper: the envelope a `shell` call returned. Every return is one
+    /// JSON object, so a test that used to match on a text body reads fields
+    /// here instead.
+    fn body_of(result: &KernelToolResult) -> serde_json::Value {
+        match result.content.as_slice() {
+            [ToolContent::Json(v)] => v.clone(),
+            other => panic!("a shell result must be one JSON value, got {other:?}"),
+        }
+    }
+
+    /// Helper: everything the command wrote, both streams. For assertions
+    /// about whether some text appeared at all.
+    fn streams_of(result: &KernelToolResult) -> String {
+        let body = body_of(result);
+        format!(
+            "{}{}",
+            body["stdout"].as_str().unwrap_or_default(),
+            body["stderr"].as_str().unwrap_or_default()
+        )
+    }
+
+    /// Every `shell` return is one JSON object with every key present. This
+    /// is the fix for the shape flip a worknote reported: the body used to be
+    /// prose, and a command with no output fell through to a pretty-printed
+    /// envelope while every other command produced text.
+    #[test]
+    fn every_return_is_one_json_object_with_every_key() {
+        let cases = vec![
+            (
+                "silent success",
+                envelope_result(shell_result_to_envelope(
+                    kaish_kernel::interpreter::ExecResult::success(""),
+                    0,
+                )),
+            ),
+            (
+                "output",
+                envelope_result(shell_result_to_envelope(
+                    kaish_kernel::interpreter::ExecResult::success("hi"),
+                    0,
+                )),
+            ),
+            (
+                "failure",
+                envelope_result(shell_result_to_envelope(
+                    kaish_kernel::interpreter::ExecResult::failure(1, "boom"),
+                    0,
+                )),
+            ),
+            ("rejection", {
+                let mut env = ShellEnvelope::new(ShellStatus::Rejected);
+                env.error = Some("parse error".into());
+                envelope_result(env)
+            }),
+            ("background", {
+                let mut env = ShellEnvelope::new(ShellStatus::Running);
+                env.background_id = Some("bg-1".into());
+                envelope_result(env)
+            }),
+        ];
+        for (label, kr) in cases {
+            let body = match kr.content.as_slice() {
+                [ToolContent::Json(v)] => v.clone(),
+                other => panic!("{label}: body must be one JSON value, got {other:?}"),
+            };
+            let obj = body
+                .as_object()
+                .unwrap_or_else(|| panic!("{label}: body must be an object, got {body}"));
+            for key in ShellEnvelope::KEYS {
+                assert!(obj.contains_key(*key), "{label}: key {key} missing");
+            }
+            assert_eq!(
+                kr.structured.as_ref().expect("structured present"),
+                &body,
+                "{label}: structured and the model-facing body are one value"
+            );
+        }
+    }
+
+    /// A silent success and a refused program both have empty stdout. Before
+    /// the shared envelope they were told apart only by whether the body
+    /// happened to be empty, which is what made the shape flip.
+    #[test]
+    fn silent_success_and_rejection_are_told_apart_by_status() {
+        let quiet = envelope_of(kaish_kernel::interpreter::ExecResult::success(""));
+        assert_eq!(quiet["stdout"], serde_json::json!(""));
+        assert_eq!(quiet["status"], serde_json::json!("done"));
+        assert_eq!(quiet["exit_code"], serde_json::json!(0));
+        assert_eq!(quiet["error"], serde_json::Value::Null);
+
+        let mut env = ShellEnvelope::new(ShellStatus::Rejected);
+        env.error = Some("parse error at 1:6".into());
+        let refused = envelope_result(env);
+        assert!(refused.is_error, "a refused program is an error");
+        let body = refused.structured.unwrap();
+        assert_eq!(body["stdout"], serde_json::json!(""));
+        assert_eq!(body["status"], serde_json::json!("rejected"));
+        assert_eq!(
+            body["exit_code"],
+            serde_json::Value::Null,
+            "nothing ran, so there is no exit code to report"
+        );
+        assert!(body["error"].as_str().unwrap().contains("parse error"));
+    }
+
     #[test]
     fn conversion_success_with_warnings_keeps_exit_zero_and_surfaces_stderr() {
         let mut r = kaish_kernel::interpreter::ExecResult::success("the-output");
         r.err = "a-warning".to_string();
-        let kr = shell_result_to_kernel(r);
+        let kr = envelope_result(shell_result_to_envelope(r, 0));
         assert!(!kr.is_error, "exit 0 stays non-error even with stderr");
-        match kr.content.first().unwrap() {
-            ToolContent::Text(s) => {
-                assert!(s.contains("the-output"));
-                assert!(s.contains("a-warning"), "stderr must be surfaced: {s:?}");
-            }
-            other => panic!("expected text, got {other:?}"),
-        }
+        let body = kr.structured.unwrap();
+        assert_eq!(body["stdout"], serde_json::json!("the-output"));
+        assert_eq!(
+            body["stderr"],
+            serde_json::json!("a-warning"),
+            "stderr is its own field, never folded into stdout"
+        );
     }
 
     #[test]
     fn conversion_surfaces_latch_request_structurally() {
         // A latched destructive op (exit 2) carries its gate on kaish's opaque
         // `baggage` channel (kaish 0.14 deleted the typed `.latch` field). The
-        // MCP shell envelope must surface it so a batch loop reads the gate
-        // structurally instead of scraping the confirmation prose out of the
-        // body. Resolves the on-hold docs/issues.md "latch nonce on stderr"
-        // entry.
+        // envelope must surface it so a batch loop reads the gate structurally
+        // instead of scraping the confirmation prose out of stdout. Resolves
+        // the on-hold docs/issues.md "latch nonce on stderr" entry.
         let r = crate::runtime::kj_builtin::latch_result(
             "kj context remove",
             "doomed",
             "removing a context is destructive",
             "kj context remove doomed --confirm".to_string(),
         );
-        let structured = shell_result_to_kernel(r)
-            .structured
-            .expect("structured envelope");
+        let structured = envelope_of(r);
         assert_eq!(
             structured["latch"]["command"],
             serde_json::json!("kj context remove")
@@ -1414,43 +1531,38 @@ mod tests {
         assert_eq!(
             structured["latch"]["hint"],
             serde_json::json!("kj context remove doomed --confirm"),
-            "the ready-to-run confirmation command must ride the structured envelope"
+            "the ready-to-run confirmation command must ride the envelope"
         );
 
         // A non-latched result carries an explicit null — present as a key so a
         // consumer can test `latch == null` rather than guess at omission.
-        let plain = shell_result_to_kernel(kaish_kernel::interpreter::ExecResult::success("ok"));
+        let plain = envelope_of(kaish_kernel::interpreter::ExecResult::success("ok"));
         assert_eq!(
-            plain.structured.unwrap()["latch"],
+            plain["latch"],
             serde_json::Value::Null,
             "a non-latched result leaves `latch` explicitly null"
         );
     }
 
     #[test]
-    fn conversion_nonzero_exit_is_error_and_labelled() {
+    fn conversion_nonzero_exit_is_error_and_status_agrees() {
         let r = kaish_kernel::interpreter::ExecResult::failure(3, "boom");
-        let kr = shell_result_to_kernel(r);
+        let kr = envelope_result(shell_result_to_envelope(r, 0));
         assert!(kr.is_error, "nonzero exit must be an error");
-        match kr.content.first().unwrap() {
-            ToolContent::Text(s) => {
-                assert!(s.contains("boom"));
-                assert!(s.contains("[exit 3]"), "exit code must be labelled: {s:?}");
-            }
-            other => panic!("expected text, got {other:?}"),
-        }
+        let body = kr.structured.unwrap();
+        assert_eq!(body["exit_code"], serde_json::json!(3));
         assert_eq!(
-            kr.structured.unwrap()["exit_code"],
-            serde_json::json!(3),
-            "structured envelope carries the exit code"
+            body["status"],
+            serde_json::json!("error"),
+            "the flag and the status field must never disagree"
         );
     }
 
     #[test]
     fn conversion_spilled_success_is_not_error_but_signals_truncation() {
         // kaish remaps a capped/spilled result to exit 3, stashing the real
-        // exit in `original_code`. Truncation is not failure: flagging it
-        // `is_error` tempts a model into re-running a command that succeeded.
+        // exit in `original_code`. Truncation is not failure: flagging it an
+        // error tempts a model into re-running a command that succeeded.
         // The truncation must still be unmissable — a model reasoning over a
         // head+tail excerpt as if it were complete output hallucinates.
         let mut r = kaish_kernel::interpreter::ExecResult::success(
@@ -1459,28 +1571,20 @@ mod tests {
         r.did_spill = true;
         r.original_code = Some(r.code);
         r.code = 3;
-        let kr = shell_result_to_kernel(r);
+        let kr = envelope_result(shell_result_to_envelope(r, 0));
         assert!(!kr.is_error, "a spilled successful command is not an error");
-        match kr.content.first().unwrap() {
-            ToolContent::Text(s) => {
-                assert!(
-                    s.contains("[output truncated]"),
-                    "truncation must be labelled in the body: {s:?}"
-                );
-                assert!(
-                    !s.contains("[exit"),
-                    "a successful spill must not carry an exit label: {s:?}"
-                );
-            }
-            other => panic!("expected text, got {other:?}"),
-        }
         let structured = kr.structured.unwrap();
         assert_eq!(
             structured["exit_code"],
             serde_json::json!(0),
             "envelope carries the command's real exit, not kaish's spill marker"
         );
-        assert_eq!(structured["did_spill"], serde_json::json!(true));
+        assert_eq!(structured["status"], serde_json::json!("done"));
+        assert_eq!(
+            structured["did_spill"],
+            serde_json::json!(true),
+            "truncation stays unmissable as a field"
+        );
     }
 
     #[test]
@@ -1488,28 +1592,23 @@ mod tests {
         let mut r = kaish_kernel::interpreter::ExecResult::failure(3, "tail of a real failure");
         r.did_spill = true;
         r.original_code = Some(1);
-        let kr = shell_result_to_kernel(r);
+        let kr = envelope_result(shell_result_to_envelope(r, 0));
         assert!(kr.is_error, "a spilled FAILING command is still an error");
-        match kr.content.first().unwrap() {
-            ToolContent::Text(s) => {
-                assert!(s.contains("[output truncated]"), "truncation labelled: {s:?}");
-                assert!(
-                    s.contains("[exit 1]"),
-                    "exit label shows the real code, not the spill marker: {s:?}"
-                );
-            }
-            other => panic!("expected text, got {other:?}"),
-        }
         let structured = kr.structured.unwrap();
-        assert_eq!(structured["exit_code"], serde_json::json!(1));
+        assert_eq!(
+            structured["exit_code"],
+            serde_json::json!(1),
+            "the real code, not the spill marker"
+        );
+        assert_eq!(structured["status"], serde_json::json!("error"));
         assert_eq!(structured["did_spill"], serde_json::json!(true));
     }
 
     #[test]
     fn conversion_unspilled_results_report_did_spill_false() {
-        let plain = shell_result_to_kernel(kaish_kernel::interpreter::ExecResult::success("ok"));
+        let plain = envelope_of(kaish_kernel::interpreter::ExecResult::success("ok"));
         assert_eq!(
-            plain.structured.unwrap()["did_spill"],
+            plain["did_spill"],
             serde_json::json!(false),
             "did_spill is always present so consumers can test it directly"
         );
@@ -1590,12 +1689,8 @@ mod tests {
             .expect("safe shell call should succeed");
 
         assert!(!result.is_error, "echo should not be an error: {result:?}");
-        match result.content.first().expect("content") {
-            ToolContent::Text(s) => {
-                assert!(s.contains("hello-ro"), "stdout missing, got: {s:?}")
-            }
-            other => panic!("expected text content, got {other:?}"),
-        }
+        let out = body_of(&result)["stdout"].as_str().unwrap_or_default().to_string();
+        assert!(out.contains("hello-ro"), "stdout missing, got: {out:?}");
     }
 
     /// **Slice 3 spec test 1** (`docs/gate-and-shell-split.md`): a context
@@ -1641,8 +1736,10 @@ mod tests {
             .expect("the stale grant must still reach the safe tool under the name `shell`");
         assert!(!result.is_error);
         match result.content.first().expect("content") {
-            ToolContent::Text(s) => assert!(s.contains("still-works"), "got: {s:?}"),
-            other => panic!("expected text content, got {other:?}"),
+            _ => {
+                let out = streams_of(&result);
+                assert!(out.contains("still-works"), "got: {out:?}");
+            }
         }
     }
 
@@ -1697,13 +1794,11 @@ mod tests {
             .await
             .expect("shell_write call should succeed once the pending ask is answered");
         assert!(!result.is_error, "`id` should run and exit 0: {result:?}");
-        match result.content.first().expect("content") {
-            ToolContent::Text(s) => assert!(
-                s.contains("uid="),
-                "`id` must have actually spawned as a real external process, got: {s:?}"
-            ),
-            other => panic!("expected text content, got {other:?}"),
-        }
+        let out = streams_of(&result);
+        assert!(
+            out.contains("uid="),
+            "`id` must have actually spawned as a real external process, got: {out:?}"
+        );
     }
 
     /// **Slice 3 spec test 3 — the fail-safe pin.** A stale `"shell"` request
@@ -1733,14 +1828,12 @@ mod tests {
             .call_tool(call("id"), &cc, CancellationToken::new())
             .await
             .expect("the call itself succeeds structurally — the shell runs, `id` just can't spawn");
-        match result.content.first().expect("content") {
-            ToolContent::Text(s) => assert!(
-                !s.contains("uid="),
-                "a stale `shell` request must NEVER reach ExternalExec::Allow \
-                 and spawn a real process, got: {s:?}"
-            ),
-            other => panic!("expected text content, got {other:?}"),
-        }
+        let out = streams_of(&result);
+        assert!(
+            !out.contains("uid="),
+            "a stale `shell` request must NEVER reach ExternalExec::Allow \
+             and spawn a real process, got: {out:?}"
+        );
     }
 
     /// `background: true` requires the `exec` authority on top of
@@ -1807,19 +1900,17 @@ mod tests {
             .expect("background start should succeed");
 
         assert!(!result.is_error, "starting a background process is not itself an error");
-        let structured = result.structured.expect("structured envelope");
+        let structured = result.structured.clone().expect("structured envelope");
         assert_eq!(structured["status"], serde_json::json!("running"));
         let block_key = structured["block_id"].as_str().expect("block_id present").to_string();
         assert!(structured["background_id"].as_str().is_some(), "background_id present");
         // The response body must be a short confirmation, never the command's
         // full output — that's the whole point of backgrounding.
-        match result.content.first().unwrap() {
-            ToolContent::Text(s) => assert!(
-                !s.contains("streamed-bg-output"),
-                "the immediate response must not carry the command's output, got: {s:?}"
-            ),
-            other => panic!("expected text, got {other:?}"),
-        }
+        let out = streams_of(&result);
+        assert!(
+            !out.contains("streamed-bg-output"),
+            "the immediate response must not carry the command's output, got: {out:?}"
+        );
 
         let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
         let start = std::time::Instant::now();

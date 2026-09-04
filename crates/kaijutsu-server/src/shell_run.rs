@@ -200,7 +200,7 @@ pub(crate) async fn run_into_blocks(
             // deliberate, loud signal for a script's own control flow — but
             // this durable field is not control flow, it's the permanent
             // record. Resolving through `original_code` here is the same
-            // move `mcp/servers/shell.rs`'s `shell_result_to_kernel` makes
+            // move `mcp/servers/shell.rs`'s `shell_result_to_envelope` makes
             // ("truncation is not failure") — a command that exited 0 and
             // merely printed a lot must not read back as exit_code=3
             // forever because it once got captured over 8 KB.

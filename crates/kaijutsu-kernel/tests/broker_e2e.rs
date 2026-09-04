@@ -835,8 +835,14 @@ async fn denied_tool_call_names_the_tool_and_context_not_an_empty_or_confusing_e
 async fn is_error_result_maps_to_exec_failure() {
     // D-28 happy-path: a tool that *completes successfully* but returns
     // `KernelToolResult { is_error: true }` must surface at the call site as
-    // `ExecResult::failure(1, <text>)`. This locks the is_error→LLM-boundary
-    // conversion in `Kernel::dispatch_tool_via_broker`.
+    // a failed `ExecResult` carrying the tool's text. This locks the
+    // is_error→LLM-boundary conversion in `Kernel::dispatch_tool_via_broker`.
+    //
+    // The text lands in the BODY slot, not stderr: a tool that wrote a body
+    // already said what went wrong, and the consumer passes a body through
+    // untouched rather than prefixing "Error: " onto it. That prefix on a
+    // structured body (the shell envelope) made it unparseable — see
+    // `docs/shell-envelope.md`.
     let fx = setup().await;
 
     let mock = Arc::new(LocalMock::new("test.mock").on_call(|_p| async {
@@ -880,8 +886,65 @@ async fn is_error_result_maps_to_exec_failure() {
 
     assert!(!result.success, "expected failure, got success");
     assert_eq!(result.exit_code, 1, "expected exit_code 1");
-    assert_eq!(result.stderr, "boom", "is_error text should land in stderr");
-    assert!(result.stdout.is_empty(), "stdout should be empty on failure");
+    assert_eq!(
+        result.stdout, "boom",
+        "a failing tool's own text is its body, not a stderr aside"
+    );
+    assert!(
+        result.stderr.is_empty(),
+        "the tool wrote a body, so nothing is left for the stderr slot"
+    );
+}
+
+/// A tool that fails with NOTHING to say still reports through stderr — the
+/// body-slot rule above must not swallow the empty case, because the consumer
+/// prefixes "Error: " there and a bare empty string would say nothing at all.
+#[tokio::test]
+async fn a_failing_tool_with_no_text_still_reports_through_stderr() {
+    let fx = setup().await;
+
+    let mock = Arc::new(LocalMock::new("test.mock").on_call(|_p| async {
+        Ok(KernelToolResult {
+            is_error: true,
+            content: vec![kaijutsu_kernel::mcp::ToolContent::Text(String::new())],
+            structured: None,
+        })
+    }));
+    fx.kernel
+        .broker()
+        .register(mock, InstancePolicy::default())
+        .await
+        .unwrap();
+
+    let mut binding = ContextToolBinding::new();
+    for inst in fx.kernel.broker().list_instances().await {
+        binding.allow(inst);
+    }
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    let seed_ctx = CallContext::new(
+        fx.exec_ctx.principal_id,
+        fx.ctx_id,
+        fx.exec_ctx.session_id,
+        fx.exec_ctx.kernel_id,
+    );
+    fx.kernel
+        .broker()
+        .list_visible_tools(fx.ctx_id, &seed_ctx)
+        .await
+        .unwrap();
+
+    let result = fx
+        .kernel
+        .dispatch_tool_via_broker("fail", "{}", &fx.exec_ctx)
+        .await
+        .expect("broker call itself should succeed");
+
+    assert!(!result.success);
+    assert_eq!(result.exit_code, 1);
+    assert!(
+        result.stdout.is_empty(),
+        "there was no body to carry"
+    );
 }
 
 // ---------------------------------------------------------------------------

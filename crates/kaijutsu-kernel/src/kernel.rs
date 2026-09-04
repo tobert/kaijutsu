@@ -671,7 +671,24 @@ impl Kernel {
             text = serde_json::to_string_pretty(s).unwrap_or_default();
         }
         if result.is_error {
-            Ok(ExecResult::failure(1, text))
+            // A tool that produced a body said what went wrong in it — the
+            // body IS the report, and moving it to the stderr slot invites
+            // the caller to prefix it ("Error: {stderr}"), which corrupts a
+            // structured body like the shell envelope
+            // (`docs/shell-envelope.md`). Keep the body where a body goes and
+            // let the exit code carry the failure. A tool with nothing to say
+            // still reports through stderr, unchanged.
+            if text.is_empty() {
+                Ok(ExecResult::failure(1, text))
+            } else {
+                Ok(ExecResult {
+                    stdout: text,
+                    stderr: String::new(),
+                    exit_code: 1,
+                    success: false,
+                    output: None,
+                })
+            }
         } else {
             Ok(ExecResult::success(text))
         }

@@ -93,9 +93,10 @@
 //! # Output bounding
 //!
 //! Each background block caps at [`DEFAULT_OUTPUT_CAP`] bytes of appended
-//! text (combined stdout+stderr, interleaved by arrival — same "stdout then
-//! stderr, no per-line tag" convention `shell_result_to_kernel` uses for the
-//! synchronous tool). Past the cap, a single loud marker is appended and
+//! text (combined stdout+stderr, interleaved by arrival, no per-line tag).
+//! A block is one stream of text, so the two are merged here; the synchronous
+//! tool keeps them apart because its envelope has a field for each
+//! (`kaijutsu_types::shell_envelope`). Past the cap, a single loud marker is appended and
 //! further chunks are discarded — but the pipe keeps being drained (never
 //! `read()`-starved) so a `yes`-style runaway process can't block on a full
 //! pipe buffer and hang. This is deliberately smaller than kaish's own 10MB

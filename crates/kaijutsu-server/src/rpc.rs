@@ -9715,10 +9715,10 @@ pub(crate) fn shell_hook_result_text(result: &kaijutsu_kernel::mcp::KernelToolRe
 }
 
 /// Real kaish `ExecResult` → the `KernelToolResult` shape a `PostCall` hook
-/// sees — the same real-result contract `shell_result_to_kernel`
+/// sees — the same real-result contract `shell_result_to_envelope`
 /// (`mcp/servers/shell.rs`) builds for an actual `shell_write` tool call,
 /// reduced to what a hook body needs: text output and the `is_error`
-/// channel. Judged by the real exit the way `shell_result_to_kernel`
+/// channel. Judged by the real exit the way `shell_result_to_envelope`
 /// judges it — a spilled-and-remapped `code=3` reads back as its
 /// `original_code`, not as truncation-flavored success.
 pub(crate) fn exec_result_to_hook_tool_result(
@@ -9842,7 +9842,7 @@ mod exec_result_to_hook_tool_result_tests {
 
     /// A spilled result remaps `code` to 3 (kaish's output-limit contract);
     /// the hook must be judged by the REAL exit (`original_code`), the same
-    /// rule `shell_result_to_kernel` applies ("truncation is not failure").
+    /// rule `shell_result_to_envelope` applies ("truncation is not failure").
     /// Falsification: read `result.code` instead of `real_code` here and
     /// this test goes red (`is_error` flips to `true`, `exit_code` reads 3).
     #[test]
