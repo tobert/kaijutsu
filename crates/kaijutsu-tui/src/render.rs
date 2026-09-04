@@ -52,6 +52,13 @@ pub fn thinking_pane_open(app: &App) -> bool {
     app.current.is_some_and(|context_id| app.thinking_pane_latched(context_id))
 }
 
+/// Whether the in-flight strip has a running entry to animate — the event
+/// loop redraws on `inflight::PHASE_MILLIS` only while it does.
+pub fn strip_animating(app: &App) -> bool {
+    let plan = live_plan(app);
+    crate::inflight::animating(&crate::inflight::entries(plan.iter().map(|(b, _)| b), 0))
+}
+
 /// The turn's latest `Thinking` block, in document order, whatever its
 /// status — the band shows the newest reasoning until the turn ends.
 fn latest_thinking(app: &App) -> Option<BlockSnapshot> {
@@ -342,7 +349,7 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
     // The in-flight strip: one row, always, so the band never resizes for
     // a tool call coming or going — only the row's text changes.
     let strip = crate::inflight::entries(plan.iter().map(|(b, _)| b), now_millis);
-    lines.push(crate::inflight::strip_line(&strip, width, &palette));
+    lines.push(crate::inflight::strip_line(&strip, width, &palette, crate::inflight::phase(now_millis)));
 
     // One blank row separates what is being read from what is being typed
     // (`docs/tui.md`, "Conversation").
@@ -828,7 +835,7 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert!(
-            text.iter().any(|l| l.contains("⟳ shell cargo test -p kaijutsu-kernel · 4s")),
+            text.iter().any(|l| l.contains("◐ shell cargo test -p kaijutsu-kernel · 4s")),
             "the strip names the running call: {text:?}"
         );
         assert!(

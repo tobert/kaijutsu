@@ -89,16 +89,34 @@ pub fn entries<'a>(blocks: impl Iterator<Item = &'a BlockSnapshot>, now_millis: 
     out.into_iter().map(|(_, e)| e).collect()
 }
 
+/// How long one animation step lasts: the spinner turns and the running
+/// region's ground breathes one step per `PHASE_MILLIS`.
+pub const PHASE_MILLIS: u64 = 250;
+/// Steps per cycle — the spinner's four glyphs.
+pub const PHASES: u8 = 4;
+
+/// The animation phase at `now_millis`, `0..PHASES`.
+pub fn phase(now_millis: u64) -> u8 {
+    u8::try_from((now_millis / PHASE_MILLIS) % u64::from(PHASES)).unwrap_or(0)
+}
+
+/// Whether any entry animates — the event loop redraws on the phase clock
+/// only while this is true.
+pub fn animating(entries: &[Entry]) -> bool {
+    entries.iter().any(|e| e.doing == Doing::Running)
+}
+
 /// The strip row at `width`: every entry as its own region on a faint
 /// ground, joined by a space of the strip's own ground, padded to the full
 /// width so the ground reads as one row. Empty entries give an empty row of
-/// the same ground.
-pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette) -> Line<'static> {
+/// the same ground. `phase` turns the running entries' spinner and breathes
+/// their ground; a waiting entry is still.
+pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette, phase: u8) -> Line<'static> {
     let width = usize::from(width.max(1));
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for (i, entry) in entries.iter().enumerate() {
-        let text = format!(" {} ", entry_text(entry));
+        let text = format!(" {} ", entry_text(entry, phase));
         let sep = if i == 0 { 0 } else { 1 };
         let cell = text.chars().count();
         if used + sep + cell > width {
@@ -108,7 +126,7 @@ pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette) -> Line<'sta
                     spans.push(Span::styled(" ".to_string(), palette.strip()));
                 }
                 let clipped: String = text.chars().take(left - 1).collect::<String>() + "…";
-                spans.push(Span::styled(clipped, palette.strip_region(&entry.doing)));
+                spans.push(Span::styled(clipped, palette.strip_region(&entry.doing, phase)));
                 used = width;
             }
             break;
@@ -116,7 +134,7 @@ pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette) -> Line<'sta
         if sep == 1 {
             spans.push(Span::styled(" ".to_string(), palette.strip()));
         }
-        spans.push(Span::styled(text, palette.strip_region(&entry.doing)));
+        spans.push(Span::styled(text, palette.strip_region(&entry.doing, phase)));
         used += sep + cell;
     }
     if used < width {
@@ -125,8 +143,11 @@ pub fn strip_line(entries: &[Entry], width: u16, palette: &Palette) -> Line<'sta
     Line::from(spans)
 }
 
-/// `⟳ shell cargo test -p x · 4s` / `⏳ shell_write · waiting on ask 01a0686d · 17h`.
-fn entry_text(entry: &Entry) -> String {
+/// The running spinner, one glyph per phase.
+const SPINNER: [char; PHASES as usize] = ['◐', '◓', '◑', '◒'];
+
+/// `◐ shell cargo test -p x · 4s` / `⏳ shell_write · waiting on ask 01a0686d · 17h`.
+fn entry_text(entry: &Entry, phase: u8) -> String {
     let age = crate::status::format_age(entry.age);
     let head = if entry.arg.is_empty() {
         entry.tool.clone()
@@ -134,7 +155,7 @@ fn entry_text(entry: &Entry) -> String {
         format!("{} {}", entry.tool, entry.arg)
     };
     match &entry.doing {
-        Doing::Running => format!("⟳ {head} · {age}"),
+        Doing::Running => format!("{} {head} · {age}", SPINNER[usize::from(phase % PHASES)]),
         Doing::Waiting { ask: Some(ask) } => format!("⏳ {head} · waiting on ask {} · {age}", short_ask(ask)),
         Doing::Waiting { ask: None } => format!("⏳ {head} · waiting · {age}"),
     }
@@ -239,8 +260,8 @@ mod tests {
             }]
         );
         assert_eq!(
-            text(&strip_line(&entries, 80, &Palette::builtin())).trim_end(),
-            " ⟳ shell cargo test -p kaijutsu-kernel · 4s"
+            text(&strip_line(&entries, 80, &Palette::builtin(), 0)).trim_end(),
+            " ◐ shell cargo test -p kaijutsu-kernel · 4s"
         );
     }
 
@@ -261,8 +282,9 @@ mod tests {
         let entries = entries([&c, &r].into_iter(), 3_600_000);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].doing, Doing::Waiting { ask: Some("01a0686d-895e-7b31-aa17-e497ed849f67".to_string()) });
-        let line = text(&strip_line(&entries, 80, &Palette::builtin()));
+        let line = text(&strip_line(&entries, 80, &Palette::builtin(), 2));
         assert!(line.contains("⏳ shell_write cargo test · waiting on ask 01a0686d · 1h00m"), "{line:?}");
+        assert!(!animating(&entries), "a held ask has nothing to animate");
     }
 
     /// A `Running` result is the tool's output streaming in; it stays in
@@ -289,13 +311,31 @@ mod tests {
         let entries = entries([&a, &b].into_iter(), 1000);
         assert_eq!(entries.len(), 2);
         for width in [12u16, 30, 80] {
-            let line = strip_line(&entries, width, &Palette::builtin());
+            let line = strip_line(&entries, width, &Palette::builtin(), 0);
             assert_eq!(text(&line).chars().count(), usize::from(width), "width {width}");
         }
-        let wide = text(&strip_line(&entries, 80, &Palette::builtin()));
-        assert!(wide.contains("⟳ shell cargo build · 1s") && wide.contains("⟳ grep fn main · 1s"), "{wide:?}");
-        let empty = text(&strip_line(&[], 20, &Palette::builtin()));
+        let wide = text(&strip_line(&entries, 80, &Palette::builtin(), 0));
+        assert!(wide.contains("◐ shell cargo build · 1s") && wide.contains("◐ grep fn main · 1s"), "{wide:?}");
+        let empty = text(&strip_line(&[], 20, &Palette::builtin(), 0));
         assert_eq!(empty, " ".repeat(20));
+    }
+
+    /// A running entry turns its spinner and breathes its ground with the
+    /// phase; the phase comes from the clock, one step per `PHASE_MILLIS`.
+    #[test]
+    fn a_running_entry_animates_with_the_phase() {
+        let ctx = ContextId::new();
+        let c = call(ctx, 1, Status::Running, "shell", "{}", 0);
+        let entries = entries([&c].into_iter(), 1000);
+        assert!(animating(&entries));
+        let frames: Vec<Line<'static>> = (0..PHASES).map(|p| strip_line(&entries, 40, &Palette::builtin(), p)).collect();
+        let glyphs: Vec<char> = frames.iter().map(|l| text(l).trim_start().chars().next().unwrap()).collect();
+        assert_eq!(glyphs, SPINNER.to_vec());
+        let grounds: Vec<_> = frames.iter().map(|l| l.spans[0].style.bg).collect();
+        assert!(grounds.iter().any(|g| *g != grounds[0]), "the ground breathes: {grounds:?}");
+        assert_eq!(phase(0), 0);
+        assert_eq!(phase(PHASE_MILLIS), 1);
+        assert_eq!(phase(PHASE_MILLIS * u64::from(PHASES)), 0);
     }
 
     #[test]

@@ -142,14 +142,22 @@ impl Palette {
     }
 
     /// One entry's region inside the strip: a second tint so each entry's
-    /// extent is visible, colored by what it is doing.
-    pub fn strip_region(&self, doing: &crate::inflight::Doing) -> Style {
-        let bg = if self.light_ground { Color::Indexed(252) } else { Color::Indexed(237) };
-        let fg = match doing {
-            crate::inflight::Doing::Running => Color::Cyan,
-            crate::inflight::Doing::Waiting { .. } => Color::Yellow,
-        };
-        Style::new().bg(bg).fg(fg)
+    /// extent is visible, colored by what it is doing. A running region's
+    /// ground breathes one shade with `phase` (`inflight::phase`); a
+    /// waiting region is still.
+    pub fn strip_region(&self, doing: &crate::inflight::Doing, phase: u8) -> Style {
+        // Two shades up on the even phases, one on the odd: a slow breath.
+        let breath = u8::from(phase % 2 == 0);
+        match doing {
+            crate::inflight::Doing::Running => {
+                let bg = if self.light_ground { 252 - breath } else { 237 + breath };
+                Style::new().bg(Color::Indexed(bg)).fg(Color::Cyan)
+            }
+            crate::inflight::Doing::Waiting { .. } => {
+                let bg = if self.light_ground { 252 } else { 237 };
+                Style::new().bg(Color::Indexed(bg)).fg(Color::Yellow)
+            }
+        }
     }
 
     // ── the alternate screen: editor and diff (docs/tui.md, ruling 1) ───────

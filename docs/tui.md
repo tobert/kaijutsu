@@ -292,7 +292,7 @@ Rules the figure carries:
   ─ deepseek-v4-flash · coder ─────────────────────────────── 07:27:16
   Now that is the interesting rule — I hit a wall with a clean ▍
 
-   ⟳ shell cargo test -p kaijutsu-kernel · 4s   ⏳ shell_write · waiting on ask 01a0686d · 17h
+   ◐ shell cargo test -p kaijutsu-kernel · 4s   ⏳ shell_write · waiting on ask 01a0686d · 17h
 
   ❯                                                          -- NORMAL --
   0 ROOT  1 cc-exomemory  2 0de73794  3 tui-testing   coder  ▮ 13%  ● ok
@@ -300,7 +300,7 @@ Rules the figure carries:
 
 One row, always present, directly above the blank row over `❯`: every
 tool call of the current context that has not settled, as one region
-each — `⟳ <tool> <arg> · <elapsed>` while it runs, `⏳ <tool> · waiting on
+each — `◐ <tool> <arg> · <elapsed>` while it runs, `⏳ <tool> · waiting on
 ask <id> · <age>` while a gate holds it. The row is a faint ground so it
 reads as a row when empty; each region is a second tint, cyan for running
 and yellow for waiting, so its extent is visible.
@@ -325,6 +325,12 @@ Rules the figure carries:
   `!` and the ask card carry the rest.
 - Entries are clipped with `…` to the width, never wrapped: the row is one
   row at any width.
+- **A running entry moves.** Its spinner turns (`◐ ◓ ◑ ◒`) and its ground
+  breathes one shade, one step every 250 ms (`inflight::PHASE_MILLIS`),
+  and its elapsed time counts. The phase is a pure function of the clock
+  (`inflight::phase`), and the event loop redraws on that step only while
+  a running entry exists — a held entry is still, and an empty strip costs
+  no redraws at all.
 - The machinery: `inflight::entries` over the mirror's unprinted blocks,
   `inflight::strip_line` for the row, `render::live_frame` places it.
 

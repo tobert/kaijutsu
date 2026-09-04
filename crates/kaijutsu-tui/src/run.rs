@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::app::{App, ContextView};
 use crate::asks;
+use crate::inflight;
 use crate::bridge::KernelBridge;
 use crate::cmdline::{self, ColonVerb};
 use crate::compose::{Compose, CursorShape};
@@ -225,6 +226,7 @@ async fn event_loop(
     let mut refresh = tokio::time::interval(REFRESH);
     let mut tick = tokio::time::interval(TICK);
     let mut dirty = true;
+    let mut last_strip_frame = Instant::now();
     // The alternate screen, when one is up. `draw` owns the transition: the
     // screen mode is state on `App`, and the terminal follows it.
     let mut alt: Option<AltScreen> = None;
@@ -376,6 +378,15 @@ async fn event_loop(
                 dirty = true;
             }
             _ = tick.tick() => {
+                // The strip's spinner and breath: a redraw every phase step
+                // while a tool call is running, and none otherwise.
+                if !dirty
+                    && last_strip_frame.elapsed() >= Duration::from_millis(inflight::PHASE_MILLIS)
+                    && render::strip_animating(app)
+                {
+                    last_strip_frame = Instant::now();
+                    dirty = true;
+                }
                 let want = render::viewport_lines(app, terminal.size()?.width);
                 if want != viewport_height {
                     tracing::debug!(from = viewport_height, to = want, "viewport resized");
