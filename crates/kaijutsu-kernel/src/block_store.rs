@@ -3063,8 +3063,18 @@ impl BlockStore {
     ///
     /// Returns how many blocks were swept.
     pub fn abandon_running_blocks_on_restart(&self, reason: &str) -> usize {
-        let mut swept = 0usize;
-        for context_id in self.list_ids() {
+        self.list_ids()
+            .into_iter()
+            .map(|context_id| self.abandon_open_blocks(context_id, reason))
+            .sum()
+    }
+
+    /// Fail every `Running`/`Waiting` block of one document and leave one
+    /// Error block naming them — the restart sweep's body, also what a fork
+    /// runs on its child, whose copied open blocks no writer will finish.
+    /// Returns how many blocks it failed.
+    pub fn abandon_open_blocks(&self, context_id: ContextId, reason: &str) -> usize {
+        {
             let running: Vec<BlockSnapshot> = match self.block_snapshots(context_id) {
                 Ok(snaps) => snaps
                     .into_iter()
@@ -3074,9 +3084,9 @@ impl BlockStore {
                     tracing::warn!(
                         context_id = %context_id.to_hex(),
                         error = %e,
-                        "abandon_running_blocks_on_restart: failed to read blocks; skipping this document"
+                        "abandon_open_blocks: failed to read blocks; skipping this document"
                     );
-                    continue;
+                    return 0;
                 }
             };
             let mut failed: Vec<BlockSnapshot> = Vec::new();
@@ -3086,7 +3096,7 @@ impl BlockStore {
                         context_id = %context_id.to_hex(),
                         block_id = %snap.id,
                         error = %e,
-                        "abandon_running_blocks_on_restart: failed to set Error status"
+                        "abandon_open_blocks: failed to set Error status"
                     );
                     continue;
                 }
@@ -3099,7 +3109,7 @@ impl BlockStore {
                         context_id = %context_id.to_hex(),
                         block_id = %snap.id,
                         error = %e,
-                        "abandon_running_blocks_on_restart: failed to record the reason on the result"
+                        "abandon_open_blocks: failed to record the reason on the result"
                     );
                 }
                 failed.push(snap);
@@ -3132,13 +3142,12 @@ impl BlockStore {
                         context_id = %context_id.to_hex(),
                         block_id = %last.id,
                         error = %e,
-                        "abandon_running_blocks_on_restart: failed to attach error detail"
+                        "abandon_open_blocks: failed to attach error detail"
                     );
                 }
             }
-            swept += failed.len();
+            failed.len()
         }
-        swept
     }
 }
 

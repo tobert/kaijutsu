@@ -517,6 +517,17 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj fork: failed to copy document: {e}"));
         }
 
+        // A block still `Running` or `Waiting` in the parent was copied as
+        // such, and nothing in the child will ever finish it — the parent's
+        // stream, tool, or ask is the parent's. Close them here, the way the
+        // restart sweep does, so they neither pin a client's in-flight strip
+        // nor wait forever on an answer that cannot reach them. The parent's
+        // own blocks are untouched. The count rides on the fork marker below.
+        let closed_at_fork = self.block_store().abandon_open_blocks(
+            new_id,
+            "left open in the parent when this context was forked; nothing is being retried here",
+        );
+
         // 3d — hydration policy travel. The policy row travels iff the marked
         // block survived the selection. The marker remap is mechanical: fork
         // preserves `(principal, seq)` and rewrites only the context part, so
@@ -750,11 +761,16 @@ impl KjDispatcher {
         // selection, the drop is visible in the marker (not silent) — softer
         // than the hydrate-side fail-loud, because a fresh fork's rc lifecycle
         // re-marks downstream.
-        let policy_note = if parent_policy.is_some() && !policy_travels {
-            Some("hydration policy not carried (marker fell outside the selection)")
-        } else {
-            None
-        };
+        let mut notes: Vec<String> = Vec::new();
+        if parent_policy.is_some() && !policy_travels {
+            notes.push("hydration policy not carried (marker fell outside the selection)".to_string());
+        }
+        if closed_at_fork > 0 {
+            notes.push(format!(
+                "{closed_at_fork} block(s) left open in the parent were closed here"
+            ));
+        }
+        let marker_note = (!notes.is_empty()).then(|| notes.join(" — "));
         if let Err(e) = self.inject_fork_marker(
             new_id,
             source_id,
@@ -762,7 +778,7 @@ impl KjDispatcher {
             block_count,
             source_label.as_deref(),
             staging,
-            policy_note,
+            marker_note.as_deref(),
             caller.principal_id,
         ) {
             tracing::warn!("kj fork: failed to inject fork marker: {e}");
@@ -2033,6 +2049,50 @@ mod tests {
     /// pre-fix code (temporarily bypassing the `plan_splice` call): this test
     /// FAILED with `kinds: [Text, Text, ToolCall]` (no `ToolResult`) before
     /// the fix, and passes after it.
+    #[tokio::test]
+    async fn fork_closes_the_parents_open_blocks_in_the_child_only() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("mid-turn"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        use kaijutsu_types::{BlockKind, Role, Status};
+        insert_role_text(&d, source, principal, Role::User, "u0");
+        let call_id = d
+            .block_store()
+            .insert_tool_call(source, None, None, "shell", serde_json::json!({"command": "sleep 99"}), None)
+            .unwrap();
+        d.block_store().set_status(source, &call_id, Status::Waiting).unwrap();
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "child");
+        let kid_call = kaijutsu_types::BlockId::new(child, call_id.principal_id, call_id.seq);
+        let snap = d.block_store().get_block_snapshot(child, &kid_call).unwrap().expect("the call was copied");
+        assert_eq!(snap.status, Status::Error, "the copied open call is closed in the child");
+        let blocks = d.block_store().block_snapshots(child).unwrap();
+        let summary = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Error && b.parent_id == Some(kid_call))
+            .expect("one error block names what was closed");
+        assert!(summary.content.contains("left open in the parent"), "{}", summary.content);
+        let marker = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Drift && b.content.starts_with("forked from"))
+            .expect("the fork marker");
+        assert!(
+            marker.content.contains("1 block(s) left open in the parent were closed here"),
+            "the marker carries the count: {}",
+            marker.content
+        );
+
+        let parent_snap = d.block_store().get_block_snapshot(source, &call_id).unwrap().unwrap();
+        assert_eq!(parent_snap.status, Status::Waiting, "the parent's own block is untouched");
+    }
+
     #[tokio::test]
     async fn fork_include_ending_on_tool_call_keeps_the_matching_result() {
         let d = test_dispatcher().await;
