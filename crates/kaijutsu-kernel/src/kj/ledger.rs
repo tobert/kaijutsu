@@ -751,6 +751,11 @@ impl KjDispatcher {
         if let Some(decided) = &row.decided_option {
             lines.push(format!("decided:    {decided}"));
         }
+        // Who answered, so a card closed from another surface can say so
+        // (`docs/tui.md`, "Asks"). Absent on a pending or auto-decided ask.
+        if let Some(by) = &row.decided_by {
+            lines.push(format!("decided_by: {}", Self::ledger_id_display(PrincipalId::try_from_slice(by).map(|p| p.to_string()), by)));
+        }
         if let Some(reason) = &row.auto_reason {
             lines.push(format!("auto:       {reason}"));
         }
@@ -793,6 +798,11 @@ impl KjDispatcher {
             "request_id": row.request_id,
             "context_id": ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()),
             "principal_id": PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()),
+            "created_at": row.created_at,
+            "decided_at": row.decided_at,
+            "decided_by": row.decided_by.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+            "decided_option": row.decided_option,
+            "remember_scope": row.remember_scope,
             "redeemed_at": redeemed_at,
             "status": row.status.to_string(),
             "origin": row.origin.to_string(),
@@ -1764,9 +1774,20 @@ mod tests {
             !msg.contains("redeemed:"),
             "a pending ask has no answer to spend, so it must claim nothing about redemption: {msg}"
         );
+        let pending_data = match &pending {
+            KjResult::Ok { data: Some(d), .. } => d.clone(),
+            other => panic!("kj ledger show must emit structured data: {other:?}"),
+        };
+        assert!(pending_data["decided_by"].is_null(), "nobody has decided a pending ask: {pending_data}");
+        assert!(pending_data["decided_at"].is_null(), "{pending_data}");
+        assert!(
+            pending_data["created_at"].as_i64().is_some_and(|at| at > 0),
+            "created_at is a unix-epoch millisecond stamp: {pending_data}"
+        );
 
+        let answerer = answering_seat();
         let allowed = d
-            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat())
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answerer)
             .await;
         assert!(allowed.is_ok(), "{allowed:?}");
 
@@ -1786,6 +1807,20 @@ mod tests {
             "{data}"
         );
         assert!(data["redeemed_at"].is_null(), "an unspent answer has no redemption stamp: {data}");
+        // The answer names its answerer — a client whose card was answered
+        // from another surface reads this to say who (`docs/tui.md`, "Asks").
+        assert_eq!(
+            data["decided_by"].as_str(),
+            Some(answerer.principal_id.to_string().as_str()),
+            "{data}"
+        );
+        assert_eq!(data["decided_option"].as_str(), Some("allow_once"), "{data}");
+        assert!(data["decided_at"].as_i64().is_some_and(|at| at > 0), "{data}");
+        assert!(
+            unspent.message().contains(&format!("decided_by: {}", answerer.principal_id)),
+            "show must name who decided: {}",
+            unspent.message()
+        );
 
         // The retry collects the answer; that is what makes it spent.
         let second = gate_once(&d, &c, spec()).await;

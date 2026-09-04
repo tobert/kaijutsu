@@ -42,7 +42,7 @@
 
 use std::collections::HashSet;
 
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::actor::{ActorHandle, CallError};
 use crate::rpc::KjExecutionResult;
@@ -258,15 +258,6 @@ pub struct EnvVar {
 /// One ask's full detail, decoded from `kj ledger show`'s `.data` — every
 /// field that JSON carries today (`kaijutsu-kernel/src/kj/ledger.rs`,
 /// `ledger_show`).
-///
-/// Two figures the ledger view's ANSWERED rows want are not on the wire yet:
-/// `created_at` (an ask's age, for the PENDING rows) and `decided_at` /
-/// `decided_by` / `decided_option` / `remember_scope` (when it was decided,
-/// by whom, and how). `ApprovalRow` carries all of them
-/// (`crates/approval-ledger/src/types.rs`), but `ledger_show`'s `data =
-/// serde_json::json!({...})` object omits them — a client that wants those
-/// columns is blocked on that object growing, not on anything in this
-/// module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskDetail {
     pub request_id: String,
@@ -286,6 +277,16 @@ pub struct AskDetail {
     pub exec_source: Option<String>,
     pub cwd: Option<String>,
     pub env: Vec<EnvVar>,
+    /// When the ask was raised, unix-epoch milliseconds.
+    pub created_at: Option<i64>,
+    /// When it was decided, unix-epoch milliseconds; `None` while pending.
+    pub decided_at: Option<i64>,
+    /// Who decided it; `None` while pending or when a rule auto-decided it.
+    pub decided_by: Option<PrincipalId>,
+    /// `allow_once` / `allow_always` / `deny` / `auto_allow`; `None` while
+    /// pending. Finer than `status`, which says only `allowed`/`denied`.
+    pub decided_option: Option<String>,
+    pub remember_scope: Option<String>,
     /// When this decision was redeemed (actually executed), or `None` when
     /// it never was, or the ask is still pending. `docs/tui.md`'s "was this
     /// consumed" question (`docs/issues.md`, the resolved redemption entry).
@@ -360,6 +361,11 @@ fn decode_ask_detail(data: &serde_json::Value) -> Option<AskDetail> {
         exec_source: str_field("exec_source"),
         cwd: str_field("cwd"),
         env,
+        created_at: data.get("created_at").and_then(|v| v.as_i64()),
+        decided_at: data.get("decided_at").and_then(|v| v.as_i64()),
+        decided_by: str_field("decided_by").and_then(|s| PrincipalId::parse(&s).ok()),
+        decided_option: str_field("decided_option"),
+        remember_scope: str_field("remember_scope"),
         redeemed_at: data.get("redeemed_at").and_then(|v| v.as_i64()),
     })
 }
@@ -448,6 +454,11 @@ mod detail_tests {
             "request_id": "01a04eb6-aaaa-bbbb-cccc-000000000001",
             "context_id": "0198f2b0-0000-7000-8000-000000000001",
             "principal_id": "0198f2b0-0000-7000-8000-000000000002",
+            "created_at": 1_756_819_300_000i64,
+            "decided_at": 1_756_819_330_000i64,
+            "decided_by": "0198f2b0-0000-7000-8000-000000000003",
+            "decided_option": "allow_once",
+            "remember_scope": null,
             "redeemed_at": 1_756_819_331_000i64,
             "status": "allowed",
             "origin": "shell_gate",
@@ -477,6 +488,14 @@ mod detail_tests {
         assert_eq!(detail.exec_source.as_deref(), Some("kaish"));
         assert_eq!(detail.cwd.as_deref(), Some("/home/amy/src/wt/kaish-arith"));
         assert_eq!(detail.redeemed_at, Some(1_756_819_331_000));
+        assert_eq!(detail.created_at, Some(1_756_819_300_000));
+        assert_eq!(detail.decided_at, Some(1_756_819_330_000));
+        assert_eq!(
+            detail.decided_by.map(|p| p.to_string()).as_deref(),
+            Some("0198f2b0-0000-7000-8000-000000000003")
+        );
+        assert_eq!(detail.decided_option.as_deref(), Some("allow_once"));
+        assert_eq!(detail.remember_scope, None);
         assert_eq!(
             detail.env,
             vec![
