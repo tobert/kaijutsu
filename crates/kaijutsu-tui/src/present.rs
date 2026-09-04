@@ -129,6 +129,29 @@ impl Palette {
         }
     }
 
+    /// The in-flight strip's ground: a faint tint one step off the
+    /// terminal's own background, so the row reads as a row even when it
+    /// is empty. The one place the palette leaves 16-color ANSI; a
+    /// `theme.toml` token will replace the indexed color.
+    pub fn strip(&self) -> Style {
+        if self.light_ground {
+            Style::new().bg(Color::Indexed(254))
+        } else {
+            Style::new().bg(Color::Indexed(235))
+        }
+    }
+
+    /// One entry's region inside the strip: a second tint so each entry's
+    /// extent is visible, colored by what it is doing.
+    pub fn strip_region(&self, doing: &crate::inflight::Doing) -> Style {
+        let bg = if self.light_ground { Color::Indexed(252) } else { Color::Indexed(237) };
+        let fg = match doing {
+            crate::inflight::Doing::Running => Color::Cyan,
+            crate::inflight::Doing::Waiting { .. } => Color::Yellow,
+        };
+        Style::new().bg(bg).fg(fg)
+    }
+
     // ── the alternate screen: editor and diff (docs/tui.md, ruling 1) ───────
 
     /// Buffer text in the editor.

@@ -409,6 +409,16 @@ where it lines up. Where it does not, name the difference in `docs/tui.md`
 or `docs/input.md`, and leave room to trip on a new combination — Amy's
 statements are guidance, not rulings.
 
+**The tui's live band is a static-height box pinned at the bottom.** The
+transcript is printed once into the terminal's own scrollback and never
+redrawn; the inline viewport below it is the only thing that changes,
+and it changes its text, not its height. What is in flight is one fixed
+row (the in-flight strip), not a body that grows and shrinks, because a
+resize scrolls the transcript and a mutating row does not. Grow the band
+only for a surface that earns it once per turn (the thinking pane) or on
+dismissal (the picker, the ledger). `docs/tui.md`, "Surfaces" and "The
+in-flight strip".
+
 The standard is a power user's: roll with defaults plus a few earned
 preferences, and never overhaul a tool from the state its developers ship
 it in. A powerful subset of a few powertools, played really well. Amy

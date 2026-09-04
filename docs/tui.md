@@ -124,10 +124,11 @@ grammar, and a new surface arrives in the same shape:
   the band until the next print sinks the band back to the screen bottom —
   never a gap in the transcript, never a whole-band jump.
 
-Two sanctioned deviations: compose's figure is the `❯` line inside the
-conversation figure — it is part of that frame, not a grown view — and
-editor/diff has no figure because its look is vim's, specified by
-`EditorState` rather than by this document. Cache health and Images are
+Three sanctioned deviations: compose's figure is the `❯` line inside the
+conversation figure — it is part of that frame, not a grown view; the
+in-flight strip is one fixed row of that same frame ("The in-flight
+strip"); and editor/diff has no figure because its look is vim's,
+specified by `EditorState` rather than by this document. Cache health and Images are
 rendering concerns that ride other surfaces, not surfaces of their own.
 
 ### Conversation
@@ -264,7 +265,7 @@ Rules the figure carries:
   `mark_turn_ended`; a block that completed inside one delivery latches
   too, as long as its stub has not printed).
 - **The band is its own rows.** The viewport grows to `THINKING_PANE_LINES`
-  (14 = the ordinary 7 + `THINKING_BAND_LINES` 6 + one blank row) and the
+  (15 = the ordinary 8 + `THINKING_BAND_LINES` 6 + one blank row) and the
   latest reasoning's tail takes the top six rows, dim and italic, above
   the stream — so the answer streaming in never scrolls the reasoning out
   of the pane, and a later thinking block in the same turn replaces the
@@ -284,6 +285,48 @@ Rules the figure carries:
 - No tui-side truncation, no kernel budget: what prints is what the
   provider sent (Claude's adaptive summarized thinking is the API's own
   summary; DeepSeek gets `reasoning_effort`).
+
+### The in-flight strip
+
+```text
+  ─ deepseek-v4-flash · coder ─────────────────────────────── 07:27:16
+  Now that is the interesting rule — I hit a wall with a clean ▍
+
+   ⟳ shell cargo test -p kaijutsu-kernel · 4s   ⏳ shell_write · waiting on ask 01a0686d · 17h
+
+  ❯                                                          -- NORMAL --
+  0 ROOT  1 cc-exomemory  2 0de73794  3 tui-testing   coder  ▮ 13%  ● ok
+```
+
+One row, always present, directly above the blank row over `❯`: every
+tool call of the current context that has not settled, as one region
+each — `⟳ <tool> <arg> · <elapsed>` while it runs, `⏳ <tool> · waiting on
+ask <id> · <age>` while a gate holds it. The row is a faint ground so it
+reads as a row when empty; each region is a second tint, cyan for running
+and yellow for waiting, so its extent is visible.
+
+Rules the figure carries:
+
+- **The band is a static height.** `VIEWPORT_LINES` is 8: the strip's
+  row, the blank row, the compose rows, the status line, and what is left
+  for the stream. A tool call coming or going changes the strip's text and
+  nothing else — never the band's height, so the transcript never shifts
+  for it. The thinking pane is the one deliberate grow, once per turn.
+  (Amy, 2026-09-04: *"the screen seems to be jumpy with the tool call
+  pinning like that"* — every unsettled body used to sit in the band with
+  its divider, and wrapped or completed at its own pace.)
+- **What leaves the stream:** an unsettled `ToolCall`, and a `ToolResult`
+  a gate holds (`waiting`/`pending`). A `Running` result stays in the
+  stream, because that is the tool's output streaming in and Amy wants to
+  watch it. Bodies print to scrollback when they settle, as before.
+- **The entry is the call's**; its result refines it through
+  `tool_call_id`. A held result whose call is gone is an entry on its own.
+  The ask id is read from the gate's own text (`ask <uuid>`); the seat's
+  `!` and the ask card carry the rest.
+- Entries are clipped with `…` to the width, never wrapped: the row is one
+  row at any width.
+- The machinery: `inflight::entries` over the mirror's unprinted blocks,
+  `inflight::strip_line` for the row, `render::live_frame` places it.
 
 ### The `:` line and the `Ctrl+C` ladder
 
@@ -520,7 +563,8 @@ still pending: the seat keeps its `!`, the status line its `!n`, and
 leaves the pending set — answered from another surface (`kj ledger allow`
 in a shell, the app, a sibling session), expired, or abandoned — with a
 status-line notice saying what became of it: `ask 01a04eb6 allow once by
-you`, `by 2b1ffa32e069` (a principal's short id), or `expired`. A key
+you`, `by 2b1ffa32e069` (a principal's short id), or `expired` — the ask
+by its first id segment, the one `kj ledger list` keys on. A key
 pressed on an already-answered ask reports the lost race on the status
 line and nothing else happens.
 

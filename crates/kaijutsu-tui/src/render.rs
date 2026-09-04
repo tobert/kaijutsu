@@ -30,7 +30,7 @@ pub const LIVE_CHROME_LINES: u16 = 2;
 /// transcript is in scrollback where the terminal's own scrolling, search
 /// and copy reach it. A grown view (the picker, an ask card, the ledger)
 /// changes this — [`viewport_lines`] is where.
-pub const VIEWPORT_LINES: u16 = 7;
+pub const VIEWPORT_LINES: u16 = 8;
 
 /// Rows of the thinking band: the tail of the turn's latest reasoning,
 /// drawn above the stream while the thinking pane is open (`docs/tui.md`,
@@ -284,6 +284,12 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
         if pane_open && block.kind == BlockKind::Thinking {
             continue;
         }
+        // Unsettled calls and gate-held results are the strip's, not the
+        // stream's: their bodies would otherwise resize the stream every
+        // time one arrived or wrapped (`docs/tui.md`, "The in-flight strip").
+        if crate::inflight::takes_from_stream(block) {
+            continue;
+        }
         let block_view = crate::present::BlockView {
             speaker: &item.speaker,
             context_type: &context_type,
@@ -311,9 +317,9 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
     // Keep the tail: a long stream shows its newest lines, not its oldest.
     // The budget is the viewport's own height, so a line this function emits
     // is a line the terminal actually shows.
-    // One status line, one blank row above the input region, plus however
-    // many rows the input region takes.
-    let chrome = 2 + u16::try_from(input.len()).unwrap_or(u16::MAX);
+    // One status line, one blank row above the input region, the in-flight
+    // strip's row, plus however many rows the input region takes.
+    let chrome = 3 + u16::try_from(input.len()).unwrap_or(u16::MAX);
     let budget = usize::from(band.saturating_sub(chrome)).saturating_sub(thinking.len());
     if lines.len() > budget {
         lines.drain(..lines.len() - budget);
@@ -332,6 +338,11 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
     {
         lines.extend(crate::completion::render_popup(completion, width, &palette));
     }
+
+    // The in-flight strip: one row, always, so the band never resizes for
+    // a tool call coming or going — only the row's text changes.
+    let strip = crate::inflight::entries(plan.iter().map(|(b, _)| b), now_millis);
+    lines.push(crate::inflight::strip_line(&strip, width, &palette));
 
     // One blank row separates what is being read from what is being typed
     // (`docs/tui.md`, "Conversation").
@@ -710,8 +721,10 @@ mod tests {
     #[test]
     fn the_frame_carries_the_transcript_and_the_status_line() {
         let (mut app, _) = fixture();
+        // Five transcript rows, then the live region's four: the strip, the
+        // blank row, the prompt, the status line.
         let mut terminal =
-            Terminal::new(TestBackend::new(96, 8)).expect("test backend builds");
+            Terminal::new(TestBackend::new(96, 9)).expect("test backend builds");
 
         let prints = take_settled_prints(&mut app, 96);
         let transcript: Vec<Line<'static>> =
@@ -777,6 +790,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The strip takes a tool call's body out of the band and names it on
+    /// one row instead; a running result's output still streams in the
+    /// stream; and the band is the same height with or without either
+    /// (`docs/tui.md`, "The in-flight strip").
+    #[test]
+    fn an_unsettled_tool_call_is_a_strip_entry_and_the_band_does_not_grow() {
+        let (mut app, id) = fixture();
+        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES);
+
+        let call = BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 9), BlockKind::ToolCall)
+            .role(Role::Model)
+            .status(Status::Running)
+            .tool_name("builtin.shell.shell")
+            .tool_input(r#"{"command":"cargo test -p kaijutsu-kernel"}"#)
+            .content(r#"{"command":"cargo test -p kaijutsu-kernel"}"#)
+            .created_at(1_000)
+            .build();
+        let result = BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 10), BlockKind::ToolResult)
+            .role(Role::Tool)
+            .status(Status::Running)
+            .tool_call_id(call.id)
+            .content("test vfs::unlink_symlink ... ok")
+            .created_at(2_000)
+            .build();
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(vec![call, result], 1).expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+
+        let live = live_lines(&mut app, 80, 5_000, false);
+        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "a tool call never grows the band");
+        assert!(live.len() <= usize::from(VIEWPORT_LINES), "{}", live.len());
+        let text: Vec<String> = live
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("⟳ shell cargo test -p kaijutsu-kernel · 4s")),
+            "the strip names the running call: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains(r#"{"command""#)),
+            "the call's body left the band: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("unlink_symlink ... ok")),
+            "the running result's output still streams: {text:?}"
+        );
+    }
+
+    /// With nothing in flight the strip is still there — an empty row of
+    /// its own ground directly above the blank row over `❯` — so the band's
+    /// row count is the same in both states.
+    #[test]
+    fn the_strip_row_is_present_when_empty() {
+        let (mut app, _) = fixture();
+        let live = live_lines(&mut app, 40, 0, false);
+        let prompt = live.iter().position(|l| l.spans.iter().any(|s| s.content.contains('❯'))).expect("prompt row");
+        let blank: String = live[prompt - 1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(blank.trim().is_empty());
+        let strip = &live[prompt - 2];
+        let text: String = strip.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, " ".repeat(40), "an empty strip is a full-width row of ground");
+        assert!(strip.spans.iter().all(|s| s.style.bg.is_some()), "the strip's ground is painted");
     }
 
     #[test]
@@ -1021,7 +1099,7 @@ mod tests {
                 redeemed_at: None,
             },
         });
-        assert!(viewport_lines(&app, 16) > VIEWPORT_LINES);
+        assert!(viewport_lines(&app, 12) > VIEWPORT_LINES);
     }
 
     /// Same for the ledger, and its growth must not depend on width — its

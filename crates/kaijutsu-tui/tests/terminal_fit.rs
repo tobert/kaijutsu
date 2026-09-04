@@ -165,7 +165,7 @@ fn the_picker_grows_and_shrinks_the_viewport_cleanly() {
     session.send(":!echo marker-row\r");
     let marked = session.wait_until(Duration::from_secs(10), |screen| {
         let rows: Vec<String> = screen.rows(0, 80).collect();
-        compose_row(&rows) == Some(22) && rows[16].contains("marker-row")
+        compose_row(&rows) == Some(22) && rows[24 - usize::from(VIEWPORT_LINES) - 1].contains("marker-row")
     });
     assert!(marked, "no transcript row landed above the band: {}", session.dump("marker"));
 

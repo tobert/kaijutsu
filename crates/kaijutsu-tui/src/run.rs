@@ -644,7 +644,7 @@ async fn act(
             }
             Some(asks::AskCardKey::Aside) => {
                 let card = app.ask_card.take().expect("checked Some above");
-                app.note(format!("ask {} set aside, still pending (Ctrl+A l)", card.request_id));
+                app.note(format!("ask {} set aside, still pending (Ctrl+A l)", short_ask(&card.request_id)));
             }
             None => {}
         }
@@ -1044,8 +1044,10 @@ async fn open_ask_card(bridge: &KernelBridge, app: &mut App, request_id: &str, c
 /// back to `no longer pending` when `kj ledger show` cannot be read — the
 /// card is already down either way.
 async fn answered_elsewhere_notice(bridge: &KernelBridge, app: &App, card: &asks::AskCardState) -> String {
-    let id = &card.request_id;
-    let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), card.context_id, id).await else {
+    let id = short_ask(&card.request_id);
+    let Ok(Some(detail)) =
+        kaijutsu_client::show_ask_detail(bridge.actor(), card.context_id, &card.request_id).await
+    else {
         return format!("ask {id} no longer pending");
     };
     let outcome = decision_words(&detail);
@@ -1054,6 +1056,12 @@ async fn answered_elsewhere_notice(bridge: &KernelBridge, app: &App, card: &asks
         Some(by) => format!("ask {id} {outcome} by {}", by.short()),
         None => format!("ask {id} {outcome}"),
     }
+}
+
+/// The first segment of a request id — enough to find it in `kj ledger
+/// list`, short enough for a status-line notice beside the facts.
+fn short_ask(request_id: &str) -> &str {
+    request_id.split('-').next().unwrap_or(request_id)
 }
 
 /// `allow once` / `allow always` / `deny` from `decided_option`, else the

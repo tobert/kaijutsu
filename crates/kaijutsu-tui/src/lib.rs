@@ -32,6 +32,7 @@
 //! | [`cmdline`] | the `:` line's own dialect: `:kj`, `:!`, `:q` |
 //! | [`interrupt`] | the `Ctrl+C` escalation ladder |
 //! | [`asks`] | the ask card, the ledger view (`Ctrl+A l`) |
+//! | [`inflight`] | the in-flight strip: one fixed row naming unsettled tool calls |
 //! | [`completion`] | `:kj ` completion over the `kj` command catalog |
 //! | [`picker`] | later lane |
 //! | [`editor`], [`diff`], [`copy`] | the three alternate-screen surfaces |
@@ -43,6 +44,7 @@ pub mod cmdline;
 pub mod compose;
 pub mod completion;
 pub mod copy;
+pub mod inflight;
 pub mod interrupt;
 pub mod keys;
 pub mod layout;
