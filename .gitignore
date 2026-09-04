@@ -30,3 +30,10 @@ signoff.md
 # docs/kaijutsu-agent-feedback.md — the agent-experience log, cycled directly
 # rather than versioned; agents rewrite it in place and it never lands in git.
 docs/kaijutsu-agent-feedback.md
+
+# backups/ — pre-deploy copies of the kernel db triple, taken before every
+# bounce that could change durable state. Each one is the whole database
+# (~800 MB today), so a stage-everything command that swallowed this
+# directory would be unrecoverable in review. Local safety net, never
+# versioned; prune it by hand.
+backups/
