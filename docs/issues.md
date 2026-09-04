@@ -6,6 +6,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## A recovered document's first op races for seq 1 (2026-09-04)
+
+`BlockStore::create_document_with_block` writes the documents row and the
+block's first op in one transaction, and sets `next_journal_seq` to 1 inside
+the DashMap guard — no window. Its recovery branch (the row was already
+persisted, so only the op is left to write) cannot: journaling inside the
+guard would re-enter the same shard, so the op goes through `journal_op`
+after the guard is released, with `next_journal_seq` still 0. Another writer
+reaching the document in that window claims seq 1 and the block-creation op
+lands behind it, at seq 2 — a replay that applies an edit before the block
+it edits exists.
+
+The window is between `vacant.insert` and the `journal_op` call, the branch
+needs a document in the database but not in memory, and the same gap existed
+in the `create_document` + `insert_block` pair this replaced. Closing it
+means reserving the seq at entry-construction time and having `journal_op`
+use a pre-reserved number instead of deriving one — a change to the
+journaling contract, not a patch. Found by a kaibo review (cast `crusoe`) of
+the transactional-create fix.
+
+---
+
 ## The scorer cannot see a redirect, only the exemption can (2026-09-01)
 
 Closing the `--help`/`ledger` redirect hole (`9f426c9c`) stopped those

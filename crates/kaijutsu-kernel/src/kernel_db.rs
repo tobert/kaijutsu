@@ -2630,24 +2630,66 @@ impl KernelDb {
 
     /// Insert a new document.
     pub fn insert_document(&self, row: &DocumentRow) -> KernelDbResult<()> {
-        self.conn
-            .execute(
-                "INSERT INTO documents (
+        Self::write_document(&self.conn, row)
+            .map_err(|e| self.classify_document_insert_error(e, row))
+    }
+
+    /// Insert a document row against `conn` (a `&Connection` or a
+    /// `&Transaction` via deref). Shared by `insert_document` and the
+    /// transactional `insert_document_with_op`. Returns the raw SQLite error
+    /// so the caller can classify a constraint violation by reading the
+    /// database back. Does NOT commit.
+    fn write_document(conn: &Connection, row: &DocumentRow) -> SqliteResult<()> {
+        conn.execute(
+            "INSERT INTO documents (
                 document_id, workspace_id, doc_kind,
                 language, path, created_at, created_by
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    blob_param(row.document_id.as_bytes()),
-                    blob_param(row.workspace_id.as_bytes()),
-                    row.doc_kind.as_str(),
-                    row.language,
-                    row.path,
-                    row.created_at,
-                    blob_param(row.created_by.as_bytes()),
-                ],
-            )
-            .map_err(|e| self.classify_document_insert_error(e, row))?;
+            params![
+                blob_param(row.document_id.as_bytes()),
+                blob_param(row.workspace_id.as_bytes()),
+                row.doc_kind.as_str(),
+                row.language,
+                row.path,
+                row.created_at,
+                blob_param(row.created_by.as_bytes()),
+            ],
+        )?;
         Ok(())
+    }
+
+    /// Insert a document row and its first op in ONE transaction: both commit
+    /// or neither does.
+    ///
+    /// A document row that commits without its first op is unreadable. The
+    /// boot replay finds no snapshot and no oplog, builds an empty document,
+    /// and every read of it answers "exists but has no blocks" — the shape
+    /// `BlockStore::load_from_db`'s boot repair now sweeps. Writing the two
+    /// rows in separate transactions is what leaves that gap;
+    /// `BlockStore::create_document_with_block` closes it by coming here.
+    ///
+    /// `seq` is the op's oplog sequence, 1 for a document's first op.
+    pub fn insert_document_with_op(
+        &mut self,
+        row: &DocumentRow,
+        seq: i64,
+        payload: &[u8],
+    ) -> KernelDbResult<()> {
+        let tx = self.conn.transaction()?;
+        let doc_err = Self::write_document(&tx, row).err();
+        let op_err = match doc_err {
+            None => Self::write_op(&tx, row.document_id, seq, payload).err(),
+            Some(_) => None,
+        };
+        if doc_err.is_none() && op_err.is_none() {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.rollback()?;
+        match doc_err {
+            Some(e) => Err(self.classify_document_insert_error(e, row)),
+            None => Err(op_err.expect("one of the two writes failed").into()),
+        }
     }
 
     /// Classify an `insert_document` constraint-violation failure by READING
@@ -2772,7 +2814,20 @@ impl KernelDb {
         seq: i64,
         payload: &[u8],
     ) -> KernelDbResult<()> {
-        self.conn.execute(
+        Self::write_op(&self.conn, document_id, seq, payload)?;
+        Ok(())
+    }
+
+    /// Append an op row against `conn` (a `&Connection` or a `&Transaction`
+    /// via deref). Shared by `append_op` and the transactional
+    /// `insert_document_with_op`. Does NOT commit.
+    fn write_op(
+        conn: &Connection,
+        document_id: ContextId,
+        seq: i64,
+        payload: &[u8],
+    ) -> SqliteResult<()> {
+        conn.execute(
             "INSERT INTO oplog (document_id, seq, payload) VALUES (?1, ?2, ?3)",
             params![blob_param(document_id.as_bytes()), seq, payload],
         )?;
@@ -13320,6 +13375,94 @@ mod tests {
         assert!(
             !dir.exists(),
             "the temp directory must be removed once the KernelDb handle drops"
+        );
+    }
+
+    // ========================================================================
+    // insert_document_with_op — the row and the first op commit together or
+    // not at all. A row that commits alone is a document with no snapshot and
+    // no oplog: it loads empty and every read of it fails.
+    // ========================================================================
+
+    fn file_doc_row(id: ContextId, ws_id: WorkspaceId) -> DocumentRow {
+        DocumentRow {
+            document_id: id,
+            workspace_id: ws_id,
+            doc_kind: DocKind::File,
+            language: Some("rust".to_string()),
+            path: None,
+            created_at: now_millis(),
+            created_by: PrincipalId::system(),
+        }
+    }
+
+    #[test]
+    fn insert_document_with_op_commits_the_row_and_the_op() {
+        let mut db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let id = ContextId::new();
+
+        db.insert_document_with_op(&file_doc_row(id, ws_id), 1, b"payload")
+            .unwrap();
+
+        assert!(db.get_document(id).unwrap().is_some(), "the row must be committed");
+        assert_eq!(
+            db.load_oplog_since(id, 0).unwrap(),
+            vec![(1i64, b"payload".to_vec())],
+            "the first op must be committed with the row"
+        );
+    }
+
+    /// The direction that matters: a failing op insert must take the document
+    /// row down with it. Forced by planting an orphan oplog row (FKs off) at
+    /// the seq the insert will use, so the op hits the oplog PRIMARY KEY.
+    #[test]
+    fn insert_document_with_op_rolls_the_row_back_when_the_op_fails() {
+        let mut db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let id = ContextId::new();
+
+        db.conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO oplog (document_id, seq, payload) VALUES (?1, ?2, ?3)",
+                params![blob_param(id.as_bytes()), 1i64, b"squatter".as_slice()],
+            )
+            .unwrap();
+        db.conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+
+        let err = db
+            .insert_document_with_op(&file_doc_row(id, ws_id), 1, b"payload")
+            .unwrap_err();
+
+        assert!(
+            db.get_document(id).unwrap().is_none(),
+            "the document row must roll back with the failed op, got: {err}"
+        );
+    }
+
+    /// The other direction: a duplicate document id fails before the op is
+    /// written, so no op lands for a row that was never created here.
+    #[test]
+    fn insert_document_with_op_writes_no_op_when_the_row_is_a_duplicate() {
+        let mut db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let id = ContextId::new();
+
+        db.insert_document_with_op(&file_doc_row(id, ws_id), 1, b"first")
+            .unwrap();
+        let err = db
+            .insert_document_with_op(&file_doc_row(id, ws_id), 2, b"second")
+            .unwrap_err();
+
+        assert!(
+            matches!(err, KernelDbError::DuplicateDocument(dup) if dup == id),
+            "expected DuplicateDocument({id}), got: {err}"
+        );
+        assert_eq!(
+            db.load_oplog_since(id, 0).unwrap(),
+            vec![(1i64, b"first".to_vec())],
+            "the second call must leave no op behind"
         );
     }
 }

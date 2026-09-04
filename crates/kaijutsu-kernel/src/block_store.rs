@@ -354,57 +354,71 @@ impl BlockStore {
         match db.insert_document(row) {
             Ok(()) => Ok(()),
             Err(KernelDbError::DuplicateDocument(id)) => {
-                let persisted = db
-                    .get_document(id)
-                    .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-                let Some(persisted) = persisted else {
-                    return Err(BlockStoreError::DocumentDiverged {
-                        id,
-                        detail: "persisted row vanished between insert and read-back"
-                            .to_string(),
-                    });
-                };
-
-                let mut diffs = Vec::new();
-                if persisted.doc_kind != row.doc_kind {
-                    diffs.push(format!(
-                        "doc_kind: persisted={:?} intended={:?}",
-                        persisted.doc_kind, row.doc_kind
-                    ));
-                }
-                if persisted.workspace_id != row.workspace_id {
-                    diffs.push(format!(
-                        "workspace_id: persisted={} intended={}",
-                        persisted.workspace_id, row.workspace_id
-                    ));
-                }
-                if persisted.path != row.path {
-                    diffs.push(format!(
-                        "path: persisted={:?} intended={:?}",
-                        persisted.path, row.path
-                    ));
-                }
-                if !diffs.is_empty() {
-                    return Err(BlockStoreError::DocumentDiverged {
-                        id,
-                        detail: diffs.join("; "),
-                    });
-                }
-
-                // `language` differing is not divergence — log and continue.
-                if persisted.language != row.language {
-                    tracing::warn!(
-                        context_id = %id.to_hex(),
-                        persisted_language = ?persisted.language,
-                        intended_language = ?row.language,
-                        "Document language differs from persisted row; not treated as divergence"
-                    );
-                }
-                tracing::warn!(context_id = %id.to_hex(), "Document already in DB but not in memory, recovering");
-                Ok(())
+                Self::reconcile_persisted_document(db, id, row)
             }
             Err(e) => Err(BlockStoreError::Db(e.to_string())),
         }
+    }
+
+    /// Decide whether the row already persisted at `id` is the same document
+    /// `row` describes. `Ok(())` is the benign already-in-DB-not-in-memory
+    /// recovery; `DocumentDiverged` means a different document is squatting
+    /// this id and must not be written to. Shared by
+    /// `insert_or_reconcile_document` and `create_document_with_block`, which
+    /// reach the same conflict from a plain insert and from a transaction.
+    fn reconcile_persisted_document(
+        db: &KernelDb,
+        id: ContextId,
+        row: &DocumentRow,
+    ) -> BlockStoreResult<()> {
+        let persisted = db
+            .get_document(id)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        let Some(persisted) = persisted else {
+            return Err(BlockStoreError::DocumentDiverged {
+                id,
+                detail: "persisted row vanished between insert and read-back"
+                    .to_string(),
+            });
+        };
+
+        let mut diffs = Vec::new();
+        if persisted.doc_kind != row.doc_kind {
+            diffs.push(format!(
+                "doc_kind: persisted={:?} intended={:?}",
+                persisted.doc_kind, row.doc_kind
+            ));
+        }
+        if persisted.workspace_id != row.workspace_id {
+            diffs.push(format!(
+                "workspace_id: persisted={} intended={}",
+                persisted.workspace_id, row.workspace_id
+            ));
+        }
+        if persisted.path != row.path {
+            diffs.push(format!(
+                "path: persisted={:?} intended={:?}",
+                persisted.path, row.path
+            ));
+        }
+        if !diffs.is_empty() {
+            return Err(BlockStoreError::DocumentDiverged {
+                id,
+                detail: diffs.join("; "),
+            });
+        }
+
+        // `language` differing is not divergence — log and continue.
+        if persisted.language != row.language {
+            tracing::warn!(
+                context_id = %id.to_hex(),
+                persisted_language = ?persisted.language,
+                intended_language = ?row.language,
+                "Document language differs from persisted row; not treated as divergence"
+            );
+        }
+        tracing::warn!(context_id = %id.to_hex(), "Document already in DB but not in memory, recovering");
+        Ok(())
     }
 
     /// Create a new document.
@@ -445,6 +459,131 @@ impl BlockStore {
                 Ok(())
             }
         }
+    }
+
+    /// Create a document and its first block as ONE durable write.
+    ///
+    /// `create_document` then `insert_block` commit in two transactions: the
+    /// documents row lands first, the op second. A failure between them — or
+    /// anything that later drops the op — leaves a row with no snapshot and no
+    /// oplog, which loads as an empty document and answers every read with
+    /// "exists but has no blocks". Here the row and the op share one SQLite
+    /// transaction, so the document either exists with its first block or does
+    /// not exist at all.
+    ///
+    /// A row already persisted at this id is classified the way
+    /// `create_document` classifies it: a matching row is the benign
+    /// not-in-memory recovery and the block is journaled onto it, while a
+    /// divergent one is `DocumentDiverged` and nothing is written.
+    /// `DocumentAlreadyExists` means the document is already resident.
+    pub fn create_document_with_block(
+        &self,
+        context_id: ContextId,
+        kind: DocKind,
+        language: Option<String>,
+        role: Role,
+        block_kind: BlockKind,
+        content: impl Into<String>,
+        status: Status,
+        content_type: ContentType,
+    ) -> BlockStoreResult<BlockId> {
+        use dashmap::mapref::entry::Entry;
+
+        // The first op of a document's oplog. `journal_op` derives the same
+        // number from `next_journal_seq`, which a fresh entry starts at 0.
+        const FIRST_SEQ: i64 = 1;
+
+        let (block_id, snapshot, version, unjournaled) = match self.documents.entry(context_id) {
+            Entry::Occupied(_) => return Err(BlockStoreError::DocumentAlreadyExists(context_id)),
+            Entry::Vacant(vacant) => {
+                let principal_id = self.principal_id();
+                let mut entry = DocumentEntry::new(context_id, kind, language.clone(), principal_id);
+                entry.doc.set_principal_id(principal_id);
+                let block_id = entry.doc.insert_block(
+                    None,
+                    None,
+                    role,
+                    block_kind,
+                    content,
+                    status,
+                    content_type,
+                )?;
+                let snapshot = entry
+                    .doc
+                    .get_block_snapshot(&block_id)
+                    .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
+                // The journaled payload for a fresh block is just its own
+                // snapshot — the same payload `insert_block_as` writes.
+                let payload = SyncPayload::from_new_block(snapshot.clone());
+                entry.touch(principal_id);
+                let version = entry.version();
+
+                // `Some(payload)` once the document is resident means the op
+                // still has to be journaled: the recovery path below reached a
+                // row that was already persisted, so only the op is left to
+                // write, and `journal_op` does it outside this shard guard.
+                let mut unjournaled = None;
+                if let Some(db) = self.journaling_db()? {
+                    let payload_bytes = codec::encode(&payload)
+                        .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+                    let row = DocumentRow {
+                        document_id: context_id,
+                        workspace_id: self.default_workspace_id.unwrap_or_default(),
+                        doc_kind: kind,
+                        language,
+                        path: None,
+                        created_at: kaijutsu_types::now_millis() as i64,
+                        created_by: principal_id,
+                    };
+                    let mut db_guard = db.lock();
+                    match db_guard.insert_document_with_op(&row, FIRST_SEQ, &payload_bytes) {
+                        Ok(()) => {
+                            db_guard
+                                .touch_context_activity(
+                                    context_id,
+                                    kaijutsu_types::now_millis() as i64,
+                                )
+                                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+                            entry
+                                .next_journal_seq
+                                .store(FIRST_SEQ as u64, Ordering::SeqCst);
+                            entry.uncompacted_count.store(1, Ordering::SeqCst);
+                            entry
+                                .uncompacted_bytes
+                                .store(payload_bytes.len() as u64, Ordering::SeqCst);
+                        }
+                        Err(KernelDbError::DuplicateDocument(id)) => {
+                            // The row is already there, so there is nothing
+                            // left to make atomic — but it has to be the SAME
+                            // document, not a different one squatting this id.
+                            Self::reconcile_persisted_document(&db_guard, id, &row)?;
+                            unjournaled = Some(payload);
+                        }
+                        Err(e) => return Err(BlockStoreError::Db(e.to_string())),
+                    }
+                }
+
+                vacant.insert(entry);
+                (block_id, snapshot, version, unjournaled)
+            }
+        };
+
+        // Everything below runs after the shard guard is released: each takes
+        // its own lookup on `context_id` and would deadlock against a held
+        // entry.
+        match unjournaled {
+            Some(payload) => self.journal_op(context_id, payload)?,
+            None => self.recompute_live_status(context_id, &[snapshot.status]),
+        }
+        self.emit(BlockFlow::Inserted {
+            context_id,
+            block: Arc::new(snapshot),
+            after_id: None,
+            version,
+            source: OpSource::Local,
+        });
+
+        Ok(block_id)
     }
 
     /// Create a document from a serialized store snapshot (for sync from server).
@@ -2330,6 +2469,16 @@ impl BlockStore {
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         let principal_id = self.principal_id();
 
+        // Paths carrying an unflushed swap marker, mapped through the same
+        // derivation the file cache keys its documents by. The boot repair
+        // below keeps a contentless File document whose path is in this set.
+        let swap_marked: HashSet<ContextId> = db_guard
+            .list_dirty_file_buffers()
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?
+            .iter()
+            .map(|row| crate::file_tools::cache::file_context_id(&row.path))
+            .collect();
+
         for doc in docs {
             let context_id = doc.document_id;
 
@@ -2337,6 +2486,7 @@ impl BlockStore {
             // context version the snapshot was taken AT — the durable half of
             // the version this document resumes from (see `base_version`
             // below).
+            let mut had_snapshot = true;
             let (mut document, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
                 Ok(Some(snap_row)) => {
                     match codec::decode::<StoreSnapshot>(&snap_row.state) {
@@ -2362,7 +2512,10 @@ impl BlockStore {
                         }
                     }
                 }
-                Ok(None) => (BlockDocument::new(context_id, principal_id), 0, 0),
+                Ok(None) => {
+                    had_snapshot = false;
+                    (BlockDocument::new(context_id, principal_id), 0, 0)
+                }
                 Err(e) => {
                     tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot, skipping");
                     continue;
@@ -2373,6 +2526,56 @@ impl BlockStore {
             let oplog_entries = db_guard
                 .load_oplog_since(context_id, base_seq)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+
+            // Boot repair: a File document with neither a snapshot nor an
+            // oplog carries no content. It loads as an empty document and
+            // answers every read with "exists but has no blocks", so the row
+            // is deleted here rather than left to fail every reader that
+            // reaches for that path. Documents rows hold no path for File
+            // documents, so the warning names the id only.
+            //
+            // A path with an unflushed swap marker is kept and shouted about
+            // instead: the marker is the durable evidence that an edit is
+            // outstanding, and deleting the document it points at throws that
+            // work away. See docs/file-buffers.md.
+            if doc.doc_kind == DocKind::File && !had_snapshot && oplog_entries.is_empty() {
+                // Two reasons to keep the row anyway, both louder than the
+                // deletion itself: something durable points at this document,
+                // and the sweep must not be what takes it away.
+                let keep = if swap_marked.contains(&context_id) {
+                    Some("a swap marker claims an unflushed edit for it; recover or discard it with `kj swap`")
+                } else if db_guard
+                    .get_context(context_id)
+                    .map_err(|e| BlockStoreError::Db(e.to_string()))?
+                    .is_some()
+                {
+                    Some("a context row depends on it, and deleting the document would cascade that context away")
+                } else {
+                    None
+                };
+
+                match keep {
+                    Some(reason) => tracing::error!(
+                        document_id = %context_id.to_hex(),
+                        reason,
+                        "File document has no snapshot and no oplog; keeping the row. Reads of its path fail until this is resolved"
+                    ),
+                    None => {
+                        match db_guard.delete_document(context_id) {
+                            Ok(_) => tracing::warn!(
+                                document_id = %context_id.to_hex(),
+                                "Deleted a File document with no snapshot and no oplog: it held no content and every read of it failed"
+                            ),
+                            Err(e) => tracing::error!(
+                                document_id = %context_id.to_hex(),
+                                error = %e,
+                                "Failed to delete a contentless File document; reads of its path keep failing"
+                            ),
+                        }
+                        continue;
+                    }
+                }
+            }
 
             let mut max_seq = base_seq;
             let mut total_bytes: u64 = 0;
@@ -5999,6 +6202,294 @@ mod tests {
             store.get(ctx).is_none(),
             "a diverged document must not be inserted into memory"
         );
+    }
+
+    // ========================================================================
+    // A document row and its first op are one durable write, and a File
+    // document that lost that op is swept at boot. Together these are why a
+    // path can no longer answer "exists but has no blocks" forever.
+    // ========================================================================
+
+    /// A db-backed store plus the workspace id its rows belong to.
+    fn store_with_db() -> (Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>, WorkspaceId, BlockStore) {
+        use crate::kernel_db::KernelDb;
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let creator = PrincipalId::system();
+        let ws_id = {
+            let db_guard = db.lock();
+            db_guard.get_or_create_default_workspace(creator).unwrap()
+        };
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
+        (db, ws_id, store)
+    }
+
+    /// Write a `documents` row with no snapshot and no oplog — the shape a
+    /// dropped first op leaves behind.
+    fn insert_contentless_doc(
+        db: &Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
+        ws_id: WorkspaceId,
+        kind: DocumentKind,
+    ) -> ContextId {
+        use crate::kernel_db::DocumentRow;
+        use kaijutsu_types::now_millis;
+
+        let ctx = ContextId::new();
+        db.lock()
+            .insert_document(&DocumentRow {
+                document_id: ctx,
+                workspace_id: ws_id,
+                doc_kind: kind,
+                language: None,
+                path: None,
+                created_at: now_millis() as i64,
+                created_by: PrincipalId::system(),
+            })
+            .unwrap();
+        ctx
+    }
+
+    #[test]
+    fn create_document_with_block_leaves_a_readable_document_after_a_restart() {
+        let (db, ws_id, store) = store_with_db();
+        let ctx = ContextId::new();
+
+        store
+            .create_document_with_block(
+                ctx,
+                DocumentKind::File,
+                Some("rust".to_string()),
+                Role::System,
+                BlockKind::Text,
+                "fn main() {}",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        // The op is on disk, not merely in memory: a cold store replays it.
+        let reloaded = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        reloaded.load_from_db().unwrap();
+        let blocks = reloaded.block_snapshots(ctx).unwrap();
+        assert_eq!(blocks.len(), 1, "the first block must survive the restart");
+        assert_eq!(blocks[0].content, "fn main() {}");
+    }
+
+    #[test]
+    fn create_document_with_block_refuses_a_resident_document() {
+        let (_db, _ws_id, store) = store_with_db();
+        let ctx = ContextId::new();
+
+        let make = |content: &str| {
+            store.create_document_with_block(
+                ctx,
+                DocumentKind::File,
+                None,
+                Role::System,
+                BlockKind::Text,
+                content,
+                Status::Done,
+                ContentType::Plain,
+            )
+        };
+        make("first").unwrap();
+        let err = make("second").unwrap_err();
+
+        assert!(
+            matches!(err, BlockStoreError::DocumentAlreadyExists(id) if id == ctx),
+            "expected DocumentAlreadyExists({ctx}), got: {err}"
+        );
+        let blocks = store.block_snapshots(ctx).unwrap();
+        assert_eq!(blocks.len(), 1, "the refused call must not append a second block");
+        assert_eq!(blocks[0].content, "first");
+    }
+
+    /// A row already persisted at this id, but not resident, is the benign
+    /// recovery `create_document` performs — the block is journaled onto the
+    /// existing row rather than refused.
+    #[test]
+    fn create_document_with_block_journals_onto_a_persisted_row() {
+        let (db, ws_id, _store) = store_with_db();
+        let ctx = insert_contentless_doc(&db, ws_id, DocumentKind::File);
+
+        let store = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        store
+            .create_document_with_block(
+                ctx,
+                DocumentKind::File,
+                None,
+                Role::System,
+                BlockKind::Text,
+                "recovered",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .expect("a matching persisted row must recover, not error");
+
+        let reloaded = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        reloaded.load_from_db().unwrap();
+        let blocks = reloaded.block_snapshots(ctx).unwrap();
+        assert_eq!(blocks.len(), 1, "the op must be journaled onto the existing row");
+        assert_eq!(blocks[0].content, "recovered");
+    }
+
+    /// The boot sweep: a File document with no snapshot and no oplog holds no
+    /// content, so its row goes rather than failing every future read of that
+    /// path with "exists but has no blocks".
+    #[test]
+    fn load_from_db_deletes_a_contentless_file_document() {
+        let (db, ws_id, _store) = store_with_db();
+        let ctx = insert_contentless_doc(&db, ws_id, DocumentKind::File);
+
+        let store = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        store.load_from_db().unwrap();
+
+        assert!(store.get(ctx).is_none(), "the swept document must not be resident");
+        assert!(
+            db.lock().get_document(ctx).unwrap().is_none(),
+            "the swept document's row must be deleted"
+        );
+    }
+
+    /// A swap marker is the durable evidence of an unflushed edit. The sweep
+    /// keeps the row it points at rather than throwing that work away.
+    #[test]
+    fn load_from_db_keeps_a_contentless_file_document_with_a_swap_marker() {
+        let (db, ws_id, _store) = store_with_db();
+
+        // The path must be one the file cache would key to this document.
+        let path = "/home/atobey/src/kaijutsu/unflushed.rs";
+        let ctx = crate::file_tools::cache::file_context_id(path);
+        {
+            use crate::kernel_db::DocumentRow;
+            use kaijutsu_types::now_millis;
+            let db_guard = db.lock();
+            db_guard
+                .insert_document(&DocumentRow {
+                    document_id: ctx,
+                    workspace_id: ws_id,
+                    doc_kind: DocumentKind::File,
+                    language: None,
+                    path: None,
+                    created_at: now_millis() as i64,
+                    created_by: PrincipalId::system(),
+                })
+                .unwrap();
+            db_guard.record_dirty_file_buffer(path, ctx, None).unwrap();
+        }
+
+        let store = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        store.load_from_db().unwrap();
+
+        assert!(
+            db.lock().get_document(ctx).unwrap().is_some(),
+            "a document with an unflushed swap marker must survive the sweep"
+        );
+        assert!(store.get(ctx).is_some(), "the kept document must still load");
+    }
+
+    /// The recovery above journals the block's op at seq 1, so a persisted
+    /// row that already carries an oplog fails loudly on the oplog primary
+    /// key rather than writing past history the store never replayed. Not
+    /// reachable from the file cache — `load_from_db` makes any document with
+    /// an oplog resident, which the `Occupied` arm refuses first — but this
+    /// pins which way it breaks if it ever is.
+    #[test]
+    fn create_document_with_block_refuses_a_persisted_row_that_already_has_an_oplog() {
+        let (db, ws_id, _store) = store_with_db();
+        let ctx = insert_contentless_doc(&db, ws_id, DocumentKind::File);
+        db.lock().append_op(ctx, 1, b"an op this store never replayed").unwrap();
+
+        let store = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        let err = store
+            .create_document_with_block(
+                ctx,
+                DocumentKind::File,
+                None,
+                Role::System,
+                BlockKind::Text,
+                "clobber",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BlockStoreError::Db(_)),
+            "expected a loud Db failure on the oplog primary key, got: {err}"
+        );
+        assert_eq!(
+            db.lock().load_oplog_since(ctx, 0).unwrap().len(),
+            1,
+            "the existing op must be untouched"
+        );
+    }
+
+    /// Deleting a `documents` row CASCADEs to `contexts`. A File document
+    /// carrying a context row is not a file-cache document, and the sweep must
+    /// never be what takes that context away.
+    #[test]
+    fn load_from_db_keeps_a_contentless_file_document_a_context_depends_on() {
+        use crate::kernel_db::ContextRow;
+        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
+
+        let (db, ws_id, _store) = store_with_db();
+        let ctx = insert_contentless_doc(&db, ws_id, DocumentKind::File);
+        db.lock()
+            .insert_context(&ContextRow {
+                context_id: ctx,
+                label: None,
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                context_type: "default".to_string(),
+                created_at: now_millis() as i64,
+                created_by: PrincipalId::system(),
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: Some(ws_id),
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+                cast_id: None,
+                origin_host: None,
+            })
+            .unwrap();
+
+        let store = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        store.load_from_db().unwrap();
+
+        assert!(
+            db.lock().get_context(ctx).unwrap().is_some(),
+            "the sweep must not cascade a context row away"
+        );
+        assert!(
+            db.lock().get_document(ctx).unwrap().is_some(),
+            "and the document row it depends on must survive"
+        );
+    }
+
+    /// The sweep is scoped to File documents. A Conversation document with no
+    /// blocks yet is an ordinary empty context, not damage.
+    #[test]
+    fn load_from_db_leaves_a_blockless_conversation_document_alone() {
+        let (db, ws_id, _store) = store_with_db();
+        let ctx = insert_contentless_doc(&db, ws_id, DocumentKind::Conversation);
+
+        let store = BlockStore::with_db(db.clone(), ws_id, PrincipalId::system());
+        store.load_from_db().unwrap();
+
+        assert!(
+            db.lock().get_document(ctx).unwrap().is_some(),
+            "a blockless Conversation document must survive the sweep"
+        );
+        assert!(store.get(ctx).is_some(), "and must still be resident");
     }
 
     // ========================================================================

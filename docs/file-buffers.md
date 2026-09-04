@@ -136,6 +136,42 @@ places:
   entry dirty whenever `EditorSessions::quit` reports a content-changing
   rollback.
 
+## A file document is its content, or it is not there at all
+
+`kj block read` on a file whose document row exists without any content
+answers "exists but has no blocks", and so does every other path — `cat`,
+`head`, `grep`, the `read` tool. The row is enough to make the path look
+taken and not enough to serve a byte of it.
+
+Two mechanisms keep that shape out of the store:
+
+- **The row and the first op commit together.**
+  `BlockStore::create_document_with_block` writes the `documents` row and the
+  block's first oplog op in one SQLite transaction
+  (`KernelDb::insert_document_with_op`). Creating the row and journaling the
+  block as two commits is what leaves the gap; a crash between them, or
+  anything that later drops the op, strands the row.
+- **Boot sweeps what is already stranded.** `BlockStore::load_from_db`
+  deletes a `File` document that has neither a snapshot nor an oplog. It held
+  no content, so nothing is lost, and the next read of that path materializes
+  it fresh from disk. Document rows carry no path for file documents, so the
+  warning names the document id only.
+
+The sweep yields to anything durable that points at the document, and says so
+at error level instead of deleting it:
+
+- **A swap marker.** A `dirty_file_buffers` row is the durable evidence that
+  an unflushed edit exists for that path. Reads of it keep failing until the
+  swap is recovered or discarded (`kj swap`) — a loud, addressable state
+  instead of a quiet deletion.
+- **A context row.** `documents` CASCADEs to `contexts`, so deleting the row
+  would take a context with it. A file document never has one; a document
+  that does is not a file document, whatever its `doc_kind` says.
+
+The 2026-08-16 diamond-types cutover produced a batch of these: the purge
+dropped each affected document's only op, leaving the row behind. That purge
+is a dated one-shot; the sweep is the standing guard.
+
 ## Tool surface: three removals
 
 Decided by Amy 2026-08-18. Each removal deletes a hazard rather than guarding

@@ -428,28 +428,20 @@ impl FileDocumentCache {
         let loaded_generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
         let language = detect_language(path);
 
-        let block_id = match self
-            .block_store
-            .create_document(ctx_id, DocKind::File, language)
-        {
-            Ok(()) => self
-                .block_store
-                .insert_block(
-                    ctx_id,
-                    None,
-                    None,
-                    Role::System,
-                    BlockKind::Text,
-                    text,
-                    Status::Done,
-                    ContentType::Plain,
-                )
-                .map_err(|e| {
-                    CacheReadError::Backend(format!(
-                        "failed to insert block for {}: {}",
-                        path, e
-                    ))
-                })?,
+        // Document row and first block commit together: a row without its op
+        // is the contentless document every later read reports as "exists but
+        // has no blocks" (`BlockStore::create_document_with_block`).
+        let block_id = match self.block_store.create_document_with_block(
+            ctx_id,
+            DocKind::File,
+            language,
+            Role::System,
+            BlockKind::Text,
+            text,
+            Status::Done,
+            ContentType::Plain,
+        ) {
+            Ok(block_id) => block_id,
             Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
                 // The block store persists file documents across restarts
                 // while this in-memory cache starts cold, so a miss does not
@@ -478,27 +470,37 @@ impl FileDocumentCache {
                             path, e
                         ))
                     })?;
-                let existing_block_id = snapshots
-                    .first()
-                    .map(|s| s.id)
-                    .ok_or_else(|| {
-                        CacheReadError::Backend(format!(
-                            "document {} exists but has no blocks",
-                            path
-                        ))
-                    })?;
-
                 // A `dirty_file_buffers` row means this document is a swap —
                 // unsaved work still in flight when the kernel went down —
                 // not a stale mirror of disk. Reconciling it (like the branch
                 // below) would silently discard that work, which is the exact
-                // failure this table exists to prevent. See docs/file-buffers.md.
+                // failure this table exists to prevent. Read before the
+                // no-blocks check below, which needs it to say WHY a document
+                // holds nothing. See docs/file-buffers.md.
                 let dirty_row = self.db.lock().get_dirty_file_buffer(path).map_err(|e| {
                     CacheReadError::Backend(format!(
                         "failed to check swap marker for {}: {}",
                         path, e
                     ))
                 })?;
+
+                let existing_block_id = match snapshots.first() {
+                    Some(snapshot) => snapshot.id,
+                    // A document with no blocks holds no content, so there is
+                    // nothing to serve and nothing to reconcile against disk.
+                    // Both messages name the one action that clears the state;
+                    // "exists but has no blocks" named neither.
+                    None if dirty_row.is_some() => {
+                        return Err(CacheReadError::Backend(format!(
+                            "{path}: the unflushed edit recorded for this file never reached durable storage, so its content is gone. `kj swap discard {path}` clears the marker, after which the file reads from disk again."
+                        )));
+                    }
+                    None => {
+                        return Err(CacheReadError::Backend(format!(
+                            "{path}: this file's document holds no content and cannot be served. Restarting the kernel deletes it, after which the file reads from disk again."
+                        )));
+                    }
+                };
                 if let Some(row) = dirty_row {
                     let mut cache = self.cache.write();
                     self.evict_if_needed(&mut cache);
@@ -697,7 +699,8 @@ impl FileDocumentCache {
     ///
     /// Plain `invalidate` only removes the in-memory entry; the shadow document
     /// (at `file_context_id(path)`) survives in the block store. The next
-    /// `try_get_or_load` hits `create_document`'s `DocumentAlreadyExists` arm, which
+    /// `try_get_or_load` hits `create_document_with_block`'s `DocumentAlreadyExists`
+    /// arm, which
     /// reconciles that shadow's content against a fresh VFS read before serving
     /// it — so for a **self-contained file** (the doc *is* the truth, and "VFS
     /// read" means "read disk"), plain `invalidate` is already enough to pick up
@@ -973,29 +976,24 @@ impl FileDocumentCache {
         // The kernel block store persists file documents across restarts while
         // this in-memory cache starts cold. So a cache miss does NOT imply the
         // document is new — it may already exist in the store (e.g. after a
-        // kernel restart). create_document's DocumentAlreadyExists is that
-        // case; fall back to replacing the existing block's content rather
-        // than erroring. Any other create_document failure (a real DB error,
+        // kernel restart). `create_document_with_block`'s
+        // `DocumentAlreadyExists` is that case; fall back to replacing the
+        // existing block's content rather than erroring. Any other failure
+        // from it (a real DB error,
         // or DocumentDiverged — a persisted row under this path that does not
         // match what we intended to create) is a genuine backend failure and
         // must propagate, matching try_get_or_load's classification.
-        let block_id = match self
-            .block_store
-            .create_document(ctx_id, DocKind::File, language)
-        {
-            Ok(()) => self
-                .block_store
-                .insert_block(
-                    ctx_id,
-                    None,
-                    None,
-                    Role::System,
-                    BlockKind::Text,
-                    content,
-                    Status::Done,
-                    ContentType::Plain,
-                )
-                .map_err(|e| format!("failed to insert block for {}: {}", path, e))?,
+        let block_id = match self.block_store.create_document_with_block(
+            ctx_id,
+            DocKind::File,
+            language,
+            Role::System,
+            BlockKind::Text,
+            content,
+            Status::Done,
+            ContentType::Plain,
+        ) {
+            Ok(block_id) => block_id,
             Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
                 // Doc already in the store (cold cache). Replace its block's
                 // content with the new bytes (char-indexed delete, like the
@@ -1004,19 +1002,40 @@ impl FileDocumentCache {
                     .block_store
                     .block_snapshots(ctx_id)
                     .map_err(|e| format!("failed to read existing doc {}: {}", path, e))?;
-                let existing = snaps
-                    .first()
-                    .ok_or_else(|| format!("document {} exists but has no blocks", path))?;
-                self.block_store
-                    .edit_text(
-                        ctx_id,
-                        &existing.id,
-                        0,
-                        content,
-                        existing.content.chars().count(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                existing.id
+                match snaps.first() {
+                    Some(existing) => {
+                        self.block_store
+                            .edit_text(
+                                ctx_id,
+                                &existing.id,
+                                0,
+                                content,
+                                existing.content.chars().count(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        existing.id
+                    }
+                    // A document with no blocks holds no content, and this
+                    // call is replacing the content wholesale — give it the
+                    // block it is missing rather than refusing. The swap
+                    // guard already ran above, so there is no unflushed edit
+                    // to lose here.
+                    None => self
+                        .block_store
+                        .insert_block(
+                            ctx_id,
+                            None,
+                            None,
+                            Role::System,
+                            BlockKind::Text,
+                            content,
+                            Status::Done,
+                            ContentType::Plain,
+                        )
+                        .map_err(|e| {
+                            format!("failed to insert first block for {}: {}", path, e)
+                        })?,
+                }
             }
             Err(e) => {
                 return Err(format!("failed to create document for {}: {}", path, e));
@@ -1217,6 +1236,73 @@ mod tests {
         std::path::Path::new(s)
     }
 
+    /// A document with no blocks holds no content. Reading it must say what
+    /// clears the state, not just that the blocks are missing — and when a
+    /// swap marker points at it, must say that the unflushed edit is gone.
+    #[tokio::test]
+    async fn reading_a_contentless_document_names_the_action_that_clears_it() {
+        let (vfs, cache) = tmp_cache().await;
+        let path = "/tmp/contentless.rs";
+        vfs.write_all(p(path), b"on disk").await.unwrap();
+
+        // The shape a dropped first op leaves: a document in the store with
+        // no blocks, and a cold cache.
+        let ctx_id = file_context_id(path);
+        cache
+            .block_store()
+            .create_document(ctx_id, DocKind::File, None)
+            .unwrap();
+
+        let err = cache
+            .try_read_content(path)
+            .await
+            .expect_err("a document with no blocks cannot be served");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("holds no content") && msg.contains("Restarting the kernel"),
+            "must name what clears it, got: {msg}"
+        );
+
+        // With a swap marker, the same document means lost unflushed work.
+        cache
+            .db
+            .lock()
+            .record_dirty_file_buffer(path, ctx_id, None)
+            .unwrap();
+        let err = cache
+            .try_read_content(path)
+            .await
+            .expect_err("a contentless swap cannot be served either");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kj swap discard"),
+            "must name the verb that clears the marker, got: {msg}"
+        );
+    }
+
+    /// The write path replaces content wholesale, so a document with no
+    /// blocks gets the block it is missing rather than an error.
+    #[tokio::test]
+    async fn create_or_replace_gives_a_contentless_document_its_first_block() {
+        let (_vfs, cache) = tmp_cache().await;
+        let path = "/tmp/contentless-write.kai";
+
+        let ctx_id = file_context_id(path);
+        cache
+            .block_store()
+            .create_document(ctx_id, DocKind::File, None)
+            .unwrap();
+
+        cache
+            .create_or_replace(path, "written anyway")
+            .await
+            .expect("a contentless document must take a first block, not refuse");
+        assert_eq!(
+            cache.try_read_content(path).await.unwrap(),
+            "written anyway"
+        );
+    }
+
     #[tokio::test]
     async fn create_or_replace_handles_multibyte_when_cached() {
         // Regression: create_or_replace deleted `old_content.len()` (bytes)
@@ -1247,8 +1333,8 @@ mod tests {
     async fn create_or_replace_handles_doc_in_store_but_not_cache() {
         // Regression: the block store persists file docs across restarts while
         // this cache starts cold. A cache miss with the doc still in the store
-        // must replace its content, not fail create_document with
-        // "document already exists". `invalidate` reproduces the cold cache.
+        // must replace its content, not fail the create with "document
+        // already exists". `invalidate` reproduces the cold cache.
         let (_vfs, cache) = tmp_cache().await;
 
         cache.create_or_replace("/tmp/r.kai", "v1").await.unwrap();
@@ -1265,7 +1351,7 @@ mod tests {
     }
 
     /// `get_or_load_with_content`'s cold-cache fallback must discriminate
-    /// `create_document`'s error the same way `try_get_or_load` does:
+    /// `create_document_with_block`'s error the same way `try_get_or_load` does:
     /// `DocumentAlreadyExists` is the benign "doc already in the store"
     /// case, but a persisted row that diverges (different `doc_kind`,
     /// `workspace_id`, or `path` than the one being created) is
