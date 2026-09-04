@@ -1100,12 +1100,17 @@ async fn handle_ask_decision(
     let allow = !matches!(decision, asks::AskDecision::Deny);
     let remember = matches!(decision, asks::AskDecision::AllowAlways)
         .then_some(kaijutsu_client::RememberScope::Always);
+    // Never from the ask's own context: the kernel refuses that seat, and
+    // the card is always the current context's ask.
+    let Some(seat) = app.answering_seat(card.context_id) else {
+        app.note(format!("ask {} needs another seat to answer from; none open", short_ask(&card.request_id)));
+        return;
+    };
     report_decision(
         app,
         &card.request_id,
         allow,
-        kaijutsu_client::decide_ask_remember(bridge.actor(), card.context_id, &card.request_id, allow, remember)
-            .await,
+        kaijutsu_client::decide_ask_remember(bridge.actor(), seat, &card.request_id, allow, remember).await,
     );
 }
 
@@ -1142,11 +1147,23 @@ async fn handle_ledger_key(bridge: &KernelBridge, app: &mut App, key: crossterm:
             let remember = matches!(action, asks::LedgerAction::AllowAlways)
                 .then_some(kaijutsu_client::RememberScope::Always);
             app.ledger_view = None;
+            // The row does not carry the ask's context; read it, then answer
+            // from a seat that is not it (the kernel refuses the author's).
+            let raised_in = kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &request_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|d| d.context_id)
+                .unwrap_or(ctx);
+            let Some(seat) = app.answering_seat(raised_in) else {
+                app.note(format!("ask {} needs another seat to answer from; none open", short_ask(&request_id)));
+                return;
+            };
             report_decision(
                 app,
                 &request_id,
                 allow,
-                kaijutsu_client::decide_ask_remember(bridge.actor(), ctx, &request_id, allow, remember).await,
+                kaijutsu_client::decide_ask_remember(bridge.actor(), seat, &request_id, allow, remember).await,
             );
         }
         asks::LedgerAction::Ignored => {}

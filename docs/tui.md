@@ -592,6 +592,18 @@ by its first id segment, the one `kj ledger list` keys on. A key
 pressed on an already-answered ask reports the lost race on the status
 line and nothing else happens.
 
+**An answer never comes from the ask's own context.** The kernel refuses
+the context that raised an ask (`docs/gate-and-shell-split.md`, "No
+self-approval": author versus not-author, by context, never human versus
+model), and the card is always the current context's ask — so `a`/`A`/`d`
+here, and on a ledger row, run `kj ledger allow|deny` from another seat
+this client holds (`App::answering_seat`: the last context, then the rank
+in seat order, then any context it knows). A client that holds only the
+ask's own context says so on the status line and answers nothing. Found
+by the tui-testing model probing the ledger (2026-09-04): *"an ask raised
+by context X can't be allow/deny-ed from context X — even by the human
+operating X via TUI."*
+
 The card's line count is measured at the terminal's own width — the
 statement wraps by width, so a wider count would say fewer lines than a
 narrower terminal actually needs. The ledger's row count does not need

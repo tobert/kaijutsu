@@ -405,6 +405,24 @@ driven end to end by the `shell_box_*` cases in `gate_executes_wire.rs`.
    (`{e:#}`), which will show the kernel's text; the kernel side should
    return the "waiting for approval" result instead of an error.
 
+**From the tui-testing model's ledger probe (2026-09-04, delivered as a
+note in `drift.md` after its drift did not arrive):**
+
+- **`kj ledger cancel`** — withdrawal without a verdict, distinct from
+  deny. Orphaned asks from dead seats pile up forever; nothing but an
+  answer clears them.
+- **No TTL on asks.** A dead seat's pending asks stay pending
+  indefinitely. `expires_at` exists on the row; nothing sets or sweeps it
+  for shell/hook asks.
+- **`kj ledger list` should show the origin context**, so "answer it from
+  another context" is actionable from the listing.
+- **Same-seat deny.** The no-self-approval rule refuses both verdicts from
+  the raising context. The note suggests permitting deny from the same
+  seat (the safe direction). The tui now answers from another seat it
+  holds (`App::answering_seat`), which side-steps the question for the
+  human at a tui; the question stands for a model that wants to withdraw
+  its own ask — that is the `cancel` verb above.
+
 Also open from the same lane: `archive_context` stamps `archived_at` and
 leaves `context_state` at `live`. The two checks that matter now read both
 halves, but every other reader of `context_state` alone is wrong the same
