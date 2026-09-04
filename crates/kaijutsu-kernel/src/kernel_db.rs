@@ -159,10 +159,11 @@ impl ContextRow {
     /// nothing and answers nothing.
     ///
     /// `archived_at` is authoritative per `ContextState`'s own doc comment,
-    /// so it is checked ahead of the enum. One predicate rather than the
-    /// hand-rolled pair each caller used to write, because the two fields
-    /// can disagree and a caller that checks only one is a caller that
-    /// treats a dead context as live.
+    /// so it is checked ahead of the enum. The kernel writes both together —
+    /// `archive_context` stamps the timestamp and the state, and resurrection
+    /// clears both — so this reads two fields that agree. It stays one
+    /// predicate anyway: a caller that checks a single field is a caller that
+    /// treats a dead context as live if they ever part again.
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some() || self.context_state == ContextState::Archived
     }
@@ -1990,6 +1991,7 @@ impl KernelDb {
         Self::drop_legacy_value_enum_checks(conn)?;
         Self::migrate_well_known_lost_found(conn)?;
         Self::migrate_doc_kind_file_collapse(conn)?;
+        Self::migrate_archived_context_state(conn)?;
         Self::drop_doc_snapshots_content_column(conn)?;
         Ok(())
     }
@@ -2415,6 +2417,23 @@ impl KernelDb {
         conn.execute(
             "UPDATE documents SET doc_kind = 'file'
               WHERE doc_kind IN ('code', 'text', 'config')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Bring `context_state` into agreement with `archived_at` on rows written
+    /// before archiving set the state. Until then `archive_context` stamped
+    /// only the timestamp, so every archived context read back as `live` and a
+    /// caller switching on the enum alone saw a dead context as a running one.
+    ///
+    /// Idempotent by construction — after the first run the `WHERE` clause
+    /// matches zero rows — so this needs no `kernel_migrations` marker and is
+    /// safe on every `open()`.
+    fn migrate_archived_context_state(conn: &Connection) -> KernelDbResult<()> {
+        conn.execute(
+            "UPDATE contexts SET context_state = 'archived'
+              WHERE archived_at IS NOT NULL AND context_state <> 'archived'",
             [],
         )?;
         Ok(())
@@ -3483,7 +3502,9 @@ impl KernelDb {
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
         let now = now_millis();
         let updated = self.conn.execute(
-            "UPDATE contexts SET archived_at = ?1, promoted_at = NULL, demoted_at = NULL
+            "UPDATE contexts
+                SET archived_at = ?1, context_state = 'archived',
+                    promoted_at = NULL, demoted_at = NULL
              WHERE context_id = ?2 AND archived_at IS NULL",
             params![now, blob_param(id.as_bytes())],
         )?;
@@ -3590,8 +3611,14 @@ impl KernelDb {
             // shouldn't still carry one — but stamp unconditionally anyway:
             // the old seat was surrendered at archive time either way.
             self.conn.execute(
+                // The restored state is derived from `concluded_at`, not
+                // remembered from before the archive: the timestamps are what
+                // survive, so they are what the state is read back out of.
                 "UPDATE contexts
-                    SET archived_at = NULL, promoted_at = ?1, demoted_at = NULL
+                    SET archived_at = NULL,
+                        context_state = CASE WHEN concluded_at IS NULL
+                                             THEN 'live' ELSE 'concluded' END,
+                        promoted_at = ?1, demoted_at = NULL
                  WHERE context_id = ?2",
                 params![now_millis(), blob_param(id.as_bytes())],
             )?;
@@ -13394,6 +13421,102 @@ mod tests {
             created_at: now_millis(),
             created_by: PrincipalId::system(),
         }
+    }
+
+    // ========================================================================
+    // `context_state` and `archived_at` are written together. Before this,
+    // archiving stamped only the timestamp, so every archived context read
+    // back as `live` and the enum lied to anyone who trusted it alone.
+    // ========================================================================
+
+    #[test]
+    fn archiving_sets_the_state_as_well_as_the_timestamp() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("to-archive"));
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert!(db.archive_context(row.context_id).unwrap());
+
+        let loaded = db.get_context(row.context_id).unwrap().unwrap();
+        assert_eq!(loaded.context_state, ContextState::Archived);
+        assert!(loaded.archived_at.is_some());
+        assert!(loaded.is_archived());
+    }
+
+    /// Resurrection derives the restored state from the timestamps that
+    /// survived the archive, rather than remembering one.
+    #[test]
+    fn resurrecting_restores_live_or_concluded_from_the_timestamps() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let plain = make_context_row(Some("plain"));
+        insert_context_with_doc(&db, &plain, ws_id);
+        db.archive_context(plain.context_id).unwrap();
+        db.promote_context(plain.context_id).unwrap();
+        let loaded = db.get_context(plain.context_id).unwrap().unwrap();
+        assert_eq!(loaded.context_state, ContextState::Live);
+        assert!(loaded.archived_at.is_none());
+        assert!(!loaded.is_archived());
+
+        let done = make_context_row(Some("done"));
+        insert_context_with_doc(&db, &done, ws_id);
+        db.conclude_context(done.context_id).unwrap();
+        db.archive_context(done.context_id).unwrap();
+        assert_eq!(
+            db.get_context(done.context_id).unwrap().unwrap().context_state,
+            ContextState::Archived,
+            "archiving a concluded context reads as archived — the outer state wins"
+        );
+        db.promote_context(done.context_id).unwrap();
+        let loaded = db.get_context(done.context_id).unwrap().unwrap();
+        assert_eq!(
+            loaded.context_state,
+            ContextState::Concluded,
+            "concluded_at survived the archive, so the restored state is concluded"
+        );
+    }
+
+    /// The backfill for databases written before archiving set the state.
+    /// The disagreeing row is planted the way those rows were made — the
+    /// timestamp alone.
+    #[test]
+    fn migrate_archived_context_state_backfills_a_disagreeing_row() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("legacy-archived"));
+        insert_context_with_doc(&db, &row, ws_id);
+        db.conn
+            .execute(
+                "UPDATE contexts SET archived_at = ?1 WHERE context_id = ?2",
+                params![now_millis(), blob_param(row.context_id.as_bytes())],
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_context(row.context_id).unwrap().unwrap().context_state,
+            ContextState::Live,
+            "the planted row must start out disagreeing, or this proves nothing"
+        );
+
+        KernelDb::migrate_archived_context_state(&db.conn).unwrap();
+        assert_eq!(
+            db.get_context(row.context_id).unwrap().unwrap().context_state,
+            ContextState::Archived
+        );
+
+        // A live context is not swept up by it, and a second run is a no-op.
+        let live = make_context_row(Some("still-live"));
+        insert_context_with_doc(&db, &live, ws_id);
+        KernelDb::migrate_archived_context_state(&db.conn).unwrap();
+        assert_eq!(
+            db.get_context(live.context_id).unwrap().unwrap().context_state,
+            ContextState::Live
+        );
+        assert_eq!(
+            db.get_context(row.context_id).unwrap().unwrap().context_state,
+            ContextState::Archived
+        );
     }
 
     #[test]
