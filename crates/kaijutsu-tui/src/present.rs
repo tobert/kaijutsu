@@ -265,6 +265,11 @@ pub struct BlockView<'a> {
     /// block.
     pub tool: Option<&'a str>,
     pub arg: Option<String>,
+    /// The block's parent and grandparent, when the context holds them —
+    /// what an `Error` block's provenance line names (`tool error ← shell
+    /// (#12)`). Resolved by the caller from the context mirror; empty when
+    /// nothing above the block is known, and the line then says so.
+    pub lineage: Vec<BlockSnapshot>,
     /// Render collapsed. Kernel state (`CollapsedChanged`) after first
     /// arrival; [`collapses_by_default`] supplies the first-arrival value.
     pub collapsed: bool,
@@ -374,7 +379,9 @@ pub fn render_block(
     let text = if block.kind == BlockKind::Thinking {
         block.content.trim_end().to_string()
     } else {
-        format_single_block(block, view.local_ctx, &|_| None)
+        format_single_block(block, view.local_ctx, &|id| {
+            view.lineage.iter().find(|b| b.id == *id).cloned()
+        })
     };
 
     let mut lines = Vec::new();
@@ -760,9 +767,54 @@ mod tests {
             show_divider: false,
             tool: None,
             arg: None,
+            lineage: Vec::new(),
             collapsed: false,
             local_ctx: None,
         }
+    }
+
+    /// An error block names what failed when its lineage is in hand — the
+    /// tool call two hops up, by name and ordinal — and says the parent is
+    /// not found only when it really is not. Until this landed the tui
+    /// resolved every parent to nothing, so every error read as an orphan.
+    #[test]
+    fn an_error_block_names_its_tool_call_through_its_lineage() {
+        let palette = Palette::builtin();
+        let ctx = ContextId::new();
+        let p = PrincipalId::new();
+        let call = BlockSnapshotBuilder::new(BlockId::new(ctx, p, 5), BlockKind::ToolCall)
+            .role(Role::Model)
+            .status(Status::Done)
+            .tool_name("shell")
+            .content("{}")
+            .build();
+        let result = BlockSnapshotBuilder::new(BlockId::new(ctx, p, 6), BlockKind::ToolResult)
+            .role(Role::Tool)
+            .status(Status::Error)
+            .parent_id(call.id)
+            .tool_call_id(call.id)
+            .content("")
+            .build();
+        let error = BlockSnapshotBuilder::new(BlockId::new(ctx, p, 7), BlockKind::Error)
+            .parent_id(result.id)
+            .error_payload(kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Tool,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None,
+                detail: None,
+                span: None,
+                source_kind: Some(BlockKind::ToolResult),
+            })
+            .content("the kernel restarted while this was still in progress")
+            .build();
+
+        let with = BlockView { lineage: vec![result.clone(), call.clone()], ..view() };
+        let text = line_text(&render_block(&error, &with, 80, &palette)[0]);
+        assert!(text.contains("tool error ← shell (#5)"), "got {text:?}");
+
+        let without = BlockView { lineage: Vec::new(), ..view() };
+        let text = line_text(&render_block(&error, &without, 80, &palette)[0]);
+        assert!(text.contains("orphan (parent block not found)"), "got {text:?}");
     }
 
     fn line_text(line: &Line<'static>) -> String {

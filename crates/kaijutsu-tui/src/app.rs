@@ -319,6 +319,7 @@ impl App {
             show_divider,
             tool,
             arg,
+            lineage: self.lineage_for(block),
             collapsed: self
                 .views
                 .get(&ctx)
@@ -326,6 +327,25 @@ impl App {
                 .unwrap_or_else(|| block.collapsed || collapses_by_default(block.kind)),
             local_ctx: Some(ctx),
         }
+    }
+
+    /// The block's parent and grandparent from its context's mirror — the
+    /// two hops an error's provenance line walks (`present::BlockView::
+    /// lineage`). Stops at the first hop the mirror does not hold.
+    pub fn lineage_for(&self, block: &BlockSnapshot) -> Vec<BlockSnapshot> {
+        let Some(view) = self.views.get(&block.id.context_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut next = block.parent_id;
+        while let Some(id) = next
+            && out.len() < 2
+            && let Some(parent) = view.mirror.block(&id)
+        {
+            next = parent.parent_id;
+            out.push(parent.clone());
+        }
+        out
     }
 
     /// Post a status-line notice. It stands until something replaces it or

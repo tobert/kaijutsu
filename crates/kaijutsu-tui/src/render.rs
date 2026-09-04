@@ -298,6 +298,7 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
             show_divider: false,
             tool: None,
             arg: None,
+            lineage: Vec::new(),
             collapsed: false,
             local_ctx: Some(block.id.context_id),
         };
@@ -326,6 +327,7 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
             show_divider: item.show_divider,
             tool,
             arg,
+            lineage: app.lineage_for(block),
             collapsed: item.collapsed,
             local_ctx: Some(block.id.context_id),
         };
@@ -522,6 +524,7 @@ pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'sta
             show_divider,
             tool,
             arg,
+            lineage: app.lineage_for(block),
             // Copy mode is where reasoning stays findable, so a `Thinking`
             // block renders whole here even when a sibling collapsed it
             // (`docs/tui.md`, "The thinking pane").
