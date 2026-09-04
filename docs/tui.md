@@ -147,7 +147,7 @@ is the terminal's; search, copy and split are the terminal's.
   ╰──────────────────────────────────────────────────────────────────────────╯
 
   ❯ and getattr? _                                                  -- INSERT --
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        coder/deepseek-v4  ▮ 42%  ● ok
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        -- NORMAL --  ▮ 42%
 ```
 
 Rules the figure carries:
@@ -180,7 +180,10 @@ Rules the figure carries:
 ### Compose
 
 ```text
-  ❯ and getattr?                                                  -- INSERT --
+  ❯ and getattr? the symlink case too, and whether rename shares the
+    cause — run vfs::unlink_symlink before touching rename_
+
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo                 -- INSERT --  ▮ 42%
 ```
 
 Compose is a modalkit `VimMachine` over the kernel-owned input block
@@ -200,17 +203,31 @@ Rules the figure carries:
 - A fresh draft rests in normal mode, as vim opens a buffer; `i`, `a` or
   `o` start typing, and a submit returns to normal mode. A resumed draft
   opens with the cursor on its last character, so `a` continues it. The
-  banner at the right names every mode, normal included: vim leaves normal
-  mode blank, and a blank was the one mode a player could not tell apart
-  (Amy: *"I can't tell which mode I'm in besides INSERT"*).
+  mode is the status line's first figure on the right, vim's own spelling,
+  normal included: vim leaves normal mode blank, and a blank was the one
+  mode a player could not tell apart (Amy: *"I can't tell which mode I'm
+  in besides INSERT"*). It took the model name's place there (Amy,
+  2026-09-04: *"drop the model name in the status bar for now and put the
+  vi mode there instead"*); `kj context info` still names the model.
 - **The sibling's edit wins only when it is newer.** The draft is redrawn from
   the change feed, and `edit_input` acknowledges the same context version the
   feed speaks, so a mirror older than this client's last ack is refused rather
   than applied — otherwise our own echo, arriving one keystroke behind, would
   delete what was just typed.
-- Enter in insert mode is a newline: that is how a multi-line draft is
-  written, and the compose region grows inside the viewport, taking rows from
-  the transcript.
+- **A long line wraps, and the band grows for the draft.** A logical line
+  wraps at the width by character, as vim wraps, and continuation rows
+  indent under the prompt; Enter in insert mode is a newline. Every row
+  past the first grows the band by one, up to a third of the screen
+  (`render::third_of_screen`, the same ceiling the thinking band takes):
+  the stream keeps its rows while a long prompt is typed, and a grow tied
+  to a keystroke reads as the line editor growing, not as a jump. Past the
+  cap the draft scrolls around the cursor, as vim's command line does.
+  The band shrinks once, when the draft is submitted or cleared — never
+  gradually: each step of a gradual shrink is a viewport rebuild that
+  shifts the transcript, which is exactly the jitter the static band
+  exists to avoid (Amy, 2026-09-04: *"the next turn or tool that scrolls
+  would have it shrink back maybe gradually or would that get jittery?"*
+  — it would).
 - **The cursor is the terminal's own.** The tui puts the real cursor on the
   draft's vi cursor — past the `❯` prompt, past the matching indent on a
   continuation row — or after the `:` bar's text, and shapes it by mode as
@@ -241,7 +258,7 @@ Rules the figure carries:
   The unlink bug was in resolve(): it canonicalized the final ▍
 
   ❯                                                                -- NORMAL --
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        coder/deepseek-v4  ▮ 42%  ● ok
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        -- NORMAL --  ▮ 42%
 ```
 
 …and once the block completes, scrollback holds one line in its place:
@@ -264,10 +281,11 @@ Rules the figure carries:
   deepseek-v4-flash (`App::observe_thinking` is the latch, cleared by
   `mark_turn_ended`; a block that completed inside one delivery latches
   too, as long as its stub has not printed).
-- **The band is its own rows.** The viewport grows to `THINKING_PANE_LINES`
-  (15 = the ordinary 8 + `THINKING_BAND_LINES` 6 + one blank row) and the
-  latest reasoning's tail takes the top six rows, dim and italic, above
-  the stream — so the answer streaming in never scrolls the reasoning out
+- **The band is its own rows, a third of the screen.** The viewport grows
+  to `thinking_pane_lines` (the ordinary 8 + `thinking_band_lines` + one
+  blank row, where the band is `third_of_screen`: 8 rows on a 24-row
+  terminal, 20 on a 60-row one) and the latest reasoning's tail takes
+  those top rows, dim and italic, above the stream — so the answer streaming in never scrolls the reasoning out
   of the pane, and a later thinking block in the same turn replaces the
   earlier one in place. One size, taken once and given back once.
 - The turn-liveness half is what closes a pane a lost turn would otherwise
@@ -295,7 +313,7 @@ Rules the figure carries:
    ◐ shell cargo test -p kaijutsu-kernel · 4s   ⏳ shell_write · waiting on ask 01a0686d · 17h
 
   ❯                                                          -- NORMAL --
-  0 ROOT  1 cc-exomemory  2 0de73794  3 tui-testing   coder  ▮ 13%  ● ok
+  0 ROOT  1 cc-exomemory  2 0de73794  3 tui-testing   -- NORMAL --  ▮ 13%
 ```
 
 One row, always present, directly above the blank row over `❯`: every
@@ -621,13 +639,17 @@ Rules the figure carries:
 Screen's window list, with kaijutsu's facts on the right:
 
 ```text
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo  coder/deepseek-v4  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m  17.3 ●  ● ok
+  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo  -- NORMAL --  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m  17.3 ●
 ```
 
 Left to right: the rank (ring 0, seat digits, `*` current, `@` activity, `!`
 an ask waiting in that seat, `!n` the pending count across all contexts);
-cast and model; context-window occupancy; cache health (next); bar.beat and
-pulse for the playing track; connection state from `ConnectionStatus`.
+the vi mode (`-- NORMAL --`, `-- INSERT --`, vim's spelling); context-window
+occupancy; cache health (next); bar.beat and pulse for the playing track;
+and connection state from `ConnectionStatus` only while it is not
+`Connected` — a healthy connection says nothing, `◐ connecting`,
+`◐ retrying` and `○ offline` do (Amy: *"where 'ok' is, that's not super
+useful"*).
 
 ### Cache health
 

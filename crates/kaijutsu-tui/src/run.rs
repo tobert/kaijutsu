@@ -387,7 +387,9 @@ async fn event_loop(
                     last_strip_frame = Instant::now();
                     dirty = true;
                 }
-                let want = render::viewport_lines(app, terminal.size()?.width);
+                let size = terminal.size()?;
+                app.screen_rows = size.height;
+                let want = render::viewport_lines(app, size.width);
                 if want != viewport_height {
                     tracing::debug!(from = viewport_height, to = want, "viewport resized");
                     set_viewport_height(&wires.term_lock, terminal, want)?;

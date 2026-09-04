@@ -21,7 +21,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kaijutsu_editor::{EditOp, EditorCore};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
 use crate::present::Palette;
@@ -218,26 +218,34 @@ impl Compose {
     /// col)` in cells from the region's first line: after the typed text on
     /// the `:` bar, and on the draft's vi cursor — past the `❯` prompt on the
     /// first row, past the matching indent on a continuation row.
-    pub fn cursor_cell(&mut self) -> (u16, u16) {
+    pub fn cursor_cell(&mut self, width: u16) -> (u16, u16) {
         if let Some(raw) = self.editor.command_line() {
             let (glyph, body) = bar_prompt(&raw);
             return (0, cells(glyph.width() + body.width()));
         }
         let text = self.text();
         let offset = self.cursor();
+        let avail = wrap_width(width);
+        // Visual rows above the cursor's logical line: every earlier line's
+        // wrapped row count.
         let mut row = 0usize;
         let mut line_start = 0usize;
+        let mut line_no = 0usize;
         for (seen, ch) in text.chars().enumerate() {
             if seen >= offset {
                 break;
             }
             if ch == '\n' {
-                row += 1;
+                let line: String = text.chars().skip(line_start).take(seen - line_start).collect();
+                row += wrapped_rows(&line, avail);
+                line_no += 1;
                 line_start = seen + 1;
             }
         }
+        let _ = line_no;
         let before: String = text.chars().skip(line_start).take(offset - line_start).collect();
-        (cells(row), cells(PROMPT.width() + before.width()))
+        let cells_before = before.width();
+        (cells(row + cells_before / avail), cells(PROMPT.width() + cells_before % avail))
     }
 
     /// The cursor's shape for the mode the draft is in: a bar while inserting
@@ -409,9 +417,11 @@ pub fn input_lines(app: &App, width: u16, palette: &Palette) -> Vec<Line<'static
     compose_lines(&app.compose, width, palette)
 }
 
-/// The `❯` line, one row per draft line, with the mode banner right-aligned
-/// on the first row — or, while the `:` bar is focused, the bar itself
-/// as vim draws it: `:kj con`, `:!echo hi` (`docs/tui.md`, "The `:` line").
+/// The `❯` line, one row per visual row of the draft: a logical line wraps
+/// at the width the way vim's does, and continuation rows indent under the
+/// prompt — or, while the `:` bar is focused, the bar itself as vim draws
+/// it: `:kj con`, `:!echo hi` (`docs/tui.md`, "The `:` line"). The mode is
+/// the status line's figure, not this row's.
 pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Line<'static>> {
     if let Some(cmdline) = compose.command_line() {
         let (glyph, body) = bar_prompt(&cmdline);
@@ -421,29 +431,55 @@ pub fn compose_lines(compose: &Compose, width: u16, palette: &Palette) -> Vec<Li
         ])];
     }
     let text = compose.text();
-    let banner = compose.mode_banner();
+    let avail = wrap_width(width);
     let mut out = Vec::new();
-    for (n, body) in text.split('\n').enumerate() {
-        // Continuation rows indent under the prompt so the draft reads as one
-        // block of text rather than restarting at column zero.
-        let lead = if n == 0 {
-            PROMPT.to_string()
-        } else {
-            " ".repeat(PROMPT.width())
-        };
-        let mut spans = vec![
-            Span::styled(lead.clone(), palette.status()),
-            Span::styled(body.to_string(), palette.compose()),
-        ];
-        if n == 0 && !banner.is_empty() {
-            let used = lead.width() + body.width() + banner.width();
-            let pad = usize::from(width).saturating_sub(used).max(1);
-            spans.push(Span::styled(" ".repeat(pad), palette.compose()));
-            spans.push(Span::styled(banner.clone(), palette.divider()));
+    for body in text.split('\n') {
+        for row in wrap_cells(body, avail) {
+            let lead = if out.is_empty() {
+                PROMPT.to_string()
+            } else {
+                " ".repeat(PROMPT.width())
+            };
+            out.push(Line::from(vec![
+                Span::styled(lead, palette.status()),
+                Span::styled(row, palette.compose()),
+            ]));
         }
-        out.push(Line::from(spans));
     }
     out
+}
+
+/// Cells a draft row has to the right of the prompt: at least one, so a
+/// draft on an absurdly narrow terminal still advances.
+fn wrap_width(width: u16) -> usize {
+    usize::from(width).saturating_sub(PROMPT.width()).max(1)
+}
+
+/// One logical line as visual rows of at most `avail` cells, split by
+/// character the way vim wraps a long line. A line whose width is an exact
+/// multiple of `avail` ends with an empty row — that is where the cursor
+/// sits after the last character, so the row must exist to draw it on.
+fn wrap_cells(line: &str, avail: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut used = 0usize;
+    for ch in line.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > avail {
+            rows.push(String::new());
+            used = 0;
+        }
+        rows.last_mut().expect("one row always exists").push(ch);
+        used += w;
+    }
+    if used == avail {
+        rows.push(String::new());
+    }
+    rows
+}
+
+/// How many visual rows [`wrap_cells`] gives `line` at `avail`.
+fn wrapped_rows(line: &str, avail: usize) -> usize {
+    wrap_cells(line, avail).len()
 }
 
 /// A cell count as the terminal addresses it. A draft wider than `u16`
@@ -653,17 +689,45 @@ mod tests {
         assert_eq!(compose.text(), "half a\nthought!");
     }
 
-    /// The figure: `❯ and getattr? _` with `-- INSERT --` at the right.
+    /// The figure: `❯ and getattr? _`. The mode is the status line's
+    /// figure now, so the row carries only the prompt and the draft.
     #[test]
-    fn the_compose_line_carries_the_mode_banner_at_the_right() {
+    fn the_compose_line_is_the_prompt_and_the_draft() {
         let mut compose = Compose::new();
         insert(&mut compose);
         typed(&mut compose, "and getattr?");
         let lines = compose_lines(&compose, 40, &Palette::builtin());
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.starts_with("❯ and getattr?"), "got {text:?}");
-        assert!(text.ends_with("-- INSERT --"), "got {text:?}");
-        assert_eq!(text.width(), 40, "the banner sits at the right edge");
+        assert_eq!(text, "❯ and getattr?");
+        assert_eq!(compose.mode_banner(), "-- INSERT --");
+    }
+
+    /// A long line wraps at the width by character, continuation rows
+    /// indent under the prompt, and the cursor lands on the wrapped row —
+    /// vim's own wrap, so a long prompt is never cut off at the right edge
+    /// (Amy: "the prompt doesn't seem to wrap if I type a longer prompt").
+    #[test]
+    fn a_long_line_wraps_at_the_width_and_the_cursor_follows() {
+        let mut compose = Compose::new();
+        insert(&mut compose);
+        let long = "abcdefghij".repeat(5); // 50 cells
+        typed(&mut compose, &long);
+        let lines = compose_lines(&compose, 22, &Palette::builtin());
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        // 22 wide minus the 2-cell prompt = 20 cells per row: 20 + 20 + 10.
+        assert_eq!(text.len(), 3, "{text:?}");
+        assert_eq!(text[0], "❯ abcdefghijabcdefghij");
+        assert_eq!(text[1], "  abcdefghijabcdefghij");
+        assert_eq!(text[2], "  abcdefghij");
+        assert_eq!(compose.cursor_cell(22), (2, cells(PROMPT.width() + 10)), "the cursor is after the last char on row 2");
+        // A width that divides the line exactly leaves an empty row for the
+        // cursor to sit on.
+        let lines = compose_lines(&compose, 27, &Palette::builtin());
+        assert_eq!(lines.len(), 3, "25 + 25 + the empty row");
+        assert_eq!(compose.cursor_cell(27), (2, cells(PROMPT.width())));
+        // Wide enough: one row, no wrap.
+        assert_eq!(compose_lines(&compose, 80, &Palette::builtin()).len(), 1);
+        assert_eq!(compose.cursor_cell(80), (0, cells(PROMPT.width() + 50)));
     }
 
     /// Nothing you would paste is inside a box.
@@ -889,10 +953,10 @@ mod tests {
         assert_eq!(compose.cursor_shape(), CursorShape::Block, "a fresh draft rests in normal");
         insert(&mut compose);
         typed(&mut compose, "hi");
-        assert_eq!(compose.cursor_cell(), (0, cells(PROMPT.width() + 2)));
+        assert_eq!(compose.cursor_cell(80), (0, cells(PROMPT.width() + 2)));
         assert_eq!(compose.cursor_shape(), CursorShape::Bar);
         compose.press(press(KeyCode::Esc));
-        assert_eq!(compose.cursor_cell(), (0, cells(PROMPT.width() + 1)), "normal mode sits on `i`");
+        assert_eq!(compose.cursor_cell(80), (0, cells(PROMPT.width() + 1)), "normal mode sits on `i`");
         assert_eq!(compose.cursor_shape(), CursorShape::Block);
     }
 
@@ -905,7 +969,7 @@ mod tests {
         typed(&mut compose, "ab");
         compose.press(press(KeyCode::Enter));
         typed(&mut compose, "c");
-        assert_eq!(compose.cursor_cell(), (1, cells(PROMPT.width() + 1)));
+        assert_eq!(compose.cursor_cell(80), (1, cells(PROMPT.width() + 1)));
     }
 
     /// One mapping serves both the compose line and the editor screen.
@@ -923,7 +987,7 @@ mod tests {
         let mut compose = Compose::new();
         compose.press(press(KeyCode::Char(':')));
         typed(&mut compose, "kj");
-        assert_eq!(compose.cursor_cell(), (0, cells(COLON_PROMPT.width() + 2)));
+        assert_eq!(compose.cursor_cell(80), (0, cells(COLON_PROMPT.width() + 2)));
         assert_eq!(compose.cursor_shape(), CursorShape::Bar);
     }
 }

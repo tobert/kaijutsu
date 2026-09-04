@@ -93,6 +93,9 @@ pub struct App {
     /// kernel-owned draft block, and the `:` bar (`compose.rs`).
     pub compose: Compose,
     pub palette: Palette,
+    /// The terminal's row count, from the last size the event loop read.
+    /// Sizes what may grow with the screen (the compose cap).
+    pub screen_rows: u16,
     pub wrap: WrapCache,
     pub quit: bool,
     /// This client's own principal, from `whoami`. It selects which draft
@@ -184,6 +187,7 @@ impl App {
             pending_asks: 0,
             compose: Compose::new(),
             palette: Palette::builtin(),
+            screen_rows: 24,
             wrap: WrapCache::new(),
             quit: false,
             principal: None,
@@ -489,15 +493,7 @@ impl App {
         let info = self.current_info();
         StatusModel {
             seats,
-            cast_model: info.map(|c| {
-                let cast = c.cast_label.clone().unwrap_or_else(|| c.context_type.clone());
-                // A context that has never completed a call carries no model.
-                // `coder` is the honest answer there; `coder/` is not.
-                match model_leaf(&c.model) {
-                    "" => cast,
-                    model => format!("{cast}/{model}"),
-                }
-            }),
+            mode: self.compose.mode_banner(),
             occupancy: info.and_then(|c| c.context_used_pct).map(|p| p as u32),
             cache: self.cache_health(now_millis),
             pending_asks: self.pending_asks,
@@ -719,7 +715,7 @@ mod tests {
         let mut app = App::new("amy");
         app.set_contexts(vec![a]);
         app.switch_to(id);
-        assert_eq!(app.status_model(0).cast_model.as_deref(), Some("coder"));
+        assert_eq!(app.status_model(0).mode, "-- NORMAL --");
     }
 
     #[test]
@@ -730,7 +726,7 @@ mod tests {
         assert_eq!(model.seats[0].label, "kaijutsu");
         assert!(!model.seats[0].current);
         assert!(model.seats[1].current);
-        assert_eq!(model.cast_model.as_deref(), Some("coder/deepseek-v4"));
+        assert_eq!(model.mode, "-- NORMAL --", "the vi mode is the status line's figure, not the model");
     }
 
     /// A change to a block already printed to scrollback cannot redraw it.

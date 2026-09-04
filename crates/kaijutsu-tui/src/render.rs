@@ -35,14 +35,24 @@ pub const VIEWPORT_LINES: u16 = 8;
 /// Rows of the thinking band: the tail of the turn's latest reasoning,
 /// drawn above the stream while the thinking pane is open (`docs/tui.md`,
 /// "The thinking pane").
-pub const THINKING_BAND_LINES: u16 = 6;
+/// A grown region's ceiling: a third of the screen. The compose region
+/// grows toward it a row at a time; the thinking band takes it whole,
+/// once, when a turn's reasoning starts (`docs/tui.md`, "The thinking
+/// pane" and "Compose").
+pub fn third_of_screen(app: &App) -> u16 {
+    (app.screen_rows / 3).max(1)
+}
 
-/// Rows the inline viewport holds while the thinking pane is open: the
-/// ordinary band plus the thinking band and one blank row between them.
-/// One size, taken at the turn's first reasoning and given back at the
-/// turn's end: growing with every streamed line would recreate the
-/// viewport each frame, and a fast model's pane would flap.
-pub const THINKING_PANE_LINES: u16 = VIEWPORT_LINES + THINKING_BAND_LINES + 1;
+/// Rows the thinking band takes above the stream while the pane is open.
+pub fn thinking_band_lines(app: &App) -> u16 {
+    third_of_screen(app)
+}
+
+/// The band's height with the thinking pane open: the ordinary rows, the
+/// thinking band, and one blank row between them.
+pub fn thinking_pane_lines(app: &App) -> u16 {
+    VIEWPORT_LINES + thinking_band_lines(app) + 1
+}
 
 /// Whether the thinking pane is open: the current context's turn is running
 /// and has shown a `Thinking` block (`App::thinking_pane_latched`). The
@@ -281,8 +291,9 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
             collapsed: false,
             local_ctx: Some(block.id.context_id),
         };
+        let band_rows = usize::from(thinking_band_lines(app));
         let rendered = app.wrap.lines(&block, &block_view, width, &palette);
-        let keep = usize::from(THINKING_BAND_LINES).min(rendered.len());
+        let keep = band_rows.min(rendered.len());
         thinking.extend(rendered[rendered.len() - keep..].iter().cloned());
         thinking.push(Line::default());
     }
@@ -316,10 +327,17 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
         );
     }
 
-    // The input region is drawn first because it sizes the transcript: a
-    // multi-line draft grows the compose region inside the viewport and the
-    // transcript gives up the rows (`docs/tui.md`, "Compose").
-    let input = crate::compose::input_lines(app, width, &palette);
+    // The input region is drawn first because it sizes the transcript. A
+    // draft longer than the cap (a third of the screen) shows the rows
+    // around the cursor, the way vim scrolls a long command line.
+    let mut input = crate::compose::input_lines(app, width, &palette);
+    let (mut cursor_row, cursor_col) = app.compose.cursor_cell(width);
+    let cap = compose_rows_cap(app);
+    if input.len() > cap {
+        let start = usize::from(cursor_row).saturating_sub(cap - 1).min(input.len() - cap);
+        input = input[start..start + cap].to_vec();
+        cursor_row = u16::try_from(usize::from(cursor_row) - start).unwrap_or(0);
+    }
 
     // Keep the tail: a long stream shows its newest lines, not its oldest.
     // The budget is the viewport's own height, so a line this function emits
@@ -364,10 +382,9 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
     } else {
         // The terminal's own cursor, on the draft's vi cursor: the row is
         // the compose region's first line plus the draft row it is on.
-        let (row, col) = app.compose.cursor_cell();
         let first = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         lines.extend(input);
-        Some((first.saturating_add(row), col))
+        Some((first.saturating_add(cursor_row), cursor_col))
     };
     lines.push(status_line(&app.status_model(now_millis), width, &palette));
     LiveFrame { lines, cursor }
@@ -513,17 +530,28 @@ pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'sta
 /// future grown view adds its own arm here rather than each surface picking
 /// its own resize path.
 pub fn viewport_lines(app: &App, width: u16) -> u16 {
-    let mut want = VIEWPORT_LINES;
     if let Some(picker) = &app.picker {
-        want = want.max(crate::picker::viewport_lines(picker));
+        return VIEWPORT_LINES.max(crate::picker::viewport_lines(picker));
     }
     if let Some(active) = crate::asks::active_view_viewport_lines(app, width) {
-        want = want.max(active);
+        return VIEWPORT_LINES.max(active);
     }
+    let mut want = VIEWPORT_LINES;
     if thinking_pane_open(app) {
-        want = want.max(THINKING_PANE_LINES);
+        want = want.max(thinking_pane_lines(app));
     }
-    want
+    // A draft past one row grows the band a row per wrapped row, up to a
+    // third of the screen, so the stream keeps its rows while a long
+    // prompt is typed; the band shrinks once, when the draft is submitted
+    // (`docs/tui.md`, "Compose").
+    let rows = crate::compose::input_lines(app, width, &app.palette).len();
+    let extra = rows.min(compose_rows_cap(app)).saturating_sub(1);
+    want.saturating_add(u16::try_from(extra).unwrap_or(u16::MAX))
+}
+
+/// The most rows the compose region may take: [`third_of_screen`].
+pub fn compose_rows_cap(app: &App) -> usize {
+    usize::from(third_of_screen(app))
 }
 
 #[cfg(test)]
@@ -754,7 +782,7 @@ mod tests {
 
         let status = rows.last().expect("a status line");
         assert!(status.starts_with("0 kaijutsu*"), "got {status:?}");
-        assert!(status.contains("coder/deepseek-v4"), "got {status:?}");
+        assert!(status.contains("-- NORMAL --"), "the vi mode is the status line's figure: {status:?}");
         assert!(status.contains("▮ 42%"), "got {status:?}");
         assert!(status.contains("⟳ 91%"), "got {status:?}");
         assert!(status.contains("⏱ 1m00s/5m"), "got {status:?}");
@@ -918,7 +946,21 @@ mod tests {
             );
         }
         let grown = live_lines(&mut app, 80, 0, false);
-        assert_eq!(grown.len(), one_line, "the viewport height did not change");
+        // The band grows one row for the second draft row (a third of a
+        // 24-row screen is the cap, far above two), so the stream keeps its
+        // rows and the frame is one line taller.
+        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES + 1, "the band grew one row for the draft");
+        assert_eq!(grown.len(), one_line + 1, "the frame is one row taller");
+        // Past the cap the band stops growing and the draft scrolls instead.
+        app.screen_rows = 6; // cap = 2 rows
+        for _ in 0..3 {
+            app.compose.press(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Enter,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES + 1, "capped at a third of the screen");
+        app.screen_rows = 24;
         let text: Vec<String> = grown
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1363,10 +1405,10 @@ mod tests {
         assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "no known turn: no pane");
         app.mark_turn_running(id);
         assert!(app.observe_thinking(id));
-        assert_eq!(viewport_lines(&app, 80), THINKING_PANE_LINES);
+        assert_eq!(viewport_lines(&app, 80), thinking_pane_lines(&app));
 
         thinking_then_answer(&mut app, id, 3);
-        assert_eq!(viewport_lines(&app, 80), THINKING_PANE_LINES, "the block completing is not the dismiss");
+        assert_eq!(viewport_lines(&app, 80), thinking_pane_lines(&app), "the block completing is not the dismiss");
         app.mark_turn_ended(id);
         assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "the turn's end closes it");
     }
@@ -1394,11 +1436,13 @@ mod tests {
         let live = live_lines(&mut app, 80, 0, false);
         // A short answer leaves the frame under the viewport's height;
         // `draw_live` bottom-aligns it. What must hold is the band's shape.
-        assert!(live.len() <= usize::from(THINKING_PANE_LINES), "{}", live.len());
+        assert!(live.len() <= usize::from(thinking_pane_lines(&app)), "{}", live.len());
         let rows = text_of(&live);
         let newest = rows.iter().position(|r| r == "thought 29").expect("the newest line");
-        let oldest = rows.iter().position(|r| r == "thought 24").expect("six rows of tail");
-        assert!(!rows.iter().any(|r| r == "thought 23"), "the band is six rows: {rows:?}");
+        // A 24-row screen gives the band a third: eight rows of tail.
+        assert_eq!(thinking_band_lines(&app), 8);
+        let oldest = rows.iter().position(|r| r == "thought 22").expect("eight rows of tail");
+        assert!(!rows.iter().any(|r| r == "thought 21"), "the band is a third of the screen: {rows:?}");
         let answer = rows.iter().position(|r| r.contains("The unlink bug")).expect("the answer streams");
         assert!(oldest < newest && newest < answer, "band above the stream: {rows:?}");
         assert_eq!(rows[newest + 1], "", "one blank row between them: {rows:?}");

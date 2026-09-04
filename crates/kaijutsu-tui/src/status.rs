@@ -2,7 +2,7 @@
 //! right.
 //!
 //! ```text
-//! 0 kaijutsu*  1 kaish@  2 lfm2d  3 exo   coder/deepseek-v4  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m  ● ok
+//! 0 kaijutsu*  1 kaish@  2 lfm2d  3 exo   -- NORMAL --  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m
 //! ```
 //!
 //! Left to right: the rank (seat digits, `*` current, `@` activity, `!` an
@@ -192,8 +192,10 @@ impl SeatCell {
 #[derive(Debug, Clone, Default)]
 pub struct StatusModel {
     pub seats: Vec<SeatCell>,
-    /// `coder/deepseek-v4` — the cast and the model.
-    pub cast_model: Option<String>,
+    /// The vi mode the draft is in, as vim spells it: `-- INSERT --`,
+    /// `-- NORMAL --`. The model name used to sit here; the mode is what a
+    /// hand needs to know, the model is `kj context info`'s.
+    pub mode: String,
     /// Context-window occupancy in whole percent.
     pub occupancy: Option<u32>,
     pub cache: CacheHealth,
@@ -258,8 +260,8 @@ impl StatusModel {
     /// The right half: cast/model, occupancy, cache health, connection.
     pub fn right_figures(&self) -> Vec<Figure> {
         let mut figures = Vec::new();
-        if let Some(cast_model) = &self.cast_model {
-            figures.push(Figure::ok(cast_model.clone()));
+        if !self.mode.is_empty() {
+            figures.push(Figure::ok(self.mode.clone()));
         }
         figures.push(match self.occupancy {
             Some(pct) if pct >= 90 => Figure::at(Severity::Alarm, format!("▮ {pct}%")),
@@ -272,7 +274,10 @@ impl StatusModel {
         if let Some(track) = &self.track {
             figures.push(track.figure());
         }
-        figures.push(connection_figure(self.connection.as_ref()));
+        // A healthy connection says nothing; only trouble earns a figure.
+        if !matches!(self.connection, Some(ConnectionStatus::Connected { .. })) {
+            figures.push(connection_figure(self.connection.as_ref()));
+        }
         figures
     }
 }
@@ -522,7 +527,7 @@ mod tests {
                     ask: false,
                 },
             ],
-            cast_model: Some("coder/deepseek-v4".to_string()),
+            mode: "-- NORMAL --".to_string(),
             occupancy: Some(42),
             cache: CacheHealth {
                 age: Some(Duration::from_secs(252)),
@@ -539,7 +544,7 @@ mod tests {
         assert_eq!(rendered.chars().count(), 100);
         assert!(rendered.starts_with("0 kaijutsu*  1 kaish@"), "got {rendered:?}");
         assert!(
-            rendered.ends_with("coder/deepseek-v4  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m  ○ offline"),
+            rendered.ends_with("-- NORMAL --  ▮ 42%  ⟳ 91%  ⏱ 4m12s/5m  ○ offline"),
             "got {rendered:?}"
         );
     }
@@ -553,6 +558,23 @@ mod tests {
         let figures = model.left_figures();
         assert_eq!(figures.last().unwrap().text, "!2");
         assert_eq!(figures.last().unwrap().severity, Severity::Warning);
+    }
+
+    /// A healthy connection earns no figure; only trouble does. The right
+    /// edge is the cache's while connected, and `○ offline` when not.
+    #[test]
+    fn a_connected_kernel_shows_no_connection_figure() {
+        let connected = StatusModel {
+            mode: "-- INSERT --".to_string(),
+            connection: Some(ConnectionStatus::Connected { kernel_id: kaijutsu_types::KernelId::new(), context_id: None, since_ms: 0 }),
+            ..Default::default()
+        };
+        let figures: Vec<String> = connected.right_figures().into_iter().map(|f| f.text).collect();
+        assert!(!figures.iter().any(|f| f.contains("ok")), "{figures:?}");
+        assert_eq!(figures[0], "-- INSERT --", "the vi mode leads the facts: {figures:?}");
+        let offline = StatusModel { connection: None, ..Default::default() };
+        let figures: Vec<String> = offline.right_figures().into_iter().map(|f| f.text).collect();
+        assert_eq!(figures.last().map(String::as_str), Some("○ offline"));
     }
 
     #[test]
@@ -610,7 +632,7 @@ mod tests {
                 seat(2, "cc-kaijutsu-0902-1816"),
                 seat(3, "score-cap2-musician-e1"),
             ],
-            cast_model: Some("coder/deepseek-v4".to_string()),
+            mode: "-- NORMAL --".to_string(),
             occupancy: Some(42),
             ..Default::default()
         };
@@ -618,7 +640,7 @@ mod tests {
         assert_eq!(rendered.chars().count(), 80);
         assert!(rendered.starts_with("0 kaijutsu*"), "got {rendered:?}");
         assert!(!rendered.contains("score-cap2"), "got {rendered:?}");
-        assert!(rendered.contains("coder/deepseek-v4"), "got {rendered:?}");
+        assert!(rendered.contains("-- NORMAL --"), "got {rendered:?}");
         assert!(rendered.ends_with("○ offline"), "got {rendered:?}");
     }
 
@@ -633,7 +655,7 @@ mod tests {
                 activity: false,
                 ask: false,
             }],
-            cast_model: Some("coder/deepseek-v4".to_string()),
+            mode: "-- NORMAL --".to_string(),
             ..Default::default()
         };
         let rendered = text(&status_line(&model, 20, &palette));
