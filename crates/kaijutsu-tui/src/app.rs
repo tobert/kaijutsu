@@ -538,6 +538,18 @@ impl App {
         self.ask_owners.retain(|id, _| still_pending.contains(id));
     }
 
+    /// Take the ask card down when its ask is no longer pending — answered
+    /// from another surface, expired, or abandoned — and hand it back so
+    /// the caller can say what became of it. `None` while no card is up or
+    /// its ask is still in `still_pending`. The card's own keys never come
+    /// through here: they take the card before the answer round trip.
+    pub fn take_answered_card(&mut self, still_pending: &HashSet<String>) -> Option<crate::asks::AskCardState> {
+        if self.ask_card.as_ref().is_some_and(|card| !still_pending.contains(&card.request_id)) {
+            return self.ask_card.take();
+        }
+        None
+    }
+
     /// Whether any tracked ask belongs to `context_id` — [`SeatCell::ask`]'s
     /// derivation.
     pub fn has_pending_ask(&self, context_id: ContextId) -> bool {
@@ -971,5 +983,51 @@ mod tests {
 
         app.mark_submitted(id);
         assert_eq!(app.current_draft(), None, "the promoted block is not a draft to refill from");
+    }
+
+    fn ask_card(request_id: &str, context_id: ContextId) -> crate::asks::AskCardState {
+        crate::asks::AskCardState {
+            request_id: request_id.to_string(),
+            context_id,
+            detail: kaijutsu_client::AskDetail {
+                request_id: request_id.to_string(),
+                context_id: Some(context_id),
+                status: "pending".to_string(),
+                origin: "shell_gate".to_string(),
+                tool: Some("shell_write".to_string()),
+                hook_id: None,
+                instance: None,
+                description: "kj cc send".to_string(),
+                authorized_label: None,
+                statements: vec!["kj cc send".to_string()],
+                exec_source: None,
+                cwd: None,
+                env: Vec::new(),
+                created_at: None,
+                decided_at: None,
+                decided_by: None,
+                decided_option: None,
+                remember_scope: None,
+                redeemed_at: None,
+            },
+        }
+    }
+
+    /// An ask answered from another surface leaves the pending set on the
+    /// next poll; the card showing it must come down with it, or every key
+    /// stays swallowed by a card nobody can answer.
+    #[test]
+    fn an_ask_card_comes_down_when_its_ask_leaves_the_pending_set() {
+        let (mut app, a, _b) = app_with_two();
+        app.ask_card = Some(ask_card("01a05d22", a));
+
+        let still_pending: HashSet<String> = ["01a05d22".to_string()].into_iter().collect();
+        assert!(app.take_answered_card(&still_pending).is_none(), "a pending ask keeps its card");
+        assert!(app.ask_card.is_some());
+
+        let taken = app.take_answered_card(&HashSet::new()).expect("the answered ask's card is handed back");
+        assert_eq!(taken.request_id, "01a05d22");
+        assert!(app.ask_card.is_none(), "the card is down");
+        assert!(app.take_answered_card(&HashSet::new()).is_none(), "nothing to take twice");
     }
 }

@@ -335,6 +335,13 @@ async fn event_loop(
                     if let Ok(new_asks) =
                         kaijutsu_client::poll_new_asks(bridge.actor(), ctx, &mut seen_asks).await
                     {
+                        // `seen_asks` is now what is still pending; a card
+                        // whose ask left it comes down first, so the next
+                        // ask below gets the card instead of only a `!`.
+                        if let Some(card) = app.take_answered_card(&seen_asks) {
+                            let notice = answered_elsewhere_notice(bridge, app, &card).await;
+                            app.note(notice);
+                        }
                         for ask in &new_asks {
                             seen_asks.insert(ask.request_id.clone());
                             app.note_ask(ask.request_id.clone(), ask.info.context_id);
@@ -630,9 +637,16 @@ async fn act(
     // own a/A/d/v/j/k/Esc keys are never compose text or a `Ctrl+A` chord
     // (`docs/tui.md`, "Asks" / "The ledger").
     if app.ask_card.is_some() {
-        if let Some(decision) = asks::ask_key_to_decision(key) {
-            let card = app.ask_card.take().expect("checked Some above");
-            handle_ask_decision(bridge, app, card, decision).await;
+        match asks::ask_card_key(key) {
+            Some(asks::AskCardKey::Decide(decision)) => {
+                let card = app.ask_card.take().expect("checked Some above");
+                handle_ask_decision(bridge, app, card, decision).await;
+            }
+            Some(asks::AskCardKey::Aside) => {
+                let card = app.ask_card.take().expect("checked Some above");
+                app.note(format!("ask {} set aside, still pending (Ctrl+A l)", card.request_id));
+            }
+            None => {}
         }
         return Ok(Acted::Continue);
     }
@@ -795,7 +809,7 @@ async fn handle_colon_line(bridge: &KernelBridge, app: &mut App, ctx: ContextId,
                 app.note(result.latch.map(|l| l.message).unwrap_or_default());
             }
             Ok(result) => app.note(result.stdout.lines().next().unwrap_or("done").to_string()),
-            Err(e) => app.note(format!(":kj failed: {e}")),
+            Err(e) => app.note(format!(":kj failed: {e:#}")),
         },
         ColonVerb::Shell(statement) => match bridge.shell_execute(ctx, &statement).await {
             Ok(_) => app.clear_notice(),
@@ -976,9 +990,10 @@ fn pending_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::PendingR
         .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
     asks::PendingRow {
         request_id: detail.request_id.clone(),
-        // `created_at` is not on `kj ledger show`'s `.data` yet
-        // (`kaijutsu_client::AskDetail`'s doc names the gap).
-        age: None,
+        age: detail.created_at.map(|at| {
+            let now = kaijutsu_types::now_millis();
+            crate::status::format_age(std::time::Duration::from_millis(now.saturating_sub(at as u64)))
+        }),
         context_label,
         context_type,
         hook: detail.tool.clone().unwrap_or_else(|| "-".to_string()),
@@ -986,11 +1001,10 @@ fn pending_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::PendingR
     }
 }
 
-/// One `AskDetail` as the ledger view's ANSWERED row. `decision`/`time`/
-/// `principal` are only as precise as the wire is today: `status` alone
-/// (`allowed`/`denied`) stands in for `decided_option`
-/// (`allow_once`/`allow_always`/`deny`), and `time`/`principal` stay `None`
-/// — `kaijutsu_client::AskDetail`'s doc names the same gap.
+/// One `AskDetail` as the ledger view's ANSWERED row: when it was decided,
+/// how (`allow once`/`allow always`/`deny`, or `status` for an expired or
+/// abandoned ask), and by whom (`you`, a principal's short id, or `—` for
+/// a rule's auto-decision).
 fn answered_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::AnsweredRow {
     let (context_label, _context_type) = detail
         .context_id
@@ -1002,10 +1016,10 @@ fn answered_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::Answere
     };
     asks::AnsweredRow {
         request_id: detail.request_id.clone(),
-        time: None,
+        time: detail.decided_at.map(|at| render::wallclock(at as u64)),
         context_label,
-        decision: Some(detail.status.clone()),
-        principal: None,
+        decision: Some(decision_words(detail)),
+        principal: detail.decided_by.map(|by| if app.principal == Some(by) { "you".to_string() } else { by.short() }),
         redeemed,
         statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
     }
@@ -1022,6 +1036,32 @@ async fn open_ask_card(bridge: &KernelBridge, app: &mut App, request_id: &str, c
             context_id,
             detail,
         });
+    }
+}
+
+/// The status-line notice for a card whose ask was decided from another
+/// surface: `ask <id> allowed by you` / `by <principal>` / `expired`. Falls
+/// back to `no longer pending` when `kj ledger show` cannot be read — the
+/// card is already down either way.
+async fn answered_elsewhere_notice(bridge: &KernelBridge, app: &App, card: &asks::AskCardState) -> String {
+    let id = &card.request_id;
+    let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), card.context_id, id).await else {
+        return format!("ask {id} no longer pending");
+    };
+    let outcome = decision_words(&detail);
+    match detail.decided_by {
+        Some(by) if app.principal == Some(by) => format!("ask {id} {outcome} by you"),
+        Some(by) => format!("ask {id} {outcome} by {}", by.short()),
+        None => format!("ask {id} {outcome}"),
+    }
+}
+
+/// `allow once` / `allow always` / `deny` from `decided_option`, else the
+/// coarser `status` (`allowed`, `denied`, `expired`, `abandoned`).
+fn decision_words(detail: &kaijutsu_client::AskDetail) -> String {
+    match detail.decided_option.as_deref() {
+        Some(option) => option.replace('_', " "),
+        None => detail.status.clone(),
     }
 }
 

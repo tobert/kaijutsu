@@ -135,7 +135,7 @@ impl CacheHealth {
 }
 
 /// `4m12s`, `17s`, `1h04m`.
-fn format_age(age: Duration) -> String {
+pub(crate) fn format_age(age: Duration) -> String {
     let secs = age.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if h > 0 {
@@ -309,6 +309,13 @@ pub fn status_line(model: &StatusModel, width: u16, palette: &Palette) -> Line<'
         return Line::from(spans);
     }
     while !left.is_empty() && join_width(&left) + right_w + 2 > width {
+        // A notice is one figure, so popping it would blank the line: clip
+        // it to what fits instead. Seats drop from the end.
+        if model.notice.is_some() && left.len() == 1 {
+            let room = width - right_w - 2;
+            left[0].text = left[0].text.chars().take(room.saturating_sub(1)).collect::<String>() + "…";
+            break;
+        }
         left.pop();
     }
 
@@ -564,6 +571,23 @@ mod tests {
         let figures = model.left_figures();
         assert_eq!(figures.len(), 1);
         assert_eq!(figures[0].text, "block #12 changed after print");
+    }
+
+    /// A notice longer than the room beside the facts is clipped, never
+    /// dropped — the elastic-rank rule would otherwise blank the line, and
+    /// a blank line says nothing about why the seats went away.
+    #[test]
+    fn a_long_notice_clips_rather_than_vanishing() {
+        let palette = Palette::builtin();
+        let model = StatusModel {
+            notice: Some("ask 01a06c29-f9dd-7853-a101-12689a781ffd set aside, still pending; Ctrl+A l to answer it".to_string()),
+            ..Default::default()
+        };
+        let line = status_line(&model, 60, &palette);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("ask 01a06c29-f9dd"), "the notice's head survives: {text:?}");
+        assert!(text.contains('…'), "the clip is marked: {text:?}");
+        assert!(text.chars().count() <= 60, "{text:?}");
     }
 
     /// A rank of long labels is the ordinary case, so seats give way to the

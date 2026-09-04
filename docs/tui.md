@@ -510,8 +510,19 @@ statement never pushes `[a]llow once ...` off the bottom.
 ```text
   ⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)
     rm -rf ~/src/wt/kaish-arith
-    [a]llow once  [A]llow always  [d]eny  [v]iew ledger
+    [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside
 ```
+
+While the card is up it takes every key; the four answers and `Esc` are
+the only ones that do anything. `Esc` puts the card aside with the ask
+still pending: the seat keeps its `!`, the status line its `!n`, and
+`Ctrl+A l` reaches it. The card also comes down by itself when its ask
+leaves the pending set — answered from another surface (`kj ledger allow`
+in a shell, the app, a sibling session), expired, or abandoned — with a
+status-line notice saying what became of it: `ask 01a04eb6 allow once by
+you`, `by 2b1ffa32e069` (a principal's short id), or `expired`. A key
+pressed on an already-answered ask reports the lost race on the status
+line and nothing else happens.
 
 The card's line count is measured at the terminal's own width — the
 statement wraps by width, so a wider count would say fewer lines than a

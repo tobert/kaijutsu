@@ -22,6 +22,28 @@ pub enum AskDecision {
     ViewLedger,
 }
 
+/// What one key does on a live ask card: decide the ask, or put the card
+/// aside with the ask still pending in the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskCardKey {
+    Decide(AskDecision),
+    /// `Esc`: the card comes down, the ask stays pending — the seat keeps
+    /// its `!` and `Ctrl+A l` reaches it.
+    Aside,
+}
+
+/// `a`/`A`/`d`/`v`/`Esc` on a live ask card (`docs/tui.md`'s Asks figure).
+/// `None` for anything else.
+pub fn ask_card_key(key: KeyEvent) -> Option<AskCardKey> {
+    if let Some(decision) = ask_key_to_decision(key) {
+        return Some(AskCardKey::Decide(decision));
+    }
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    (key.code == KeyCode::Esc && key.modifiers.is_empty()).then_some(AskCardKey::Aside)
+}
+
 /// `a`/`A`/`d`/`v` on a live ask card (`docs/tui.md`'s Asks figure). `None`
 /// for anything else, including a key-release event — a card key is never
 /// swallowed by acting on both edges of one press.
@@ -70,7 +92,7 @@ pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec
         lines.push(Line::from(Span::styled(format!("  {row}"), palette.status())));
     }
     lines.push(Line::from(Span::styled(
-        "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger".to_string(),
+        "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside".to_string(),
         palette.divider(),
     )));
     lines
@@ -92,9 +114,8 @@ pub fn ask_card_viewport_lines(card: &AskCard<'_>, width: u16) -> u16 {
 /// One row of the ledger view's PENDING section.
 pub struct PendingRow {
     pub request_id: String,
-    /// Formatted age (`format_age` in `status.rs`'s convention), or `None`
-    /// when unknown — `created_at` is not on `kj ledger show`'s `.data` yet
-    /// ([`kaijutsu_client::AskDetail`]'s doc names the gap).
+    /// Formatted age (`format_age` in `status.rs`'s convention) from
+    /// `created_at`, or `None` when the ask has no stamp.
     pub age: Option<String>,
     pub context_label: String,
     pub context_type: String,
@@ -105,14 +126,15 @@ pub struct PendingRow {
 /// One row of the ledger view's ANSWERED section.
 pub struct AnsweredRow {
     pub request_id: String,
-    /// Formatted decision time, or `None` — `decided_at` is not on the wire
-    /// yet, same gap as [`PendingRow::age`].
+    /// Formatted decision time (`decided_at`), or `None` when the ask has
+    /// no stamp.
     pub time: Option<String>,
     pub context_label: String,
     /// `"allow once"`, `"allow always"`, `"deny"` — or `None` when the wire
     /// carried only `status` (`allowed`/`denied`) and not `decided_option`.
     pub decision: Option<String>,
-    /// Who decided it — `decided_by` is not on the wire yet.
+    /// Who decided it — `you`, a principal's short id, or `None` for a
+    /// rule's auto-decision.
     pub principal: Option<String>,
     /// `redeemed <time>` / `redeemed ×N` / `—`, pre-formatted by the caller
     /// because a rule's redeem count is a different query than the ask's own
@@ -588,6 +610,17 @@ mod tests {
         assert_eq!(ask_key_to_decision(ctrl_a), None);
     }
 
+    /// `Esc` puts the card aside; a decision key still decides; any other
+    /// key is still swallowed by the card rather than reaching compose.
+    #[test]
+    fn esc_puts_the_ask_card_aside() {
+        assert_eq!(ask_card_key(press(KeyCode::Esc)), Some(AskCardKey::Aside));
+        assert_eq!(ask_card_key(press(KeyCode::Char('d'))), Some(AskCardKey::Decide(AskDecision::Deny)));
+        assert_eq!(ask_card_key(press(KeyCode::Char('x'))), None);
+        let released = KeyEvent { kind: KeyEventKind::Release, ..press(KeyCode::Esc) };
+        assert_eq!(ask_card_key(released), None);
+    }
+
     #[test]
     fn the_ask_card_renders_the_figures_shape() {
         let card = AskCard {
@@ -601,7 +634,7 @@ mod tests {
         let text: Vec<String> = lines.iter().map(line_text).collect();
         assert_eq!(text[0], "⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)");
         assert_eq!(text[1], "  rm -rf ~/src/wt/kaish-arith");
-        assert_eq!(text[2], "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger");
+        assert_eq!(text[2], "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside");
     }
 
     #[test]

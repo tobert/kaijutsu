@@ -257,12 +257,10 @@ and Amy's second morning, in rough priority:
   plain file — a print-time decision, never a redraw. *"we work on adding
   ways to flow the data better, esp since we have kaish .data. Maybe tui
   could have some kaish scripts fire for formatting?"*
-- **The ask card swallows `Esc` and `Ctrl+C`.** `ask_key_to_decision`
-  answers only `a`/`A`/`d`/`v`; while an ask is up the interrupt ladder is
-  unreachable and the card cannot be put aside. A gate must be decided, but
-  `Esc` doing nothing is a surprise — ruling wanted: `Esc` returns the ask
-  to the ledger (still pending), or stays a no-op with the hint line saying
-  so.
+- **`Ctrl+C` on an ask card is swallowed.** `Esc` puts the card aside
+  now, so the interrupt ladder is one key away rather than unreachable;
+  whether `Ctrl+C` should also put the card aside on its way to the ladder
+  is untried.
 - **`LedgerAction::Show` is a stub** (*"full detail view not yet wired"*)
   while `render_ask_detail` is complete and unreachable. Wire it, on the
   same growth seam as the card.
@@ -380,6 +378,32 @@ design: `kj cc send` and non-shell hook asks. `find_redeemable`'s digest
 match is deletable only when those execute too, not before
 (`docs/gate-shape-b.md`, "The rest, settled"). The `shellExecute` path is
 driven end to end by the `shell_box_*` cases in `gate_executes_wire.rs`.
+
+**Three receipts from the ask-card probe (2026-09-04, zorak, kernel
+`ebc84e9c`):**
+
+1. **A decided ask leaves its gate pair `waiting` forever.** Context
+   `b90048cc` holds two pairs still `[waiting]` — `#293/#294` (a
+   `shell_write` gate) and `#307/#309` (the `lfm2d-advisory` gate for ask
+   `01a0686d-895e`, allowed and redeemed 2026-09-03 14:06). Nothing
+   completes the pair when the ask is decided, so a tui keeps the stale
+   "gate for … is waiting on a human" block pinned in its live band, and
+   the player cannot do anything about it from that surface (Amy, this
+   morning: *"why is that 'gate for' stuck at the bottom there?"*). The
+   approval-executes path should complete or replace the pair; a
+   decided-by-deny or an abandoned ask needs the same.
+2. **Approving a `:`-line statement wakes a model turn.** The probe typed
+   `:kj cc send probe-nobody hello` in a coder context with no turn
+   running; the scorer gated it. An allow from another seat executed it
+   and a deepseek turn started in that context (thinking "The approval
+   came through and the command already ran"), then looped on new
+   `kj cc send` asks. A `:`-line origin has no waiting turn to resume, so
+   the wake is a bug, and an expensive one.
+3. **A gated `:kj` statement surfaces as `:kj failed: execute addressed
+   kj command`.** `executeKj` returns an RPC error for a gated statement
+   rather than a result naming the ask. The tui now prints the error chain
+   (`{e:#}`), which will show the kernel's text; the kernel side should
+   return the "waiting for approval" result instead of an error.
 
 Also open from the same lane: `archive_context` stamps `archived_at` and
 leaves `context_state` at `live`. The two checks that matter now read both
