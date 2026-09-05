@@ -122,16 +122,17 @@ Two facts from that table drive the whole design:
   and nothing else; rc scripts see `KJ_CONTEXT`, `KJ_VERB`, `KJ_RC_DEPTH`,
   `KJ_PARENT_CONTEXT`, `KJ_FORK_INFO`, `KJ_PARENT_BLOCK_COUNT`, `KJ_DRIFT_INFO`
   (`kj/lifecycle.rs:523–584`), not the type and not a character.
-- **Drift addresses live contexts only.** `DriftRouter::resolve_context`
-  (`kernel/src/drift.rs:527`) is the in-memory registry; `refs::resolve_context_arg`
-  (`kj/refs.rs:80`) is the db resolver; a name with no live context has
-  nowhere to receive a note. `docs/drift-ux.md` gap 3 is this split.
+- **Drift addresses contexts only.** Push resolves through
+  `refs::resolve_context_arg` (`kj/refs.rs:80`) with a `DriftRouter`
+  fallback (`kernel/src/drift.rs:527`) for archived contexts the router
+  still holds; both grammars are one since `46878b28`. A character with no
+  context has nowhere to receive a note.
 - **The handoff is a file nothing reads.** Whole-file rewrite, one writer,
   no per-entry stamp or author, no window, melting by hand.
-- **Distillation picks the source's cast silently.** `summarize_with_model`
-  (`kj/mod.rs:725`) uses the source context's provider/model unless an
-  override is named, and only `fork --compact` exposes `--distill-model`;
-  `kj drift pull` (`kj/drift.rs:51`) does not.
+- ~~Distillation picks the source's cast silently.~~ Fixed 2026-09-05:
+  `summarize_with_model_for_caller` (`kj/mod.rs`) refuses when the caller's
+  and source's (provider, model) pairs differ and no `--distill-model` is
+  named; `kj drift pull` and `merge` take the flag.
 
 ## The design
 
@@ -442,10 +443,9 @@ accountable to kaijutsu-lead. Its `tick` rc:
       same model on a fraction of the input;
    4. if unreachable, archive and leave a note saying so.
 
-`summarize_with_model` gains a rule alongside: when the caller's cast and the
-source's cast differ and no distill model is named, **refuse** and name both
-casts and the flag. `kj drift pull` gains `--distill-model`. A default that
-quietly flips casts is a silent fallback.
+The distillation refusal is already in: when the caller's cast and the
+source's differ and no distill model is named, the kernel refuses and names
+both casts and the flag; `kj drift pull` and `merge` take `--distill-model`.
 
 The proctor is last on purpose. It depends on reliable liveness, consent to
 external drive, the warm/cold cache policy, archival semantics, and the

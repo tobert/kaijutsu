@@ -722,11 +722,40 @@ impl KjDispatcher {
     /// Use a cheaper model for distillation than the source context's
     /// chat model — `kj fork --compact --distill-model haiku` style.
     /// Pass `None` to inherit from the source context (existing behavior).
+    ///
+    /// Treats the summarized context as its own caller, so the cross-cast
+    /// refusal in [`summarize_with_model_for_caller`] can never fire here —
+    /// correct for `fork --compact`, which always distills the forking
+    /// caller's own context.
     pub(crate) async fn summarize_with_model(
         &self,
         context_id: ContextId,
         directed_prompt: Option<&str>,
         distill_model: Option<&str>,
+    ) -> Result<String, String> {
+        self.summarize_with_model_for_caller(context_id, directed_prompt, distill_model, Some(context_id))
+            .await
+    }
+
+    /// Same as [`summarize_with_model`], but names the CALLER's context
+    /// separately from the SOURCE being summarized — the shape `drift pull`
+    /// and `drift merge` need, where the caller distilling the material may
+    /// not be the context that holds it.
+    ///
+    /// With no explicit `--distill-model` and a caller that differs from the
+    /// source, a caller whose own (provider, model) pair does not match the
+    /// source's is REFUSED rather than silently billed on the source's cast
+    /// (docs/issues.md "Distillation picks the source's cast silently when
+    /// the caller differs"). The refusal is skipped — today's behavior keeps
+    /// running — when the caller has no resolvable pair, when the source has
+    /// none, or when caller and source are the same context (always true for
+    /// `fork --compact` and `drift merge`; never true for `drift pull`).
+    pub(crate) async fn summarize_with_model_for_caller(
+        &self,
+        context_id: ContextId,
+        directed_prompt: Option<&str>,
+        distill_model: Option<&str>,
+        caller_context_id: Option<ContextId>,
     ) -> Result<String, String> {
         let blocks = self
             .blocks
@@ -738,14 +767,21 @@ impl KjDispatcher {
 
         let user_prompt = build_distillation_prompt(&blocks, directed_prompt);
 
-        // The calling context's OWN (provider, model) pair — the combination
-        // known to work for it. Read under the sync router lock before the async
-        // registry lock (guard drops at the block's end; no await while held).
-        let ctx_pair = self
-            .drift
-            .read()
-            .get(context_id)
-            .map(|h| (h.provider.clone(), h.model.clone()));
+        // The SOURCE context's own (provider, model) pair, and — only when
+        // the caller is a different context — the CALLER's own pair. Both
+        // read under one lock acquisition (a second `self.drift.read()`
+        // while the first is still held risks deadlock on a
+        // writer-preferring lock). Guard drops at the block's end; no await
+        // while held.
+        let (ctx_pair, caller_pair) = {
+            let router = self.drift.read();
+            let ctx_pair = router.get(context_id).map(|h| (h.provider.clone(), h.model.clone()));
+            let caller_pair = caller_context_id
+                .filter(|id| *id != context_id)
+                .and_then(|id| router.get(id))
+                .map(|h| (h.provider.clone(), h.model.clone()));
+            (ctx_pair, caller_pair)
+        };
 
         let registry = self.kernel.llm().read().await;
 
@@ -759,14 +795,18 @@ impl KjDispatcher {
         //      failure hint below recommends rode as a literal model name on
         //      the default provider, and an unknown provider was silently
         //      swallowed instead of failing loud.
-        //   2. else the calling context's OWN provider+model (the known-good
+        //   2. else, when the caller differs from the source and both resolve
+        //      to a complete pair: REFUSE if the pairs differ, instead of
+        //      billing the caller on whatever cast the source happens to run
+        //      — a cheap caller pulling from an expensive context must say so.
+        //   3. else the source context's OWN provider+model (the known-good
         //      pair). This previously used only the context's *model*, re-pinned
         //      on the registry's *default provider* via `resolve_model` — so a
         //      caller on `anthropic` whose registry default was `deepseek` would
         //      try to distill anthropic's model on deepseek, the cross-provider
         //      `not_found_error` papercut. Using the pair keeps distill on the
-        //      caller's own provider.
-        //   3. else the registry default.
+        //      source's own provider.
+        //   4. else the registry default.
         let (provider, provider_name, model) = match distill_model {
             Some(spec) => {
                 let (p_name, m) = parse::resolve_model_choice(&registry, spec)
@@ -782,32 +822,46 @@ impl KjDispatcher {
                 })?;
                 (provider, p_name, m)
             }
-            None => match ctx_pair {
-                Some((Some(p_name), Some(m))) => {
-                    let provider = registry.get(&p_name).ok_or_else(|| {
-                        format!(
-                            "distillation: the calling context's provider '{p_name}' is not \
-                             registered — pass an explicit `--distill-model provider/model`"
-                        )
-                    })?;
-                    (provider, p_name, m)
+            None => {
+                if let (Some((Some(sp), Some(sm))), Some((Some(cp), Some(cm)))) =
+                    (&ctx_pair, &caller_pair)
+                    && (sp != cp || sm != cm)
+                {
+                    return Err(format!(
+                        "distillation would silently switch casts: the source context \
+                         ({}) runs {sp}/{sm}, the calling context runs {cp}/{cm} — pass an \
+                         explicit `--distill-model provider/model` (or a configured alias) \
+                         to confirm the cross-cast distill",
+                        context_id.short()
+                    ));
                 }
-                // The calling context lacks a complete provider+model pair; fall
-                // to the registry default rather than pinning a half-known model
-                // on a possibly-wrong provider.
-                _ => {
-                    let name = registry
-                        .default_provider_name()
-                        .ok_or("no LLM configured")?
-                        .to_string();
-                    let p = registry.default_provider().ok_or("no LLM configured")?;
-                    let m = registry
-                        .default_model()
-                        .ok_or("no default model configured")?
-                        .to_string();
-                    (p, name, m)
+                match ctx_pair {
+                    Some((Some(p_name), Some(m))) => {
+                        let provider = registry.get(&p_name).ok_or_else(|| {
+                            format!(
+                                "distillation: the source context's provider '{p_name}' is not \
+                                 registered — pass an explicit `--distill-model provider/model`"
+                            )
+                        })?;
+                        (provider, p_name, m)
+                    }
+                    // The source context lacks a complete provider+model pair;
+                    // fall to the registry default rather than pinning a
+                    // half-known model on a possibly-wrong provider.
+                    _ => {
+                        let name = registry
+                            .default_provider_name()
+                            .ok_or("no LLM configured")?
+                            .to_string();
+                        let p = registry.default_provider().ok_or("no LLM configured")?;
+                        let m = registry
+                            .default_model()
+                            .ok_or("no default model configured")?
+                            .to_string();
+                        (p, name, m)
+                    }
                 }
-            },
+            }
         };
 
         provider

@@ -10,6 +10,22 @@ Drift transfers knowledge between contexts without sharing conversation history.
 - **pull** — You want a digest of another context's work. LLM reads their blocks and writes a summary into yours.
 - **merge** — Your fork is done. LLM summarizes your work into the parent context.
 
+## Distillation model
+
+`pull` and `merge` distill on the source context's own model by default. If
+you (the caller) are on a different model than the source, `pull` refuses
+instead of silently billing your pull on the source's cast — pass
+`--distill-model <provider/model|alias>` to confirm the cross-cast distill or
+pick a cheaper one:
+
+```bash
+kj drift pull expensive-ctx --distill-model deepseek/deepseek-flash
+```
+
+`merge` always distills your own context, so it never hits that refusal;
+`--distill-model` there just lets you pick a cheaper model than your own for
+the one-shot summary, same as `fork --compact --distill-model`.
+
 ## Delivery
 
 `push` delivers on the spot — the content is a durable block in the target's
@@ -42,7 +58,9 @@ push <dst> <content>     Send content to target context (delivers now)
 push <dst> --summarize   Send LLM-distilled summary of your context
 push <dst> --stage ...   Queue for a later flush instead of delivering
 pull <src> [prompt]      Pull + LLM-distill from source
+pull <src> --distill-model <m>   Distill with this model instead of refusing on a cast mismatch
 merge [ctx]              Summarize this fork back into parent
+merge [ctx] --distill-model <m>  Distill with this model instead of your own
 flush                    Deliver all staged drifts
 queue                    Show staging queue (yields queue u64 ids)
 cancel <queue_id>        Remove staged drift before flush (pre-flush only)

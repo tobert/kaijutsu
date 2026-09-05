@@ -51,6 +51,11 @@ enum DriftCommand {
     Pull {
         /// Source context reference
         src: String,
+        /// Model to distill with, as `provider/model` or a configured alias.
+        /// Without it, a pull whose caller and source run different models
+        /// refuses instead of silently billing the source's cast.
+        #[arg(long = "distill-model")]
+        distill_model: Option<String>,
         /// Optional directed prompt (joined with spaces)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -59,6 +64,11 @@ enum DriftCommand {
     Merge {
         /// Target context (defaults to forked_from parent)
         ctx: Option<String>,
+        /// Model to distill with, as `provider/model` or a configured alias.
+        /// A merge always distills the caller's own context, so this only
+        /// picks the model — it never triggers a cast-mismatch refusal.
+        #[arg(long = "distill-model")]
+        distill_model: Option<String>,
     },
     /// Deliver all staged drifts.
     Flush,
@@ -135,8 +145,18 @@ impl KjDispatcher {
                 self.drift_push(&dst, summarize, stage, &content, caller)
                     .await
             }
-            DriftCommand::Pull { src, prompt } => self.drift_pull(&src, &prompt, caller).await,
-            DriftCommand::Merge { ctx } => self.drift_merge(ctx.as_deref(), caller).await,
+            DriftCommand::Pull {
+                src,
+                distill_model,
+                prompt,
+            } => {
+                self.drift_pull(&src, &prompt, distill_model.as_deref(), caller)
+                    .await
+            }
+            DriftCommand::Merge { ctx, distill_model } => {
+                self.drift_merge(ctx.as_deref(), distill_model.as_deref(), caller)
+                    .await
+            }
             DriftCommand::Flush => self.drift_flush(caller).await,
             DriftCommand::Queue => self.drift_queue().await,
             DriftCommand::Cancel { queue_id } => self.drift_cancel(&queue_id).await,
@@ -395,7 +415,13 @@ impl KjDispatcher {
         }
     }
 
-    async fn drift_pull(&self, src_query: &str, prompt: &[String], caller: &KjCaller) -> KjResult {
+    async fn drift_pull(
+        &self,
+        src_query: &str,
+        prompt: &[String],
+        distill_model: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
         // Resolve source context
         let source_id = {
             let db = self.kernel_db().lock();
@@ -421,8 +447,20 @@ impl KjDispatcher {
             Some(prompt.join(" "))
         };
 
-        // Summarize source via LLM
-        let summary = match self.summarize(source_id, directed_prompt.as_deref()).await {
+        // Summarize source via LLM. The CALLER (context_id) is named
+        // separately from the SOURCE (source_id) here — the only one of the
+        // three distill call sites where they differ — so a caller whose own
+        // model differs from the source's is refused rather than silently
+        // billed on the source's cast when `--distill-model` is omitted.
+        let summary = match self
+            .summarize_with_model_for_caller(
+                source_id,
+                directed_prompt.as_deref(),
+                distill_model,
+                Some(context_id),
+            )
+            .await
+        {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj drift pull: {e}")),
         };
@@ -498,7 +536,12 @@ impl KjDispatcher {
         KjResult::ok(format!("pulled from {}:\n{}", src_query, preview))
     }
 
-    async fn drift_merge(&self, target_arg: Option<&str>, caller: &KjCaller) -> KjResult {
+    async fn drift_merge(
+        &self,
+        target_arg: Option<&str>,
+        distill_model: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
         let context_id = match caller.require_context() {
             Ok(id) => id,
             Err(e) => return e,
@@ -534,8 +577,14 @@ impl KjDispatcher {
             return KjResult::Err("kj drift merge: cannot merge into self".to_string());
         }
 
-        // Summarize caller's context
-        let summary = match self.summarize(context_id, None).await {
+        // Summarize caller's context. Caller and source are the same
+        // context here (a merge always distills what it's standing in), so
+        // the cross-cast refusal in `summarize_with_model_for_caller` can
+        // never fire — `--distill-model` only picks the model.
+        let summary = match self
+            .summarize_with_model_for_caller(context_id, None, distill_model, Some(context_id))
+            .await
+        {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
         };
@@ -1476,6 +1525,64 @@ mod tests {
         );
     }
 
+    /// The router fallback in `drift_push` (kept "for anything registered in
+    /// this process the DB cannot resolve") is not dead weight: `kj context
+    /// archive` sets `archived_at` in the DB — which
+    /// `refs::resolve_context_arg` excludes via `list_active_contexts` — but
+    /// does not unregister the context from the in-memory `DriftRouter`
+    /// (`context_archive_flips_drift_router_state` above pins that it only
+    /// flips the handle's state). So an archived-but-still-registered
+    /// context is exactly the "live-only registration" the fallback exists
+    /// for. This is the receipt for docs/issues.md item 3's "delete the
+    /// fallback if it's never needed" branch: it is needed.
+    #[tokio::test]
+    async fn drift_push_resolves_archived_context_via_router_fallback() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("target"), Some(parent), principal);
+        let pusher = register_context(&d, Some("pusher"), None, principal);
+        d.block_store()
+            .create_document(target, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let archiver = confirmed_caller(parent);
+        let archived = d
+            .dispatch(&[s("context"), s("archive"), s("target")], &archiver)
+            .await;
+        assert!(archived.is_ok(), "archive failed: {}", archived.message());
+
+        // Sanity: the DB-only resolver can no longer name the archived
+        // context by label — this is the gap the router fallback covers.
+        {
+            let db = d.kernel_db().lock();
+            let c = caller_with_context(pusher);
+            assert!(
+                crate::kj::refs::resolve_context_arg(Some("target"), &c, &db).is_err(),
+                "an archived context must not resolve through the DB-active resolver"
+            );
+        }
+
+        let c = caller_with_context(pusher);
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("target"), s("hi")], &c)
+            .await;
+        assert!(
+            result.is_ok(),
+            "push must still reach an archived-but-registered context via the \
+             router fallback: {}",
+            result.message()
+        );
+
+        let blocks = d.block_store().block_snapshots(target).expect("snapshots");
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.kind == kaijutsu_types::BlockKind::Drift && b.content.contains("hi")),
+            "drift should have landed in the archived target"
+        );
+    }
+
     #[tokio::test]
     async fn drift_cancel() {
         let d = test_dispatcher().await;
@@ -2020,6 +2127,170 @@ mod tests {
         );
     }
 
+    /// docs/issues.md "Distillation picks the source's cast silently when
+    /// the caller differs": `drift pull` is the one call site where caller
+    /// and source are genuinely different contexts, so it is the one place
+    /// the mismatch can actually happen. With no `--distill-model` and the
+    /// puller on a different (provider, model) pair than the source, the
+    /// pull must refuse rather than silently bill the puller on the
+    /// source's (here, more expensive) cast — and the error must name both
+    /// casts plus the flag that resolves it.
+    #[tokio::test]
+    async fn drift_pull_refuses_cross_cast_without_distill_model() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        let dest = register_context(&d, Some("dest"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(dest, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                source,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
+            );
+            reg.register(
+                "deepseek",
+                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
+            );
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "anthropic", "claude-opus-5");
+            let _ = drift.configure_llm(dest, "deepseek", "deepseek-flash");
+        }
+
+        let c = caller_with_context(dest);
+        let result = d
+            .dispatch(&[s("drift"), s("pull"), s("source")], &c)
+            .await;
+        assert!(
+            !result.is_ok(),
+            "a cross-cast pull without --distill-model must refuse"
+        );
+        let msg = result.message();
+        assert!(
+            msg.contains("anthropic/claude-opus-5"),
+            "error must name the source's cast: {msg}"
+        );
+        assert!(
+            msg.contains("deepseek/deepseek-flash"),
+            "error must name the caller's cast: {msg}"
+        );
+        assert!(
+            msg.contains("--distill-model"),
+            "error must point at the escape hatch: {msg}"
+        );
+
+        // No half-delivered drift block — the refusal must land before any
+        // mutation of the caller's context.
+        let blocks = d.block_store().block_snapshots(dest).unwrap();
+        assert!(
+            !blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Drift),
+            "a refused pull must not insert a drift block: {blocks:?}"
+        );
+    }
+
+    /// The same cross-cast setup as `drift_pull_refuses_cross_cast_without_distill_model`,
+    /// but with an explicit `--distill-model` naming a THIRD cast — the flag
+    /// must win over the refusal (and over both the source's and the
+    /// caller's own pair), same as `fork --compact --distill-model`.
+    #[tokio::test]
+    async fn drift_pull_distill_model_flag_overrides_cross_cast_refusal() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        let dest = register_context(&d, Some("dest"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(dest, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                source,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
+            );
+            reg.register(
+                "deepseek",
+                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
+            );
+            reg.register(
+                "cheap",
+                Arc::new(Provider::Mock(MockClient::new("CHEAP-DISTILL"))),
+            );
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "anthropic", "claude-opus-5");
+            let _ = drift.configure_llm(dest, "deepseek", "deepseek-flash");
+        }
+
+        let c = caller_with_context(dest);
+        let result = d
+            .dispatch(
+                &[
+                    s("drift"),
+                    s("pull"),
+                    s("source"),
+                    s("--distill-model"),
+                    s("cheap/cheap-model"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "pull with --distill-model failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(dest).unwrap();
+        let drift_block = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("drift block");
+        assert!(
+            drift_block.content.contains("CHEAP-DISTILL"),
+            "--distill-model must win over both the source's and caller's own cast: {:?}",
+            drift_block.content
+        );
+    }
+
     #[tokio::test]
     async fn drift_merge_no_parent() {
         let d = test_dispatcher().await;
@@ -2122,6 +2393,82 @@ mod tests {
             drift_block.unwrap().content.contains("MERGE-SUMMARY"),
             "drift block should carry the LLM's distilled summary: {:?}",
             drift_block.unwrap().content
+        );
+    }
+
+    /// `drift merge` gains the same `--distill-model` grammar as `fork
+    /// --compact` and `drift pull`. Caller and source are always the same
+    /// context for a merge, so there is no cross-cast refusal to bypass
+    /// here — the flag exists purely to pick a cheaper model than the
+    /// merging context's own, same motivation as `fork --compact
+    /// --distill-model`.
+    #[tokio::test]
+    async fn drift_merge_distill_model_flag_overrides() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let child = register_context(&d, Some("child"), Some(parent), principal);
+        d.block_store()
+            .create_document(parent, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(child, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                child,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "child material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "expensive",
+                Arc::new(Provider::Mock(MockClient::new("EXPENSIVE-DISTILL"))),
+            );
+            reg.register(
+                "cheap",
+                Arc::new(Provider::Mock(MockClient::new("CHEAP-DISTILL"))),
+            );
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(child, "expensive", "opus-5");
+        }
+
+        let c = caller_with_context(child);
+        let result = d
+            .dispatch(
+                &[
+                    s("drift"),
+                    s("merge"),
+                    s("--distill-model"),
+                    s("cheap/cheap-model"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "merge with --distill-model failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(parent).unwrap();
+        let drift_block = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("drift block");
+        assert!(
+            drift_block.content.contains("CHEAP-DISTILL"),
+            "--distill-model must override the merging context's own cast: {:?}",
+            drift_block.content
         );
     }
 
