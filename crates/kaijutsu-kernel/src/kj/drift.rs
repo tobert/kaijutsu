@@ -33,7 +33,8 @@ enum DriftCommand {
     /// Send content to a target context, delivered immediately. With
     /// --summarize, LLM-distill the caller's whole context instead of
     /// sending literal content. With --stage, queue it for a later
-    /// `flush` instead of delivering now.
+    /// `flush` instead of delivering now. Refuses an archived or concluded
+    /// target, at both push and flush time — fork it to continue.
     Push {
         /// Destination context reference
         dst: String,
@@ -254,6 +255,29 @@ impl KjDispatcher {
         Ok(())
     }
 
+    /// The refusal a drift delivery into a non-live target gets — the SAME
+    /// states and wording `kj drive` refuses a turn into (`kj/drive.rs`):
+    /// archived and concluded contexts are retained work, not a live
+    /// mailbox, and landing a drift block plus a `context_edges` row into
+    /// either would mutate a record meant to stay as-is. `Staging` is NOT
+    /// refused here — it blocks a *turn* (`kj drive`), not a delivery.
+    ///
+    /// `None` for a `Live`/`Staging` target, and for a context row that
+    /// cannot be read (the caller's own resolution has already failed, or
+    /// will, through its own path).
+    fn drift_target_refusal(&self, target: ContextId) -> Option<String> {
+        let row = self.kernel_db().lock().get_context(target).ok().flatten()?;
+        let why = if row.archived_at.is_some() {
+            "archived — archived contexts are retained work; fork it to continue"
+        } else if row.context_state == kaijutsu_types::ContextState::Concluded {
+            "concluded — fork it to continue the work"
+        } else {
+            return None;
+        };
+        let name = row.label.clone().unwrap_or_else(|| target.short());
+        Some(format!("context '{name}' is {why}"))
+    }
+
     async fn drift_push(
         &self,
         dst_query: &str,
@@ -277,27 +301,31 @@ impl KjDispatcher {
         // the in-memory router alone, so `merge .parent` worked and
         // `push .parent` did not (docs/drift-ux.md, gap #3).
         //
-        // The router remains a fallback for anything registered in this
-        // process that the DB cannot resolve. On a double failure we report
-        // the DB's error: it resolves against the larger candidate set, so
-        // its message (the ambiguity candidate list in particular) is the
-        // more useful of the two.
+        // No router fallback: `KernelDb::resolve_context` already resolves a
+        // full UUID regardless of `context_state`/`archived_at` (only its
+        // label/hex-prefix path excludes archived rows via
+        // `list_active_contexts`), so the one case the fallback used to catch
+        // — an archived context reachable by label only through the
+        // still-registered `DriftRouter` handle — is now refused outright by
+        // the state check below rather than delivered through. There is no
+        // remaining case where a genuinely LIVE context resolves through the
+        // router and not the DB (every production registration pairs the two
+        // in the same call — `kj/context.rs`, `kj/fork.rs`).
         let target_id = {
-            let db_result = {
-                let db = self.kernel_db().lock();
-                refs::resolve_context_arg(Some(dst_query), caller, &db)
-            };
-            match db_result {
+            let db = self.kernel_db().lock();
+            match refs::resolve_context_arg(Some(dst_query), caller, &db) {
                 Ok(id) => id,
-                Err(db_err) => {
-                    let router = self.drift_router().read();
-                    match router.resolve_context(dst_query) {
-                        Ok(id) => id,
-                        Err(_) => return KjResult::Err(format!("kj drift push: {db_err}")),
-                    }
-                }
+                Err(e) => return KjResult::Err(format!("kj drift push: {e}")),
             }
         };
+
+        // Refuse before doing any work (including the `--summarize` distill
+        // below, which would otherwise run an LLM call for content that can
+        // never land) — on both the immediate-delivery and `--stage` paths,
+        // since both share this one resolution point.
+        if let Some(why) = self.drift_target_refusal(target_id) {
+            return KjResult::Err(format!("kj drift push: {why}"));
+        }
 
         // Determine content and drift kind
         let (content, drift_kind) = if summarize {
@@ -713,6 +741,20 @@ impl KjDispatcher {
                 failed.push(drift);
                 continue;
             };
+            // Re-check the target's state at delivery time, not just at
+            // stage time: a target archived or concluded between `push
+            // --stage` and this `flush` must not receive the item either.
+            // Treated as an ordinary delivery failure — it requeues and
+            // converges on dead-letter/lost+found like any other
+            // undeliverable item, rather than a new sink.
+            if let Some(why) = self.drift_target_refusal(drift.target_ctx) {
+                tracing::warn!(
+                    target = %drift.target_ctx.short(),
+                    "drift flush: {why}, requeuing"
+                );
+                failed.push(drift);
+                continue;
+            }
             let after = self.block_store().last_block_id(drift.target_ctx);
             // The author is whoever STAGED this item, not whoever is running
             // flush — see `StagedDrift::staged_by`.
@@ -1525,61 +1567,157 @@ mod tests {
         );
     }
 
-    /// The router fallback in `drift_push` (kept "for anything registered in
-    /// this process the DB cannot resolve") is not dead weight: `kj context
-    /// archive` sets `archived_at` in the DB — which
-    /// `refs::resolve_context_arg` excludes via `list_active_contexts` — but
-    /// does not unregister the context from the in-memory `DriftRouter`
-    /// (`context_archive_flips_drift_router_state` above pins that it only
-    /// flips the handle's state). So an archived-but-still-registered
-    /// context is exactly the "live-only registration" the fallback exists
-    /// for. This is the receipt for docs/issues.md item 3's "delete the
-    /// fallback if it's never needed" branch: it is needed.
+    /// `drift push` must refuse an archived target, the same as `kj drive`
+    /// (`kj/drive.rs`'s `drive_refuses_an_archived_context`). This used to be
+    /// the receipt FOR the router fallback (`docs/issues.md` item 3): an
+    /// archived-but-still-registered context resolved through
+    /// `DriftRouter::resolve_context` and the drift landed anyway. The
+    /// fallback is deleted now (see the comment at `drift_push`'s target
+    /// resolution) — `KernelDb::resolve_context` already parses a full UUID
+    /// through `get_context`, which does not filter archived rows, so this
+    /// is reachable exactly the way `drive`'s own test reaches it: by full
+    /// UUID, not by label (label resolution excludes archived rows via
+    /// `list_active_contexts`, in both the DB resolver and, previously, the
+    /// router's `resolve_context`, so the fallback was never reachable by
+    /// label either — a genuinely live context has no case that resolves
+    /// through the router and not the DB, since every production
+    /// registration writes both in the same call).
     #[tokio::test]
-    async fn drift_push_resolves_archived_context_via_router_fallback() {
+    async fn drift_push_refuses_an_archived_target() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-        let target = register_context(&d, Some("target"), Some(parent), principal);
+        let target = register_context(&d, Some("target"), None, principal);
         let pusher = register_context(&d, Some("pusher"), None, principal);
         d.block_store()
             .create_document(target, crate::DocumentKind::Conversation, None)
             .unwrap();
+        d.kernel_db().lock().archive_context(target).unwrap();
 
-        let archiver = confirmed_caller(parent);
-        let archived = d
-            .dispatch(&[s("context"), s("archive"), s("target")], &archiver)
+        let c = caller_with_context(pusher);
+        // Address it by full UUID — the path that bypasses the active-context
+        // filter and is therefore the one that must be gated here.
+        let result = d
+            .dispatch(&[s("drift"), s("push"), target.to_hex(), s("hi")], &c)
             .await;
-        assert!(archived.is_ok(), "archive failed: {}", archived.message());
+        assert!(!result.is_ok(), "an archived target must refuse a push");
+        let msg = result.message();
+        assert!(msg.contains("archived"), "error should say why: {msg}");
+        assert!(
+            msg.contains("fork it to continue"),
+            "error should point at the recovery: {msg}"
+        );
 
-        // Sanity: the DB-only resolver can no longer name the archived
-        // context by label — this is the gap the router fallback covers.
-        {
-            let db = d.kernel_db().lock();
-            let c = caller_with_context(pusher);
-            assert!(
-                crate::kj::refs::resolve_context_arg(Some("target"), &c, &db).is_err(),
-                "an archived context must not resolve through the DB-active resolver"
-            );
-        }
+        let blocks = d.block_store().block_snapshots(target).expect("snapshots");
+        assert!(
+            !blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Drift),
+            "a refused push must not insert a drift block: {blocks:?}"
+        );
+    }
+
+    /// The `Concluded` half of the same refusal — reachable by LABEL,
+    /// unlike the archived case, since `Concluded` does not set
+    /// `archived_at` and so is not excluded by `list_active_contexts`.
+    #[tokio::test]
+    async fn drift_push_refuses_a_concluded_target() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("target"), None, principal);
+        let pusher = register_context(&d, Some("pusher"), None, principal);
+        d.block_store()
+            .create_document(target, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.kernel_db().lock().conclude_context(target).unwrap();
 
         let c = caller_with_context(pusher);
         let result = d
             .dispatch(&[s("drift"), s("push"), s("target"), s("hi")], &c)
             .await;
+        assert!(!result.is_ok(), "a concluded target must refuse a push");
+        let msg = result.message();
+        assert!(msg.contains("concluded"), "error should say why: {msg}");
         assert!(
-            result.is_ok(),
-            "push must still reach an archived-but-registered context via the \
-             router fallback: {}",
+            msg.contains("fork it to continue"),
+            "error should point at the recovery: {msg}"
+        );
+
+        let blocks = d.block_store().block_snapshots(target).expect("snapshots");
+        assert!(
+            !blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Drift),
+            "a refused push must not insert a drift block: {blocks:?}"
+        );
+    }
+
+    /// The `--stage` half must refuse too — a staged item must not deliver
+    /// into an archived target just because the check at push time only
+    /// covers the immediate path.
+    #[tokio::test]
+    async fn drift_push_stage_refuses_an_archived_target() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("target"), None, principal);
+        let pusher = register_context(&d, Some("pusher"), None, principal);
+        d.block_store()
+            .create_document(target, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.kernel_db().lock().archive_context(target).unwrap();
+
+        let c = caller_with_context(pusher);
+        let result = d
+            .dispatch(
+                &[s("drift"), s("push"), s("--stage"), target.to_hex(), s("hi")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "staging into an archived target must refuse");
+        assert!(result.message().contains("archived"), "msg: {}", result.message());
+
+        let result = d.dispatch(&[s("drift"), s("queue")], &c).await;
+        assert_eq!(
+            result.message(),
+            "(queue empty)",
+            "a refused stage must not queue anything"
+        );
+    }
+
+    /// The TOCTOU half: a target that was LIVE when a drift was staged but
+    /// is archived by the time `flush` runs must not receive it either —
+    /// the check at push/stage time alone is not enough. The item requeues
+    /// like any other undeliverable drift rather than being silently
+    /// dropped or forced through.
+    #[tokio::test]
+    async fn drift_flush_refuses_a_target_archived_after_staging() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("target"), None, principal);
+        let pusher = register_context(&d, Some("pusher"), None, principal);
+        d.block_store()
+            .create_document(target, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(pusher);
+        let staged = d
+            .dispatch(
+                &[s("drift"), s("push"), s("--stage"), s("target"), s("hi")],
+                &c,
+            )
+            .await;
+        assert!(staged.is_ok(), "stage failed: {}", staged.message());
+
+        // Archived AFTER staging, before flush.
+        d.kernel_db().lock().archive_context(target).unwrap();
+
+        let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(result.is_ok(), "flush call itself: {}", result.message());
+        assert!(
+            result.message().contains("0/1") && result.message().contains("requeued"),
+            "the item must requeue, not deliver: {}",
             result.message()
         );
 
         let blocks = d.block_store().block_snapshots(target).expect("snapshots");
         assert!(
-            blocks
-                .iter()
-                .any(|b| b.kind == kaijutsu_types::BlockKind::Drift && b.content.contains("hi")),
-            "drift should have landed in the archived target"
+            !blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Drift),
+            "a target archived before flush must not receive the drift: {blocks:?}"
         );
     }
 
@@ -2288,6 +2426,239 @@ mod tests {
             drift_block.content.contains("CHEAP-DISTILL"),
             "--distill-model must win over both the source's and caller's own cast: {:?}",
             drift_block.content
+        );
+    }
+
+    /// The bug the two tests above never exercised: the puller had an
+    /// EXPLICIT `DriftRouter` override in both, so the refusal's own
+    /// comparison always had two `Some/Some` pairs to compare. The far more
+    /// common shape is a puller that has never been pinned at all — a fresh
+    /// context resolving through the registry default — pulling from a
+    /// source that IS pinned. Before the fix, `resolve_context_pair`'s
+    /// predecessor read the puller's pair straight off the (unset)
+    /// `DriftRouter` handle, got `(None, None)`, and the refusal's `if let
+    /// (Some((Some(sp), Some(sm))), Some((Some(cp), Some(cm))))` guard never
+    /// matched — the pull went through and silently billed the unpinned
+    /// puller on the source's expensive cast.
+    #[tokio::test]
+    async fn drift_pull_refuses_when_puller_has_no_explicit_override() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        let dest = register_context(&d, Some("dest"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(dest, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                source,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "anthropic",
+                Arc::new(Provider::Mock(MockClient::new("ANTHROPIC-DISTILL"))),
+            );
+            reg.register(
+                "deepseek",
+                Arc::new(Provider::Mock(MockClient::new("DEEPSEEK-DISTILL"))),
+            );
+            // The registry's own default — what `dest` resolves to, since it
+            // is never pinned via `configure_llm` or `context set --model`.
+            reg.set_default("deepseek");
+            reg.set_default_model("deepseek-flash");
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "anthropic", "claude-opus-5");
+            // `dest` deliberately gets no `configure_llm` call — it must
+            // still resolve (to the registry default) for the refusal to
+            // see it, not read back as an unresolvable `(None, None)`.
+        }
+
+        let c = caller_with_context(dest);
+        let result = d
+            .dispatch(&[s("drift"), s("pull"), s("source")], &c)
+            .await;
+        assert!(
+            !result.is_ok(),
+            "an unpinned puller resolving to a different pair than the source must refuse"
+        );
+        let msg = result.message();
+        assert!(
+            msg.contains("anthropic/claude-opus-5"),
+            "error must name the source's resolved pair: {msg}"
+        );
+        assert!(
+            msg.contains("deepseek/deepseek-flash"),
+            "error must name the puller's resolved (registry-default) pair: {msg}"
+        );
+        assert!(
+            msg.contains("--distill-model"),
+            "error must point at the escape hatch: {msg}"
+        );
+
+        let blocks = d.block_store().block_snapshots(dest).unwrap();
+        assert!(
+            !blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Drift),
+            "a refused pull must not insert a drift block: {blocks:?}"
+        );
+    }
+
+    /// The non-refusal half of the same fix: two contexts that resolve to
+    /// the SAME pair (both unpinned, both landing on the one registered
+    /// provider) must still pull cleanly — resolving both sides through the
+    /// ladder must not turn an ordinary same-cast pull into a false-positive
+    /// refusal.
+    #[tokio::test]
+    async fn drift_pull_does_not_refuse_when_both_resolve_to_the_same_pair() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        let dest = register_context(&d, Some("dest"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(dest, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                source,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "mock",
+                Arc::new(Provider::Mock(MockClient::new("SAME-CAST-DISTILL"))),
+            );
+            reg.set_default("mock");
+            reg.set_default_model("mock-model");
+        }
+        // Neither context is pinned — both resolve through the one registry
+        // default, landing on the same pair.
+
+        let c = caller_with_context(dest);
+        let result = d
+            .dispatch(&[s("drift"), s("pull"), s("source")], &c)
+            .await;
+        assert!(result.is_ok(), "same-pair pull must not refuse: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(dest).unwrap();
+        let drift_block = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("drift block");
+        assert!(
+            drift_block.content.contains("SAME-CAST-DISTILL"),
+            "drift block should carry the distilled summary: {:?}",
+            drift_block.content
+        );
+    }
+
+    /// The other half of the same-ladder fix: a source context with NO
+    /// explicit override but an assigned CAST must distill on that cast's
+    /// slot model, not fall straight past it to the registry default. Before
+    /// the fix, `summarize_with_model`'s source pair came only from the
+    /// `DriftRouter` handle (`(None, None)` for a cast-slot context), so
+    /// branch 3 ("else the source context's OWN provider+model") always
+    /// missed the cast and landed on branch 4 (the registry default).
+    #[tokio::test]
+    async fn summarize_uses_the_source_contexts_cast_slot_when_unpinned() {
+        use crate::llm::{MockClient, Provider, ResolvedSlot, SlotTunables};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                source,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        let c = caller_with_context(source);
+        let cast_created = d.dispatch(&[s("cast"), s("create"), s("house")], &c).await;
+        assert!(cast_created.is_ok(), "cast create failed: {}", cast_created.message());
+        let cast_set = d
+            .dispatch(&[s("context"), s("set"), s("--cast"), s("house")], &c)
+            .await;
+        assert!(cast_set.is_ok(), "context set --cast failed: {}", cast_set.message());
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "castbackend",
+                Arc::new(Provider::Mock(MockClient::new("CAST-SLOT-DISTILL"))),
+            );
+            reg.register(
+                "defaultbackend",
+                Arc::new(Provider::Mock(MockClient::new("REGISTRY-DEFAULT-DISTILL"))),
+            );
+            // A different provider as the registry default, so a summary
+            // that lands on it (rather than the cast slot) is unambiguous.
+            reg.set_default("defaultbackend");
+            reg.set_default_model("default-model");
+            reg.set_cast_slots(vec![(
+                "house".to_string(),
+                ResolvedSlot {
+                    // `register_context` always sets `context_type: "default"`.
+                    role: "default".to_string(),
+                    backend: "castbackend".to_string(),
+                    model: "cast-model".to_string(),
+                    tunables: SlotTunables::default(),
+                    loadout: None,
+                    extra: None,
+                },
+            )]);
+        }
+        // `source` deliberately gets no `configure_llm`/`--model` override —
+        // its only signal is the cast just assigned.
+
+        let summary = d
+            .summarize_with_model(source, None, None)
+            .await
+            .expect("summarize failed");
+        assert!(
+            summary.contains("CAST-SLOT-DISTILL"),
+            "distillation must run on the source's cast slot model, not the registry default: {summary:?}"
         );
     }
 

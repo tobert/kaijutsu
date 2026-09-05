@@ -328,6 +328,21 @@ mod tests {
     /// covers the same loop wired through the real server boot path; this is
     /// the unit-scoped counterpart that runs with `cargo test -p
     /// kaijutsu-kernel` alone.
+    ///
+    /// NOT `#[tokio::test(start_paused = true)]`: a paused virtual clock
+    /// would make the loop's OWN scheduling deterministic, but the thing
+    /// this test actually asserts on — "the second tick is LATER than the
+    /// first" — is a comparison of two `refresh_once`-stamped
+    /// `roster.refreshed_at()` values, and that stamp is
+    /// `kaijutsu_types::now_millis()`, real `SystemTime::now()`
+    /// (`roster_sources.rs`'s `refresh_once`), not a `tokio::time::Instant`.
+    /// Advancing the virtual clock does not move that clock at all, so a
+    /// paused test could deliver both ticks within the same real
+    /// millisecond and the "later" assertion would be the flaky one instead
+    /// — trading one flake vector for a worse one. Wall-clock deadlines stay,
+    /// widened from 2s to 10s so scheduler contention under load (the actual
+    /// flake vector — two 20ms-interval ticks landing inside a 2s budget is
+    /// otherwise generous) doesn't trip them.
     #[tokio::test]
     async fn spawn_periodic_refresh_ticks_and_cancels() {
         let (db, _ctx) = db_with_context("agent-a");
@@ -346,7 +361,7 @@ mod tests {
         // `tokio::time::interval`'s own contract is that the first tick
         // fires immediately, so this must land well inside the polling
         // deadline rather than needing anywhere near the loop's interval.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if roster.refreshed_at().is_some() {
                 break;
@@ -360,7 +375,7 @@ mod tests {
         let first_refresh = roster.refreshed_at().unwrap();
 
         // A second, later tick proves this is a loop, not a one-shot.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             if roster.refreshed_at().unwrap() > first_refresh {
                 break;
@@ -373,7 +388,7 @@ mod tests {
         }
 
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(10), handle)
             .await
             .expect("cancelling the token must end the loop promptly")
             .expect("the loop task must not panic");

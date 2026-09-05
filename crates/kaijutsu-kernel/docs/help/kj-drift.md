@@ -28,6 +28,9 @@ the one-shot summary, same as `fork --compact --distill-model`.
 
 ## Delivery
 
+`push` refuses an archived or concluded target — fork it to continue — checked
+both when you push (or `--stage`) and again when a staged item flushes.
+
 `push` delivers on the spot — the content is a durable block in the target's
 document when the command returns:
 

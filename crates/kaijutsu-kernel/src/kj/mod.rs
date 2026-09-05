@@ -767,23 +767,22 @@ impl KjDispatcher {
 
         let user_prompt = build_distillation_prompt(&blocks, directed_prompt);
 
-        // The SOURCE context's own (provider, model) pair, and — only when
-        // the caller is a different context — the CALLER's own pair. Both
-        // read under one lock acquisition (a second `self.drift.read()`
-        // while the first is still held risks deadlock on a
-        // writer-preferring lock). Guard drops at the block's end; no await
-        // while held.
-        let (ctx_pair, caller_pair) = {
-            let router = self.drift.read();
-            let ctx_pair = router.get(context_id).map(|h| (h.provider.clone(), h.model.clone()));
-            let caller_pair = caller_context_id
-                .filter(|id| *id != context_id)
-                .and_then(|id| router.get(id))
-                .map(|h| (h.provider.clone(), h.model.clone()));
-            (ctx_pair, caller_pair)
-        };
-
         let registry = self.kernel.llm().read().await;
+
+        // The SOURCE context's own effective (backend, model) pair, and —
+        // only when the caller is a different context — the CALLER's own
+        // pair. Resolved through the SAME ladder the turn path walks
+        // (`resolve_context_model`: explicit context override → cast slot on
+        // context_type → registry default), not read off the `DriftRouter`
+        // handle: that handle is populated only for a context with an
+        // explicit per-context model override, so a cast-slot or
+        // default-resolved context always answered `(None, None)` there and
+        // the cross-cast refusal below silently never fired for the common
+        // case of an unpinned caller pulling from a pinned expensive source.
+        let ctx_pair = self.resolve_context_pair(context_id, &registry);
+        let caller_pair = caller_context_id
+            .filter(|id| *id != context_id)
+            .and_then(|id| self.resolve_context_pair(id, &registry));
 
         // Distillation model resolution:
         //   1. explicit `--distill-model` → the SAME grammar as `--model`
@@ -823,8 +822,7 @@ impl KjDispatcher {
                 (provider, p_name, m)
             }
             None => {
-                if let (Some((Some(sp), Some(sm))), Some((Some(cp), Some(cm)))) =
-                    (&ctx_pair, &caller_pair)
+                if let (Some((sp, sm)), Some((cp, cm))) = (&ctx_pair, &caller_pair)
                     && (sp != cp || sm != cm)
                 {
                     return Err(format!(
@@ -836,7 +834,7 @@ impl KjDispatcher {
                     ));
                 }
                 match ctx_pair {
-                    Some((Some(p_name), Some(m))) => {
+                    Some((p_name, m)) => {
                         let provider = registry.get(&p_name).ok_or_else(|| {
                             format!(
                                 "distillation: the source context's provider '{p_name}' is not \
@@ -845,10 +843,10 @@ impl KjDispatcher {
                         })?;
                         (provider, p_name, m)
                     }
-                    // The source context lacks a complete provider+model pair;
-                    // fall to the registry default rather than pinning a
-                    // half-known model on a possibly-wrong provider.
-                    _ => {
+                    // The source context resolved to no pair at all (row
+                    // unreadable/missing and no registry default); fall to
+                    // the registry default rather than erroring outright.
+                    None => {
                         let name = registry
                             .default_provider_name()
                             .ok_or("no LLM configured")?
@@ -874,6 +872,49 @@ impl KjDispatcher {
                      `--distill-model provider/model`"
                 )
             })
+    }
+
+    /// Resolve a context's effective (backend, model) pair through the same
+    /// ladder the turn path walks — explicit per-context override, else a
+    /// cast slot matched on `context_type`, else the registry default
+    /// (`model_resolution::resolve_context_model`).
+    ///
+    /// The override tier reads the `DriftRouter` handle, not the context
+    /// row's `provider`/`model` columns — that is the field
+    /// `llm_stream.rs`'s `spawn_llm_for_prompt` actually reads for a live
+    /// turn (`ctx_provider_name`/`ctx_model`), and every production write
+    /// path keeps the two in sync (`apply_context_config` writes both the DB
+    /// row and the handle in the same call). The row is still read here for
+    /// `context_type` and `cast_id` — the DriftRouter handle carries
+    /// neither, so the cast-slot tier has no other source.
+    ///
+    /// `None` only when the context row cannot be read (removed context, DB
+    /// error) or when nothing in the ladder can answer (no registry default
+    /// configured) — never a guess standing in for an unresolvable pair.
+    fn resolve_context_pair(
+        &self,
+        context_id: ContextId,
+        registry: &crate::llm::LlmRegistry,
+    ) -> Option<(String, String)> {
+        let row = self.kernel_db().lock().get_context(context_id).ok().flatten()?;
+        let (provider_override, model_override) = self
+            .drift
+            .read()
+            .get(context_id)
+            .map(|h| (h.provider.clone(), h.model.clone()))
+            .unwrap_or((None, None));
+        let cast_label = row
+            .cast_id
+            .and_then(|cid| self.kernel_db().lock().get_cast(cid).ok().flatten())
+            .map(|c| c.label);
+        let resolved = crate::model_resolution::resolve_context_model(
+            &row.context_type,
+            provider_override.as_deref(),
+            model_override.as_deref(),
+            cast_label.as_deref(),
+            registry,
+        )?;
+        Some((resolved.backend, resolved.model))
     }
 }
 
