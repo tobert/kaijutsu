@@ -488,10 +488,11 @@ Each slice is independently shippable and leaves the tree green.
 3. **rc union.** Two directories, one sorted list, collision is an error,
    `KJ_CONTEXT_TYPE` and `KJ_CHARACTER` seeded; `characters.rc_dir` arrives.
    Reseed leaves character dirs alone (they are not shipped defaults).
-4. **Roster inversion.** After the periodic refresh is wired into
-   production (`roster_sources.rs:183` says it is not called from anywhere
-   yet): `kj roster` groups rows by character, presence specified as the
-   aggregation above.
+4. **Roster inversion.** `kj roster` groups rows by character, presence
+   specified as the aggregation above. The periodic refresh is already wired:
+   `create_shared_kernel` spawns it every 10 s under the server's shutdown
+   token (`kaijutsu-server/src/rpc.rs:2984`; `roster_sources.rs:67`). A stale
+   doc comment said otherwise until 2026-09-05.
 5. **Drift to a character.** `@name` addressing; one resolver.
 6. **Janitor, then proctor.** The `yakin` character, its track, its tick rc;
    `accountable_to` and `default_cast_id` arrive with the character rows that
@@ -561,8 +562,8 @@ it.
   `auth.db` renames and deletes principals; the handoff on an ordinary
   context instead of a track score; explicit `@name` drift addressing in
   place of a liveness-dependent fallback; no automatic rc inheritance up
-  the accountability chain; rc output keeps its `created_by` author; the
-  roster inversion waits for the refresh loop to be wired; slice 1 trimmed
+  the accountability chain; rc output keeps its `created_by` author; the roster inversion was gated on wiring the refresh loop, which
+  turned out to be wired already; slice 1 trimmed
   to identity and attribution with the sheet's other columns arriving with
   their readers; the `PrincipalId` consumer audit. Declined, for Amy:
   a distinct `CharacterId` (recorded under Open); deferring the rc union
