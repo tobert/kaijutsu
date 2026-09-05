@@ -1185,6 +1185,10 @@ async fn dispatch_inline_tool_result(
     tool_ctx: &kaijutsu_kernel::ExecContext,
     cancel: tokio_util::sync::CancellationToken,
     tool_use_id: &str,
+    // PROVIDER-OUTPUT: this ToolCall block records the model's own callback
+    // request, the same as an ordinary streamed tool-use event — stamp the
+    // caller's actor principal, not a literal system() here.
+    actor_principal: PrincipalId,
 ) -> InlineToolResult {
     // Tool kind no longer has a registry category at this layer.  This is the
     // same conservative marker ordinary streamed tool calls use.
@@ -1196,7 +1200,7 @@ async fn dispatch_inline_tool_result(
         tool_name,
         input.clone(),
         Some(tool_kind),
-        Some(PrincipalId::system()),
+        Some(actor_principal),
         Some(tool_use_id.to_owned()),
         None,
     ) {
@@ -1384,6 +1388,21 @@ async fn process_llm_stream(
     // id, not at spawn racing the model.
     origin: TurnOrigin,
 ) {
+    // The principal stamped on blocks this stream authors. Two provenance
+    // categories share the turn: PROVIDER-OUTPUT is content the LLM itself
+    // produced — the streamed Thinking and Text blocks and their appends,
+    // and a ToolCall block, whether it arrives as an ordinary tool-use event
+    // or an inline provider callback — and stamps `actor_principal` at its
+    // insert and at every append/edit that extends the same block.
+    // KERNEL-OUTPUT is everything the kernel itself authors about the turn —
+    // tool results, structured tool errors, the max-iterations halt,
+    // interrupt/quiesce/staging notices, warnings — and stamps
+    // `PrincipalId::system()` directly at each site, never this binding.
+    // Resolved once so every provider-output site agrees; today it equals
+    // `PrincipalId::system()`, kept as its own binding so per-model
+    // attribution can retarget it later without touching call sites.
+    let actor_principal: PrincipalId = PrincipalId::system();
+
     // Get per-context mailbox lock — held for the entire stream,
     // serializing concurrent prompts to the same context (Fix D+E).
     // The mailbox holds the live conversation session (see
@@ -1815,7 +1834,7 @@ async fn process_llm_stream(
                         "",
                         Status::Running,
                         ContentType::Plain,
-                        Some(PrincipalId::system()),
+                        Some(actor_principal),
                     ) {
                         Ok(block_id) => {
                             last_block_id = block_id;
@@ -1840,7 +1859,7 @@ async fn process_llm_stream(
                             context_id,
                             block_id,
                             &text,
-                            Some(PrincipalId::system()),
+                            Some(actor_principal),
                         )
                     {
                         log::error!("Failed to append thinking text: {}", e);
@@ -1887,7 +1906,7 @@ async fn process_llm_stream(
                         "",
                         Status::Running,
                         ContentType::Plain,
-                        Some(PrincipalId::system()),
+                        Some(actor_principal),
                     ) {
                         Ok(block_id) => {
                             last_block_id = block_id;
@@ -1910,7 +1929,7 @@ async fn process_llm_stream(
                             context_id,
                             block_id,
                             &text,
-                            Some(PrincipalId::system()),
+                            Some(actor_principal),
                         )
                     {
                         log::error!("Failed to append text: {}", e);
@@ -1943,7 +1962,7 @@ async fn process_llm_stream(
                         &name,
                         input.clone(),
                         Some(tool_kind),
-                        Some(PrincipalId::system()),
+                        Some(actor_principal),
                         Some(id.clone()),
                         None,
                     ) {
@@ -1982,6 +2001,7 @@ async fn process_llm_stream(
                         &tool_ctx,
                         interrupt.cancel.clone(),
                         &id,
+                        actor_principal,
                     )
                     .await;
 
@@ -4171,5 +4191,239 @@ mod usage_tests {
                 assert_eq!(blocks.len(), 252);
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod authorship_tests {
+    //! Pins the PROVIDER-OUTPUT / KERNEL-OUTPUT block-provenance split drawn
+    //! around `actor_principal` (see its declaration comment near the top of
+    //! `process_llm_stream`). Two kinds of coverage:
+    //!
+    //! - a driven turn's real blocks carry the expected principal on each
+    //!   category — regression coverage against a `None` author or a block
+    //!   landing with an unrelated principal;
+    //! - the source itself is checked for the two call-site markers
+    //!   (`Some(actor_principal)` vs `Some(PrincipalId::system())`), because
+    //!   `actor_principal` equals `PrincipalId::system()` today (this is a
+    //!   no-behavior-change refactor) — no block's runtime value can tell a
+    //!   provider-output site that regressed to a literal `system()` call
+    //!   apart from one that didn't. Only the source text can, so that is
+    //!   what these two pin.
+    use super::*;
+    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
+    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
+    use kaijutsu_kernel::kernel_db::KernelDb;
+    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use kaijutsu_types::SessionId;
+
+    use crate::interrupt::ContextInterruptState;
+    use crate::rpc::ConversationCache;
+
+    /// Drive one turn against a scripted Mock provider that emits a Thinking
+    /// block, a Text block, and a tool call against a tool that doesn't
+    /// exist — the dispatch failure still produces a durable ToolResult plus
+    /// a structured Error child, the same shape `usage_tests` relies on —
+    /// then a second iteration's final text closes the turn. Returns the
+    /// documents store so the caller can inspect every block's author.
+    async fn drive_turn_with_tool_call(kernel: Arc<Kernel>) -> (SharedBlockStore, ContextId) {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let documents: SharedBlockStore = Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let ctx = ContextId::new();
+        documents
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let player = PrincipalId::new();
+        let after = documents
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "write a phrase",
+                Status::Done,
+                ContentType::Plain,
+                Some(player),
+            )
+            .unwrap();
+
+        let provider = Arc::new(Provider::Mock(MockClient::new("unused").with_scripted_stream(
+            vec![
+                vec![
+                    StreamEvent::ThinkingStart,
+                    StreamEvent::ThinkingDelta("reasoning about it".into()),
+                    StreamEvent::ThinkingEnd { signature: None },
+                    StreamEvent::TextStart,
+                    StreamEvent::TextDelta("checking a tool".into()),
+                    StreamEvent::TextEnd,
+                    StreamEvent::ToolUse {
+                        id: "call_1".into(),
+                        name: "nonexistent_tool".into(),
+                        input: serde_json::json!({}),
+                    },
+                    StreamEvent::Done {
+                        stop_reason: Some("tool_use".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        extra: None,
+                    },
+                ],
+                vec![
+                    StreamEvent::TextStart,
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::TextEnd,
+                    StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        input_tokens: Some(20),
+                        output_tokens: Some(8),
+                        extra: None,
+                    },
+                ],
+            ],
+        )));
+
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let conversation_cache = Arc::new(ConversationCache::new(8));
+        let interrupt = ContextInterruptState::new(1);
+        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            player,
+            ctx,
+            std::path::PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+
+        process_llm_stream(
+            provider,
+            documents.clone(),
+            ctx,
+            "mock-model".to_string(),
+            kernel.clone(),
+            kernel_db,
+            vec![],
+            after,
+            "system".to_string(),
+            1024,
+            StreamTimeouts::from_policy(kernel.timeouts()),
+            None,
+            conversation_cache,
+            player,
+            tool_ctx,
+            interrupt,
+            1,
+            context_interrupts,
+            TurnOrigin::Autonomous,
+        )
+        .await;
+
+        (documents, ctx)
+    }
+
+    /// PROVIDER-OUTPUT blocks (Thinking, Text, ToolCall) carry the system
+    /// principal today, the value `actor_principal` resolves to. This alone
+    /// can't distinguish the shared binding from an independent literal call
+    /// (see module doc) — it pins that the split didn't regress to `None` or
+    /// some unrelated principal on any of these three kinds.
+    #[tokio::test]
+    async fn provider_output_blocks_carry_the_system_principal() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("authorship-provider").await);
+                let (documents, ctx) = drive_turn_with_tool_call(kernel).await;
+                let blocks = documents.block_snapshots(ctx).unwrap();
+
+                let thinking = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::Thinking)
+                    .expect("thinking block inserted");
+                assert_eq!(thinking.id.principal_id, PrincipalId::system());
+
+                let text_blocks: Vec<_> = blocks
+                    .iter()
+                    .filter(|b| b.kind == BlockKind::Text && b.role == Role::Model)
+                    .collect();
+                assert!(!text_blocks.is_empty(), "at least one model text block");
+                for t in &text_blocks {
+                    assert_eq!(t.id.principal_id, PrincipalId::system());
+                }
+
+                let tool_call = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::ToolCall)
+                    .expect("tool call block inserted");
+                assert_eq!(tool_call.id.principal_id, PrincipalId::system());
+            })
+            .await;
+    }
+
+    /// KERNEL-OUTPUT blocks (ToolResult, the structured tool Error) carry the
+    /// system principal too — stamped directly at each site, never through
+    /// `actor_principal`.
+    #[tokio::test]
+    async fn kernel_output_blocks_carry_the_system_principal() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("authorship-kernel").await);
+                let (documents, ctx) = drive_turn_with_tool_call(kernel).await;
+                let blocks = documents.block_snapshots(ctx).unwrap();
+
+                let tool_result = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::ToolResult)
+                    .expect("tool result block inserted");
+                assert_eq!(tool_result.id.principal_id, PrincipalId::system());
+
+                let error_block = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::Error)
+                    .expect("the nonexistent-tool dispatch produces a structured error block");
+                assert_eq!(error_block.id.principal_id, PrincipalId::system());
+            })
+            .await;
+    }
+
+    /// Source-level pin: `actor_principal` (PROVIDER-OUTPUT) and a literal
+    /// `PrincipalId::system()` (KERNEL-OUTPUT) resolve to the same value
+    /// today, so no block's content can tell the two call-site categories
+    /// apart at runtime — only the source text can. These counts are the
+    /// ones established at the refactor: 6 provider-output sites share the
+    /// binding, 15 kernel-output sites stamp `system()` directly. Moving a
+    /// site between categories, in either direction, changes both counts.
+    /// Only the code above this test module counts as a classification
+    /// site — the module's own doc comments and assertion strings quote
+    /// both markers verbatim and would otherwise inflate the count.
+    fn production_source() -> &'static str {
+        let source = include_str!("llm_stream.rs");
+        source
+            .split("mod authorship_tests")
+            .next()
+            .expect("this file contains its own module name")
+    }
+
+    #[test]
+    fn provider_output_sites_use_the_actor_principal_binding() {
+        let actor_sites = production_source().matches("Some(actor_principal)").count();
+        assert_eq!(
+            actor_sites, 6,
+            "expected 6 provider-output sites stamping `Some(actor_principal)` — a \
+             different count means a site was recategorized (or a provider-output site \
+             reverted to a literal `Some(PrincipalId::system())`) without updating this pin"
+        );
+    }
+
+    #[test]
+    fn kernel_output_sites_stamp_system_literally() {
+        let system_sites = production_source().matches("Some(PrincipalId::system())").count();
+        assert_eq!(
+            system_sites, 15,
+            "expected 15 kernel-output sites stamping `Some(PrincipalId::system())` \
+             directly — a different count means a kernel-output site was switched onto \
+             `actor_principal` (or a provider-output site off it) without updating this pin"
+        );
     }
 }
