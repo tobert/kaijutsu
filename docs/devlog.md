@@ -2501,3 +2501,16 @@ performs it, and asked for an explicit address when a note is meant for a
 character rather than a live context. `docs/character.md` carries the
 slices; slice one is a column and that stamp.
 
+The prework went out the same afternoon as six small lanes, each in its own
+files, committed by the lead one at a time. Two of them turned into
+corrections instead of fixes: a comment said the roster's refresh loop was
+never called, and it had been called since August; the lead had read the
+turn path as stamping the driving human on model blocks, and it stamped the
+system principal. Both had been gated on in the design. The rule that came
+out of the day is small: run `git log -S` on a comment before building on
+it. The third lane found the restart mystery from Thursday, which was never
+the kernel: the hook listener archived its own context on any session's
+end, because the id it thought was its own came from a transcript scrape
+that named the session before. Amy reconnected to the fixed binary before
+lunch.
+
