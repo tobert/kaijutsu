@@ -2510,18 +2510,15 @@ the honest shape, not a landmine. What this leaves of the anchor idea is
 "never swept by age" and, maybe, "parentless"; the cascade-stops behaviour
 below is moot.
 
-**Open from the same conversation — what happens to an archived context's
-label.** Amy: *"archive maybe gets an auto-rename? or un-name? tho I guess we
-want to save the original name somewhere. perhaps they just fall out of the
-hot indexes."* The last reading is the cheapest and keeps the name where it
-was: the label stays on the row, and archived rows leave the live-name
-index. Concretely: the unique index on `contexts.label` becomes partial on
-`archived_at IS NULL` (an existing DB needs a drop-and-recreate at open;
-there is no index migration today), `find_context_by_label` prefers the live
-holder, and `DriftRouter` drops the label from `label_to_id` on archive.
-Then `ROOT-0815` can be archived and a live `ROOT-0815` created a year later
-without a collision, and `kj context list`'s archived view still shows the
-old name. Not built; Amy's go wanted.
+**Decided and built (Amy, 2026-09-05): archived contexts keep their name
+and leave the live index.** *"let's only index live contexts and let names
+stay when they're archived, that way we can find all the roots easy or
+whatever in search."* The unique index on `contexts.label` is partial on
+`archived_at IS NULL` (an old-shape index is rebuilt at open),
+`find_context_by_label` returns the live holder only, and the drift router
+drops an archived context's label from its live map while the handle keeps
+it. So `ROOT-0815` stays findable by name in the archived set, and a live
+`ROOT-0815` could be created tomorrow without a collision.
 
 **Two shapes, cheapest first:**
 
@@ -2553,9 +2550,8 @@ tree fragile.
 - ~~The archive latch prints a **consequence**, not an inventory.~~ Moot as
   of 2026-09-05: there is no cascade; the latch says how many children stay
   live under the archived context.
-- Free the label on archive — see "what happens to an archived context's
-  label" above for the proposed shape. Until then "already in use" and "not
-  found" contradict each other and neither points anywhere.
+- ~~Free the label on archive.~~ Done 2026-09-05: archived rows leave the
+  label index and keep their name.
 
 **Slice 2 — the anchor bit.** A column (`anchored_at`, same shape as
 `promoted_at`/`archived_at`) plus two behaviours: **parentless by
@@ -2630,8 +2626,9 @@ which is a wry confirmation of #2: the forest is representable and renderable
 (the orphan displayed correctly as a root), and the CLI simply cannot ask for
 it deliberately.
 
-**3. An archived context still holds its label, so the label is
-simultaneously "in use" and "not found".** `kj context create ROOT` →
+**3. RESOLVED 2026-09-05 — archived rows leave the label index and keep
+their name.** Kept for the record: an archived context still held its
+label, so the label was simultaneously "in use" and "not found".** `kj context create ROOT` →
 `label conflict: label 'ROOT' already in use`; `kj context info ROOT` →
 `not found: no context matches 'ROOT'`. The uniqueness check sees archived
 rows, resolution does not. `retag` *can* still see the holder (it reported

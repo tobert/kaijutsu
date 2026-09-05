@@ -525,7 +525,13 @@ impl DriftRouter {
     /// 2. Unique label prefix match
     /// 3. Unique hex prefix match
     pub fn resolve_context(&self, query: &str) -> Result<ContextId, DriftError> {
-        let entries = self.contexts.values().map(|h| (h.id, h.label.as_deref()));
+        // Archived contexts are not on the live map: their labels can be
+        // held again by a live context, and a fuzzy form never reaches them.
+        let entries = self
+            .contexts
+            .values()
+            .filter(|h| h.state != ContextState::Archived)
+            .map(|h| (h.id, h.label.as_deref()));
         resolve_context_prefix(entries, query).map_err(|e| match e {
             PrefixError::NoMatch(q) => DriftError::UnknownContext(q),
             PrefixError::Ambiguous { prefix, candidates } => {
@@ -576,6 +582,21 @@ impl DriftRouter {
             .get_mut(&id)
             .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
         handle.state = state;
+        // An archived context keeps its label as history but no longer
+        // holds it: the name is free for a live context, as in the DB's
+        // label index. Coming back from archived reclaims it if still free.
+        if let Some(label) = handle.label.clone() {
+            match state {
+                ContextState::Archived => {
+                    if self.label_to_id.get(&label) == Some(&id) {
+                        self.label_to_id.remove(&label);
+                    }
+                }
+                _ => {
+                    self.label_to_id.entry(label).or_insert(id);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1691,6 +1712,23 @@ mod tests {
         router.unregister(id);
         assert!(router.get(id).is_none());
         assert!(router.resolve_context("test").is_err());
+    }
+
+    #[test]
+    /// An archived context keeps its label as history and frees it.
+    #[test]
+    fn archived_label_is_free_for_a_live_context() {
+        let mut router = DriftRouter::new();
+        let old = ContextId::new();
+        router.register(old, Some("ROOT"), None, PrincipalId::system()).unwrap();
+        router.set_state(old, ContextState::Archived).unwrap();
+
+        let new = ContextId::new();
+        router.register(new, Some("ROOT"), None, PrincipalId::system())
+            .expect("an archived holder must not block the label");
+        assert_eq!(router.get(old).unwrap().label.as_deref(), Some("ROOT"), "the archived handle lost its name");
+        assert_eq!(router.resolve_context("ROOT").unwrap(), new);
+        assert_eq!(router.resolve_context("RO").unwrap(), new, "an archived label must not make a prefix ambiguous");
     }
 
     #[test]

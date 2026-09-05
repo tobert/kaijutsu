@@ -621,8 +621,10 @@ CREATE TABLE IF NOT EXISTS contexts (
     -- (NULL = unknown). See `ContextRow::origin_host`'s doc comment.
     origin_host  TEXT
 );
+-- Labels are unique among LIVE contexts only. An archived context keeps its
+-- label as history and leaves this index, so the name can be given again.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
-    ON contexts(label) WHERE label IS NOT NULL;
+    ON contexts(label) WHERE label IS NOT NULL AND archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
 
@@ -1992,6 +1994,7 @@ impl KernelDb {
         Self::migrate_well_known_lost_found(conn)?;
         Self::migrate_doc_kind_file_collapse(conn)?;
         Self::migrate_archived_context_state(conn)?;
+        Self::migrate_label_index_live_only(conn)?;
         Self::drop_doc_snapshots_content_column(conn)?;
         Ok(())
     }
@@ -2430,6 +2433,33 @@ impl KernelDb {
     /// Idempotent by construction — after the first run the `WHERE` clause
     /// matches zero rows — so this needs no `kernel_migrations` marker and is
     /// safe on every `open()`.
+    /// The label index covers live contexts only (`SCHEMA`,
+    /// `idx_contexts_label`). A DB created when it also covered archived
+    /// rows keeps that index — `CREATE INDEX IF NOT EXISTS` never replaces
+    /// one — so it is rebuilt here when its SQL lacks the archived filter.
+    /// Idempotent; a fresh DB matches and nothing runs.
+    fn migrate_label_index_live_only(conn: &Connection) -> KernelDbResult<()> {
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_contexts_label'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let live_only = current
+            .as_deref()
+            .is_some_and(|sql| sql.contains("archived_at IS NULL"));
+        if live_only {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_contexts_label;
+             CREATE UNIQUE INDEX idx_contexts_label
+                 ON contexts(label) WHERE label IS NOT NULL AND archived_at IS NULL;",
+        )?;
+        Ok(())
+    }
+
     fn migrate_archived_context_state(conn: &Connection) -> KernelDbResult<()> {
         conn.execute(
             "UPDATE contexts SET context_state = 'archived'
@@ -6104,7 +6134,9 @@ impl KernelDb {
         Ok(count as usize)
     }
 
-    /// Find the context that currently holds a given label.
+    /// Find the live context that currently holds a given label. Archived
+    /// contexts keep their label but never hold it: `None` when only
+    /// archived rows carry it, so the label is free to give again.
     pub fn find_context_by_label(&self, label: &str) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
@@ -6112,7 +6144,7 @@ impl KernelDb {
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
-             FROM contexts WHERE label = ?1",
+             FROM contexts WHERE label = ?1 AND archived_at IS NULL",
         )?;
 
         let mut rows = stmt.query(params![label])?;
@@ -13587,5 +13619,77 @@ mod tests {
             vec![(1i64, b"first".to_vec())],
             "the second call must leave no op behind"
         );
+    }
+}
+
+#[cfg(test)]
+mod label_index_tests {
+    //! Labels are unique among live contexts; an archived context keeps its
+    //! name and frees it.
+    use super::*;
+
+    fn index_sql(db: &KernelDb) -> String {
+        db.conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_contexts_label'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn an_archived_context_keeps_its_label_and_frees_it() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let old = make_context_row(Some("ROOT"));
+        insert_context_with_doc(&db, &old, ws_id);
+        assert!(db.archive_context(old.context_id).unwrap());
+
+        let new = make_context_row(Some("ROOT"));
+        insert_context_with_doc(&db, &new, ws_id);
+
+        let archived = db.get_context(old.context_id).unwrap().unwrap();
+        assert_eq!(archived.label.as_deref(), Some("ROOT"), "the archived row lost its name");
+        let holder = db.find_context_by_label("ROOT").unwrap().expect("the live holder");
+        assert_eq!(holder.context_id, new.context_id);
+    }
+
+    #[test]
+    fn two_live_contexts_still_cannot_share_a_label() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        insert_context_with_doc(&db, &make_context_row(Some("ROOT")), ws_id);
+        let dup = make_context_row(Some("ROOT"));
+        let err = db
+            .insert_context_with_document(&dup, ws_id)
+            .expect_err("a second live ROOT must be refused");
+        assert!(err.to_string().contains("already in use"), "{err}");
+    }
+
+    #[test]
+    fn the_old_index_shape_is_rebuilt_at_open() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_contexts_label;
+                 CREATE UNIQUE INDEX idx_contexts_label
+                     ON contexts(label) WHERE label IS NOT NULL;",
+            )
+            .unwrap();
+        assert!(!index_sql(&db).contains("archived_at IS NULL"), "the planted index must be the old shape");
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        assert!(index_sql(&db).contains("archived_at IS NULL"));
+
+        let old = make_context_row(Some("ROOT"));
+        insert_context_with_doc(&db, &old, ws_id);
+        assert!(db.archive_context(old.context_id).unwrap());
+        insert_context_with_doc(&db, &make_context_row(Some("ROOT")), ws_id);
+
+        // A second run is a no-op.
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        assert!(index_sql(&db).contains("archived_at IS NULL"));
     }
 }

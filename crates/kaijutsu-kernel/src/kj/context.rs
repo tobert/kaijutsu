@@ -2844,6 +2844,35 @@ mod tests {
         assert_eq!(router.get(child).unwrap().state, kaijutsu_types::ContextState::Live);
     }
 
+    /// The name of an archived context can be given again — the daily root
+    /// rotation depends on it — and the archived row keeps its own copy.
+    #[tokio::test]
+    async fn context_create_may_reuse_an_archived_label() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let old = register_context(&d, Some("ROOT-old"), Some(parent), principal);
+
+        let c = confirmed_caller(parent);
+        let result = d
+            .dispatch(&[s("context"), s("archive"), s("ROOT-old")], &c)
+            .await;
+        assert!(result.is_ok(), "archive failed: {}", result.message());
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("ROOT-old")], &c)
+            .await;
+        assert!(result.is_ok(), "create over an archived label failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let holder = db.find_context_by_label("ROOT-old").unwrap().expect("a live holder");
+        assert_ne!(holder.context_id, old);
+        assert_eq!(db.get_context(old).unwrap().unwrap().label.as_deref(), Some("ROOT-old"));
+        let router = d.drift_router().read();
+        assert_eq!(router.resolve_context("ROOT-old").unwrap(), holder.context_id);
+    }
+
     #[tokio::test]
     async fn context_archive_flips_drift_router_state() {
         // M2-B3: archive must mark the in-memory drift router state as
