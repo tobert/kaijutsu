@@ -84,14 +84,15 @@ impl KjDispatcher {
     }
 
     /// **Boot rule** (`crate::roster` module doc): a row persisted before
-    /// this process's first refresh must never render as current. Rather
-    /// than depend on `roster_sources::spawn_periodic_refresh` having been
-    /// started somewhere (it isn't wired into production boot yet — see
-    /// `roster_sources.rs`'s module doc), a read surface satisfies the rule
-    /// itself: run one refresh pass inline the first time anything reads the
-    /// roster, then rely on the periodic loop (once it exists) for ongoing
-    /// freshness. Idempotent to call on every `kj roster list` — a no-op
-    /// once `refreshed_at()` is set.
+    /// this process's first refresh must never render as current.
+    /// `roster_sources::spawn_periodic_refresh` is wired into
+    /// `kaijutsu-server`'s `create_shared_kernel` and its first tick fires
+    /// at spawn time, but a read surface cannot assume it already landed
+    /// (a read racing the spawned task, or a caller of this dispatcher
+    /// outside that boot path) — so it satisfies the rule itself: run one
+    /// refresh pass inline the first time anything reads the roster, then
+    /// rely on the periodic loop for ongoing freshness. Idempotent to call
+    /// on every `kj roster list` — a no-op once `refreshed_at()` is set.
     async fn ensure_refreshed(&self) -> KjResult {
         if self.roster().refreshed_at().is_none() {
             let peers = self.kernel().list_peers().await;

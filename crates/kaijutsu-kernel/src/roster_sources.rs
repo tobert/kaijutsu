@@ -179,9 +179,10 @@ pub fn refresh_once(
 /// Spawn the scheduled-periodic refresh loop. Cancels cleanly via `cancel`
 /// (mirrors `kaijutsu-server`'s connection-scoped interval loops, e.g.
 /// `rpc.rs`'s VFS activity subscription) — a kernel-wide task, not
-/// connection-scoped, so its lifetime is the caller's (typically the server
-/// process) to own. **Not called from anywhere in production yet** — see
-/// module doc.
+/// connection-scoped, so its lifetime is the caller's to own. Called from
+/// `kaijutsu-server`'s `create_shared_kernel`, which passes its
+/// `shutdown` `CancellationToken` (fired from `SharedKernelState::drop`) as
+/// `cancel` — see module doc.
 pub fn spawn_periodic_refresh(
     kernel: Arc<Kernel>,
     db: Arc<parking_lot::Mutex<KernelDb>>,
@@ -318,5 +319,63 @@ mod tests {
             !roster.snapshot().unwrap().iter().any(|r| r.entity == RosterEntity::Principal(principal)),
             "a bound peer absent from the refresh's own peer list must not linger"
         );
+    }
+
+    /// `spawn_periodic_refresh` itself, in isolation from a full
+    /// `create_shared_kernel` boot: the first tick lands without a reader,
+    /// a second tick proves it is a loop and not a one-shot, and cancelling
+    /// the token ends the task. `kaijutsu-server/tests/roster_refresh_boot.rs`
+    /// covers the same loop wired through the real server boot path; this is
+    /// the unit-scoped counterpart that runs with `cargo test -p
+    /// kaijutsu-kernel` alone.
+    #[tokio::test]
+    async fn spawn_periodic_refresh_ticks_and_cancels() {
+        let (db, _ctx) = db_with_context("agent-a");
+        let roster = Arc::new(RosterStore::new(db.clone()));
+        let kernel = Arc::new(Kernel::new_ephemeral("roster-refresh-loop-test").await);
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_periodic_refresh(
+            kernel,
+            db,
+            roster.clone(),
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        // `tokio::time::interval`'s own contract is that the first tick
+        // fires immediately, so this must land well inside the polling
+        // deadline rather than needing anywhere near the loop's interval.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if roster.refreshed_at().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_periodic_refresh never ran its first tick"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let first_refresh = roster.refreshed_at().unwrap();
+
+        // A second, later tick proves this is a loop, not a one-shot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if roster.refreshed_at().unwrap() > first_refresh {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_periodic_refresh never ran a second tick"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cancelling the token must end the loop promptly")
+            .expect("the loop task must not panic");
     }
 }
