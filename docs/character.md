@@ -119,9 +119,10 @@ Two facts from that table drive the whole design:
   cascading credentials (`auth_db.rs:242`). A character that must retire
   and never be deleted cannot rest on that as it stands.
 - **rc reads one directory.** `load_rc_scripts` takes `(context_type, verb)`
-  and nothing else; rc scripts see `KJ_CONTEXT`, `KJ_VERB`, `KJ_RC_DEPTH`,
-  `KJ_PARENT_CONTEXT`, `KJ_FORK_INFO`, `KJ_PARENT_BLOCK_COUNT`, `KJ_DRIFT_INFO`
-  (`kj/lifecycle.rs:523–584`), not the type and not a character.
+  and nothing else. rc scripts see `KJ_CONTEXT`, `KJ_VERB`, `KJ_CONTEXT_TYPE`
+  (seeded 2026-09-05), `KJ_RC_DEPTH`, `KJ_PARENT_CONTEXT`, `KJ_FORK_INFO`,
+  `KJ_PARENT_BLOCK_COUNT`, `KJ_DRIFT_INFO` (`kj/lifecycle.rs`, `run_kai_script`),
+  not a character.
 - **Drift addresses contexts only.** Push resolves through
   `refs::resolve_context_arg` (`kj/refs.rs:80`) with a `DriftRouter`
   fallback (`kernel/src/drift.rs:527`) for archived contexts the router
@@ -344,8 +345,8 @@ both sides, loudly**, no shadowing; combine and sort once as one `Vec` by
 filename (`names.sort()` at `:400` is the existing sort; two pre-sorted lists
 concatenated would put a character `S05` after a type `S10`); snapshot every
 body; execute the snapshot. Collision is judged on the link's own filename,
-since that is what governs ordering today (`:372–374`). Two new rc
-variables: `KJ_CONTEXT_TYPE` and `KJ_CHARACTER` (the name). A character
+since that is what governs ordering today (`:372–374`). One new rc
+variable, `KJ_CHARACTER` (the name); `KJ_CONTEXT_TYPE` is already seeded. A character
 script branches in kaish:
 
 ```kaish

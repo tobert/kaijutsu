@@ -309,6 +309,7 @@ impl KjDispatcher {
                         fork_kind,
                         drift_info.as_ref(),
                         verb,
+                        &context_type,
                         script,
                         child_depth,
                         extra_vars,
@@ -480,6 +481,7 @@ async fn run_kai_script(
     fork_kind: Option<ForkKind>,
     drift_info: Option<&DriftInfo>,
     verb: &str,
+    context_type: &str,
     script: &RcScript,
     child_depth: u8,
     extra_vars: &HashMap<String, String>,
@@ -526,6 +528,10 @@ async fn run_kai_script(
     vars.insert(
         "KJ_VERB".into(),
         kaish_kernel::ast::Value::String(verb.to_string()),
+    );
+    vars.insert(
+        "KJ_CONTEXT_TYPE".into(),
+        kaish_kernel::ast::Value::String(context_type.to_string()),
     );
     vars.insert(
         "KJ_RC_DEPTH".into(),
@@ -1191,6 +1197,43 @@ mod tests {
                 .expect("provenance query"),
             None,
             "escape-free rc output must not write a provenance row"
+        );
+    }
+
+    /// The lifecycle resolves `context_type` before any script runs
+    /// (`row.context_type`, read once in `run_rc_lifecycle_inner`) but never
+    /// told `.kai` scripts what it found. `KJ_CONTEXT_TYPE` closes that gap so
+    /// a shared rc bucket can branch on it:
+    /// `case "$KJ_CONTEXT_TYPE" in coder) ... esac`.
+    #[tokio::test]
+    async fn rc_kai_receives_context_type() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/config/rc/test/create/S00-echo-type.kai",
+            "test",
+            "create",
+            "S00",
+            "echo-type",
+            "kai",
+            "echo \"type=$KJ_CONTEXT_TYPE\"",
+        ).await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-type", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-type");
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let trace = snapshots
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Trace)
+            .expect("the echoing script must produce a trace block");
+        assert!(
+            trace.content.contains("type=test"),
+            "KJ_CONTEXT_TYPE must carry the resolved context_type into the .kai env, got: {}",
+            trace.content
         );
     }
 
