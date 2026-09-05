@@ -348,12 +348,17 @@ context, so nothing there changes); a bound roster row per connected lead,
 which is the identity half of the roster inversion for free; and `kj whoami`
 from the bridge saying who is speaking.
 
-Things to read once with the new identity in mind on the first live run:
-whether the SSH server compares the connection's username to the principal's
-username or uses the key alone; the `mcp` type's governance script and the
-hook pipeline's dry-run path for anything keyed on the username `amy`; and
-whether the kernel roster and the cc-peer roster agree about who is in the
-room when one process is two names.
+First live run, 2026-09-05 14:55, zorak: the bridge authenticated with the
+`kaijutsu-lead` key while the SSH username stayed `atobey`, and `whoami`
+answered `kaijutsu-lead`, so **the server resolves the principal from the
+key alone**; the username is not compared. The client's log line
+"Authenticated as atobey with key SHA256:…" names the SSH username, which
+reads as the wrong identity now that keys carry the identity; it should say
+"ssh user". No personal-key warning fired. The hook socket bound on the new
+hosting pid without waiting. Still to read once: the `mcp` type's governance
+script and the hook pipeline's dry-run path for anything keyed on the
+username `amy`, and whether the kernel roster and the cc-peer roster agree
+about who is in the room when one process is two names.
 
 This is slice 1's first character row without the sheet, and the cheapest
 possible test of "a model character is a principal", the question the
