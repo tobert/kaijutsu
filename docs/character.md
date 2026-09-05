@@ -45,6 +45,10 @@ thread that thing through a kernel that already has most of its parts.
   several currencies: tokens, dollars, megabytes, a house scrip) and an
   availability field.
 - **Kaijutsu stays bespoke** for Amy and the fleet. Open source, so who knows.
+- **The principal is the character's key.** No distinct `CharacterId`.
+  Permanence comes from the three rules in the design: kernel-owned name, no
+  deletion while referenced, missing mapping is corruption. Revisit if a
+  surface confuses performer with requester in review.
 
 The word "character" collides with the text unit. In prose, *character* is
 the persistent someone; for text say code point, glyph, or `char`. The
@@ -551,12 +555,6 @@ it.
 
 ## Open
 
-- **Principal key, or a distinct `CharacterId`?** The frontier review wants
-  the distinct id for type safety at API boundaries. This design keeps the
-  principal as the key and gets permanence from three rules (kernel-owned
-  name, no deletion while referenced, missing mapping is corruption). Amy's
-  call; recommendation: principal key, and revisit if a surface confuses
-  performer with requester in review.
 - **Where do principals live?** In `auth.db` today, owned by the server. A
   sheet in `kernel.db` referencing across databases works the way
   `created_by` already does. A real foreign key would need `principals` in

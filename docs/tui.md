@@ -850,6 +850,13 @@ mockup: *"the legend in the status line is awesome, that'll help me a lot, I
 tend to forget keys outside the core stuff I use."* Every grown view (picker,
 ledger) ends with its own key line for the same reason.
 
+**A key never waits on the kernel.** The rank, the pending asks and the
+tracks are fetched on their own task (`refresh.rs`) and folded into the
+app when the result lands; the event loop itself awaits no kernel call for
+a refresh, so a kernel busy with a coder turn cannot queue keys behind it.
+A key that asks the kernel for something (`:` verbs, a submit, a seat
+switch) still waits for that one answer.
+
 **Shared `bindings.toml`.** The TUI's bindings file is keyed by vim key
 notation (`<C-a>`, `<Esc>`, `<S-Tab>`), which `modalkit::key::TerminalKey`
 parses. The app's file today is keyed by Bevy `KeyCode` names

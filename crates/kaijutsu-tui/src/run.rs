@@ -31,6 +31,7 @@ use crate::completion;
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
 use crate::picker::{self, Outcome as PickerOutcome};
+use crate::refresh::{self, decision_words, short_ask};
 use crate::render;
 
 use crossterm::event::KeyEvent;
@@ -217,13 +218,14 @@ async fn event_loop(
     let mut interrupt_ladder = interrupt::Ladder::new();
     let mut status = bridge.actor().watch_status();
     // Ask polling is driven by the ledger's own change stream, not by the
-    // refresh timer: `poll_new_asks` runs `kj ledger list` in the context,
-    // which authors a ToolCall/ToolResult pair — on a timer that fills the
-    // transcript with the client's own bookkeeping.
+    // refresh timer (`refresh::Request::poll_asks`).
     let mut ledger_events = bridge.actor().subscribe_ledger_events();
     let mut seen_asks = std::collections::HashSet::new();
     let mut poll_asks = true;
     let mut refresh = tokio::time::interval(REFRESH);
+    // The round in flight, if one is. Its result lands through the join arm
+    // below; the loop itself never awaits the kernel for a refresh.
+    let mut refresh_task: Option<tokio::task::JoinHandle<refresh::Refreshed>> = None;
     let mut tick = tokio::time::interval(TICK);
     let mut dirty = true;
     let mut last_strip_frame = Instant::now();
@@ -327,41 +329,26 @@ async fn event_loop(
                 poll_asks = true;
             }
             _ = refresh.tick() => {
-                if let Ok(contexts) = bridge.list_contexts().await {
-                    app.set_contexts(contexts);
-                }
-                if poll_asks
-                    && let Some(ctx) = app.current
-                {
-                    poll_asks = false;
-                    if let Ok(new_asks) =
-                        kaijutsu_client::poll_new_asks(bridge.actor(), ctx, &mut seen_asks).await
-                    {
-                        // `seen_asks` is now what is still pending; a card
-                        // whose ask left it comes down first, so the next
-                        // ask below gets the card instead of only a `!`.
-                        if let Some(card) = app.take_answered_card(&seen_asks) {
-                            let notice = answered_elsewhere_notice(bridge, app, &card).await;
-                            app.note(notice);
-                        }
-                        for ask in &new_asks {
-                            seen_asks.insert(ask.request_id.clone());
-                            app.note_ask(ask.request_id.clone(), ask.info.context_id);
-                            // Auto-show only the current context's own ask,
-                            // never a modal for a seat you are not looking
-                            // at (`docs/tui.md`, "Asks") — those surface as
-                            // the seat's `!` and the status line's `!n`.
-                            if app.ask_card.is_none() && app.current == Some(ask.info.context_id) {
-                                open_ask_card(bridge, app, &ask.request_id, ask.info.context_id).await;
-                            }
-                        }
-                        app.forget_asks_not_pending(&seen_asks);
-                        app.pending_asks = seen_asks.len();
+                // Single-flight: a round still running is left to finish,
+                // and the next tick starts the next one.
+                if refresh_task.is_none() {
+                    let poll = poll_asks && app.current.is_some();
+                    if poll {
+                        poll_asks = false;
                     }
+                    let request = refresh::Request {
+                        current: app.current,
+                        poll_asks: poll,
+                        seen_asks: seen_asks.clone(),
+                        card: app.ask_card.as_ref().map(|card| (card.request_id.clone(), card.context_id)),
+                    };
+                    refresh_task = Some(tokio::spawn(refresh::fetch(bridge.clone(), request)));
                 }
-                if let Ok(tracks) = bridge.actor().list_tracks().await {
-                    app.tracks = tracks.iter().map(picker::track_row_from).collect();
-                }
+            }
+            joined = async { refresh_task.as_mut().expect("guarded by is_some").await }, if refresh_task.is_some() => {
+                refresh_task = None;
+                let refreshed = joined.context("background refresh round")?;
+                refresh::apply(app, refreshed, &mut seen_asks);
                 rearm_beat_wake(app, &mut beat_wake, &mut beat_tempo_bps);
                 dirty = true;
             }
@@ -1038,54 +1025,6 @@ fn answered_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::Answere
     }
 }
 
-/// Fetch one ask's full detail and open the ask card over it. Silent on
-/// failure — the poll loop tries again next generation bump
-/// (`ledger_events`), and a card that never opens still shows as the seat's
-/// `!` and the status line's `!n`.
-async fn open_ask_card(bridge: &KernelBridge, app: &mut App, request_id: &str, context_id: ContextId) {
-    if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), context_id, request_id).await {
-        app.ask_card = Some(asks::AskCardState {
-            request_id: request_id.to_string(),
-            context_id,
-            detail,
-        });
-    }
-}
-
-/// The status-line notice for a card whose ask was decided from another
-/// surface: `ask <id> allowed by you` / `by <principal>` / `expired`. Falls
-/// back to `no longer pending` when `kj ledger show` cannot be read — the
-/// card is already down either way.
-async fn answered_elsewhere_notice(bridge: &KernelBridge, app: &App, card: &asks::AskCardState) -> String {
-    let id = short_ask(&card.request_id);
-    let Ok(Some(detail)) =
-        kaijutsu_client::show_ask_detail(bridge.actor(), card.context_id, &card.request_id).await
-    else {
-        return format!("ask {id} no longer pending");
-    };
-    let outcome = decision_words(&detail);
-    match detail.decided_by {
-        Some(by) if app.principal == Some(by) => format!("ask {id} {outcome} by you"),
-        Some(by) => format!("ask {id} {outcome} by {}", by.short()),
-        None => format!("ask {id} {outcome}"),
-    }
-}
-
-/// The first segment of a request id — enough to find it in `kj ledger
-/// list`, short enough for a status-line notice beside the facts.
-fn short_ask(request_id: &str) -> &str {
-    request_id.split('-').next().unwrap_or(request_id)
-}
-
-/// `allow once` / `allow always` / `deny` from `decided_option`, else the
-/// coarser `status` (`allowed`, `denied`, `expired`, `abandoned`).
-fn decision_words(detail: &kaijutsu_client::AskDetail) -> String {
-    match detail.decided_option.as_deref() {
-        Some(option) => option.replace('_', " "),
-        None => detail.status.clone(),
-    }
-}
-
 /// Answer the ask card's own ask, then close it.
 async fn handle_ask_decision(
     bridge: &KernelBridge,
@@ -1601,6 +1540,25 @@ mod tests {
             origin: TurnOrigin::Interactive,
         };
         assert!(!mark_turn_liveness(&mut app, &event));
+    }
+
+    /// The refresh's kernel calls live in `refresh::fetch`, on their own
+    /// task. Inside the loop they would hold every key until a busy kernel
+    /// answered (`docs/tui.md`, "Keys").
+    #[test]
+    fn the_event_loop_never_awaits_the_kernel_for_a_refresh() {
+        let source = include_str!("run.rs");
+        let start = source.find("async fn event_loop(").expect("event_loop is in run.rs");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("event_loop ends");
+        let body = &body[..end];
+        for call in ["list_contexts(", "poll_new_asks(", "list_tracks(", "show_ask_detail("] {
+            assert!(
+                !body.contains(call),
+                "`{call}` is awaited inside event_loop; fetch it in refresh::fetch and fold the \
+                 result in refresh::apply so keys never queue behind the kernel"
+            );
+        }
     }
 
     #[test]

@@ -334,6 +334,15 @@ From Amy's first evening on it (2026-09-02), in her order:
   the client, but not a rush."* The status line has `app.connection`; a
   keystroke that stalls on a reconnecting actor should say so instead of
   looking hung.
+- **Seat switching is inconsistent** (Amy, 2026-09-05): *"if root is
+  marked 4 in and I hit Ctrl+A 4, I should switch to it. same for the list
+  view. but it doesn't seem to work consistently."* First suspect: the rank
+  is rebuilt on every refresh (`App::set_contexts` → `kaijutsu_client::ranked_seats`), so a
+  digit read off the status line can name a different context by the time
+  it is pressed. screen/tmux windows never renumber under the hand; seats
+  should hold their digit for the life of the session, or at least until a
+  context leaves. Needs a probe with the refresh disabled to split rank
+  churn from a switch that fails outright.
 - **`Ctrl+A a` locked the client.** The chord is unbound and only posts a
   notice; nothing on that path awaits. Still open: the `:` line lane's step-1
   probe (`docs/tui.md`, "The `:` line and the `Ctrl+C` ladder") confirmed a
@@ -362,10 +371,6 @@ and Amy's second morning, in rough priority:
 - **Beat wake past due redraws every select cycle.** `rearm` steps by one
   period; when the loop falls behind the tempo `sleep(0)` fires each pass
   until the 5 s refresh re-anchors. Re-anchor on the wake itself.
-- **The refresh tick awaits three RPCs inside the select loop**
-  (`list_contexts`, `poll_new_asks`, `list_tracks`), so keys stall while a
-  slow kernel answers — the same symptom as the reconnect item above, and
-  the same fix: never await the kernel in the input path.
 - **`set_command_body` rewrites the `:` bar by replaying keystrokes**
   (`End`, N × `Backspace`, then the body) because `EditorCore` has no
   cmdline setter. Correct today; a setter in `kaijutsu-editor` is the
