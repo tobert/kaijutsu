@@ -60,7 +60,7 @@ other names.
 | Part of a character | Exists today as | Where |
 |---|---|---|
 | id + given name | `Principal { id, username, display_name }` | `kaijutsu-types/src/principal.rs:16`, `ids.rs:20` |
-| handles, many per character | `credentials(fingerprint → principal_id)`; `principals.username UNIQUE` | server `auth_db.rs:37`, `:44`; default path `~/.local/share/kaijutsu/auth.db` (`:104`) |
+| handles, many per character | `credentials(fingerprint → principal_id)`; `principals.username UNIQUE`; `add-key --nick` chooses which principal a key joins (default: a new hash-named one) | server `auth_db.rs:37`, `:44`; default path `~/.local/share/kaijutsu/auth.db` (`:104`) |
 | presence, derived | the roster: `RosterEntity::{Principal, Context}`, liveness `Bound`/`Recent`, self-reported `Availability {Active, Idle, Away, Dnd}`; four `roster_*` tables; `kj roster` | `kernel/src/roster.rs:103`, `:192`, `:250`; `kernel_db.rs:1189–1281`; `kj/roster.rs` |
 | a role's rc bundle | `context_type` → `/config/rc/<type>/<verb>/`, loaded and sorted by `SXX-name` | `kaijutsu-types/src/paths.rs:144`; `kj/lifecycle.rs:352` |
 | who plays | casts: one slot per role, keyed `(cast_id, role)`; per-context `cast_id` and `provider`/`model` override; resolution ladder explicit override → cast slot on `context_type` → registry default | `kernel_db.rs:1094`, `:1118`; `contexts.cast_id`; `kj/context.rs:704–722` |
@@ -77,9 +77,13 @@ Two facts from that table drive the whole design:
 
 1. **A principal is already most of a character.** It has the opaque id, the
    unique given name, a display name, and many credentials mapping into it.
-   Amy's keys from every machine already resolve to one principal. So the
-   character is **a principal with a sheet**, not a new identity beside the
-   principal.
+   The schema allows Amy's keys from every machine to resolve to one
+   principal; in practice `add-key` defaults the nick to a fingerprint hash,
+   so on 2026-09-05 zorak's auth db held her as three (`amy`, `amy/moltar`,
+   and a hash-named one for usagi). Consolidating is `add-key --nick amy`
+   for each key, or `set-nick`. So the character is **a principal with a
+   sheet**, not a new identity beside the principal, and slice 1's first
+   act is that consolidation.
 2. **The kernel already has a roster that knows principals and contexts,
    presence, and self-reported availability.** Inverting it onto characters
    is grouping, not a new store.
