@@ -312,6 +312,28 @@ lookups, nothing to keep in sync. Decided with Amy, 2026-09-05:
 - The dead `session_principal` field is deleted in the same change. A real
   identity flows through the connection now.
 
+**Setting one up** (the client side is built; the kernel needs nothing):
+
+```sh
+ssh-keygen -t ed25519 -N "" -C "kaijutsu-lead" -f ~/.ssh/kaijutsu-lead   # unencrypted, on purpose
+kaijutsu-server auth import ~/.ssh/kaijutsu-lead.pub --user kaijutsu-lead  # public half → a credentials row
+ssh-add ~/.ssh/kaijutsu-lead        # or skip the agent and use --key-file below
+ssh-add -l                          # copy the SHA256:… line for this key
+```
+
+Then in the repo's `.mcp.json`, on the `kaijutsu` server entry:
+
+```json
+"env": { "KAIJUTSU_KEY_FINGERPRINT": "SHA256:…" }
+```
+
+or `"KAIJUTSU_KEY_FILE": "/home/atobey/.ssh/kaijutsu-lead"` to read the
+file directly. The exact `auth import` spelling is whatever
+`kaijutsu-server auth --help` prints; the doc does not pin it. The MCP warns
+at connect when it is probably using a personal key: the default
+try-every-agent-key mode, or a `--key-file` named like `~/.ssh/id_*`. It
+still connects, so a first run stays easy.
+
 What it buys, before any character table exists: blocks authored by the
 character on the wire; asks raised by the lead's principal and answered from
 Amy's, the cross-character shape the ledger already wants (its rule keys on

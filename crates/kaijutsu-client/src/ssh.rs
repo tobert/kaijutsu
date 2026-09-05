@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use russh::client::{self, Config, Handle};
+use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::{Channel, Disconnect};
@@ -30,6 +31,13 @@ pub enum KeySource {
     /// Use SSH agent (default) - tries all keys in the agent
     #[default]
     Agent,
+    /// Use exactly one SSH agent identity, selected by its OpenSSH
+    /// `SHA256:<base64>` fingerprint (the string `ssh-add -l` prints, and
+    /// the string the server's `credentials` table keys on). Never falls
+    /// back to another identity: a fingerprint the agent doesn't hold fails
+    /// the connection instead of silently authenticating as a different
+    /// principal.
+    AgentKey { fingerprint: String },
     /// Load key from file, with optional passphrase
     File {
         path: PathBuf,
@@ -40,6 +48,13 @@ pub enum KeySource {
 }
 
 impl KeySource {
+    /// Select one SSH agent identity by its `SHA256:<base64>` fingerprint.
+    pub fn agent_key(fingerprint: impl Into<String>) -> Self {
+        Self::AgentKey {
+            fingerprint: fingerprint.into(),
+        }
+    }
+
     /// Generate an ephemeral Ed25519 key in memory (useful for tests)
     pub fn ephemeral() -> Self {
         let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
@@ -240,6 +255,9 @@ impl SshClient {
             KeySource::Agent => {
                 self.auth_with_agent(&mut session).await?;
             }
+            KeySource::AgentKey { fingerprint } => {
+                self.auth_with_agent_key(&mut session, fingerprint).await?;
+            }
             KeySource::File { path, passphrase } => {
                 self.auth_with_file(&mut session, path, passphrase.as_deref())
                     .await?;
@@ -322,6 +340,59 @@ impl SshClient {
         Err(SshError::AuthFailed("No keys accepted by server".into()))
     }
 
+    /// Authenticate using exactly one SSH agent identity, matched by
+    /// fingerprint. Unlike [`auth_with_agent`](Self::auth_with_agent), a
+    /// non-matching fingerprint never falls through to trying another
+    /// identity — it fails, naming the fingerprint asked for and how many
+    /// identities the agent offered.
+    async fn auth_with_agent_key(
+        &self,
+        session: &mut Handle<ClientHandler>,
+        fingerprint: &str,
+    ) -> Result<(), SshError> {
+        let mut agent = AgentClient::connect_env()
+            .await
+            .map_err(|e| SshError::AgentFailed(e.to_string()))?;
+
+        let identities = agent
+            .request_identities()
+            .await
+            .map_err(|e| SshError::AgentFailed(e.to_string()))?;
+
+        if identities.is_empty() {
+            return Err(SshError::NoKeysAvailable);
+        }
+
+        let identity = find_agent_identity(&identities, fingerprint)?;
+        let key = identity.public_key().into_owned();
+
+        let hash_alg = session
+            .best_supported_rsa_hash()
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+
+        let result = session
+            .authenticate_publickey_with(&self.config.username, key, hash_alg, &mut agent)
+            .await
+            .map_err(|e| SshError::AuthFailed(e.to_string()))?;
+
+        if result.success() {
+            log::info!(
+                "Authenticated as {} with key {}",
+                self.config.username,
+                fingerprint
+            );
+            Ok(())
+        } else {
+            Err(SshError::AuthFailed(format!(
+                "Key {} rejected by server",
+                fingerprint
+            )))
+        }
+    }
+
     /// Authenticate using a key file
     async fn auth_with_file(
         &self,
@@ -390,6 +461,26 @@ impl SshClient {
     }
 }
 
+/// Select the one agent identity whose OpenSSH `SHA256:<base64>` fingerprint
+/// equals `fingerprint`. Never picks a substitute: no match is a named error
+/// rather than a fallback to the first (or any other) identity, since a
+/// silent substitution would reconnect as a different principal than the one
+/// asked for.
+fn find_agent_identity<'a>(
+    identities: &'a [AgentIdentity],
+    fingerprint: &str,
+) -> Result<&'a AgentIdentity, SshError> {
+    identities
+        .iter()
+        .find(|identity| {
+            identity.public_key().fingerprint(HashAlg::Sha256).to_string() == fingerprint
+        })
+        .ok_or_else(|| SshError::KeyNotFoundInAgent {
+            fingerprint: fingerprint.to_string(),
+            offered: identities.len(),
+        })
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SshError {
     #[error("Connection failed: {0}")]
@@ -404,6 +495,8 @@ pub enum SshError {
     KeyLoadFailed(String),
     #[error("No SSH keys available in agent")]
     NoKeysAvailable,
+    #[error("SSH agent does not hold key {fingerprint} ({offered} identities offered)")]
+    KeyNotFoundInAgent { fingerprint: String, offered: usize },
     #[error("Disconnected")]
     Disconnected,
     #[error(
@@ -437,6 +530,7 @@ impl SshError {
             self,
             SshError::AgentFailed(_)
                 | SshError::NoKeysAvailable
+                | SshError::KeyNotFoundInAgent { .. }
                 | SshError::AuthFailed(_)
                 | SshError::KeyLoadFailed(_)
                 | SshError::HostKeyMismatch { .. }
@@ -491,5 +585,101 @@ mod tests {
     #[test]
     fn disconnected_is_transient() {
         assert!(!SshError::Disconnected.is_permanent());
+    }
+
+    /// Ground truth from a real `ssh-keygen -E sha256 -lf` run against a
+    /// generated Ed25519 key — pins the exact algorithm and string format
+    /// (`SHA256:<base64, no padding>`) that `find_agent_identity` and the
+    /// server's `credentials` table (`auth_db.rs`) both compute by calling
+    /// the identical `PublicKey::fingerprint(HashAlg::Sha256)` from the same
+    /// `russh` version. Since both sides are one function in one crate
+    /// version (single `Cargo.lock` entry), agreement is structural; this
+    /// test guards the format itself against drifting from what `ssh-add -l`
+    /// prints.
+    #[test]
+    fn fingerprint_matches_ssh_keygen_sha256_format() {
+        const PUBKEY: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPB7ZADWggFejQHEymlA5jP+cnlNvlyGrI7YFKoBFAZh kaijutsu-test";
+        const EXPECTED_FINGERPRINT: &str = "SHA256:36I3B8xOMk3u4OY0+2bdYqwm420ECJ54esl4ZN79f/I";
+
+        let key = PublicKey::from_openssh(PUBKEY).expect("parse test pubkey");
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+
+        assert_eq!(fingerprint, EXPECTED_FINGERPRINT);
+    }
+
+    fn identity_with_fingerprint() -> (AgentIdentity, String) {
+        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
+            .expect("generate test key");
+        let public = key.public_key().clone();
+        let fingerprint = public.fingerprint(HashAlg::Sha256).to_string();
+        (AgentIdentity::from(public), fingerprint)
+    }
+
+    #[test]
+    fn find_agent_identity_selects_the_matching_fingerprint_not_the_first() {
+        let (decoy, _decoy_fp) = identity_with_fingerprint();
+        let (target, target_fp) = identity_with_fingerprint();
+        let identities = vec![decoy, target];
+
+        let found = find_agent_identity(&identities, &target_fp).expect("must find target");
+
+        // A mutation that falls back to `identities[0]` (the decoy) must
+        // turn this red: assert the exact fingerprint, not merely `is_ok`.
+        assert_eq!(
+            found.public_key().fingerprint(HashAlg::Sha256).to_string(),
+            target_fp
+        );
+    }
+
+    #[test]
+    fn find_agent_identity_never_falls_back_when_nothing_matches() {
+        let (a, _fp_a) = identity_with_fingerprint();
+        let (b, _fp_b) = identity_with_fingerprint();
+        let identities = vec![a, b];
+        let wanted = "SHA256:doesnotexistinthisagent0000000000000000000";
+
+        let err = find_agent_identity(&identities, wanted).expect_err("no key should match");
+
+        match err {
+            SshError::KeyNotFoundInAgent {
+                fingerprint,
+                offered,
+            } => {
+                assert_eq!(fingerprint, wanted, "error must name the fingerprint asked for");
+                assert_eq!(offered, 2, "error must name how many identities the agent offered");
+            }
+            other => panic!("expected KeyNotFoundInAgent, got {other:?}"),
+        }
+    }
+
+    /// `load_secret_key` is the exact primitive `auth_with_file` calls. An
+    /// encrypted key with no passphrase must return an error synchronously —
+    /// there is no stdin prompt anywhere in this path — never hang waiting
+    /// for interactive input.
+    #[test]
+    fn encrypted_key_file_without_passphrase_fails_without_prompting() {
+        use russh::keys::ssh_key::LineEnding;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("id_ed25519");
+
+        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
+            .expect("generate test key");
+        let encrypted = key
+            .encrypt(&mut rand_v10::rng(), "correct horse battery staple")
+            .expect("encrypt test key");
+        let pem = encrypted.to_openssh(LineEnding::LF).expect("serialize encrypted key");
+        std::fs::write(&path, pem.as_str()).expect("write encrypted key file");
+
+        let err = russh::keys::load_secret_key(&path, None).expect_err(
+            "an encrypted key with no passphrase must fail, not decode or prompt",
+        );
+
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("encrypt"),
+            "error should name encryption as the cause, got: {err}"
+        );
     }
 }

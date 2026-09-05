@@ -84,7 +84,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{
-    ActorHandle, CallError, PeerConfig, PeerInvocation, ServerEvent, SshConfig,
+    ActorHandle, CallError, KeySource, PeerConfig, PeerInvocation, ServerEvent, SshConfig,
     TurnCompletedStopReason, connect_ssh, spawn_actor,
 };
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, ConversationDAG, PrincipalId};
@@ -658,10 +658,6 @@ pub struct KaijutsuMcp {
     /// Hosting agent name. Shared with the hook listener because a lifecycle
     /// event may identify the host when startup detection could not.
     agent_name: Arc<Mutex<Option<String>>>,
-    /// Per-session principal for block authorship. Captured at connect; the
-    /// authorship path doesn't read it back through this handle yet.
-    #[allow(dead_code)]
-    session_principal: PrincipalId,
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -689,7 +685,6 @@ impl KaijutsuMcp {
             session_id: Arc::new(Mutex::new(None)),
             context_name: "local".to_string(),
             agent_name: Arc::new(Mutex::new(None)),
-            session_principal: PrincipalId::new(),
         }
     }
 
@@ -701,7 +696,11 @@ impl KaijutsuMcp {
 
     /// Connect to a running kaijutsu-server via SSH.
     ///
-    /// Uses ssh-agent for authentication. Must be called within a `LocalSet`.
+    /// `key_source` selects how the connection authenticates: the default
+    /// `KeySource::Agent` tries every key the SSH agent holds, landing as
+    /// whichever principal owns the first one the server accepts.
+    /// `KeySource::AgentKey`/`KeySource::File` pin the connection to one
+    /// named identity instead. Must be called within a `LocalSet`.
     ///
     /// Establishes the SSH connection and spawns the actor, but does NOT
     /// join a context. Call `register_session` to create and join a context.
@@ -711,11 +710,13 @@ impl KaijutsuMcp {
         context_name: &str,
         session_id: Option<&str>,
         agent_name: Option<&str>,
+        key_source: KeySource,
     ) -> Result<Self, anyhow::Error> {
         let config = SshConfig {
             host: host.to_string(),
             port,
             username: whoami::username(),
+            key_source,
             ..SshConfig::default()
         };
         let mut server = Self::connect_with_config(config, context_name, session_id).await?;
@@ -764,7 +765,6 @@ impl KaijutsuMcp {
         tracing::info!("RPC actor spawned, persistent connection ready");
 
         let shared_context_id = Arc::new(Mutex::new(None));
-        let session_principal = PrincipalId::new();
 
         Ok(Self {
             backend: Backend::Remote(RemoteState {
@@ -786,7 +786,6 @@ impl KaijutsuMcp {
             agent_name: Arc::new(Mutex::new(
                 cc_session_id.map(|_| "claude-code".to_string()),
             )),
-            session_principal,
         })
     }
 

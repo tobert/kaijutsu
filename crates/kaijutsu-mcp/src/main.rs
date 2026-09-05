@@ -27,6 +27,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use kaijutsu_client::KeySource;
 use kaijutsu_mcp::KaijutsuMcp;
 use kaijutsu_mcp::hook_listener::{
     HookListener, PING_TIMEOUT, candidate_sockets, default_socket_path, resolve_hook_socket,
@@ -81,6 +82,25 @@ struct ServeArgs {
     /// Default: $XDG_RUNTIME_DIR/kaijutsu/hook-{ppid}.sock
     #[arg(long)]
     hook_socket: Option<PathBuf>,
+
+    /// SSH agent identity to connect as, given as its OpenSSH
+    /// `SHA256:<base64>` fingerprint (the string `ssh-add -l` prints).
+    /// Falls back to `KAIJUTSU_KEY_FINGERPRINT`; a flag wins over its
+    /// variable. Default, with `--key-file` also unset: try every key the
+    /// agent holds. A fingerprint the agent does not offer fails the
+    /// connection rather than falling back to another key.
+    #[arg(long)]
+    key_fingerprint: Option<String>,
+
+    /// Private key file to connect with, read directly instead of through
+    /// the SSH agent. Falls back to `KAIJUTSU_KEY_FILE`; a flag wins over
+    /// its variable. Default, with `--key-fingerprint` also unset: try
+    /// every key the agent holds. The file must be unencrypted — an
+    /// encrypted key fails the connection instead of prompting for a
+    /// passphrase, and giving both `--key-fingerprint` and `--key-file`
+    /// (after resolving their variables) is also an error.
+    #[arg(long)]
+    key_file: Option<PathBuf>,
 }
 
 /// Hook client arguments.
@@ -130,6 +150,13 @@ async fn main() -> Result<()> {
 
 /// MCP stdio server + hook socket listener.
 async fn run_serve(args: ServeArgs) -> Result<()> {
+    let key_source = resolve_key_source(
+        args.key_fingerprint.clone(),
+        args.key_file.clone(),
+        std::env::var("KAIJUTSU_KEY_FINGERPRINT").ok(),
+        std::env::var("KAIJUTSU_KEY_FILE").ok(),
+    )?;
+
     // Detect hosting agent (Claude Code, etc.)
     let agent = kaijutsu_agent_tools::detect();
     if let Some(ref a) = agent {
@@ -164,6 +191,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         let mut pending_label_base: Option<String> = None;
 
         let mcp = if args.connect {
+            let ssh_dir = dirs::home_dir().map(|home| home.join(".ssh"));
+            if let Some(warning) = personal_key_warning(&key_source, ssh_dir.as_deref()) {
+                tracing::warn!("{warning}");
+            }
+
             tracing::info!(
                 host = %args.host,
                 port = %args.port,
@@ -176,6 +208,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 &args.context_name,
                 detected_session_id.as_deref(),
                 detected_agent_name,
+                key_source.clone(),
             ).await?;
 
             // Auto-register a session context so hook events land somewhere
@@ -436,6 +469,94 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
     Ok(())
 }
 
+/// Resolve `--key-fingerprint`/`--key-file` against their environment
+/// fallbacks (`KAIJUTSU_KEY_FINGERPRINT`, `KAIJUTSU_KEY_FILE`) into a
+/// [`KeySource`]. A flag wins over its variable. Naming both (after
+/// resolution) is an error — never a silent pick of one over the other.
+/// Naming neither keeps `KeySource::Agent`, trying every key the agent
+/// holds.
+fn resolve_key_source(
+    key_fingerprint: Option<String>,
+    key_file: Option<PathBuf>,
+    env_fingerprint: Option<String>,
+    env_file: Option<String>,
+) -> Result<KeySource> {
+    let fingerprint = key_fingerprint.or(env_fingerprint);
+    let file = key_file.or_else(|| env_file.map(PathBuf::from));
+
+    match (fingerprint, file) {
+        (Some(fingerprint), Some(path)) => Err(anyhow::anyhow!(
+            "--key-fingerprint ({fingerprint}) and --key-file ({}) (or their \
+             KAIJUTSU_KEY_FINGERPRINT/KAIJUTSU_KEY_FILE variables) name two \
+             different keys; give exactly one",
+            path.display()
+        )),
+        (Some(fingerprint), None) => Ok(KeySource::agent_key(fingerprint)),
+        (None, Some(path)) => Ok(KeySource::from_file(path)),
+        (None, None) => Ok(KeySource::Agent),
+    }
+}
+
+/// Basenames `ssh` itself tries automatically when no `-i` is given — the
+/// files a human's own login almost certainly uses. A `--key-file` naming
+/// one of these under the user's `~/.ssh` is a personal key pressed into
+/// service for the bridge, not a key minted for a model character.
+const DEFAULT_PERSONAL_KEY_BASENAMES: &[&str] = &[
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_ed25519_sk",
+    "id_ecdsa_sk",
+];
+
+/// True when `path` names one of [`DEFAULT_PERSONAL_KEY_BASENAMES`] (with or
+/// without a trailing `.pub`) directly inside `ssh_dir` — pure so the
+/// decision is testable without touching `$HOME` or the filesystem.
+fn is_default_personal_key_path(path: &Path, ssh_dir: &Path) -> bool {
+    if path.parent() != Some(ssh_dir) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name = name.strip_suffix(".pub").unwrap_or(name);
+    DEFAULT_PERSONAL_KEY_BASENAMES.contains(&name)
+}
+
+/// Decide whether this `KeySource` probably authenticates as the human
+/// rather than a bridge-specific identity, and if so, the one-line warning
+/// to log. Pure: `ssh_dir` (typically `~/.ssh`) is passed in rather than read
+/// from the environment, so the decision is testable in isolation.
+///
+/// Warns for the default `KeySource::Agent` (tries every key the agent
+/// holds — lands as whichever principal owns the first one accepted) and for
+/// `KeySource::File` naming a default personal key path. Never warns for
+/// `KeySource::AgentKey` (one fingerprint, named on purpose) or a
+/// `KeySource::File` outside the default-personal-key set.
+fn personal_key_warning(key_source: &KeySource, ssh_dir: Option<&Path>) -> Option<String> {
+    match key_source {
+        KeySource::Agent => Some(
+            "connecting with whatever key the SSH agent offers first; the bridge will act \
+             as that principal — set KAIJUTSU_KEY_FINGERPRINT or --key-file to a \
+             per-character key (docs/character.md, \"The bridge identity\")"
+                .to_string(),
+        ),
+        KeySource::File { path, .. } => {
+            let ssh_dir = ssh_dir?;
+            is_default_personal_key_path(path, ssh_dir).then(|| {
+                format!(
+                    "--key-file (or KAIJUTSU_KEY_FILE) names {}, which looks like your \
+                     personal SSH key; the bridge will act as you — point it at a \
+                     per-character key instead (docs/character.md, \"The bridge identity\")",
+                    path.display()
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Parse hook stdin as JSON and re-serialize compact (single line), also
 /// extracting `session_id` (if present) for socket resolution. `None` if
 /// `input` isn't valid JSON — the caller must never forward garbage.
@@ -627,5 +748,169 @@ mod tests {
         assert_eq!(agent_label_prefix(Some("codex")), "codex");
         assert_eq!(agent_label_prefix(None), "mcp");
         assert_eq!(agent_label_prefix(Some("future-agent")), "mcp");
+    }
+
+    // -- resolve_key_source (--key-fingerprint / --key-file precedence) --
+
+    #[test]
+    fn resolve_key_source_defaults_to_agent_when_nothing_given() {
+        let source = resolve_key_source(None, None, None, None).expect("no error");
+        assert!(matches!(source, KeySource::Agent));
+    }
+
+    #[test]
+    fn resolve_key_source_flag_fingerprint_wins_over_its_env_var() {
+        let source = resolve_key_source(
+            Some("SHA256:flag".to_string()),
+            None,
+            Some("SHA256:env".to_string()),
+            None,
+        )
+        .expect("no error");
+        match source {
+            KeySource::AgentKey { fingerprint } => assert_eq!(fingerprint, "SHA256:flag"),
+            other => panic!("expected AgentKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_key_source_env_fingerprint_used_when_flag_unset() {
+        let source = resolve_key_source(None, None, Some("SHA256:env".to_string()), None)
+            .expect("no error");
+        match source {
+            KeySource::AgentKey { fingerprint } => assert_eq!(fingerprint, "SHA256:env"),
+            other => panic!("expected AgentKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_key_source_flag_file_wins_over_its_env_var() {
+        let source = resolve_key_source(
+            None,
+            Some(PathBuf::from("/flag/key")),
+            None,
+            Some("/env/key".to_string()),
+        )
+        .expect("no error");
+        match source {
+            KeySource::File { path, passphrase } => {
+                assert_eq!(path, PathBuf::from("/flag/key"));
+                assert_eq!(passphrase, None);
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_key_source_env_file_used_when_flag_unset() {
+        let source =
+            resolve_key_source(None, None, None, Some("/env/key".to_string())).expect("no error");
+        match source {
+            KeySource::File { path, .. } => assert_eq!(path, PathBuf::from("/env/key")),
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_key_source_both_given_after_resolution_is_an_error() {
+        // Both from flags.
+        let err = resolve_key_source(
+            Some("SHA256:flag".to_string()),
+            Some(PathBuf::from("/flag/key")),
+            None,
+            None,
+        )
+        .expect_err("both a fingerprint and a file must be refused");
+        assert!(err.to_string().contains("SHA256:flag"));
+        assert!(err.to_string().contains("/flag/key"));
+
+        // One from a flag, the other from its variable — still both given.
+        let err = resolve_key_source(
+            Some("SHA256:flag".to_string()),
+            None,
+            None,
+            Some("/env/key".to_string()),
+        )
+        .expect_err("a flag plus the OTHER option's env var must still be refused");
+        assert!(err.to_string().contains("SHA256:flag"));
+        assert!(err.to_string().contains("/env/key"));
+    }
+
+    // -- is_default_personal_key_path / personal_key_warning --
+
+    #[test]
+    fn default_personal_key_basenames_under_ssh_dir_match() {
+        let ssh_dir = Path::new("/home/amy/.ssh");
+        for name in DEFAULT_PERSONAL_KEY_BASENAMES {
+            assert!(
+                is_default_personal_key_path(&ssh_dir.join(name), ssh_dir),
+                "{name} should match"
+            );
+            // The .pub half of the pair is the same personal identity.
+            assert!(
+                is_default_personal_key_path(&ssh_dir.join(format!("{name}.pub")), ssh_dir),
+                "{name}.pub should match"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_named_key_under_ssh_dir_does_not_match() {
+        let ssh_dir = Path::new("/home/amy/.ssh");
+        assert!(!is_default_personal_key_path(
+            &ssh_dir.join("kaijutsu-lead"),
+            ssh_dir
+        ));
+    }
+
+    #[test]
+    fn a_default_named_key_outside_ssh_dir_does_not_match() {
+        // Same basename, wrong directory — a project-local key someone
+        // happened to name id_ed25519 is not the user's personal identity.
+        let ssh_dir = Path::new("/home/amy/.ssh");
+        assert!(!is_default_personal_key_path(
+            Path::new("/home/amy/src/kaijutsu/id_ed25519"),
+            ssh_dir
+        ));
+    }
+
+    #[test]
+    fn agent_source_always_warns() {
+        let warning = personal_key_warning(&KeySource::Agent, Some(Path::new("/home/amy/.ssh")))
+            .expect("Agent must warn");
+        assert!(warning.contains("KAIJUTSU_KEY_FINGERPRINT"));
+        assert!(warning.contains("--key-file"));
+        assert!(warning.contains("docs/character.md"));
+    }
+
+    #[test]
+    fn agent_key_by_fingerprint_never_warns() {
+        let source = KeySource::agent_key("SHA256:abc");
+        assert!(personal_key_warning(&source, Some(Path::new("/home/amy/.ssh"))).is_none());
+    }
+
+    #[test]
+    fn default_personal_key_file_warns_and_names_the_path() {
+        let source = KeySource::from_file("/home/amy/.ssh/id_ed25519");
+        let warning = personal_key_warning(&source, Some(Path::new("/home/amy/.ssh")))
+            .expect("a default personal key file must warn");
+        assert!(warning.contains("/home/amy/.ssh/id_ed25519"));
+        assert!(warning.contains("--key-file"));
+        assert!(warning.contains("KAIJUTSU_KEY_FILE"));
+        assert!(warning.contains("docs/character.md"));
+    }
+
+    #[test]
+    fn a_named_character_key_file_never_warns() {
+        let source = KeySource::from_file("/home/amy/.ssh/kaijutsu-lead");
+        assert!(personal_key_warning(&source, Some(Path::new("/home/amy/.ssh"))).is_none());
+    }
+
+    #[test]
+    fn key_file_warning_is_silent_when_ssh_dir_is_unknown() {
+        // No $HOME resolved — cannot judge "under ~/.ssh", so stay quiet
+        // rather than guess.
+        let source = KeySource::from_file("/home/amy/.ssh/id_ed25519");
+        assert!(personal_key_warning(&source, None).is_none());
     }
 }

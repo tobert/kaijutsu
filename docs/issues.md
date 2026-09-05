@@ -8,6 +8,18 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 
 
+
+## Check the hook socket's PPID resolution on macOS (2026-09-05)
+
+The hook adapter derives the MCP's socket path from the parent process id so
+a hook event reaches the listener in its own process tree
+(`docs/cc-peer.md`; `kaijutsu-mcp/src/main.rs`, `candidate_sockets` /
+`resolve_hook_socket`). All of that was built and proved on Linux. Amy's
+MacBook is a supported client; nobody has confirmed the PPID chain and the
+`$XDG_RUNTIME_DIR` fallback behave the same under macOS's launchd-spawned
+shells and Claude Code's process model. Sometime: run a bridge session on
+the Mac with `RUST_LOG` on and read what the resolver picked.
+
 ## Hook listener fix: deploy and two follow-ups (2026-09-05)
 
 The misroute-then-archive bug is FIXED in the tree (`session.end` archives
@@ -27,16 +39,6 @@ Follow-ups:
   its socket back. A bounded retry until the path reads stale, then reclaim,
   would close it. The lane treated the contest as the same severity as the
   existing no-`XDG_RUNTIME_DIR` degradation; hard abort was the alternative.
-
-## Bridge identity: `kaijutsu-mcp` selects its key (2026-09-05, queued)
-
-`docs/character.md`, "The bridge identity". `--key-fingerprint` (one agent
-identity) and `--key-file` (unencrypted file) with env fallbacks, loud
-refusal instead of fall-through to every key, generic `kaijutsu-mcp`
-principal for the user-scope entry, per-repo `.mcp.json` entries for named
-leads, dead `session_principal` deleted. Client side already has both key
-sources (`kaijutsu-client/src/ssh.rs:29–37`). Delete this entry when the
-lane ships.
 
 ## Character support (designed 2026-09-05, unbuilt)
 
