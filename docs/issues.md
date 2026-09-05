@@ -2498,6 +2498,31 @@ consult (see the janitor/librarian entry). Solve them separately and we build
 two overlapping mechanisms that disagree at the edges. Solve the root marker
 first and the janitor inherits its safety rule for free.
 
+**Decided (Amy, 2026-09-05): archive is one row, never a subtree.** *"I'm
+not convinced cascade should be a thing? ideally we have long lineages we
+can study someday, with most of the past archived but still in the same
+graph. so the root keeps moving, around daily."* `kj context archive` marks
+the one context; children keep their parent edge and their own state; an
+archived ancestor stays in the graph as lineage. Rotation is then four
+plain steps with no hazard — create a child of ROOT, promote, retag,
+archive the old one — and the successor being a child of its predecessor is
+the honest shape, not a landmine. What this leaves of the anchor idea is
+"never swept by age" and, maybe, "parentless"; the cascade-stops behaviour
+below is moot.
+
+**Open from the same conversation — what happens to an archived context's
+label.** Amy: *"archive maybe gets an auto-rename? or un-name? tho I guess we
+want to save the original name somewhere. perhaps they just fall out of the
+hot indexes."* The last reading is the cheapest and keeps the name where it
+was: the label stays on the row, and archived rows leave the live-name
+index. Concretely: the unique index on `contexts.label` becomes partial on
+`archived_at IS NULL` (an existing DB needs a drop-and-recreate at open;
+there is no index migration today), `find_context_by_label` prefers the live
+holder, and `DriftRouter` drops the label from `label_to_id` on archive.
+Then `ROOT-0815` can be archived and a live `ROOT-0815` created a year later
+without a collision, and `kj context list`'s archived view still shows the
+old name. Not built; Amy's go wanted.
+
 **Two shapes, cheapest first:**
 
 - **A — an `anchor` bit, no new noun.** A context can be anchored: parentless
@@ -2525,17 +2550,17 @@ tree fragile.
 **Slice 1 — guardrails (no new concept, all independently correct).**
 - `kj context move` in ONE transaction, or cycle-check before deleting the old
   edge. Today a refused move orphans the context (edge 2b above, proved live).
-- The archive latch prints a **consequence**, not an inventory: "this will also
-  archive N descendant context(s)" instead of `1 children`. This is the line
-  that cost a context today.
-- Free the label on archive, or make the conflict error say the holder is
-  archived and name `retag`. Right now "already in use" and "not found"
-  contradict each other and neither points anywhere.
+- ~~The archive latch prints a **consequence**, not an inventory.~~ Moot as
+  of 2026-09-05: there is no cascade; the latch says how many children stay
+  live under the archived context.
+- Free the label on archive — see "what happens to an archived context's
+  label" above for the proposed shape. Until then "already in use" and "not
+  found" contradict each other and neither points anywhere.
 
 **Slice 2 — the anchor bit.** A column (`anchored_at`, same shape as
-`promoted_at`/`archived_at`) plus three behaviours: **parentless by
-construction**, **cascade stops** (never archived as a descendant), **never
-swept by age**. `kj context create --detached` sets it. Genesis marks ROOT.
+`promoted_at`/`archived_at`) plus two behaviours: **parentless by
+construction** and **never swept by age** (the third, cascade stops, went
+with the cascade on 2026-09-05). `kj context create --detached` sets it. Genesis marks ROOT.
 Multiple anchors allowed — the forest falls out rather than being designed.
 Both layers, per the approval-ledger/roster precedent: a schema CHECK or
 trigger that refuses a structural parent edge into an anchored context, *and*
@@ -2550,9 +2575,10 @@ rather than new machinery.
 **Slice 4 — `kj root`/`kj anchor` verbs.** Only once 1–3 exist.
 
 **Migration, do it in slice 2:** the current ROOT (`f0a66870`) is a structural
-child of a `cc-kaijutsu-*` session context. Nothing sweeps automatically today
-so it is not urgent, but it is the live instance of the landmine — anchoring it
-must also detach it.
+child of a `cc-kaijutsu-*` session context (and since 2026-09-05 the live
+ROOT `1e5c7643` is a child of `ROOT-0815` under it). With no cascade this is
+lineage, not a landmine; the only remaining reason to detach a root is
+tidiness.
 
 ---
 
@@ -2561,8 +2587,10 @@ must also detach it.
 Found the expensive way, replacing ROOT with a fresh deepseek-v4-flash
 generation. All three are real; the first destroyed a context.
 
-**1. `kj context archive` CASCADES to structural children, and the confirm
-prompt does not say so.** The latch prints `(90 blocks | 1 children | 0 drift
+**1. RESOLVED 2026-09-05 — the cascade is gone.** Archive marks one row;
+children keep their edge and state (Amy: lineages should stay in the graph).
+Kept for the record: `kj context archive` CASCADED to structural children,
+and the confirm prompt did not say so.** The latch prints `(90 blocks | 1 children | 0 drift
 edges)` — a count, not a consequence — and then reports `archived 2
 context(s)`. I had reparented the new ROOT under the old one (to give the new
 generation honest lineage), archived the old one, and **took the new ROOT with

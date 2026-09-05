@@ -13,7 +13,7 @@ set <ctx> [flags]            Update context settings
 unset [<ctx>] --env KEY      Remove an env var from a context
 log [<ctx>]                  Show fork lineage
 move <ctx> <new-parent>      Reparent a context                  (alias: mv)
-archive <ctx>                Soft-delete (latched — needs --confirm)
+archive <ctx>                Soft-delete one context; children stay (latched — needs --confirm)
 remove <ctx>                 Hard-delete (latched)                (alias: rm)
 retag <label> <ctx>          Move a label to a different context (latched)
 hydrate [<ctx>] [flags]      Set/clear the hydration window policy (Operator-gated)

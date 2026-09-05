@@ -1504,6 +1504,16 @@ an anchor is what you fork from, and forks copy history, so every block that
 lands in one is paid for again by every descendant forever. The old ROOT
 carried ninety.
 
+Three weeks later the cascade itself went. Rotating ROOT again, this time by
+create rather than fork, ran into the same wall from the other side: the
+successor is a child of the old root, so the old root could never be
+archived without taking the new one, and five live contexts with it. Amy's
+answer was that the premise was wrong. Archive is a fact about one context,
+and a lineage is worth more intact than tidy: most of the past archived,
+all of it still in one graph, the root moving under it daily. With that,
+the anchor idea shrinks to "never swept by age", and rotation is four plain
+steps.
+
 Two lessons, and they are the same lesson from opposite ends. A mechanism can
 be correct in isolation and wrong in place — a function with no caller, a
 signal aimed at the wrong audience, a specialness that lives only in a label.

@@ -8315,9 +8315,8 @@ impl kernel::Server for KernelImpl {
     }
 
     /// Archive a single context — the well's single-keystroke archive
-    /// action. Unlike the `kj context archive` builtin (latched, recurses
-    /// into structural children), this is single-context, not latched, no
-    /// subtree recursion. Idempotent: archiving an already-archived context
+    /// action. Same one-row semantics as the `kj context archive` builtin,
+    /// minus the latch. Idempotent: archiving an already-archived context
     /// succeeds (the DB write's `archived_at IS NULL` guard is already a
     /// no-op).
     fn archive_context(

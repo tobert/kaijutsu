@@ -177,10 +177,11 @@ enum ContextCommand {
         #[arg(long, short = 'c')]
         context: Option<String>,
     },
-    /// Soft-delete a context (latched).
+    /// Soft-delete one context (latched). Its children are untouched and
+    /// keep their parent edge: an archived context stays in the graph as
+    /// lineage.
     Archive {
-        /// Context to archive, along with its structural subtree. Ids and
-        /// labels come from `kj context list`.
+        /// Context to archive. Ids and labels come from `kj context list`.
         context: String,
     },
     /// Conclude a context — mark this work "done" (the time-well's hot→recent
@@ -1682,7 +1683,11 @@ impl KjDispatcher {
         KjResult::ok(format!("moved '{}' under '{}'", ctx_label, parent_label))
     }
 
-    /// `kj context archive <ctx>` — soft-delete a context (latched).
+    /// `kj context archive <ctx>` — soft-delete one context (latched).
+    ///
+    /// Never recurses. Children keep their structural edge and their own
+    /// state, so a lineage stays walkable after most of it is archived
+    /// (`docs/issues.md`, "Managing roots").
     async fn context_archive(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
@@ -1725,41 +1730,34 @@ impl KjDispatcher {
                 command: "kj context archive".to_string(),
                 target: target_label,
                 message: format!(
-                    "{} blocks | {} children | {} drift edges",
+                    "{} blocks | {} drift edges | {} children stay live under it",
                     block_count,
+                    drift_from + drift_to,
                     children_count,
-                    drift_from + drift_to
                 ),
             };
         }
 
-        // Archive the target + recursive children
-        let archived_ids: Vec<ContextId>;
-        {
+        let archived = {
             let db = self.kernel_db().lock();
-            let subtree = db.subtree_snapshot(target_id).unwrap_or_default();
-            archived_ids = subtree
-                .iter()
-                .filter(|(row, _)| db.archive_context(row.context_id).unwrap_or(false))
-                .map(|(row, _)| row.context_id)
-                .collect();
-        }
+            match db.archive_context(target_id) {
+                Ok(v) => v,
+                Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
+            }
+        };
 
-        // Sync the in-memory drift router with the on-disk state (M2-B3).
-        // Without this the drift router still has the contexts as Live, and
-        // any active session can write a drift op that resurrects them — the
-        // archive-while-joined bug from the constellation flow.
+        // The in-memory drift router must agree with the row, or an active
+        // session can write a drift op that resurrects the context.
         {
             let mut drift = self.drift_router().write();
-            for id in &archived_ids {
-                let _ = drift.set_state(*id, ContextState::Archived);
-            }
+            let _ = drift.set_state(target_id, ContextState::Archived);
         }
 
-        // MCP subscription cleanup removed alongside the legacy MCP pool
-        // in Phase 1 M5. Phase 2 will re-introduce via broker + coalescer.
-
-        KjResult::ok(format!("archived {} context(s)", archived_ids.len()))
+        if archived {
+            KjResult::ok(format!("archived {target_label}"))
+        } else {
+            KjResult::ok(format!("{target_label} already archived"))
+        }
     }
 
     /// `kj context conclude <ctx>` — the explicit "this work is done" act.
@@ -2801,6 +2799,49 @@ mod tests {
         let db = d.kernel_db().lock();
         let row = db.get_context(a).unwrap().unwrap();
         assert_eq!(row.label.as_deref(), Some("alpha"));
+    }
+
+    /// Archive is one row, never a subtree: a child keeps its state and its
+    /// parent edge, so the lineage above it stays in the graph.
+    #[tokio::test]
+    async fn context_archive_leaves_children_live_with_their_parent_edge() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let root = register_context(&d, Some("root"), None, principal);
+        let old = register_context(&d, Some("old-root"), Some(root), principal);
+        let child = register_context(&d, Some("child"), Some(old), principal);
+        {
+            let db = d.kernel_db().lock();
+            for (source, target) in [(root, old), (old, child)] {
+                db.insert_edge(&ContextEdgeRow {
+                    edge_id: uuid::Uuid::now_v7(),
+                    source_id: source,
+                    target_id: target,
+                    kind: EdgeKind::Structural,
+                    metadata: None,
+                    created_at: kaijutsu_types::now_millis() as i64,
+                })
+                .unwrap();
+            }
+        }
+
+        let c = confirmed_caller(root);
+        let result = d
+            .dispatch(&[s("context"), s("archive"), s("old-root")], &c)
+            .await;
+        assert!(result.is_ok(), "archive failed: {}", result.message());
+        assert_eq!(result.message(), "archived old-root");
+
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(old).unwrap().unwrap().archived_at.is_some());
+        let child_row = db.get_context(child).unwrap().unwrap();
+        assert!(child_row.archived_at.is_none(), "the child was archived with its parent");
+        assert_eq!(child_row.context_state, kaijutsu_types::ContextState::Live);
+        let parents = db.structural_parents(child).unwrap();
+        assert_eq!(parents.len(), 1, "the child lost its parent edge");
+        assert_eq!(parents[0].context_id, old);
+        let router = d.drift_router().read();
+        assert_eq!(router.get(child).unwrap().state, kaijutsu_types::ContextState::Live);
     }
 
     #[tokio::test]

@@ -319,7 +319,7 @@ The verbs (keys provisional; the in-well legend — the transient `?` toggle,
   unchanged by the ring collapse; what changed is that its middle rung now
   *renders* as the horizon rather than as a ring of its own.
 - **`a` archive** — straight past the horizon from anywhere (same unlatched
-  single-card semantics; `kj context archive` keeps its latched subtree form).
+  single-card semantics; `kj context archive` is the same one row behind a latch).
 - **`z` pause** — *suspend activity*, *designed now, gated later*: the
   `paused_at` stamp, wire field, toggle, and dimmed/badged card ship today;
   the behavioral gate (skip hyoushigi wakeups; reject turn-starts loudly) is
