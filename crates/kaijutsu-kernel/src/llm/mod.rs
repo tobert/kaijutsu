@@ -648,6 +648,19 @@ fn resolve_key_or_placeholder(config: &BackendConfig, label: &str) -> LlmResult<
     }
 }
 
+/// Outbound `User-Agent` for the kernel's provider HTTP requests (OpenAI-,
+/// DeepSeek-, Anthropic-dialect clients in this module tree). Providers log
+/// it, so it identifies the *product*, not the HTTP library — reqwest 0.13
+/// sends no default UA, so without this the requests carry no UA at all.
+/// The identity deliberately matches the two other places the kernel names
+/// itself on the wire: the Codex `initialize` handshake (this file) and MCP
+/// `client_info` (`mcp::servers::external`) — product name + this crate's
+/// version. Lives in `llm/mod.rs` rather than a provider module because it
+/// is cross-provider; each provider's client builder applies it.
+pub(crate) const fn http_user_agent() -> &'static str {
+    concat!("kaijutsu/", env!("CARGO_PKG_VERSION"))
+}
+
 /// Default per-request HTTP timeout applied when a backend's
 /// `request_timeout_secs` is `NULL`. Generous enough that it almost never
 /// fires before kaijutsu-server's own total-deadline

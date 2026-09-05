@@ -29,7 +29,7 @@ use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::stream::{BuildOpts, StreamEvent};
-use crate::llm::{LlmError, LlmResult, Message};
+use crate::llm::{LlmError, LlmResult, Message, http_user_agent};
 
 use self::sse::{OpenAiSseEvent, decode_event};
 use self::stream::StateMachine;
@@ -89,6 +89,7 @@ impl Client {
     /// the base URL, or enable the reasoning-echo quirk.
     pub fn new(provider_name: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
+            .user_agent(http_user_agent())
             .build()
             .expect("reqwest::Client::builder must succeed on healthy host");
         Self {
@@ -447,6 +448,79 @@ mod tests {
         fn scheme_with_port_is_still_matched_on_host_only() {
             assert!(is_hosted_openai("https://api.openai.com:443/v1"));
         }
+    }
+
+    /// The UA rides the real wire path: reqwest applies client defaults at
+    /// `execute()`, so a built request isn't proof — a captured request is.
+    /// A loopback listener reads the raw request head the server receives,
+    /// then answers a minimal chat-completion so `prompt()` completes.
+    #[tokio::test]
+    async fn outbound_requests_carry_the_kaijutsu_user_agent() {
+        // The wire check compares against `http_user_agent()`, so pin its
+        // content here — a shared-const regression to some other string
+        // can't pass this test unnoticed.
+        assert!(
+            http_user_agent().starts_with("kaijutsu/"),
+            "UA must name the product: {}",
+            http_user_agent()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            use tokio::io::AsyncReadExt;
+            let mut head = Vec::new();
+            // Terminate on the head's double-CRLF (always present regardless
+            // of whether a UA was sent) or on peer EOF — neither a byte cap
+            // nor the presence of the UA gates this loop's exit.
+            loop {
+                let mut buf = [0u8; 512];
+                let n = sock.read(&mut buf).await.expect("read request");
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(resp.as_bytes()).await;
+            String::from_utf8_lossy(&head).into_owned()
+        });
+
+        let text = Client::new("test-backend")
+            .with_base_url(format!("http://127.0.0.1:{port}/v1"))
+            .prompt("m", None, "hi")
+            .await
+            .expect("prompt round-trip against loopback");
+        assert_eq!(text, "ok", "response must parse through the real path");
+
+        let head = server.await.expect("server task");
+        let ua = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .unwrap_or_else(|| panic!("request head carried no User-Agent:\n{head}"));
+        // Header NAME matched case-insensitively above (RFC 9110); compare
+        // it the same way and keep the VALUE comparison exact — lowercasing
+        // the whole line would force the value lowercase as policy.
+        let (name, value) = ua.split_once(':').expect("matched on the colon");
+        assert!(name.eq_ignore_ascii_case("user-agent"), "header name: {name}");
+        assert_eq!(
+            value.trim(),
+            http_user_agent(),
+            "UA must be exactly the kaijutsu identity, not reqwest/none"
+        );
     }
 
     const SIMPLE: &str = "\
