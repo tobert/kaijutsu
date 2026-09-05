@@ -383,19 +383,11 @@ impl HookListener {
         }
 
         if socket_path.exists() {
-            // A predecessor's clean shutdown can remove the path entirely
-            // partway through the wait below — treat "gone" the same as
-            // `Stale` (nothing left to steal) rather than falling through
-            // to `probe_existing_socket`'s conservative `Unknown` for a
-            // connect that fails with `NotFound` instead of
-            // `ConnectionRefused`.
-            let probe = || async {
-                if !socket_path.exists() {
-                    ExistingSocket::Stale
-                } else {
-                    probe_existing_socket(socket_path).await
-                }
-            };
+            // Each call already carries its own Stale-confirmation
+            // (`confirm_stale`): a raw `Stale` from `probe_socket_or_gone`
+            // is re-checked once before this closure ever returns it, so
+            // the polling loop below sees only confirmed verdicts.
+            let probe = || confirm_stale(|| probe_socket_or_gone(socket_path), interval);
 
             let mut verdict = probe().await;
             if matches!(verdict, ExistingSocket::Live | ExistingSocket::Unknown) {
@@ -1515,16 +1507,18 @@ pub async fn resolve_hook_socket(
 /// Scan `dir` for `hook-*.sock` files other than `keep` and unlink any that
 /// refuse connections (`ECONNREFUSED` — the listener process is gone but the
 /// socket special file outlives it; nothing cleans these up on an unclean
-/// exit). Never touches a socket that accepts a connection, and never
-/// touches `keep` (the path we're about to bind ourselves). Returns the
-/// number removed.
+/// exit). A refusal is confirmed once (see [`confirm_stale`]) before it
+/// drives an unlink. Never touches a socket that accepts a connection, and
+/// never touches `keep` (the path we're about to bind ourselves). Returns
+/// the number removed.
 pub async fn sweep_stale_sockets(dir: &Path, keep: &Path) -> usize {
     let mut removed = 0;
     for path in list_hook_sockets_in(dir) {
         if path == keep {
             continue;
         }
-        if let ExistingSocket::Stale = probe_existing_socket(&path).await {
+        let verdict = confirm_stale(|| probe_socket_or_gone(&path), BIND_RETRY_INTERVAL).await;
+        if let ExistingSocket::Stale = verdict {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => removed += 1,
                 Err(e) => tracing::debug!(
@@ -1563,6 +1557,40 @@ async fn probe_existing_socket(path: &Path) -> ExistingSocket {
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => ExistingSocket::Stale,
         _ => ExistingSocket::Unknown,
     }
+}
+
+/// [`probe_existing_socket`], treating an already-vanished special file as
+/// `Stale` (nothing left to steal) rather than the conservative `Unknown`
+/// a connect against a missing path produces (`NotFound`, not
+/// `ConnectionRefused`) — a predecessor's clean shutdown can remove the
+/// path mid-check.
+async fn probe_socket_or_gone(path: &Path) -> ExistingSocket {
+    if !path.exists() { ExistingSocket::Stale } else { probe_existing_socket(path).await }
+}
+
+/// A single `Stale` verdict is provisional, never final grounds to unlink:
+/// on BSD-derived systems (macOS included) `connect()` to a live
+/// `AF_UNIX` listener whose accept backlog is momentarily full also
+/// returns `ECONNREFUSED` — the same error a genuinely dead listener
+/// produces (Linux returns `EAGAIN` for a full backlog instead, already
+/// classified `Unknown`, never `Stale`). Trust a `Stale` verdict only
+/// after a second, confirming call: wait one `interval`, then probe
+/// again. `Stale` stands only if that second call agrees; any other
+/// verdict overrides the first, since unlinking on an unconfirmed `Stale`
+/// is the exact socket theft this mechanism exists to prevent. Shared by
+/// [`HookListener::bind_socket`] and [`sweep_stale_sockets`] so the rule
+/// lives once.
+async fn confirm_stale<F, Fut>(mut probe: F, interval: Duration) -> ExistingSocket
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ExistingSocket>,
+{
+    let first = probe().await;
+    if !matches!(first, ExistingSocket::Stale) {
+        return first;
+    }
+    tokio::time::sleep(interval).await;
+    probe().await
 }
 
 /// Poll `probe` every `interval` until it stops reporting `Live`/`Unknown`
@@ -2676,6 +2704,86 @@ mod tests {
             elapsed < Duration::from_millis(200),
             "an already-stale path must bind at once, not wait out any part of a 10s window \
              (elapsed: {elapsed:?})"
+        );
+    }
+
+    // -- confirm_stale: a raw Stale verdict is provisional, not final --
+
+    #[tokio::test]
+    async fn confirm_stale_does_not_confirm_when_the_second_probe_says_live() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { if n == 0 { ExistingSocket::Stale } else { ExistingSocket::Live } }
+        };
+
+        let verdict = confirm_stale(probe, Duration::from_millis(5)).await;
+
+        assert!(
+            matches!(verdict, ExistingSocket::Live),
+            "a momentarily-refused live listener (a full accept backlog reads ECONNREFUSED \
+             on BSD-derived systems, same as a dead listener) must not be confirmed stale"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "must re-probe exactly once before trusting a Stale verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_stale_confirms_when_the_second_probe_agrees() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { ExistingSocket::Stale }
+        };
+
+        let verdict = confirm_stale(probe, Duration::from_millis(5)).await;
+
+        assert!(
+            matches!(verdict, ExistingSocket::Stale),
+            "two agreeing Stale probes must confirm the verdict"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "must probe exactly twice: once, then once more to confirm"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_stale_does_not_wait_when_the_first_probe_is_not_stale() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { ExistingSocket::Live }
+        };
+
+        let start = tokio::time::Instant::now();
+        let verdict = confirm_stale(probe, Duration::from_secs(10)).await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(verdict, ExistingSocket::Live));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "must probe exactly once");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a non-Stale first verdict must return at once, never wait out the confirmation \
+             interval (elapsed: {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_socket_or_gone_treats_a_missing_path_as_stale() {
+        let dir = unique_temp_dir("probe-gone");
+        let path = dir.join("hook-never-existed.sock");
+        assert!(!path.exists());
+
+        let verdict = probe_socket_or_gone(&path).await;
+
+        assert!(
+            matches!(verdict, ExistingSocket::Stale),
+            "a path that was never bound (or already vanished) has nothing left to steal"
         );
     }
 }

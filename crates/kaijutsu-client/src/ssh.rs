@@ -322,7 +322,8 @@ impl SshClient {
             match result {
                 Ok(auth_result) if auth_result.success() => {
                     log::info!(
-                        "Authenticated as {} with key {}",
+                        "Authenticated (ssh user {}) with key {}; the kernel resolves the \
+                         principal from the key",
                         self.config.username,
                         key.public_key().fingerprint(HashAlg::Sha256)
                     );
@@ -380,7 +381,8 @@ impl SshClient {
 
         if result.success() {
             log::info!(
-                "Authenticated as {} with key {}",
+                "Authenticated (ssh user {}) with key {}; the kernel resolves the principal \
+                 from the key",
                 self.config.username,
                 fingerprint
             );
@@ -431,7 +433,8 @@ impl SshClient {
 
         if result.success() {
             log::info!(
-                "Authenticated as {} with key {}",
+                "Authenticated (ssh user {}) with key {}; the kernel resolves the principal \
+                 from the key",
                 self.config.username,
                 fingerprint
             );
