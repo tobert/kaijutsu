@@ -1027,7 +1027,13 @@ async fn act_on_executable_answer(
 /// unless the ask names blocks, in which case settling them to `Error` with
 /// the reason is the delivery and no turn is spent.
 pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
-    let builder = std::thread::Builder::new().name("gate-resume".to_string());
+    // An approved `kj context create` or `kj fork` runs its rc lifecycle on
+    // THIS thread, re-entering kaish deeply; the default 2 MiB stack
+    // overflows and aborts the whole server. Same reservation as the SSH
+    // session and beat-scheduler threads — see `KAISH_RC_THREAD_STACK`.
+    let builder = std::thread::Builder::new()
+        .name("gate-resume".to_string())
+        .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
     if let Err(e) = builder.spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -12858,5 +12864,35 @@ mod status_wire_mapping_tests {
             status_to_capnp(Status::Waiting),
             crate::kaijutsu_capnp::Status::Error
         );
+    }
+}
+
+#[cfg(test)]
+mod rc_thread_stack_tests {
+    //! Every thread that drives an rc lifecycle reserves
+    //! `KAISH_RC_THREAD_STACK`; on the default 2 MiB stack the nested kaish
+    //! re-entry of a create or fork overflows and aborts the server.
+
+    /// The builder that names each rc-driving thread must size it in the
+    /// same chain. The gate-resume driver was the one that got missed.
+    #[test]
+    fn every_rc_driving_thread_reserves_the_rc_stack() {
+        let sources: [(&str, &str, &str); 3] = [
+            ("rpc.rs", include_str!("rpc.rs"), "\"gate-resume\""),
+            ("beat.rs", include_str!("beat.rs"), "\"beat-scheduler\""),
+            ("ssh.rs", include_str!("ssh.rs"), ".name(session_label.clone())"),
+        ];
+        for (file, source, thread) in sources {
+            let at = source
+                .find(thread)
+                .unwrap_or_else(|| panic!("{file}: the thread named by {thread} is gone; update this pin"));
+            let chain = &source[at..source.len().min(at + 200)];
+            assert!(
+                chain.contains(".stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)"),
+                "{file}: the thread named by {thread} runs rc lifecycles and must reserve \
+                 KAISH_RC_THREAD_STACK in the same builder chain, or an approved \
+                 `kj context create` aborts the whole server (stack overflow)"
+            );
+        }
     }
 }

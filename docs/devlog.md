@@ -2367,6 +2367,16 @@ the command and output blocks already sitting `Waiting` on that ask. There is
 nothing for a caller to present, so the tool parameter and the redeem verb
 from the earlier sketch never got built.
 
+One edge showed up only when a human approved something heavier than a
+shell line. The driver that runs an approved command has its own thread, and
+an approved `kj context create` runs the new context's rc lifecycle there —
+the same deep kaish re-entry that had already pushed the SSH session and
+beat-scheduler threads onto a 16 MiB stack. The driver still had the default
+2 MiB, and the first such approval aborted the live kernel mid-rotation of
+ROOT. It reserves the same stack now, and a test pins every rc-driving
+thread to it, so the next thread that forgets fails in CI rather than in
+production.
+
 Three things had to be true first, and one plan turned out wrong. The ask
 had to know its blocks, and nothing on the gate path could tell it: the RPC
 shell path authors its pair *before* gating and reaches the gate through the
