@@ -237,6 +237,69 @@ and would read the name from there. The app keeps its authenticated session
 principal for drafts and local blocks; a character playing a context is not
 the app's compose identity.
 
+### The bridge identity: a key per model character
+
+Today a Claude Code session reaches the kernel through `kaijutsu-mcp
+--connect`, configured once in `~/.claude.json` for the whole user. The MCP
+takes no user or key argument; the client's default key source is the SSH
+agent, trying every key it holds (`kaijutsu-client/src/ssh.rs:29–32`), so
+the kernel sees Amy's fingerprint, finds it in `credentials`, and the
+connection is principal `amy`. Everything the bridge then does is Amy: the
+`cc-*` context's creator, every block a tool writes, every ask the hook
+pipeline raises, the roster's bound row. The MCP's `session_principal` field
+was meant to carry a session identity and is dead code
+(`kaijutsu-mcp/src/lib.rs:661–664`).
+
+**The fingerprint is the identity handle.** `credentials` is keyed by
+fingerprint (`auth_db.rs:44`), so the string that selects a key out of the
+agent is the string the kernel uses to find the principal. One value, two
+lookups, nothing to keep in sync. Decided with Amy, 2026-09-05:
+
+- `kaijutsu-mcp` gains `--key-fingerprint SHA256:…`, selecting exactly one
+  agent identity, and `--key-file <path>`, reading an **unencrypted** key
+  file through the client's existing file key source (`ssh.rs:34–37`). Each
+  has an environment variable fallback so a per-repo `.mcp.json` can set it
+  in its `env` block; a flag wins over its variable. Both given is an error.
+  A fingerprint the agent does not hold, or an encrypted key file, **fails
+  the connection loudly** and names what was asked for; it never falls back
+  to trying every key, since that would silently reconnect as Amy. Neither
+  given keeps today's behavior.
+- Keys for model characters are unencrypted and live under `~/.ssh/`, so a
+  login shell can `ssh-add` them without anyone thinking about it, or the
+  MCP reads the file directly. Their public halves go in through the
+  existing auth import. Inside one trust boundary an unencrypted local
+  identity key is the same posture as the agent socket itself.
+- The user-scope entry connects as a generic `kaijutsu-mcp` principal. Any
+  session without a named lead shows up as that, which already beats showing
+  up as Amy. Each repo with a lead adds a `.mcp.json` entry naming its own
+  key, so the kaish repo connects as `kaish-lead` and this one as
+  `kaijutsu-lead`. Project-scope entries override the user-scope entry of
+  the same name; confirm that precedence at setup.
+- The dead `session_principal` field is deleted in the same change. A real
+  identity flows through the connection now.
+
+What it buys, before any character table exists: blocks authored by the
+character on the wire; asks raised by the lead's principal and answered from
+Amy's, the cross-character shape the ledger already wants (its rule keys on
+context, so nothing there changes); a bound roster row per connected lead,
+which is the identity half of the roster inversion for free; and `kj whoami`
+from the bridge saying who is speaking.
+
+Things to read once with the new identity in mind on the first live run:
+whether the SSH server compares the connection's username to the principal's
+username or uses the key alone; the `mcp` type's governance script and the
+hook pipeline's dry-run path for anything keyed on the username `amy`; and
+whether the kernel roster and the cc-peer roster agree about who is in the
+room when one process is two names.
+
+This is slice 1's first character row without the sheet, and the cheapest
+possible test of "a model character is a principal", the question the
+frontier review pushed on. It needs no kernel code. The fix to the hook
+listener archiving the wrong context on `session.end` (`docs/issues.md`,
+"The hook listener archives another session's context") should land first,
+because a spurious archive re-runs the `mcp` create bundle and drifts the
+bridge context's label.
+
 ### rc is a union
 
 `load_rc_scripts(context_type, verb)` becomes
@@ -364,6 +427,13 @@ Each slice is independently shippable and leaves the tree green.
 
 0. **Terms and docs.** This file; Terms table rows; devlog chapter. Done
    with this commit.
+0a. **Prework, no kernel code, running or queued as lanes** (2026-09-05):
+   the `PrincipalId` consumer audit; one `actor_principal` binding threaded
+   through the turn path with no behavior change; `--distill-model` on pull
+   and merge with the caller-versus-source refusal; push and pull on one
+   resolver; the hook-listener `session.end` guard; the roster's periodic
+   refresh wired into the server; `KJ_CONTEXT_TYPE` seeded for rc; and the
+   bridge identity above.
 1. **Identity and attribution.** `characters` with its first four columns;
    `contexts.played_by`, copied by fork; one idempotent server operation to
    create a character and its principal; turn-start resolution of
