@@ -99,7 +99,18 @@ Two facts from that table drive the whole design:
   `:10432`). Capabilities key on the caller's context (`kj/mod.rs:666`), the
   ledger stamps the caller who tripped the gate (`kj/gate.rs:372`), and the
   hydrator maps by role and kind (`llm/hydrate.rs:169`); none of them read a
-  block's principal.
+  block's principal. One production path does, and it is the one that
+  *wants* the change: the beat scheduler reads a model block's principal as
+  `played_by` and records it as the attachment's producer so a cell failure
+  routes back to the producing conversation (`kaijutsu-server/src/beat.rs:2213–2221`,
+  matched in `producer_ctx_for` at `:1481–1494`). With every model block
+  stamped `system` today, every producer records the same value and the
+  match returns whichever attachment iterates first. Distinct character
+  principals make it work as documented; the multi-producer path has no
+  test that would have caught the collapse, so slice 1 adds one. Nothing in
+  production compares a principal against `system()`; the only sentinel
+  equality is against `beat()` (`beat.rs:2199`). Sequence lanes tolerate
+  foreign principals by construction (`blocks/block_store.rs:353–362`).
 - **A context does not know which character performs it.** `contexts` has
   `created_by`, `context_type`, `cast_id`, but no "played by".
 - **The auth database does not honor the principal's documented permanence.**
@@ -216,6 +227,17 @@ stays `system`; the tool result is kernel-generated and stays `system`
 streaming appends use that same principal. A NULL `played_by` keeps today's
 behavior exactly.
 
+Two seams the audit named that slice 1 must decide, not discover: builtin
+tool servers author their blocks under the requester (`mcp/servers/shell.rs:345`,
+`block.rs`, `tasks.rs`, `background.rs`), so after slice 1 a model's
+`ToolCall` carries the character while the tool's own output block carries
+the human who drove the turn; the matrix above says tool output is kernel
+output and should stamp `system`, and those servers should follow it. And
+the gate-resume seed passes no principal (`rpc.rs:1316`), falling through
+to the store default `system` (`rpc.rs:2431`), where `kj drive`'s seed stamps
+the caller (`kj/drive.rs:158`); the resume seed is a requester act and should
+say so.
+
 Two invariants to pin with tests, because both are already load-bearing:
 
 - **Approval redemption keys on the requester.** Gate resume reuses the
@@ -244,11 +266,21 @@ Today a Claude Code session reaches the kernel through `kaijutsu-mcp
 takes no user or key argument; the client's default key source is the SSH
 agent, trying every key it holds (`kaijutsu-client/src/ssh.rs:29–32`), so
 the kernel sees Amy's fingerprint, finds it in `credentials`, and the
-connection is principal `amy`. Everything the bridge then does is Amy: the
-`cc-*` context's creator, every block a tool writes, every ask the hook
-pipeline raises, the roster's bound row. The MCP's `session_principal` field
-was meant to carry a session identity and is dead code
-(`kaijutsu-mcp/src/lib.rs:661–664`).
+connection is principal `amy`. That principal is the `cc-*` context's
+creator (`rpc.rs:5086`), what `whoami` answers (`rpc.rs:3076`), and the
+roster's bound row. Blocks the bridge authors are a different story:
+`authorBlock` takes the principal from the wire by design (`rpc.rs:8118–8139`),
+and the hook listener supplies a **deterministic per-session id**,
+`PrincipalId::for_agent_session(<Claude Code session id>)`
+(`kaijutsu-mcp/src/hook_listener.rs:775–786`; rationale at
+`kaijutsu-types/src/ids.rs:252–271`). So a bridge session already authors
+under its own principal, one that exists in no table and changes with every
+Claude Code session. Blocks written by builtin tool servers on a bridge
+session's behalf carry the requester instead (`mcp/servers/shell.rs:345`).
+The MCP's `session_principal` field was an earlier attempt and is dead code
+(`kaijutsu-mcp/src/lib.rs:661–664`). The bridge identity below replaces an
+anonymous per-session author and an `amy` connection with one named
+principal for both.
 
 **The fingerprint is the identity handle.** `credentials` is keyed by
 fingerprint (`auth_db.rs:44`), so the string that selects a key out of the
@@ -535,6 +567,17 @@ it.
   a distinct `CharacterId` (recorded under Open); deferring the rc union
   outright (kept, ordered after the handoff). Every citation acted on here
   was re-read in the source before it was written down.
+
+- **PrincipalId consumer audit (Opus lane, read-only, 2026-09-05),
+  `scratchpad/audit-principal-consumers.md`.** Every reader classified.
+  Findings folded in above: the beat scheduler's `played_by` read, the
+  tool-server authoring split, the gate-resume seed, the bridge's
+  per-session author principal, and the absence of any `system()`
+  comparison or principal-keyed cache. One headline was an artifact: it
+  reported the `actor_principal` binding as pre-existing, but that binding
+  is the refactor lane's in-progress edit to the same file (zero occurrences
+  in HEAD at the time). A read-only lane running beside builders must read
+  `git show HEAD:<path>`, not the working tree.
 
 ## Records
 
