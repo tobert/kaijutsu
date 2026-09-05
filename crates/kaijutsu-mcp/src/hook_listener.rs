@@ -209,6 +209,42 @@ pub fn should_adopt_session_id(
     }
 }
 
+/// Whether a `session.end` event should archive this listener's joined
+/// context.
+///
+/// Requires BOTH: the event's `session_id` equals the stored one, and the
+/// stored id came from a real hook event ([`SessionIdSource::Event`]) —
+/// never a startup transcript scrape ([`SessionIdSource::Detected`]). A
+/// scraped id can name the wrong (often previous) session; trusting it here
+/// would let that other session's `SessionEnd` archive the context THIS
+/// listener actually serves. See `should_adopt_session_id` for the capture
+/// side of the same hazard.
+pub fn should_archive_on_session_end(
+    stored: Option<&str>,
+    source: SessionIdSource,
+    event_session_id: Option<&str>,
+) -> bool {
+    source == SessionIdSource::Event && event_session_id.is_some() && stored == event_session_id
+}
+
+/// The session id a ping response advertises to `resolve_hook_socket`.
+///
+/// A [`SessionIdSource::Detected`] id is a guess (a startup transcript
+/// scrape) that can name the wrong session. Advertising it as fact lets a
+/// stale guess win rule 2 (session-id match) in `resolve_hook_socket` over a
+/// listener that genuinely has no id yet — which is exactly what rule 3 (the
+/// sole-unidentified-responder bootstrap) exists to recover. Hiding a
+/// detected id as `None` until a real event has named the session means a
+/// wrong guess can never win by "matching"; it can only ever be recovered as
+/// an honest unknown.
+///
+pub fn advertised_session_id(stored: Option<&str>, source: SessionIdSource) -> Option<&str> {
+    match source {
+        SessionIdSource::Event => stored,
+        SessionIdSource::Detected => None,
+    }
+}
+
 impl HookListener {
     /// Get the current context ID (from shared or local).
     fn context_id(&self) -> Option<ContextId> {
@@ -282,22 +318,61 @@ impl HookListener {
         }
     }
 
-    /// Start listening on a Unix socket. Runs until the socket is closed or
-    /// the task is cancelled. Spawns a tokio task per connection.
+    /// Bind and start listening on a Unix socket, then serve forever.
+    /// Convenience wrapper over [`Self::bind_socket`] + [`Self::serve`] for
+    /// callers that don't need to observe bind success separately from serve
+    /// (tests, and any future caller that doesn't need ownership tracking —
+    /// see `main.rs`'s `run_serve`, which calls the two steps separately so
+    /// it only unlinks the socket on exit if THIS process actually bound
+    /// it).
     pub async fn start(self: Arc<Self>, socket_path: PathBuf) -> anyhow::Result<()> {
-        // Ensure parent directory exists
+        let listener = Self::bind_socket(&socket_path).await?;
+        self.serve(listener).await
+    }
+
+    /// Bind the hook Unix socket, refusing to steal a path a live listener
+    /// still owns.
+    ///
+    /// Successive MCP processes under one Claude Code PPID compute the same
+    /// path (`default_socket_path`) and each used to unlink-then-rebind it
+    /// unconditionally. If the OLD process was still alive when a NEW one
+    /// bound the path, the new bind silently replaced the socket special
+    /// file out from under it: the old listener kept running and accepting
+    /// on its already-open fd, but nothing could reach it by that path any
+    /// more (observed live: "Hook socket listening" logged three times for
+    /// one path). A socket special file left behind by an UNCLEAN exit is
+    /// the one case safe to reclaim — `ECONNREFUSED` on connect proves
+    /// nothing is listening. Anything else (a live accept, or an
+    /// inconclusive probe) refuses outright: the caller decides whether to
+    /// run without a hook socket rather than corrupt another listener's.
+    pub async fn bind_socket(socket_path: &Path) -> anyhow::Result<UnixListener> {
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Remove stale socket
         if socket_path.exists() {
-            tokio::fs::remove_file(&socket_path).await?;
+            match probe_existing_socket(socket_path).await {
+                ExistingSocket::Stale => tokio::fs::remove_file(socket_path).await?,
+                ExistingSocket::Live | ExistingSocket::Unknown => {
+                    anyhow::bail!(
+                        "refusing to bind hook socket {}: another listener appears to still \
+                         own it (or its liveness could not be confirmed) — stealing the path \
+                         would leave that listener unreachable while it keeps running",
+                        socket_path.display()
+                    );
+                }
+            }
         }
 
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = UnixListener::bind(socket_path)?;
         tracing::info!(path = %socket_path.display(), "Hook socket listening");
+        Ok(listener)
+    }
 
+    /// Serve hook connections on an already-bound socket. Runs until the
+    /// socket is closed or the task is cancelled. Spawns a tokio task per
+    /// connection.
+    pub async fn serve(self: Arc<Self>, listener: UnixListener) -> anyhow::Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
@@ -341,7 +416,18 @@ impl HookListener {
         // Handle ping — return status without creating blocks
         if event.event == "ping" {
             let pending = self.pending_drift_count().await;
-            let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
+            // Advertise the session id only when a real event named it — a
+            // startup-detected (scraped) id must never be reported as fact,
+            // or a stale guess can win `resolve_hook_socket`'s session-match
+            // rule over a listener that honestly has none yet.
+            let session_id = {
+                let stored = self.session_id.lock().ok().and_then(|g| g.clone());
+                let source = *self
+                    .session_id_source
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                advertised_session_id(stored.as_deref(), source).map(str::to_string)
+            };
             let ping = PingResponse {
                 status: "ok".to_string(),
                 pid: std::process::id(),
@@ -510,7 +596,13 @@ impl HookListener {
                     author_error.get_or_insert(e);
                 }
 
-                // Then archive the context (Amy's ruling, 2026-08-12). Ordering
+                // Then archive the context (Amy's ruling, 2026-08-12) — but ONLY
+                // when this event really belongs to the session we serve.
+                // Routing can deliver a `session.end` here for someone else's
+                // session (a stale startup-detected id this process still
+                // carries, or the sole-responder fallback in
+                // `resolve_hook_socket`) — `should_archive_on_session_end`
+                // requires the stored id to be event-sourced AND match. Ordering
                 // matters: the "Session ended" block above is written first so
                 // the record is complete before it is frozen.
                 //
@@ -538,19 +630,44 @@ impl HookListener {
                 if let Some(ref remote) = self.remote
                     && let Some(ctx_id) = self.context_id()
                 {
-                    match remote.actor.archive_context(ctx_id).await {
-                        Ok(()) => tracing::info!(
+                    let stored = self.session_id.lock().ok().and_then(|g| g.clone());
+                    let source = *self
+                        .session_id_source
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if should_archive_on_session_end(
+                        stored.as_deref(),
+                        source,
+                        event.session_id.as_deref(),
+                    ) {
+                        match remote.actor.archive_context(ctx_id).await {
+                            Ok(()) => tracing::info!(
+                                context = %ctx_id.short(),
+                                "archived context on session.end"
+                            ),
+                            // Loud, not swallowed: a failure here means the label
+                            // keeps competing for drift resolution, which is the
+                            // whole problem this closes.
+                            Err(e) => tracing::warn!(
+                                context = %ctx_id.short(),
+                                "failed to archive context on session.end, its label \
+                                 stays in the active set: {e}"
+                            ),
+                        }
+                    } else {
+                        // Loud, not silent: this is exactly the misroute that
+                        // used to archive the wrong context. Naming both ids
+                        // and the source turns a silent corruption into a
+                        // diagnosable log line.
+                        tracing::warn!(
                             context = %ctx_id.short(),
-                            "archived context on session.end"
-                        ),
-                        // Loud, not swallowed: a failure here means the label
-                        // keeps competing for drift resolution, which is the
-                        // whole problem this closes.
-                        Err(e) => tracing::warn!(
-                            context = %ctx_id.short(),
-                            "failed to archive context on session.end, its label \
-                             stays in the active set: {e}"
-                        ),
+                            stored_session_id = ?stored,
+                            stored_source = ?source,
+                            event_session_id = ?event.session_id,
+                            "session.end did not match this listener's owned session — \
+                             not archiving; likely a stale startup-detected id or a \
+                             sole-responder-fallback misroute"
+                        );
                     }
                 }
             }
@@ -1290,15 +1407,42 @@ pub async fn resolve_hook_socket(
     // routing it there is also what bootstraps that server's session id
     // (session.start capture/overwrite).
     if event_session_id.is_some() {
-        let mut unknown = answered.iter().filter(|(_, r)| r.session_id.is_none());
-        if let (Some((path, _)), None) = (unknown.next(), unknown.next()) {
-            return Some(path.clone());
+        let unknown: Vec<&(PathBuf, PingResponse)> =
+            answered.iter().filter(|(_, r)| r.session_id.is_none()).collect();
+        match unknown.as_slice() {
+            [(path, _)] => return Some(path.clone()),
+            [] => {}
+            multiple => {
+                // Never pick among unidentified strangers: since a
+                // Detected-sourced (scraped) id is hidden on ping, a
+                // stale-but-wrong guess reports exactly the same as a
+                // genuinely unset listener — there is no signal left to
+                // break the tie, so this is loud, not a silent drop.
+                tracing::warn!(
+                    candidates = ?multiple.iter().map(|(p, _)| p.display().to_string()).collect::<Vec<_>>(),
+                    event_session_id = ?event_session_id,
+                    "multiple hook sockets answered with no known session id — \
+                     refusing to guess which one owns this event"
+                );
+                return None;
+            }
         }
     }
 
     match answered.len() {
         1 => Some(answered[0].0.clone()),
-        _ => None,
+        0 => None,
+        _ => {
+            tracing::warn!(
+                candidates = ?answered.iter()
+                    .map(|(p, r)| format!("{} (session_id={:?})", p.display(), r.session_id))
+                    .collect::<Vec<_>>(),
+                event_session_id = ?event_session_id,
+                "hook event matched no candidate by session id, and more than one \
+                 candidate answered — refusing to guess"
+            );
+            None
+        }
     }
 }
 
@@ -1314,24 +1458,45 @@ pub async fn sweep_stale_sockets(dir: &Path, keep: &Path) -> usize {
         if path == keep {
             continue;
         }
-        match tokio::time::timeout(SWEEP_CONNECT_TIMEOUT, tokio::net::UnixStream::connect(&path))
-            .await
-        {
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                match tokio::fs::remove_file(&path).await {
-                    Ok(()) => removed += 1,
-                    Err(e) => tracing::debug!(
-                        path = %path.display(),
-                        "Failed to unlink stale hook socket: {e}"
-                    ),
-                }
+        if let ExistingSocket::Stale = probe_existing_socket(&path).await {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::debug!(
+                    path = %path.display(),
+                    "Failed to unlink stale hook socket: {e}"
+                ),
             }
-            // Accepted (someone's listening), some other error, or timed
-            // out — leave it alone rather than guess.
-            _ => {}
         }
+        // Live or Unknown (accepted, some other error, or timed out) —
+        // leave it alone rather than guess.
     }
     removed
+}
+
+/// The bind-time liveness verdict for an existing socket special file.
+enum ExistingSocket {
+    /// Nothing answered — `ECONNREFUSED` proves the listener process is
+    /// gone and the file is an unclean exit's leftover. Safe to unlink.
+    Stale,
+    /// A connection was accepted — a listener is still actually there.
+    Live,
+    /// Neither confirmed: some other I/O error, or the probe timed out.
+    /// Treated the same as `Live` — refusing to touch it is the safe
+    /// failure; silently reclaiming it is not.
+    Unknown,
+}
+
+/// Probe whether something is listening at `path` by connecting to it.
+/// Shared by [`sweep_stale_sockets`] (removes only `Stale`) and
+/// [`HookListener::bind_socket`] (refuses to bind over anything but
+/// `Stale`).
+async fn probe_existing_socket(path: &Path) -> ExistingSocket {
+    match tokio::time::timeout(SWEEP_CONNECT_TIMEOUT, tokio::net::UnixStream::connect(path)).await
+    {
+        Ok(Ok(_stream)) => ExistingSocket::Live,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => ExistingSocket::Stale,
+        _ => ExistingSocket::Unknown,
+    }
 }
 
 /// Extract the last assistant message's text from a Claude Code transcript
@@ -1469,6 +1634,150 @@ mod tests {
             "83768815-this",
         ));
     }
+
+    // -- session.end archiving: only an event-owned session may archive --
+
+    /// A stale scraped id ([`SessionIdSource::Detected`]) that happens to
+    /// equal the ending session's id must NOT authorize archiving — the
+    /// scrape can name the previous session, and this is exactly the live
+    /// bug: L(new) advertises S(old)'s id, S(old) ends, and the match alone
+    /// is not enough to trust it.
+    #[test]
+    fn a_stale_detected_id_matching_the_event_does_not_archive() {
+        assert!(!should_archive_on_session_end(
+            Some("357380d2-old"),
+            SessionIdSource::Detected,
+            Some("357380d2-old"),
+        ));
+    }
+
+    /// An event-sourced id that matches the ending session's id is the one
+    /// case that should archive — this listener really did serve that
+    /// session.
+    #[test]
+    fn an_event_sourced_matching_id_archives() {
+        assert!(should_archive_on_session_end(
+            Some("83768815-this"),
+            SessionIdSource::Event,
+            Some("83768815-this"),
+        ));
+    }
+
+    /// An event-sourced id that does NOT match the ending session's id
+    /// means this `session.end` belongs to some other session (a stray
+    /// delivery via the sole-responder fallback) — must not archive.
+    #[test]
+    fn an_event_sourced_non_matching_id_does_not_archive() {
+        assert!(!should_archive_on_session_end(
+            Some("83768815-this"),
+            SessionIdSource::Event,
+            Some("other-session"),
+        ));
+    }
+
+    /// No stored id at all — never archive; there is nothing to attribute
+    /// the ending session to.
+    #[test]
+    fn no_stored_id_does_not_archive() {
+        assert!(!should_archive_on_session_end(
+            None,
+            SessionIdSource::Detected,
+            Some("some-session"),
+        ));
+    }
+
+    // -- ping advertising: a scraped id must never be reported as fact --
+
+    /// A [`SessionIdSource::Detected`] id (the startup transcript scrape) is
+    /// a guess and must not be advertised — this is what stops a stale guess
+    /// from winning `resolve_hook_socket`'s session-id-match rule.
+    #[test]
+    fn a_detected_id_is_not_advertised() {
+        assert_eq!(
+            advertised_session_id(Some("357380d2-old"), SessionIdSource::Detected),
+            None
+        );
+    }
+
+    /// An event-sourced id is the one case that should be advertised — a
+    /// real hook event actually named this session.
+    #[test]
+    fn an_event_sourced_id_is_advertised() {
+        assert_eq!(
+            advertised_session_id(Some("83768815-this"), SessionIdSource::Event),
+            Some("83768815-this")
+        );
+    }
+
+    /// End-to-end receipt for the ping-advertising fix: a listener whose
+    /// `session_id` was set by startup detection (source stays `Detected`,
+    /// exactly what `main.rs`'s transcript scrape produces) must answer a
+    /// real ping over the socket with `session_id: null` — not the scraped
+    /// value — until an actual hook event names the session, after which it
+    /// reports the true id.
+    #[tokio::test]
+    async fn ping_hides_a_detected_id_until_an_event_names_the_session() {
+        let (listener, _store, _ctx_id) = local_listener_with_context();
+        // Simulate what startup detection does: populate session_id without
+        // ever going through the event-capture path, so source stays
+        // Detected — same shape as a scraped transcript's previous-session id.
+        *listener.session_id.lock().unwrap() = Some("357380d2-scraped".to_string());
+        assert_eq!(*listener.session_id_source.lock().unwrap(), SessionIdSource::Detected);
+
+        let dir = unique_temp_dir("ping-hides-detected");
+        let socket_path = dir.join("hook-ping.sock");
+        let listener = Arc::new(listener);
+        let bg_path = socket_path.clone();
+        let bg_listener = Arc::clone(&listener);
+        tokio::spawn(async move {
+            let _ = bg_listener.start(bg_path).await;
+        });
+        for _ in 0..100 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(socket_path.exists(), "hook socket never bound");
+
+        let response = send_hook_event(
+            &socket_path,
+            r#"{"event":"ping","source":"kaijutsu-mcp-hook"}"#,
+        )
+        .await
+        .unwrap()
+        .expect("ping must get a response");
+        let ping: PingResponse = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(
+            ping.session_id, None,
+            "a Detected-sourced id must never be advertised as fact"
+        );
+
+        // Now a real event names the session — the capture path in
+        // `handle_connection` should adopt it (source becomes Event).
+        let named = send_hook_event(
+            &socket_path,
+            r#"{"event":"tool.before","source":"claude-code","session_id":"83768815-real"}"#,
+        )
+        .await
+        .unwrap();
+        assert!(named.is_some());
+
+        let response2 = send_hook_event(
+            &socket_path,
+            r#"{"event":"ping","source":"kaijutsu-mcp-hook"}"#,
+        )
+        .await
+        .unwrap()
+        .expect("ping must get a response");
+        let ping2: PingResponse = serde_json::from_str(response2.trim()).unwrap();
+        assert_eq!(
+            ping2.session_id.as_deref(),
+            Some("83768815-real"),
+            "once an event names the session, ping must advertise it"
+        );
+    }
+
     use crate::hook_types::ToolInfo;
 
     /// The hook must answer before Claude Code gives up. When the work
@@ -1999,6 +2308,36 @@ mod tests {
         assert_eq!(resolved, Some(path_b));
     }
 
+    /// The scenario item 2 targets: a listener with a stale scraped id equal
+    /// to the event's session id, alongside one that never learned any id.
+    /// Now that ping hides a Detected-sourced id (`advertised_session_id`),
+    /// BOTH report `session_id: None` — the scraped one can no longer win
+    /// rule 2 by "matching" on a guess it should never have offered as fact.
+    /// With two unidentified responders, rule 3 requires exactly one and
+    /// refuses to guess between them: fail loudly (drop), never pick.
+    #[tokio::test]
+    async fn resolve_refuses_to_pick_between_two_unidentified_responders() {
+        let dir = unique_temp_dir("resolve-two-unidentified");
+        let path_a = dir.join("hook-a.sock");
+        let path_b = dir.join("hook-b.sock");
+        // Neither advertises a session id — this is what a Detected-sourced
+        // listener now reports (hidden), same as a genuinely unset one.
+        spawn_fake_ping_server(path_a.clone(), None).await;
+        spawn_fake_ping_server(path_b.clone(), None).await;
+
+        let resolved = resolve_hook_socket(
+            vec![path_a, path_b],
+            None,
+            Some("357380d2-scraped"),
+            PING_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            resolved, None,
+            "ambiguous between two unidentified responders must fail open, not guess"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_fails_open_when_multiple_answer_and_none_match() {
         let dir = unique_temp_dir("resolve-ambiguous");
@@ -2063,5 +2402,65 @@ mod tests {
         let dir = unique_temp_dir("sweep-missing").join("does-not-exist");
         let removed = sweep_stale_sockets(&dir, Path::new("/nonexistent/keep.sock")).await;
         assert_eq!(removed, 0);
+    }
+
+    // -- item 3: bind_socket must not steal a live listener's path --
+
+    #[tokio::test]
+    async fn bind_socket_succeeds_on_a_fresh_path() {
+        let dir = unique_temp_dir("bind-fresh");
+        let path = dir.join("hook-fresh.sock");
+        let listener = HookListener::bind_socket(&path).await.expect("fresh bind must succeed");
+        assert!(path.exists());
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_reclaims_a_stale_socket_file() {
+        let dir = unique_temp_dir("bind-stale");
+        let path = dir.join("hook-stale.sock");
+        {
+            // Bind and drop without unlinking — the special file outlives
+            // the dropped listener, exactly like an unclean exit.
+            let _listener = UnixListener::bind(&path).unwrap();
+        }
+        assert!(path.exists());
+
+        let listener = HookListener::bind_socket(&path)
+            .await
+            .expect("a stale socket file must be reclaimed, not refused");
+        assert!(path.exists());
+        drop(listener);
+    }
+
+    /// The defect this closes: two successive processes computing the same
+    /// PPID-derived path used to unlink-then-rebind unconditionally, so a
+    /// still-alive predecessor's socket special file was silently replaced
+    /// out from under it — the predecessor kept running but nothing could
+    /// reach it by that path any more. `bind_socket` must refuse instead.
+    #[tokio::test]
+    async fn bind_socket_refuses_to_steal_a_live_listeners_path() {
+        let dir = unique_temp_dir("bind-live");
+        let path = dir.join("hook-live.sock");
+        let live_listener = UnixListener::bind(&path).unwrap();
+
+        let result = HookListener::bind_socket(&path).await;
+        assert!(
+            result.is_err(),
+            "binding over a live listener's path must fail loudly, not silently rebind"
+        );
+
+        // The original listener must still be reachable at the same path —
+        // proof nothing stole it.
+        let connect = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::UnixStream::connect(&path),
+        )
+        .await;
+        assert!(
+            connect.is_ok() && connect.unwrap().is_ok(),
+            "the original live listener must still be reachable after the refused bind"
+        );
+        drop(live_listener);
     }
 }

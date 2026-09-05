@@ -8,23 +8,25 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 
 
-## The hook listener archives another session's context on `session.end` (2026-09-05, fix lane running)
+## Hook listener fix: deploy and two follow-ups (2026-09-05)
 
-`kaijutsu-mcp`'s hook listener archives its own context on `session.end`
-(`hook_listener.rs:504`, archive at `:541`) without checking that the
-event's `session_id` is the session it serves. Its stored id is seeded from
-a transcript scrape that can name the PREVIOUS session (`main.rs:191` says
-so), routing trusts the advertised id (`hook_listener.rs:1281`), and the
-PPID-derived `--socket` tiebreaker never fires because the shipped hook
-command passes none (`main.rs:358`). Proved live on zorak: the listener for
-the current session advertised the previous session's id. Consequence
-beyond the annoyance: a spurious archive makes `register_session` mint a
-`-2`, `-3` label and re-run the `mcp` create bundle mid-session, which
-`docs/character.md` slice 2 cannot tolerate. Fix in flight: archive only on
-an event-sourced matching id, never advertise a scraped id on ping, never
-unlink a shared socket. Settings follow-up for Amy: pass `--socket` from the
-hook command so the PPID path is authoritative. Deploy needs the
-`~/bin/kaijutsu-mcp` rebuild and a `/mcp` reconnect.
+The misroute-then-archive bug is FIXED in the tree (`session.end` archives
+only on an event-sourced matching id; ping hides a scraped id; a live peer's
+socket is never stolen or unlinked). Not yet deployed: `~/bin/kaijutsu-mcp`
+needs the rebuild-and-rename, then `/mcp` reconnect in each session.
+Follow-ups:
+
+- **Settings, Amy's:** pass `--socket` from the hook command
+  (`~/.claude/settings.json` / `contrib/claude-hooks.json`) so the
+  PPID-derived socket outranks routing on every call, not only when routing
+  falls through.
+- **A refused bind has no retry.** When `bind_socket` finds a LIVE listener
+  on its path it now refuses and the MCP keeps serving without a hook socket,
+  logging at error. If the peer is an old process about to exit (a `/mcp`
+  reconnect racing the previous MCP's shutdown), the new process never gets
+  its socket back. A bounded retry until the path reads stale, then reclaim,
+  would close it. The lane treated the contest as the same severity as the
+  existing no-`XDG_RUNTIME_DIR` degradation; hard abort was the alternative.
 
 ## Bridge identity: `kaijutsu-mcp` selects its key (2026-09-05, queued)
 

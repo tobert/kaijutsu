@@ -262,35 +262,58 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             tracing::info!(removed, dir = %dir.display(), "Stale hook socket sweep complete");
         }
 
-        let listener = match mcp.backend() {
-            kaijutsu_mcp::Backend::Local(store) => {
-                // Local mode: hooks write to the same in-memory store
-                let doc_ids = store.list_ids();
-                let ctx_id = doc_ids.first()
-                    .copied()
-                    .unwrap_or_else(kaijutsu_types::ContextId::new);
-                Arc::new(HookListener::local(store.clone(), ctx_id))
-            }
-            kaijutsu_mcp::Backend::Remote(remote) => {
-                // shared_context_id is updated by register_session when a context is joined
-                Arc::new(HookListener::remote_with_agent(
-                    remote.clone(),
-                    Arc::clone(&remote.shared_context_id),
-                    Arc::clone(mcp.session_id_arc()),
-                    Arc::clone(mcp.agent_name_arc()),
-                    pending_label_base.clone(),
-                ))
+        // Bind the socket SYNCHRONOUSLY, before spawning the accept loop —
+        // `bind_socket` refuses (rather than silently steals) a path a live
+        // listener still owns, and this process must know whether that
+        // refusal happened before it decides, on exit, whether the path is
+        // its own to unlink. A bound-then-spawned accept loop would let
+        // main.rs find out about a bind failure only via a log line, with
+        // no way to gate the exit-time cleanup on it.
+        let bound_socket = match HookListener::bind_socket(&socket_path).await {
+            Ok(unix_listener) => Some(unix_listener),
+            Err(e) => {
+                tracing::error!(
+                    path = %socket_path.display(),
+                    "Failed to bind hook socket: {e} — continuing without a hook socket \
+                     rather than share another listener's endpoint"
+                );
+                None
             }
         };
+        // Only this branch means WE bound the path — the one condition
+        // under which cleanup on exit may unlink it.
+        let owns_socket = bound_socket.is_some();
 
-        let socket_path_bg = socket_path.clone();
-        tokio::spawn(async move {
-            if let Err(e) = listener.start(socket_path_bg).await {
-                tracing::error!("Hook listener error: {e}");
-            }
-        });
+        if let Some(unix_listener) = bound_socket {
+            let listener = match mcp.backend() {
+                kaijutsu_mcp::Backend::Local(store) => {
+                    // Local mode: hooks write to the same in-memory store
+                    let doc_ids = store.list_ids();
+                    let ctx_id = doc_ids.first()
+                        .copied()
+                        .unwrap_or_else(kaijutsu_types::ContextId::new);
+                    Arc::new(HookListener::local(store.clone(), ctx_id))
+                }
+                kaijutsu_mcp::Backend::Remote(remote) => {
+                    // shared_context_id is updated by register_session when a context is joined
+                    Arc::new(HookListener::remote_with_agent(
+                        remote.clone(),
+                        Arc::clone(&remote.shared_context_id),
+                        Arc::clone(mcp.session_id_arc()),
+                        Arc::clone(mcp.agent_name_arc()),
+                        pending_label_base.clone(),
+                    ))
+                }
+            };
 
-        tracing::info!(socket = %socket_path.display(), "Hook socket started");
+            tokio::spawn(async move {
+                if let Err(e) = listener.serve(unix_listener).await {
+                    tracing::error!("Hook listener error: {e}");
+                }
+            });
+
+            tracing::info!(socket = %socket_path.display(), "Hook socket started");
+        }
 
         // Create and serve the MCP server
         let service = mcp
@@ -305,8 +328,14 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         // Wait for the service to complete
         service.waiting().await?;
 
-        // Cleanup socket on exit
-        let _ = tokio::fs::remove_file(&socket_path).await;
+        // Cleanup socket on exit — ONLY if this process is the one that
+        // bound it. Unlinking unconditionally (the old behavior) deletes
+        // whatever now lives at this shared PPID-derived path, including a
+        // successor process's live socket if one bound it after we lost our
+        // own liveness check race — see `HookListener::bind_socket`.
+        if owns_socket {
+            let _ = tokio::fs::remove_file(&socket_path).await;
+        }
 
         tracing::info!("kaijutsu-mcp server shutting down");
         Ok(())
