@@ -2445,3 +2445,59 @@ one the rest of the day had been circling: *"let's use kaish as a library
 which mcp already does so there's no way to have version skew."* The hook
 began moving into kaijutsu-mcp that evening, planning in process against
 the lockfile and replying to Claude Code before it scores.
+
+## The name that had no home (September 5)
+
+Amy opened a Saturday with her own routine on the table: she restarts every
+Claude Code session each morning, and again whenever a context's prompt
+cache has gone cold, and the thing that makes a restart cheap is a handoff
+she and the lead maintain by hand. She had been wondering whether it was
+time for "a lil message board." Within a few exchanges she had reframed it:
+*"really message board would be a rework of the drift queue."*
+
+The musician already had the answer in miniature. A player's score lives in
+a track's context, written ahead of the playhead; a page-turn forks a thin
+child that re-attaches; the child rehydrates from a window plus the last
+eight phrases the kernel hands it. Map that onto the lead and the seat is a
+track, the handoff is the score, the restart is a rotate, and the morning
+read is the window. The signoff file's flaws, whole-file rewrite, no stamp,
+no author, no window, all fall out of using blocks instead.
+
+What the conversation could not get past for a while was the connecting
+noun. A context is ephemeral. The context graph is a forest, and Amy's
+instinct that it could not be the container was right: the identity would be
+a whole tree, and no tree is a thing you can hand a note to. The name is the
+home, she said, but "the name needs a home in code. A bare string or
+identifier probably isn't it." Game design supplied the shape: a character
+sheet, a collection of things with an opaque id in the records and a given
+name at the table. **Character** also turned out to be the missing word in
+a set kaijutsu already used, cast and role and context, the thing an actor
+is cast as. Amy is a character. So, eventually, is everyone in the house.
+
+Then she pruned. Party went, because the accountability chain covers it.
+Chair and seat went, because no concept needed them. The purse and an
+availability field were deferred. Presence stayed, with a caution against
+ever tying one client to one character, since she is connected two to five
+ways on a normal day. And the night shift became a janitor first, with a
+proctor sweep as its second job: notice an idle session, ask Amy, then drive
+the session to write its own handoff note while its cache is still warm,
+because *"the session's own model is both the best summarizer and the
+cheapest one."*
+
+The code review at the end changed the plan more than the design did. A
+principal already has an opaque id, a unique username, a display name, and
+many credentials mapping into it; Amy's keys from every machine already
+resolve to one. The roster already knows principals and contexts, liveness,
+and self-reported availability. So a character is a principal with a sheet,
+and the design adds no new identity type. The lead first read the turn path
+as stamping a model's blocks with the human who drove the turn; a kaibo
+review the same afternoon corrected it: the blocks carry the system
+principal, because there has never been a principal for the model to be, and
+the only thing that reads a block's principal is the wire's author field.
+A frontier deliberation that evening moved the handoff off the track's
+score and onto an ordinary context with a hydration window, split every
+turn's identity into the requester who caused it and the character who
+performs it, and asked for an explicit address when a note is meant for a
+character rather than a live context. `docs/character.md` carries the
+slices; slice one is a column and that stamp.
+

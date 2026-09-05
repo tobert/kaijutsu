@@ -233,6 +233,16 @@ Two consequences worth stating plainly:
    on zorak only — I have not measured moltar and am not claiming its
    number.
 
+### Where the "message board" went (2026-09-05)
+
+Amy: *"really message board would be a rework of the drift queue."* The
+rework is addressing: `kj drift push <character>` resolves to the
+character's **handoff track** when no live context matches, so a note to a
+name with no session lands durably and shows in that character's next
+`create` window. Gaps 2 (no wake, shape D), 3 (one resolver) and 5 (presence
+hangs off characters, roster inverted) are all absorbed there.
+`docs/character.md`, "Drift addresses a character".
+
 ## Slices
 
 Ordered by value over cost. Slice 1 shipped today; the 60-candidate

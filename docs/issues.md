@@ -6,6 +6,29 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+
+## Character support (designed 2026-09-05, unbuilt)
+
+`docs/character.md` is canonical: a character is a principal with a sheet,
+a context is played by one, rc is a union of the type's and the character's
+directories, the handoff is a track, drift can address a character, and a
+janitor character runs the proctor sweep. Six slices there; slice 1 is the
+`characters` table + `contexts.played_by` + turn-path attribution. Until it
+lands, a model's own blocks are stamped `PrincipalId::system()`
+(`kaijutsu-server/src/llm_stream.rs:1818`, `:1890`), and the wire shows
+"system" as their author (`rpc.rs:10234`).
+
+## Distillation picks the source's cast silently when the caller differs (2026-09-05)
+
+`summarize_with_model` (`kj/mod.rs:725`) resolves the distill model as:
+explicit `--distill-model`, else the **source** context's provider/model,
+else the registry default. Only `fork --compact` exposes the flag;
+`kj drift pull` (`kj/drift.rs:51`) does not. A cheap caller pulling from an
+expensive context bills the expensive cast without saying so. Fix agreed
+(Amy): when the caller's cast and the source's differ and no distill model is
+named, **refuse** and name both casts and the flag; add `--distill-model` to
+`pull`. A default that flips casts quietly is a silent fallback.
+
 ## The MCP `shell` path applies no size limit to its envelope (2026-09-04)
 
 The in-kernel `shell` result is bounded by the broker's per-instance

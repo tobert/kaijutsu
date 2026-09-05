@@ -182,6 +182,16 @@ beat/clock/cue code with that section open.
 
 `stage exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) reach the next turn through a per-context mailbox, which is a **pull-based cursor over the durable block log**, not a queue: a background writer inserts into the block store and the mailbox discovers the delta on the next turn's `catch_up`. **There is no insert-time atomicity gate**, so an unrelated writer can still land a block between a tool_use and its tool_result; what exists is repair at `snapshot()` time, which fixes the conversation shape and leaves the durable blocks interleaved. The gate is a named follow-up — `docs/conversation-session.md`, "Out of scope for Slice A".
 
+## Character
+
+A **character** is the persistent someone a name like `kaijutsu-lead`
+resolves to. Amy is one; so is every model seat. It is a principal with a
+sheet: accountable-to, default cast, and pointers to an rc directory, a
+memory root, a handoff track and a root context. A context is one
+performance of a character in a `context_type` by a cast. Designed
+2026-09-05, unbuilt; `docs/character.md` is canonical and carries the
+rollout. Not terms: party, chair, seat.
+
 ## Machines
 
 Kaijutsu is hacked on across three machines — `hostname` tells you where you are:
@@ -396,6 +406,8 @@ a collision appears in real prose, not in advance.
 | hydrate | verb | To build a conversation from a context. Happens only at a boundary event. |
 | sequence | verb, noun | What the kernel does to every accepted mutation. There is exactly one sequencer. |
 | fail loudly | verb phrase | An error is explicit and immediate. We never continue on a wrong assumption, and we prefer crashing to corrupting. |
+| character | noun | The persistent someone a name resolves to; human or model. A principal with a sheet (`docs/character.md`). For a text unit say code point, glyph, or `char`, never character. |
+| context_type | noun | The rc bundle a context runs, `/config/rc/<type>/<verb>/`. A role, not an individual; half of the rc union once characters land. Not "chair". |
 
 ## Proprioception
 
