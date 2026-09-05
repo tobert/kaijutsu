@@ -615,6 +615,29 @@ it.
   in HEAD at the time). A read-only lane running beside builders must read
   `git show HEAD:<path>`, not the working tree.
 
+- **kaibo, cast `crusoe` (GLM-5.2 synth), 2026-09-05 afternoon, on the
+  MCP bridge and SSH client changes, whole files attached.** Found no
+  defect in the session-end guard, the ping hiding, the fingerprint parity
+  with `auth_db`, or the flag/env precedence. Two follow-ups adopted: a
+  `Stale` probe verdict is confirmed by a second probe before a socket is
+  unlinked, because BSD-derived systems return ECONNREFUSED for a live
+  listener with a full backlog where Linux returns EAGAIN; and an empty
+  environment value counts as unset. Noted and accepted: a session whose
+  end event carries no session id, or whose scraped id happened to be
+  right with no earlier event, stays un-archived, and the warn line names
+  why.
+- **kaibo, cast `crusoe-ds4` (DeepSeek-V4-Flash), 2026-09-05 afternoon, on
+  the kernel and server changes, whole files attached.** The authorship
+  classification and `KJ_CONTEXT_TYPE` threading are clean. Two defects
+  adopted: the distillation refusal compared `DriftRouter` pairs, which
+  exist only for explicitly pinned contexts, so a default-configured caller
+  pulling from a pinned expensive source, the very case it was built for,
+  slipped through; both sides now resolve through the turn path's ladder.
+  And `kj drift push` could deliver into an archived context through the
+  router fallback, mutating retained work and firing its `drift` rc; push
+  now refuses an archived target as `kj drive` does. Minor: the roster
+  loop test's two-second deadlines were a flake vector under load.
+
 ## Records
 
 - Design artifact, three passes with concept art:
