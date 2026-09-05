@@ -316,7 +316,7 @@ lookups, nothing to keep in sync. Decided with Amy, 2026-09-05:
 
 ```sh
 ssh-keygen -t ed25519 -N "" -C "kaijutsu-lead" -f ~/.ssh/kaijutsu-lead   # unencrypted, on purpose
-kaijutsu-server auth import ~/.ssh/kaijutsu-lead.pub --user kaijutsu-lead  # public half → a credentials row
+kaijutsu-server add-key ~/.ssh/kaijutsu-lead.pub --nick kaijutsu-lead   # public half → a principal + credentials row
 ssh-add ~/.ssh/kaijutsu-lead        # or skip the agent and use --key-file below
 ssh-add -l                          # copy the SHA256:… line for this key
 ```
@@ -328,8 +328,11 @@ Then in the repo's `.mcp.json`, on the `kaijutsu` server entry:
 ```
 
 or `"KAIJUTSU_KEY_FILE": "/home/atobey/.ssh/kaijutsu-lead"` to read the
-file directly. The exact `auth import` spelling is whatever
-`kaijutsu-server auth --help` prints; the doc does not pin it. The MCP warns
+file directly. On a machine where the MCP entry is machine-specific (a
+`target/debug` path), prefer `claude mcp add -s local kaijutsu -e
+KAIJUTSU_KEY_FINGERPRINT=SHA256:… -- <path> --connect`: local scope is
+per project and per user, is not committed, and overrides the user-scope
+entry of the same name. `kaijutsu-server list-keys <nick>` confirms the row. The MCP warns
 at connect when it is probably using a personal key: the default
 try-every-agent-key mode, or a `--key-file` named like `~/.ssh/id_*`. It
 still connects, so a first run stays easy.
