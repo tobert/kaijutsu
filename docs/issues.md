@@ -32,13 +32,6 @@ Follow-ups:
   (`~/.claude/settings.json` / `contrib/claude-hooks.json`) so the
   PPID-derived socket outranks routing on every call, not only when routing
   falls through.
-- **A refused bind has no retry.** When `bind_socket` finds a LIVE listener
-  on its path it now refuses and the MCP keeps serving without a hook socket,
-  logging at error. If the peer is an old process about to exit (a `/mcp`
-  reconnect racing the previous MCP's shutdown), the new process never gets
-  its socket back. A bounded retry until the path reads stale, then reclaim,
-  would close it. The lane treated the contest as the same severity as the
-  existing no-`XDG_RUNTIME_DIR` degradation; hard abort was the alternative.
 
 ## Character support (designed 2026-09-05, unbuilt)
 

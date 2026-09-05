@@ -41,6 +41,16 @@ pub const PING_TIMEOUT: Duration = tiers::PROBE;
 /// **Probe tier**, same reasoning.
 const SWEEP_CONNECT_TIMEOUT: Duration = tiers::PROBE;
 
+/// How long [`HookListener::bind_socket`] will wait for a `Live`/`Unknown`
+/// socket path to clear before giving up. Successive `kaijutsu-mcp`
+/// processes under one hosting-process PID compute the same socket path, so
+/// a predecessor still finishing its own shutdown reads as `Live` for a
+/// moment — a clean shutdown finishes well under this window.
+const BIND_RETRY_WINDOW: Duration = Duration::from_secs(10);
+
+/// Poll interval while `bind_socket` waits out a `Live`/`Unknown` path.
+const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Maximum size of a block's content created from hook events.
 const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
 
@@ -342,17 +352,73 @@ impl HookListener {
     /// more (observed live: "Hook socket listening" logged three times for
     /// one path). A socket special file left behind by an UNCLEAN exit is
     /// the one case safe to reclaim — `ECONNREFUSED` on connect proves
-    /// nothing is listening. Anything else (a live accept, or an
-    /// inconclusive probe) refuses outright: the caller decides whether to
-    /// run without a hook socket rather than corrupt another listener's.
+    /// nothing is listening.
+    ///
+    /// A `Live`/`Unknown` verdict is not necessarily a competing listener —
+    /// the path is stable across reconnects, so a predecessor still
+    /// finishing its own shutdown reads the same way for a moment. Rather
+    /// than refuse on the first probe, wait out [`BIND_RETRY_WINDOW`]
+    /// (polling every [`BIND_RETRY_INTERVAL`]) for the path to go `Stale`
+    /// or disappear. Only a path still `Live`/`Unknown` at the end of that
+    /// window is treated as a genuine competing listener: the caller
+    /// decides whether to run without a hook socket rather than corrupt
+    /// another listener's.
     pub async fn bind_socket(socket_path: &Path) -> anyhow::Result<UnixListener> {
+        Self::bind_socket_with_retry(socket_path, BIND_RETRY_INTERVAL, BIND_RETRY_WINDOW).await
+    }
+
+    /// [`Self::bind_socket`] with the poll interval and wait window as
+    /// parameters instead of the fixed [`BIND_RETRY_INTERVAL`] /
+    /// [`BIND_RETRY_WINDOW`]. `bind_socket` is the constant-parameter
+    /// production entry point; this split exists so a test can exercise the
+    /// same refuse-at-deadline path in real wall-clock time without waiting
+    /// out the production 10-second window.
+    async fn bind_socket_with_retry(
+        socket_path: &Path,
+        interval: Duration,
+        window: Duration,
+    ) -> anyhow::Result<UnixListener> {
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
         if socket_path.exists() {
-            match probe_existing_socket(socket_path).await {
-                ExistingSocket::Stale => tokio::fs::remove_file(socket_path).await?,
+            // A predecessor's clean shutdown can remove the path entirely
+            // partway through the wait below — treat "gone" the same as
+            // `Stale` (nothing left to steal) rather than falling through
+            // to `probe_existing_socket`'s conservative `Unknown` for a
+            // connect that fails with `NotFound` instead of
+            // `ConnectionRefused`.
+            let probe = || async {
+                if !socket_path.exists() {
+                    ExistingSocket::Stale
+                } else {
+                    probe_existing_socket(socket_path).await
+                }
+            };
+
+            let mut verdict = probe().await;
+            if matches!(verdict, ExistingSocket::Live | ExistingSocket::Unknown) {
+                tracing::info!(
+                    path = %socket_path.display(),
+                    window_ms = window.as_millis(),
+                    "hook socket path still appears owned by another listener; waiting for \
+                     it to clear before binding"
+                );
+                verdict = wait_for_socket_to_clear(probe, interval, window).await;
+            }
+
+            match verdict {
+                ExistingSocket::Stale => {
+                    // The path may already be gone (the "disappeared
+                    // mid-wait" case above) — that is success, not a
+                    // failure to report.
+                    if let Err(e) = tokio::fs::remove_file(socket_path).await {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            return Err(e.into());
+                        }
+                    }
+                }
                 ExistingSocket::Live | ExistingSocket::Unknown => {
                     anyhow::bail!(
                         "refusing to bind hook socket {}: another listener appears to still \
@@ -1499,6 +1565,37 @@ async fn probe_existing_socket(path: &Path) -> ExistingSocket {
     }
 }
 
+/// Poll `probe` every `interval` until it stops reporting `Live`/`Unknown`
+/// or `window` elapses, whichever comes first. Returns the last verdict —
+/// `Stale` (or an `Unknown` that never resolved) once seen, otherwise the
+/// verdict standing when the window runs out.
+///
+/// Takes the probe as a closure so [`HookListener::bind_socket`]'s retry
+/// policy is exercisable without a real socket or a real 10-second wait: a
+/// test injects a probe that flips from `Live` to `Stale` after a fixed
+/// number of calls, plus a millisecond-scale `interval`/`window`.
+async fn wait_for_socket_to_clear<F, Fut>(
+    mut probe: F,
+    interval: Duration,
+    window: Duration,
+) -> ExistingSocket
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ExistingSocket>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let verdict = probe().await;
+        if !matches!(verdict, ExistingSocket::Live | ExistingSocket::Unknown) {
+            return verdict;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return verdict;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Extract the last assistant message's text from a Claude Code transcript
 /// (JSONL, one JSON object per line).
 ///
@@ -2444,7 +2541,16 @@ mod tests {
         let path = dir.join("hook-live.sock");
         let live_listener = UnixListener::bind(&path).unwrap();
 
-        let result = HookListener::bind_socket(&path).await;
+        // Real bind_socket() would wait out the full production
+        // BIND_RETRY_WINDOW (10s) before giving up — same code path,
+        // exercised here with a millisecond-scale window so the test stays
+        // fast.
+        let result = HookListener::bind_socket_with_retry(
+            &path,
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+        )
+        .await;
         assert!(
             result.is_err(),
             "binding over a live listener's path must fail loudly, not silently rebind"
@@ -2462,5 +2568,114 @@ mod tests {
             "the original live listener must still be reachable after the refused bind"
         );
         drop(live_listener);
+    }
+
+    /// The defect this closes: the hook socket path is per hosting-process
+    /// PID and stable across `kaijutsu-mcp` reconnects, so a predecessor
+    /// still finishing its own shutdown reads as `Live`/`Unknown` for a
+    /// moment. `bind_socket` used to refuse permanently on that first
+    /// probe; it must instead wait for the path to clear and bind as soon
+    /// as it does, within `BIND_RETRY_WINDOW`.
+    #[tokio::test]
+    async fn bind_socket_binds_once_a_live_predecessor_exits_within_the_window() {
+        let dir = unique_temp_dir("bind-retry-clears");
+        let path = dir.join("hook-retry-clears.sock");
+        let live_listener = UnixListener::bind(&path).unwrap();
+
+        let path_for_task = path.clone();
+        let unlink_after_a_beat = tokio::spawn(async move {
+            // Simulate the predecessor's shutdown completing shortly after
+            // the successor starts probing.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(live_listener);
+            tokio::fs::remove_file(&path_for_task).await.unwrap();
+        });
+
+        let listener = HookListener::bind_socket_with_retry(
+            &path,
+            Duration::from_millis(5),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("a predecessor that clears within the window must be waited out, not refused");
+        assert!(path.exists());
+
+        unlink_after_a_beat.await.unwrap();
+        drop(listener);
+    }
+
+    // -- wait_for_socket_to_clear: the pure retry loop bind_socket delegates to --
+
+    #[tokio::test]
+    async fn wait_for_socket_to_clear_binds_once_probe_goes_stale_within_window() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n < 2 { ExistingSocket::Live } else { ExistingSocket::Stale }
+            }
+        };
+
+        let verdict =
+            wait_for_socket_to_clear(probe, Duration::from_millis(5), Duration::from_millis(500))
+                .await;
+
+        assert!(
+            matches!(verdict, ExistingSocket::Stale),
+            "must resolve Stale once the probe reports it within the window"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must stop polling as soon as the path clears, not keep going to the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_socket_to_clear_refuses_when_live_for_the_whole_window() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { ExistingSocket::Live }
+        };
+
+        let verdict =
+            wait_for_socket_to_clear(probe, Duration::from_millis(5), Duration::from_millis(30))
+                .await;
+
+        assert!(
+            matches!(verdict, ExistingSocket::Live),
+            "a path Live for the whole window must come back Live, not silently resolve"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "must have actually polled more than once across the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_socket_to_clear_returns_immediately_when_already_stale() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { ExistingSocket::Stale }
+        };
+
+        let start = tokio::time::Instant::now();
+        let verdict = wait_for_socket_to_clear(
+            probe,
+            Duration::from_millis(5),
+            Duration::from_secs(10),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(verdict, ExistingSocket::Stale));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "must probe exactly once");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "an already-stale path must bind at once, not wait out any part of a 10s window \
+             (elapsed: {elapsed:?})"
+        );
     }
 }
