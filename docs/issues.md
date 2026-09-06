@@ -334,15 +334,24 @@ From Amy's first evening on it (2026-09-02), in her order:
   the client, but not a rush."* The status line has `app.connection`; a
   keystroke that stalls on a reconnecting actor should say so instead of
   looking hung.
-- **Seat switching is inconsistent** (Amy, 2026-09-05): *"if root is
-  marked 4 in and I hit Ctrl+A 4, I should switch to it. same for the list
-  view. but it doesn't seem to work consistently."* First suspect: the rank
-  is rebuilt on every refresh (`App::set_contexts` → `kaijutsu_client::ranked_seats`), so a
-  digit read off the status line can name a different context by the time
-  it is pressed. screen/tmux windows never renumber under the hand; seats
-  should hold their digit for the life of the session, or at least until a
-  context leaves. Needs a probe with the refresh disabled to split rank
-  churn from a switch that fails outright.
+- **Seat digits: ring 1 churns, and the picker disagrees with the status
+  line.** From Amy's 2026-09-05 report (*"if root is marked 4 in and I hit
+  Ctrl+A 4, I should switch to it. same for the list view. but it doesn't
+  seem to work consistently."*). The contributing factor found and fixed
+  2026-09-06 was the ask card: it took every key while up, chords included,
+  and the advisory gate raises one often (`docs/tui.md`, "Asks"). ROOT's
+  digit itself is stable — ring 0 is append-ordered by `promoted_at`, so
+  ROOT holds 4 until a context promoted before it leaves. What remains is
+  design: the status line digits the first ten seats of ring 0 *then*
+  ring 1, and `Ctrl+A <digit>` reaches both, but ring 1 reorders by last
+  activity on every refresh, so a digit past ring 0 can name a different
+  context by the time it is pressed; and the picker digits ring 0 only, so
+  `7` in the picker does nothing where `Ctrl+A 7` switches. screen/tmux
+  windows never renumber under the hand. Two shapes, Amy's call: digits
+  for ring 0 only on every surface (promote is what earns a digit; ring 1
+  stays reachable by `n`/`p` and the picker), or a session-held
+  digit→context table for ring 1 that only changes when a context leaves
+  the rank.
 - **`Ctrl+A a` locked the client.** The chord is unbound and only posts a
   notice; nothing on that path awaits. Still open: the `:` line lane's step-1
   probe (`docs/tui.md`, "The `:` line and the `Ctrl+C` ladder") confirmed a

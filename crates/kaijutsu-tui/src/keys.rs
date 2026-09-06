@@ -14,7 +14,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 pub enum Intent {
     /// Nothing to do, and nothing to say about it.
     Ignored,
-    /// Switch to a ring-0 seat.
+    /// `Ctrl+A <digit>` — switch to that position on the rank, ring 0 then
+    /// ring 1, the digits the status line shows.
     SwitchSeat(usize),
     /// `Ctrl+A Ctrl+A` — toggle to the previous context.
     LastContext,

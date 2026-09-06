@@ -612,10 +612,17 @@ statement never pushes `[a]llow once ...` off the bottom.
     [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside
 ```
 
-While the card is up it takes every key; the four answers and `Esc` are
-the only ones that do anything. `Esc` puts the card aside with the ask
-still pending: the seat keeps its `!`, the status line its `!n`, and
-`Ctrl+A l` reaches it. The card also comes down by itself when its ask
+While the card is up, `a`/`A`/`d`/`v` answer it and typed text is held:
+the draft never changes under a card, so a decision key and a typed
+letter are never confused. A `Ctrl+A` chord, `Ctrl+C` and `Ctrl+Z` act
+exactly as they do with no card up — `Ctrl+A 4` still switches seats, and
+the card goes aside with the switch, since it is always the current
+context's ask; the next refresh raises it again on return. With the
+prefix armed, `Ctrl+A d` is the chord `d`, never a deny. (Until
+2026-09-06 the card took every key, which is why `Ctrl+A <digit>` and the
+picker "did not always work": the advisory gate raises a card often.)
+`Esc` puts the card aside with the ask still pending: the seat keeps its
+`!`, the status line its `!n`, and `Ctrl+A l` reaches it. The card also comes down by itself when its ask
 leaves the pending set — answered from another surface (`kj ledger allow`
 in a shell, the app, a sibling session), expired, or abandoned — with a
 status-line notice saying what became of it: `ask 01a04eb6 allow once by

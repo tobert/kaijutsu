@@ -272,6 +272,10 @@ impl App {
         if let Some(view) = self.views.get_mut(&id) {
             view.activity = false;
         }
+        // The card is the current context's ask; leaving that context sets
+        // it aside. The ask stays pending and the refresh raises the card
+        // again on return.
+        self.ask_card = None;
     }
 
     /// `Ctrl+A Ctrl+A`. Returns the context switched to, or `None` when
@@ -1104,5 +1108,19 @@ mod tests {
         assert_eq!(taken.request_id, "01a05d22");
         assert!(app.ask_card.is_none(), "the card is down");
         assert!(app.take_answered_card(&HashSet::new()).is_none(), "nothing to take twice");
+    }
+
+    /// The card is always the current context's ask, so leaving that
+    /// context sets it aside: the seat on screen never shows another seat's
+    /// card, and the ask stays pending for the refresh to raise again.
+    #[test]
+    fn switching_seats_sets_the_ask_card_aside() {
+        let (mut app, a, b) = app_with_two();
+        app.switch_to(a);
+        app.ask_card = Some(ask_card("01a05d22", a));
+        app.switch_to(a);
+        assert!(app.ask_card.is_some(), "a no-op switch keeps the card");
+        app.switch_to(b);
+        assert!(app.ask_card.is_none(), "the card belongs to a, not to the seat on screen");
     }
 }

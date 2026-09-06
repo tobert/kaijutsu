@@ -10,7 +10,36 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::{Line, Span};
 
+use crate::keys::{Intent, Keys};
 use crate::present::Palette;
+
+/// Where a key goes while an ask card is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardRoute {
+    /// One of the card's own keys: `a`/`A`/`d`/`v` decide, `Esc` sets aside.
+    Card(AskCardKey),
+    /// A chord or control key the card does not own — a `Ctrl+A` chord,
+    /// `Ctrl+C`, `Ctrl+Z` — acted on as if no card were up.
+    Chord(Intent),
+    /// Compose text. The card holds it: the draft never changes under a
+    /// card, so a decision key and a typed letter are never confused.
+    Held,
+}
+
+/// Route one key while an ask card is up. The card's own keys win unless
+/// the `Ctrl+A` prefix is armed, in which case the whole chord belongs to
+/// the prefix table — `Ctrl+A d` is the chord `d`, never a deny.
+pub fn route_under_card(key: KeyEvent, keys: &mut Keys) -> CardRoute {
+    if !keys.armed()
+        && let Some(card_key) = ask_card_key(key)
+    {
+        return CardRoute::Card(card_key);
+    }
+    match keys.interpret(key) {
+        Intent::InputKey(_) | Intent::Tab => CardRoute::Held,
+        intent => CardRoute::Chord(intent),
+    }
+}
 
 /// What a decided ask's own key answers, on the ask card and on a selected
 /// ledger row alike.
@@ -830,5 +859,66 @@ mod tests {
             wrap_plain("one two three", 7),
             vec!["one two".to_string(), "three".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod card_route_tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// The card's own keys decide or set aside; a typed letter is held.
+    #[test]
+    fn the_card_owns_its_five_keys_and_holds_text() {
+        let mut keys = Keys::new();
+        assert_eq!(
+            route_under_card(press(KeyCode::Char('a')), &mut keys),
+            CardRoute::Card(AskCardKey::Decide(AskDecision::AllowOnce))
+        );
+        assert_eq!(route_under_card(press(KeyCode::Esc), &mut keys), CardRoute::Card(AskCardKey::Aside));
+        assert_eq!(route_under_card(press(KeyCode::Char('x')), &mut keys), CardRoute::Held);
+        assert_eq!(route_under_card(press(KeyCode::Tab), &mut keys), CardRoute::Held);
+    }
+
+    /// `Ctrl+A 4` switches seats with a card up, exactly as it does without
+    /// one — the prefix is the one key that works everywhere.
+    #[test]
+    fn a_seat_chord_acts_under_a_card() {
+        let mut keys = Keys::new();
+        assert_eq!(route_under_card(ctrl('a'), &mut keys), CardRoute::Chord(Intent::LegendChanged));
+        assert_eq!(route_under_card(press(KeyCode::Char('4')), &mut keys), CardRoute::Chord(Intent::SwitchSeat(4)));
+        assert_eq!(route_under_card(ctrl('a'), &mut keys), CardRoute::Chord(Intent::LegendChanged));
+        assert_eq!(route_under_card(press(KeyCode::Char('"')), &mut keys), CardRoute::Chord(Intent::TogglePicker));
+    }
+
+    /// With the prefix armed, `d` is the chord `d`, not a deny.
+    #[test]
+    fn an_armed_prefix_takes_a_card_letter_as_its_chord() {
+        let mut keys = Keys::new();
+        route_under_card(ctrl('a'), &mut keys);
+        assert!(matches!(
+            route_under_card(press(KeyCode::Char('d')), &mut keys),
+            CardRoute::Chord(Intent::NotYet(_))
+        ));
+        assert_eq!(
+            route_under_card(press(KeyCode::Char('d')), &mut keys),
+            CardRoute::Card(AskCardKey::Decide(AskDecision::Deny)),
+            "the prefix is spent; the next d is the card's"
+        );
+    }
+
+    /// `Ctrl+C` and `Ctrl+Z` are never held by a card.
+    #[test]
+    fn control_keys_act_under_a_card() {
+        let mut keys = Keys::new();
+        assert_eq!(route_under_card(ctrl('c'), &mut keys), CardRoute::Chord(Intent::Interrupt));
+        assert_eq!(route_under_card(ctrl('z'), &mut keys), CardRoute::Chord(Intent::Suspend));
     }
 }

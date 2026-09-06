@@ -633,29 +633,35 @@ async fn act(
         act_alternate(bridge, app, key, term_lock).await?;
         return Ok(Acted::Continue);
     }
-    // The ask card and the ledger view capture every key while open — their
-    // own a/A/d/v/j/k/Esc keys are never compose text or a `Ctrl+A` chord
-    // (`docs/tui.md`, "Asks" / "The ledger").
-    if app.ask_card.is_some() {
-        match asks::ask_card_key(key) {
-            Some(asks::AskCardKey::Decide(decision)) => {
-                let card = app.ask_card.take().expect("checked Some above");
-                handle_ask_decision(bridge, app, card, decision).await;
-            }
-            Some(asks::AskCardKey::Aside) => {
-                let card = app.ask_card.take().expect("checked Some above");
-                app.note(format!("ask {} set aside, still pending (Ctrl+A l)", short_ask(&card.request_id)));
-            }
-            None => {}
-        }
-        return Ok(Acted::Continue);
-    }
+    // The ledger view captures every key while open — its j/k/Esc keys are
+    // never compose text or a `Ctrl+A` chord (`docs/tui.md`, "The ledger").
     if app.ledger_view.is_some() {
         handle_ledger_key(bridge, app, key).await;
         return Ok(Acted::Continue);
     }
+    // The ask card owns a/A/d/v/Esc and holds compose text; a `Ctrl+A`
+    // chord, `Ctrl+C` and `Ctrl+Z` act under it as they would under no card
+    // (`docs/tui.md`, "Asks").
+    let intent = if app.ask_card.is_some() {
+        match asks::route_under_card(key, keys) {
+            asks::CardRoute::Card(asks::AskCardKey::Decide(decision)) => {
+                let card = app.ask_card.take().expect("checked Some above");
+                handle_ask_decision(bridge, app, card, decision).await;
+                return Ok(Acted::Continue);
+            }
+            asks::CardRoute::Card(asks::AskCardKey::Aside) => {
+                let card = app.ask_card.take().expect("checked Some above");
+                app.note(format!("ask {} set aside, still pending (Ctrl+A l)", short_ask(&card.request_id)));
+                return Ok(Acted::Continue);
+            }
+            asks::CardRoute::Held => return Ok(Acted::Continue),
+            asks::CardRoute::Chord(intent) => intent,
+        }
+    } else {
+        keys.interpret(key)
+    };
 
-    match keys.interpret(key) {
+    match intent {
         Intent::Ignored | Intent::LegendChanged => {}
         Intent::Interrupt => {
             interrupt_ctrl_c(bridge, app, interrupt_ladder).await;
