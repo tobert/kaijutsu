@@ -1,10 +1,11 @@
 # Character — the persistent someone a name resolves to
 
-> Design + rollout plan, 2026-09-05. Drawn from a morning's conversation
-> with Amy about her restart-every-session routine and what kaijutsu needs so
-> the morning is smooth, then revised through two model reviews the same
-> afternoon ("Review", below). Nothing here is built. Every code claim
-> carries a `file:line` read that day; re-read it before relying on it.
+> Design + rollout plan, 2026-09-05, revised 2026-09-06. Drawn from a
+> morning's conversation with Amy about her restart-every-session routine
+> and what kaijutsu needs so the morning is smooth, then revised through two
+> model reviews the same afternoon ("Review", below) and a readiness pass
+> the next day. **Slice 0a is built and verified; slices 1–6 are not.**
+> Every code claim carries a `file:line`; re-read it before relying on it.
 > Amy's statements are guidance, not rulings.
 
 ## The problem, in one paragraph
@@ -19,6 +20,31 @@ hangs on, `kaijutsu-lead`, has no home: it is a flag on `claude --name`, a
 label on whichever context is live, and a principal on each act. The
 question this document answers is **what the name resolves to**, and how to
 thread that thing through a kernel that already has most of its parts.
+
+## What a character is
+
+A character is the collection of things that makes up **one continuous
+lineage of interactions**. In kaijutsu that lineage is made of contexts, a
+`context_type`, the models a cast resolves to, and the rc that customizes
+them — and the character is the sheet that holds them together and points
+outward at the rest.
+
+Amy's word for the shape is a D&D character sheet (guidance, 2026-09-06):
+a page of stats and pointers that is not itself the lore, but that
+references out to deeper lore. Read the design that way. The sheet is
+small and mostly foreign keys; what it names — the rc directory, the
+handoff log, the root context, the memory root — is where the depth
+lives. Adding a column is how the sheet reaches somewhere new.
+
+Two things follow, and they are the ones to check a change against:
+
+- **The sheet is pointers, not content.** If a field wants to hold prose,
+  a policy, or a list, it wants to be a context or a directory the sheet
+  points at instead.
+- **The lineage is the point, not the row.** A character outlives any one
+  context; contexts are performances of it. That is why it retires rather
+  than being deleted, and why the handoff log is the part of the design
+  that changes a morning.
 
 ## Decisions (guidance, Amy, 2026-09-05)
 
@@ -49,6 +75,22 @@ thread that thing through a kernel that already has most of its parts.
   Permanence comes from the three rules in the design: kernel-owned name, no
   deletion while referenced, missing mapping is corruption. Revisit if a
   surface confuses performer with requester in review.
+- **`auth.db` is a keyring; names melt into the character** (guidance, Amy,
+  2026-09-06). *"Nicks were a quick idea"* — `auth.db` binds a fingerprint
+  to a principal id and nothing else, `characters.name` becomes the only
+  name in the system, `add-key` binds instead of minting, and bulk import
+  is removed. `Principal` loses its name fields and `authenticate` returns
+  a `PrincipalId`. Detail in "`auth.db` is a keyring".
+- **A fresh kernel seeds `hajime`, and its id is minted** (guidance, Amy,
+  2026-09-06). One bootstrap character that carries the rc for replacing
+  itself, with an ordinary minted id rather than a well-known one: *"deterministic
+  feels like a choice we'd regret."* Detail in "Bootstrap: `hajime`".
+- **Retire takes its contexts with it** (guidance, Amy, 2026-09-06). A
+  retired character's live contexts are concluded and archived by the same
+  act. There is no reassignment, no orphan performance, and no verb for
+  moving a context to another character — simpler, and it means a turn can
+  never start for a retired character because no unarchived context plays
+  one.
 
 The word "character" collides with the text unit. In prose, *character* is
 the persistent someone; for text say code point, glyph, or `char`. The
@@ -63,13 +105,13 @@ other names.
 
 | Part of a character | Exists today as | Where |
 |---|---|---|
-| id + given name | `Principal { id, username, display_name }` | `kaijutsu-types/src/principal.rs:16`, `ids.rs:20` |
+| id + given name | `Principal { id, username, display_name }` — the id half survives; the name half melts into the sheet ("`auth.db` is a keyring") | `kaijutsu-types/src/principal.rs:16`, `ids.rs:20` |
 | handles, many per character | `credentials(fingerprint → principal_id)`; `principals.username UNIQUE`; `add-key --nick` chooses which principal a key joins (default: a new hash-named one) | server `auth_db.rs:37`, `:44`; default path `~/.local/share/kaijutsu/auth.db` (`:104`) |
 | presence, derived | the roster: `RosterEntity::{Principal, Context}`, liveness `Bound`/`Recent`, self-reported `Availability {Active, Idle, Away, Dnd}`; four `roster_*` tables; `kj roster` | `kernel/src/roster.rs:103`, `:192`, `:250`; `kernel_db.rs:1189–1281`; `kj/roster.rs` |
-| a role's rc bundle | `context_type` → `/config/rc/<type>/<verb>/`, loaded and sorted by `SXX-name` | `kaijutsu-types/src/paths.rs:144`; `kj/lifecycle.rs:352` |
+| a role's rc bundle | `context_type` → `/config/rc/<type>/<verb>/`, loaded and sorted by `SXX-name` | `kaijutsu-types/src/paths.rs:144`; `kj/lifecycle.rs:353` |
 | who plays | casts: one slot per role, keyed `(cast_id, role)`; per-context `cast_id` and `provider`/`model` override; resolution ladder explicit override → cast slot on `context_type` → registry default | `kernel_db.rs:1094`, `:1118`; `contexts.cast_id`; `kj/context.rs:704–722` |
 | a cadence that outlives contexts | a track: clock (`BeatPolicy`) + score context + attachments; `kj transport attach` creates the track stopped if absent; non-rotating attachments are first-class | `hyoushigi/mod.rs:45`, `:47`, `:125`; `kj/transport.rs:40–48`; `docs/tracks.md` §5 |
-| a window over a long log | `kj context hydrate --window N`: `[0, marker] ∪ last-N`, persisted per context | `kj/context.rs:1497`; `kernel_db.rs:5413` |
+| a window over a long log | `kj context hydrate --window N`: `[0, marker] ∪ last-N`, persisted per context | `kj/context.rs:1498`; `kernel_db.rs:5443` |
 | async notes reaching the next turn | the mailbox, a pull cursor over the block log | `llm/mailbox.rs:153` |
 | addressed sends | `kj drift push <ctx>`, staged queue, flush, cancel | `kj/drift.rs:37–70` |
 | idle detection | `contexts.last_activity_at` | `kernel_db.rs:612` |
@@ -84,10 +126,10 @@ Two facts from that table drive the whole design:
    The schema allows Amy's keys from every machine to resolve to one
    principal; in practice `add-key` defaults the nick to a fingerprint hash,
    so on 2026-09-05 zorak's auth db held her as three (`amy`, `amy/moltar`,
-   and a hash-named one for usagi). Consolidating is `add-key --nick amy`
-   for each key, or `set-nick`. So the character is **a principal with a
-   sheet**, not a new identity beside the principal, and slice 1's first
-   act is that consolidation.
+   and a hash-named one for usagi). So the character is **a principal with
+   a sheet**, not a new identity beside the principal. Consolidating her
+   three is re-binding each key to one principal id — slice 2's
+   `add-key --as`, since before the melt every way to do it mints.
 2. **The kernel already has a roster that knows principals and contexts,
    presence, and self-reported availability.** Inverting it onto characters
    is grouping, not a new store.
@@ -98,9 +140,9 @@ Two facts from that table drive the whole design:
   accountable-to, no default cast, no pointers to rc, memory, handoff, root.
 - **A model character's blocks are stamped `PrincipalId::system()`.** The
   turn path inserts every provider-emitted block, thinking, text and tool
-  call alike, with the system principal (`kaijutsu-server/src/llm_stream.rs:1818`,
-  `:1890`, `:1946`; 21 such sites in that file, not all of them provider
-  output). The human's principal goes on the user's prompt block
+  call alike, with the system principal (`kaijutsu-server/src/llm_stream.rs:1837`,
+  `:1862`, `:1909`, `:1932`, `:1965`; 21 stamp sites in that file, not all of
+  them provider output). The human's principal goes on the user's prompt block
   (`rpc.rs:4686`), which is right. There is no principal for kaijutsu-lead,
   so `system` is all there is to stamp. The consumer that shows this is the
   wire: a block's author on the wire *is* its principal id (`rpc.rs:10234`,
@@ -115,7 +157,7 @@ Two facts from that table drive the whole design:
   stamped `system` today, every producer records the same value and the
   match returns whichever attachment iterates first. Distinct character
   principals make it work as documented; the multi-producer path has no
-  test that would have caught the collapse, so slice 1 adds one. Nothing in
+  test that would have caught the collapse, so slice 3 adds one. Nothing in
   production compares a principal against `system()`; the only sentinel
   equality is against `beat()` (`beat.rs:2199`). Sequence lanes tolerate
   foreign principals by construction (`blocks/block_store.rs:353–362`).
@@ -125,7 +167,9 @@ Two facts from that table drive the whole design:
   `Principal` says its id is permanent (`principal.rs:16–18`), but
   `set_username` renames (`auth_db.rs:224`) and `remove_principal` deletes,
   cascading credentials (`auth_db.rs:242`). A character that must retire
-  and never be deleted cannot rest on that as it stands.
+  and never be deleted cannot rest on that as it stands. The keyring melt
+  removes both verbs along with the columns they mutate: there is no
+  username to rename, and removal is a key's business, not an identity's.
 - **rc reads one directory.** `load_rc_scripts` takes `(context_type, verb)`
   and nothing else. rc scripts see `KJ_CONTEXT`, `KJ_VERB`, `KJ_CONTEXT_TYPE`
   (seeded 2026-09-05), `KJ_RC_DEPTH`, `KJ_PARENT_CONTEXT`, `KJ_FORK_INFO`,
@@ -170,26 +214,61 @@ CREATE TABLE IF NOT EXISTS characters (
 
 Three rules make the principal a safe key:
 
-- **`name` is the kernel's, not `auth.db`'s.** It does not follow a
-  username rename, and it is the drift address. `principals.username` stays
-  the login handle.
+- **`name` is the kernel's, not `auth.db`'s.** It is the drift address,
+  and after the keyring melt there is no other name for it to disagree
+  with — `principals.username` is gone, not demoted.
 - **A principal with a character cannot be removed.** `remove_principal`
-  refuses while a `characters` row references it. Retirement sets
-  `retired_at`; starting a turn for a retired character fails loudly until
-  the context is reassigned.
+  refuses while a `characters` row references it (`auth_db.rs:242` deletes
+  today, cascading credentials). Retirement sets `retired_at` and, in the
+  same act, concludes and archives every live context the character plays.
+  A retired character therefore has no live performance to start a turn
+  in; `kj drive` already refuses an archived context (`kj/drive.rs:265`),
+  so the loud failure is the one that exists.
 - **A missing mapped principal is corruption**, never a fallback to `system`.
 
-`principal_id` refers into the server's `auth.db`, a second database. The
-kernel already stores principal ids without a foreign key (`contexts.created_by`,
-every block, the roster's principal rows; the schema says so at
-`kernel_db.rs:1209–1211`: a `PrincipalId` is a bare, un-rowed identity here).
-The sheet does the same. A model character is already a legal row in
-`auth.db`: `create_principal` (`auth_db.rs:160`) needs no credential, and
-only `authenticate` joins through credentials. Creating a character is one
-idempotent server operation that makes or resolves the principal and writes
-the sheet.
+#### How principals line up today, and why the sheet is not a second truth
 
-Given name = `characters.name`. Display = `principals.display_name`.
+Read this before deciding where a character is created; the answer is not
+the one the two-database split suggests (verified 2026-09-06).
+
+**The join key is always the opaque `PrincipalId`. Every name is a
+denormalized display label, cached where the identity was seen, and none of
+them is authoritative.**
+
+- `auth.db` holds two tables: `principals(id, username, display_name)` and
+  `credentials(fingerprint → principal_id)` (`auth_db.rs:36–53`). It is a
+  **credential map**, not an identity registry. `create_principal`
+  (`auth_db.rs:160`) mints a `PrincipalId::new()` and names it; only
+  `authenticate` joins through credentials.
+- **The kernel never reads `auth.db`.** Zero reads in the crate. It stores
+  bare principal ids with no foreign key — `contexts.created_by`, every
+  `BlockId`, the roster's principal rows — and says so deliberately at
+  `kernel_db.rs:1209–1211`: a `PrincipalId` is a bare, un-rowed identity
+  here.
+- The kernel already caches a name for one: `roster_entity.label`, whose
+  schema comment is explicit that it is display only and never the join key
+  (`kernel_db.rs:1195–1198`). It is fed from a peer's self-reported nick
+  (`roster_sources.rs:92`), not from `auth.db`.
+- The one live id → name resolution is `answerer_name` (`rpc.rs:474`), in
+  the **server**, which can do it only because the server owns both
+  databases. It reads `display_name`, else `username`, else the id's short
+  form.
+
+So `characters.name` does not compete with `auth.db` for a truth that
+`auth.db` holds. It is **the first authoritative name the kernel owns**, and
+every other name in the system is already a cache of something else. The
+sheet referring to a principal id across databases is the same move
+`created_by` has always made.
+
+Two consequences:
+
+- **A model character needs no `auth.db` row until it gets a key.** Nothing
+  authenticates as it, so nothing looks it up by fingerprint.
+- **A name rendered from `auth.db` would be a second name.** Rather than
+  reconcile the two, the melt below removes one: names leave `auth.db`
+  entirely.
+
+Given name = `characters.name`, and it is the only name in the system.
 Signature is rendered from the principal and its credentials, never stored.
 
 Presence is a query over the roster: rows for the principal plus rows for
@@ -204,7 +283,184 @@ immutable principal mapping, is what the frontier review recommended. It
 buys type safety at API boundaries: "who performs this context" can never
 be confused with "who authenticated this request". It costs a second id on
 every surface that names a character. The three rules above deliver the
-permanence half of that argument; the type-safety half is open, below.
+permanence half of that argument, and the keyring melt takes most of the
+type-safety half: with `Principal` reduced to an id, there is no longer a
+named struct on the authentication path for a performer to be confused
+with. Revisit only if a review finds a surface that still conflates them.
+
+### `auth.db` is a keyring
+
+Decided with Amy, 2026-09-06, after "How principals line up today" showed
+that nothing joins on a username. **Names melt out of `auth.db` into the
+character sheet, and `auth.db` answers exactly one question: which principal
+does this fingerprint belong to?**
+
+```sql
+-- auth.db, after the melt
+CREATE TABLE IF NOT EXISTS credentials (
+    fingerprint   TEXT NOT NULL PRIMARY KEY,
+    principal_id  BLOB NOT NULL,   -- bare identity, as everywhere else
+    kind          TEXT NOT NULL DEFAULT 'ssh_key',
+    key_type      TEXT NOT NULL,
+    key_blob      BLOB NOT NULL,
+    comment       TEXT,
+    created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_used_at  INTEGER
+);
+```
+
+`principals` loses `username` and `display_name`, which is everything it
+had beyond an id and a timestamp. What remains of it is a bare existence
+row; whether to keep it as the `ON DELETE CASCADE` target or drop it and
+let `principal_id` be un-rowed here the way it is in `kernel.db` is an
+implementation call for the slice.
+
+**`Principal` loses its name, and with it its reason to exist.**
+`authenticate` returns a `PrincipalId`. The struct is constructed in exactly
+two production places today, both in `auth_db.rs` (`:136`, `:544`), so the
+change has one small blast radius and no wire consequence: a `BlockId`
+already carries `{contextId, principalId, seq}` and no name (`rpc.rs:10236`).
+
+Three rules follow.
+
+- **One name, one source.** `characters.name` is the only name a player
+  reads. `Identity` on the wire keeps carrying it — a client cannot
+  round-trip per block — and is the one sanctioned cache, the same pattern
+  `roster_entity.label` already documents (`kernel_db.rs:1195–1198`).
+- **A log line takes the id, not the name.** `id.short()` is greppable,
+  unambiguous, and cannot go stale. The `ssh.rs` and `share.rs` sites that
+  print `principal.username` today want that, not a resolver call. The
+  surfaces that genuinely need a name are the `Identity` fill, the ledger's
+  answerer column (`answerer_name`, `rpc.rs:474`), and the app chrome, which
+  reads `Identity` and does not change.
+- **`display_name` does not survive.** Its content is the key's comment
+  (`atobey@zorak`), and `credentials.comment` is the column that already
+  describes the key. A name for a credential belongs on the credential.
+
+**The sentinels stay constants, not rows.** `PrincipalId::system()` and
+`::beat()` derive from fixed `UUIDv5` seeds (`ids.rs:230`) and their names
+are already compile-time constants (`principal.rs:41`). They get no
+`characters` row: a character is a continuous lineage of interactions, and
+the kernel's own hand is not one — rows for them would make the table a
+junk drawer of every id that needs a label. One resolver,
+`name_for(PrincipalId)`, checks the two sentinels and then the sheet.
+`PrincipalId::for_agent_session` needs no answer at all: the bridge
+connects with a real key now.
+
+**Adding a key binds; it never mints.** `kj character create` mints the
+principal id, so `add-key` takes an existing one:
+
+```sh
+kj character create kaijutsu-lead                       # mints the principal id + the sheet
+kaijutsu-server add-key ~/.ssh/kaijutsu-lead.pub --as kaijutsu-lead
+kaijutsu-server list-keys                               # fingerprint → character
+```
+
+`--nick` and `add_key_auto_principal` go away with it. Without this
+inversion, `add-key --nick kaijutsu-lead` would quietly create a second
+principal with the same name in the other database — the corruption case,
+and a silent one.
+
+**Bulk import is removed** (Amy, 2026-09-06). `import_authorized_keys`
+minted a principal per imported key, which is exactly the minting this
+design takes away, and there is no sensible character to bind a file of
+keys to. First run becomes two deliberate steps, `create` then `add-key`,
+which is the right shape for an act that establishes who someone is.
+
+**Anonymous auto-register binds to `hajime` instead of minting.** The
+server has a second, *runtime* minting path that the CLI review missed:
+with `allow_anonymous` set, an unknown key on connection calls
+`add_key_auto_principal` and mints a principal per key (`ssh.rs:1111`).
+It is not a production path — `production()` sets `allow_anonymous: false`
+(`ssh.rs:241`) and only the ephemeral test config turns it on, commented
+"Tests need to accept any key" (`ssh.rs:226`). Since every kernel seeds
+`hajime`, the mode keeps working by binding an unknown key to it rather
+than minting: tests still accept any key, and no minting path survives the
+melt. Removing `add_key_auto_principal` without this is a compile break,
+not just a design gap.
+
+**Three name reads break at compile time** when `Principal` loses its
+fields, and all three land in the same change: `answerer_name`
+(`rpc.rs:483`), `whoami`'s `Identity` fill (`rpc.rs:3077`), and
+`materialize_context_shell_for`, which builds a shell name as
+`"{kernel}-{username}-{session}"` (`rpc.rs:9307`). The first two read
+`name_for`; the third wants `id.short()`, since it is naming a shell, not
+a person.
+
+**`add-key` gains a `kernel.db` read** it does not have today: it opens
+`auth.db` only (`main.rs:359`), and resolving `--as <name>` means opening
+`kernel.db` read-only as well. Writes stay in `auth.db`.
+
+**`add-key` never rebinds silently.** `credentials.fingerprint` is the
+primary key, so one key maps to one principal and the same key cannot be
+bound to two characters. Adding a key that is already bound refuses and
+names the current binding — `key SHA256:… is bound to hajime; move it with
+--rebind` — rather than issuing an UPDATE. A silent move would take a live
+session's identity out from under it.
+
+**`auth.db` moves to WAL.** It sets only `foreign_keys` and `busy_timeout`
+today (`auth_db.rs:60`) while `kernel.db` has been WAL since it was written
+(`kernel_db.rs:1951`). In rollback-journal mode a writer locks the whole
+file, so `add-key` against a running server retries for five seconds and
+then fails `SQLITE_BUSY`, blocking any connection authenticating meanwhile.
+That is nearly invisible while add-key is a once-a-machine act and becomes
+routine the moment binding a character's key is the normal path. There is
+no cache to invalidate underneath it: `AuthDb` holds one long-lived
+connection (`ssh.rs:320`) and every lookup is a fresh query, with no
+`HashMap<PrincipalId, _>` anywhere, so a CLI side-write is visible to a
+running server on its next read once the lock allows it.
+
+### Bootstrap: `hajime`, a character that exists to be replaced
+
+A fresh kernel seeds exactly one character, `hajime` (始め — the beginning,
+and the word called to start a match). It holds the rc that walks a new
+user through making their own character, and it is built to be retired the
+same day.
+
+**Its principal id is minted, not derived** (guidance, Amy, 2026-09-06).
+The sentinels get a fixed `UUIDv5` because they are not anyone: `system`
+and `beat` are the kernel's own hand and are identical on every install by
+definition. `hajime` is someone — a sheet, contexts, a lineage — so a
+well-known id would make it the same character on every machine and one
+that could never be rotated. The cost is a single ordering constraint: the
+server must run once, to seed `hajime` and mint its id, before the first
+`add-key` can resolve a name.
+
+```sh
+systemctl --user start kaijutsu-server   # creates kernel.db, seeds hajime, mints its id
+#   log: no keys bound. bind one:
+#     kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as hajime
+kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as hajime
+ssh kaijutsu                             # you are hajime; its rc tells you what to do next
+kj character create amy
+kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as amy --rebind   # moves the key off hajime
+kj character retire hajime
+```
+
+**Taking your key back is the same act as retiring the guide.** Most people
+have one key, so the fourth line moves it rather than adding a second, and
+`hajime` ends up keyless — which is what a retired character should be. Its
+blocks and its lineage stay in the graph, archived, the way a rotated ROOT
+does.
+
+**A kernel wipe orphans every binding.** The schema stance is that a
+version bump wipes (`kernel_db.rs:1959`), which takes `characters` with it
+while `auth.db` keeps every credential bound to a principal id that now has
+no sheet. `name_for` renders those as `id.short()` — the loud failure the
+"missing mapped principal is corruption" rule wants — and recovery is the
+bootstrap path again: the wiped kernel seeds a fresh `hajime`, and
+`add-key --as` rebinds. Worth saying out loud because the keys still
+authenticate; it is the names that vanish.
+
+**Lockout recovery is why the CLI lists characters.** Retire `hajime`
+before binding your own key and no character has a key, so nobody can
+connect — and `kj character list` is unreachable, because reaching it means
+connecting. `kaijutsu-server list-characters` reads `kernel.db` read-only
+and is the way back in, feeding either `--as <name>` or `--principal <id>`.
+
+So the server CLI after the melt is three verbs — `add-key --as`,
+`list-keys`, `list-characters` — all of which read `kernel.db` at most, and
+all of which work with the service stopped.
 
 ### A context is played by a character
 
@@ -233,13 +489,13 @@ stamped where:
 The criterion is **provenance, provider output versus kernel output, not
 role**. The max-iterations halt is `Role::Model` and kernel-generated, so it
 stays `system`; the tool result is kernel-generated and stays `system`
-(`llm_stream.rs:2376`). Once a model block is created under the actor, its
+(`llm_stream.rs:2396`). Once a model block is created under the actor, its
 streaming appends use that same principal. A NULL `played_by` keeps today's
 behavior exactly.
 
-Two seams the audit named that slice 1 must decide, not discover: builtin
+Two seams the audit named that slice 3 must decide, not discover: builtin
 tool servers author their blocks under the requester (`mcp/servers/shell.rs:345`,
-`block.rs`, `tasks.rs`, `background.rs`), so after slice 1 a model's
+`block.rs`, `tasks.rs`, `background.rs`), so after slice 3 a model's
 `ToolCall` carries the character while the tool's own output block carries
 the human who drove the turn; the matrix above says tool output is kernel
 output and should stamp `system`, and those servers should follow it. And
@@ -324,10 +580,15 @@ lookups, nothing to keep in sync. Decided with Amy, 2026-09-05:
 
 ```sh
 ssh-keygen -t ed25519 -N "" -C "kaijutsu-lead" -f ~/.ssh/kaijutsu-lead   # unencrypted, on purpose
-kaijutsu-server add-key ~/.ssh/kaijutsu-lead.pub --nick kaijutsu-lead   # public half → a principal + credentials row
+kj character create kaijutsu-lead                                       # mints the principal id + the sheet
+kaijutsu-server add-key ~/.ssh/kaijutsu-lead.pub --as kaijutsu-lead     # public half → a credentials row
 ssh-add ~/.ssh/kaijutsu-lead        # or skip the agent and use --key-file below
 ssh-add -l                          # copy the SHA256:… line for this key
 ```
+
+Before the melt lands, the middle two lines are one
+`kaijutsu-server add-key --nick kaijutsu-lead`, which mints the principal
+itself. That is how the first live run below was set up.
 
 Then in the repo's `.mcp.json`, on the `kaijutsu` server entry:
 
@@ -340,7 +601,7 @@ file directly. On a machine where the MCP entry is machine-specific (a
 `target/debug` path), prefer `claude mcp add -s local kaijutsu -e
 KAIJUTSU_KEY_FINGERPRINT=SHA256:… -- <path> --connect`: local scope is
 per project and per user, is not committed, and overrides the user-scope
-entry of the same name. `kaijutsu-server list-keys <nick>` confirms the row. The MCP warns
+entry of the same name. `kaijutsu-server list-keys` confirms the row. The MCP warns
 at connect when it is probably using a personal key: the default
 try-every-agent-key mode, or a `--key-file` named like `~/.ssh/id_*`. It
 still connects, so a first run stays easy.
@@ -380,7 +641,7 @@ order: enumerate `/config/rc/<type>/<verb>/` and `<rc_dir>/<verb>/`;
 validate every name in both (the invalid-name rule already fails the whole
 verb, `kj/lifecycle.rs:389–396`); **reject a canonical filename present on
 both sides, loudly**, no shadowing; combine and sort once as one `Vec` by
-filename (`names.sort()` at `:400` is the existing sort; two pre-sorted lists
+filename (`names.sort()` at `:401` is the existing sort; two pre-sorted lists
 concatenated would put a character `S05` after a type `S10`); snapshot every
 body; execute the snapshot. Collision is judged on the link's own filename,
 since that is what governs ordering today (`:372–374`). One new rc
@@ -415,8 +676,8 @@ it.
 
 Each character gets a context of `context_type = "handoff"`, pointed at by
 `characters.handoff_ctx`, with a persisted hydration policy so a reader
-takes a window (`kj context hydrate --window N`, `kj/context.rs:1497`;
-`kernel_db.rs:5413`).
+takes a window (`kj context hydrate --window N`, `kj/context.rs:1498`;
+`kernel_db.rs:5443`, default `:5433`).
 
 - `kj handoff note "…"` appends one block to the caller's character's
   handoff context, authored by the caller's principal. A note from another
@@ -498,41 +759,80 @@ Each slice is independently shippable and leaves the tree green.
 
 0. **Terms and docs.** This file; Terms table rows; devlog chapter. Done
    with this commit.
-0a. **Prework, no kernel code, running or queued as lanes** (2026-09-05):
-   the `PrincipalId` consumer audit; one `actor_principal` binding threaded
-   through the turn path with no behavior change; `--distill-model` on pull
-   and merge with the caller-versus-source refusal; push and pull on one
-   resolver; the hook-listener `session.end` guard; the roster's periodic
-   refresh wired into the server; `KJ_CONTEXT_TYPE` seeded for rc; and the
-   bridge identity above.
-1. **Identity and attribution.** `characters` with its first four columns;
-   `contexts.played_by`, copied by fork; one idempotent server operation to
-   create a character and its principal; turn-start resolution of
-   `played_by` to the actor; provider-emitted blocks authored by the actor;
-   optional `played_by` and name in context metadata. `kj character
-   create|list|show|retire`. First rows by hand: `amy` (the existing
-   principal) and `kaijutsu-lead` (a new principal, no credential).
-   Tests: NULL `played_by` preserves today's behavior; a model block's
-   author is the character and differs from the requester; the prompt's
-   author is still the requester; a tool call is actor-authored while its
-   result stays `system`; appends use the inserted block's principal;
-   `TurnFlow` still names the requester; approval redemption still uses the
-   ask's original requester; the app's draft owner is still the session
-   principal; a retired or unmapped character fails loudly.
-2. **Handoff context.** `handoff` type, `kj handoff note|tail`, hydration
+0a. **Prework, no kernel code** (2026-09-05). **Landed; each item
+   re-verified 2026-09-06.** The `PrincipalId` consumer audit; one
+   `actor_principal` binding threaded through the turn path with no
+   behavior change (`llm_stream.rs:1404`, pinned by a source test at
+   `:4409` asserting exactly six provider-output sites); `--distill-model`
+   on pull and merge with the caller-versus-source refusal (`kj/mod.rs:757`);
+   push and pull on one resolver (`kj/drift.rs:316`, `:456`, `:582`); the
+   hook-listener `session.end` guard (`hook_listener.rs:232`); the roster's
+   periodic refresh wired into the server (`rpc.rs:2990`);
+   `KJ_CONTEXT_TYPE` seeded for rc (`kj/lifecycle.rs:533`); and the bridge
+   identity above (`kaijutsu-mcp/src/main.rs:88–103`).
+1. **The sheet.** `characters` with its first four columns;
+   `contexts.played_by`, copied by fork; `kj character
+   create|list|show|retire`, where `create` mints the principal id and
+   `retire` concludes and archives every context the character plays;
+   optional `played_by` and the name in context metadata. No attribution
+   change — every block is stamped exactly as it is today. First rows by
+   hand: `amy` (the existing principal) and `kaijutsu-lead`.
+   Tests: NULL `played_by` preserves today's behavior; fork copies it;
+   retiring archives the live contexts and leaves blocks and their authors
+   intact; an unmapped character fails loudly.
+2. **The keyring melt.** `auth.db` drops `username` and `display_name` and
+   gains `PRAGMA journal_mode = WAL`; `authenticate` returns a
+   `PrincipalId`; `Principal` loses its name fields; `add-key --as
+   <character>` binds, never mints, and refuses an already-bound
+   fingerprint without `--rebind`; `--nick`, `set-nick`,
+   `set_display_name`, `add_key_auto_principal` and
+   `import_authorized_keys` are removed; `kaijutsu-server list-characters`
+   reads `kernel.db` read-only; a fresh kernel seeds `hajime` with a minted
+   id and the empty-auth log line names it; anonymous auto-register
+   (`ssh.rs:1111`) binds to `hajime` rather than minting;
+   `name_for(PrincipalId)` resolves sentinels then the sheet; the three
+   compile-time name reads — `answerer_name` (`rpc.rs:483`), `whoami`'s
+   `Identity` fill (`:3077`), and `materialize_context_shell_for`
+   (`:9307`, which wants `id.short()`) — land in this change; `ssh.rs`,
+   `share.rs` and `sftp.rs` log lines and `tracing` fields take
+   `id.short()`.
+   **This slice follows the sheet immediately** because between the two
+   there are two minting paths for one name, and `add-key --nick <name>`
+   would quietly create a second principal beside the character.
+   Tests: a bound key authenticates to the character's principal; a name
+   renders identically from the wire before and after; a fingerprint with
+   no character fails loudly rather than rendering blank; re-adding a bound
+   fingerprint refuses and names the current binding; `--rebind` moves it;
+   a fresh kernel seeds exactly one character and `list-characters` finds
+   it with the service stopped.
+3. **Attribution.** Turn-start resolution of `played_by` to the effective
+   actor; provider-emitted blocks authored by it. This is the slice that
+   changes `BlockId` lanes, so it ships alone.
+   Tests: a model block's author is the character and differs from the
+   requester; the prompt's author is still the requester; a tool call is
+   actor-authored while its result stays `system`; appends use the inserted
+   block's principal; `TurnFlow` still names the requester; approval
+   redemption still uses the ask's original requester; the app's draft
+   owner is still the session principal; and the multi-producer beat path
+   routes a cell failure to its own producer, which no test covers today
+   (`beat.rs:2216`, `producer_ctx_for` at `:1481`).
+4. **Handoff context.** `handoff` type, `kj handoff note|tail`, hydration
    policy set at creation, `S16-handoff.kai` in the `coder` and `mcp` create
    bundles, `register_session` sets `played_by`. `characters.handoff_ctx`
-   arrives here. This is the slice that changes tomorrow morning.
-3. **rc union.** Two directories, one sorted list, collision is an error,
+   arrives here. This is the slice that changes tomorrow morning, and it
+   needs only slice 1 — if the morning is worth more than closing the
+   double-mint window early, it can swap with slice 2, as long as nobody
+   runs `add-key --nick` in between.
+5. **rc union.** Two directories, one sorted list, collision is an error,
    `KJ_CONTEXT_TYPE` and `KJ_CHARACTER` seeded; `characters.rc_dir` arrives.
    Reseed leaves character dirs alone (they are not shipped defaults).
-4. **Roster inversion.** `kj roster` groups rows by character, presence
+6. **Roster inversion.** `kj roster` groups rows by character, presence
    specified as the aggregation above. The periodic refresh is already wired:
    `create_shared_kernel` spawns it every 10 s under the server's shutdown
    token (`kaijutsu-server/src/rpc.rs:2984`; `roster_sources.rs:67`). A stale
    doc comment said otherwise until 2026-09-05.
-5. **Drift to a character.** `@name` addressing; one resolver.
-6. **Janitor, then proctor.** The `yakin` character, its track, its tick rc;
+7. **Drift to a character.** `@name` addressing; one resolver.
+8. **Janitor, then proctor.** The `yakin` character, its track, its tick rc;
    `accountable_to` and `default_cast_id` arrive with the character rows that
    need them; the distill-cast refusal and `--distill-model` on pull.
 
@@ -545,21 +845,21 @@ exists. Not doing: party, chair, seat, any reputation or trust score
 Today: Amy restarts sessions; I read `signoff.md`, exomemory, and the memory
 index by hand; the name lives in a flag.
 
-After slice 2: Amy restarts sessions; `register_session` makes a bridge
+After slice 4: Amy restarts sessions; `register_session` makes a bridge
 context played by `kaijutsu-lead`; `create` rc injects the last twelve
 handoff notes and the memory indexes; the notes carry who wrote them and
-when, including anything another character left overnight. After slice 6:
+when, including anything another character left overnight. After slice 8:
 a session that goes idle gets asked to write its own note before it goes
 cold, so the morning window is current without anyone remembering to write
 it.
 
 ## Open
 
-- **Where do principals live?** In `auth.db` today, owned by the server. A
-  sheet in `kernel.db` referencing across databases works the way
-  `created_by` already does. A real foreign key would need `principals` in
-  `kernel.db`. Decide when the second cross-database read appears.
-- **A repository-wide audit of `PrincipalId` consumers** before slice 1
+- **What `hajime`'s rc actually says.** It is the only prose a new user
+  reads before knowing anything about kaijutsu, and it has to carry them to
+  `kj character create`, the rebind, and its own retirement. Written with
+  the slice, not designed here.
+- **A repository-wide audit of `PrincipalId` consumers** before slice 3
   lands: broker policy, hooks, telemetry, indexing, client caches. The
   reviews established the turn path, capabilities, ledger, roster, RPC, tui
   and app; they did not establish every consumer. Anything that treats a
@@ -598,7 +898,7 @@ it.
   turned out to be wired already; slice 1 trimmed
   to identity and attribution with the sheet's other columns arriving with
   their readers; the `PrincipalId` consumer audit. Declined, for Amy:
-  a distinct `CharacterId` (recorded under Open); deferring the rc union
+  a distinct `CharacterId` (see "Character = principal + sheet"); deferring the rc union
   outright (kept, ordered after the handoff). Every citation acted on here
   was re-read in the source before it was written down.
 
@@ -635,6 +935,26 @@ it.
   router fallback, mutating retained work and firing its `drift` rc; push
   now refuses an archived target as `kj drive` does. Minor: the roster
   loop test's two-second deadlines were a flake vector under load.
+
+- **kaibo, cast `crusoe` (GLM-5.2 synth, DeepSeek-V4-Flash explorer),
+  2026-09-06, whole-file attach of this design plus `auth_db.rs`,
+  `principal.rs`, `ids.rs`.** A readiness review of the keyring melt before
+  any code. Confirmed the structural claim (nothing joins on a username;
+  authentication resolves from the fingerprint alone and never compares the
+  SSH login user), the no-cache claim, the WAL implication, the slice 1→2→3
+  ordering and both of its stated reasons, the rebind mechanic against the
+  primary key, and the lockout recovery. Found and fixed here: the
+  anonymous auto-register path at `ssh.rs:1111`, a *runtime* minting path
+  the design had missed entirely; `materialize_context_shell_for`
+  (`rpc.rs:9307`) as a third compile-time name read; `add-key`'s new
+  `kernel.db` dependency; the wipe-and-rebind scenario; and five stale
+  citations — the hydrate window (`kernel_db.rs:5413` → `:5443`), three
+  `llm_stream.rs` anchors that sat near their stamp sites rather than on
+  them, and the tool-result stamp (`:2376` → `:2396`). Every correction was
+  re-read in the source before it was applied, which is how the
+  `allow_anonymous` finding sharpened: the mode is off in `production()`
+  (`ssh.rs:241`) and on only in the ephemeral test config (`:226`), so it
+  binds to `hajime` rather than needing to survive as a minting path.
 
 ## Records
 

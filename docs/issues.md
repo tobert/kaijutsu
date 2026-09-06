@@ -37,11 +37,16 @@ Follow-ups:
 
 `docs/character.md` is canonical: a character is a principal with a sheet,
 a context is played by one, rc is a union of the type's and the character's
-directories, the handoff is a track, drift can address a character, and a
-janitor character runs the proctor sweep. Six slices there; slice 1 is the
-`characters` table + `contexts.played_by` + turn-path attribution. Until it
-lands, a model's own blocks are stamped `PrincipalId::system()`
-(`kaijutsu-server/src/llm_stream.rs:1818`, `:1890`), and the wire shows
+directories, the handoff is an ordinary context, drift can address a
+character, and a janitor character runs the proctor sweep. `auth.db` melts
+down to a keyring — fingerprint to principal id, no names, WAL, no bulk
+import — and `characters.name` becomes the only name in the system; a
+fresh kernel seeds one bootstrap character, `hajime`, built to be retired
+once the user has their own. Eight slices there;
+slice 1 is the `characters` table + `contexts.played_by`, slice 2 the
+keyring melt, slice 3 the turn-path attribution. Until slice 3 lands, a
+model's own blocks are stamped `PrincipalId::system()`
+(`kaijutsu-server/src/llm_stream.rs:1837`, `:1862`), and the wire shows
 "system" as their author (`rpc.rs:10234`).
 
 ## The MCP `shell` path applies no size limit to its envelope (2026-09-04)
