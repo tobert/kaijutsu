@@ -738,6 +738,17 @@ fn relaunch_reattaches_to_the_same_stable_context() {
              not stay on its own placeholder or create a new one"
         );
 
+        // The connection must have moved with it. `whoami` answers from the
+        // connection's context (wire `getContextId`) while the shell tool
+        // runs in `shared_context_id`; if only the MCP-side slot moves, every
+        // shell command runs in one context while the kernel keeps that
+        // connection's cwd, exports and gate seat in another.
+        let (wire_context_id, _) = remote_b.actor.get_context_id().await.unwrap();
+        assert_eq!(
+            wire_context_id, placeholder_a_id,
+            "the reattach must re-join the connection, not only the MCP's own joined slot"
+        );
+
         // The stable label still resolves to exactly one live context (A's) —
         // B's stabilization did not fork a second context under it.
         let resolved = remote_b.actor.resolve_context_label(&stable_label).await.unwrap();

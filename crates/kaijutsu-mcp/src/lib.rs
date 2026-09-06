@@ -554,6 +554,15 @@ pub(crate) async fn stabilize_context_label(
                  earlier MCP process for this session — reattaching instead of renaming \
                  the placeholder (relaunch/reconnect upsert)",
             );
+            // The connection moves first. `finish_join` only records the
+            // context on the MCP side; the kernel keeps this connection's
+            // shell state and gate seat on the context it last joined, and
+            // `whoami` answers from there — the two must name one context.
+            remote
+                .actor
+                .join_context(ctx.id)
+                .await
+                .map_err(|e| format!("Error joining context {}: {e}", ctx.id.short()))?;
             finish_join(remote, ctx.id, stable_label, true, None).await
         }
         Some(ctx) if ctx.id == current_context_id => {
