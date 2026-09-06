@@ -66,6 +66,10 @@ cc              list — roster of live Claude Code sessions on this machine,
                 read from ~/.claude/sessions/*.json (never reads *.key files);
                 send — deliver a message into a live session's inbox, gated
                 behind the approval ledger (`--dry-run` exempt)
+character       create, list, show, retire — the sheet a name resolves to
+                (principal id + given name); create mints a fresh principal
+                and is idempotent on the name; retire concludes and archives
+                every live context the character plays
 config          list, show, set, edit, reset — CRDT-owned config at /config/kernel
                 (system.md, theme.toml, mcp.toml) + per-client at /config/client
 context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,

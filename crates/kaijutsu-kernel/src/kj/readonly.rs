@@ -134,6 +134,10 @@ pub(crate) const READ_ONLY_TABLE: &[(&str, &str)] = &[
     ("cast", "list"),
     ("cast", "show"),
     ("alias", "list"),
+    // -- character: `list`/`show` read the sheet table; `create` mints a
+    // principal and `retire` archives contexts, both writes.
+    ("character", "list"),
+    ("character", "show"),
     // -- cas: `ls`/`info` read the store's metadata. `get` is excluded
     // despite reading an object, because it accepts `--out <path>`.
     ("cas", "ls"),
@@ -274,6 +278,8 @@ const MUTATING_TABLE: &[(&str, &str)] = &[
     ("cast", "remove"),
     ("cast", "set"),
     ("cast", "slot"),
+    ("character", "create"),
+    ("character", "retire"),
     ("alias", "set"),
     ("alias", "remove"),
     ("cas", "put"),

@@ -1452,6 +1452,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         })
         .unwrap();
     }

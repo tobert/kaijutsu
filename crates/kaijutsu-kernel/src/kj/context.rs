@@ -611,6 +611,7 @@ impl KjDispatcher {
             workspace_paths,
             workspace_label,
             cast_label,
+            played_by_name,
         ) = {
             let db = self.kernel_db().lock();
 
@@ -675,6 +676,17 @@ impl KjDispatcher {
                 .and_then(|cid| db.get_cast(cid).ok().flatten())
                 .map(|c| c.label);
 
+            // The character playing this context, if any — the row carries
+            // only the principal id; resolve its name here the same way
+            // `cast_label` resolves `cast_id`. A dangling id (the character
+            // retired but the pointer was never cleared) shows as absent,
+            // not an error — `played_by` staying set through a retirement
+            // is metadata, not corruption, in this slice.
+            let played_by_name = row
+                .played_by
+                .and_then(|pid| db.get_character(pid).ok().flatten())
+                .map(|c| c.name);
+
             (
                 row,
                 children_count,
@@ -688,6 +700,7 @@ impl KjDispatcher {
                 workspace_paths,
                 workspace_label,
                 cast_label,
+                played_by_name,
             )
         };
 
@@ -809,6 +822,10 @@ impl KjDispatcher {
             info.push_str(&format!("\nCast:    {label}"));
         }
 
+        if let Some(ref name) = played_by_name {
+            info.push_str(&format!("\nPlayed by: {name}"));
+        }
+
         // Structured record: full ids and the same fields the text view
         // surfaces, so `kaish-last` round-trips and per-field jq queries work.
         let record = serde_json::json!({
@@ -835,6 +852,12 @@ impl KjDispatcher {
             "preset_id": row.preset_id.map(|id| id.to_hex()),
             "cast_id": row.cast_id.map(|id| id.to_hex()),
             "cast_label": cast_label,
+            // The character whose performance this context is, and its
+            // kernel-owned name — `null` together when nobody plays it (a
+            // score context, a file document, a pre-character row). See
+            // `ContextRow::played_by`'s doc comment.
+            "played_by": row.played_by.map(|id| id.to_hex()),
+            "played_by_name": played_by_name,
             // Resolved effective model — same ladder as `kj model` and the
             // turn path (`resolve_context_model`): explicit context
             // override → cast slot on context_type → registry default.
@@ -1181,6 +1204,7 @@ impl KjDispatcher {
                 paused_at: None,
                 cast_id: None,
                 origin_host: None,
+                played_by: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
@@ -1413,6 +1437,7 @@ impl KjDispatcher {
                 paused_at: None,
                 cast_id: None,
                 origin_host: None,
+                played_by: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));

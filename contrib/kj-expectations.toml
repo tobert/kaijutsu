@@ -9,9 +9,9 @@
 #   - permanent, irreversible, or destroys something unrecoverable ->
 #     data-critical
 # mutates: changes durable kernel state.
-# confirm_gated: the handler tests KjCaller.confirmed (exactly six sites in
-#   the whole kj surface: doc delete, context archive/remove/retag,
-#   workspace remove, preset remove).
+# confirm_gated: the handler tests KjCaller.confirmed (seven sites in the
+#   whole kj surface: doc delete, context archive/remove/retag, workspace
+#   remove, preset remove, character retire).
 # clause: optional literal override. Omit to synthesize `kj <path>` plus one
 #   placeholder per required positional (corpus.rs's synthesize_clause). Two
 #   subtrees need an override because a required arg lives on an ANCESTOR
@@ -251,6 +251,24 @@ mutates = false
 expect = "situation-normal"
 mutates = true
 note = "External side effect (delivers into a live session's inbox); gated by the approval ledger, not --confirm (cc.rs:110-118)."
+
+["character create"]
+expect = "situation-normal"
+mutates = true
+
+["character list"]
+expect = "informative"
+mutates = false
+
+["character retire"]
+expect = "situation-normal"
+mutates = true
+confirm_gated = true
+note = "Concludes and archives every live context the character plays via the same archive path 'kj context archive' uses — reversible per-context by 'kj context promote', same as an ordinary archive."
+
+["character show"]
+expect = "informative"
+mutates = false
 
 ["config list"]
 expect = "informative"

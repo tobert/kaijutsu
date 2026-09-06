@@ -19,6 +19,7 @@ pub mod cache;
 pub mod cas;
 pub mod cast;
 pub mod cc;
+pub mod character;
 pub mod corpus;
 pub mod cp;
 pub mod config;
@@ -424,6 +425,11 @@ impl KjDispatcher {
         }
         if cmd == "alias" {
             return self.dispatch_alias(&argv[1..], caller).await;
+        }
+        // `kj character` addresses the sheet table by name, never a
+        // context — same exemption rationale as `kj cast`/`kj backend`.
+        if cmd == "character" {
+            return self.dispatch_character(&argv[1..], caller).await;
         }
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
@@ -1004,6 +1010,7 @@ pub fn kj_command() -> clap::Command {
         .subcommand(preset::PresetArgs::command())
         .subcommand(backend::BackendArgs::command())
         .subcommand(cast::CastArgs::command())
+        .subcommand(character::CharacterArgs::command())
         .subcommand(alias::AliasArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(cc::CcArgs::command())
@@ -1301,6 +1308,7 @@ pub(crate) mod test_helpers {
                 paused_at: None,
                 cast_id: None,
                 origin_host: None,
+                played_by: None,
             };
             db.insert_context(&row).unwrap();
 

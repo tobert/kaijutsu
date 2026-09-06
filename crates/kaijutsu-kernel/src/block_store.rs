@@ -5170,6 +5170,7 @@ mod tests {
                 paused_at: None,
                 cast_id: None,
                 origin_host: None,
+                played_by: None,
             })
             .unwrap();
 
@@ -6459,6 +6460,7 @@ mod tests {
                 paused_at: None,
                 cast_id: None,
                 origin_host: None,
+                played_by: None,
             })
             .unwrap();
 

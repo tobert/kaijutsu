@@ -1300,6 +1300,7 @@ pub fn ensure_drift_queue_context(
                     paused_at: None,
                     cast_id: None,
                     origin_host: None,
+                    played_by: None,
                 };
                 db.insert_context_with_document(&row, ws)
                     .map_err(|e| format!("failed to persist drift-queue context row: {e}"))

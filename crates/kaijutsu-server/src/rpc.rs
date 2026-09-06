@@ -2141,6 +2141,7 @@ fn bootstrap_discovered_context(
         paused_at: None,
         cast_id: None,
         origin_host: None,
+        played_by: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
@@ -2225,6 +2226,7 @@ mod context_bootstrap_tests {
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -3360,6 +3362,7 @@ async fn create_context_inner(
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         };
         // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
         // no row in `workspaces`, so it only turns a legible workspace error

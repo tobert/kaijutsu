@@ -572,6 +572,9 @@ impl KjDispatcher {
             let source_row = db.get_context(source_id).ok().flatten();
             let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
             let source_cast = source_row.as_ref().and_then(|r| r.cast_id);
+            // A fork is the same performance's continuation by default —
+            // whoever plays the source plays the child too.
+            let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -600,6 +603,7 @@ impl KjDispatcher {
                 paused_at: None,
                 cast_id: source_cast,
                 origin_host: None,
+                played_by: source_played_by,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -895,6 +899,9 @@ impl KjDispatcher {
             let source_row = db.get_context(source_id).ok().flatten();
             let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
             let source_cast = source_row.as_ref().and_then(|r| r.cast_id);
+            // A fork is the same performance's continuation by default —
+            // whoever plays the source plays the child too.
+            let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -919,6 +926,7 @@ impl KjDispatcher {
                 paused_at: None,
                 cast_id: source_cast,
                 origin_host: None,
+                played_by: source_played_by,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1160,6 +1168,7 @@ impl KjDispatcher {
                     paused_at: None,
                     cast_id: row.cast_id,
                     origin_host: None,
+                    played_by: row.played_by,
                 };
                 let default_ws =
                     match db.get_or_create_default_workspace(caller.principal_id) {
@@ -3183,6 +3192,52 @@ mod tests {
         assert_eq!(cast.label, "house");
     }
 
+    // ── Character slice 1: fork copies `played_by` ────────────────────────
+
+    /// A fork is the same performance's continuation by default — the child
+    /// inherits the source's `played_by`, same convention as
+    /// `fork_inherits_cast_from_source`/`fork_inherits_workspace`.
+    #[tokio::test]
+    async fn fork_copies_played_by_from_source() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let character_id = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.kernel_db().lock().update_played_by(source, Some(character_id)).unwrap();
+        let c = caller_with_context(source);
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("child").unwrap().unwrap();
+        assert_eq!(child.played_by, Some(character_id));
+    }
+
+    /// A source nobody plays forks a child nobody plays — NULL `played_by`
+    /// preserves today's behavior exactly, it isn't a marker that invents a
+    /// performer.
+    #[tokio::test]
+    async fn fork_of_unplayed_source_leaves_child_unplayed() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("src"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("child").unwrap().unwrap();
+        assert_eq!(child.played_by, None);
+    }
+
     /// A source with no cast forks a child with no cast — inheritance copies
     /// the actual value, it doesn't invent one.
     #[tokio::test]
@@ -3232,6 +3287,33 @@ mod tests {
         let child = db.find_context_by_label("clone").unwrap().unwrap();
         let cast = db.get_cast(child.cast_id.expect("cast copied from template")).unwrap().unwrap();
         assert_eq!(cast.label, "house");
+    }
+
+    /// `fork --as` copies `played_by` from the template node, same
+    /// convention as `fork_as_subtree_copies_cast_id_from_template`.
+    #[tokio::test]
+    async fn fork_as_subtree_copies_played_by_from_template() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let character_id = PrincipalId::new();
+        let template = register_context(&d, Some("template"), None, principal);
+        d.block_store()
+            .create_document(template, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.kernel_db().lock().update_played_by(template, Some(character_id)).unwrap();
+        let c = caller_with_context(template);
+
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--as"), s("template"), s("--name"), s("clone")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "subtree fork failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("clone").unwrap().unwrap();
+        assert_eq!(child.played_by, Some(character_id));
     }
 
     /// A preset carrying a `cast_id` assigns it to the newly forked context

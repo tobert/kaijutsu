@@ -331,7 +331,7 @@ pub(crate) fn format_model(provider: &Option<String>, model: &Option<String>) ->
 }
 
 /// Format a Unix-millis timestamp for display.
-fn format_timestamp(millis: i64) -> String {
+pub(crate) fn format_timestamp(millis: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let secs = (millis / 1000) as u64;
     let dt = UNIX_EPOCH + Duration::from_secs(secs);
@@ -538,6 +538,7 @@ mod tests {
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         }
     }
 

@@ -252,6 +252,7 @@ mod tests {
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         };
         db.insert_context_with_document(&row, ws).expect("create context");
         (Arc::new(parking_lot::Mutex::new(db)), ctx_id)

@@ -152,6 +152,12 @@ pub struct ContextRow {
     /// MCP relaunch"). Rendered as `"-"` when `None` (`kj context info`,
     /// `kj context list`).
     pub origin_host: Option<String>,
+    /// The character whose performance this context is, or `None` when
+    /// nobody plays it (a score context, a file document, a pre-character
+    /// row). Copied onto a fork's child — a fork is the same performance's
+    /// continuation by default. See `docs/character.md`, "A context is
+    /// played by a character".
+    pub played_by: Option<PrincipalId>,
 }
 
 impl ContextRow {
@@ -619,7 +625,12 @@ CREATE TABLE IF NOT EXISTS contexts (
     cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     -- Advisory hostname the registering client self-reported at creation
     -- (NULL = unknown). See `ContextRow::origin_host`'s doc comment.
-    origin_host  TEXT
+    origin_host  TEXT,
+    -- The character whose performance this context is (NULL = nobody plays
+    -- it). A bare principal id, same as `created_by` — the kernel never
+    -- reads `auth.db`, so no FK reaches it. See `ContextRow::played_by`'s
+    -- doc comment.
+    played_by    BLOB
 );
 -- Labels are unique among LIVE contexts only. An archived context keeps its
 -- label as history and leaves this index, so the name can be given again.
@@ -1121,6 +1132,22 @@ CREATE TABLE IF NOT EXISTS cast_slots (
 );
 CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
 
+-- ── Characters (principal + sheet) ──────────────────────────────
+-- The persistent someone a name resolves to: a principal id plus a small,
+-- normalized sheet. `principal_id` carries no FK — the kernel never reads
+-- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
+-- Only the first four columns ship in this slice; the rest of the sheet
+-- (accountable_to, default_cast_id, rc_dir, memory_root, handoff_ctx,
+-- root_ctx) arrives with the slice that reads it. See docs/character.md,
+-- "Character = principal + sheet".
+CREATE TABLE IF NOT EXISTS characters (
+    principal_id BLOB NOT NULL PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    created_at   INTEGER NOT NULL,
+    -- Characters retire; they are never deleted. NULL = live.
+    retired_at   INTEGER
+);
+
 -- ── Model aliases ──────────────────────────────────────────────
 -- The short `--model` handles (fast/smart/opus/ds-pro/local/…). Replaces
 -- the TOML `[model_aliases]` table; same semantics, now with a real FK so a
@@ -1500,6 +1527,20 @@ fn read_principal_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Princi
             "invalid PrincipalId bytes".into(),
         )
     })
+}
+
+fn read_opt_principal_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<PrincipalId>> {
+    let bytes: Option<Vec<u8>> = row.get(idx)?;
+    match bytes {
+        Some(b) => PrincipalId::try_from_slice(&b).map(Some).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "invalid PrincipalId bytes".into(),
+            )
+        }),
+        None => Ok(None),
+    }
 }
 
 fn read_opt_workspace_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<WorkspaceId>> {
@@ -1975,6 +2016,7 @@ impl KernelDb {
             "ALTER TABLE contexts ADD COLUMN cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
             "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
+            "ALTER TABLE contexts ADD COLUMN played_by BLOB",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
@@ -3312,14 +3354,14 @@ impl KernelDb {
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-                origin_host
+                origin_host, played_by
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21,
-                ?22
+                ?22, ?23
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -3344,6 +3386,7 @@ impl KernelDb {
                     row.paused_at,
                     row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.origin_host,
+                    row.played_by.as_ref().map(|id| id.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -3363,7 +3406,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -3431,6 +3474,29 @@ impl KernelDb {
             "UPDATE contexts SET cast_id = ?1 WHERE context_id = ?2",
             params![
                 cast_id.as_ref().map(|c| c.as_bytes().to_vec()),
+                blob_param(id.as_bytes())
+            ],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
+        }
+        Ok(())
+    }
+
+    /// Set or clear the character that plays a context. `None` means
+    /// nobody plays it — the NULL that preserves today's behavior on every
+    /// context that predates this column. No FK to `characters`: a bare
+    /// principal id, same as `created_by`. See `ContextRow::played_by`'s
+    /// doc comment.
+    pub fn update_played_by(
+        &self,
+        id: ContextId,
+        played_by: Option<PrincipalId>,
+    ) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE contexts SET played_by = ?1 WHERE context_id = ?2",
+            params![
+                played_by.as_ref().map(|p| p.as_bytes().to_vec()),
                 blob_param(id.as_bytes())
             ],
         )?;
@@ -3774,7 +3840,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -3791,7 +3857,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -3842,7 +3908,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -3861,7 +3927,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -3900,7 +3966,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, dag.depth
+                   c.cast_id, c.origin_host, c.played_by, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -3908,7 +3974,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(22)?;
+            let depth: i64 = row.get(23)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -3931,7 +3997,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, lineage.depth
+                   c.cast_id, c.origin_host, c.played_by, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -3939,7 +4005,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(22)?;
+            let depth: i64 = row.get(23)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -3961,7 +4027,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, subtree.depth
+                   c.cast_id, c.origin_host, c.played_by, subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
             ORDER BY subtree.depth, c.created_at",
@@ -3969,7 +4035,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(22)?;
+            let depth: i64 = row.get(23)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -6143,7 +6209,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
              FROM contexts WHERE label = ?1 AND archived_at IS NULL",
         )?;
 
@@ -6362,6 +6428,22 @@ pub struct CastRow {
     pub description: Option<String>,
     pub created_at: i64,
     pub created_by: PrincipalId,
+}
+
+/// A character's sheet — the persistent someone `name` resolves to. The
+/// principal is the character's key (`docs/character.md`, "Character =
+/// principal + sheet"): no distinct id type, `principal_id` is immutable,
+/// and `name` is kernel-owned and immutable in this slice. Only the first
+/// four columns of the eventual sheet; the rest arrive with the slice that
+/// reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterRow {
+    pub principal_id: PrincipalId,
+    pub name: String,
+    pub created_at: i64,
+    /// `None` while live. Set once, never cleared — a character retires,
+    /// it is never un-retired.
+    pub retired_at: Option<i64>,
 }
 
 /// One role's seat in a cast. NULL tunables cascade to `llm_defaults`.
@@ -6908,6 +6990,102 @@ impl KernelDb {
             .optional()?)
     }
 
+    // ── characters ──────────────────────────────────────────────────────
+
+    /// Create a character's sheet row. Fails loudly on a duplicate name —
+    /// the caller (`kj character create`) checks for an existing name first
+    /// and returns that row unchanged rather than calling this twice; this
+    /// method itself does not dedupe.
+    pub fn insert_character(&self, row: &CharacterRow) -> KernelDbResult<()> {
+        validate_label(&row.name)?;
+        self.conn
+            .execute(
+                "INSERT INTO characters (principal_id, name, created_at, retired_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    blob_param(row.principal_id.as_bytes()),
+                    row.name,
+                    row.created_at,
+                    row.retired_at,
+                ],
+            )
+            .map_err(|e| {
+                map_unique_violation(e, format!("character name '{}' already in use", row.name))
+            })?;
+        Ok(())
+    }
+
+    /// Fetch a character by its kernel-owned name.
+    pub fn get_character_by_name(&self, name: &str) -> KernelDbResult<Option<CharacterRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT principal_id, name, created_at, retired_at
+             FROM characters WHERE name = ?1",
+        )?;
+        Ok(stmt.query_row(params![name], row_to_character_row).optional()?)
+    }
+
+    /// Fetch a character by the principal id that plays it — the counterpart
+    /// to `get_character_by_name` for callers that only have a context row's
+    /// `played_by` (e.g. resolving the name to display in `kj context info`).
+    pub fn get_character(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT principal_id, name, created_at, retired_at
+             FROM characters WHERE principal_id = ?1",
+        )?;
+        Ok(stmt
+            .query_row(params![blob_param(principal_id.as_bytes())], row_to_character_row)
+            .optional()?)
+    }
+
+    /// Every character, ordered by name. `include_retired` controls whether
+    /// a retired row is included — `kj character list` wants only the live
+    /// ones by default.
+    pub fn list_characters(&self, include_retired: bool) -> KernelDbResult<Vec<CharacterRow>> {
+        let sql = if include_retired {
+            "SELECT principal_id, name, created_at, retired_at FROM characters ORDER BY name"
+        } else {
+            "SELECT principal_id, name, created_at, retired_at FROM characters \
+             WHERE retired_at IS NULL ORDER BY name"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], row_to_character_row)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Retire a character: stamp `retired_at`, first time only. Returns
+    /// `true` if this call newly retired it, `false` if it was unknown or
+    /// already retired — idempotent re-retire is a no-op success, never an
+    /// error, since "already retired" and "just retired" leave the same
+    /// row behind.
+    ///
+    /// Does not touch the character's contexts — `kj character retire`
+    /// concludes and archives them separately, through the same
+    /// `archive_context`/`conclude_context` every other archival path uses.
+    pub fn retire_character(&self, principal_id: PrincipalId, at: i64) -> KernelDbResult<bool> {
+        let updated = self.conn.execute(
+            "UPDATE characters SET retired_at = ?1
+             WHERE principal_id = ?2 AND retired_at IS NULL",
+            params![at, blob_param(principal_id.as_bytes())],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Every live (non-archived) context `principal_id` plays, via
+    /// `contexts.played_by` — the set `kj character retire` archives.
+    pub fn contexts_played_by(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<ContextRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_id, label, provider, model,
+                    system_prompt, consent_mode, context_state, context_type,
+                    created_at, created_by, forked_from, fork_kind,
+                    archived_at, workspace_id, preset_id, concluded_at,
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
+                    origin_host, played_by
+             FROM contexts WHERE played_by = ?1 AND archived_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], row_to_context_row)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
     // ── model_aliases ───────────────────────────────────────────────────
 
     /// Insert or replace a `--model` alias.
@@ -7092,6 +7270,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         paused_at: row.get(19)?,
         cast_id: read_opt_cast_id(row, 20)?,
         origin_host: row.get(21)?,
+        played_by: read_opt_principal_id(row, 22)?,
     })
 }
 
@@ -7119,6 +7298,15 @@ fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
         consent_mode: consent_mode_from_sql(&consent_str),
         created_at: row.get(6)?,
         created_by: read_principal_id(row, 7)?,
+    })
+}
+
+fn row_to_character_row(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterRow> {
+    Ok(CharacterRow {
+        principal_id: read_principal_id(row, 0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        retired_at: row.get(3)?,
     })
 }
 
@@ -7473,6 +7661,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         paused_at: None,
         cast_id: None,
         origin_host: None,
+        played_by: None,
     }
 }
 
@@ -9238,6 +9427,7 @@ mod tests {
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         };
 
         let ctx = row.to_context();
@@ -9292,6 +9482,7 @@ mod tests {
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
@@ -9320,6 +9511,7 @@ mod tests {
             paused_at: None,
             cast_id: Some(cast_id),
             origin_host: None,
+            played_by: None,
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -9339,6 +9531,7 @@ mod tests {
         assert!(recovered.workspace_id.is_none());
         assert!(recovered.preset_id.is_none());
         assert_eq!(recovered.cast_id, Some(cast_id));
+        assert_eq!(recovered.played_by, None, "NULL played_by preserves today's behavior");
 
         // Verify list_active_contexts returns both
         let active = db.list_active_contexts().unwrap();
@@ -9363,6 +9556,16 @@ mod tests {
         db.update_cast(child_id, Some(cast_id)).unwrap();
         let recast = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(recast.cast_id, Some(cast_id));
+
+        // Verify update_played_by roundtrip, including clearing it back to
+        // None.
+        let character = PrincipalId::new();
+        db.update_played_by(child_id, Some(character)).unwrap();
+        let played = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(played.played_by, Some(character));
+        db.update_played_by(child_id, None).unwrap();
+        let cleared_played = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(cleared_played.played_by, None);
     }
 
     // ── 22. FK violation produces Validation, not LabelConflict ──────────
@@ -9409,12 +9612,103 @@ mod tests {
             paused_at: None,
             cast_id: None,
             origin_host: None,
+            played_by: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(
             matches!(err, KernelDbError::Validation(_)),
             "expected Validation for FK violation, got: {err}"
         );
+    }
+
+    // ── 22b. Characters CRUD ──────────────────────────────────────────
+
+    /// Create, fetch by name, fetch by principal, list, and retire — the
+    /// full lifecycle a sheet row goes through in this slice.
+    #[test]
+    fn character_crud_roundtrip() {
+        let db = KernelDb::temporary().unwrap();
+        let principal = PrincipalId::new();
+        db.insert_character(&CharacterRow {
+            principal_id: principal,
+            name: "hajime".to_string(),
+            created_at: 1000,
+            retired_at: None,
+        })
+        .unwrap();
+
+        let by_name = db.get_character_by_name("hajime").unwrap().unwrap();
+        assert_eq!(by_name.principal_id, principal);
+        let by_principal = db.get_character(principal).unwrap().unwrap();
+        assert_eq!(by_principal.name, "hajime");
+
+        assert!(db.get_character_by_name("nobody").unwrap().is_none());
+        assert!(db.get_character(PrincipalId::new()).unwrap().is_none());
+
+        let live = db.list_characters(false).unwrap();
+        assert_eq!(live.len(), 1);
+
+        // Retire: first call newly retires, second is a no-op that still
+        // reports "nothing new happened" rather than an error.
+        assert!(db.retire_character(principal, 2000).unwrap());
+        assert!(!db.retire_character(principal, 3000).unwrap());
+        let retired = db.get_character(principal).unwrap().unwrap();
+        assert_eq!(retired.retired_at, Some(2000), "first retire wins the timestamp");
+
+        // A retired character drops out of the live-only listing but stays
+        // reachable with `include_retired`.
+        assert!(db.list_characters(false).unwrap().is_empty());
+        assert_eq!(db.list_characters(true).unwrap().len(), 1);
+    }
+
+    /// A duplicate name fails loudly rather than minting a second principal
+    /// under the same name.
+    #[test]
+    fn character_duplicate_name_is_rejected() {
+        let db = KernelDb::temporary().unwrap();
+        db.insert_character(&CharacterRow {
+            principal_id: PrincipalId::new(),
+            name: "hajime".to_string(),
+            created_at: 1000,
+            retired_at: None,
+        })
+        .unwrap();
+        let err = db
+            .insert_character(&CharacterRow {
+                principal_id: PrincipalId::new(),
+                name: "hajime".to_string(),
+                created_at: 2000,
+                retired_at: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, KernelDbError::LabelConflict(_)), "got: {err}");
+    }
+
+    /// `contexts_played_by` returns only the LIVE contexts a principal
+    /// plays — an archived one drops out, matching what `kj character
+    /// retire` must NOT try to archive twice.
+    #[test]
+    fn contexts_played_by_excludes_archived() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let character = PrincipalId::new();
+
+        let mut live = make_context_row(Some("live-ctx"));
+        live.played_by = Some(character);
+        insert_context_with_doc(&db, &live, ws_id);
+
+        let mut archived = make_context_row(Some("archived-ctx"));
+        archived.played_by = Some(character);
+        insert_context_with_doc(&db, &archived, ws_id);
+        db.archive_context(archived.context_id).unwrap();
+
+        let mut other = make_context_row(Some("other-ctx"));
+        other.played_by = Some(PrincipalId::new());
+        insert_context_with_doc(&db, &other, ws_id);
+
+        let played = db.contexts_played_by(character).unwrap();
+        assert_eq!(played.len(), 1);
+        assert_eq!(played[0].context_id, live.context_id);
     }
 
     // ── 23. Context shell CRUD ────────────────────────────────────────
