@@ -75,7 +75,66 @@ impl Client {
 mod tests {
     use super::*;
     use crate::llm::StreamEvent;
+    use crate::llm::http_user_agent;
     use crate::llm::stream::UsageExtra;
+
+    /// DeepSeek is a thin preset over `openai::Client` — this proves the
+    /// kaijutsu identity actually rides through that wrapper to the wire,
+    /// rather than assuming inheritance from the shared builder. Mirrors
+    /// `openai::tests::outbound_requests_carry_the_kaijutsu_user_agent`.
+    #[tokio::test]
+    async fn outbound_requests_carry_the_kaijutsu_user_agent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            use tokio::io::AsyncReadExt;
+            let mut head = Vec::new();
+            loop {
+                let mut buf = [0u8; 512];
+                let n = sock.read(&mut buf).await.expect("read request");
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(resp.as_bytes()).await;
+            String::from_utf8_lossy(&head).into_owned()
+        });
+
+        let text = Client::new("fake-key")
+            .with_base_url(format!("http://127.0.0.1:{port}"))
+            .prompt("deepseek-v4-flash", None, "hi")
+            .await
+            .expect("prompt round-trip against loopback");
+        assert_eq!(text, "ok", "response must parse through the real path");
+
+        let head = server.await.expect("server task");
+        let ua = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .unwrap_or_else(|| panic!("request head carried no User-Agent:\n{head}"));
+        let (name, value) = ua.split_once(':').expect("matched on the colon");
+        assert!(name.eq_ignore_ascii_case("user-agent"), "header name: {name}");
+        assert_eq!(
+            value.trim(),
+            http_user_agent(),
+            "UA must be exactly the kaijutsu identity, not reqwest/none"
+        );
+    }
 
     /// Live API smoke test against api.deepseek.com. Gated behind
     /// `DEEPSEEK_API_KEY` so CI / casual `cargo test` skip it.

@@ -26,7 +26,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::stream::{BuildOpts, StreamEvent};
-use crate::llm::{LlmError, LlmResult, Message};
+use crate::llm::{LlmError, LlmResult, Message, http_user_agent};
 
 use self::models_api::{HttpModelCapabilitySource, ModelCapabilitySource};
 use self::sse::{ClaudeSseEvent, decode_event};
@@ -104,6 +104,7 @@ impl Client {
         );
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .user_agent(http_user_agent())
             .build()
             .expect("reqwest::Client::builder must succeed on healthy host");
         let base_url = ANTHROPIC_DEFAULT_BASE_URL.to_string();
@@ -689,6 +690,65 @@ data: {\"type\":\"message_stop\"}
         assert!(
             saw_thinking_end_signature,
             "thinking block must carry a signature for multi-turn replay"
+        );
+    }
+
+    /// The UA rides the real wire path: reqwest applies client defaults at
+    /// `execute()`, so a built request isn't proof — a captured request is.
+    /// A loopback listener reads the raw request head the server receives,
+    /// then answers a minimal `/v1/messages` completion so `prompt()`
+    /// completes. Mirrors `openai::tests::outbound_requests_carry_the_kaijutsu_user_agent`.
+    #[tokio::test]
+    async fn outbound_requests_carry_the_kaijutsu_user_agent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            use tokio::io::AsyncReadExt;
+            let mut head = Vec::new();
+            loop {
+                let mut buf = [0u8; 512];
+                let n = sock.read(&mut buf).await.expect("read request");
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"id":"msg_01","model":"claude-haiku-4-5","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(resp.as_bytes()).await;
+            String::from_utf8_lossy(&head).into_owned()
+        });
+
+        let text = Client::new("fake-key")
+            .with_base_url(format!("http://127.0.0.1:{port}"))
+            .prompt("claude-haiku-4-5", None, "hi")
+            .await
+            .expect("prompt round-trip against loopback");
+        assert_eq!(text, "ok", "response must parse through the real path");
+
+        let head = server.await.expect("server task");
+        let ua = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .unwrap_or_else(|| panic!("request head carried no User-Agent:\n{head}"));
+        let (name, value) = ua.split_once(':').expect("matched on the colon");
+        assert!(name.eq_ignore_ascii_case("user-agent"), "header name: {name}");
+        assert_eq!(
+            value.trim(),
+            http_user_agent(),
+            "UA must be exactly the kaijutsu identity, not reqwest/none"
         );
     }
 

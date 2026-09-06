@@ -435,7 +435,17 @@ struct CodexWsTransport {
 
 impl CodexWsTransport {
     async fn connect(endpoint: &str, timeout: std::time::Duration) -> codex::Result<Self> {
-        let connected = tokio::time::timeout(timeout, connect_async(endpoint)).await.map_err(|_| {
+        let uri: http::Uri = endpoint.parse().map_err(|error| {
+            codex::CodexError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid Codex app-server endpoint {endpoint}: {error}"),
+            ))
+        })?;
+        // The WS upgrade is an HTTP request too — it carries the same
+        // kernel identity as every other outbound provider request.
+        let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
+            .with_header("User-Agent", http_user_agent());
+        let connected = tokio::time::timeout(timeout, connect_async(request)).await.map_err(|_| {
             codex::CodexError::Io(io::Error::new(io::ErrorKind::TimedOut, "timed out connecting to Codex app-server"))
         })?;
         let (socket, _) = connected.map_err(|error| {
@@ -648,15 +658,17 @@ fn resolve_key_or_placeholder(config: &BackendConfig, label: &str) -> LlmResult<
     }
 }
 
-/// Outbound `User-Agent` for the kernel's provider HTTP requests (OpenAI-,
-/// DeepSeek-, Anthropic-dialect clients in this module tree). Providers log
-/// it, so it identifies the *product*, not the HTTP library — reqwest 0.13
-/// sends no default UA, so without this the requests carry no UA at all.
-/// The identity deliberately matches the two other places the kernel names
-/// itself on the wire: the Codex `initialize` handshake (this file) and MCP
-/// `client_info` (`mcp::servers::external`) — product name + this crate's
-/// version. Lives in `llm/mod.rs` rather than a provider module because it
-/// is cross-provider; each provider's client builder applies it.
+/// Outbound `User-Agent` for the kernel's provider HTTP requests (every
+/// dialect in this module tree: OpenAI-compatible, DeepSeek, Anthropic, and
+/// the Codex app-server's WebSocket upgrade). Providers log it, so it
+/// identifies the *product*, not the HTTP library — reqwest 0.13 sends no
+/// default UA, so without this the requests carry no UA at all. The
+/// identity deliberately matches the two other places the kernel names
+/// itself on the wire: the Codex `initialize` handshake (this file, name +
+/// version as separate JSON-RPC fields) and MCP `client_info`
+/// (`mcp::servers::external`, same two fields) — product name + this
+/// crate's version. Lives in `llm/mod.rs` rather than a provider module
+/// because it is cross-provider; each provider's client builder applies it.
 pub(crate) const fn http_user_agent() -> &'static str {
     concat!("kaijutsu/", env!("CARGO_PKG_VERSION"))
 }
@@ -1401,6 +1413,54 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Codex app-server connection is a WebSocket, not a `reqwest`
+    /// client, but the upgrade is still an HTTP request — it must carry the
+    /// same kernel identity as the OpenAI-, DeepSeek-, and Anthropic-dialect
+    /// clients. A loopback server inspects the real upgrade request via
+    /// tungstenite's server-side handshake callback rather than trusting
+    /// the client-side request builder.
+    #[tokio::test]
+    async fn codex_ws_handshake_carries_the_kaijutsu_user_agent() {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let captured_in_cb = captured.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                let ua = req
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                *captured_in_cb.lock().expect("mutex") = ua;
+                Ok(resp)
+            };
+            tokio_tungstenite::accept_hdr_async(stream, callback)
+                .await
+                .expect("server-side handshake");
+        });
+
+        let endpoint = format!("ws://127.0.0.1:{port}/");
+        CodexWsTransport::connect(&endpoint, std::time::Duration::from_secs(5))
+            .await
+            .expect("client-side handshake");
+        server.await.expect("server task");
+
+        let ua = captured.lock().expect("mutex").clone();
+        assert_eq!(
+            ua.as_deref(),
+            Some(http_user_agent()),
+            "Codex app-server WS upgrade must carry the kaijutsu User-Agent"
+        );
+    }
 
     #[test]
     fn test_message_constructors() {

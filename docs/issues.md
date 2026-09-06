@@ -9,6 +9,29 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 
 
+## Two outbound HTTP clients still call out anonymously (2026-09-06)
+
+Every LLM provider dialect now sends `kaijutsu/<version>` — OpenAI-compatible,
+DeepSeek (inherited through its wrapper), Anthropic, and the Codex app-server's
+WebSocket upgrade — each pinned by a loopback test that captures the real
+request head. Two clients outside that tree still do not:
+
+- **The MCP streamable-HTTP transport**, `mcp/servers/external.rs:283`.
+  `http_transport()` returns `StreamableHttpClientTransport::from_config`, which
+  builds its own `reqwest::Client` from a config carrying only the user's
+  configured headers. reqwest sends no default UA, so these requests are
+  anonymous. Not a one-liner: it needs a way to hand `rmcp` a pre-built client,
+  or a UA folded into `custom_headers`. `llm::http_user_agent()` is already
+  `pub(crate)`, so the identity is reachable without a visibility change.
+- **A live smoke test**, `llm/claude/models_api.rs:270`, builds a bare
+  `reqwest::Client`. It is `#[ignore]`d and needs a real key, so it never runs
+  by default — cosmetic unless someone wires it into CI, where it would go out
+  anonymous.
+
+Why it matters beyond tidiness: the point of the identity is that providers can
+attribute traffic to kaijutsu, which is a precondition for being recognized as
+an agent harness.
+
 ## Check the hook socket's PPID resolution on macOS (2026-09-05)
 
 The hook adapter derives the MCP's socket path from the parent process id so
