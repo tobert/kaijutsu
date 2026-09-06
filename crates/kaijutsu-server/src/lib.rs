@@ -10,6 +10,7 @@ pub mod constants;
 pub mod context_feed;
 pub mod interrupt;
 pub mod llm_stream;
+pub mod migrate_keyring;
 pub mod rpc;
 pub mod sftp;
 pub mod share;

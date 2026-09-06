@@ -114,7 +114,7 @@ use kaijutsu_kernel::{
     shared_block_flow_bus,
 };
 use kaijutsu_types::paths;
-use kaijutsu_types::{BlockId, ContextId, KernelId, Principal, PrincipalId, SessionId};
+use kaijutsu_types::{BlockId, ContextId, KernelId, PrincipalId, SessionId};
 // Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
 use kaijutsu_types::ToolKind as TypesToolKind;
 use serde_json;
@@ -461,29 +461,21 @@ impl SharedKernelState {
 /// Server-wide state. Shared via Arc across all SSH connections.
 pub struct ServerRegistry {
     pub kernel: SharedKernel,
-    /// The auth database, for naming a principal to a model — who answered
-    /// an ask. `None` in tests that build a registry without one; names
-    /// then fall back to the principal's short id.
-    pub auth_db: Option<Arc<parking_lot::Mutex<crate::auth_db::AuthDb>>>,
 }
 
-/// Who a principal is, as a model should read it: the auth db's display
-/// name (`atobey@zorak`, a key's comment), else its username, else the id's
-/// short form. `None` — a rule's auto-decision, or a row with no answerer —
-/// reads as `a human`, which is all the ledger knows then.
+/// Who a principal is, as a model should read it: the two sentinels, then
+/// the character sheet, then the id's short form
+/// (`KernelDb::name_for` — `docs/character.md`, "`auth.db` is a keyring").
+/// `None` — a rule's auto-decision, or a row with no answerer — reads as
+/// `a human`, which is all the ledger knows then.
 pub fn answerer_name(
-    auth_db: Option<&Arc<parking_lot::Mutex<crate::auth_db::AuthDb>>>,
+    kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
     decided_by: Option<&[u8]>,
 ) -> String {
     let Some(id) = decided_by.and_then(PrincipalId::try_from_slice) else {
         return "a human".to_string();
     };
-    let known = auth_db.and_then(|db| db.lock().get_principal(id).ok().flatten());
-    match known {
-        Some(p) if !p.display_name.trim().is_empty() => p.display_name,
-        Some(p) if !p.username.trim().is_empty() => p.username,
-        _ => id.short(),
-    }
+    kernel_db.lock().name_for(id)
 }
 
 /// Spawn the server-lifetime turn driver.
@@ -1231,7 +1223,7 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                     // Who answered, by name: the seed a model reads should
                     // say `atobey@zorak approved`, not `a human approved` —
                     // it will not always be the same person.
-                    let who = answerer_name(registry.auth_db.as_ref(), row.decided_by.as_deref());
+                    let who = answerer_name(&kernel.kernel_db, row.decided_by.as_deref());
                     let executable = row.exec_source.clone().map(|source| {
                         let pair = row
                             .command_block_id
@@ -1438,7 +1430,7 @@ struct RunningExecution {
 
 /// Per-connection state. Lives in each connection's LocalSet.
 pub struct ConnectionState {
-    pub principal: Principal,
+    pub principal: PrincipalId,
     pub session_id: SessionId,
     /// Global session map for context tracking.
     pub session_contexts: kaijutsu_kernel::runtime::context_engine::SessionContextMap,
@@ -1487,7 +1479,7 @@ pub struct ConnectionState {
 
 impl ConnectionState {
     pub fn new(
-        principal: Principal,
+        principal: PrincipalId,
         session_contexts: kaijutsu_kernel::runtime::context_engine::SessionContextMap,
     ) -> Self {
         Self {
@@ -1677,7 +1669,11 @@ fn dir_is_empty(dir: &Path) -> bool {
 
 /// Creates the directory if it doesn't exist.
 /// Returns: ~/.local/share/kaijutsu/kernel/
-fn kernel_data_dir() -> std::path::PathBuf {
+///
+/// `pub`: the server CLI (`main.rs`'s `add-key --as` and `list-characters`)
+/// needs the same default `kernel.db` location this crate's own bootstrap
+/// uses, so there is one answer to "where is kernel.db" rather than two.
+pub fn kernel_data_dir() -> std::path::PathBuf {
     let dir = kaish_kernel::xdg_data_home()
         .join("kaijutsu")
         .join("kernel");
@@ -2174,23 +2170,27 @@ fn bootstrap_discovered_context(
 mod context_bootstrap_tests {
     use super::*;
 
-    /// The seed a model reads names its answerer: the auth db's display
-    /// name first (a key's comment, `atobey@zorak`), the username when
-    /// there is no display name, the short id for a principal the auth db
-    /// does not know, and `a human` only when the row names nobody.
+    /// The seed a model reads names its answerer: the character sheet's
+    /// name, the short id for a principal with no sheet, and `a human` only
+    /// when the row names nobody (`KernelDb::name_for` —
+    /// `docs/character.md`, "`auth.db` is a keyring").
     #[test]
-    fn answerer_name_prefers_display_name_then_username_then_short_id() {
-        let db = crate::auth_db::AuthDb::temporary().expect("temp auth db");
-        let named = db.create_principal("amy", "atobey@zorak").expect("principal");
-        let bare = db.create_principal("kaish", "").expect("principal");
-        let db = std::sync::Arc::new(parking_lot::Mutex::new(db));
-        assert_eq!(super::answerer_name(Some(&db), Some(named.as_bytes())), "atobey@zorak");
-        assert_eq!(super::answerer_name(Some(&db), Some(bare.as_bytes())), "kaish");
+    fn answerer_name_prefers_the_character_sheet_then_short_id() {
+        let kdb = db();
+        let amy = PrincipalId::new();
+        kdb.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            principal_id: amy,
+            name: "amy".to_string(),
+            created_at: 1000,
+            retired_at: None,
+        })
+        .unwrap();
+        let kdb = std::sync::Arc::new(parking_lot::Mutex::new(kdb));
+        assert_eq!(super::answerer_name(&kdb, Some(amy.as_bytes())), "amy");
         let stranger = PrincipalId::new();
-        assert_eq!(super::answerer_name(Some(&db), Some(stranger.as_bytes())), stranger.short());
-        assert_eq!(super::answerer_name(None, Some(stranger.as_bytes())), stranger.short());
-        assert_eq!(super::answerer_name(Some(&db), None), "a human");
-        assert_eq!(super::answerer_name(Some(&db), Some(&[1, 2, 3])), "a human", "a malformed id names nobody");
+        assert_eq!(super::answerer_name(&kdb, Some(stranger.as_bytes())), stranger.short());
+        assert_eq!(super::answerer_name(&kdb, None), "a human");
+        assert_eq!(super::answerer_name(&kdb, Some(&[1, 2, 3])), "a human", "a malformed id names nobody");
     }
 
     fn db() -> KernelDb {
@@ -2426,6 +2426,13 @@ pub async fn create_shared_kernel(
         // kernel with no backends hangs its first turn on "no provider
         // configured", which is a far worse diagnostic than this error.
         kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        // Seed the bootstrap character. Every kernel seeds exactly one —
+        // `hajime` — so the anonymous auto-register path always has
+        // somewhere to bind an unknown key, and the lockout-recovery CLI
+        // (`kaijutsu-server list-characters`) always finds at least one row
+        // (`docs/character.md`, "Bootstrap: `hajime`").
+        kaijutsu_kernel::seed_character::ensure_hajime(&mut db)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         ws
     };
@@ -3075,13 +3082,19 @@ impl world::Server for WorldImpl {
         mut results: world::WhoamiResults,
     ) -> Promise<(), capnp::Error> {
         let conn = self.connection.borrow();
+        // One name, one source: the character sheet, through the same
+        // resolver every other name read uses (`docs/character.md`,
+        // "`auth.db` is a keyring"). The wire still carries `username` and
+        // `displayName` separately — a client can't round-trip per block —
+        // so both get the same resolved name.
+        let name = self.registry.kernel.kernel_db.lock().name_for(conn.principal);
         let mut identity = results.get().init_identity();
-        identity.set_username(&conn.principal.username);
-        identity.set_display_name(&conn.principal.display_name);
+        identity.set_username(&name);
+        identity.set_display_name(&name);
         // principalId @2 exists on the wire but was never populated — the
         // canonical principal-population gap. The server is authoritative for
         // the connection's identity, so stamp it from conn.principal here.
-        identity.set_principal_id(conn.principal.id.as_bytes());
+        identity.set_principal_id(conn.principal.as_bytes());
         Promise::ok(())
     }
 
@@ -3494,7 +3507,7 @@ impl kernel::Server for KernelImpl {
                 {
                     let (principal_id, session_id) = {
                         let conn = connection.borrow();
-                        (conn.principal.id, conn.session_id)
+                        (conn.principal, conn.session_id)
                     };
                     let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
                         principal_id,
@@ -3571,7 +3584,7 @@ impl kernel::Server for KernelImpl {
                     let call_ctx = {
                         let conn = connection_bg.borrow();
                         kaijutsu_kernel::mcp::CallContext::new(
-                            conn.principal.id,
+                            conn.principal,
                             started_ctx,
                             conn.session_id,
                             kernel.id,
@@ -3872,7 +3885,7 @@ impl kernel::Server for KernelImpl {
         let (principal_id, context_id, session_id) = {
             let conn = self.connection.borrow();
             (
-                conn.principal.id,
+                conn.principal,
                 pry!(conn.require_context()),
                 conn.session_id,
             )
@@ -3940,7 +3953,7 @@ impl kernel::Server for KernelImpl {
             // active context — the broker will auto-populate a binding for
             // that ephemeral id.
             let ctx = conn.require_context().unwrap_or_else(|_| ContextId::new());
-            (conn.principal.id, ctx)
+            (conn.principal, ctx)
         };
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_tool_schemas");
@@ -4641,7 +4654,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let (user_principal_id, session_id) = {
             let conn = self.connection.borrow();
-            (conn.principal.id, conn.session_id)
+            (conn.principal, conn.session_id)
         };
 
         Promise::from_future(
@@ -5092,7 +5105,7 @@ impl kernel::Server for KernelImpl {
                 return Err(capnp::Error::failed(e));
             }
             let context_id = ContextId::new();
-            let created_by = connection.borrow().principal.id;
+            let created_by = connection.borrow().principal;
             let label_ref = if label.is_empty() {
                 None
             } else {
@@ -5199,7 +5212,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         Promise::from_future(async move {
             let session_id = connection.borrow().session_id;
-            let principal_id = connection.borrow().principal.id;
+            let principal_id = connection.borrow().principal;
             let context_id = connection
                 .borrow()
                 .session_contexts
@@ -5297,7 +5310,7 @@ impl kernel::Server for KernelImpl {
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
-        let user_principal_id = self.connection.borrow().principal.id;
+        let user_principal_id = self.connection.borrow().principal;
 
         Promise::from_future(
             async move {
@@ -5473,7 +5486,7 @@ impl kernel::Server for KernelImpl {
         let quiet = p.get_quiet();
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
-        let principal = self.connection.borrow().principal.id;
+        let principal = self.connection.borrow().principal;
         Promise::from_future(async move {
             match execute_kj_command(context_id, principal, &argv, &kernel, &connection, quiet).await? {
                 Ok(executed) => {
@@ -5586,7 +5599,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let (principal_id, session_id) = {
             let conn = self.connection.borrow();
-            (conn.principal.id, conn.session_id)
+            (conn.principal, conn.session_id)
         };
         Promise::from_future(
             async move {
@@ -5873,7 +5886,7 @@ impl kernel::Server for KernelImpl {
         // Stamp the peer's principal from the authoritative connection identity
         // — never trusted from the client. The client-supplied `instance` is
         // just a uniqueness token (no trust claim); empty keys the peer by nick.
-        let principal = self.connection.borrow().principal.id;
+        let principal = self.connection.borrow().principal;
         let instance = config_reader
             .get_instance()
             .ok()
@@ -6096,7 +6109,7 @@ impl kernel::Server for KernelImpl {
 
         let documents = self.kernel.documents.clone();
         let kernel_arc = self.kernel.kernel.clone();
-        let user_principal_id = self.connection.borrow().principal.id;
+        let user_principal_id = self.connection.borrow().principal;
 
         // Get the source document and extract block snapshot (DashMap access is sync)
         let doc_entry = match documents.get(source_block_id.context_id) {
@@ -6960,7 +6973,7 @@ impl kernel::Server for KernelImpl {
         // A draft belongs to the principal who is typing it, and `editInput` can
         // only ever reach the caller's own — the id is taken from the
         // authenticated connection, never from the request.
-        let principal_id = self.connection.borrow().principal.id;
+        let principal_id = self.connection.borrow().principal;
         Promise::from_future(
             async move {
                 // Shared facade gate — both live compose typing (app) and the
@@ -7016,7 +7029,7 @@ impl kernel::Server for KernelImpl {
         log::debug!("get_input_state: context={}", context_id);
 
         let documents = &self.kernel.documents;
-        let principal_id = self.connection.borrow().principal.id;
+        let principal_id = self.connection.borrow().principal;
 
         match documents.draft_block(context_id, principal_id) {
             Ok(draft) => {
@@ -7056,7 +7069,7 @@ impl kernel::Server for KernelImpl {
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
-        let user_principal_id = self.connection.borrow().principal.id;
+        let user_principal_id = self.connection.borrow().principal;
 
         Promise::from_future(
             async move {
@@ -7208,7 +7221,7 @@ impl kernel::Server for KernelImpl {
         // Only ever the caller's own draft — the principal comes from the
         // authenticated connection, so one player cannot discard another's
         // half-typed message.
-        let principal_id = self.connection.borrow().principal.id;
+        let principal_id = self.connection.borrow().principal;
 
         match self.kernel.documents.clear_draft(context_id, principal_id) {
             Ok(_discarded) => Promise::ok(()),
@@ -7510,7 +7523,7 @@ impl kernel::Server for KernelImpl {
                 (
                     conn.cancel_token(),
                     conn.disconnect_token(),
-                    conn.principal.id,
+                    conn.principal,
                     conn.session_id,
                 )
             };
@@ -8405,7 +8418,7 @@ impl kernel::Server for KernelImpl {
         // played_by = the authenticated caller shipping the batch (a probe
         // context never produces via turns, so the attachment carries no
         // producer principal to borrow).
-        let played_by = self.connection.borrow().principal.id;
+        let played_by = self.connection.borrow().principal;
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
@@ -9304,13 +9317,16 @@ async fn materialize_context_shell_for(
     let (name, principal, session_id) = {
         let conn = connection.borrow();
         (
+            // Naming a shell, not a person: the id's short form, not a
+            // resolved character name that could go stale or require a
+            // lookup just to label a kaish instance.
             format!(
                 "{}-{}-{}",
                 kernel.name,
-                conn.principal.username,
+                conn.principal.short(),
                 conn.session_id.short()
             ),
-            conn.principal.id,
+            conn.principal,
             conn.session_id,
         )
     };
@@ -12418,12 +12434,8 @@ mod connection_state_tests {
     use super::*;
     use kaijutsu_kernel::runtime::context_engine::session_context_map;
 
-    fn test_principal() -> Principal {
-        Principal {
-            id: kaijutsu_types::PrincipalId::new(),
-            username: "drop-test".into(),
-            display_name: "drop-test".into(),
-        }
+    fn test_principal() -> PrincipalId {
+        PrincipalId::new()
     }
 
     #[test]

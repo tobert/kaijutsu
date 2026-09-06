@@ -76,18 +76,16 @@ cargo versions soon.
 ## Quick Start
 
 ```bash
-# First time: add your SSH key
-cargo run -p kaijutsu-server -- add-key ~/.ssh/id_ed25519.pub --nick amy
+# Terminal 1: Server (first run seeds kernel.db and the bootstrap
+# character, `hajime` — see docs/character.md, "Bootstrap: hajime")
+cargo run -p kaijutsu-server
 
-# ...or bulk-import an existing authorized_keys file
-cargo run -p kaijutsu-server -- import ~/.ssh/authorized_keys
+# First time: bind your SSH key to hajime
+cargo run -p kaijutsu-server -- add-key ~/.ssh/id_ed25519.pub --as hajime
 
 # Check what's registered
-cargo run -p kaijutsu-server -- list-users
-cargo run -p kaijutsu-server -- list-keys amy
-
-# Terminal 1: Server
-cargo run -p kaijutsu-server
+cargo run -p kaijutsu-server -- list-keys
+cargo run -p kaijutsu-server -- list-characters
 
 # Terminal 2: Client
 cargo run -p kaijutsu-app

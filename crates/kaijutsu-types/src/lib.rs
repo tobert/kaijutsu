@@ -8,10 +8,11 @@
 //!
 //! ```text
 //! Kernel (KernelId) ← 会場, the meeting place
-//!     └── founded by Principal (PrincipalId)
+//!     └── founded by PrincipalId
 //!     └── contains Context (ContextId, forks/threads/drifts)
 //!
-//! Principal (PrincipalId) ← user, model, or system
+//! PrincipalId ← user, model, or system; the given name it reads as is
+//!     `characters.name`, the kernel-owned sheet (docs/character.md)
 //!     └── authenticates via Credential (fingerprint → PrincipalId)
 //!     └── founds Kernel
 //!     └── joins Kernel as peer
@@ -33,8 +34,7 @@
 //! | [`Kernel`]        | Kernel birth certificate (founder + label)   |
 //! | [`Context`]       | Context metadata (lineage + creator)         |
 //! | [`Session`]       | Session birth certificate (who + where)      |
-//! | [`Principal`]     | Full identity (id + username + display_name) |
-//! | [`PrincipalId`]   | Who (user, model, system)                    |
+//! | [`PrincipalId`]   | Who (user, model, system) — the join key     |
 //! | [`KernelId`]      | Which kernel instance                        |
 //! | [`ContextId`]     | Which context (= document)                   |
 //! | [`SessionId`]     | Which connection session                     |
@@ -164,7 +164,7 @@ pub use ids::{
 };
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};
 pub use kernel::Kernel;
-pub use principal::{Credential, CredentialKind, Principal};
+pub use principal::{Credential, CredentialKind};
 pub use refusal::{AskRef, AskStatus, Refusal, RefusalKind};
 pub use session::Session;
 pub use tick::{Span, Tick, TickDelta};

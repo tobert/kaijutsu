@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult, params};
 use tracing::{error, info, warn};
 
 use kaijutsu_types::{
@@ -2530,6 +2530,25 @@ impl KernelDb {
         Self::apply_additive_migrations(&conn)?;
         Self::migrate_ledger(&conn)?;
         Self::ensure_singleton_kernel(&conn)?;
+        Ok(Self {
+            conn,
+            #[cfg(any(test, feature = "test-util"))]
+            _temp_dir: None,
+        })
+    }
+
+    /// Open an existing `kernel.db` as a genuine read-only SQLite connection:
+    /// no `SCHEMA` execution, no migration. `open()` always runs both, which
+    /// needs write access even when nothing changes — unusable for a reader
+    /// that must never contend with a live server's write connection.
+    ///
+    /// The lockout-recovery CLI (`kaijutsu-server list-characters`) and
+    /// `add-key --as`'s name lookup: both read `kernel.db` while a server
+    /// may already be holding it open, and both must work with the service
+    /// stopped. Fails loudly if the file does not exist or is not a
+    /// kaijutsu `kernel.db` — there is nothing sensible to fall back to.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> KernelDbResult<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
             conn,
             #[cfg(any(test, feature = "test-util"))]
@@ -7070,6 +7089,25 @@ impl KernelDb {
         Ok(updated > 0)
     }
 
+    /// Resolve a principal to the name a player reads: the two sentinels
+    /// first, then the sheet. A principal with a credential but no
+    /// `characters` row — the wipe-and-rebind case, or a stranger nobody
+    /// minted a sheet for — renders as its id's short form: loud, never
+    /// blank, and never a fabricated name (`docs/character.md`, "`auth.db`
+    /// is a keyring").
+    pub fn name_for(&self, principal_id: PrincipalId) -> String {
+        if principal_id == PrincipalId::system() {
+            return "system".to_string();
+        }
+        if principal_id == PrincipalId::beat() {
+            return "beat".to_string();
+        }
+        match self.get_character(principal_id) {
+            Ok(Some(row)) => row.name,
+            _ => principal_id.short(),
+        }
+    }
+
     /// Every live (non-archived) context `principal_id` plays, via
     /// `contexts.played_by` — the set `kj character retire` archives.
     pub fn contexts_played_by(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<ContextRow>> {
@@ -9709,6 +9747,83 @@ mod tests {
         let played = db.contexts_played_by(character).unwrap();
         assert_eq!(played.len(), 1);
         assert_eq!(played[0].context_id, live.context_id);
+    }
+
+    /// `name_for` checks the two sentinels first, then the sheet, and
+    /// renders an unmapped principal as its short id rather than blank.
+    #[test]
+    fn name_for_resolves_sentinels_then_sheet_then_short_id() {
+        let db = KernelDb::temporary().unwrap();
+        assert_eq!(db.name_for(PrincipalId::system()), "system");
+        assert_eq!(db.name_for(PrincipalId::beat()), "beat");
+
+        let character = PrincipalId::new();
+        db.insert_character(&CharacterRow {
+            principal_id: character,
+            name: "hajime".to_string(),
+            created_at: 1000,
+            retired_at: None,
+        })
+        .unwrap();
+        assert_eq!(db.name_for(character), "hajime");
+
+        let stranger = PrincipalId::new();
+        assert_eq!(
+            db.name_for(stranger),
+            stranger.short(),
+            "a credential with no characters row renders as its short id, never blank"
+        );
+    }
+
+    /// `open_read_only` reads an existing `kernel.db` without running
+    /// `SCHEMA` or migrations — the lockout-recovery path
+    /// (`kaijutsu-server list-characters`), which must work with the
+    /// service stopped and must never contend with a live server's write
+    /// connection.
+    #[test]
+    fn open_read_only_reads_an_existing_db_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        let character = PrincipalId::new();
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.insert_character(&CharacterRow {
+                principal_id: character,
+                name: "hajime".to_string(),
+                created_at: 1000,
+                retired_at: None,
+            })
+            .unwrap();
+        }
+
+        let ro = KernelDb::open_read_only(&path).unwrap();
+        let row = ro.get_character_by_name("hajime").unwrap().unwrap();
+        assert_eq!(row.principal_id, character);
+
+        // A write attempt through the read-only connection must fail loudly
+        // rather than silently succeeding — the whole point of the mode.
+        let err = ro
+            .insert_character(&CharacterRow {
+                principal_id: PrincipalId::new(),
+                name: "intruder".to_string(),
+                created_at: 2000,
+                retired_at: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, KernelDbError::Db(_)),
+            "a write on a read-only connection must fail, got: {err}"
+        );
+    }
+
+    /// `open_read_only` against a path with no database must fail loudly —
+    /// there is nothing sensible to fall back to (`docs/character.md`'s
+    /// "corruption, never a fallback" rule applies here too).
+    #[test]
+    fn open_read_only_fails_loudly_on_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-kernel.db");
+        assert!(KernelDb::open_read_only(&missing).is_err());
     }
 
     // ── 23. Context shell CRUD ────────────────────────────────────────

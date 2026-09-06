@@ -196,8 +196,8 @@ fn actor_connects_eagerly_without_a_command() {
         .await;
 
         // And the first call now succeeds straight away — no kick needed.
-        // Anonymous-mode auto-registration may rename the user on collision;
-        // the load-bearing assertion is that we GOT an identity.
+        // Anonymous mode binds every unknown key to the seeded `hajime`
+        // character; the load-bearing assertion is that we GOT an identity.
         let id = actor.whoami().await.expect("whoami after eager connect");
         assert!(!id.username.is_empty(), "username should be non-empty");
     });
@@ -504,11 +504,12 @@ fn commands_concurrent_with_join_context_do_not_block() {
 /// both connects succeed without errors — historically, double-subscribe
 /// caused server-side wedges.
 ///
-/// Note: each actor uses an ephemeral SSH key, so the server registers two
-/// distinct principals under anonymous mode. Dedupe is per-(principal,
-/// instance), so different principals don't trigger replacement — but the
-/// test still proves that two simultaneous subscriptions don't wedge the
-/// server, which is the load-bearing invariant.
+/// Note: each actor uses an ephemeral SSH key, but anonymous mode binds
+/// every unknown key to the same seeded `hajime` character, so both actors
+/// share one principal here — this exercises the dedupe path itself
+/// (same principal, same instance), not the no-dedupe path. Either way the
+/// test proves two simultaneous subscriptions don't wedge the server, which
+/// is the load-bearing invariant.
 #[test]
 fn duplicate_instance_subscribes_do_not_wedge() {
     run_local(async {
@@ -519,9 +520,9 @@ fn duplicate_instance_subscribes_do_not_wedge() {
             .await
             .expect("actor1 connect");
 
-        // Spawn a second actor with the same instance. Even with different
-        // principals (different ephemeral keys), the server should accept
-        // the new subscription without wedging on the prior one.
+        // Spawn a second actor with the same instance and (now) the same
+        // principal — the server should accept the new subscription without
+        // wedging on the prior one.
         let actor2 = spawn_test_actor(server.addr, "shared-instance");
         let _id2 = whoami_with_retry(&actor2, Duration::from_secs(5))
             .await

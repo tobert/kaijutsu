@@ -75,13 +75,23 @@ impl TestKernel {
     }
 
     /// Boot on an explicit $HOME — the restart test reuses one across boots.
+    ///
+    /// `auth.db` is a keyring now: `add-key` binds to an EXISTING character
+    /// rather than minting one, so it needs `kernel.db` to already carry a
+    /// character to bind to. A fresh $HOME has neither database yet, and
+    /// only the server's own bootstrap creates `kernel.db` and seeds the
+    /// bootstrap character, `hajime` (`docs/character.md`, "Bootstrap:
+    /// `hajime`"). So the order inverts from the old mint-before-boot
+    /// shape: spawn the server first, wait for `kernel.db` to appear, THEN
+    /// `add-key --as hajime` — safe to run while the server is up, because
+    /// `auth.db` is WAL now and the server never caches a credential lookup
+    /// (`docs/character.md`, "`auth.db` moves to WAL").
     pub fn boot_at(home: PathBuf, port: u16) -> Self {
         std::fs::create_dir_all(&home).expect("create test home");
 
         // Test rigs ALWAYS use an ephemeral key, clearly labeled as such:
         // generated fresh per boot, never reused, and the label survives
-        // into auth.db (nick) and the key comment so a stray entry is
-        // unmistakably a throwaway.
+        // into the key comment so a stray entry is unmistakably a throwaway.
         let key = Arc::new(
             PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
                 .expect("generate ephemeral client key"),
@@ -89,19 +99,11 @@ impl TestKernel {
         let mut pubkey = key.public_key().clone();
         pubkey.set_comment(EPHEMERAL_LABEL);
         let pub_path = home.join("isotest-ephemeral.pub");
-        // add-key is idempotent enough for the restart case: re-adding the
-        // same fingerprint on the same auth.db is fine.
         std::fs::write(
             &pub_path,
             pubkey.to_openssh().expect("serialize client pubkey"),
         )
         .expect("write client pubkey");
-        let status = Command::new(server_bin())
-            .args(["add-key", pub_path.to_str().unwrap(), "--nick", EPHEMERAL_LABEL])
-            .env("HOME", &home)
-            .status()
-            .expect("run add-key");
-        assert!(status.success(), "add-key failed with {status}");
 
         // Server output goes to files under $HOME so `contrib/isotest --keep`
         // debugging can read the story after the fact.
@@ -117,6 +119,35 @@ impl TestKernel {
             .stderr(err)
             .spawn()
             .expect("spawn kaijutsu-server");
+
+        // `kernel.db` is the honest "bootstrap ran" signal for a server we
+        // can't yet authenticate to (allow_anonymous=false in production()
+        // and there is no registration RPC). It appears well before the
+        // server is ready to accept SSH — `create_shared_kernel` seeds it
+        // early in startup, long before the listener's auth path is live.
+        let kernel_db_path = home
+            .join(".local")
+            .join("share")
+            .join("kaijutsu")
+            .join("kernel")
+            .join("kernel.db");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !kernel_db_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "kernel.db never appeared at {}\n--- server.stderr.log:\n{}",
+                kernel_db_path.display(),
+                std::fs::read_to_string(home.join("server.stderr.log")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let status = Command::new(server_bin())
+            .args(["add-key", pub_path.to_str().unwrap(), "--as", "hajime"])
+            .env("HOME", &home)
+            .status()
+            .expect("run add-key");
+        assert!(status.success(), "add-key failed with {status}");
 
         TestKernel { child, home, port, key }
     }

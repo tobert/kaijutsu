@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use kaijutsu_kernel::{SHARE_OP_TIMEOUT, ShareRegistry, ShareRow};
-use kaijutsu_types::Principal;
+use kaijutsu_types::PrincipalId;
 use kaijutsu_types::share::{GENERATION_EXTENSION, GENERATION_EXTENSION_VERSION, parse_manifest};
 
 use russh_sftp::client::rawsession::RawSftpSession;
@@ -127,7 +127,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ClosedSignalStream<S> {
 /// session simply never (or no longer) appears under `/r`, matching the
 /// fail-loud-but-don't-crash-the-connection posture the rest of the SSH
 /// server uses for a single misbehaving client.
-pub async fn run_share_session<S>(stream: S, principal: Principal, registry: Arc<ShareRegistry>)
+pub async fn run_share_session<S>(stream: S, principal: PrincipalId, registry: Arc<ShareRegistry>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -140,7 +140,7 @@ where
 /// enters through [`run_share_session`].
 pub async fn run_share_session_with_keepalive<S>(
     stream: S,
-    principal: Principal,
+    principal: PrincipalId,
     registry: Arc<ShareRegistry>,
     keepalive: Duration,
 ) where
@@ -153,9 +153,8 @@ pub async fn run_share_session_with_keepalive<S>(
     match register(raw, &principal, &registry).await {
         Ok((client_id, token)) => {
             log::info!(
-                "share session registered: client={client_id} principal={} ({})",
-                principal.username,
-                principal.display_name,
+                "share session registered: client={client_id} principal={}",
+                principal.short(),
             );
             let mut tick = tokio::time::interval(keepalive);
             tick.tick().await; // first tick fires immediately; drop it
@@ -177,7 +176,7 @@ pub async fn run_share_session_with_keepalive<S>(
                             log::info!(
                                 "share session for client={client_id} ({}) failed keepalive: \
                                  {e}; treating as disconnect",
-                                principal.username,
+                                principal.short(),
                             );
                             cancel.cancel();
                             break;
@@ -188,14 +187,13 @@ pub async fn run_share_session_with_keepalive<S>(
             registry.unregister(&client_id, token).await;
             log::info!(
                 "share session for client={client_id} ({}) closed; unregistered",
-                principal.username,
+                principal.short(),
             );
         }
         Err(e) => {
             log::warn!(
-                "share session for {} ({}) refused: {e}",
-                principal.username,
-                principal.display_name,
+                "share session for {} refused: {e}",
+                principal.short(),
             );
         }
     }
@@ -207,7 +205,7 @@ pub async fn run_share_session_with_keepalive<S>(
 /// closes the underlying channel.
 async fn register(
     raw: RawSftpSession,
-    principal: &Principal,
+    principal: &PrincipalId,
     registry: &Arc<ShareRegistry>,
 ) -> Result<(String, Uuid), String> {
     let version = with_timeout("init", raw.init()).await?;
@@ -340,7 +338,7 @@ mod tests {
         russh_sftp::server::run(client_io, handler).await;
 
         let registry = Arc::new(ShareRegistry::new());
-        let principal = Principal::new("amy", "Amy Tobey");
+        let principal = PrincipalId::new();
         let registry_clone = registry.clone();
         let handle = tokio::spawn(run_share_session(server_io, principal, registry_clone));
 
@@ -377,7 +375,7 @@ mod tests {
         russh_sftp::server::run(client_io, BareHandler).await;
 
         let registry = Arc::new(ShareRegistry::new());
-        let principal = Principal::system();
+        let principal = PrincipalId::system();
         run_share_session(server_io, principal, registry.clone()).await;
 
         assert!(registry.live_clients().await.is_empty(), "an unversioned session must never register");

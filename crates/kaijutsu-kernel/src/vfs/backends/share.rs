@@ -28,7 +28,7 @@ use futures::stream::BoxStream;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use kaijutsu_types::Principal;
+use kaijutsu_types::PrincipalId;
 use kaijutsu_types::share::{GENERATION_EXTENSION, GenerationReply, GenerationRequest};
 
 use russh_sftp::client::rawsession::RawSftpSession;
@@ -58,7 +58,7 @@ pub struct ShareRow {
 
 /// A live client's registration.
 struct ClientEntry {
-    principal: Principal,
+    principal: PrincipalId,
     nick: String,
     shares: Vec<ShareRow>,
     /// `RawSftpSession` is not internally serialized against OUR usage
@@ -123,7 +123,7 @@ impl ShareRegistry {
     pub async fn register(
         &self,
         client_id: String,
-        principal: Principal,
+        principal: PrincipalId,
         nick: String,
         shares: Vec<ShareRow>,
         session: RawSftpSession,
@@ -199,7 +199,7 @@ impl ShareRegistry {
 
     /// The authenticated principal behind a live client-id, for display
     /// (`kj share ls`, future `/v/session` rows).
-    pub async fn principal_of(&self, client_id: &str) -> Option<Principal> {
+    pub async fn principal_of(&self, client_id: &str) -> Option<PrincipalId> {
         self.clients.read().await.get(client_id).map(|e| e.principal.clone())
     }
 
@@ -1023,7 +1023,7 @@ mod tests {
         registry
             .register(
                 "client-1".to_string(),
-                Principal::system(),
+                PrincipalId::system(),
                 "nick".to_string(),
                 vec![ShareRow { name: "share".to_string(), rw: false }],
                 session,
@@ -1036,7 +1036,7 @@ mod tests {
         let err = registry
             .register(
                 "client-1".to_string(),
-                Principal::system(),
+                PrincipalId::system(),
                 "nick2".to_string(),
                 vec![],
                 second,
@@ -1053,7 +1053,7 @@ mod tests {
         let token = registry
             .register(
                 "client-1".to_string(),
-                Principal::system(),
+                PrincipalId::system(),
                 "nick".to_string(),
                 vec![],
                 RawSftpSession::new(a),
@@ -1069,7 +1069,7 @@ mod tests {
         let new_token = registry
             .register(
                 "client-1".to_string(),
-                Principal::system(),
+                PrincipalId::system(),
                 "nick-reconnected".to_string(),
                 vec![],
                 RawSftpSession::new(c),
@@ -1092,7 +1092,7 @@ mod tests {
         registry
             .register(
                 "client-1".to_string(),
-                Principal::system(),
+                PrincipalId::system(),
                 "amy-laptop".to_string(),
                 vec![
                     ShareRow { name: "downloads".to_string(), rw: false },
@@ -1127,7 +1127,7 @@ mod tests {
         registry
             .register(
                 "c1".to_string(),
-                Principal::system(),
+                PrincipalId::system(),
                 "nick".to_string(),
                 vec![ShareRow { name: "downloads".to_string(), rw: false }],
                 RawSftpSession::new(a),

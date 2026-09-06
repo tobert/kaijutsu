@@ -24,7 +24,7 @@ use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use kaijutsu_types::{Principal, SSH_RPC_SUBSYSTEM, SSH_SFTP_SUBSYSTEM, SSH_SHARE_SUBSYSTEM};
+use kaijutsu_types::{PrincipalId, SSH_RPC_SUBSYSTEM, SSH_SFTP_SUBSYSTEM, SSH_SHARE_SUBSYSTEM};
 
 use crate::auth_db::AuthDb;
 use crate::kaijutsu_capnp;
@@ -330,8 +330,12 @@ impl SshServer {
 
         // Check if database is empty
         if auth_db.is_empty().map_err(std::io::Error::other)? {
-            log::warn!("Auth database is empty! Add keys with: kaijutsu-server add-key <pubkey>");
-            log::warn!("Or import existing keys: kaijutsu-server import ~/.ssh/authorized_keys");
+            log::warn!(
+                "Auth database is empty! Bind a key to the seeded '{}' character: \
+                 kaijutsu-server add-key <pubkey> --as {}",
+                kaijutsu_kernel::seed_character::HAJIME,
+                kaijutsu_kernel::seed_character::HAJIME,
+            );
         }
 
         let config = russh::server::Config {
@@ -387,7 +391,6 @@ impl SshServer {
         let auth_db = Arc::new(Mutex::new(auth_db));
         let registry = Arc::new(ServerRegistry {
             kernel: shared_kernel,
-            auth_db: Some(auth_db.clone()),
         });
 
         log::info!("Shared kernel created: {}", registry.kernel.name);
@@ -465,7 +468,7 @@ struct ConnectionHandler {
     auth_db: Arc<Mutex<AuthDb>>,
     peer_addr: Option<SocketAddr>,
     allow_anonymous: bool,
-    identity: Option<Principal>,
+    identity: Option<PrincipalId>,
     /// Shared kernel and MCP pool (created at server startup)
     registry: Arc<ServerRegistry>,
     /// Channels opened but not yet bound to a subsystem. `channel_open_session`
@@ -516,13 +519,13 @@ impl ConnectionHandler {
     /// panic on the RPC thread is logged but does not take down the server —
     /// the default panic hook plus this `catch_unwind` boundary contain damage
     /// to that one connection.
-    fn spawn_rpc_thread(&self, channel: Channel<Msg>, principal: Principal) -> bool {
+    fn spawn_rpc_thread(&self, channel: Channel<Msg>, principal: PrincipalId) -> bool {
         let stream = channel.into_stream();
         let registry = self.registry.clone();
-        let username_for_thread = principal.username.clone();
+        let short_id_for_thread = principal.short();
         let session_label = format!(
             "kjutsu-rpc-{}-{:?}",
-            principal.username,
+            principal.short(),
             self.peer_addr.as_ref().map(|a| a.port()).unwrap_or(0),
         );
 
@@ -542,7 +545,7 @@ impl ConnectionHandler {
                 Err(e) => {
                     log::error!(
                         "Failed to build tokio runtime for {}: {}",
-                        username_for_thread, e,
+                        short_id_for_thread, e,
                     );
                     return;
                 }
@@ -559,7 +562,7 @@ impl ConnectionHandler {
                     .unwrap_or("<non-string panic payload>");
                 log::error!(
                     "RPC thread for {} panicked: {}",
-                    username_for_thread,
+                    short_id_for_thread,
                     msg,
                 );
             }
@@ -605,7 +608,7 @@ impl Drop for ConnectionHandler {
 ///     `current_thread` runtime from outside; the watchdog is for diagnosis.
 async fn run_rpc(
     stream: russh::ChannelStream<Msg>,
-    principal: Principal,
+    principal: PrincipalId,
     registry: Arc<ServerRegistry>,
 ) {
     // Stamp a liveness timestamp on every byte that moves in either
@@ -640,9 +643,8 @@ async fn run_rpc(
     let rpc_system = RpcSystem::new(Box::new(network), Some(client.clone().client));
 
     log::info!(
-        "RPC session started for {} ({}) session={}",
-        principal.username,
-        principal.display_name,
+        "RPC session started for {} session={}",
+        principal.short(),
         session_id.short(),
     );
 
@@ -652,13 +654,13 @@ async fn run_rpc(
     // watchdog still runs and surfaces the problem in logs.
     let watchdog_cancel = tokio_util::sync::CancellationToken::new();
     let watchdog_token = watchdog_cancel.clone();
-    let watchdog_username = principal.username.clone();
+    let watchdog_id = principal.short();
     let watchdog_session = session_id;
     let watchdog_activity = last_activity.clone();
     let watchdog = tokio::task::spawn_local(async move {
         run_rpc_watchdog(
             watchdog_token,
-            watchdog_username,
+            watchdog_id,
             watchdog_session,
             watchdog_activity,
         )
@@ -672,7 +674,7 @@ async fn run_rpc(
                 "Dropping RPC session for {} session={}: a push subscription \
                  fell too far behind (see the FlowBus termination above). The \
                  client reconnects and resyncs — we do not serve a partial view.",
-                principal.username,
+                principal.short(),
                 session_id.short(),
             );
             Ok(())
@@ -684,12 +686,12 @@ async fn run_rpc(
     match rpc_result {
         Ok(()) => log::info!(
             "RPC session ended cleanly for {} session={}",
-            principal.username,
+            principal.short(),
             session_id.short(),
         ),
         Err(e) => log::error!(
             "RPC system error for {} session={}: {}",
-            principal.username,
+            principal.short(),
             session_id.short(),
             e,
         ),
@@ -731,7 +733,7 @@ fn should_warn_idle(idle: Duration) -> bool {
 /// silence is itself the signal that the wedge is at the executor level.
 async fn run_rpc_watchdog(
     cancel: tokio_util::sync::CancellationToken,
-    username: String,
+    principal_short_id: String,
     session_id: kaijutsu_types::SessionId,
     last_activity: Rc<Cell<Instant>>,
 ) {
@@ -746,7 +748,7 @@ async fn run_rpc_watchdog(
                     log::warn!(
                         "RPC session for {} session={} open but idle for {:?} \
                          (no RPC traffic) — possible stall",
-                        username,
+                        principal_short_id,
                         session_id.short(),
                         idle,
                     );
@@ -818,17 +820,6 @@ impl<S: futures::io::AsyncWrite + Unpin> futures::io::AsyncWrite for ActivityStr
     }
 }
 
-/// Sanitize a username for use in anonymous mode.
-///
-/// Filters to alphanumeric, underscore, and hyphen characters.
-/// Truncates to 32 characters max.
-fn sanitize_username(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-        .take(32)
-        .collect()
-}
-
 impl server::Handler for ConnectionHandler {
     type Error = russh::Error;
 
@@ -853,7 +844,7 @@ impl server::Handler for ConnectionHandler {
                 self.active_connections.fetch_sub(1, Ordering::Relaxed);
                 log::warn!(
                     "Connection rejected for {} ({:?}): at capacity ({}/{})",
-                    principal.username,
+                    principal.short(),
                     self.peer_addr,
                     current,
                     self.max_connections,
@@ -863,7 +854,7 @@ impl server::Handler for ConnectionHandler {
             self.counted = true;
             log::debug!(
                 "Connection accepted for {} ({:?}), active connections: {}",
-                principal.username,
+                principal.short(),
                 self.peer_addr,
                 current + 1,
             );
@@ -876,10 +867,9 @@ impl server::Handler for ConnectionHandler {
         // and a debug shell later).
         let channel_id = channel.id();
         log::info!(
-            "Channel {} opened for {} ({}), awaiting subsystem request",
+            "Channel {} opened for {}, awaiting subsystem request",
             channel_id,
-            principal.username,
-            principal.display_name,
+            principal.short(),
         );
         self.pending_channels.insert(channel_id, channel);
 
@@ -917,7 +907,7 @@ impl server::Handler for ConnectionHandler {
                     "Subsystem request {:?} for unknown channel {} from {}",
                     name,
                     channel,
-                    principal.username,
+                    principal.short(),
                 );
                 session.channel_failure(channel)?;
                 return Ok(());
@@ -927,11 +917,10 @@ impl server::Handler for ConnectionHandler {
         match name {
             SSH_RPC_SUBSYSTEM => {
                 log::info!(
-                    "Binding channel {} to {} for {} ({})",
+                    "Binding channel {} to {} for {}",
                     channel,
                     SSH_RPC_SUBSYSTEM,
-                    principal.username,
-                    principal.display_name,
+                    principal.short(),
                 );
                 if self.spawn_rpc_thread(chan, principal) {
                     session.channel_success(channel)?;
@@ -943,11 +932,10 @@ impl server::Handler for ConnectionHandler {
             }
             SSH_SFTP_SUBSYSTEM => {
                 log::info!(
-                    "Binding channel {} to {} for {} ({})",
+                    "Binding channel {} to {} for {}",
                     channel,
                     SSH_SFTP_SUBSYSTEM,
-                    principal.username,
-                    principal.display_name,
+                    principal.short(),
                 );
                 // SFTP handler futures are `Send`, so unlike the capnp RPC path
                 // this runs on the server's ambient runtime — no dedicated
@@ -961,11 +949,10 @@ impl server::Handler for ConnectionHandler {
             }
             SSH_SHARE_SUBSYSTEM => {
                 log::info!(
-                    "Binding channel {} to {} for {} ({}) — role swap: kernel plays SFTP client",
+                    "Binding channel {} to {} for {} — role swap: kernel plays SFTP client",
                     channel,
                     SSH_SHARE_SUBSYSTEM,
-                    principal.username,
-                    principal.display_name,
+                    principal.short(),
                 );
                 // The role swap (`docs/slash-r.md`): the client just opened
                 // this channel and is now serving its own SFTP `Handler` on
@@ -992,7 +979,7 @@ impl server::Handler for ConnectionHandler {
                 log::warn!(
                     "Unknown subsystem {:?} requested by {} on channel {}",
                     other,
-                    principal.username,
+                    principal.short(),
                     channel,
                 );
                 // Refuse the request, then close the channel so the client sees
@@ -1040,7 +1027,7 @@ impl server::Handler for ConnectionHandler {
         })?;
 
         match auth_result {
-            Ok(Some(principal)) => {
+            Ok(Some(principal_id)) => {
                 // Update last_used timestamp (fire and forget, non-blocking)
                 let db = self.auth_db.clone();
                 let fp = fingerprint.clone();
@@ -1051,45 +1038,62 @@ impl server::Handler for ConnectionHandler {
                 });
 
                 log::info!(
-                    "Auth accepted: {} ({}) from {} [{}]",
-                    principal.username,
-                    principal.display_name,
+                    "Auth accepted: {} from {} [{}]",
+                    principal_id.short(),
                     peer,
                     fingerprint
                 );
 
-                self.identity = Some(principal);
+                self.identity = Some(principal_id);
 
                 Ok(Auth::Accept)
             }
             Ok(None) => {
-                // If anonymous mode, auto-register the key
+                // Anonymous mode binds an unknown key to the seeded `hajime`
+                // character rather than minting a principal for it
+                // (`docs/character.md`, "Anonymous auto-register binds to
+                // `hajime` instead of minting"). Every kernel seeds one, so
+                // there is always somewhere to bind to.
                 if self.allow_anonymous {
-                    // Sanitize username to prevent injection
-                    let safe_user = sanitize_username(user);
-                    if safe_user.is_empty() {
-                        log::warn!("Anonymous auth rejected: empty username after sanitization");
-                        return Ok(Auth::Reject {
-                            proceed_with_methods: None,
-                            partial_success: false,
-                        });
-                    }
+                    let kernel_db = self.registry.kernel.kernel_db.clone();
+                    let hajime = tokio::task::spawn_blocking(move || {
+                        kernel_db
+                            .lock()
+                            .get_character_by_name(kaijutsu_kernel::seed_character::HAJIME)
+                    })
+                    .await
+                    .map_err(|e| {
+                        log::error!("spawn_blocking panicked: {}", e);
+                        russh::Error::Disconnect
+                    })?;
 
-                    const RESERVED: &[&str] = &["root", "admin", "system", "nobody", "daemon"];
-                    if RESERVED.contains(&safe_user.as_str())
-                        || safe_user.chars().all(|c| c.is_ascii_digit())
-                    {
-                        log::warn!("Anonymous auth rejected: reserved username '{safe_user}'");
-                        return Ok(Auth::Reject {
-                            proceed_with_methods: None,
-                            partial_success: false,
-                        });
-                    }
+                    let hajime_principal = match hajime {
+                        Ok(Some(row)) => row.principal_id,
+                        Ok(None) => {
+                            log::error!(
+                                "Anonymous auth rejected: no '{}' character seeded — every \
+                                 kernel seeds one at startup",
+                                kaijutsu_kernel::seed_character::HAJIME
+                            );
+                            return Ok(Auth::Reject {
+                                proceed_with_methods: None,
+                                partial_success: false,
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("Failed to resolve '{}': {e}", kaijutsu_kernel::seed_character::HAJIME);
+                            return Ok(Auth::Reject {
+                                proceed_with_methods: None,
+                                partial_success: false,
+                            });
+                        }
+                    };
 
                     log::info!(
-                        "Anonymous mode: auto-registering key {} for user {}",
+                        "Anonymous mode: binding key {} (ssh user={}) to {}",
                         fingerprint,
-                        safe_user
+                        user,
+                        kaijutsu_kernel::seed_character::HAJIME,
                     );
 
                     // Clone for spawn_blocking - use OpenSSH format for serialization
@@ -1098,7 +1102,7 @@ impl server::Handler for ConnectionHandler {
                         log::error!("Failed to serialize public key: {}", e);
                         russh::Error::Disconnect
                     })?;
-                    let safe_user_clone = safe_user.clone();
+                    let comment = format!("ssh user {user}");
 
                     let result = tokio::task::spawn_blocking(move || {
                         // Reconstruct the key from OpenSSH format
@@ -1107,12 +1111,7 @@ impl server::Handler for ConnectionHandler {
                                 std::io::Error::other(format!("Failed to parse key: {}", e)),
                             ))
                         })?;
-                        let mut db = db.lock();
-                        db.add_key_auto_principal(
-                            &key,
-                            Some(&safe_user_clone),
-                            Some(&safe_user_clone),
-                        )
+                        db.lock().add_key(hajime_principal, &key, Some(&comment))
                     })
                     .await
                     .map_err(|e| {
@@ -1121,27 +1120,18 @@ impl server::Handler for ConnectionHandler {
                     })?;
 
                     match result {
-                        Ok((principal_id, _fingerprint)) => {
-                            let db = self.auth_db.clone();
-                            let principal_result = tokio::task::spawn_blocking(move || {
-                                db.lock().get_principal(principal_id)
-                            })
-                            .await
-                            .map_err(|_| russh::Error::Disconnect)?;
-
-                            if let Ok(Some(principal)) = principal_result {
-                                log::info!(
-                                    "Auth accepted (anonymous): {} from {} [{}]",
-                                    principal.username,
-                                    peer,
-                                    fingerprint
-                                );
-                                self.identity = Some(principal);
-                                return Ok(Auth::Accept);
-                            }
+                        Ok(bound_fingerprint) => {
+                            log::info!(
+                                "Auth accepted (anonymous): {} bound to {} from {}",
+                                kaijutsu_kernel::seed_character::HAJIME,
+                                bound_fingerprint,
+                                peer,
+                            );
+                            self.identity = Some(hajime_principal);
+                            return Ok(Auth::Accept);
                         }
                         Err(e) => {
-                            log::warn!("Failed to auto-register key: {}", e);
+                            log::warn!("Failed to bind anonymous key to {}: {e}", kaijutsu_kernel::seed_character::HAJIME);
                         }
                     }
                 }

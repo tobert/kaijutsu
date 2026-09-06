@@ -26,7 +26,7 @@ use bytes::Bytes;
 use kaijutsu_kernel::{
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
 };
-use kaijutsu_types::Principal;
+use kaijutsu_types::PrincipalId;
 
 use russh_sftp::extensions::{
     self, FsyncExtension, HardlinkExtension, Statvfs, StatvfsExtension,
@@ -108,7 +108,7 @@ pub struct SftpSession {
     /// The authenticated principal this session acts as. Carried for logging
     /// and the forthcoming capability binding (slice 3); reads/writes act as
     /// this `who` once the binding lands.
-    principal: Principal,
+    principal: PrincipalId,
     /// Opaque per-session id, stamped on every operation span so a whole sshfs
     /// session's traces correlate by `sftp.session` in telemetry.
     session_id: String,
@@ -118,7 +118,7 @@ pub struct SftpSession {
 }
 
 impl SftpSession {
-    pub fn new(principal: Principal, vfs: Arc<MountTable>) -> Self {
+    pub fn new(principal: PrincipalId, vfs: Arc<MountTable>) -> Self {
         Self {
             principal,
             session_id: uuid::Uuid::now_v7().to_string(),
@@ -289,7 +289,7 @@ impl Handler for SftpSession {
         name = "sftp.init",
         level = "info",
         skip_all,
-        fields(sftp.session = %self.session_id, sftp.user = %self.principal.username)
+        fields(sftp.session = %self.session_id, sftp.user = %self.principal.short())
     )]
     async fn init(
         &mut self,
@@ -310,14 +310,14 @@ impl Handler for SftpSession {
         })
     }
 
-    #[tracing::instrument(name = "sftp.realpath", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
+    #[tracing::instrument(name = "sftp.realpath", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path))]
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         let resolved = canonicalize(&path);
         log::debug!(
             "sftp realpath {:?} -> {} ({})",
             path,
             resolved.display(),
-            self.principal.username
+            self.principal.short()
         );
         Ok(Name {
             id,
@@ -325,7 +325,7 @@ impl Handler for SftpSession {
         })
     }
 
-    #[tracing::instrument(name = "sftp.stat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
+    #[tracing::instrument(name = "sftp.stat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path))]
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         // STAT follows symlinks to the final target.
         let path = canonicalize(&path);
@@ -336,7 +336,7 @@ impl Handler for SftpSession {
         })
     }
 
-    #[tracing::instrument(name = "sftp.lstat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
+    #[tracing::instrument(name = "sftp.lstat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path))]
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         // LSTAT does not follow the final symlink; getattr is lstat-shaped.
         let path = canonicalize(&path);
@@ -347,7 +347,7 @@ impl Handler for SftpSession {
         })
     }
 
-    #[tracing::instrument(name = "sftp.fstat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.handle = %handle))]
+    #[tracing::instrument(name = "sftp.fstat", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.handle = %handle))]
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
         let path = match self.handles.get(&handle) {
             Some(HandleEntry::File(f)) => f.path.clone(),
@@ -365,7 +365,7 @@ impl Handler for SftpSession {
         name = "sftp.opendir",
         level = "debug",
         skip_all,
-        fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path)
+        fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path)
     )]
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         if let Some(denied) = self.handle_capacity_denied() {
@@ -390,7 +390,7 @@ impl Handler for SftpSession {
         skip_all,
         fields(
             sftp.session = %self.session_id,
-            sftp.user = %self.principal.username,
+            sftp.user = %self.principal.short(),
             sftp.handle = %handle,
             sftp.entries = tracing::field::Empty,
         )
@@ -445,7 +445,7 @@ impl Handler for SftpSession {
         skip_all,
         fields(
             sftp.session = %self.session_id,
-            sftp.user = %self.principal.username,
+            sftp.user = %self.principal.short(),
             sftp.path = %filename,
             sftp.write = tracing::field::Empty,
             sftp.created = tracing::field::Empty,
@@ -532,7 +532,7 @@ impl Handler for SftpSession {
         skip_all,
         fields(
             sftp.session = %self.session_id,
-            sftp.user = %self.principal.username,
+            sftp.user = %self.principal.short(),
             sftp.handle = %handle,
             sftp.offset = offset,
             sftp.bytes = data.len(),
@@ -595,7 +595,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.mkdir", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
+    #[tracing::instrument(name = "sftp.mkdir", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path))]
     async fn mkdir(
         &mut self,
         id: u32,
@@ -608,21 +608,21 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.rmdir", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
+    #[tracing::instrument(name = "sftp.rmdir", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path))]
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         let path = canonicalize(&path);
         self.vfs.rmdir(&path).await.map_err(reply)?;
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.remove", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %filename))]
+    #[tracing::instrument(name = "sftp.remove", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %filename))]
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         let path = canonicalize(&filename);
         self.vfs.unlink(&path).await.map_err(reply)?;
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.rename", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.from = %oldpath, sftp.to = %newpath))]
+    #[tracing::instrument(name = "sftp.rename", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.from = %oldpath, sftp.to = %newpath))]
     async fn rename(
         &mut self,
         id: u32,
@@ -641,7 +641,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.setstat", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
+    #[tracing::instrument(name = "sftp.setstat", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path))]
     async fn setstat(
         &mut self,
         id: u32,
@@ -656,7 +656,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.fsetstat", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.handle = %handle))]
+    #[tracing::instrument(name = "sftp.fsetstat", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.handle = %handle))]
     async fn fsetstat(
         &mut self,
         id: u32,
@@ -704,7 +704,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.symlink", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.link = %linkpath, sftp.target = %targetpath))]
+    #[tracing::instrument(name = "sftp.symlink", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.link = %linkpath, sftp.target = %targetpath))]
     async fn symlink(
         &mut self,
         id: u32,
@@ -721,7 +721,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.readlink", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.path = %path))]
+    #[tracing::instrument(name = "sftp.readlink", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.path = %path))]
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         let path = canonicalize(&path);
         let target = self.vfs.readlink(&path).await.map_err(reply)?;
@@ -737,7 +737,7 @@ impl Handler for SftpSession {
         skip_all,
         fields(
             sftp.session = %self.session_id,
-            sftp.user = %self.principal.username,
+            sftp.user = %self.principal.short(),
             sftp.handle = %handle,
             sftp.offset = offset,
             sftp.req_len = len,
@@ -773,7 +773,7 @@ impl Handler for SftpSession {
         Ok(Data { id, data })
     }
 
-    #[tracing::instrument(name = "sftp.close", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.handle = %handle))]
+    #[tracing::instrument(name = "sftp.close", level = "debug", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.handle = %handle))]
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         if self.handles.remove(&handle).is_none() {
             return Err(StatusReply::new(StatusCode::Failure).with_message("bad handle"));
@@ -781,7 +781,7 @@ impl Handler for SftpSession {
         Ok(ok_status(id))
     }
 
-    #[tracing::instrument(name = "sftp.extended", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.username, sftp.request = %request))]
+    #[tracing::instrument(name = "sftp.extended", level = "info", skip_all, fields(sftp.session = %self.session_id, sftp.user = %self.principal.short(), sftp.request = %request))]
     async fn extended(
         &mut self,
         id: u32,
@@ -900,7 +900,7 @@ mod tests {
         vfs.mount("/", MemoryBackend::new()).await;
         vfs.write_all(Path::new("/f.txt"), b"orig").await.unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let mut s = SftpSession::new(PrincipalId::system(), vfs.clone());
         // Open for write (no truncate) — captures the current generation.
         let h = Handler::open(&mut s, 1, "/f.txt".into(), OpenFlags::WRITE, FileAttributes::empty())
             .await
@@ -929,7 +929,7 @@ mod tests {
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/", MemoryBackend::new()).await;
 
-        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let mut s = SftpSession::new(PrincipalId::system(), vfs.clone());
         let h = Handler::open(
             &mut s,
             1,
@@ -959,7 +959,7 @@ mod tests {
         vfs.mount("/", MemoryBackend::new()).await;
         vfs.write_all(Path::new("/log.txt"), b"start").await.unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let mut s = SftpSession::new(PrincipalId::system(), vfs.clone());
         let h = Handler::open(
             &mut s,
             1,
@@ -986,7 +986,7 @@ mod tests {
         vfs.mount("/", MemoryBackend::new()).await;
         vfs.write_all(Path::new("/ro.txt"), b"keepme").await.unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let mut s = SftpSession::new(PrincipalId::system(), vfs.clone());
         let h = Handler::open(&mut s, 1, "/ro.txt".into(), OpenFlags::READ, FileAttributes::empty())
             .await
             .expect("open read-only");
@@ -1008,7 +1008,7 @@ mod tests {
         vfs.write_all(Path::new("/a.txt"), b"aaa").await.unwrap();
         vfs.write_all(Path::new("/b.txt"), b"bbb").await.unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let mut s = SftpSession::new(PrincipalId::system(), vfs.clone());
         // posix-rename payload has the same two-SSH-string wire shape as
         // HardlinkExtension, so reuse its serializer to build the bytes.
         let payload: Vec<u8> = HardlinkExtension {
@@ -1035,7 +1035,7 @@ mod tests {
         vfs.mount("/", MemoryBackend::new()).await;
         vfs.write_all(Path::new("/only.txt"), b"x").await.unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs);
+        let mut s = SftpSession::new(PrincipalId::system(), vfs);
         let h = Handler::opendir(&mut s, 1, "/".into()).await.expect("opendir");
 
         let first = Handler::readdir(&mut s, 2, h.handle.clone())
@@ -1059,7 +1059,7 @@ mod tests {
         vfs.mount("/", MemoryBackend::new()).await;
         vfs.write_all(Path::new("/f.txt"), b"x").await.unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs);
+        let mut s = SftpSession::new(PrincipalId::system(), vfs);
         for i in 0..MAX_OPEN_HANDLES {
             Handler::open(&mut s, i as u32, "/f.txt".into(), OpenFlags::READ, FileAttributes::empty())
                 .await
@@ -1080,7 +1080,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs);
+        let mut s = SftpSession::new(PrincipalId::system(), vfs);
         // LSTAT reports the link itself.
         let l = Handler::lstat(&mut s, 1, "/link".into()).await.unwrap();
         assert!(l.attrs.is_symlink());
@@ -1099,7 +1099,7 @@ mod tests {
         vfs.write_all(Path::new("/a.txt"), b"a").await.unwrap();
         vfs.write_all(Path::new("/b.txt"), b"b").await.unwrap();
 
-        let mut s = SftpSession::new(Principal::system(), vfs.clone());
+        let mut s = SftpSession::new(PrincipalId::system(), vfs.clone());
         let err = Handler::rename(&mut s, 1, "/a.txt".into(), "/b.txt".into())
             .await
             .expect_err("base rename must refuse an existing destination");
@@ -1112,7 +1112,7 @@ mod tests {
     async fn read_on_write_only_handle_is_refused() {
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/", MemoryBackend::new()).await;
-        let mut s = SftpSession::new(Principal::system(), vfs);
+        let mut s = SftpSession::new(PrincipalId::system(), vfs);
         // WRITE|CREATE without READ.
         let h = Handler::open(
             &mut s,
@@ -1133,7 +1133,7 @@ mod tests {
     async fn unknown_extension_is_op_unsupported() {
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/", MemoryBackend::new()).await;
-        let mut s = SftpSession::new(Principal::system(), vfs);
+        let mut s = SftpSession::new(PrincipalId::system(), vfs);
         let err = Handler::extended(&mut s, 1, "made-up@example.com".into(), vec![])
             .await
             .expect_err("unknown extension");
@@ -1147,7 +1147,7 @@ mod tests {
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/", MemoryBackend::new()).await;
         vfs.write_all(Path::new("/src.txt"), b"x").await.unwrap();
-        let mut s = SftpSession::new(Principal::system(), vfs);
+        let mut s = SftpSession::new(PrincipalId::system(), vfs);
         let payload: Vec<u8> = HardlinkExtension {
             oldpath: "/src.txt".into(),
             newpath: "/link.txt".into(),

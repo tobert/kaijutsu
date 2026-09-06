@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use kaijutsu_kernel::{MemoryBackend, MountTable, VfsOps};
 use kaijutsu_server::sftp::SftpSession;
-use kaijutsu_types::Principal;
+use kaijutsu_types::PrincipalId;
 
 use russh_sftp::client::SftpSession as ClientSession;
 use tokio::io::AsyncWriteExt;
@@ -44,7 +44,7 @@ async fn fixture() -> ClientSession {
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
-    let handler = SftpSession::new(Principal::system(), vfs);
+    let handler = SftpSession::new(PrincipalId::system(), vfs);
     russh_sftp::server::run(server_io, handler).await;
 
     ClientSession::new(client_io)
@@ -87,7 +87,7 @@ async fn read_dir_pages_a_large_directory() {
     }
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    russh_sftp::server::run(server_io, SftpSession::new(Principal::system(), vfs)).await;
+    russh_sftp::server::run(server_io, SftpSession::new(PrincipalId::system(), vfs)).await;
     let client = ClientSession::new(client_io).await.expect("handshake");
 
     let count = client.read_dir("/big").await.expect("read_dir /big").count();
@@ -217,7 +217,7 @@ async fn an_sftp_write_to_etc_rc_is_an_ordinary_file_write() {
     vfs.mkdir(std::path::Path::new("/config/rc"), 0o755).await.unwrap();
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    russh_sftp::server::run(server_io, SftpSession::new(Principal::system(), vfs)).await;
+    russh_sftp::server::run(server_io, SftpSession::new(PrincipalId::system(), vfs)).await;
     let client = ClientSession::new(client_io).await.expect("handshake");
 
     put(&client, "/config/rc/evil.kai", b"echo hi\n").await;

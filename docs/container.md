@@ -51,8 +51,10 @@ independently and read-only; do not put them in either directory.
 
 ## Add the first SSH key
 
-The server starts with an empty authorization database. Add a key explicitly;
-the public-key mount need not persist.
+The server starts with an empty authorization database. Start it once first —
+that seeds `kernel.db` and the bootstrap character, `hajime`
+(`docs/character.md`, "Bootstrap: `hajime`") — then bind a key to it; the
+public-key mount need not persist.
 
 ```bash
 podman run --rm \
@@ -60,11 +62,12 @@ podman run --rm \
   --mount type=bind,src=/tank/kaijutsu/kernel-data,dst=/var/lib/kaijutsu \
   --mount type=bind,src="$HOME/.ssh/id_ed25519.pub",dst=/keys/operator.pub,ro \
   --entrypoint /usr/local/bin/kaijutsu-server \
-  localhost/kaijutsu:dev add-key /keys/operator.pub --nick operator
+  localhost/kaijutsu:dev add-key /keys/operator.pub --as hajime
 ```
 
-Run that command only while the server is stopped: both commands write the
-same SQLite-backed state directory.
+`add-key` is safe to run while the server keeps running — `auth.db` is WAL
+and never cached — but it needs `kernel.db` to already carry a character to
+bind to.
 
 ## Devcontainer
 

@@ -118,13 +118,16 @@ track-bearing, `beat()`-authored). Poison cells get a 3-failure retry budget.
 against the stream loop), and a `generation` counter so stream-A cleanup can't
 clobber stream-B. Created fresh per prompt.
 
-`AuthDb` (`src/auth_db.rs`): SQLite (`auth.db`) with `principals` (UUIDv7 id,
-unique username) and `credentials` (SSH fingerprint → principal, CASCADE).
-`authenticate` (`:94`) is a single join on the hot path via `spawn_blocking`.
-Authorization is binary (key in DB = allowed); anonymous mode auto-registers with
-a sanitized username. Identity flows into every block insert as the author.
-Management CLI in `main.rs`: add-key, remove-user, list-users/keys, import,
-set-nick.
+`AuthDb` (`src/auth_db.rs`): a keyring, not an identity registry — SQLite
+(`auth.db`) with `principals` (UUIDv7 id, bare bookkeeping row) and
+`credentials` (SSH fingerprint → principal id, no name). `authenticate` is a
+single-table lookup on the hot path via `spawn_blocking`, returning a bare
+`PrincipalId`. Authorization is binary (key in DB = allowed); anonymous mode
+binds an unknown key to the seeded `hajime` character rather than minting.
+The given name a player reads is `characters.name` in `kernel.db`, resolved
+through `KernelDb::name_for` (`docs/character.md`, "`auth.db` is a
+keyring"). Management CLI in `main.rs`: `add-key --as <character>
+[--rebind]`, `list-keys`, `list-characters`.
 
 ---
 

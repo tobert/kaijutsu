@@ -48,12 +48,17 @@ server for real → asserts on `/proc`.
 
 **Credentials: always ephemeral, always labeled.** Every key the suite
 mints is generated fresh per boot and carries the `isotest-ephemeral` label
-in the auth.db nick, the pubkey comment, and the SSH username — a stray
-entry can never be mistaken for a durable identity. Registration happens
-via `add-key` pre-boot (the shipped binary has `allow_anonymous: false` and
-no registration RPC). Most tests authenticate with an in-memory key; the
-agent test runs a real `ssh-agent` inside the namespace and injects the key
-via the agent protocol, so that private key never touches disk at all.
+in the pubkey comment and the SSH username — a stray entry can never be
+mistaken for a durable identity. `auth.db` carries no name of its own
+(`docs/character.md`, "`auth.db` is a keyring"), so registration binds the
+key to the server's own seeded `hajime` character: the harness boots the
+server first (which seeds `kernel.db`), waits for it to appear, then runs
+`add-key --as hajime` while the server keeps running (safe — `auth.db` is
+WAL and never cached). The shipped binary has `allow_anonymous: false` and
+no registration RPC, so this is still the only way in. Most tests
+authenticate with an in-memory key; the agent test runs a real `ssh-agent`
+inside the namespace and injects the key via the agent protocol, so that
+private key never touches disk at all.
 
 Tests run `--test-threads=1` (the runner enforces it): `/proc` assertions
 must never interleave.

@@ -7,6 +7,11 @@ use std::net::SocketAddr;
 mod common;
 use common::*;
 
+/// The ephemeral server's `allow_anonymous` mode binds an unknown key to the
+/// seeded `hajime` character rather than minting a principal from the SSH
+/// login name (`docs/character.md`, "Anonymous auto-register binds to
+/// `hajime` instead of minting") — the SSH username ("test_user") is not
+/// compared and does not appear in the resolved identity.
 #[test]
 fn test_whoami() {
     run_local(async {
@@ -14,8 +19,53 @@ fn test_whoami() {
         let client = connect_client(addr).await;
 
         let identity = client.whoami().await.unwrap();
-        assert_eq!(identity.username, "test_user");
-        assert_eq!(identity.display_name, "test_user");
+        assert_eq!(identity.username, "hajime");
+        assert_eq!(identity.display_name, "hajime");
+    });
+}
+
+/// Two different unknown keys, connecting independently, both bind to the
+/// SAME seeded `hajime` principal — anonymous auto-register mints nothing
+/// (`docs/character.md`, "Anonymous auto-register binds to `hajime` instead
+/// of minting"). Under the old auto-mint behavior each connection would have
+/// received its own distinct principal.
+#[test]
+fn anonymous_auto_register_binds_to_hajime_and_mints_nothing() {
+    run_local(async {
+        let addr = start_server().await;
+
+        let client1 = connect_client(addr).await;
+        let id1 = client1.whoami().await.unwrap();
+
+        let client2 = connect_client(addr).await;
+        let id2 = client2.whoami().await.unwrap();
+
+        assert_eq!(id1.username, "hajime");
+        assert_eq!(id2.username, "hajime");
+        assert_eq!(
+            id1.principal_id, id2.principal_id,
+            "two different anonymous keys must resolve to the SAME hajime \
+             principal, never two distinct minted ones"
+        );
+    });
+}
+
+/// A character's name renders identically over the wire regardless of how
+/// many times or which connection asks: `whoami`'s `Identity` is filled from
+/// `KernelDb::name_for`, the one resolver every name read goes through
+/// (`docs/character.md`, "One name, one source").
+#[test]
+fn character_name_renders_identically_over_repeated_whoami_calls() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let first = client.whoami().await.unwrap();
+        let second = client.whoami().await.unwrap();
+        assert_eq!(first.username, second.username);
+        assert_eq!(first.display_name, second.display_name);
+        assert_eq!(first.principal_id, second.principal_id);
+        assert_eq!(first.username, "hajime");
     });
 }
 

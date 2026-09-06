@@ -4,7 +4,7 @@
 > morning's conversation with Amy about her restart-every-session routine
 > and what kaijutsu needs so the morning is smooth, then revised through two
 > model reviews the same afternoon ("Review", below) and a readiness pass
-> the next day. **Slice 0a is built and verified; slices 1–6 are not.**
+> the next day. **Slices 0a, 1 and 2 are built and verified; slices 3–6 are not.**
 > Every code claim carries a `file:line`; re-read it before relying on it.
 > Amy's statements are guidance, not rulings.
 
@@ -314,6 +314,32 @@ had beyond an id and a timestamp. What remains of it is a bare existence
 row; whether to keep it as the `ON DELETE CASCADE` target or drop it and
 let `principal_id` be un-rowed here the way it is in `kernel.db` is an
 implementation call for the slice.
+
+**Resolved (slice 2 implementation): kept, un-rowed relationship.**
+`principals(id, created_at)` stays — `ensure_principal_row` upserts it
+before every `add_key`/`rebind_key` write, which is what lets `add-key`
+record a binding with no live `kernel.db` connection (the name was already
+resolved to an id before this write). `credentials.principal_id` carries no
+FK, matching the printed schema above ("bare identity, as everywhere
+else") — `remove_principal` is gone, so there is no delete path for the
+cascade to guard.
+
+A pre-existing installation's `credentials` table keeps its OLD
+`principal_id REFERENCES principals(id) ON DELETE CASCADE` (only
+`principals` is rebuilt to shed `username`/`display_name`; `credentials` is
+untouched) — harmless day to day, but load-bearing for the migration that
+sheds those columns: SQLite's `ALTER TABLE ... DROP COLUMN` refuses a
+column carrying a `UNIQUE` constraint (`username` was `UNIQUE`), so the
+migration rebuilds `principals` via `CREATE` + `INSERT ... SELECT` +
+`DROP TABLE` + `RENAME`. `DROP TABLE` on a table another table's row
+references performs an *implicit* `DELETE FROM` first when foreign key
+enforcement is on — which fires that legacy `ON DELETE CASCADE` and erases
+every credential the instant `principals` is dropped. `PRAGMA foreign_keys`
+has to go `OFF` for the rebuild and back `ON` after (it is a no-op inside an
+open transaction, so this must bracket the `BEGIN`/`COMMIT`, not sit inside
+it). Caught by a test that asserts a fixture's key still authenticates
+after migrating — the crash would otherwise be silent (`unwrap()` all
+succeed; the row is just gone).
 
 **`Principal` loses its name, and with it its reason to exist.**
 `authenticate` returns a `PrincipalId`. The struct is constructed in exactly
@@ -780,7 +806,9 @@ Each slice is independently shippable and leaves the tree green.
    Tests: NULL `played_by` preserves today's behavior; fork copies it;
    retiring archives the live contexts and leaves blocks and their authors
    intact; an unmapped character fails loudly.
-2. **The keyring melt.** `auth.db` drops `username` and `display_name` and
+2. **The keyring melt. Built and verified 2026-09-06** (the migration and
+   `principals`/FK-cascade findings above are from this pass). `auth.db`
+   drops `username` and `display_name` and
    gains `PRAGMA journal_mode = WAL`; `authenticate` returns a
    `PrincipalId`; `Principal` loses its name fields; `add-key --as
    <character>` binds, never mints, and refuses an already-bound
@@ -804,7 +832,11 @@ Each slice is independently shippable and leaves the tree green.
    no character fails loudly rather than rendering blank; re-adding a bound
    fingerprint refuses and names the current binding; `--rebind` moves it;
    a fresh kernel seeds exactly one character and `list-characters` finds
-   it with the service stopped.
+   it with the service stopped; the migration
+   (`kaijutsu-server::migrate_keyring`) turns pre-existing principals into
+   characters carrying their old usernames, against a fixture mimicking a
+   real `auth.db`, never against anything real; anonymous auto-register
+   binds to `hajime` and mints nothing.
 3. **Attribution.** Turn-start resolution of `played_by` to the effective
    actor; provider-emitted blocks authored by it. This is the slice that
    changes `BlockId` lanes, so it ships alone.

@@ -19,7 +19,7 @@ use kaijutsu_client::{ShareArg, ShareHandler, ShareServerConfig};
 use kaijutsu_kernel::vfs::{VfsSink, pump_stream};
 use kaijutsu_kernel::{MemoryBackend, MountTable, ShareFs, ShareRegistry, VfsError, VfsOps};
 use kaijutsu_server::share::{run_share_session, run_share_session_with_keepalive};
-use kaijutsu_types::Principal;
+use kaijutsu_types::PrincipalId;
 
 use russh_sftp::protocol::{
     Attrs, Data, FileAttributes, Handle as SftpHandle, Name, OpenFlags, Packet, Status, Version,
@@ -210,7 +210,7 @@ async fn fixture(dir: &Path, share_name: &str) -> (ShareFs, String) {
     russh_sftp::server::run(client_io, handler).await;
 
     let registry = Arc::new(ShareRegistry::new());
-    let principal = Principal::new("amy", "Amy Tobey");
+    let principal = PrincipalId::new();
     tokio::spawn(run_share_session(server_io, principal, registry.clone()));
 
     wait_for(|| {
@@ -251,7 +251,7 @@ async fn counting_fixture(
     russh_sftp::server::run(client_io, handler).await;
 
     let registry = Arc::new(ShareRegistry::new());
-    tokio::spawn(run_share_session(server_io, Principal::system(), registry.clone()));
+    tokio::spawn(run_share_session(server_io, PrincipalId::system(), registry.clone()));
     {
         let registry = registry.clone();
         let client_id = client_id.clone();
@@ -391,7 +391,7 @@ async fn disconnect_unregisters_promptly_and_pending_ops_surface_the_dedicated_e
     });
 
     let registry = Arc::new(ShareRegistry::new());
-    tokio::spawn(run_share_session(server_io, Principal::system(), registry.clone()));
+    tokio::spawn(run_share_session(server_io, PrincipalId::system(), registry.clone()));
     {
         let registry = registry.clone();
         let client_id = client_id.clone();
@@ -482,7 +482,7 @@ async fn a_silently_dead_idle_session_is_evicted_by_the_keepalive() {
     let registry = Arc::new(ShareRegistry::new());
     tokio::spawn(run_share_session_with_keepalive(
         killable_server_io,
-        Principal::system(),
+        PrincipalId::system(),
         registry.clone(),
         Duration::from_millis(100),
     ));

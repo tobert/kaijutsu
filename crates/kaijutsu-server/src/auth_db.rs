@@ -1,11 +1,18 @@
-//! SQLite-backed SSH public key authorization and principal identity.
+//! SQLite-backed SSH public key authorization — a keyring.
+//!
+//! `auth.db` answers exactly one question: which principal does this
+//! fingerprint belong to? It carries no name — the given name a player
+//! reads is `characters.name` in `kernel.db`, resolved through
+//! `KernelDb::name_for` (`docs/character.md`, "`auth.db` is a keyring").
 //!
 //! Provides:
-//! - Principal management (username, display_name) backed by PrincipalId (UUIDv7)
-//! - SSH public key storage and lookup by fingerprint
-//! - Import from OpenSSH authorized_keys format
+//! - SSH public key storage and lookup by fingerprint, resolving to a
+//!   [`PrincipalId`]
+//! - A bare `principals` bookkeeping row per id that has ever held a key —
+//!   no name, just existence, so `add-key` can record a binding with the
+//!   kernel down
 
-use kaijutsu_types::{Principal, PrincipalId};
+use kaijutsu_types::PrincipalId;
 use rusqlite::{Connection, Result as SqliteResult, params};
 use russh::keys::ssh_key::{self, HashAlg};
 use std::fs;
@@ -21,7 +28,7 @@ pub struct AuthDb {
     _temp_dir: Option<tempfile::TempDir>,
 }
 
-/// An SSH public key record (DB columns not on Credential).
+/// An SSH public key record (DB columns not on the resolved principal).
 #[derive(Debug, Clone)]
 pub struct SshKeyRecord {
     pub fingerprint: String,
@@ -36,14 +43,12 @@ pub struct SshKeyRecord {
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS principals (
     id BLOB NOT NULL PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE,
-    display_name TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS credentials (
     fingerprint TEXT NOT NULL PRIMARY KEY,
-    principal_id BLOB NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+    principal_id BLOB NOT NULL,
     kind TEXT NOT NULL DEFAULT 'ssh_key',
     key_type TEXT NOT NULL,
     key_blob BLOB NOT NULL,
@@ -55,10 +60,19 @@ CREATE TABLE IF NOT EXISTS credentials (
 
 impl AuthDb {
     /// Initialize connection with required PRAGMAs.
+    ///
+    /// WAL, so a routine `add-key` against a running server doesn't lock the
+    /// whole file: in the old rollback-journal mode a writer holds an
+    /// exclusive lock, and a connection authenticating meanwhile retries for
+    /// `busy_timeout` and then fails `SQLITE_BUSY`. `kernel.db` has been WAL
+    /// since it was written; this brings `auth.db` to the same footing now
+    /// that binding a character's key is the normal path, not a once-a-machine
+    /// act.
     fn init_connection(conn: &Connection) -> SqliteResult<()> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA busy_timeout = 5000;
+             PRAGMA journal_mode = WAL;",
         )?;
         Ok(())
     }
@@ -114,14 +128,13 @@ impl AuthDb {
 
     /// Look up a principal by SSH key fingerprint.
     ///
-    /// Returns the principal if the key is authorized, None otherwise.
-    pub fn authenticate(&self, fingerprint: &str) -> SqliteResult<Option<Principal>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.username, p.display_name
-             FROM principals p
-             JOIN credentials c ON c.principal_id = p.id
-             WHERE c.fingerprint = ?1",
-        )?;
+    /// Returns the principal id if the key is authorized, `None` otherwise.
+    /// Never compares the SSH login username — the fingerprint alone decides
+    /// identity.
+    pub fn authenticate(&self, fingerprint: &str) -> SqliteResult<Option<PrincipalId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT principal_id FROM credentials WHERE fingerprint = ?1")?;
 
         let mut rows = stmt.query(params![fingerprint])?;
         if let Some(row) = rows.next()? {
@@ -133,11 +146,7 @@ impl AuthDb {
                     "invalid PrincipalId bytes".into(),
                 )
             })?;
-            Ok(Some(Principal {
-                id,
-                username: row.get(1)?,
-                display_name: row.get(2)?,
-            }))
+            Ok(Some(id))
         } else {
             Ok(None)
         }
@@ -153,66 +162,10 @@ impl AuthDb {
     }
 
     // =========================================================================
-    // Principal management
+    // Principal bookkeeping
     // =========================================================================
 
-    /// Create a new principal. Generates a fresh PrincipalId.
-    pub fn create_principal(
-        &self,
-        username: &str,
-        display_name: &str,
-    ) -> SqliteResult<PrincipalId> {
-        let id = PrincipalId::new();
-        self.conn.execute(
-            "INSERT INTO principals (id, username, display_name)
-             VALUES (?1, ?2, ?3)",
-            params![id.as_bytes().as_slice(), username, display_name],
-        )?;
-        Ok(id)
-    }
-
-    /// Get a principal by username.
-    pub fn get_principal_by_username(&self, username: &str) -> SqliteResult<Option<Principal>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, username, display_name
-             FROM principals WHERE username = ?1",
-        )?;
-
-        let mut rows = stmt.query(params![username])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row_to_principal(row)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Get a principal by ID.
-    pub fn get_principal(&self, id: PrincipalId) -> SqliteResult<Option<Principal>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, username, display_name
-             FROM principals WHERE id = ?1",
-        )?;
-
-        let mut rows = stmt.query(params![id.as_bytes().as_slice()])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row_to_principal(row)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// List all principals.
-    pub fn list_principals(&self) -> SqliteResult<Vec<Principal>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, username, display_name
-             FROM principals ORDER BY username",
-        )?;
-
-        let rows = stmt.query_map([], row_to_principal)?;
-        rows.collect()
-    }
-
-    /// Check if the database has any principals.
+    /// Check if the database has any credential-holding principal.
     pub fn is_empty(&self) -> SqliteResult<bool> {
         let count: i64 = self
             .conn
@@ -220,38 +173,118 @@ impl AuthDb {
         Ok(count == 0)
     }
 
-    /// Rename a principal (change username).
-    pub fn set_username(&self, old_username: &str, new_username: &str) -> SqliteResult<bool> {
-        let updated = self.conn.execute(
-            "UPDATE principals SET username = ?1 WHERE username = ?2",
-            params![new_username, old_username],
+    /// Record a principal's bare existence row if it doesn't already have
+    /// one. Never fails on a duplicate — every `add_key`/`rebind_key` call
+    /// runs this first so the row exists before the credential does, with no
+    /// dependency on `kernel.db` being reachable at write time (the id was
+    /// already resolved from a name before this call).
+    fn ensure_principal_row(&self, principal_id: PrincipalId) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO principals (id) VALUES (?1)",
+            params![principal_id.as_bytes().as_slice()],
         )?;
-        Ok(updated > 0)
+        Ok(())
     }
 
-    /// Update display name.
-    pub fn set_display_name(&self, username: &str, display_name: &str) -> SqliteResult<bool> {
-        let updated = self.conn.execute(
-            "UPDATE principals SET display_name = ?1 WHERE username = ?2",
-            params![display_name, username],
-        )?;
-        Ok(updated > 0)
+    // =========================================================================
+    // Legacy name migration
+    // =========================================================================
+    //
+    // Before this melt, `principals` carried `username`/`display_name`.
+    // `open()`'s `CREATE TABLE IF NOT EXISTS` is a no-op against an existing
+    // table, so opening a pre-melt `auth.db` with this code leaves those
+    // columns physically in place — and their NOT NULL constraint then
+    // rejects `ensure_principal_row`'s bare `INSERT INTO principals (id)`.
+    // The methods below detect that shape, hand the names to the caller (who
+    // writes them into `kernel.db` as characters — this file never touches
+    // `kernel.db`), and then drop the columns so the table matches `SCHEMA`.
+    // `docs/character.md`, "`auth.db` is a keyring".
+
+    /// True when this database still carries the pre-melt `username` column
+    /// — the marker that its `principals` rows have a name nothing has
+    /// harvested into `kernel.db` yet.
+    pub fn has_legacy_names(&self) -> SqliteResult<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(principals)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get("name")?;
+            if name == "username" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    /// Remove a principal and all their keys (via CASCADE).
-    pub fn remove_principal(&self, username: &str) -> SqliteResult<bool> {
-        let deleted = self.conn.execute(
-            "DELETE FROM principals WHERE username = ?1",
-            params![username],
+    /// Every pre-melt principal's `(id, username)` pair. Fails loudly if
+    /// `has_legacy_names` would return `false` — there is nothing to read.
+    pub fn legacy_principal_names(&self) -> SqliteResult<Vec<(PrincipalId, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, username FROM principals")?;
+        let rows = stmt.query_map([], |row| {
+            let id_bytes: Vec<u8> = row.get(0)?;
+            let id = PrincipalId::try_from_slice(&id_bytes).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    "invalid PrincipalId bytes".into(),
+                )
+            })?;
+            let username: String = row.get(1)?;
+            Ok((id, username))
+        })?;
+        rows.collect()
+    }
+
+    /// Drop the pre-melt `username`/`display_name` columns, bringing an
+    /// upgraded table to the shape `SCHEMA` declares. Call only after every
+    /// name `legacy_principal_names` returned has landed in `kernel.db` —
+    /// this is the point of no return for those two columns.
+    ///
+    /// `ALTER TABLE ... DROP COLUMN` refuses a column carrying a UNIQUE
+    /// constraint (`username` was `UNIQUE`) — SQLite's autoindex for it
+    /// cannot be dropped independently of the table — so this rebuilds
+    /// `principals` instead: a fresh table in `SCHEMA`'s shape, every
+    /// `(id, created_at)` copied over, the old table replaced.
+    ///
+    /// Foreign keys go off for the rebuild and back on after. `DROP TABLE`
+    /// on a table other rows reference performs an implicit `DELETE FROM`
+    /// first when foreign key enforcement is on — which would fire
+    /// `credentials`'s legacy `ON DELETE CASCADE` and erase every bound key
+    /// the instant `principals` is dropped, taking the very credentials this
+    /// migration exists to preserve. `credentials`'s own schema is otherwise
+    /// untouched; a pre-existing installation's copy keeps its legacy
+    /// `principal_id REFERENCES principals(id) ON DELETE CASCADE` —
+    /// harmless from here on, since every write path ensures the referenced
+    /// row first, and no id changes in this rebuild.
+    pub fn drop_legacy_name_columns(&self) -> SqliteResult<()> {
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             BEGIN;
+             CREATE TABLE principals_new (
+                 id BLOB NOT NULL PRIMARY KEY,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             INSERT INTO principals_new (id, created_at) SELECT id, created_at FROM principals;
+             DROP TABLE principals;
+             ALTER TABLE principals_new RENAME TO principals;
+             COMMIT;
+             PRAGMA foreign_keys = ON;",
         )?;
-        Ok(deleted > 0)
+        Ok(())
     }
 
     // =========================================================================
     // SSH key management
     // =========================================================================
 
-    /// Add an SSH key for an existing principal.
+    /// Bind a key to an existing principal. Never mints: `principal_id`
+    /// comes from the caller having already resolved a character's name
+    /// (`kj character create`, then `add-key --as <name>`).
+    ///
+    /// Fails on a fingerprint that is already bound — `credentials.fingerprint`
+    /// is the primary key, so this is an ordinary constraint violation, not a
+    /// silent rebind. The caller checks first (`get_key`) so it can name the
+    /// current binding rather than surfacing a raw SQLite error; `rebind_key`
+    /// is the deliberate move.
     pub fn add_key(
         &self,
         principal_id: PrincipalId,
@@ -264,6 +297,7 @@ impl AuthDb {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e)))
         })?;
 
+        self.ensure_principal_row(principal_id)?;
         self.conn.execute(
             "INSERT INTO credentials (fingerprint, principal_id, kind, key_type, key_blob, comment)
              VALUES (?1, ?2, 'ssh_key', ?3, ?4, ?5)",
@@ -278,52 +312,31 @@ impl AuthDb {
         Ok(fingerprint)
     }
 
-    /// Add a key and auto-create a principal if needed.
-    ///
-    /// Username is derived from the fingerprint tail if not provided.
-    /// Display name defaults to the comment or the username.
-    ///
-    /// Returns (PrincipalId, fingerprint).
-    pub fn add_key_auto_principal(
-        &mut self,
+    /// Move an already-bound key to a different principal — the deliberate
+    /// counterpart to `add_key`'s refusal. Resets `last_used_at`: the key is
+    /// now a fresh binding, and its prior use belonged to the old principal.
+    pub fn rebind_key(
+        &self,
+        principal_id: PrincipalId,
         key: &ssh_key::PublicKey,
         comment: Option<&str>,
-        username: Option<&str>,
-    ) -> SqliteResult<(PrincipalId, String)> {
+    ) -> SqliteResult<String> {
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
-
-        // Derive username from fingerprint if not provided
-        let base_username = username
-            .map(String::from)
-            .unwrap_or_else(|| nick_from_fingerprint(&fingerprint));
-        let unique_username = self.unique_username(&base_username)?;
-
-        // Display name from comment or username
-        let display_name = comment.unwrap_or(&unique_username).to_string();
-
-        // Use transaction to ensure atomicity
-        let tx = self.conn.transaction()?;
-
-        let principal_id = PrincipalId::new();
-
-        tx.execute(
-            "INSERT INTO principals (id, username, display_name)
-             VALUES (?1, ?2, ?3)",
-            params![
-                principal_id.as_bytes().as_slice(),
-                unique_username,
-                display_name
-            ],
-        )?;
-
         let key_type = key.algorithm().to_string();
         let key_blob = key.to_bytes().map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e)))
         })?;
 
-        tx.execute(
-            "INSERT INTO credentials (fingerprint, principal_id, kind, key_type, key_blob, comment)
-             VALUES (?1, ?2, 'ssh_key', ?3, ?4, ?5)",
+        self.ensure_principal_row(principal_id)?;
+        self.conn.execute(
+            "INSERT INTO credentials (fingerprint, principal_id, kind, key_type, key_blob, comment, last_used_at)
+             VALUES (?1, ?2, 'ssh_key', ?3, ?4, ?5, NULL)
+             ON CONFLICT(fingerprint) DO UPDATE SET
+                 principal_id = excluded.principal_id,
+                 key_type = excluded.key_type,
+                 key_blob = excluded.key_blob,
+                 comment = excluded.comment,
+                 last_used_at = NULL",
             params![
                 fingerprint,
                 principal_id.as_bytes().as_slice(),
@@ -332,32 +345,7 @@ impl AuthDb {
                 comment
             ],
         )?;
-
-        tx.commit()?;
-        Ok((principal_id, fingerprint))
-    }
-
-    /// Generate a unique username by appending -1, -2, etc. if needed.
-    fn unique_username(&self, base: &str) -> SqliteResult<String> {
-        let mut username = base.to_string();
-        let mut suffix = 1;
-
-        while self.username_exists(&username)? {
-            username = format!("{}-{}", base, suffix);
-            suffix += 1;
-        }
-
-        Ok(username)
-    }
-
-    /// Check if a username already exists.
-    fn username_exists(&self, username: &str) -> SqliteResult<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM principals WHERE username = ?1",
-            params![username],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        Ok(fingerprint)
     }
 
     /// List all keys for a principal.
@@ -367,61 +355,20 @@ impl AuthDb {
              FROM credentials WHERE principal_id = ?1 ORDER BY created_at",
         )?;
 
-        let rows = stmt.query_map(params![principal_id.as_bytes().as_slice()], |row| {
-            let pid_bytes: Vec<u8> = row.get(1)?;
-            let pid = PrincipalId::try_from_slice(&pid_bytes).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Blob,
-                    "invalid PrincipalId".into(),
-                )
-            })?;
-            Ok(SshKeyRecord {
-                fingerprint: row.get(0)?,
-                principal_id: pid,
-                key_type: row.get(2)?,
-                key_blob: row.get(3)?,
-                comment: row.get(4)?,
-                created_at: row.get(5)?,
-                last_used_at: row.get(6)?,
-            })
-        })?;
-
+        let rows = stmt.query_map(params![principal_id.as_bytes().as_slice()], row_to_key)?;
         rows.collect()
     }
 
-    /// List all keys in the database.
-    pub fn list_all_keys(&self) -> SqliteResult<Vec<(Principal, SshKeyRecord)>> {
+    /// List every key in the database, ordered by principal then age — the
+    /// `list-keys` fingerprint-to-principal table. Resolving a principal to
+    /// a character's name is the caller's job (`kernel.db`, not this file).
+    pub fn list_all_keys(&self) -> SqliteResult<Vec<SshKeyRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.username, p.display_name,
-                    c.fingerprint, c.principal_id, c.key_type, c.key_blob, c.comment, c.created_at, c.last_used_at
-             FROM principals p
-             JOIN credentials c ON c.principal_id = p.id
-             ORDER BY p.username, c.created_at",
+            "SELECT fingerprint, principal_id, key_type, key_blob, comment, created_at, last_used_at
+             FROM credentials ORDER BY principal_id, created_at",
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            let principal = row_to_principal(row)?;
-            let pid_bytes: Vec<u8> = row.get(4)?;
-            let pid = PrincipalId::try_from_slice(&pid_bytes).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Blob,
-                    "invalid PrincipalId".into(),
-                )
-            })?;
-            let key = SshKeyRecord {
-                fingerprint: row.get(3)?,
-                principal_id: pid,
-                key_type: row.get(5)?,
-                key_blob: row.get(6)?,
-                comment: row.get(7)?,
-                created_at: row.get(8)?,
-                last_used_at: row.get(9)?,
-            };
-            Ok((principal, key))
-        })?;
-
+        let rows = stmt.query_map([], row_to_key)?;
         rows.collect()
     }
 
@@ -434,7 +381,8 @@ impl AuthDb {
         Ok(deleted > 0)
     }
 
-    /// Get a key by fingerprint.
+    /// Get a key by fingerprint — the pre-check `add-key` uses to refuse an
+    /// already-bound fingerprint by name rather than a raw constraint error.
     pub fn get_key(&self, fingerprint: &str) -> SqliteResult<Option<SshKeyRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT fingerprint, principal_id, key_type, key_blob, comment, created_at, last_used_at
@@ -443,136 +391,33 @@ impl AuthDb {
 
         let mut rows = stmt.query(params![fingerprint])?;
         if let Some(row) = rows.next()? {
-            let pid_bytes: Vec<u8> = row.get(1)?;
-            let pid = PrincipalId::try_from_slice(&pid_bytes).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Blob,
-                    "invalid PrincipalId".into(),
-                )
-            })?;
-            Ok(Some(SshKeyRecord {
-                fingerprint: row.get(0)?,
-                principal_id: pid,
-                key_type: row.get(2)?,
-                key_blob: row.get(3)?,
-                comment: row.get(4)?,
-                created_at: row.get(5)?,
-                last_used_at: row.get(6)?,
-            }))
+            Ok(Some(row_to_key(row)?))
         } else {
             Ok(None)
         }
     }
-
-    // =========================================================================
-    // Import
-    // =========================================================================
-
-    /// Import keys from an OpenSSH authorized_keys file.
-    ///
-    /// Creates a principal for each unique key.
-    ///
-    /// Returns the number of keys imported.
-    pub fn import_authorized_keys<P: AsRef<Path>>(&mut self, path: P) -> SqliteResult<usize> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-        let mut imported = 0;
-
-        for line in content.lines() {
-            let line = line.trim();
-
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Parse the key
-            match ssh_key::PublicKey::from_openssh(line) {
-                Ok(key) => {
-                    let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
-
-                    // Skip if key already exists
-                    if self.get_key(&fingerprint)?.is_some() {
-                        log::debug!("Skipping existing key: {}", fingerprint);
-                        continue;
-                    }
-
-                    // Extract comment (last field after key data)
-                    let comment = extract_comment(line);
-
-                    match self.add_key_auto_principal(&key, comment.as_deref(), None) {
-                        Ok((principal_id, _fingerprint)) => {
-                            let username = self
-                                .get_principal(principal_id)?
-                                .map(|p| p.username)
-                                .unwrap_or_default();
-                            log::info!(
-                                "Imported key for '{}': {} ({})",
-                                username,
-                                fingerprint,
-                                comment.as_deref().unwrap_or("no comment")
-                            );
-                            imported += 1;
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to import key {}: {}", fingerprint, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse key line: {} ({})", e, line);
-                }
-            }
-        }
-
-        Ok(imported)
-    }
 }
 
-/// Extract a Principal from a row with columns (id, username, display_name).
-fn row_to_principal(row: &rusqlite::Row<'_>) -> SqliteResult<Principal> {
-    let id_bytes: Vec<u8> = row.get(0)?;
-    let id = PrincipalId::try_from_slice(&id_bytes).ok_or_else(|| {
+/// Extract an `SshKeyRecord` from a row with columns (fingerprint,
+/// principal_id, key_type, key_blob, comment, created_at, last_used_at).
+fn row_to_key(row: &rusqlite::Row<'_>) -> SqliteResult<SshKeyRecord> {
+    let pid_bytes: Vec<u8> = row.get(1)?;
+    let principal_id = PrincipalId::try_from_slice(&pid_bytes).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            0,
+            1,
             rusqlite::types::Type::Blob,
-            "invalid PrincipalId bytes".into(),
+            "invalid PrincipalId".into(),
         )
     })?;
-    Ok(Principal {
-        id,
-        username: row.get(1)?,
-        display_name: row.get(2)?,
+    Ok(SshKeyRecord {
+        fingerprint: row.get(0)?,
+        principal_id,
+        key_type: row.get(2)?,
+        key_blob: row.get(3)?,
+        comment: row.get(4)?,
+        created_at: row.get(5)?,
+        last_used_at: row.get(6)?,
     })
-}
-
-/// Derive a username from a fingerprint.
-///
-/// Takes the last 8 characters of the base64 portion.
-fn nick_from_fingerprint(fingerprint: &str) -> String {
-    fingerprint
-        .trim_start_matches("SHA256:")
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
-}
-
-/// Extract comment from an authorized_keys line.
-///
-/// Format: "key-type base64-data [comment]"
-fn extract_comment(line: &str) -> Option<String> {
-    let parts: Vec<&str> = line.splitn(3, ' ').collect();
-    if parts.len() >= 3 {
-        Some(parts[2].to_string())
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -589,98 +434,54 @@ mod tests {
     }
 
     #[test]
-    fn test_nick_from_fingerprint() {
-        assert_eq!(nick_from_fingerprint("SHA256:abcdefghijklmnop"), "ijklmnop");
-        assert_eq!(nick_from_fingerprint("SHA256:short"), "short");
-        assert_eq!(nick_from_fingerprint("SHA256:12345678"), "12345678");
-    }
-
-    #[test]
-    fn test_extract_comment() {
-        assert_eq!(
-            extract_comment("ssh-ed25519 AAAA... amy@laptop"),
-            Some("amy@laptop".to_string())
-        );
-        assert_eq!(
-            extract_comment("ssh-ed25519 AAAA... user@host with spaces"),
-            Some("user@host with spaces".to_string())
-        );
-        assert_eq!(extract_comment("ssh-ed25519 AAAA..."), None);
-    }
-
-    #[test]
-    fn test_principal_crud() {
-        let db = AuthDb::temporary().unwrap();
-        assert!(db.is_empty().unwrap());
-
-        let id = db.create_principal("amy", "Amy Tobey").unwrap();
-        assert!(!db.is_empty().unwrap());
-
-        let principal = db.get_principal_by_username("amy").unwrap().unwrap();
-        assert_eq!(principal.id, id);
-        assert_eq!(principal.username, "amy");
-        assert_eq!(principal.display_name, "Amy Tobey");
-
-        // List principals
-        let principals = db.list_principals().unwrap();
-        assert_eq!(principals.len(), 1);
-
-        // Rename
-        assert!(db.set_username("amy", "atobey").unwrap());
-        assert!(db.get_principal_by_username("amy").unwrap().is_none());
-        assert!(db.get_principal_by_username("atobey").unwrap().is_some());
-    }
-
-    #[test]
     fn test_key_management() {
-        let mut db = AuthDb::temporary().unwrap();
+        let db = AuthDb::temporary().unwrap();
         let key = make_test_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let principal_id = PrincipalId::new();
 
-        // Add key with auto-principal
-        let (principal_id, fp) = db
-            .add_key_auto_principal(&key, Some("test@host"), None)
-            .unwrap();
-        assert!(!principal_id.is_nil());
+        // Bind the key to an existing (already-minted) principal.
+        let fp = db.add_key(principal_id, &key, Some("test@host")).unwrap();
         assert_eq!(fp, fingerprint);
+        assert!(!db.is_empty().unwrap());
 
-        // Authenticate
-        let principal = db.authenticate(&fingerprint).unwrap().unwrap();
-        assert_eq!(principal.display_name, "test@host");
+        // Authenticate.
+        let authed = db.authenticate(&fingerprint).unwrap().unwrap();
+        assert_eq!(authed, principal_id);
 
-        // List keys
+        // List keys.
         let keys = db.list_keys(principal_id).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].fingerprint, fingerprint);
+        assert_eq!(keys[0].comment.as_deref(), Some("test@host"));
 
-        // Update last used
+        // Update last used.
         db.update_last_used(&fingerprint).unwrap();
         let key_record = db.get_key(&fingerprint).unwrap().unwrap();
         assert!(key_record.last_used_at.is_some());
 
-        // Remove key
+        // Remove key.
         assert!(db.remove_key(&fingerprint).unwrap());
         assert!(db.authenticate(&fingerprint).unwrap().is_none());
     }
 
+    /// A bound key authenticates to the character's principal — the core
+    /// invariant slice 2 exists to prove.
     #[test]
-    fn test_add_key_with_custom_username() {
-        let mut db = AuthDb::temporary().unwrap();
+    fn a_bound_key_authenticates_to_its_principal() {
+        let db = AuthDb::temporary().unwrap();
         let key = make_test_key();
+        let principal_id = PrincipalId::new();
+        db.add_key(principal_id, &key, None).unwrap();
 
-        let (principal_id, _) = db
-            .add_key_auto_principal(&key, Some("comment"), Some("custom-nick"))
-            .unwrap();
-
-        let principal = db.get_principal(principal_id).unwrap().unwrap();
-        assert_eq!(principal.username, "custom-nick");
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        assert_eq!(db.authenticate(&fingerprint).unwrap(), Some(principal_id));
     }
 
     #[test]
     fn test_multiple_keys_per_principal() {
         let db = AuthDb::temporary().unwrap();
-
-        let principal_id = db.create_principal("multikey", "Multi Key User").unwrap();
+        let principal_id = PrincipalId::new();
 
         let key1 = make_test_key();
         let key2 = make_test_key();
@@ -691,88 +492,83 @@ mod tests {
         let keys = db.list_keys(principal_id).unwrap();
         assert_eq!(keys.len(), 2);
 
-        // Both keys should authenticate to the same principal
+        // Both keys should authenticate to the same principal.
         let fp1 = key1.fingerprint(HashAlg::Sha256).to_string();
         let fp2 = key2.fingerprint(HashAlg::Sha256).to_string();
 
         let p1 = db.authenticate(&fp1).unwrap().unwrap();
         let p2 = db.authenticate(&fp2).unwrap().unwrap();
-        assert_eq!(p1.id, p2.id);
+        assert_eq!(p1, p2);
     }
 
     #[test]
     fn test_list_all_keys() {
-        let mut db = AuthDb::temporary().unwrap();
+        let db = AuthDb::temporary().unwrap();
 
         let key1 = make_test_key();
         let key2 = make_test_key();
 
-        db.add_key_auto_principal(&key1, Some("user1@host"), None)
-            .unwrap();
-        db.add_key_auto_principal(&key2, Some("user2@host"), None)
-            .unwrap();
+        db.add_key(PrincipalId::new(), &key1, Some("user1@host")).unwrap();
+        db.add_key(PrincipalId::new(), &key2, Some("user2@host")).unwrap();
 
         let all = db.list_all_keys().unwrap();
         assert_eq!(all.len(), 2);
     }
 
+    /// Re-adding an already-bound fingerprint refuses — `fingerprint` is the
+    /// credentials primary key, so a second `add_key` on the same key is an
+    /// ordinary constraint violation, never a silent move.
     #[test]
-    fn test_remove_principal_cascades_keys() {
-        let mut db = AuthDb::temporary().unwrap();
+    fn adding_an_already_bound_key_refuses() {
+        let db = AuthDb::temporary().unwrap();
+        let key = make_test_key();
+        let first = PrincipalId::new();
+        let second = PrincipalId::new();
+
+        db.add_key(first, &key, None).unwrap();
+        let err = db.add_key(second, &key, None).unwrap_err();
+        assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)), "got: {err}");
+
+        // The original binding must be untouched.
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        assert_eq!(db.authenticate(&fingerprint).unwrap(), Some(first));
+    }
+
+    /// `rebind_key` is the deliberate move `add_key` refuses to do silently:
+    /// the fingerprint now authenticates to the new principal, and the prior
+    /// binding's `last_used_at` does not survive the move.
+    #[test]
+    fn rebind_key_moves_the_binding() {
+        let db = AuthDb::temporary().unwrap();
         let key = make_test_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let hajime = PrincipalId::new();
+        let amy = PrincipalId::new();
 
-        // Add principal with key
-        let (principal_id, _) = db
-            .add_key_auto_principal(&key, Some("test@host"), Some("test-user"))
-            .unwrap();
-        assert!(!principal_id.is_nil());
+        db.add_key(hajime, &key, Some("bootstrap")).unwrap();
+        db.update_last_used(&fingerprint).unwrap();
+        assert!(db.get_key(&fingerprint).unwrap().unwrap().last_used_at.is_some());
 
-        // Verify key exists
-        assert!(db.get_key(&fingerprint).unwrap().is_some());
+        db.rebind_key(amy, &key, Some("amy@zorak")).unwrap();
 
-        // Remove principal
-        assert!(db.remove_principal("test-user").unwrap());
+        assert_eq!(db.authenticate(&fingerprint).unwrap(), Some(amy));
+        let rebound = db.get_key(&fingerprint).unwrap().unwrap();
+        assert_eq!(rebound.comment.as_deref(), Some("amy@zorak"));
+        assert!(rebound.last_used_at.is_none(), "a fresh binding has no prior use");
 
-        // Key should be gone (CASCADE)
-        assert!(db.get_key(&fingerprint).unwrap().is_none());
-
-        // Principal should be gone
-        assert!(db.get_principal_by_username("test-user").unwrap().is_none());
+        // Exactly one credential row survives the move — never two.
+        assert_eq!(db.list_all_keys().unwrap().len(), 1);
     }
 
+    /// WAL mode is on: `add-key` against a database another connection has
+    /// open must not block behind a rollback-journal exclusive lock.
     #[test]
-    fn test_username_collision_handling() {
-        let mut db = AuthDb::temporary().unwrap();
-
-        // Create a principal with username "test"
-        db.create_principal("test", "Test User 1").unwrap();
-
-        // Add a key that would derive username "test" - should get "test-1"
-        let key = make_test_key();
-        let (principal_id, _) = db
-            .add_key_auto_principal(&key, Some("comment"), Some("test"))
-            .unwrap();
-
-        let principal = db.get_principal(principal_id).unwrap().unwrap();
-        assert_eq!(principal.username, "test-1");
-
-        // Add another - should get "test-2"
-        let key2 = make_test_key();
-        let (principal_id2, _) = db
-            .add_key_auto_principal(&key2, Some("comment"), Some("test"))
-            .unwrap();
-
-        let principal2 = db.get_principal(principal_id2).unwrap().unwrap();
-        assert_eq!(principal2.username, "test-2");
-    }
-
-    #[test]
-    fn test_principal_id_roundtrip() {
+    fn opens_in_wal_mode() {
         let db = AuthDb::temporary().unwrap();
-        let id = db.create_principal("roundtrip", "Roundtrip Test").unwrap();
-        let principal = db.get_principal(id).unwrap().unwrap();
-        assert_eq!(principal.id, id);
-        assert_eq!(principal.username, "roundtrip");
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
     }
 }

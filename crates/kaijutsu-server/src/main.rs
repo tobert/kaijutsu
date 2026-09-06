@@ -8,12 +8,20 @@
 //! # Run the server (default)
 //! kaijutsu-server [port]
 //!
-//! # Key management
-//! kaijutsu-server add-key <pubkey-file> [--nick NAME]
-//! kaijutsu-server list-users
-//! kaijutsu-server list-keys [username]
-//! kaijutsu-server import <authorized_keys_file>
-//! kaijutsu-server set-nick <old> <new>
+//! # Key management — auth.db is a keyring: it binds a fingerprint to a
+//! # principal id and carries no name (docs/character.md, "auth.db is a
+//! # keyring"). `kj character create <name>` mints the principal id first.
+//! kaijutsu-server add-key <pubkey-file> --as <character> [--rebind]
+//! kaijutsu-server list-keys
+//!
+//! # Lockout recovery — reads kernel.db read-only, works with the service
+//! # stopped, needs no connection or authentication.
+//! kaijutsu-server list-characters
+//!
+//! # One-time upgrade of a pre-melt auth.db: harvest its usernames into
+//! # kernel.db as characters, then drop the columns that held them. Run
+//! # once, deliberately, with the service stopped. No-op if already melted.
+//! kaijutsu-server migrate-keyring
 //!
 //! # rc scripts (no running kernel needed)
 //! kaijutsu-server rc reseed [--force] [--dir <path>]
@@ -27,8 +35,10 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_server::config_mounts::ConfigMounts;
 use kaijutsu_server::constants::DEFAULT_SSH_PORT;
+use kaijutsu_server::rpc::kernel_data_dir;
 use kaijutsu_server::{AuthDb, SshServer, SshServerConfig};
 use russh::keys::ssh_key::{self, HashAlg};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -41,17 +51,22 @@ USAGE:
     kaijutsu-server [OPTIONS] [COMMAND]
 
 COMMANDS:
-    (default)                     Run the SSH server
-    add-key <file> [OPTIONS]      Add an SSH public key
-    remove-user <username>        Remove a user and all their keys
-    list-users                    List all users
-    list-keys [username]          List keys (all or for a specific user)
-    import <file>                 Import keys from authorized_keys file
-    set-nick <old> <new>          Rename a user
-    rc reseed [--force] [--dir D] Install embedded rc scripts into the rc tree.
-                                  Names any script that differs from its
-                                  default and leaves it alone; --force
-                                  overwrites those.
+    (default)                       Run the SSH server
+    add-key <file> --as <name>      Bind a public key to an existing character.
+                                    Refuses an already-bound fingerprint; pass
+                                    --rebind to move it instead.
+    list-keys                       List every bound fingerprint.
+    list-characters                 List characters from kernel.db, read-only.
+                                    Works with the service stopped — the
+                                    lockout-recovery path.
+    migrate-keyring                 One-time upgrade of a pre-melt auth.db:
+                                    harvest its usernames into kernel.db as
+                                    characters, then drop the columns that
+                                    held them. No-op if already melted.
+    rc reseed [--force] [--dir D]   Install embedded rc scripts into the rc tree.
+                                    Names any script that differs from its
+                                    default and leaves it alone; --force
+                                    overwrites those.
 
 OPTIONS:
     --config-root <DIR>           Where the /config trees live
@@ -61,28 +76,39 @@ OPTIONS:
                                   --mount /config/rc=./assets/defaults/rc.
                                   Beats <config-root>/mounts.toml.
     --port <PORT>                 SSH port (default: {port})
-    --nick <NAME>                 Username for the key (default: derived from fingerprint)
+    --as <NAME>                   add-key: the character to bind the key to.
+    --rebind                      add-key: move an already-bound key instead
+                                  of refusing.
     --help, -h                    Show this help
 
 EXAMPLES:
-    kaijutsu-server                           # Run server on port {port}
-    kaijutsu-server --port 2222               # Run server on port 2222
-    kaijutsu-server add-key ~/.ssh/id_ed25519.pub --nick amy
-    kaijutsu-server import ~/.ssh/authorized_keys
-    kaijutsu-server list-users
-    kaijutsu-server list-keys amy
-    kaijutsu-server set-nick xyz789ab amy
-    kaijutsu-server remove-user olduser
-    kaijutsu-server rc reseed                 # install anything missing, name what differs
-    kaijutsu-server rc reseed --force         # also overwrite what differs
-    kaijutsu-server rc reseed --dir ./rc      # seed a directory of your choosing
+    kaijutsu-server                                    # Run server on port {port}
+    kaijutsu-server --port 2222                        # Run server on port 2222
+    kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as hajime
+    kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as amy --rebind
+    kaijutsu-server list-keys
+    kaijutsu-server list-characters
+    kaijutsu-server migrate-keyring                    # one-time, pre-melt auth.db only
+    kaijutsu-server rc reseed                          # install anything missing, name what differs
+    kaijutsu-server rc reseed --force                  # also overwrite what differs
+    kaijutsu-server rc reseed --dir ./rc                # seed a directory of your choosing
 
-DATABASE:
-    Keys are stored in: {db_path}
+DATABASES:
+    Keys are stored in:       {auth_db_path}
+    Characters live in:       {kernel_db_path}
 "#,
         port = DEFAULT_SSH_PORT,
-        db_path = AuthDb::default_path().display()
+        auth_db_path = AuthDb::default_path().display(),
+        kernel_db_path = default_kernel_db_path().display(),
     );
+}
+
+/// The default `kernel.db` path — same default the running server's own
+/// bootstrap uses (`kaijutsu_server::rpc::kernel_data_dir`), so `add-key
+/// --as` and `list-characters` resolve a name against the exact file a live
+/// server would.
+fn default_kernel_db_path() -> PathBuf {
+    kernel_data_dir().join("kernel.db")
 }
 
 #[tokio::main]
@@ -136,11 +162,9 @@ async fn main() -> ExitCode {
             run_server(port, server_paths).await
         }
         "add-key" => cmd_add_key(&args[2..]),
-        "remove-user" => cmd_remove_user(&args[2..]),
-        "list-users" => cmd_list_users(),
-        "list-keys" => cmd_list_keys(&args[2..]),
-        "import" => cmd_import(&args[2..]),
-        "set-nick" => cmd_set_nick(&args[2..]),
+        "list-keys" => cmd_list_keys(),
+        "list-characters" => cmd_list_characters(),
+        "migrate-keyring" => cmd_migrate_keyring(),
         "rc" => cmd_rc(&args[2..]),
         arg => {
             // Try parsing as port number for backwards compatibility
@@ -300,38 +324,60 @@ fn cmd_rc(args: &[String]) -> ExitCode {
     }
 }
 
-/// Add a public key to the database
-fn cmd_add_key(args: &[String]) -> ExitCode {
+/// Parsed `add-key` arguments.
+struct AddKeyArgs {
+    key_file: String,
+    character: String,
+    rebind: bool,
+}
+
+fn parse_add_key_args(args: &[String]) -> Result<AddKeyArgs, String> {
     if args.is_empty() {
-        eprintln!("Usage: kaijutsu-server add-key <pubkey-file> [--nick NAME]");
-        return ExitCode::FAILURE;
+        return Err("Usage: kaijutsu-server add-key <pubkey-file> --as <character> [--rebind]".to_string());
     }
+    let key_file = args[0].clone();
+    let mut character: Option<String> = None;
+    let mut rebind = false;
 
-    let key_file = &args[0];
-    let mut nick: Option<&str> = None;
-
-    // Parse options
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--nick" => {
+            "--as" => {
                 if i + 1 < args.len() {
-                    nick = Some(&args[i + 1]);
+                    character = Some(args[i + 1].clone());
                     i += 2;
                 } else {
-                    eprintln!("--nick requires a value");
-                    return ExitCode::FAILURE;
+                    return Err("--as requires a character name".to_string());
                 }
             }
-            other => {
-                eprintln!("Unknown option: {}", other);
-                return ExitCode::FAILURE;
+            "--rebind" => {
+                rebind = true;
+                i += 1;
             }
+            other => return Err(format!("Unknown option: {other}")),
         }
     }
 
+    let character = character
+        .ok_or_else(|| "--as <character> is required — `kaijutsu-server list-characters` to see who exists".to_string())?;
+    Ok(AddKeyArgs { key_file, character, rebind })
+}
+
+/// Bind a public key to an existing character. Never mints: the character's
+/// principal id must already exist in `kernel.db` (`kj character create
+/// <name>`), and this only writes `auth.db`
+/// (`docs/character.md`, "Adding a key binds; it never mints").
+fn cmd_add_key(args: &[String]) -> ExitCode {
+    let parsed = match parse_add_key_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Expand path (handle ~)
-    let key_path: PathBuf = shellexpand::tilde(key_file).as_ref().into();
+    let key_path: PathBuf = shellexpand::tilde(&parsed.key_file).as_ref().into();
 
     // Read and parse the key
     let key_data = match std::fs::read_to_string(&key_path) {
@@ -350,287 +396,234 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
         }
     };
 
-    let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
-
-    // Extract comment from key data
     let comment = extract_comment(key_data.trim());
 
-    // Open database
-    let mut db = match AuthDb::open(AuthDb::default_path()) {
+    // Resolve the character's name to a principal id — a genuine read-only
+    // connection, so this never contends with a live server's write
+    // connection and works whether or not the service is running.
+    let kernel_db_path = default_kernel_db_path();
+    let kdb = match KernelDb::open_read_only(&kernel_db_path) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("Failed to open auth database: {}", e);
+            eprintln!(
+                "Failed to open {} read-only: {e}\n\
+                 (start the server once first — it seeds the bootstrap character)",
+                kernel_db_path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
-
-    // Check if key already exists
-    match db.get_key(&fingerprint) {
-        Ok(Some(existing)) => {
-            eprintln!("Key already exists: {}", fingerprint);
-            if let Ok(Some(principal)) = db.get_principal(existing.principal_id) {
-                eprintln!(
-                    "  User: {} ({})",
-                    principal.username, principal.display_name
-                );
-            }
-            return ExitCode::FAILURE;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("Database error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // Add the key
-    match db.add_key_auto_principal(&key, comment.as_deref(), nick) {
-        Ok((principal_id, _fingerprint)) => {
-            if let Ok(Some(principal)) = db.get_principal(principal_id) {
-                println!("Added key for user '{}':", principal.username);
-                println!("  Fingerprint: {}", fingerprint);
-                println!("  Display name: {}", principal.display_name);
-                println!("  Principal ID: {}", principal.id.short());
-            } else {
-                println!("Added key: {}", fingerprint);
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("Failed to add key: {}", e);
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Remove a user and all their keys
-fn cmd_remove_user(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("Usage: kaijutsu-server remove-user <username>");
-        return ExitCode::FAILURE;
-    }
-
-    let username = &args[0];
-
-    let db = match AuthDb::open(AuthDb::default_path()) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("Failed to open auth database: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Check if user exists first
-    match db.get_principal_by_username(username) {
-        Ok(Some(principal)) => {
-            let key_count = db.list_keys(principal.id).map(|k| k.len()).unwrap_or(0);
-
-            match db.remove_principal(username) {
-                Ok(true) => {
-                    println!(
-                        "Removed user '{}' ({}) and {} key(s)",
-                        username, principal.display_name, key_count
-                    );
-                    ExitCode::SUCCESS
-                }
-                Ok(false) => {
-                    eprintln!("User not found: {}", username);
-                    ExitCode::FAILURE
-                }
-                Err(e) => {
-                    eprintln!("Failed to remove user: {}", e);
-                    ExitCode::FAILURE
-                }
-            }
-        }
+    let character = match kdb.get_character_by_name(&parsed.character) {
+        Ok(Some(row)) => row,
         Ok(None) => {
-            eprintln!("User not found: {}", username);
-            ExitCode::FAILURE
+            eprintln!(
+                "No character named '{}' — `kaijutsu-server list-characters` to see who exists",
+                parsed.character
+            );
+            return ExitCode::FAILURE;
         }
+        Err(e) => {
+            eprintln!("Failed to read {}: {e}", kernel_db_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Open auth.db for the write.
+    let auth_db = match AuthDb::open(AuthDb::default_path()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Failed to open auth database: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+    let existing = match auth_db.get_key(&fingerprint) {
+        Ok(existing) => existing,
         Err(e) => {
             eprintln!("Database error: {}", e);
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// List all users
-fn cmd_list_users() -> ExitCode {
-    let db = match AuthDb::open(AuthDb::default_path()) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("Failed to open auth database: {}", e);
             return ExitCode::FAILURE;
         }
     };
 
-    let principals = match db.list_principals() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to list users: {}", e);
+    if let Some(existing) = existing {
+        if !parsed.rebind {
+            // Never a silent move — name the current binding and point at
+            // the escape hatch (`docs/character.md`, "`add-key` never
+            // rebinds silently").
+            let current_name = kdb.get_character(existing.principal_id);
+            let current_name = match current_name {
+                Ok(Some(row)) => row.name,
+                _ => existing.principal_id.short(),
+            };
+            eprintln!(
+                "key {fingerprint} is bound to {current_name}; move it with --rebind"
+            );
             return ExitCode::FAILURE;
         }
-    };
-
-    if principals.is_empty() {
-        println!("No users found. Add keys with: kaijutsu-server add-key <pubkey>");
-        return ExitCode::SUCCESS;
-    }
-
-    println!("{:<16} {:<24} {:>10}", "USERNAME", "DISPLAY NAME", "ID");
-    println!("{}", "-".repeat(52));
-
-    for p in principals {
-        println!(
-            "{:<16} {:<24} {:>10}",
-            p.username,
-            p.display_name,
-            p.id.short()
-        );
-    }
-
-    ExitCode::SUCCESS
-}
-
-/// List keys (all or for a specific user)
-fn cmd_list_keys(args: &[String]) -> ExitCode {
-    let db = match AuthDb::open(AuthDb::default_path()) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("Failed to open auth database: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if let Some(username) = args.first() {
-        // List keys for specific user
-        let principal = match db.get_principal_by_username(username) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                eprintln!("User not found: {}", username);
-                return ExitCode::FAILURE;
+        match auth_db.rebind_key(character.principal_id, &key, comment.as_deref()) {
+            Ok(fp) => {
+                println!(
+                    "Moved key {fp} to {} ({})",
+                    character.name,
+                    character.principal_id.short()
+                );
+                ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("Database error: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-
-        let keys = match db.list_keys(principal.id) {
-            Ok(keys) => keys,
-            Err(e) => {
-                eprintln!("Failed to list keys: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-
-        println!(
-            "Keys for {} ({}):",
-            principal.username, principal.display_name
-        );
-        println!();
-
-        for key in keys {
-            println!("  {} {}", key.key_type, key.fingerprint);
-            if let Some(comment) = &key.comment {
-                println!("    Comment: {}", comment);
-            }
-            if let Some(last_used) = key.last_used_at {
-                println!("    Last used: {}", format_timestamp(last_used));
+                eprintln!("Failed to rebind key: {}", e);
+                ExitCode::FAILURE
             }
         }
     } else {
-        // List all keys
-        let all_keys = match db.list_all_keys() {
-            Ok(keys) => keys,
-            Err(e) => {
-                eprintln!("Failed to list keys: {}", e);
-                return ExitCode::FAILURE;
+        match auth_db.add_key(character.principal_id, &key, comment.as_deref()) {
+            Ok(fp) => {
+                println!(
+                    "Bound key {fp} to {} ({})",
+                    character.name,
+                    character.principal_id.short()
+                );
+                ExitCode::SUCCESS
             }
-        };
-
-        if all_keys.is_empty() {
-            println!("No keys found. Add keys with: kaijutsu-server add-key <pubkey>");
-            return ExitCode::SUCCESS;
+            Err(e) => {
+                eprintln!("Failed to add key: {}", e);
+                ExitCode::FAILURE
+            }
         }
+    }
+}
 
+/// List every bound fingerprint. Resolves each principal to its character's
+/// name when `kernel.db` is reachable; falls back to the id's short form
+/// otherwise (a stopped service, or a wiped kernel — `docs/character.md`,
+/// "A kernel wipe orphans every binding").
+fn cmd_list_keys() -> ExitCode {
+    let auth_db = match AuthDb::open(AuthDb::default_path()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Failed to open auth database: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let keys = match auth_db.list_all_keys() {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("Failed to list keys: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if keys.is_empty() {
         println!(
-            "{:<16} {:<12} {:<48} COMMENT",
-            "USER", "TYPE", "FINGERPRINT"
+            "No keys found. Add one with: kaijutsu-server add-key <pubkey> --as <character>"
         );
-        println!("{}", "-".repeat(90));
+        return ExitCode::SUCCESS;
+    }
 
-        for (principal, key) in all_keys {
-            let comment = key.comment.as_deref().unwrap_or("");
-            println!(
-                "{:<16} {:<12} {:<48} {}",
-                principal.username, key.key_type, key.fingerprint, comment
-            );
-        }
+    let kdb = KernelDb::open_read_only(default_kernel_db_path()).ok();
+    let name_for = |id: kaijutsu_types::PrincipalId| -> String {
+        kdb.as_ref()
+            .and_then(|db| db.get_character(id).ok().flatten())
+            .map(|row| row.name)
+            .unwrap_or_else(|| id.short())
+    };
+
+    println!(
+        "{:<16} {:<12} {:<48} COMMENT",
+        "CHARACTER", "TYPE", "FINGERPRINT"
+    );
+    println!("{}", "-".repeat(90));
+
+    for key in keys {
+        let comment = key.comment.as_deref().unwrap_or("");
+        println!(
+            "{:<16} {:<12} {:<48} {}",
+            name_for(key.principal_id),
+            key.key_type,
+            key.fingerprint,
+            comment
+        );
     }
 
     ExitCode::SUCCESS
 }
 
-/// Import keys from authorized_keys file
-fn cmd_import(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("Usage: kaijutsu-server import <authorized_keys_file>");
-        return ExitCode::FAILURE;
-    }
-
-    let file = &args[0];
-    let path: PathBuf = shellexpand::tilde(file).as_ref().into();
-
-    let mut db = match AuthDb::open(AuthDb::default_path()) {
+/// List characters from `kernel.db`, read-only. The lockout-recovery path:
+/// reaches no network, needs no authentication, and works with the service
+/// stopped (`docs/character.md`, "Lockout recovery is why the CLI lists
+/// characters").
+fn cmd_list_characters() -> ExitCode {
+    let path = default_kernel_db_path();
+    let db = match KernelDb::open_read_only(&path) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("Failed to open auth database: {}", e);
+            eprintln!(
+                "Failed to open {} read-only: {e}\n\
+                 (start the server once first — it seeds the bootstrap character)",
+                path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
 
-    match db.import_authorized_keys(&path) {
-        Ok(count) => {
-            println!("Imported {} key(s) from {}", count, path.display());
-            ExitCode::SUCCESS
-        }
+    let characters = match db.list_characters(true) {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to import keys: {}", e);
-            ExitCode::FAILURE
+            eprintln!("Failed to list characters: {}", e);
+            return ExitCode::FAILURE;
         }
+    };
+
+    if characters.is_empty() {
+        println!("No characters found — this kernel.db was never bootstrapped.");
+        return ExitCode::SUCCESS;
     }
+
+    println!("{:<20} {:<34} STATUS", "NAME", "PRINCIPAL ID");
+    println!("{}", "-".repeat(64));
+    for c in characters {
+        let status = if c.retired_at.is_some() { "retired" } else { "live" };
+        println!("{:<20} {:<34} {}", c.name, c.principal_id.to_hex(), status);
+    }
+
+    ExitCode::SUCCESS
 }
 
-/// Rename a user
-fn cmd_set_nick(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("Usage: kaijutsu-server set-nick <old-username> <new-username>");
-        return ExitCode::FAILURE;
-    }
-
-    let old_username = &args[0];
-    let new_username = &args[1];
-
-    let db = match AuthDb::open(AuthDb::default_path()) {
+/// One-time upgrade of a pre-melt `auth.db`: harvest its usernames into
+/// `kernel.db` as characters, then drop the columns that held them
+/// (`docs/character.md`, "`auth.db` is a keyring";
+/// `kaijutsu_server::migrate_keyring`). Opens both databases read-write at
+/// their default paths — run this with the service stopped. A no-op,
+/// reported as such, when `auth.db` has already been melted.
+fn cmd_migrate_keyring() -> ExitCode {
+    let auth_db = match AuthDb::open(AuthDb::default_path()) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to open auth database: {}", e);
             return ExitCode::FAILURE;
         }
     };
+    let kernel_db_path = default_kernel_db_path();
+    let mut kernel_db = match KernelDb::open(&kernel_db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Failed to open {}: {e}", kernel_db_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match db.set_username(old_username, new_username) {
-        Ok(true) => {
-            println!("Renamed user '{}' to '{}'", old_username, new_username);
+    match kaijutsu_server::migrate_keyring::migrate_legacy_names(&auth_db, &mut kernel_db) {
+        Ok(0) => {
+            println!("Nothing to migrate — auth.db has already been melted.");
             ExitCode::SUCCESS
         }
-        Ok(false) => {
-            eprintln!("User not found: {}", old_username);
-            ExitCode::FAILURE
+        Ok(n) => {
+            println!("Migrated {n} principal(s) into kernel.db characters. auth.db's legacy columns are dropped.");
+            ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("Failed to rename user: {}", e);
+            eprintln!("Migration failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -643,29 +636,5 @@ fn extract_comment(line: &str) -> Option<String> {
         Some(parts[2].to_string())
     } else {
         None
-    }
-}
-
-/// Format a Unix timestamp for display
-fn format_timestamp(ts: i64) -> String {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    let time = UNIX_EPOCH + Duration::from_secs(ts as u64);
-    let now = SystemTime::now();
-
-    match now.duration_since(time) {
-        Ok(elapsed) => {
-            let secs = elapsed.as_secs();
-            if secs < 60 {
-                format!("{}s ago", secs)
-            } else if secs < 3600 {
-                format!("{}m ago", secs / 60)
-            } else if secs < 86400 {
-                format!("{}h ago", secs / 3600)
-            } else {
-                format!("{}d ago", secs / 86400)
-            }
-        }
-        Err(_) => "in the future".to_string(),
     }
 }

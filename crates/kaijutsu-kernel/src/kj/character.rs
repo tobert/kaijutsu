@@ -99,7 +99,7 @@ impl KjDispatcher {
 
     /// Idempotent on `name`: an existing row is returned unchanged rather
     /// than minting a second principal for the same name — the double-mint
-    /// hazard the design calls out for `add-key --nick`
+    /// hazard `add-key` avoids by binding instead of minting
     /// (`docs/character.md`, "Adding a key binds; it never mints") applies
     /// just as much to a repeated `create`.
     fn character_create(&self, name: &str) -> KjResult {
