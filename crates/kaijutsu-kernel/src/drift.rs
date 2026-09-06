@@ -1715,7 +1715,6 @@ mod tests {
         assert!(router.resolve_context("test").is_err());
     }
 
-    #[test]
     /// An archived context keeps its label as history and frees it.
     #[test]
     fn archived_label_is_free_for_a_live_context() {
