@@ -6124,6 +6124,7 @@ dependencies = [
  "libc",
  "log",
  "rodio",
+ "russh-sftp",
  "serde",
  "serde_json",
  "tempfile",

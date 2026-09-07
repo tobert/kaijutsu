@@ -24,11 +24,84 @@ give the timing threads an optional Linux scheduling priority.
 
 Includes MIDI capture/output, clock estimation, device presence and SysEx,
 PCM playback with trim/gain, CAS prefetch, metronome and transport flush.
+MIDI inputs also retain bounded RAM history for retrospective keeps, described
+below. This does not require a recording context.
 The first daemon uses the current broadcast render contract: all attached
 render clients receive playback cues. Named destination routing is separate
 work. No PCM recording, plugin host, or network PCM stream is introduced.
 Offline beat analysis stays outside the timing threads. MIDI currently uses
 ALSA on Linux; CoreMIDI remains unimplemented.
+
+## Keep recent MIDI
+
+```bash
+kj audio devices --node audio/moltar
+kj audio keep --node audio/moltar --source '24:0' --generation '<generation-uuid>' --seconds 10
+kj audio keep-status '<job-uuid>'
+```
+
+Use an actual address and generation from `devices`; `24:0` is illustrative.
+`ports` is the raw inventory, including unmatched and output-only endpoints;
+`sources` lists retained input histories and their generations. Capabilities,
+listening success, errors, available coverage and input-loss counts are separate
+facts. A generation changes when its endpoint is replaced or restarted. The
+inventory is read through the kernel's existing named-peer RPC; the consolidated
+`/run/audio` projection remains planned, not implemented. `kj midi list` still
+shows the older profile-matched presence view.
+
+Each listening source retains up to 60 seconds, 1 MiB and 64 KiB per message,
+within 16 MiB of node history and 64 source slots. These are implementation
+defaults, not CLI options yet. Raw MIDI clock/active sensing is included in
+history; the explicit recording consumer keeps its existing filtering. Inventory
+is reconciled every two seconds and after hotplug. A separate observer drains
+bounded ingress while the runtime waits on kernel RPCs.
+
+The default keep is ten seconds. Relative windows end at a confirmed local
+read watermark, not the time an RPC happens to arrive. A watermark older than
+one second fails. Missing coverage, input loss, expired history and changed
+generations fail explicitly. No notes are invented and windows are not silently
+shortened. Quiet input can have complete coverage with zero MIDI events.
+
+The keep reply names a kernel-owned job after the daemon confirms a protected
+RAM snapshot. It does not mean CAS publication has completed. `keep-status`
+reports progression through upload, acceptance and release, with `complete`
+and a hash after kernel acceptance. A lost acknowledgement returns an error
+with an inspectable job id and unconfirmed protection. Jobs are pinned to the
+selected daemon process instance; two connected instances with the same name
+are refused rather than choosing one.
+
+```bash
+kj audio keep-retry '<job-uuid>'
+kj audio keep-cancel '<job-uuid>'
+```
+
+Failed uploads keep the same RAM snapshot. Retry uses fresh private staging;
+it never selects a newer musical window. Cancellation waits for the active
+writer to stop before deleting that job's staging. Up to eight active takes
+share a 32 MiB encoded RAM budget; each artifact is capped at 16 MiB. Snapshot
+preparation reserves its maximum encoded budget before copying. Status records
+are bounded to 32; only released/cancelled records may be evicted in the daemon.
+Transient snapshot/encoding memory is additional and bounded by preparation
+admission. Hashing and SFTP run on ordinary workers, not the ALSA read thread.
+
+SFTP uploads use acknowledged chunks of at most 64 KiB to a unique private
+`/tmp/kaijutsu-audio-<uuid>/capture.json`. The kernel verifies that VFS `/tmp`
+maps to host `/tmp`, then uses the same streaming CAS writer as `kj cas put`.
+It checks length and hash before acknowledging release of daemon RAM. No new
+transfer protocol, shell execution site or automatic track placement is added.
+
+The CAS artifact is JSON with MIME
+`application/vnd.kaijutsu.midi-history+json`, not SMF or ABC. It carries node,
+process instance, source generation, event positions, monotonic offsets and
+wallclock anchors alongside raw MIDI bytes. It is inspectable source material;
+conversion to a playable score is a separate operation.
+
+Current failure boundaries: RAM takes do not survive daemon restart. Keep jobs
+are kernel-ephemeral; kernel restart loses their ownership metadata and may
+leave exact staging directories behind. Same-process SSH reconnect can recover;
+a permanently gone process leaves its pinned job pending. No force-abandon or
+broad staging-cleanup sweep is implemented. Successful publication and explicit
+cancellation clean their own staging paths only.
 
 ## Evolution: observe once, retain windows, request material
 
@@ -234,29 +307,36 @@ is required for a replaced Kaijutsu mechanism.
 
 Implementation progress:
 
-- Inventory audit complete: the current runtime discards unmatched ports, and
+- Inventory audit complete: the older profile presence path discards unmatched ports, and
   an initial empty profile match sends no report. The live JD-Xi has no profile;
   all-unknown profile presence does not prove a connection failure. Raw inventory
-  and matching health must be reported independently. Profile snapshot denial
-  and truncation currently go unchecked; reload is reconnect-driven. Port-change
-  notifications and periodic reconciliation are also missing. Presence currently
+  and matching health are now reported independently through raw inventory.
+  Profile snapshot denial and truncation currently go unchecked; reload is
+  reconnect-driven. Raw inventory now reconciles periodically and after hotplug.
+  Profile presence currently
   carries queried identity across present-to-present replacements even if the
   endpoint changed; replace that with generation-scoped identity.
 - Pure MIDI primitive implemented in `kaijutsu-audio/src/capture.rs`: explicit
   message/retained-byte limits, fallible admission and non-destructive owned
   position-window snapshots. Six regression tests cover independent reads,
   expired/future coverage, byte eviction/rejection, wallclock rollback and
-  overwrite after snapshot. Existing capture callers remain count-bounded;
-  runtime wiring is not done. Generation validation, source lifecycle, monotonic
-  time windows, aggregate budgets and rejected-ingress gap accounting remain
-  owner responsibilities. This does not complete slice 2.
+  overwrite after snapshot. The runtime now has a per-source stamped history
+  manager for time retention/generations, bounded ingress and protected keeps;
+  its explicit-recording ring is byte-bounded too. A `VecDeque` supports direct
+  time eviction; it is not an SPSC queue pretending to be shared history.
+  Source watch controls and configurable policy remain open.
+- MIDI keep/export vertical path implemented; see "Keep recent MIDI". Runtime
+  tests cover loss fences, sampled heads, cancellation, upload chunks and hash
+  ownership. Kernel tests cover instance pinning, private staging and CAS-before-
+  release. A live synthetic SFTP upload on zorak passed; musical-input capture
+  on moltar is not yet verified. No running daemon or kernel was replaced.
 
 - [ ] **1 — inventory.** Diagnose current unknown MIDI presence. Expose raw
   MIDI and PCM endpoints, per-node/per-connection state and coherent `/run`
   reads. Tests: unprofiled JD-Xi-shaped endpoint is visible; two equal models
   on different nodes; unplug/replug address reuse; stale connection cleanup;
   disabled/empty/error states; missed notification reconciliation.
-- [ ] **2 — retained MIDI windows.** Add independent retrospective reads and
+- [x] **2 — retained MIDI windows.** Add independent retrospective reads and
   byte bounds to the existing capture substrate; wire per-source lifecycle
   and bounded ingress. Tests: repeated/overlapping reads; overwrite and
   oversize messages; clock rollback; stale generation; slow reader; stop and
@@ -270,6 +350,8 @@ Implementation progress:
   Add immediate keep reservations: eviction cannot remove an acknowledged take,
   and a full take budget rejects new keeps without stopping input. Export long
   windows in bounded chunks rather than imposing a small whole-take byte limit.
+  The bounded MIDI path is implemented; longer artifacts and restart recovery
+  remain open. Current artifact limit is 16 MiB.
 - [ ] **5 — PCM input.** Add opt-in input watches behind the same coverage and
   lifecycle contract. Tests: frame alignment, format changes, xruns, retention
   budget, unplug while reading, and callback progress during a slow export.

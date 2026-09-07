@@ -146,6 +146,16 @@ phasors for display. Device-open failure is explicit, RT-priority failure is
 a warning, and the hardware lifetime no longer depends on a window.
 `docs/audio-daemon.md` is the deployment guide.
 
+Retrospective recording followed from Amy's wish to "grab a happy accident real
+quick." MIDI input now feeds bounded, per-source RAM history independently of
+recording a context. A keep copies a complete recent window, protects the copy
+from history eviction, and exports it through the existing SSH/SFTP path. The
+kernel accepts the artifact into CAS before releasing that RAM. Hashing and
+upload run outside the hardware reader; neither happens continuously. Source
+generations and explicit loss reject incomplete windows instead of claiming a
+complete recording. This first step keeps RAM history and kernel jobs ephemeral;
+PCM history, configurable retention and restart recovery remain separate work.
+
 **The chameleon loop (June 13).** The first loop reached MIDI end to end:
 models playing to a beat, a player's turn text *being* the score
 (`on_turn_completed` eager-parses ABC). The hard-won constraint: players must

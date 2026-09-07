@@ -111,9 +111,11 @@ async fn run(cli: Cli) -> Result<()> {
     }).await.context("kernel connection timed out")??;
 
     let (peer_tx, peer_rx) = std::sync::mpsc::channel();
-    actor.attach_peer(PeerConfig { nick: format!("audio/{}", hostname::get()?.to_string_lossy()), instance }, peer_tx)
+    let node = format!("audio/{}", hostname::get()?.to_string_lossy());
+    actor.attach_peer(PeerConfig { nick: node.clone(), instance: instance.clone() }, peer_tx)
         .await.context("register audio peer")?;
     let mut engine = Engine::start(actor, ssh.clone(), context, options.clone()).map_err(anyhow::Error::msg)?;
+    let capture = kaijutsu_audio_runtime::CaptureControl::new(&engine, ssh.clone(), node, instance);
     tracing::info!(host = ssh.host, port = ssh.port, ?context, ?options, "audio node running; kernel drives playback");
     let mut health = tokio::time::interval(Duration::from_millis(100));
     let stopped = shutdown_signal();
@@ -133,13 +135,21 @@ async fn run(cli: Cli) -> Result<()> {
                             "output": options.output, "context": context.map(|id| id.to_string()),
                             "rt_priority_requested": options.rt_priority,
                         })).map_err(|e| e.to_string())
-                    } else { Err(format!("unknown audio peer action '{}'; use status", request.action)) };
+                    } else {
+                        let capture = capture.clone();
+                        tokio::task::spawn_local(async move {
+                            let result = capture.handle(&request.action, &request.params).await;
+                            let _ = request.reply.send(result);
+                        });
+                        continue;
+                    };
                     let _ = request.reply.send(result);
                 }
                 while engine.pulses.try_recv().is_ok() {}
             }
         }
     }
+    capture.shutdown();
     engine.shutdown().map_err(anyhow::Error::msg)?;
     tracing::info!("audio node stopped");
     Ok(())

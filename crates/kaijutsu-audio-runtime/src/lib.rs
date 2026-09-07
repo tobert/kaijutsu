@@ -9,8 +9,13 @@ pub mod midi_presence;
 pub mod patch_graph;
 mod runtime;
 mod scheduling;
+mod capture_export;
+mod takes;
+pub mod history;
+mod observer;
 
 pub use runtime::{Engine, Options};
+pub use takes::CaptureControl;
 pub use audio_sched::output_names;
 
 #[cfg(test)]

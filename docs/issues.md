@@ -6109,10 +6109,11 @@ there rather than maintaining a second checklist here.
   render client. Multiple machines need an explicit destination contract.
 - Remote patch-bay topology and traffic: the app still observes local ALSA;
   the daemon's in-process traffic pulse does not reach another process.
-- Bound capture ingress: the hardware worker feeds an unbounded channel before
-  the bounded capture ring. A prolonged stalled consumer can accumulate data
-  before ring overwrite accounting applies. Preserve topology notifications
-  and explicit capture-loss reporting when bounding this channel.
+- Kept-take recovery after kernel restart and explicit handling of a
+  permanently lost daemon instance: jobs are ephemeral and private staging may
+  remain. Do not add a broad `/tmp` sweep; ownership recovery must name exact
+  job paths. Per-source watch controls, configurable budgets and `/run/audio`
+  inventory projection remain in the audio-daemon execution checklist.
 - Generic `kj` help still understates MIDI verbs and contains stale config/CRDT
   wording. The live subcommand help is more complete.
 - Dependency lint: strict clippy for the audio crate without `--no-deps` stops

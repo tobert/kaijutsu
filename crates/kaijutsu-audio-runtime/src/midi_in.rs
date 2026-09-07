@@ -1,11 +1,66 @@
 //! MIDI capture and hotplug events from the local hardware backend.
 use tracing::{debug, error, info, warn};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::time::{Duration, Instant};
+
+const INGRESS_EVENTS: usize = 128;
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_INVENTORY_PORTS: usize = 256;
+
+#[derive(Clone, Debug)]
+pub struct ObservedPort {
+    pub facts: crate::midi_match::PortFacts,
+    pub readable: bool,
+    pub writable: bool,
+    pub listening: bool,
+    pub error: Option<String>,
+}
+
+impl serde::Serialize for ObservedPort {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ObservedPort", 8)?;
+        s.serialize_field("address", &self.facts.address)?;
+        s.serialize_field("client_name", &self.facts.client_name)?;
+        s.serialize_field("port_name", &self.facts.port_name)?;
+        s.serialize_field("usb_id", &self.facts.usb_id)?;
+        s.serialize_field("readable", &self.readable)?;
+        s.serialize_field("writable", &self.writable)?;
+        s.serialize_field("listening", &self.listening)?;
+        s.serialize_field("error", &self.error)?;
+        s.end()
+    }
+}
+
+struct EarSender {
+    tx: std::sync::mpsc::SyncSender<EarEvent>,
+    losses: Arc<AtomicU64>,
+}
+
+impl EarSender {
+    fn send(&self, event: EarEvent) -> Result<(), ()> {
+        match self.tx.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.losses.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
+}
 
 pub(crate) struct EarWorker {
-    pub rx: std::sync::mpsc::Receiver<EarEvent>,
+    rx: Option<std::sync::mpsc::Receiver<EarEvent>>,
+    pub losses: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EarWorker {
+    pub fn take_rx(&mut self) -> std::sync::mpsc::Receiver<EarEvent> {
+        self.rx.take().expect("MIDI ingress receiver already taken")
+    }
 }
 
 impl Drop for EarWorker {
@@ -18,7 +73,10 @@ impl Drop for EarWorker {
 }
 
 pub(crate) enum EarEvent {
-    Capture(kaijutsu_audio::CaptureEvent),
+    Capture { event: kaijutsu_audio::CaptureEvent, observed_at: Instant },
+    Inventory { ports: Vec<ObservedPort>, observed_at: Instant },
+    InventoryError { error: String },
+    Watermark { observed_at: Instant, epoch_ns: u64 },
     Clock {
         /// Source port ("client:port") the clock master was observed on.
         source: String,
@@ -27,15 +85,10 @@ pub(crate) enum EarEvent {
         /// slipped when this moves).
         discontinuities: u64,
     },
-    /// A port exists: seen in the initial sweep or announced by hotplug
-    /// (`docs/midi-next.md` "Presence is sink-fed" — Announce is the trigger,
-    /// nothing polls). Backend-neutral facts only; the matcher never sees an
-    /// ALSA type.
+    /// A new endpoint incarnation announced by hotplug. Full snapshots
+    /// reconcile missed notices; the matcher only receives portable facts.
     PortUp(crate::midi_match::PortFacts),
-    /// A port vanished. Address only — its names left with it, so the Bevy
-    /// side resolves them from the topology it already holds. **Unplug is a
-    /// first-class event**: it becomes a `present=false` report, never a
-    /// silence.
+    /// A port vanished. The observer invalidates its generation immediately.
     PortDown { address: String },
     /// A whole client vanished (belt-and-braces for a backend that reports
     /// the client exit without a `PortExit` per port): every port under it is
@@ -55,8 +108,8 @@ fn epoch_ns_now() -> u64 {
 }
 
 /// Spawn the ALSA capture thread: its own seq client ("kaijutsu-ear"), a
-/// capture port, ambient subscriptions, blocking event loop → stamped events
-/// on the channel. Exits when the Bevy side drops the receiver.
+/// capture port, ambient subscriptions, readiness-driven reads and bounded
+/// nonblocking ingress. Exits when the receiver closes or shutdown is set.
 #[cfg(target_os = "linux")]
 pub(crate) fn spawn_capture_thread(priority: u8) -> Result<EarWorker, String> {
     use alsa::seq::{Addr, PortCap, PortSubscribe, PortType};
@@ -86,25 +139,18 @@ pub(crate) fn spawn_capture_thread(priority: u8) -> Result<EarWorker, String> {
     // The channel exists before the sweep so the sweep's port facts ride it:
     // presence needs the ports that were already there at startup, not only
     // the ones that arrive later by announce.
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (channel_tx, rx) = std::sync::mpsc::sync_channel(INGRESS_EVENTS);
+    let losses = Arc::new(AtomicU64::new(0));
+    let tx = EarSender { tx: channel_tx, losses: losses.clone() };
 
     // Ambient initial sweep: every external readable port gets subscribed;
     // every external port at all (readable or not — a synth's input port is
     // still evidence the device is here) gets reported for presence matching.
-    let mut subscribed = 0usize;
-    for client in alsa::seq::ClientIter::new(&seq) {
-        for p in alsa::seq::PortIter::new(&seq, client.get_client()) {
-            let addr = p.addr();
-            if let Some(facts) = port_facts(&seq, dest.client, addr) {
-                let _ = tx.send(EarEvent::PortUp(facts));
-            }
-            if subscribe_source(&seq, dest, addr) {
-                subscribed += 1;
-            }
-        }
-    }
+    let initial = scan_ports(&seq, dest)?;
+    let subscribed = initial.iter().filter(|p| p.listening).count();
+    let _ = tx.send(EarEvent::Inventory { ports: initial, observed_at: Instant::now() });
     info!(
-        "kaijutsu-app MIDI ear open on ALSA seq {}:{} ({subscribed} source(s) subscribed)",
+        "MIDI ear open on ALSA seq {}:{} ({subscribed} source(s) subscribed)",
         own, port
     );
     let stop = Arc::new(AtomicBool::new(false));
@@ -118,7 +164,7 @@ pub(crate) fn spawn_capture_thread(priority: u8) -> Result<EarWorker, String> {
             capture_loop(seq, dest, tx, worker_stop)
         })
         .map_err(|e| e.to_string())?;
-    Ok(EarWorker { rx, stop, join: Some(join) })
+    Ok(EarWorker { rx: Some(rx), losses, stop, join: Some(join) })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -167,31 +213,34 @@ fn port_facts(
 /// (anything routed through it that we should hear, we already hear at its
 /// real source; through-wiring our own output would echo).
 #[cfg(target_os = "linux")]
-fn subscribe_source(seq: &alsa::Seq, dest: alsa::seq::Addr, addr: alsa::seq::Addr) -> bool {
-    use alsa::seq::{PortCap, PortSubscribe};
+fn subscribe_source(seq: &alsa::Seq, dest: alsa::seq::Addr, addr: alsa::seq::Addr) -> Result<bool, String> {
+    use alsa::seq::{PortCap, PortSubscribe, PortSubscribeIter, QuerySubsType};
 
     if addr.client == 0 || addr.client == dest.client {
-        return false;
+        return Ok(false);
     }
     let Ok(client_info) = seq.get_any_client_info(addr.client) else {
-        return false;
+        return Ok(false);
     };
     match client_info.get_name() {
         Ok(name) if is_own_client(name) => {
-            return false;
+            return Ok(false);
         }
         Ok(_) => {}
-        Err(_) => return false,
+        Err(e) => return Err(e.to_string()),
     }
     let Ok(pinfo) = seq.get_any_port_info(addr) else {
-        return false;
+        return Ok(false);
     };
     let caps = pinfo.get_capability();
     if !caps.contains(PortCap::READ | PortCap::SUBS_READ) {
-        return false;
+        return Ok(false);
+    }
+    if PortSubscribeIter::new(seq, addr, QuerySubsType::READ).any(|s| s.get_dest() == dest) {
+        return Ok(true);
     }
     let Ok(subs) = PortSubscribe::empty() else {
-        return false;
+        return Err("cannot allocate MIDI subscription".into());
     };
     subs.set_sender(addr);
     subs.set_dest(dest);
@@ -203,29 +252,48 @@ fn subscribe_source(seq: &alsa::Seq, dest: alsa::seq::Addr, addr: alsa::seq::Add
                 addr.port,
                 client_info.get_name().unwrap_or("?")
             );
-            true
+            Ok(true)
         }
         Err(e) => {
             // Already-subscribed (announce raced the sweep) and permission
             // refusals both land here; neither is fatal.
             debug!("MIDI ear: subscribe {}:{} failed: {e}", addr.client, addr.port);
-            false
+            if PortSubscribeIter::new(seq, addr, QuerySubsType::READ).any(|s| s.get_dest() == dest) {
+                Ok(true)
+            } else { Err(e.to_string()) }
         }
     }
 }
 
-/// The blocking capture loop: decode each event to raw MIDI bytes, stamp it,
-/// send it. `PortStart` announce events feed hotplug subscription; clock
-/// events feed the **pre-ring tap** — a per-source `ClockEstimator`
-/// (`docs/midi.md` M3). `F8` pulses are tap-exclusive (24 PPQN would flood
-/// the ring and no score consumer wants them); Start/Stop/Continue/
-/// SongPosition feed the tap AND fall through to the ring, because
-/// transport intent is score-meaningful capture too.
+#[cfg(target_os = "linux")]
+fn scan_ports(seq: &alsa::Seq, dest: alsa::seq::Addr) -> Result<Vec<ObservedPort>, String> {
+    use alsa::seq::PortCap;
+    let mut ports = Vec::new();
+    for client in alsa::seq::ClientIter::new(seq) {
+        for p in alsa::seq::PortIter::new(seq, client.get_client()) {
+            let Some(facts) = port_facts(seq, dest.client, p.addr()) else { continue; };
+            if ports.len() == MAX_INVENTORY_PORTS {
+                return Err(format!("MIDI inventory exceeds {MAX_INVENTORY_PORTS} ports; full snapshot unavailable"));
+            }
+            let caps = p.get_capability();
+            let result = subscribe_source(seq, dest, p.addr());
+            ports.push(ObservedPort { facts,
+                readable: caps.contains(PortCap::READ),
+                writable: caps.contains(PortCap::WRITE),
+                listening: result.as_ref().copied().unwrap_or(false), error: result.err() });
+        }
+    }
+    Ok(ports)
+}
+
+/// Decode raw MIDI with receipt stamps. Clock messages also feed the local
+/// estimator. Musical recording filters clock/active sensing downstream;
+/// retrospective history retains them with every other admitted message.
 #[cfg(target_os = "linux")]
 fn capture_loop(
     seq: alsa::Seq,
     dest: alsa::seq::Addr,
-    tx: std::sync::mpsc::Sender<EarEvent>,
+    tx: EarSender,
     stop: Arc<AtomicBool>,
 ) {
     use alsa::seq::EventType;
@@ -238,7 +306,7 @@ fn capture_loop(
         Err(e) => { error!("cannot poll MIDI capture: {e}"); return; }
     };
 
-    let decoder = match alsa::seq::MidiEvent::new(4096) {
+    let decoder = match alsa::seq::MidiEvent::new(MAX_MESSAGE_BYTES as u32) {
         Ok(d) => d,
         Err(e) => {
             error!("MIDI ear: decoder init failed: {e}");
@@ -247,15 +315,27 @@ fn capture_loop(
     };
     // Every event decodes to a complete message with its own status byte.
     decoder.enable_running_status(false);
-    let mut buf = [0u8; 4096];
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
     // One estimator per observed clock master (source port).
     let mut clocks: HashMap<String, ClockEstimator> = HashMap::new();
 
     let mut input = seq.input();
+    let mut next_scan = Instant::now() + Duration::from_secs(2);
     while !stop.load(Ordering::Relaxed) {
+        if Instant::now() >= next_scan {
+            let report = match scan_ports(&seq, dest) {
+                Ok(ports) => EarEvent::Inventory { ports, observed_at: Instant::now() },
+                Err(error) => EarEvent::InventoryError { error },
+            };
+            if tx.send(report).is_err() { return; }
+            next_scan = Instant::now() + Duration::from_secs(2);
+        }
         let ev = match input.event_input() {
             Ok(ev) => ev,
             Err(e) if e.errno() == libc::EAGAIN => {
+                if tx.send(EarEvent::Watermark { observed_at: Instant::now(), epoch_ns: epoch_ns_now() }).is_err() {
+                    return;
+                }
                 if let Err(e) = alsa::poll::poll(&mut descriptors, 20)
                     && e.errno() != libc::EINTR {
                     error!("MIDI input poll failed: {e}");
@@ -268,7 +348,8 @@ fn capture_loop(
                 // then keep listening — the ring's lost-counting covers the
                 // Bevy side; this covers the ALSA side.
                 warn!("MIDI ear: event_input error (events may be lost): {e}");
-                if e.errno() == libc::ENOSPC || e.errno() == libc::EINTR { continue; }
+                if e.errno() == libc::ENOSPC { tx.losses.fetch_add(1, Ordering::Relaxed); continue; }
+                if e.errno() == libc::EINTR { continue; }
                 return;
             }
         };
@@ -285,13 +366,16 @@ fn capture_loop(
                     {
                         return;
                     }
-                    subscribe_source(&seq, dest, addr);
+                    let _ = subscribe_source(&seq, dest, addr);
+                    next_scan = Instant::now();
                 }
                 continue;
             }
             EventType::PortExit => {
                 if let Some(addr) = ev.get_data::<alsa::seq::Addr>() {
                     let address = format!("{}:{}", addr.client, addr.port);
+                    clocks.remove(&address);
+                    next_scan = Instant::now();
                     if tx.send(EarEvent::PortDown { address }).is_err() {
                         return;
                     }
@@ -299,6 +383,7 @@ fn capture_loop(
                 continue;
             }
             EventType::ClientExit => {
+                next_scan = Instant::now();
                 if let Some(addr) = ev.get_data::<alsa::seq::Addr>()
                     && tx.send(EarEvent::ClientDown { client_id: addr.client }).is_err()
                 {
@@ -312,6 +397,7 @@ fn capture_loop(
         // The clock tap, BEFORE the ring's door filter — its stamps are the
         // estimator's measurements, taken here at receipt, per source.
         let now_ns = epoch_ns_now();
+        let observed_at = Instant::now();
         let source_addr = ev.get_source();
         let source = format!("{}:{}", source_addr.client, source_addr.port);
         let clock_event = match ev.get_type() {
@@ -336,31 +422,45 @@ fn capture_loop(
                     return; // Bevy side is gone — shut the ear down.
                 }
             }
-            if ev.get_type() == EventType::Clock {
-                continue; // pulses are tap-exclusive; the rest fall through
-            }
         }
 
+        if ev.get_ext().is_some_and(|bytes| bytes.len() > MAX_MESSAGE_BYTES) {
+            tx.losses.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let n = match decoder.decode(&mut buf, &mut ev.into_owned()) {
             Ok(n) => n,
-            // Non-MIDI events (announce chatter, client start/exit) and
-            // oversized sysex land here; neither is a capture event.
-            Err(_) => continue,
+            // Failed decoding is counted as unknown-source loss.
+            Err(_) => { tx.losses.fetch_add(1, Ordering::Relaxed); continue; },
         };
         if n == 0 {
             continue;
         }
         let bytes = buf[..n].to_vec();
-        if !kaijutsu_audio::keep_at_ingest(&bytes) {
-            continue;
-        }
         let event = kaijutsu_audio::CaptureEvent {
             epoch_ns: now_ns,
             source,
             bytes,
         };
-        if tx.send(EarEvent::Capture(event)).is_err() {
+        if tx.send(EarEvent::Capture { event, observed_at }).is_err() {
             return; // Bevy side is gone — shut the ear down.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_ingress_counts_loss_without_blocking_and_disconnects() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let losses = Arc::new(AtomicU64::new(0));
+        let sender = EarSender { tx, losses: losses.clone() };
+        sender.send(EarEvent::PortDown { address: "24:0".into() }).unwrap();
+        sender.send(EarEvent::PortDown { address: "25:0".into() }).unwrap();
+        assert_eq!(losses.load(Ordering::Relaxed), 1);
+        assert!(matches!(rx.try_recv(), Ok(EarEvent::PortDown { address }) if address == "24:0"));
+        drop(rx);
+        assert!(sender.send(EarEvent::PortDown { address: "24:0".into() }).is_err());
     }
 }

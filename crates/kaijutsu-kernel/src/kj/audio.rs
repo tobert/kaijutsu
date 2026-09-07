@@ -24,7 +24,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "audio",
-    about = "Offline audio analysis (docs/pcm.md future work surface)",
+    about = "Inspect audio nodes, keep retained MIDI, and analyze audio",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -35,31 +35,48 @@ pub(crate) struct AudioArgs {
 
 #[derive(Subcommand, Debug)]
 enum AudioCommand {
-    /// Beat and downbeat tracking via the Beat This! (ISMIR 2024) model,
-    /// run through the pure-Rust `beat-this` crate (rten inference — no
-    /// external ONNX Runtime). Offline CPU work: expect low seconds per
-    /// track, not real-time. Models load fresh on every invocation — no
-    /// caching layer for this spike (see the `run_beats` doc comment).
-    ///
-    /// Model directory: `~/.local/share/kaijutsu/models/beat-this/`
-    ///
-    /// - `mel_spectrogram.onnx` — required
-    ///
-    /// - `beat_this.onnx` — preferred (full model)
-    ///
-    /// - `beat_this_small.onnx` — fallback if the full model is absent
-    ///
-    /// The model actually used is always named in the output — no silent
-    /// full→small fallback without saying so. Missing files point at
-    /// github.com/danigb/beat-this-rs: the `models/` dir in the repo for
-    /// the mel + small models, and the GitHub release tag `model-large`
-    /// for the full beat model.
-    ///
-    /// Accepts WAV/MP3/FLAC/OGG (symphonia decode, any input sample rate —
-    /// resampled internally to the model's 22050 Hz via rubato).
+    /// Read a connected audio node's device inventory and retained coverage.
+    Devices {
+        /// Exact connected peer name, such as audio/moltar.
+        #[arg(long)]
+        node: String,
+    },
+    /// Protect recent MIDI in daemon RAM, then upload it to kernel CAS.
+    Keep {
+        /// Exact connected peer name, such as audio/moltar.
+        #[arg(long)]
+        node: String,
+        /// Source address from the node inventory.
+        #[arg(long)]
+        source: String,
+        /// Stream generation UUID from the node inventory.
+        #[arg(long)]
+        generation: uuid::Uuid,
+        /// Seconds preceding the current head (1–60); incomplete coverage is refused.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=60))]
+        seconds: u32,
+    },
+    /// Read a keep job's state, publication hash, or last error.
+    KeepStatus {
+        /// Job UUID returned by keep.
+        id: uuid::Uuid,
+    },
+    /// Retry a failed upload without selecting a different retained window.
+    KeepRetry {
+        /// Job UUID returned by keep.
+        id: uuid::Uuid,
+    },
+    /// Cancel a keep and release its protected material after acknowledgement.
+    KeepCancel {
+        /// Job UUID returned by keep.
+        id: uuid::Uuid,
+    },
+    /// Detect beats and downbeats in WAV, MP3, FLAC, or OGG audio.
+    /// Models must be installed under ~/.local/share/kaijutsu/models/beat-this/.
+    /// Reports which model was used; the small model is used when the full
+    /// model is absent. Missing models produce download instructions.
     Beats {
-        /// Path to the audio file to analyze (OS path, not a VFS path —
-        /// mirrors `kj play`/`kj cas put`).
+        /// Host path to the audio file; VFS paths are not accepted.
         path: String,
     },
 }
@@ -179,6 +196,11 @@ impl KjDispatcher {
         };
 
         match parsed.command {
+            AudioCommand::Devices { node } => self.audio_devices(node).await,
+            AudioCommand::Keep { node, source, generation, seconds } => self.audio_keep(node, source, generation, seconds).await,
+            AudioCommand::KeepStatus { id } => self.audio_keep_status(id),
+            AudioCommand::KeepRetry { id } => self.audio_keep_retry(id).await,
+            AudioCommand::KeepCancel { id } => self.audio_keep_cancel(id).await,
             AudioCommand::Beats { path } => self.audio_beats(path).await,
         }
     }
@@ -240,6 +262,17 @@ impl KjDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_help_is_inspectable() {
+        for verb in ["devices", "keep", "keep-status", "keep-retry", "keep-cancel", "beats"] {
+            let help = AudioArgs::try_parse_from([verb, "--help"]).unwrap_err();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+            println!("{help}");
+        }
+        assert!(AudioArgs::try_parse_from(["keep", "--node", "audio/test", "--source", "24:0", "--generation", "00000000-0000-0000-0000-000000000001", "--seconds", "0"]).is_err());
+        assert!(AudioArgs::try_parse_from(["keep", "--node", "audio/test", "--source", "24:0", "--generation", "00000000-0000-0000-0000-000000000001", "--seconds", "61"]).is_err());
+    }
 
     /// Build a minimal 44-byte-header PCM WAV: mono, 16-bit, `sample_rate`
     /// Hz, `num_samples` samples of `data` (already `i16`-encoded LE bytes

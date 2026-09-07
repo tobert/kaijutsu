@@ -5,13 +5,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kaijutsu_audio::{CaptureRing, Tracker, MIDI_CAPTURE_MIME};
+use kaijutsu_audio::{CaptureLimits, CaptureRing, Tracker, MIDI_CAPTURE_MIME};
 use kaijutsu_client::{ActorHandle, ConnectionStatus, SshConfig};
 use kaijutsu_types::ContextId;
 use tokio::sync::watch;
 
 use crate::dj::thread::{DjCtl, DjHandle};
-use crate::midi_in::{EarEvent, EarWorker};
+use crate::midi_in::EarEvent;
+use crate::observer::{Observation, Observer};
 use crate::midi_match::{DeviceMatch, match_ports, parse_profile};
 use crate::midi_presence::{MidiPortTopology, BACKEND, DEVICES_DIR, MAX_PROFILES, routes_from_match, diff_presence, sink_host};
 
@@ -36,6 +37,7 @@ pub struct Engine {
     stop: watch::Sender<bool>,
     join: Option<std::thread::JoinHandle<Result<(), String>>>,
     pub pulses: crossbeam_channel::Receiver<crate::dj::DjPulse>,
+    pub(crate) observation: Option<Arc<std::sync::Mutex<Observation>>>,
 }
 
 impl Engine {
@@ -57,11 +59,11 @@ impl Engine {
             let result = (|| {
                 let _ownership = Ownership::acquire(&lock_path())?;
                 let mut dj = DjHandle::start(&options)?;
-                let ear = if options.midi { Some(crate::midi_in::spawn_capture_thread(options.rt_priority)?) } else { None };
+                let ear = if options.midi { Some(Observer::start(crate::midi_in::spawn_capture_thread(options.rt_priority)?, context.is_some())?) } else { None };
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
                 dj.ctl_tx.send(DjCtl::ActorReady { handle: actor.clone(), ssh_config: ssh, generation: 0 })
                     .map_err(|e| e.to_string())?;
-                let _ = ready_tx.send(Ok(dj.pulse_rx.clone()));
+                let _ = ready_tx.send(Ok((dj.pulse_rx.clone(), ear.as_ref().map(|ear| ear.shared.clone()))));
                 let result = rt.block_on(serve(&actor, context, ear, &mut dj, stop_rx, &options));
                 actor.midi_exchange().clear();
                 let stopped = dj.shutdown();
@@ -73,8 +75,8 @@ impl Engine {
             }
             result
         }).map_err(|e| e.to_string())?;
-        let pulses = ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok(Self { stop, join: Some(join), pulses })
+        let (pulses, observation) = ready_rx.recv().map_err(|e| e.to_string())??;
+        Ok(Self { stop, join: Some(join), pulses, observation })
     }
 
     pub fn is_finished(&self) -> bool {
@@ -101,18 +103,36 @@ struct EarState {
     tracker: Tracker,
     topology: MidiPortTopology,
     clocks: BTreeMap<String, kaijutsu_audio::ClockEstimate>,
+    rejected: u64,
 }
 
 impl EarState {
     fn new() -> Self {
-        let ring = CaptureRing::new(16_384);
+        let ring = CaptureRing::with_limits(CaptureLimits { max_events: 16_384, max_bytes: 8 * 1024 * 1024, max_message_bytes: 64 * 1024 })
+            .expect("valid recording history limits");
         let tracker = ring.tracker_at(epoch_ns());
-        Self { ring, tracker, topology: Default::default(), clocks: Default::default() }
+        Self { ring, tracker, topology: Default::default(), clocks: Default::default(), rejected: 0 }
     }
 
     fn ingest(&mut self, event: EarEvent) {
         match event {
-            EarEvent::Capture(event) => self.ring.push(event),
+            EarEvent::Capture { event, .. } => {
+                if kaijutsu_audio::keep_at_ingest(&event.bytes)
+                    && let Err(error) = self.ring.try_push(event) {
+                    self.rejected += 1;
+                    tracing::warn!("MIDI recording history rejected event: {error}");
+                }
+            }
+            EarEvent::Inventory { ports, .. } => {
+                let mut topology = MidiPortTopology::default();
+                for port in ports { topology.port_up(port.facts); }
+                for previous in self.topology.ports() {
+                    if !topology.ports().iter().any(|p| p.address == previous.address) { self.topology.port_down(&previous.address); }
+                }
+                for port in topology.ports() { self.topology.port_up(port); }
+            }
+            EarEvent::InventoryError { error } => { tracing::warn!("MIDI inventory unavailable: {error}"); }
+            EarEvent::Watermark { .. } => {}
             EarEvent::Clock { source, estimate, discontinuities } => {
                 if discontinuities > 0 { tracing::debug!(source, discontinuities, "MIDI clock discontinuities"); }
                 self.clocks.insert(source, estimate);
@@ -128,8 +148,9 @@ impl EarState {
 
     fn cut(&mut self, connected: bool, target: Option<ContextId>, now: u64) -> Option<kaijutsu_audio::CaptureBatch> {
         if !connected || target.is_none() { return None; }
-        let batch = self.ring.cut(&mut self.tracker, now);
-        (!batch.is_empty()).then_some(batch)
+        let mut batch = self.ring.cut(&mut self.tracker, now);
+        batch.lost = batch.lost.saturating_add(std::mem::take(&mut self.rejected));
+        (!batch.is_empty() || batch.lost > 0).then_some(batch)
     }
 }
 
@@ -146,7 +167,7 @@ async fn fetch_profiles(actor: &ActorHandle) -> Result<Vec<DeviceMatch>, String>
     Ok(profiles)
 }
 
-async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<EarWorker>, dj: &mut DjHandle, mut stop: watch::Receiver<bool>, options: &Options) -> Result<(), String> {
+async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Observer>, dj: &mut DjHandle, mut stop: watch::Receiver<bool>, options: &Options) -> Result<(), String> {
     let midi = options.midi;
     let routes = Arc::new(RwLock::new(BTreeMap::new()));
     let _exchange = if midi {
@@ -165,6 +186,7 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<EarW
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_cut = std::time::Instant::now();
+    let mut legacy_seen = 0u64;
     loop {
         tokio::select! {
             biased;
@@ -182,6 +204,9 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<EarW
         }
         if dj.is_finished() { return Err("DJ worker stopped unexpectedly".into()); }
         if let Some(ear) = &ear {
+            let lost = ear.shared.lock().expect("MIDI observation lock poisoned").legacy_lost;
+            state.rejected = state.rejected.saturating_add(lost.saturating_sub(legacy_seen));
+            legacy_seen = lost;
             for _ in 0..16_384 {
                 match ear.rx.try_recv() {
                     Ok(event) => state.ingest(event),
@@ -321,7 +346,7 @@ mod tests {
     fn capture_survives_disconnection_and_missing_target() {
         let mut state = EarState::new();
         let now = epoch_ns();
-        state.ingest(EarEvent::Capture(kaijutsu_audio::CaptureEvent { epoch_ns: now, source: "24:0".into(), bytes: vec![0x90, 60, 100] }));
+        state.ingest(EarEvent::Capture { event: kaijutsu_audio::CaptureEvent { epoch_ns: now, source: "24:0".into(), bytes: vec![0x90, 60, 100] }, observed_at: std::time::Instant::now() });
         assert!(state.cut(false, Some(ContextId::new()), now + 10).is_none());
         assert!(state.cut(true, None, now + 10).is_none());
         let batch = state.cut(true, Some(ContextId::new()), now + 10).unwrap();

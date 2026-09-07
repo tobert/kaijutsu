@@ -22,6 +22,7 @@ kaijutsu-telemetry.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossbeam-channel = "0.5"
+russh-sftp.workspace = true
 cpal = "0.17"
 dirs.workspace = true
 hostname.workspace = true

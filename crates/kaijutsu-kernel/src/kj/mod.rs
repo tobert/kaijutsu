@@ -11,6 +11,7 @@
 pub mod alias;
 pub mod attach;
 pub mod audio;
+mod audio_capture;
 pub mod backend;
 pub mod binding;
 pub mod ledger;
@@ -264,6 +265,7 @@ impl KjResult {
 /// Holds Arc refs to shared kernel state. Constructed once per server,
 /// shared across all connections.
 pub struct KjDispatcher {
+    audio_keeps: Arc<audio_capture::KeepJobs>,
     drift: SharedDriftRouter,
     blocks: SharedBlockStore,
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
@@ -322,6 +324,7 @@ impl KjDispatcher {
             .kernel_id()
             .expect("KernelDb singleton row must exist");
         Self {
+            audio_keeps: Arc::new(audio_capture::KeepJobs::default()),
             drift,
             blocks,
             kernel_db,
