@@ -12,7 +12,9 @@
 #    (kj/lifecycle.rs "Failure semantics"). `kj handoff tail` legitimately
 #    fails when the context's principal has no character sheet — a
 #    pre-character principal is not an error condition — so its exit is
-#    guarded and `exit 0` is the literal last line.
+#    guarded INSIDE the substitution (`|| true`), and `exit 0` is the
+#    literal last line. Under `set -e` a failing `$(...)` assignment aborts
+#    the whole script, and no later line runs. Verified live.
 #  - NOTIFICATION, never (Role::System, BlockKind::Text). This content
 #    differs on every create, and the System+Text slot folds into the
 #    CACHED system prompt (llm/system_prompt.rs), so writing there would
@@ -26,8 +28,8 @@
 #  - kj-and-VFS only. No network, no external process.
 #
 # `$(...)` assignment cannot be guarded with a trailing `||` — kaish never
-# fires it (gotcha_kaish). Every fallback below is therefore a separate
-# `test -z` statement, not an `||` tail.
+# fires it. The `|| true` therefore sits inside the substitution, where it
+# does fire, and the fallback text is a separate `test -z` statement.
 set -e
 
 window=12
@@ -35,7 +37,7 @@ window=12
 # `kj handoff tail` prints "[when] author: text" per note, or a bare
 # "<name> has no handoff notes yet" line. It errors only when the calling
 # principal has no character sheet at all.
-notes="$(kj handoff tail --window $window)"
+notes="$(kj handoff tail --window $window || true)"
 
 if test -z "$notes"; then
   notes="(no handoff log reachable — this context's principal may have no character sheet yet; 'kj character create <name>' mints one)"

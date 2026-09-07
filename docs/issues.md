@@ -49,6 +49,22 @@ Immediate consequence for slice 4, unresolved: `signoff.md`'s durable third
 through `tail`" — is not handoff material and must land somewhere before
 `signoff.md` retires. Melting it into `docs/` is the option available today.
 
+## The lfm2d gate escalates `kj handoff note` from the MCP shell (2026-09-07)
+
+Slice 4 deliberately left `kj handoff note` un-gated by `ConfigWrite`, so a
+handoff would not route through the lfm2d escalation. It does anyway: from
+an `mcp` seat, `kj handoff note '...'` and `kj context create ... --type
+coder` both raise an ask (`hook:lfm2d-advisory`, classifier
+`kube_ordinal_v10`), each scored `situation-normal` at 0.76–0.82 with
+verdict `escalate`, because the seat's `LFM2D_BENIGN_LABEL=informative` and
+only that label passes. The previous session's first note (09:49) never
+landed for this reason, and a same-seat allow is refused, so every note
+from an MCP seat needs a second seat to approve it. Options, in order of
+size: exempt `kj handoff note` in the scorer's exemption table (see
+"The scorer cannot see a redirect, only the exemption can"); widen the
+benign set to include `situation-normal`; or teach the classifier the verb.
+Amy's call on which.
+
 ## Two outbound HTTP clients still call out anonymously (2026-09-06)
 
 Every LLM provider dialect now sends `kaijutsu/<version>` — OpenAI-compatible,
