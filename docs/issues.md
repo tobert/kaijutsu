@@ -9,34 +9,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 
 
-## `resolveContextLabel` cannot find an archived context (found 2026-09-06, character slice 2)
-
-`join_context_heals_registry_for_an_archived_context_after_restart`
-(`crates/kaijutsu-server/tests/context_label_resolve.rs`) fails on current
-`main`, unrelated to the character/keyring work that surfaced it — reverting
-every change from that slice still reproduces it.
-
-`KernelDb::find_context_by_label` (`kernel_db.rs:6225`) filters
-`WHERE label = ?1 AND archived_at IS NULL`, so an archived context's row is
-never returned. `resolve_context_label` (`rpc.rs:5019`) calls only this
-method with no fallback. The test's own premise — "an archived context's row
-must still resolve by label via `KernelDb`" — was true when the docs/issues.md
-entry above it was written (2026-08-04, `register_session` upsert work) and
-is false against the code now, so something changed `find_context_by_label`'s
-filter (or the test's premise) since then without the other side following.
-
-Confirmed unrelated to the keyring melt: the failure reproduces with
-`ensure_hajime`'s call in `create_shared_kernel` commented out (which instead
-breaks `auth_publickey` in a different, expected way — no hajime to bind
-to), and `context_label_resolve.rs` carries no diff from the character work.
-
-Not fixed here — out of scope for the keyring melt and risky to guess at
-under that slice's "can lock a human out" posture. Whoever picks this up:
-decide whether `resolve_context_label` should include archived rows (the
-test's expectation) or the test's premise is stale (matching
-`find_context_by_label`'s current, deliberate filter) and needs updating
-instead.
-
 ## Two outbound HTTP clients still call out anonymously (2026-09-06)
 
 Every LLM provider dialect now sends `kaijutsu/<version>` — OpenAI-compatible,

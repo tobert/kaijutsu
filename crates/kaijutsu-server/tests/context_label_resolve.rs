@@ -128,7 +128,9 @@ fn list_contexts_recovers_live_context_after_restart() {
 /// concluded case above. `joinContext` must heal it from the durable
 /// KernelDb row instead of hard-failing with "use createContext first", and
 /// the heal must make it visible to `listContexts` again too (the `kj
-/// context list` data source).
+/// context list` data source). The heal is addressed by context id, not by
+/// label: an archived context releases its label for reuse, so
+/// `resolveContextLabel` no longer finds it.
 #[test]
 fn join_context_heals_registry_for_an_archived_context_after_restart() {
     run_local(async {
@@ -153,15 +155,16 @@ fn join_context_heals_registry_for_an_archived_context_after_restart() {
         let client2 = connect_client(addr2).await;
         let (kernel2, _kernel_id2) = client2.bind_kernel().await.unwrap();
 
-        // The row is durable — DB-driven resolution finds it straight away,
-        // archived state and all.
-        let resolved = kernel2
-            .resolve_context_label(&label)
-            .await
-            .unwrap()
-            .expect("an archived context's row must still resolve by label via KernelDb");
-        assert_eq!(resolved.id, context_id);
-        assert!(resolved.archived, "resolve_context_label must report archived honestly");
+        // Label resolution finds the LIVE holder only: an archived context
+        // keeps its name on the row but stops holding it, so the label is
+        // free to give again (`find_context_by_label`, `WHERE archived_at IS
+        // NULL`). The heal below therefore cannot start from the label — it
+        // starts from the durable context id, which is what `joinContext`
+        // takes.
+        assert!(
+            kernel2.resolve_context_label(&label).await.unwrap().is_none(),
+            "an archived context must not hold its label against reuse"
+        );
 
         // Unlike the non-archived case, the fresh DriftRouter genuinely has
         // never heard of this one: boot recovery's `list_active_contexts`
