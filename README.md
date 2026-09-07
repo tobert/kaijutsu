@@ -162,10 +162,17 @@ that renders as both standard staff notation and audio.
 
 FFI-free audio/render types: the mime-keyed `RenderCue` wire cue, the clip
 record (`docs/pcm.md`), and the beat phasor/timebase used by the metronome.
-Sinks (the app, future edge nodes) own the actual hardware. The timing
+Sinks in `kaijutsu-audio-runtime` own the actual hardware. The timing
 doctrine — emission-stamped wire artifacts, receiver back-dating, staleness
 ladder, the deadband-locked phasor ("the local clock is the truth between
 references") — lives in `docs/midi.md`, "The one timebase".
+
+### kaijutsu-audio-runtime
+
+Bevy-free MIDI and PCM runtime, hosted by the `kaijutsu-audiod` SSH client
+or opt-in through `kaijutsu-app --audio`. The kernel drives playback; the
+runtime owns local hardware. See [Audio daemon](docs/audio-daemon.md) for
+device selection, capture and systemd setup.
 
 ### kaijutsu-hyoushigi
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=Kaijutsu audio and MIDI node
+Wants=network-online.target
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+# Provision this account with access to the intended audio devices and an SSH
+# key enrolled in the kernel. Run only one audio owner for those devices.
+User=kaijutsu-audio
+Group=audio
+StateDirectory=kaijutsu-audio
+WorkingDirectory=/var/lib/kaijutsu-audio
+ExecStart=/usr/local/bin/kaijutsu-audiod --host localhost --key /var/lib/kaijutsu-audio/id_ed25519 --rt-priority 20
+LimitRTPRIO=40
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

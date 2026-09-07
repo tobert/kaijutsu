@@ -3,10 +3,11 @@
 > **Status:** as-built + the remaining design; aggressively rewritten
 > 2026-07-16, absorbing `docs/clips.md` (merged here whole; it and this doc's
 > earlier design generations — including the retired `docs/playback.md` — are
-> recoverable from git history). Code is truth: the wire cue, the app sinks,
+> recoverable from git history). Code is truth: the wire cue, the hardware sinks,
 > the clip record, and the whole clip *path* — producer (`kj play --track`)
-> → crossing → sink renderer — are **landed** (R1–R5, 2026-07-16); open: the
-> slice-4 edge node, mapped in "The remaining work" below. Companions:
+> → crossing → sink renderer — are **landed** (R1–R5, 2026-07-16).
+> The standalone sink now lives in `kaijutsu-audiod`; see `docs/audio-daemon.md`.
+> Companions:
 > `docs/midi.md` ("Render is a wire cue" — the phase split; "The one
 > timebase" — the timing doctrine every cue rides), `docs/tracks.md`
 > (track/transport), `docs/hyoushigi.md` (the `Cell` substrate),
@@ -62,7 +63,7 @@ pub trait RenderSink: Send {
 
 The delivery path: kernel publishes `BlockFlow::RenderCue` on the FlowBus →
 both rpc bridges forward → `onRenderCue @9` (`kaijutsu.capnp`) → client
-forwarder emits `ServerEvent::RenderCue` → app systems. It's a directive,
+forwarder emits `ServerEvent::RenderCue` → audio runtime. It's a directive,
 not a block — `matches_filter` bypasses it.
 
 ### Producers (kernel side, today)
@@ -82,15 +83,15 @@ not a block — `matches_filter` bypasses it.
   what isn't theirs.
 - **Transport stop/pause** — the flush cue, ungated (cheap, must always land).
 
-### Sinks (today the app; later an edge node)
+### Sinks
 
-- **`kaijutsu-app/src/midi.rs`** — `text/vnd.abc`: renders ABC→MIDI *at the
+- **`kaijutsu-audio-runtime/src/dj/midi.rs`** — `text/vnd.abc`: renders ABC→MIDI *at the
   sink* (`kaijutsu_abc::midi::events`) and schedules into a local ALSA seq
   port at the backdated `receipt + lead`; ALSA's queue owns sub-ms timing.
   Flush drops scheduled events + all-notes-off. (Known future work: flush is
   whole-queue, not per-track — issues.md, relative-lead findings.)
-- **`kaijutsu-app/src/audio.rs` + `audio_sched.rs`** (R1+R4+R5 landed
-  2026-07-16) — `audio.rs` is pure dispatch: it computes each cue's
+- **`kaijutsu-audio-runtime/src/dj/audio.rs` + `src/audio_sched.rs`** —
+  `audio.rs` is pure dispatch: it computes each cue's
   epoch-backdated deadline at receipt (same ladder as midi.rs, collapsed to
   go/no-go/when), resolves CAS payloads through `CasResolver`, warms the
   cache ahead of time on a `PREPARE_MIME` cue (`PrefetchKind::Warm`), parses
@@ -100,12 +101,11 @@ not a block — `matches_filter` bypasses it.
   (decode-ahead, `Sink`-per-sound polyphony, flush drops pending + stops
   live). `bevy_audio` no longer plays anything (`AudioPlugin` disabled;
   dropping its compilation entirely is follow-up hygiene).
-- **Edge-node agent** (headless ALSA, the `midi.md` M4 node) — later, slice
-  4 unchanged: Symphonia decode + `pawlsa`'s proven ALSA PCM loop
-  (`~/src/pawlsa-mcp/src/alsa/playback.rs`; its `pw` graph-control surface
-  is the later routing/volume story). `alsa = 0.11` / `pipewire = 0.9` /
-  `symphonia` land in the agent binary, never the kernel. Prerequisite: the
-  node-agent RPC model (exists only by analogy).
+- **`kaijutsu-audiod`** hosts both sinks without Bevy, using the existing
+  SSH actor and render subscription. The app can host the same library with
+  `--audio`. Device ownership, capture and Linux service setup are described
+  in `docs/audio-daemon.md`. Named multi-machine destinations remain open;
+  the current render contract broadcasts to every attached sink.
 
 ## Shipped ledger
 
@@ -329,9 +329,9 @@ make it musical.
   Polish list: unify midi.rs `CUE_STALE_MAX` with the scheduler's
   `REF_STALE_MAX` (same value, two names); full bevy feature enumeration to
   stop compiling bevy_audio at all.
-- **Slice 4 — the edge-node sink** (unchanged, later): headless `kj play` on
-  a node with no app produces sound, emitted by the agent binary. Waits on
-  the node-agent RPC model (M4).
+- **Slice 4 — the standalone sink** is implemented by `kaijutsu-audiod`,
+  without a new node-agent RPC model. It receives the existing render cues
+  over SSH; see `docs/audio-daemon.md`.
 
 Adjacent prize (issues.md "Beat-tracking + local-model follow-ups"): once
 clips exist, `kj audio beats` runs on clip media and seeds a track's tempo

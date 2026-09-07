@@ -1,0 +1,46 @@
+[package]
+name = "kaijutsu-audio-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MIDI and PCM runtime for Kaijutsu audio nodes"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kaijutsu-audiod"
+path = "src/main.rs"
+
+[dependencies]
+kaijutsu-audio.workspace = true
+kaijutsu-abc.workspace = true
+kaijutsu-cas.workspace = true
+kaijutsu-client.workspace = true
+kaijutsu-types.workspace = true
+kaijutsu-telemetry.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossbeam-channel = "0.5"
+cpal = "0.17"
+dirs.workspace = true
+hostname.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal", "time"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+whoami.workspace = true
+rodio = { version = "0.22", default-features = false, features = ["playback", "wav", "vorbis"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

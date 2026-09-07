@@ -1,49 +1,11 @@
-//! The DJ thread — musical dispatch off the frame (`docs/midi.md` "The DJ
-//! thread"). A dedicated `std::thread` ("kaijutsu-dj") running a
-//! current-thread tokio runtime, one `select!` over {a Bevy control channel,
-//! the actor's own event broadcast, its connection-status watch, the
-//! click-horizon timer}. It holds its *own* `broadcast::Receiver` off the
-//! `ActorHandle` — an independent cursor, so a stalled UI drain
-//! (`poll_server_events`) costs the DJ nothing, closing the frame-jitter
-//! bug this arc exists to fix.
-//!
-//! **Keep the thread thin.** Every `select!` arm below does exactly one
-//! thing: translate channel traffic into a [`DjCore`] call, then translate
-//! `DjCore`'s report into a sink dispatch and/or a [`DjEffect`] for
-//! telemetry. The translation itself lives in small, pure, unit-testable
-//! functions ([`handle_server_event`], [`handle_due_clicks`],
-//! [`handle_status_change`]) — any decision logic beyond "what does this
-//! channel message mean to the clock" belongs in `core.rs`, not here.
-//!
-//! **Slice #3** was the first LIVE wiring: every `audio/*`, `CLIP_MIME`, and
-//! `PREPARE_MIME` `RenderCue` dispatches through
-//! [`super::audio::dispatch_render_cue`] / [`super::audio::handle_prefetch_outcome`]
-//! (ported from the deleted `audio.rs`) — the events arm calls the former for
-//! every `RenderCue` alongside (not instead of) [`handle_server_event`]'s
-//! clock reaction to the same cue, and a prefetch-outcome `select!` arm calls
-//! the latter. [`DjSinks::audio`] is the real [`AudioSchedulerHandle`],
-//! spawned in [`DjPlugin::build`] (moved from the deleted `AudioOutPlugin`).
-//!
-//! **Task #4 (the demolition) is this revision.** ABC→MIDI dispatch (events
-//! arm → [`super::midi::dispatch_midi_cue`]), the ALSA sink + patch-bay
-//! auto-connect (a loop-local [`super::midi::MidiSink`], generic parameter
-//! `M: MidiDispatch` — see that module's doc for why loop-local rather than a
-//! `DjSinks` field), and the click policy (already ported to [`DjCore`] in
-//! Task #1) all now live on this thread end to end. `midi.rs` and
-//! `metronome.rs` are DELETED — nothing outside this thread touches MIDI or
-//! the metronome anymore. The old `ClickSink` seam (click-only) is replaced
-//! by the broader [`super::midi::MidiDispatch`] (click + ABC-schedule +
-//! flush + traffic + auto-connect), reflecting that the events arm now
-//! dispatches through the same owned sink the click timer does — "one app,
-//! one port."
-//!
-//! [`DjPlugin`] is registered in `main.rs`, replacing `AudioOutPlugin`,
-//! `MidiOutPlugin`, and `MetronomePlugin`.
+//! Dedicated cue dispatch, clock tracking and hardware scheduling.
+//! Receives kernel events directly through an independent actor subscription.
+//! See `docs/midi.md`, "The one timebase".
+
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bevy::prelude::*;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
@@ -51,7 +13,6 @@ use kaijutsu_audio::{Slew, RENDER_FLUSH_MIME};
 use kaijutsu_client::{ActorHandle, ConnectionStatus, ServerEvent, SshConfig};
 
 use crate::audio_sched::AudioSchedulerHandle;
-use crate::connection::actor_plugin::{RpcActor, RpcConnectionState, RpcResultMessage};
 
 use super::audio::{dispatch_render_cue, handle_prefetch_outcome};
 use super::core::{ClockTransition, CuePlacement, DjCore, MetronomeConfig};
@@ -448,6 +409,10 @@ async fn run_loop<H, F, M>(
     let mut connected = false;
 
     loop {
+        if sinks.audio.as_ref().is_some_and(|audio| audio.failed()) {
+            warn!("audio scheduler lost its output; stopping the DJ");
+            break;
+        }
         let now = Instant::now();
         // The timer aims at whichever comes first: the next beat ENTERING the
         // click horizon (`next_wake`'s lead — waking at the beat itself would
@@ -527,6 +492,7 @@ async fn run_loop<H, F, M>(
             event = async { events_rx.as_mut().unwrap().recv().await }, if events_rx.is_some() => {
                 match event {
                     Ok(ev) => {
+                        if !connected { continue; }
                         // Read once per receipt (mirrors the deleted
                         // `audio.rs::play_render_cues`'s "Instant::now() ...
                         // read ONCE per batch" discipline) so the clock
@@ -585,7 +551,7 @@ async fn run_loop<H, F, M>(
                                     );
                                     dispatch_midi_cue(&cue, event_epoch_ns, &midi_routes, &mut midi);
                                     if midi.take_traffic() {
-                                        let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                                        let _ = pulse_tx.try_send(DjPulse::RenderTraffic);
                                     }
                                 }
                                 CuePlacement::Buffer(beat) => {
@@ -611,6 +577,10 @@ async fn run_loop<H, F, M>(
                 match changed {
                     Ok(()) => {
                         let status = status_rx.as_ref().unwrap().borrow().clone();
+                        if connected && !matches!(status, ConnectionStatus::Connected { .. }) {
+                            midi.flush();
+                            if let Some(audio) = &sinks.audio { audio.flush(); }
+                        }
                         connected = matches!(status, ConnectionStatus::Connected { .. });
                         for effect in handle_status_change(&mut core, &status, Instant::now()) {
                             record_effect(effect);
@@ -622,6 +592,10 @@ async fn run_loop<H, F, M>(
                         // branch from busy-polling an already-closed watch —
                         // a fresh `ActorReady` restores it.
                         status_rx = None;
+                        connected = false;
+                        for effect in fallback_effects(core.on_disconnect(Instant::now())) { record_effect(effect); }
+                        midi.flush();
+                        if let Some(audio) = &sinks.audio { audio.flush(); }
                     }
                 }
             }
@@ -632,7 +606,7 @@ async fn run_loop<H, F, M>(
                     record_effect(effect);
                 }
                 if midi.take_traffic() {
-                    let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                    let _ = pulse_tx.try_send(DjPulse::RenderTraffic);
                 }
 
                 // The cue-placement analog of the click dispatch above: any
@@ -697,7 +671,7 @@ async fn run_loop<H, F, M>(
                     dispatch_midi_cue(&cue, dispatch_epoch_ns, &midi_routes, &mut midi);
                 }
                 if midi.take_traffic() {
-                    let _ = pulse_tx.send(DjPulse::RenderTraffic);
+                    let _ = pulse_tx.try_send(DjPulse::RenderTraffic);
                 }
             }
 
@@ -736,212 +710,69 @@ async fn run_loop<H, F, M>(
             }
         }
     }
+    midi.flush();
+    if let Some(audio) = &sinks.audio { audio.flush(); }
 }
 
-/// Build the current-thread tokio runtime and run [`run_loop`] with real
-/// telemetry recording — the production entry point [`DjPlugin::build`]
-/// spawns onto the `"kaijutsu-dj"` thread. Mirrors
-/// `connection/bootstrap.rs::bootstrap_thread`'s
-/// `Builder::new_current_thread().enable_all()` shape (no `LocalSet` needed
-/// here — nothing in this module is `!Send`, unlike the capnp actor).
-///
-/// `scheduler` arrives pre-spawned from [`DjPlugin::build`] (the rodio
-/// thread has no dependency on this one — `audio_sched::spawn` just needs to
-/// run once, somewhere, before the DJ starts dispatching cues).
-///
-/// `prefetch` is built and OWNED here, in this sync function, never inside
-/// [`run_loop`] itself — found live (this task's thread-level tests panicked
-/// on it before this was pinned down): [`super::prefetch::CasPrefetch`] owns
-/// its own separate multi-thread `tokio::runtime::Runtime`, and dropping a
-/// `Runtime` blocks the calling thread waiting for its workers to stop.
-/// Tokio disallows that *specific* blocking op from inside an async context
-/// (`Cannot drop a runtime in a context where blocking is not allowed`) —
-/// so if `prefetch` were owned by (and dropped inside) `run_loop`'s async
-/// stack frame, its `Drop` would fire while still polled by `rt.block_on`
-/// below and panic. Building AND dropping it out here, wrapped around
-/// `block_on` rather than inside it, keeps both firmly in sync-land; only a
-/// `&CasPrefetch` borrow crosses into the async world.
-fn thread_main(
-    ctl_rx: mpsc::UnboundedReceiver<DjCtl>,
-    pulse_tx: crossbeam_channel::Sender<DjPulse>,
-    scheduler: AudioSchedulerHandle,
-) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build kaijutsu-dj tokio runtime");
-    let (prefetch, prefetch_rx) = CasPrefetch::new();
-    let sinks = DjSinks { audio: Some(scheduler) };
-    // `MidiSink::default()` here — not inside `run_loop` — for the same
-    // reason it's a plain local at all: this function already runs ON the DJ
-    // thread (spawned by `DjPlugin::build` below), so building it here vs. as
-    // `run_loop`'s first local statement is purely stylistic; kept here to
-    // keep `thread_main`'s "everything this thread owns, assembled once" shape
-    // symmetric with `prefetch`.
-    rt.block_on(run_loop(
-        ctl_rx,
-        MidiSink::default(),
-        sinks,
-        &prefetch,
-        prefetch_rx,
-        pulse_tx,
-        record_effect_via_telemetry,
-    ));
+/// Owns the DJ thread and waits for device teardown on shutdown.
+pub(crate) struct DjHandle {
+    pub ctl_tx: mpsc::UnboundedSender<DjCtl>,
+    pub pulse_rx: crossbeam_channel::Receiver<DjPulse>,
+    join: Option<std::thread::JoinHandle<Result<(), String>>>,
 }
 
-// ── Bevy-side: DjHandle resource + DjPlugin ─────────────────────────────────
+impl DjHandle {
+    pub fn start(options: &crate::Options) -> Result<Self, String> {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let (pulse_tx, pulse_rx) = crossbeam_channel::bounded(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let options = options.clone();
+        let join = std::thread::Builder::new().name("kaijutsu-dj".into()).spawn(move || {
+            let result: Result<(), String> = (|| {
+                let midi = MidiSink::open(options.midi)?;
+                let (audio, audio_join) = if options.audio {
+                    let (handle, join) = crate::audio_sched::spawn(options.output.clone(), options.rt_priority)?;
+                    (Some(handle), Some(join))
+                } else { (None, None) };
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                    .map_err(|e| e.to_string())?;
+                let (prefetch, prefetch_rx) = CasPrefetch::new();
+                if let Err(e) = crate::scheduling::set_priority(options.rt_priority) {
+                    warn!("{e}; continuing at the current scheduling priority");
+                }
+                let _ = ready_tx.send(Ok(()));
+                rt.block_on(run_loop(ctl_rx, midi, DjSinks { audio }, &prefetch,
+                    prefetch_rx, pulse_tx, record_effect_via_telemetry));
+                if let Some(join) = audio_join {
+                    join.join().map_err(|_| "audio scheduler panicked".to_string())??;
+                }
+                Ok(())
+            })();
+            if let Err(e) = &result { let _ = ready_tx.send(Err(e.clone())); }
+            result
+        }).map_err(|e| e.to_string())?;
+        ready_rx.recv().map_err(|e| e.to_string())??;
+        Ok(Self { ctl_tx, pulse_rx, join: Some(join) })
+    }
 
-/// The Bevy-side handle to the DJ thread: a ctl sender and the pulse mirror
-/// receiver. `crossbeam_channel::Receiver` is already `Sync` (unlike tokio's
-/// `mpsc::UnboundedReceiver`, which is why [`RpcResultChannel`]
-/// (`connection/actor_plugin.rs`) needs a `Mutex` wrapper and this doesn't).
-#[derive(Resource)]
-pub struct DjHandle {
-    ctl_tx: mpsc::UnboundedSender<DjCtl>,
-    pulse_rx: crossbeam_channel::Receiver<DjPulse>,
+    pub fn is_finished(&self) -> bool {
+        self.join.as_ref().is_none_or(|join| join.is_finished())
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        let _ = self.ctl_tx.send(DjCtl::Shutdown);
+        if let Some(join) = self.join.take() {
+            join.join().map_err(|_| "DJ thread panicked".to_string())??;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for DjHandle {
     fn drop(&mut self) {
-        // Best-effort clean-shutdown signal. `audio_sched.rs`'s scheduler
-        // thread has no equivalent — it relies solely on its channel closing
-        // when every `Sender` drops — but `DjCtl` already has an explicit
-        // `Shutdown` the select! loop understands, so sending it here costs
-        // nothing and makes the intent explicit rather than incidental.
-        // Never blocks: no thread join, matching audio_sched's fire-and-
-        // forget posture — worst case (send fails because the thread is
-        // already gone) the drop of `ctl_tx` right after this still closes
-        // the channel, which the loop treats identically.
-        let _ = self.ctl_tx.send(DjCtl::Shutdown);
+        if let Err(e) = self.shutdown() { tracing::error!("{e}"); }
     }
 }
-
-/// A render-port send just happened — the patch bay lights the RENDER chord.
-/// The app can only observe its OWN traffic (`docs/scenes/patchbay.md`, the
-/// live layer): every send out the render seq port — an ABC cue or a 拍子木
-/// click — is one edge-observable event. Moved here from the deleted
-/// `midi.rs` (Task #4): the DJ thread is the sole producer now, mirrored
-/// Bevy-side by [`drain_dj_pulses`] folding each [`DjPulse::RenderTraffic`]
-/// into one of these. Consumed only by the patch bay
-/// (`view/patch_bay/mod.rs`).
-#[derive(Message)]
-pub struct RenderPortTraffic;
-
-/// Spawns the DJ thread and wires the Bevy-side forwarding systems
-/// (`docs/midi.md` "The DJ thread"). Registered in `main.rs`, replacing the
-/// deleted `AudioOutPlugin`/`MidiOutPlugin`/`MetronomePlugin` — the DJ
-/// dispatches every `audio/*`/`CLIP_MIME`/`PREPARE_MIME`/`text/vnd.abc` cue
-/// and every metronome click for real, so there is a live sink to make its
-/// output audible.
-pub struct DjPlugin;
-
-impl Plugin for DjPlugin {
-    fn build(&self, app: &mut App) {
-        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
-        let (pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
-        // Spawning the rodio scheduler thread moves here from the deleted
-        // `AudioOutPlugin::build` (`docs/pcm.md` R5) — its Bevy `Resource`
-        // insertion disappears with it: `audio.rs`'s now-deleted systems
-        // were its only consumer, so the handle rides straight into the DJ
-        // thread's own sinks instead.
-        let scheduler = crate::audio_sched::spawn();
-
-        std::thread::Builder::new()
-            .name("kaijutsu-dj".into())
-            .spawn(move || thread_main(ctl_rx, pulse_tx, scheduler))
-            .expect("spawn kaijutsu-dj thread");
-
-        app.insert_resource(DjHandle { ctl_tx, pulse_rx });
-        app.add_message::<RenderPortTraffic>();
-        app.add_systems(
-            Update,
-            (
-                forward_actor_to_dj,
-                forward_metronome_config_to_dj,
-                forward_midi_routes_to_dj,
-                drain_dj_pulses,
-            ),
-        );
-    }
-}
-
-/// Forward a fresh `RpcActor` to the DJ thread — the same `actor.is_changed()`
-/// idiom `poll_server_events` uses to detect a respawn/reconnect (a new
-/// generation after the bootstrap thread replaces the resource). The DJ
-/// thread holds its OWN broadcast subscription (`docs/midi.md`: "independent
-/// cursor — a stalled UI drain costs it nothing"), so it must re-subscribe on
-/// every change exactly like the UI poll systems do, never share theirs.
-fn forward_actor_to_dj(actor: Option<Res<RpcActor>>, conn: Res<RpcConnectionState>, dj: Res<DjHandle>) {
-    let Some(actor) = actor else { return };
-    if !actor.is_changed() {
-        return;
-    }
-    let _ = dj.ctl_tx.send(DjCtl::ActorReady {
-        handle: actor.handle.clone(),
-        ssh_config: conn.ssh_config.clone(),
-        generation: actor.generation,
-    });
-}
-
-/// Parse a fetched `metronome.toml` and forward it to the DJ thread — the
-/// same source event `metronome.rs::apply_metronome_config` consumes, mirrored
-/// here so the DJ's own click config tracks the per-client config
-/// independently of the (still-live, until Task #4) metronome resource. A
-/// parse failure warns and keeps the DJ's current config — ports
-/// `apply_metronome_config`'s existing fail-loud-but-don't-revert posture
-/// verbatim, never a silent fallback.
-fn forward_metronome_config_to_dj(mut results: MessageReader<RpcResultMessage>, dj: Res<DjHandle>) {
-    for result in results.read() {
-        if let RpcResultMessage::MetronomeConfigReceived(toml) = result {
-            match toml::from_str::<MetronomeConfig>(toml) {
-                Ok(cfg) => {
-                    let _ = dj.ctl_tx.send(DjCtl::MetronomeConfig(cfg));
-                }
-                Err(e) => {
-                    log::error!("metronome.toml is unparseable: {e}; DJ thread keeps its current config");
-                }
-            }
-        }
-    }
-}
-
-/// Forward the app's device→port picture to the DJ thread — how a
-/// device-addressed control cue (`kj midi send`, `docs/midi-next.md` slice 1
-/// step 4) finds a real port on this machine.
-///
-/// The matcher (`crate::midi_presence`) is the one place that knows both the
-/// profiles and the live rig, and it already recomputes the whole picture on
-/// every topology change; this system just ships it across the same ctl
-/// channel the actor and metronome config use. Change-detection gated, so a
-/// steady rig costs one `is_changed()` read per frame — and the DJ replaces
-/// its table wholesale, so an unplug removes routability immediately.
-fn forward_midi_routes_to_dj(
-    presence: Option<Res<crate::midi_presence::MidiPresenceState>>,
-    dj: Res<DjHandle>,
-) {
-    let Some(presence) = presence else { return };
-    if !presence.is_changed() {
-        return;
-    }
-    let _ = dj.ctl_tx.send(DjCtl::MidiRoutes(presence.routes().clone()));
-}
-
-/// Drain the DJ→Bevy mirror channel: fold each [`DjPulse`] into the Bevy-side
-/// message its consumer reads (`docs/midi.md`: "room glow, block sync"
-/// precedent from `poll_server_events`). The only pulse today is
-/// [`DjPulse::RenderTraffic`] → [`RenderPortTraffic`], consumed by the patch
-/// bay (`view/patch_bay/mod.rs::pulse_render_chords`).
-fn drain_dj_pulses(dj: Res<DjHandle>, mut traffic: MessageWriter<RenderPortTraffic>) {
-    while let Ok(pulse) = dj.pulse_rx.try_recv() {
-        match pulse {
-            DjPulse::RenderTraffic => {
-                traffic.write(RenderPortTraffic);
-            }
-        }
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -949,6 +780,51 @@ mod tests {
     use crate::audio_sched::{self, SchedulerCmd};
     use kaijutsu_audio::{ABC_MIME, BeatRef, CuePayload, RenderCue};
     use kaijutsu_types::ContextId;
+
+    fn connected_status() -> ConnectionStatus {
+        ConnectionStatus::Connected { kernel_id: kaijutsu_types::KernelId::new(), context_id: None, since_ms: 0 }
+    }
+
+    #[test]
+    fn disconnected_node_flushes_and_rejects_queued_playback() {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl<TestSource>>();
+        let (pulse_tx, _pulse_rx) = crossbeam_channel::unbounded();
+        let (audio, audio_rx) = audio_sched::test_handle();
+        let (midi, midi_rx) = RecordingMidiSink::new();
+        let join = std::thread::spawn(move || {
+            let (prefetch, prefetch_rx) = CasPrefetch::new();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(run_loop(ctl_rx, midi, DjSinks { audio: Some(audio) }, &prefetch, prefetch_rx, pulse_tx, |_| {}));
+        });
+        let (events, _keep_events) = broadcast::channel(16);
+        let (status, _keep_status) = watch::channel(connected_status());
+        ctl_tx.send(DjCtl::ActorReady { handle: TestSource { events: events.clone(), status: status.clone() }, ssh_config: SshConfig::default(), generation: 1 }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while events.receiver_count() < 2 && Instant::now() < deadline { std::thread::yield_now(); }
+        assert_eq!(events.receiver_count(), 2);
+        status.send(ConnectionStatus::Closing { cause: "test disconnect".into() }).unwrap();
+        assert!(matches!(audio_rx.recv_timeout(Duration::from_secs(1)), Ok(SchedulerCmd::Flush)));
+        assert!(matches!(midi_rx.recv_timeout(Duration::from_secs(1)), Ok(MidiCmd::Flush)));
+        events.send(ServerEvent::RenderCue { context_id: ContextId::new(), cue: RenderCue::now_inline("audio/wav", vec![1, 2, 3]) }).unwrap();
+        let replayed = audio_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        ctl_tx.send(DjCtl::Shutdown).unwrap();
+        join.join().unwrap();
+        assert!(!replayed, "disconnected nodes must not play buffered events after flushing");
+    }
+
+    #[test]
+    fn shutdown_flushes_both_hardware_schedulers() {
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<DjCtl<TestSource>>();
+        let (pulse_tx, _pulse_rx) = crossbeam_channel::unbounded();
+        let (prefetch, prefetch_rx) = CasPrefetch::new();
+        let (midi, midi_rx) = RecordingMidiSink::new();
+        let (audio, audio_rx) = audio_sched::test_handle();
+        ctl_tx.send(DjCtl::Shutdown).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(run_loop(ctl_rx, midi, DjSinks { audio: Some(audio) }, &prefetch, prefetch_rx, pulse_tx, |_| {}));
+        assert!(matches!(midi_rx.try_recv(), Ok(MidiCmd::Flush)));
+        assert!(matches!(audio_rx.try_recv(), Ok(SchedulerCmd::Flush)));
+    }
 
     use super::super::core::{ClockMode, DueClicks, TransitionReason};
 
@@ -1346,7 +1222,7 @@ mod tests {
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
-                rt.block_on(run_loop(ctl_rx, MidiSink::default(), DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, move |effect| {
+                rt.block_on(run_loop(ctl_rx, MidiSink::open(false).unwrap(), DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, move |effect| {
                     let _ = effect_tx.send(effect);
                 }));
             })
@@ -1356,7 +1232,7 @@ mod tests {
         // driving a fresh, unstamped BeatSync to the deterministic first-ever
         // Fold transition.
         let (events_a, _keep_a) = broadcast::channel(16);
-        let (status_a, _keep_sa) = watch::channel(ConnectionStatus::Idle);
+        let (status_a, _keep_sa) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
                 handle: TestSource { events: events_a.clone(), status: status_a.clone() },
@@ -1398,6 +1274,7 @@ mod tests {
         );
 
         // Confirm B's event subscription is live: a fresh anchor on B.
+        status_b.send(connected_status()).unwrap();
         let reanchored = send_until_observed(&events_b, &effect_rx, || beat_sync(0.0, 2.0), Duration::from_secs(2));
         assert_eq!(
             reanchored,
@@ -1450,7 +1327,7 @@ mod tests {
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
-                rt.block_on(run_loop(ctl_rx, MidiSink::default(), DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
+                rt.block_on(run_loop(ctl_rx, MidiSink::open(false).unwrap(), DjSinks::default(), &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
             })
             .expect("spawn test dj thread");
 
@@ -1476,15 +1353,15 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
                 let sinks = DjSinks { audio: Some(scheduler) };
-                rt.block_on(run_loop(ctl_rx, MidiSink::default(), sinks, &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
+                rt.block_on(run_loop(ctl_rx, MidiSink::open(false).unwrap(), sinks, &prefetch, prefetch_rx, pulse_tx, |_effect: DjEffect| {}));
             })
             .expect("spawn test dj thread");
 
         let (events, _keep_events) = broadcast::channel(16);
-        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status },
+                handle: TestSource { events: events.clone(), status: status.clone() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1537,17 +1414,17 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
                 let sinks = DjSinks { audio: Some(scheduler) };
-                rt.block_on(run_loop(ctl_rx, MidiSink::default(), sinks, &prefetch, prefetch_rx, pulse_tx, move |effect| {
+                rt.block_on(run_loop(ctl_rx, MidiSink::open(false).unwrap(), sinks, &prefetch, prefetch_rx, pulse_tx, move |effect| {
                     let _ = effect_tx.send(effect);
                 }));
             })
             .expect("spawn test dj thread");
 
         let (events, _keep_events) = broadcast::channel(16);
-        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status },
+                handle: TestSource { events: events.clone(), status: status.clone() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1654,17 +1531,17 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let (prefetch, prefetch_rx) = CasPrefetch::new();
                 let sinks = DjSinks { audio: Some(scheduler) };
-                rt.block_on(run_loop(ctl_rx, MidiSink::default(), sinks, &prefetch, prefetch_rx, pulse_tx, move |effect| {
+                rt.block_on(run_loop(ctl_rx, MidiSink::open(false).unwrap(), sinks, &prefetch, prefetch_rx, pulse_tx, move |effect| {
                     let _ = effect_tx.send(effect);
                 }));
             })
             .expect("spawn test dj thread");
 
         let (events, _keep_events) = broadcast::channel(16);
-        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status },
+                handle: TestSource { events: events.clone(), status: status.clone() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1726,10 +1603,10 @@ mod tests {
             .expect("spawn test dj thread");
 
         let (events, _keep_events) = broadcast::channel(16);
-        let (status, _keep_status) = watch::channel(ConnectionStatus::Idle);
+        let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status },
+                handle: TestSource { events: events.clone(), status: status.clone() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1767,101 +1644,4 @@ mod tests {
         join.join().expect("dj test thread panicked");
     }
 
-    // ── Bevy-side: forward_metronome_config_to_dj ───────────────────────
-
-    #[test]
-    fn forward_metronome_config_parses_and_forwards_to_the_ctl_channel() {
-        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
-        let (_pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
-
-        let mut app = App::new();
-        app.insert_resource(DjHandle { ctl_tx, pulse_rx })
-            .add_message::<RpcResultMessage>()
-            .add_systems(Update, forward_metronome_config_to_dj);
-        app.world_mut().write_message(RpcResultMessage::MetronomeConfigReceived(
-            "enabled = false\nnote = 72\nchannel = 9\nvelocity = 40\ngate_ms = 30\n".to_string(),
-        ));
-        app.update();
-
-        // Read the ctl channel BEFORE `app` (and its `DjHandle`) drops —
-        // `DjHandle::drop` sends its own `DjCtl::Shutdown`, which would
-        // otherwise queue up behind the message forwarded above.
-        //
-        // `DjCtl<ActorHandle>` isn't `Debug` (`ActorHandle` isn't), so match
-        // explicitly rather than formatting the whole value on failure.
-        match ctl_rx.try_recv() {
-            Ok(DjCtl::MetronomeConfig(cfg)) => {
-                assert_eq!(cfg, MetronomeConfig { enabled: false, note: 72, channel: 9, velocity: 40, gate_ms: 30 });
-            }
-            Ok(DjCtl::ActorReady { .. }) => panic!("expected MetronomeConfig, got ActorReady"),
-            Ok(DjCtl::MidiRoutes(_)) => panic!("expected MetronomeConfig, got MidiRoutes"),
-            Ok(DjCtl::Shutdown) => panic!("expected MetronomeConfig, got Shutdown"),
-            Err(e) => panic!("expected a forwarded MetronomeConfig, got error: {e:?}"),
-        }
-    }
-
-    #[test]
-    fn forward_metronome_config_keeps_quiet_on_a_parse_failure() {
-        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
-        let (_pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
-
-        let mut app = App::new();
-        app.insert_resource(DjHandle { ctl_tx, pulse_rx })
-            .add_message::<RpcResultMessage>()
-            .add_systems(Update, forward_metronome_config_to_dj);
-        app.world_mut()
-            .write_message(RpcResultMessage::MetronomeConfigReceived("this is not valid toml =".to_string()));
-        app.update();
-
-        // Read before `app` drops — see the sibling test's comment on why
-        // `DjHandle::drop`'s own `Shutdown` must not be read here instead.
-        assert!(
-            ctl_rx.try_recv().is_err(),
-            "a parse failure must forward nothing — the DJ thread keeps its current config"
-        );
-    }
-
-    // ── MIDI routes → DJ thread (docs/midi-next.md slice 1 step 4) ────────
-
-    /// The matcher's device→port picture reaches the DJ thread, which is the
-    /// only way a device-addressed `kj midi send` finds a real port.
-    #[test]
-    fn forward_midi_routes_ships_the_matchers_picture_to_the_ctl_channel() {
-        use crate::midi_presence::MidiPresenceState;
-
-        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
-        let (_pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
-
-        let mut app = App::new();
-        app.insert_resource(DjHandle { ctl_tx, pulse_rx })
-            .init_resource::<MidiPresenceState>()
-            .add_systems(Update, forward_midi_routes_to_dj);
-        // A freshly inserted resource counts as changed, so the first frame
-        // already ships the (empty) picture — correct: "this sink routes
-        // nothing" is a fact the DJ needs, not an absence.
-        app.update();
-        match ctl_rx.try_recv() {
-            Ok(DjCtl::MidiRoutes(routes)) => assert!(routes.is_empty(), "routes: {routes:?}"),
-            Ok(_) => panic!("expected MidiRoutes"),
-            Err(e) => panic!("expected a forwarded MidiRoutes, got error: {e:?}"),
-        }
-
-        // A steady rig is silent: no change, no ctl traffic.
-        app.update();
-        assert!(ctl_rx.try_recv().is_err(), "an unchanged picture must forward nothing");
-    }
-
-    /// With no presence plugin registered at all (a headless/GUI-less build
-    /// path), the forwarder is a no-op rather than a panic on the missing
-    /// resource.
-    #[test]
-    fn forward_midi_routes_is_a_no_op_without_the_presence_resource() {
-        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<DjCtl>();
-        let (_pulse_tx, pulse_rx) = crossbeam_channel::unbounded::<DjPulse>();
-        let mut app = App::new();
-        app.insert_resource(DjHandle { ctl_tx, pulse_rx })
-            .add_systems(Update, forward_midi_routes_to_dj);
-        app.update();
-        assert!(ctl_rx.try_recv().is_err());
-    }
 }

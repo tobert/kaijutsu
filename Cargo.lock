@@ -6054,6 +6054,7 @@ dependencies = [
  "indexmap 2.14.0",
  "kaijutsu-abc",
  "kaijutsu-audio",
+ "kaijutsu-audio-runtime",
  "kaijutsu-cas",
  "kaijutsu-client",
  "kaijutsu-diff",
@@ -6074,7 +6075,6 @@ dependencies = [
  "pulldown-cmark",
  "rect_packer",
  "resvg",
- "rodio",
  "russh-sftp",
  "serde",
  "serde_json",
@@ -6102,6 +6102,37 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "kaijutsu-audio-runtime"
+version = "0.1.0"
+dependencies = [
+ "alsa 0.9.1",
+ "anyhow",
+ "clap",
+ "cpal",
+ "crossbeam-channel",
+ "dirs",
+ "hostname",
+ "kaijutsu-abc",
+ "kaijutsu-audio",
+ "kaijutsu-cas",
+ "kaijutsu-client",
+ "kaijutsu-telemetry",
+ "kaijutsu-types",
+ "libc",
+ "log",
+ "rodio",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "whoami",
 ]
 
 [[package]]

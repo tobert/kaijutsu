@@ -38,12 +38,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bevy::prelude::*;
+use tracing::{debug, info};
 use kaijutsu_client::MidiExchangeRequest;
 
-use crate::connection::actor_plugin::RpcActor;
 
 /// device → its matched ports' backend addresses, in match order. The same
 /// shape (and the same source) as [`crate::dj::midi::MidiRoutes`]: the app's
@@ -140,124 +140,60 @@ pub(crate) fn matches_reply(message: &[u8], reply_match: &[u8]) -> bool {
     message.starts_with(reply_match)
 }
 
-// ── the Bevy side: install the sink, keep its routes fresh ─────────────────
-
-/// The worker's shared state: the routing table Bevy keeps current, and the
-/// channel the client's [`MidiExchangeSlot`](kaijutsu_client::MidiExchangeSlot)
-/// hands requests to.
-#[derive(Resource)]
-pub struct MidiExchange {
-    /// Written by [`forward_routes`], read by the worker thread per request —
-    /// so an exchange always resolves against the CURRENT picture, not the
-    /// one that existed when the worker started.
-    routes: Arc<RwLock<ExchangeRoutes>>,
-    sender: kaijutsu_client::MidiExchangeSender,
-    /// Generation of the actor whose slot we last installed into, so a
-    /// reconnect/respawn re-installs exactly once.
-    installed_generation: Option<u64>,
-}
-
-impl MidiExchange {
-    /// The routes this sink can currently reach (for debug/UI).
-    // Deliberately unused for now — no UI/debug consumer exists yet
-    // (docs/issues.md candidate: wire this up or drop it).
-    #[allow(dead_code)]
-    pub fn routes(&self) -> ExchangeRoutes {
-        self.routes
-            .read()
-            .expect("exchange routes lock poisoned")
-            .clone()
-    }
-}
-
-pub struct MidiExchangePlugin;
-
-impl Plugin for MidiExchangePlugin {
-    fn build(&self, app: &mut App) {
-        let routes: Arc<RwLock<ExchangeRoutes>> = Arc::new(RwLock::new(ExchangeRoutes::new()));
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MidiExchangeRequest>();
-        spawn_exchange_thread(rx, routes.clone());
-        app.insert_resource(MidiExchange {
-            routes,
-            sender: tx,
-            installed_generation: None,
-        })
-        .add_systems(Update, (install_sink, forward_routes));
-    }
-}
-
-/// Seat this app's exchange worker in the actor's slot, once per actor
-/// generation. Until this runs the kernel is told "no sink installed" —
-/// loudly, which is the correct answer for the window before the app is
-/// connected.
-fn install_sink(actor: Option<Res<RpcActor>>, mut exchange: ResMut<MidiExchange>) {
-    let Some(actor) = actor else { return };
-    if exchange.installed_generation == Some(actor.generation) {
-        return;
-    }
-    actor.handle.midi_exchange().install(exchange.sender.clone());
-    exchange.installed_generation = Some(actor.generation);
-    info!("MIDI exchange: sink installed for actor generation {}", actor.generation);
-}
-
-/// Keep the worker's routing table in step with the matcher — the same source
-/// and the same whole-picture-replacement discipline
-/// `dj::thread::forward_midi_routes_to_dj` uses for control cues. A device
-/// that stopped matching must stop being askable in the same instant: its
-/// address may already belong to different gear.
-fn forward_routes(
-    presence: Option<Res<crate::midi_presence::MidiPresenceState>>,
-    exchange: Res<MidiExchange>,
-) {
-    let Some(presence) = presence else { return };
-    if !presence.is_changed() {
-        return;
-    }
-    *exchange
-        .routes
-        .write()
-        .expect("exchange routes lock poisoned") = presence.routes().clone();
-}
-
 // ── the worker thread ──────────────────────────────────────────────────────
+
+fn next_request(rx: &mut kaijutsu_client::MidiExchangeReceiver, stop: &AtomicBool) -> Option<MidiExchangeRequest> {
+    while !stop.load(Ordering::Relaxed) {
+        match rx.try_recv() {
+            Ok(request) => return Some(request),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                // A callback may retain a sender while waiting on its reply.
+                // Shutdown must not depend on that callback being polled.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    None
+}
 
 /// Spawn the dedicated exchange thread. It owns its own ALSA seq client for
 /// the life of the process and answers one request at a time.
 #[cfg(target_os = "linux")]
-fn spawn_exchange_thread(
+pub(crate) fn spawn_exchange_thread(
     mut rx: kaijutsu_client::MidiExchangeReceiver,
     routes: Arc<RwLock<ExchangeRoutes>>,
-) {
-    let spawned = std::thread::Builder::new()
+    stop: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    std::thread::Builder::new()
         .name("kaijutsu-midi-exchange".into())
         .spawn(move || {
             // Opened lazily on the FIRST request, not at startup: a machine
             // with no sequencer should not log an error just for running the
             // app, and the failure belongs in the answer to whoever asked.
             let mut client: Option<ExchangeClient> = None;
-            while let Some(req) = rx.blocking_recv() {
-                let answer = run_one(&mut client, &routes, &req);
+            while let Some(req) = next_request(&mut rx, &stop) {
+                let answer = if stop.load(Ordering::Relaxed) { Err("audio node is stopping".into()) }
+                    else { run_one(&mut client, &routes, &req, &stop) };
                 let _ = req.reply.send(answer);
             }
             info!("MIDI exchange: worker thread exiting (channel closed)");
-        });
-    if let Err(e) = spawned {
-        error!("MIDI exchange: could not spawn the worker thread: {e}");
-    }
+        }).map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn spawn_exchange_thread(
+pub(crate) fn spawn_exchange_thread(
     mut rx: kaijutsu_client::MidiExchangeReceiver,
     _routes: Arc<RwLock<ExchangeRoutes>>,
-) {
+    stop: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>, String> {
     // No ALSA here. Answer every request with the honest reason rather than
     // leaving the kernel to time out — a Mac sink says "not this backend",
     // and some other sink on the rig may well have the device.
     std::thread::Builder::new()
         .name("kaijutsu-midi-exchange".into())
         .spawn(move || {
-            while let Some(req) = rx.blocking_recv() {
+            while let Some(req) = next_request(&mut rx, &stop) {
                 let _ = req.reply.send(Err(
                     "MIDI exchange is Linux/ALSA-only on this build; this sink cannot \
                      run a device dialogue"
@@ -265,7 +201,7 @@ fn spawn_exchange_thread(
                 ));
             }
         })
-        .ok();
+        .map_err(|e| e.to_string())
 }
 
 /// One request, start to finish: resolve the port, open the client if needed,
@@ -276,6 +212,7 @@ fn run_one(
     client: &mut Option<ExchangeClient>,
     routes: &Arc<RwLock<ExchangeRoutes>>,
     req: &MidiExchangeRequest,
+    stop: &Arc<AtomicBool>,
 ) -> Result<Vec<u8>, String> {
     let address = {
         let routes = routes.read().expect("exchange routes lock poisoned");
@@ -288,6 +225,7 @@ fn run_one(
         *client = Some(ExchangeClient::open()?);
     }
     let client = client.as_mut().expect("just opened");
+    client.stop = Some(stop.clone());
     debug!(
         "MIDI exchange: {} byte(s) → '{}' at {address}, waiting {:?}",
         req.payload.len(),
@@ -314,6 +252,7 @@ struct ExchangeClient {
     seq: alsa::Seq,
     port: i32,
     client_id: i32,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -340,7 +279,7 @@ impl ExchangeClient {
             .map_err(map)?;
         let client_id = seq.client_id().map_err(map)?;
         info!("kaijutsu-exchange MIDI client open on ALSA seq {client_id}:{port}");
-        Ok(Self { seq, port, client_id })
+        Ok(Self { seq, port, client_id, stop: None })
     }
 
     fn addr(&self) -> alsa::seq::Addr {
@@ -403,6 +342,9 @@ impl ExchangeClient {
         let deadline = std::time::Instant::now() + timeout;
 
         while std::time::Instant::now() < deadline {
+            if self.stop.as_ref().is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+                return Err("audio node stopped during MIDI exchange".into());
+            }
             let mut input = self.seq.input();
             if input.event_input_pending(true).unwrap_or(0) == 0 {
                 std::thread::sleep(POLL_INTERVAL);
@@ -545,6 +487,20 @@ impl ExchangeClient {
 mod tests {
     use super::*;
 
+    #[test]
+    fn idle_worker_stops_even_while_a_callback_holds_a_sender() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = spawn_exchange_thread(rx, Arc::new(RwLock::new(BTreeMap::new())), stop.clone()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || { worker.join().unwrap(); done_tx.send(()).unwrap(); });
+        stop.store(true, Ordering::Relaxed);
+        let stopped = done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        drop(tx);
+        joiner.join().unwrap();
+        assert!(stopped, "shutdown must not depend on a callback dropping its sender");
+    }
+
     fn routes(pairs: &[(&str, &[&str])]) -> ExchangeRoutes {
         pairs
             .iter()
@@ -661,57 +617,6 @@ mod tests {
         assert!(
             matches_reply(&IDENTITY_REPLY, &[]),
             "an empty filter takes the first complete message"
-        );
-    }
-
-    // ── the Bevy wiring ───────────────────────────────────────────────────
-
-    /// The plugin owns its worker from `build`, so the resource (and the
-    /// sink channel behind it) exists before any connection does — an
-    /// exchange that arrives on the first frame has somewhere to go.
-    #[test]
-    fn the_plugin_installs_the_exchange_resource() {
-        let mut app = App::new();
-        app.add_plugins(MidiExchangePlugin);
-        assert!(app.world().get_resource::<MidiExchange>().is_some());
-        assert!(
-            app.world().resource::<MidiExchange>().routes().is_empty(),
-            "a fresh sink can reach nothing until the matcher says otherwise"
-        );
-    }
-
-    /// Routes reach the worker through the shared table, whole-picture at a
-    /// time — a device that stops matching stops being askable in the same
-    /// instant (its address may already belong to different gear).
-    #[test]
-    fn matcher_routes_reach_the_worker_and_replace_wholesale() {
-        let mut app = App::new();
-        app.add_plugins(MidiExchangePlugin)
-            .init_resource::<crate::midi_presence::MidiPresenceState>();
-
-        // Nothing matched yet.
-        app.update();
-        assert!(app.world().resource::<MidiExchange>().routes().is_empty());
-
-        // The matcher's picture is what the worker resolves against; write it
-        // the way `reconcile_presence` does and let the system carry it over.
-        app.world_mut()
-            .resource_mut::<crate::midi_presence::MidiPresenceState>()
-            .set_routes_for_test(routes(&[("keystep-pro", &["24:0"])]));
-        app.update();
-        assert_eq!(
-            app.world().resource::<MidiExchange>().routes()["keystep-pro"],
-            vec!["24:0".to_string()]
-        );
-
-        // Unplug: the whole table is replaced, not merged.
-        app.world_mut()
-            .resource_mut::<crate::midi_presence::MidiPresenceState>()
-            .set_routes_for_test(ExchangeRoutes::new());
-        app.update();
-        assert!(
-            app.world().resource::<MidiExchange>().routes().is_empty(),
-            "a device that stopped matching must stop being askable"
         );
     }
 

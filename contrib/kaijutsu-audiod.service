@@ -1,0 +1,18 @@
+[Unit]
+Description=Kaijutsu audio and MIDI node
+After=network.target sound.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kaijutsu-audiod --host localhost --rt-priority 20
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+Environment=RUST_LOG=info
+
+# User unit. Configure host, key, output and capture context with an ExecStart
+# override. RT requests are best-effort. A user manager cannot grant more
+# rtprio than it inherited; see docs/audio-daemon.md for system service setup.
+
+[Install]
+WantedBy=default.target

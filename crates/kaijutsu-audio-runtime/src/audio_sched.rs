@@ -1,39 +1,12 @@
-//! App-owned rodio scheduler thread (`docs/pcm.md` R5, "the app owns rodio
-//! outright" — decided 2026-07-16): Bevy's `AudioPlayer` has no scheduling
-//! primitive and no source-range/gain control, so `bevy_audio` leaves the
-//! sink entirely (`main.rs` disables `bevy::audio::AudioPlugin`). This module
-//! is the ONE path for ALL sample playback from here on — play-now and
-//! scheduled/trimmed/gained are the same mechanism, never two.
-//!
-//! rodio 0.22's `MixerDeviceSink` (built via `DeviceSinkBuilder`, and the
-//! `cpal::Stream` it wraps) is `!Send`, so it is built and lives entirely on
-//! ONE dedicated `std::thread` — [`run`] — and never touches Bevy's main
-//! thread. Bevy systems in `audio.rs` never see rodio types at all: they
-//! compute a deadline (via [`effective_deadline`]) and send a
-//! [`SchedulerCmd`] over a crossbeam channel; everything rodio-shaped lives
-//! from [`spawn`] down.
-//!
-//! [`backdated_lead`]/[`effective_deadline`] mirror `midi.rs::backdate_events`'s
-//! epoch-backdating discipline (`docs/midi.md` "The one timebase") collapsed
-//! to a single go/no-go/when decision: a scheduled *sound* (unlike a phrase
-//! of MIDI events) has no event list to partially drop — it either fires
-//! now, fires later, or the whole cue is rejected as too stale to trust.
-//!
-//! Testability (the house TDD rule): only [`DeviceSinkBuilder::open_default_sink`]
-//! and the eventual `Player::append` genuinely need a live audio device —
-//! everything else (the backdating ladder, the deadline-ordered pending
-//! queue, decoding + trim + gain) is plain data and pure functions,
-//! exercised without one. [`build_source`] and [`handle_cmd`] both work fine
-//! with `output: None` (the graceful no-device path this module already
-//! needs for a headless box), so unit tests drive them directly; only the
-//! literal thread-plus-device smoke test at the bottom is `#[ignore]`d.
+//! PCM decoding, trim/gain and playback on a dedicated device thread.
+//! Missing or failed output is an explicit runtime error.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering as AtomicOrdering}};
 
-use bevy::prelude::Resource;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source, decoder::DecoderError};
 use tracing::warn;
@@ -73,12 +46,13 @@ pub(crate) enum SchedulerCmd {
 /// [`Self::play_now`]/[`Self::play_at`]/[`Self::flush`] rather than building
 /// a [`SchedulerCmd`] themselves, so the wire shape stays an implementation
 /// detail this module can change freely.
-#[derive(Resource)]
 pub(crate) struct AudioSchedulerHandle {
     tx: Sender<SchedulerCmd>,
+    failed: Arc<AtomicBool>,
 }
 
 impl AudioSchedulerHandle {
+    pub(crate) fn failed(&self) -> bool { self.failed.load(AtomicOrdering::Relaxed) }
     /// Play-now parity: decode + append immediately, no trim, no gain.
     pub(crate) fn play_now(&self, bytes: Vec<u8>) {
         // A closed receiver only means the scheduler thread is gone (app
@@ -112,19 +86,62 @@ impl AudioSchedulerHandle {
     }
 }
 
-/// Spawn the scheduler thread and return the Bevy-side handle. Building the
-/// `MixerDeviceSink` happens ON the new thread (rodio 0.22's
-/// `MixerDeviceSink` is `!Send` — it cannot be built here and handed over).
-/// A missing/broken audio device degrades gracefully: [`run`] warns once and
-/// keeps draining commands so a headless box neither wedges nor crashes the
-/// app, matching `midi.rs`'s no-ALSA posture.
-pub(crate) fn spawn() -> AudioSchedulerHandle {
+/// Open the selected output on its owning thread before reporting readiness.
+pub(crate) fn spawn(output_name: Option<String>, priority: u8) -> Result<(AudioSchedulerHandle, std::thread::JoinHandle<Result<(), String>>), String> {
     let (tx, rx) = unbounded();
-    std::thread::Builder::new()
+    let failed = Arc::new(AtomicBool::new(false));
+    let worker_failed = failed.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let join = std::thread::Builder::new()
         .name("kaijutsu-audio-sched".into())
-        .spawn(move || run(rx))
-        .expect("spawn kaijutsu-audio-sched thread");
-    AudioSchedulerHandle { tx }
+        .spawn(move || {
+            let initialized = open_output(output_name.as_deref(), worker_failed.clone());
+            match initialized {
+                Ok(output) => {
+                    if let Err(e) = crate::scheduling::set_priority(priority) {
+                        warn!("{e}; continuing at the current scheduling priority");
+                    }
+                    let _ = ready_tx.send(Ok(()));
+                    run(rx, output, worker_failed)
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e.clone()));
+                    Err(e)
+                }
+            }
+        }).map_err(|e| e.to_string())?;
+    ready_rx.recv().map_err(|e| e.to_string())??;
+    Ok((AudioSchedulerHandle { tx, failed }, join))
+}
+
+fn open_output(name: Option<&str>, failed: Arc<AtomicBool>) -> Result<MixerDeviceSink, String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let device = match name {
+        Some(name) => {
+            let mut matches = host.output_devices().map_err(|e| e.to_string())?
+                .filter(|d| d.description().is_ok_and(|description| description.name() == name));
+            let device = matches.next().ok_or_else(|| format!("audio output '{name}' not found; run --list-outputs"))?;
+            if matches.next().is_some() {
+                return Err(format!("audio output '{name}' is ambiguous"));
+            }
+            device
+        }
+        None => host.default_output_device().ok_or("no default audio output; select --output or use --no-audio")?,
+    };
+    DeviceSinkBuilder::from_device(device).map_err(|e| e.to_string())?
+        .with_error_callback(move |error| {
+            tracing::error!("audio device stream failed: {error}");
+            failed.store(true, AtomicOrdering::Relaxed);
+        })
+        .open_stream().map_err(|e| format!("cannot open audio output: {e}"))
+}
+
+pub fn output_names() -> Result<Vec<String>, String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    cpal::default_host().output_devices().map_err(|e| e.to_string())?
+        .map(|device| device.description().map(|description| description.name().to_string()).map_err(|e| e.to_string()))
+        .collect()
 }
 
 // ── Backdating (mirrors midi.rs::backdate_events, collapsed to one sound) ──
@@ -377,33 +394,26 @@ fn handle_cmd(
 /// sleep-until-deadline wait — a fresh command wakes it early with no
 /// separate unpark to wire up, and a timeout means it's time to fire
 /// whatever's ready.
-fn run(rx: Receiver<SchedulerCmd>) {
-    let output = match DeviceSinkBuilder::open_default_sink() {
-        Ok(sink) => Some(sink),
-        Err(e) => {
-            warn!(
-                "kaijutsu-audio-sched: no audio output device ({e}); render cues will be drained \
-                 silently rather than wedging the app"
-            );
-            None
-        }
-    };
+fn run(rx: Receiver<SchedulerCmd>, output: MixerDeviceSink, failed: Arc<AtomicBool>) -> Result<(), String> {
+    let output = Some(output);
     let mut pending: BinaryHeap<Scheduled<BoxedSource>> = BinaryHeap::new();
     let mut live: Vec<Player> = Vec::new();
     let mut next_seq: u64 = 0;
 
     loop {
+        if failed.load(AtomicOrdering::Relaxed) { return Err("audio output stream failed; restart the audio node after restoring the device".into()); }
         // Opportunistic pruning: cheap, and keeps `live` from growing
         // unbounded across a long session.
         live.retain(|p| !p.empty());
 
         let cmd = match pending.peek() {
-            None => match rx.recv() {
+            None => match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(cmd) => cmd,
-                Err(_) => return, // every Sender dropped — app is shutting down
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
             },
             Some(top) => {
-                let wait = top.deadline.saturating_duration_since(Instant::now());
+                let wait = top.deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(100));
                 match rx.recv_timeout(wait) {
                     Ok(cmd) => cmd,
                     Err(RecvTimeoutError::Timeout) => {
@@ -412,7 +422,7 @@ fn run(rx: Receiver<SchedulerCmd>) {
                         }
                         continue;
                     }
-                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
                 }
             }
         };
@@ -425,7 +435,7 @@ fn run(rx: Receiver<SchedulerCmd>) {
 #[cfg(test)]
 pub(crate) fn test_handle() -> (AudioSchedulerHandle, Receiver<SchedulerCmd>) {
     let (tx, rx) = unbounded();
-    (AudioSchedulerHandle { tx }, rx)
+    (AudioSchedulerHandle { tx, failed: Arc::new(AtomicBool::new(false)) }, rx)
 }
 
 #[cfg(test)]
@@ -854,7 +864,7 @@ mod tests {
             eprintln!("skipping: {TEST_WAV} not present on this machine");
             return;
         };
-        let handle = spawn();
+        let (handle, join) = spawn(None, 0).unwrap();
         handle.play_now(bytes.clone());
         handle.play_at(
             bytes,
@@ -866,5 +876,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(400));
         handle.flush();
         std::thread::sleep(Duration::from_millis(50));
+        drop(handle);
+        join.join().unwrap().unwrap();
     }
 }

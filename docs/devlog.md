@@ -134,6 +134,18 @@ The longest arc, and the one that forced most of the system's ideas to get
 real. Canonical designs: `docs/chameleon.md`, `docs/tracks.md`, `docs/midi.md`,
 `docs/pcm.md` (which absorbed `docs/clips.md`, 2026-07-16), `docs/hyoushigi.md`.
 
+The next hardware owner became a separate audio daemon (September 7).
+Amy wanted MIDI presence and music to survive closing the 3D app, then widened
+the task to PCM: "a realtime audio daemon we can put on various machines that
+have audio hardware." She clarified that realtime meant an ordinary service
+with Linux RT priority available, not a new scheduling architecture. The DJ,
+PCM scheduler and MIDI workers moved into a reusable library; the app retains
+an opt-in in-process host. Each node connects over SSH and performs kernel
+cues. The kernel remains the sole sequencer, while clients retain local beat
+phasors for display. Device-open failure is explicit, RT-priority failure is
+a warning, and the hardware lifetime no longer depends on a window.
+`docs/audio-daemon.md` is the deployment guide.
+
 **The chameleon loop (June 13).** The first loop reached MIDI end to end:
 models playing to a beat, a player's turn text *being* the score
 (`on_turn_completed` eager-parses ABC). The hard-won constraint: players must
@@ -2533,4 +2545,3 @@ the kernel: the hook listener archived its own context on any session's
 end, because the id it thought was its own came from a transcript scrape
 that named the session before. Amy reconnected to the fixed binary before
 lunch.
-

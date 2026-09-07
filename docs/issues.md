@@ -6097,17 +6097,26 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 - **README doc-table** repoints to `docs/instrument-design.md` in the working
   tree but is uncommitted until that doc lands.
 
+## Audio nodes — follow-up after daemon extraction
+
+`docs/audio-daemon.md` describes the implemented daemon and deployment.
+
+- Named render destinations: playback currently broadcasts to every attached
+  render client. Multiple machines need an explicit destination contract.
+- Remote patch-bay topology and traffic: the app still observes local ALSA;
+  the daemon's in-process traffic pulse does not reach another process.
+- Bound capture ingress: the hardware worker feeds an unbounded channel before
+  the bounded capture ring. A prolonged stalled consumer can accumulate data
+  before ring overwrite accounting applies. Preserve topology notifications
+  and explicit capture-loss reporting when bounding this channel.
+- Generic `kj` help still understates MIDI verbs and contains stale config/CRDT
+  wording. The live subcommand help is more complete.
+- Dependency lint: strict clippy for the audio crate without `--no-deps` stops
+  in `kaijutsu-telemetry/src/otel.rs`, where two sampler branches both return
+  `0.1` (`if_same_then_else`). The audio crate can be checked with `--no-deps`.
+
 ## Architecture & System Design
 
-- **Headless render sink (edge-node agent) — MIDI + PCM:** PCM slice 5c-3
-  demolished the server's in-process `AlsaMidiOut` + `kj transport render`, so the
-  kernel/server binary now links **no** audio/MIDI FFI (goal achieved). The app is
-  the render sink today; a **headless kernel with no app attached makes no sound**
-  (MIDI is sink-dependent by design — `docs/midi.md`). The remaining gap: a
-  headless edge-node agent that attaches over RPC and plays cues (Symphonia/ALSA
-  for PCM, ALSA-seq for MIDI) — `midi.md`'s "first kernel-owned compute node" (M4)
-  and `pcm.md` slice 4. Reuses the exact wire `RenderCue` the app consumes; the
-  speculation-lead `at`→`lead` scheduling already travels with it.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
 - **`context_type` newtype — declined, not deferred (2026-06-28).** The beat

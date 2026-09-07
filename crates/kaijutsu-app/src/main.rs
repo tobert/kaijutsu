@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long)]
     insecure: bool,
 
+    /// Own local MIDI and audio devices in this process. Off by default;
+    /// use kaijutsu-audiod for hardware I/O independent of the GUI.
+    #[arg(long)]
+    audio: bool,
+
     /// Start borderless-fullscreen on the primary monitor (runner/gamescope)
     #[arg(long, conflicts_with = "maximize")]
     fullscreen: bool,
@@ -66,7 +71,6 @@ struct Cli {
     shares: Vec<kaijutsu_client::ShareArg>,
 }
 
-mod audio_sched;
 mod cell;
 mod commands;
 mod config;
@@ -75,11 +79,7 @@ mod constants;
 mod dj;
 mod input;
 mod kaish;
-mod midi_exchange;
-mod midi_in;
-mod midi_match;
-mod midi_presence;
-mod patch_graph;
+use kaijutsu_audio_runtime::patch_graph;
 mod peers;
 mod shaders;
 mod text;
@@ -254,30 +254,7 @@ fn main() {
         // subsystem on (re)connect and serves any --share directories. A
         // no-op plugin when no --share flag was given.
         .add_plugins(connection::ShareDialPlugin { ssh_config, share_config })
-        // Render sinks (docs/pcm.md, docs/midi.md): ServerEvent::RenderCue,
-        // dispatched by mime, ALL off the DJ thread's own select! loop now
-        // (docs/midi.md "The DJ thread") — not frame-coupled Bevy systems.
-        // DjPlugin spawns the DJ thread (which owns ABC→MIDI dispatch, the
-        // ALSA render sink + patch-bay auto-connect, and the metronome click
-        // policy end to end) and the rodio scheduler thread it drives
-        // (`audio_sched.rs`; moved from the deleted `AudioOutPlugin`). The
-        // demolished `midi::MidiOutPlugin` and `metronome::MetronomePlugin`
-        // are gone — `dj::midi::MidiSink`/`dj::DjCore` are their sole
-        // successors.
-        .add_plugins(dj::DjPlugin)
-        // The ear (docs/midi.md M2): device MIDI → ring → windowed batches →
-        // commitCapture, landing as data-only cells on the current context's track.
-        .add_plugins(midi_in::MidiInPlugin)
-        // Device-profile matching + the app→kernel presence report
-        // (docs/midi-next.md "Presence is sink-fed"): the app matches, the
-        // kernel records. Rides midi_in's existing hotplug watcher.
-        .add_plugins(midi_presence::MidiPresencePlugin)
-        // The exchange client (docs/midi-next.md "SysEx: the exchange
-        // pattern"): a THIRD ALSA client, separate from render and from the
-        // ear, that runs bounded device dialogues (`kj midi identify`) the
-        // kernel calls back for. Routes through the same matcher picture the
-        // control-cue path uses.
-        .add_plugins(midi_exchange::MidiExchangePlugin)
+        .add_plugins(dj::DjPlugin { enabled: cli.audio })
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)

@@ -19,6 +19,7 @@ members = [
     "crates/kaijutsu-ansi",
     "crates/kaijutsu-cas",
     "crates/kaijutsu-audio",
+    "crates/kaijutsu-audio-runtime",
     "crates/kaijutsu-hyoushigi",
     "crates/kaijutsu-viz",
     "crates/kaijutsu-isotest",
@@ -49,6 +50,7 @@ kaijutsu-abc = { path = "crates/kaijutsu-abc" }
 kaijutsu-ansi = { path = "crates/kaijutsu-ansi" }
 kaijutsu-cas = { path = "crates/kaijutsu-cas" }
 kaijutsu-audio = { path = "crates/kaijutsu-audio" }
+kaijutsu-audio-runtime = { path = "crates/kaijutsu-audio-runtime" }
 kaijutsu-hyoushigi = { path = "crates/kaijutsu-hyoushigi" }
 kaijutsu-viz = { path = "crates/kaijutsu-viz" }
 kaijutsu-present = { path = "crates/kaijutsu-present" }
@@ -217,5 +219,4 @@ tracing-opentelemetry = "0.32"
 
 # Testing
 tempfile = "3"
-
 

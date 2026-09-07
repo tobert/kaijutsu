@@ -1,21 +1,5 @@
-//! CAS prefetch — the DJ thread's own **Send** SFTP world (`docs/midi.md`
-//! "The DJ thread": "CAS prefetch dispatch (that runtime moves in
-//! wholesale)"). Ported from `audio.rs::CasPrefetch` (pre-Task-#3, now
-//! deleted) with ONE structural change: the outcome channel is a
-//! [`tokio::sync::mpsc`] unbounded pair instead of a `crossbeam_channel` —
-//! `crossbeam`'s blocking `recv` cannot ride `tokio::select!`, and the whole
-//! point of this task is giving the DJ thread's `select!` a native async arm
-//! for [`PrefetchOutcome`] (`dj::thread::run_loop`'s prefetch-outcome arm)
-//! instead of a per-frame `try_recv` drain. Everything else — the dedicated
-//! single-worker runtime, lazy connect, [`FETCH_TIMEOUT`] redial ladder,
-//! [`reset_slot_if_same`]'s same-resolver guard — is unchanged.
-//!
-//! `CasPrefetch::new` now hands back the receiver half separately (rather
-//! than owning it, as the old crossbeam version did): only one task may ever
-//! `.recv()` a `tokio::mpsc::UnboundedReceiver` (unlike a crossbeam
-//! `Receiver`, which several call sites could `try_recv` from without
-//! ceremony), and `dj::thread::run_loop`'s `select!` is that one task —
-//! `CasPrefetch` itself only ever needs to *send*.
+//! Resolve and cache sample media on a separate SFTP runtime.
+//! Results return to the DJ through an async channel.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -193,11 +193,13 @@ const CUE_STALE_MAX: Duration = kaijutsu_audio::REF_STALE_MAX;
 /// - `d > CUE_STALE_MAX`: the whole cue is too stale to trust even partially
 ///   — reject it outright (`None`) rather than dribble out a handful of
 ///   barely-salvaged notes.
+type TimedMidiEvents = Vec<(Duration, Vec<u8>)>;
+
 fn backdate_events(
     events: Vec<(Duration, Vec<u8>)>,
     lead: Duration,
     age: Option<Duration>,
-) -> Option<(Vec<(Duration, Vec<u8>)>, Duration)> {
+) -> Option<(TimedMidiEvents, Duration)> {
     let Some(age) = age else {
         return Some((events, lead)); // unstamped: old behavior verbatim
     };
@@ -409,7 +411,7 @@ const SYNTH_PATTERNS: [&str; 2] = ["timidity", "fluidsynth"];
 /// Our own ALSA seq clients — never an auto-connect target even if a pattern
 /// somehow matched one (the render's own output, the ear, the patch-view
 /// reader). Matched by exact client name.
-const OWN_CLIENTS: [&str; 3] = ["kaijutsu-app", "kaijutsu-ear", "kaijutsu-patchview"];
+const OWN_CLIENTS: [&str; 3] = ["kaijutsu-audio", "kaijutsu-ear", "kaijutsu-patchview"];
 
 /// The DJ thread's auto-connect retry cadence (`super::thread::run_loop`'s
 /// `tokio::time::interval` arm) — the patch-bay's 2 s poll idiom, reused.
@@ -464,10 +466,9 @@ fn decide_autoconnect(
 
 // ── MidiSink — the real, loop-local, ALSA-backed sink ───────────────────────
 
-/// Lazily-opened ALSA seq sink, owned loop-local by [`super::thread::run_loop`]
-/// (never a Bevy resource — see the module doc). Opened on the first MIDI cue
-/// or click; `failed` latches once an open attempt fails (no `/dev/snd/seq`)
-/// so we warn once, not per-cue.
+/// Local ALSA output. Production opens enabled MIDI before reporting ready.
+/// Disabled MIDI never opens a sequencer. Default construction is retained
+/// for backend tests that exercise lazy opening.
 #[derive(Default)]
 pub(crate) struct MidiSink {
     #[cfg(target_os = "linux")]
@@ -482,6 +483,17 @@ pub(crate) struct MidiSink {
 }
 
 impl MidiSink {
+    pub(crate) fn open(enabled: bool) -> Result<Self, String> {
+        if !enabled {
+            return Ok(Self { failed: true, ..Default::default() });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self { out: Some(MidiOut::open()?), ..Default::default() })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err("MIDI output is Linux/ALSA-only; disable MIDI on this platform".into())
+    }
     /// Open the sink if it isn't already; `false` if it's unavailable (open
     /// failed once — latched, so we warn once, not per-cue/click).
     #[cfg(target_os = "linux")]
@@ -707,7 +719,7 @@ impl MidiOut {
 
         let map = |e: alsa::Error| format!("{e}");
         let seq = alsa::Seq::open(None, None, false).map_err(map)?;
-        seq.set_client_name(&CString::new("kaijutsu-app").map_err(|e| e.to_string())?)
+        seq.set_client_name(&CString::new("kaijutsu-audio").map_err(|e| e.to_string())?)
             .map_err(map)?;
         let port = seq
             .create_simple_port(
@@ -717,7 +729,7 @@ impl MidiOut {
             )
             .map_err(map)?;
         let queue = seq
-            .alloc_named_queue(&CString::new("kaijutsu-app-render").map_err(|e| e.to_string())?)
+            .alloc_named_queue(&CString::new("kaijutsu-audio-render").map_err(|e| e.to_string())?)
             .map_err(map)?;
         seq.control_queue(queue, EventType::Start, 0, None).map_err(map)?;
         seq.drain_output().map_err(map)?;
@@ -1108,11 +1120,11 @@ mod tests {
     /// `run_loop`; this one just asserts what THIS function decided to do).
     #[derive(Default)]
     struct RecordingSink {
-        scheduled: Option<(Vec<(Duration, Vec<u8>)>, Duration)>,
+        scheduled: Option<(TimedMidiEvents, Duration)>,
         /// Every device-addressed control emit, in order: `(address, events)`.
         /// (`device` rides along in real dispatch to label the control port;
         /// these tests assert routing, so the address is the interesting half.)
-        controls: Vec<(String, Vec<(Duration, Vec<u8>)>)>,
+        controls: Vec<(String, TimedMidiEvents)>,
         flushed: bool,
     }
 
@@ -1695,7 +1707,7 @@ mod tests {
         assert!(
             endpoints
                 .iter()
-                .any(|e| (e.client_id, e.port_id) == render && e.client_name == "kaijutsu-app"),
+                .any(|e| (e.client_id, e.port_id) == render && e.client_name == "kaijutsu-audio"),
             "the render port should appear in its own observed graph: {endpoints:#?}"
         );
     }

@@ -192,7 +192,7 @@ const INFO_EDGE_POS: Vec3 = Vec3::new(TABLE_OUTER_R * 0.78, 190.0, TABLE_OUTER_R
 
 /// The app's own render endpoint identity (must match `MidiOut::open` in
 /// `midi.rs`): the source of any chord the app can pulse from its own traffic.
-const RENDER_CLIENT_NAME: &str = "kaijutsu-app";
+const RENDER_CLIENT_NAME: &str = "kaijutsu-audio";
 const RENDER_PORT_NAME: &str = "render";
 
 /// Poll cadence for the observed graph.
@@ -1693,8 +1693,8 @@ mod tests {
     #[test]
     fn a_meaningful_port_name_becomes_its_own_uppercase_label() {
         // The port name carries the information; the client name is redundant.
-        assert_eq!(socket_label("kaijutsu-app", "render", 1, 0), "RENDER");
-        assert_eq!(socket_label("kaijutsu-app", "capture", 2, 1), "CAPTURE");
+        assert_eq!(socket_label("kaijutsu-audio", "render", 1, 0), "RENDER");
+        assert_eq!(socket_label("kaijutsu-audio", "capture", 2, 1), "CAPTURE");
     }
 
     #[test]
@@ -1757,7 +1757,7 @@ mod tests {
     fn nameplate_redundant_false_when_the_port_label_names_something_else() {
         // A meaningful port name (RENDER) says something the client name
         // (kaijutsu-app) doesn't — the nameplate still earns its keep.
-        assert!(!nameplate_redundant("kaijutsu-app", "RENDER"));
+        assert!(!nameplate_redundant("kaijutsu-audio", "RENDER"));
     }
 
     #[test]
@@ -1798,7 +1798,7 @@ mod tests {
                 EndpointInfo {
                     client_id: 129,
                     port_id: 0,
-                    client_name: "kaijutsu-app".into(),
+                    client_name: "kaijutsu-audio".into(),
                     port_name: "render".into(),
                     is_source: true,
                     is_sink: false,
@@ -1842,11 +1842,11 @@ mod tests {
 
     #[test]
     fn is_render_port_matches_only_our_own_render_endpoint() {
-        assert!(is_render_port(&ep(129, 0, "kaijutsu-app", "render")));
+        assert!(is_render_port(&ep(129, 0, "kaijutsu-audio", "render")));
         // A synth's port, our ear, and a mis-named app port are not the send seam.
         assert!(!is_render_port(&ep(128, 0, "TiMidity", "port 0")));
         assert!(!is_render_port(&ep(200, 0, "kaijutsu-ear", "capture")));
-        assert!(!is_render_port(&ep(129, 1, "kaijutsu-app", "in")));
+        assert!(!is_render_port(&ep(129, 1, "kaijutsu-audio", "in")));
     }
 
     // -- pulse_band: the traveling-packet math --------------------------
@@ -1908,7 +1908,7 @@ mod tests {
                 EndpointInfo {
                     client_id: 129,
                     port_id: 0,
-                    client_name: "kaijutsu-app".into(),
+                    client_name: "kaijutsu-audio".into(),
                     port_name: "render".into(),
                     is_source: true,
                     is_sink: false,
