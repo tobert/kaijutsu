@@ -61,6 +61,13 @@ Two things every DAW conflates, kept separate here:
 
 ### Inside the profile: settings vs capabilities (the ground-truth split)
 
+The observation/retention evolution in `docs/audio-daemon.md` refines this
+earlier design: query results are observed state, not automatic edits to desired
+configuration. Host/USB maps, channels, roles and programming are composed
+separately; moving a recognized device does not automatically restore its role.
+The settings-writeback and automatic rerouting proposals below must be revised
+before implementing that binding work.
+
 - **`settings`** — the mutable half: receive channel, velocity curve,
   per-track channels, CC assignments. **The device is ground truth**; a SysEx
   pull refreshes this section and overwrites it.

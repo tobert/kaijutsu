@@ -6100,6 +6100,10 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 ## Audio nodes — follow-up after daemon extraction
 
 `docs/audio-daemon.md` describes the implemented daemon and deployment.
+Its "Evolution: observe once, retain windows, request material" section owns
+the execution checklist for node inventory, retained MIDI/PCM windows, ambient
+summaries, capture export to CAS and script-driven SysEx queries. Keep progress
+there rather than maintaining a second checklist here.
 
 - Named render destinations: playback currently broadcasts to every attached
   render client. Multiple machines need an explicit destination contract.

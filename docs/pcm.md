@@ -357,6 +357,12 @@ from a reference recording.
 
 ## Distributed listening — later
 
+Local retained PCM input and window export now have an execution plan in
+`docs/audio-daemon.md`, "Evolution: observe once, retain windows, request
+material". That is not continuous network playback: bounded local history is
+exported as immutable objects on request. The older exclusions below describe
+this playback design, not a prohibition on local capture.
+
 Survivors of the retired `playback.md` (2026-06-10 → retired 2026-07-01), to
 pick up when listening goes multi-peer:
 
