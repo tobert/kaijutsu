@@ -9,6 +9,46 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 
 
+## Living documents + project contexts (Amy, 2026-09-07, during slice 4)
+
+Amy, on hearing that the handoff log is scoped per character and that a
+12-note window would push `signoff.md`'s durable third off the end:
+
+> *"I like handoff per character, makes more sense to me. We can add
+> something like 'project context' too eventually so there's a place to stuff
+> things for eg kaibo or some oss project we interacted with. While some
+> things should go to AGENTS.md or docs/, maybe we need something like a
+> living document concept to accompany contexts as a kinda thing we use a
+> lot."*
+
+Two ideas, and they are not the handoff:
+
+- **Living document** — whole-file rewrite, one current truth, history in
+  git rather than in the artifact. Answers *what is true now*. This is
+  exactly the shape `docs/character.md` (the "wrong today" list) criticizes
+  for a *handoff* — "whole-file rewrite, one writer, no per-entry stamp or
+  author, no window" — and those same properties are correct for a
+  current-state document. The handoff log is append-only, stamped, authored
+  and windowed because it answers *what happened*. Different question,
+  different data structure; do not collapse them.
+- **Project context** — scoping by subject (kaibo, an OSS project we
+  interacted with) rather than by character. The handoff's axis is *who*;
+  this axis is *what*. A character working across two projects has one
+  handoff log today, which is the known cost of the per-character choice.
+
+Design opinion to argue with, not a decision: a living document probably
+wants **no new storage**. A file, a declared attachment to a
+context/character/project, and rc injection is the machinery `S15-recall.kai`
+and `S16-handoff.kai` already are. The real design is the *pointer* (which
+contexts see which living documents) and the *injection budget* (rc prose is
+the most expensive text in the repo), not a new `DocKind`. CLAUDE.md's
+"permission to get simpler" applies.
+
+Immediate consequence for slice 4, unresolved: `signoff.md`'s durable third
+— the live-environment facts, the deploy recipe, "never pipe a test run
+through `tail`" — is not handoff material and must land somewhere before
+`signoff.md` retires. Melting it into `docs/` is the option available today.
+
 ## Two outbound HTTP clients still call out anonymously (2026-09-06)
 
 Every LLM provider dialect now sends `kaijutsu/<version>` — OpenAI-compatible,
