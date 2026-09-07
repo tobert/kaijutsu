@@ -400,10 +400,23 @@ backend is implemented; do not treat this batch as covering those additions.
   float32. Retention and request defaults must be chosen together with a
   visible node budget, not inferred from an event-count limit.
 
-Open before runtime wiring: retention/budget defaults, node identity/path
-encoding, upload protocol reuse, and minimal watch/window verbs. The full
+The implemented MIDI path above settles initial budgets, upload reuse and keep
+verbs. Node path encoding and watch controls remain open. The full
 role/port/channel/programming binding remains a later routing plan, not an
 implicit part of observation.
+
+Implementation review collected from Gemini Pro through kaibo:
+`gemini/batches/wnpwihn04wyjir98qvfzvem06lioopihh1wm`.
+
+- Declined: replace CAS `write` with `write_all`. `StreamingWriter::write`
+  returns `Result<(), StoreError>`, not a byte count; its staging writer already
+  writes the full slice. The review assumed the `std::io::Write` contract.
+- Accepted as follow-up: ingress loss currently stops retained sources until
+  inventory reconciliation, then starts new generations. This discards old
+  history and may reject up to two seconds of otherwise valid new input.
+  Do not simply remove the reset: the shared ingress queue can also lose hotplug
+  events, so continued device identity is not assured. Separate data loss from
+  topology uncertainty before preserving generations across loss.
 
 ## Run
 

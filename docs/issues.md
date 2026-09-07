@@ -6099,6 +6099,14 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Audio nodes — follow-up after daemon extraction
 
+- Profile edits load only on daemon connection/reconnection. Add validated
+  profile refresh without restarting hardware capture or its history generation;
+  raw port reconciliation does not currently refresh the profile files.
+- Distinguish ingress data loss from lost topology notifications. The current
+  conservative reset stops retention until the next inventory (up to two seconds)
+  and replaces generations. Preserve more history only when device continuity
+  is established; see the implementation review in `docs/audio-daemon.md`.
+
 - A daemon restart on moltar left two `audio/moltar` peer registrations even
   though `pgrep` found one daemon and systemd reported that same PID. Raw
   inventory correctly refuses the ambiguous node. Inspect connection cancellation
