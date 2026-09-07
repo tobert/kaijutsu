@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "device": "jd-xi",
+  "node": "audio/moltar",
+  "backend": "alsa",
+  "address": "32:0",
+  "generation": null,
+  "generation_note": "Inventory refused two registered node instances; no generation was inferred.",
+  "observed_at_epoch_ns": 1788820149009913477,
+  "source": "kj midi identify jd-xi --json; read back from /run/midi/jd-xi",
+  "request_hex": "f07e7f0601f7",
+  "reply_hex": "f07e100602410e03000000030001f7",
+  "identity": {
+    "device_id": 16,
+    "manufacturer_hex": "41",
+    "manufacturer_name": "Roland",
+    "family": 398,
+    "model": 0,
+    "version_hex": "00030001"
+  },
+  "scope": "Identity reply only; not a patch, program, or settings backup."
+}

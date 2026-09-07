@@ -333,6 +333,17 @@ mod tests {
     const KEYLAB: &str = include_str!("../../../assets/defaults/midi/devices/keylab-88-mkii.md");
     const TIMIDITY: &str = include_str!("../../../assets/defaults/midi/devices/timidity.md");
     const MINIBRUTE: &str = include_str!("../../../assets/defaults/midi/devices/minibrute.md");
+    const JD_XI: &str = include_str!("../../../assets/defaults/midi/devices/jd-xi.md");
+
+    #[test]
+    fn jd_xi_profile_matches_observed_names_without_binding_host_or_address() {
+        let profile = parse_profile("jd-xi", JD_XI).unwrap().unwrap();
+        for address in ["32:0", "99:1"] {
+            let port = PortFacts { client_name: "JD-Xi".into(), port_name: "JD-Xi MIDI 1".into(), address: address.into(), usb_id: None };
+            assert!(profile.score(&port).is_some());
+        }
+        assert!(profile.score(&PortFacts { client_name: "PipeWire-System".into(), port_name: "input".into(), address: "32:0".into(), usb_id: None }).is_none());
+    }
 
     fn port(client: &str, name: &str, addr: &str) -> PortFacts {
         PortFacts {
@@ -349,6 +360,7 @@ mod tests {
             ("keylab-88-mkii", KEYLAB),
             ("timidity", TIMIDITY),
             ("minibrute", MINIBRUTE),
+            ("jd-xi", JD_XI),
         ]
         .into_iter()
         .filter_map(|(name, doc)| parse_profile(name, doc).expect("shipped profile parses"))
@@ -363,7 +375,7 @@ mod tests {
         let names: Vec<&str> = profiles.iter().map(|p| p.device.as_str()).collect();
         assert_eq!(
             names,
-            vec!["keystep-pro", "keylab-88-mkii", "timidity", "minibrute"],
+            vec!["keystep-pro", "keylab-88-mkii", "timidity", "minibrute", "jd-xi"],
             "every shipped profile must carry usb_ids/port_name_substrings"
         );
         let ksp = &profiles[0];

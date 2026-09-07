@@ -6099,6 +6099,11 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 ## Audio nodes — follow-up after daemon extraction
 
+- A daemon restart on moltar left two `audio/moltar` peer registrations even
+  though `pgrep` found one daemon and systemd reported that same PID. Raw
+  inventory correctly refuses the ambiguous node. Inspect connection cancellation
+  and peer cleanup; do not weaken instance selection or guess which entry is live.
+
 `docs/audio-daemon.md` describes the implemented daemon and deployment.
 Its "Evolution: observe once, retain windows, request material" section owns
 the execution checklist for node inventory, retained MIDI/PCM windows, ambient
