@@ -138,6 +138,9 @@ pub(crate) const READ_ONLY_TABLE: &[(&str, &str)] = &[
     // principal and `retire` archives contexts, both writes.
     ("character", "list"),
     ("character", "show"),
+    // -- handoff: `tail` reads a character's handoff log; `note` appends
+    // to it (a write, and may mint the context lazily on first use).
+    ("handoff", "tail"),
     // -- cas: `ls`/`info` read the store's metadata. `get` is excluded
     // despite reading an object, because it accepts `--out <path>`.
     ("cas", "ls"),
@@ -280,6 +283,7 @@ const MUTATING_TABLE: &[(&str, &str)] = &[
     ("cast", "slot"),
     ("character", "create"),
     ("character", "retire"),
+    ("handoff", "note"),
     ("alias", "set"),
     ("alias", "remove"),
     ("cas", "put"),

@@ -483,6 +483,15 @@ mutates = false
 expect = "situation-normal"
 mutates = true
 
+["handoff note"]
+expect = "situation-normal"
+mutates = true
+note = "Appends to a character's handoff log; may mint the context lazily on first use (docs/character.md, 'The handoff is an ordinary context')."
+
+["handoff tail"]
+expect = "informative"
+mutates = false
+
 ["hook add"]
 expect = "situation-normal"
 mutates = true

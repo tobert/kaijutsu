@@ -2183,6 +2183,7 @@ mod context_bootstrap_tests {
             name: "amy".to_string(),
             created_at: 1000,
             retired_at: None,
+            handoff_ctx: None,
         })
         .unwrap();
         let kdb = std::sync::Arc::new(parking_lot::Mutex::new(kdb));
@@ -3303,8 +3304,10 @@ async fn ensure_context_joinable(
 ///
 /// Does, in order: create the Conversation document + input doc, write the
 /// KernelDb row with `provider`/`model` left `None` (rolling back the
-/// document on failure — see the "neither path stamps" note inside), register
-/// in the DriftRouter (rolling back the row + document on failure), run the
+/// document on failure — see the "neither path stamps" note inside) and
+/// `played_by` defaulted to `created_by`'s own character when it has one
+/// (rolling back the same way on a lookup failure), register in the
+/// DriftRouter (rolling back the row + document on failure), run the
 /// `create` rc lifecycle for `context_type` (failure is logged, not fatal —
 /// it surfaces as Error blocks in the new context), and arm the beat for
 /// musician contexts. Hard failures (document / DB / drift) return `Err`;
@@ -3352,6 +3355,25 @@ async fn create_context_inner(
     // context (lost on restart), nor a DB row without a drift entry.
     {
         let db = state.kernel_db.lock();
+        // `played_by` defaults to the creating principal's own character, if
+        // it has one — a context minted this way (a fresh session's root
+        // context, ROOT/cold-start bootstrap, `register_session`) has no
+        // enclosing context to inherit from, so the principal that asked for
+        // it is the only candidate default (`docs/character.md`, "A context
+        // is played by a character"). No character row means no default:
+        // `played_by` is metadata, not authority, and a principal without a
+        // sheet is a legitimate pre-character state, not an error.
+        let played_by = match db.get_character(created_by) {
+            Ok(character) => character.map(|c| c.principal_id),
+            Err(e) => {
+                drop(db);
+                let _ = state.documents.delete_document(context_id);
+                return Err(capnp::Error::failed(format!(
+                    "Failed to resolve character for {}: {}",
+                    created_by, e
+                )));
+            }
+        };
         let row = ContextRow {
             context_id,
             label: label.map(|s| s.to_string()),
@@ -3375,7 +3397,7 @@ async fn create_context_inner(
             paused_at: None,
             cast_id: None,
             origin_host: None,
-            played_by: None,
+            played_by,
         };
         // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
         // no row in `workspaces`, so it only turns a legible workspace error

@@ -34,6 +34,7 @@ pub mod env_snapshot;
 pub mod fork;
 pub mod format;
 pub mod gate;
+pub mod handoff;
 pub mod hook;
 pub mod hook_gate;
 pub mod kaish;
@@ -430,6 +431,11 @@ impl KjDispatcher {
         // context — same exemption rationale as `kj cast`/`kj backend`.
         if cmd == "character" {
             return self.dispatch_character(&argv[1..], caller).await;
+        }
+        // `kj handoff` addresses a character's log by name, never a
+        // context — same exemption rationale as `kj character`.
+        if cmd == "handoff" {
+            return self.dispatch_handoff(&argv[1..], caller).await;
         }
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
@@ -1011,6 +1017,7 @@ pub fn kj_command() -> clap::Command {
         .subcommand(backend::BackendArgs::command())
         .subcommand(cast::CastArgs::command())
         .subcommand(character::CharacterArgs::command())
+        .subcommand(handoff::HandoffArgs::command())
         .subcommand(alias::AliasArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(cc::CcArgs::command())

@@ -1136,16 +1136,22 @@ CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
 -- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
--- Only the first four columns ship in this slice; the rest of the sheet
--- (accountable_to, default_cast_id, rc_dir, memory_root, handoff_ctx,
--- root_ctx) arrives with the slice that reads it. See docs/character.md,
+-- `handoff_ctx` arrives with slice 4 (`kj handoff`); the rest of the sheet
+-- (accountable_to, default_cast_id, rc_dir, memory_root, root_ctx) arrives
+-- with the slice that reads it. See docs/character.md,
 -- "Character = principal + sheet".
 CREATE TABLE IF NOT EXISTS characters (
     principal_id BLOB NOT NULL PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
     created_at   INTEGER NOT NULL,
     -- Characters retire; they are never deleted. NULL = live.
-    retired_at   INTEGER
+    retired_at   INTEGER,
+    -- The character's handoff-log context, minted lazily by the first `kj
+    -- handoff note`/`tail` that needs one (docs/character.md, "The handoff
+    -- is an ordinary context"). ON DELETE SET NULL rather than CASCADE: an
+    -- archived context is retained work, not a reason to disown the sheet
+    -- row that points at it.
+    handoff_ctx  BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
@@ -2021,6 +2027,7 @@ impl KernelDb {
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
                  CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0)",
+            "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
         ];
         for sql in alters {
             if let Err(e) = conn.execute(sql, []) {
@@ -6452,9 +6459,9 @@ pub struct CastRow {
 /// A character's sheet — the persistent someone `name` resolves to. The
 /// principal is the character's key (`docs/character.md`, "Character =
 /// principal + sheet"): no distinct id type, `principal_id` is immutable,
-/// and `name` is kernel-owned and immutable in this slice. Only the first
-/// four columns of the eventual sheet; the rest arrive with the slice that
-/// reads them.
+/// and `name` is kernel-owned and immutable in this slice. `handoff_ctx`
+/// arrives with slice 4; the rest of the sheet arrives with the slice that
+/// reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CharacterRow {
     pub principal_id: PrincipalId,
@@ -6463,6 +6470,12 @@ pub struct CharacterRow {
     /// `None` while live. Set once, never cleared — a character retires,
     /// it is never un-retired.
     pub retired_at: Option<i64>,
+    /// The character's handoff-log context, or `None` before the first `kj
+    /// handoff note`/`tail` mints one. Set exactly once, by
+    /// `set_character_handoff_ctx` under the same `KernelDb` lock that
+    /// checked it was still unset (`docs/character.md`, "The handoff is an
+    /// ordinary context").
+    pub handoff_ctx: Option<ContextId>,
 }
 
 /// One role's seat in a cast. NULL tunables cascade to `llm_defaults`.
@@ -7019,13 +7032,14 @@ impl KernelDb {
         validate_label(&row.name)?;
         self.conn
             .execute(
-                "INSERT INTO characters (principal_id, name, created_at, retired_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     blob_param(row.principal_id.as_bytes()),
                     row.name,
                     row.created_at,
                     row.retired_at,
+                    row.handoff_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -7037,7 +7051,7 @@ impl KernelDb {
     /// Fetch a character by its kernel-owned name.
     pub fn get_character_by_name(&self, name: &str) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx
              FROM characters WHERE name = ?1",
         )?;
         Ok(stmt.query_row(params![name], row_to_character_row).optional()?)
@@ -7048,7 +7062,7 @@ impl KernelDb {
     /// `played_by` (e.g. resolving the name to display in `kj context info`).
     pub fn get_character(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx
              FROM characters WHERE principal_id = ?1",
         )?;
         Ok(stmt
@@ -7061,14 +7075,43 @@ impl KernelDb {
     /// ones by default.
     pub fn list_characters(&self, include_retired: bool) -> KernelDbResult<Vec<CharacterRow>> {
         let sql = if include_retired {
-            "SELECT principal_id, name, created_at, retired_at FROM characters ORDER BY name"
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx FROM characters \
+             ORDER BY name"
         } else {
-            "SELECT principal_id, name, created_at, retired_at FROM characters \
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx FROM characters \
              WHERE retired_at IS NULL ORDER BY name"
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], row_to_character_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Set (or clear) a character's handoff-log context. Called exactly
+    /// once per character in the ordinary case, by `kj handoff`'s
+    /// get-or-create path, under the same lock that just confirmed the
+    /// column was still NULL — see that call site for the race this
+    /// guards. `None` is accepted (not just produced) so a future repair
+    /// verb can disown a context without a bespoke clear method, mirroring
+    /// `update_played_by`.
+    pub fn set_character_handoff_ctx(
+        &self,
+        principal_id: PrincipalId,
+        ctx: Option<ContextId>,
+    ) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE characters SET handoff_ctx = ?1 WHERE principal_id = ?2",
+            params![
+                ctx.as_ref().map(|c| c.as_bytes().to_vec()),
+                blob_param(principal_id.as_bytes())
+            ],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!(
+                "character {}",
+                principal_id.short()
+            )));
+        }
+        Ok(())
     }
 
     /// Retire a character: stamp `retired_at`, first time only. Returns
@@ -7345,6 +7388,7 @@ fn row_to_character_row(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterRow> {
         name: row.get(1)?,
         created_at: row.get(2)?,
         retired_at: row.get(3)?,
+        handoff_ctx: read_opt_context_id(row, 4)?,
     })
 }
 
@@ -9672,6 +9716,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
+            handoff_ctx: None,
         })
         .unwrap();
 
@@ -9709,6 +9754,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
+            handoff_ctx: None,
         })
         .unwrap();
         let err = db
@@ -9717,6 +9763,7 @@ mod tests {
                 name: "hajime".to_string(),
                 created_at: 2000,
                 retired_at: None,
+                handoff_ctx: None,
             })
             .unwrap_err();
         assert!(matches!(err, KernelDbError::LabelConflict(_)), "got: {err}");
@@ -9763,6 +9810,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
+            handoff_ctx: None,
         })
         .unwrap();
         assert_eq!(db.name_for(character), "hajime");
@@ -9792,6 +9840,7 @@ mod tests {
                 name: "hajime".to_string(),
                 created_at: 1000,
                 retired_at: None,
+                handoff_ctx: None,
             })
             .unwrap();
         }
@@ -9808,6 +9857,7 @@ mod tests {
                 name: "intruder".to_string(),
                 created_at: 2000,
                 retired_at: None,
+                handoff_ctx: None,
             })
             .unwrap_err();
         assert!(

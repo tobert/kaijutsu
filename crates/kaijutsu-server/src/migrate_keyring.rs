@@ -81,6 +81,9 @@ pub fn migrate_legacy_names(
             name: username.clone(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
+            // A migrated character's handoff context is minted lazily, on
+            // its first note or tail, like every other character's.
+            handoff_ctx: None,
         })?;
         created += 1;
     }
@@ -220,6 +223,7 @@ CREATE TABLE IF NOT EXISTS credentials (
                 name: "kaijutsu-lead".to_string(),
                 created_at: 1,
                 retired_at: None,
+                handoff_ctx: None,
             })
             .unwrap();
 
@@ -246,6 +250,7 @@ CREATE TABLE IF NOT EXISTS credentials (
                 name: "amy".to_string(),
                 created_at: 1,
                 retired_at: None,
+                handoff_ctx: None,
             })
             .unwrap();
 

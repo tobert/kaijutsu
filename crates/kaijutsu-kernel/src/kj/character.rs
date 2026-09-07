@@ -119,6 +119,7 @@ impl KjDispatcher {
             name: name.to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
+            handoff_ctx: None,
         };
         if let Err(e) = db.insert_character(&row) {
             return KjResult::Err(format!("kj character create: {e}"));
