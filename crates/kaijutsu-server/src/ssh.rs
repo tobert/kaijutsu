@@ -328,6 +328,19 @@ impl SshServer {
             }
         };
 
+        // A pre-melt `auth.db` still carries `principals.username NOT NULL
+        // UNIQUE`. Opening it succeeds and existing fingerprints keep
+        // authenticating, but every path that mints a principal — the seed
+        // character, anonymous auto-register — fails on that constraint,
+        // long after boot. Refuse here instead of running half a kernel.
+        if auth_db.has_legacy_names().map_err(std::io::Error::other)? {
+            return Err(std::io::Error::other(
+                "auth database still carries the pre-melt 'username' column, so binding a \
+                 new principal would fail. Stop the server, back up auth.db and kernel.db, \
+                 then run: kaijutsu-server migrate-keyring",
+            ));
+        }
+
         // Check if database is empty
         if auth_db.is_empty().map_err(std::io::Error::other)? {
             log::warn!(
