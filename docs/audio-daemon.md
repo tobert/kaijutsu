@@ -135,6 +135,41 @@ connection ownership from local stream continuity. Across reconnect, a request
 may name retained history only after the current node connection advertises
 that generation and coverage again. Missing history is never fabricated.
 
+### Ambient recording and keeping a take
+
+Ambient recording is a primary use of retained history, not just diagnostic
+telemetry. Amy: "if we turn 'em up and put 'em on nvme or use plenty of ram,
+we can keep enough to occasionally grab a happy accident real quick."
+Watching an input can retain a substantial rolling recording without a track
+or context. Retention remains finite and visible; export is deliberate.
+
+Support a RAM history backend first and a local-NVMe rolling-chunk backend
+when longer retention needs it. They share generation, position, coverage and
+loss semantics. Storage is local to the daemon; network availability is not
+required for ambient recording. Disk-backed history is not automatically
+kernel CAS content and is not a promise of permanent archival storage.
+At 48 kHz stereo float32, one hour is about 1.38 GB before metadata; the
+configuration should express time and byte budgets so the tradeoff is visible.
+
+"Keep the last N seconds" resolves its end at one sampled local head and
+reserves the actual window before asynchronous encoding/upload begins. After
+the reservation is acknowledged, rolling eviction cannot remove that take.
+Keep requests must support meaningful musical windows, not a fixed small RPC
+payload limit. Chunked export keeps a long take from requiring one large
+contiguous allocation. Repeated keeps and slow uploads remain bounded by a
+separate retained-take budget; refuse new requests explicitly when exhausted,
+without interrupting ambient ingestion or discarding an acknowledged take.
+Release kept material only on successful publication or explicit cancellation.
+The keep acknowledgement must name whether protection is memory-only or
+locally durable; it cannot imply that RAM survives a process or machine crash.
+
+The NVMe backend needs preallocated/reusable chunks, explicit disk-full and
+I/O-loss reporting, and a crash-recovery/index contract before it ships. File
+allocation, filesystem work and sealing stay off the input callback. Stopping
+a watch stops acquisition, not a previously acknowledged keep operation.
+Default retention sizes, persistent watch settings, durability policy and the
+eventual `kj` spelling remain open; no disk capture is enabled by this plan.
+
 ### Summaries and queries
 
 Reuse the existing independent MIDI cursor/window mechanism for deterministic
@@ -232,9 +267,15 @@ Implementation progress:
 - [ ] **4 — snapshot to CAS.** Freeze bounded windows, encode and upload through
   kernel acceptance; expose `kj` operations. Tests: expired/partial requests,
   corruption, interrupted upload, retries, cancellation and concurrent readers.
+  Add immediate keep reservations: eviction cannot remove an acknowledged take,
+  and a full take budget rejects new keeps without stopping input. Export long
+  windows in bounded chunks rather than imposing a small whole-take byte limit.
 - [ ] **5 — PCM input.** Add opt-in input watches behind the same coverage and
   lifecycle contract. Tests: frame alignment, format changes, xruns, retention
   budget, unplug while reading, and callback progress during a slow export.
+  Follow with the local-NVMe rolling-chunk backend for long ambient recordings;
+  test disk-full, chunk reuse, crash recovery and kept-take protection. Mark
+  RAM-only and durable keep acknowledgements distinctly.
 - [ ] **6 — scripted probing.** Expose bounded transactions and sample scripts.
   Tests: no reply/backoff, competing requests, reply fanout, disconnect and
   endpoint reuse. Device-specific queries require documented protocol evidence.
@@ -251,6 +292,10 @@ side effect of building these changes.
 Gemini Pro batch review through kaibo was submitted as
 `gemini/batches/haggchzwu5upwehlrqyxy7qimz0pw75xibpw` using
 `gemini-pro-latest`. Review collected; dispositions:
+
+The ambient-recording/NVMe and immediate-keep requirements were added after
+this batch review. They require a focused storage/lifetime review before that
+backend is implemented; do not treat this batch as covering those additions.
 
 - Accepted: isolate source retention, bound bytes/messages/exports, expose
   multi-node inventory, scope identity to generations and classify reply fanout.
