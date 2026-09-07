@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::ops::Range;
 
 /// The capture batch MIME. JSON, not SMF (`audio/midi` implies a standard
 /// MIDI file; this is a stamped event log) — per the clip-record precedent a
@@ -156,6 +157,59 @@ pub struct Tracker {
     window_start_ns: u64,
 }
 
+/// Explicit retention limits. Byte accounting includes each live event's
+/// metadata and allocated source/payload capacity, not allocator overhead or
+/// unused ring slots (separately bounded by `max_events`).
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureLimits {
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub max_message_bytes: usize,
+}
+
+/// An owned, non-destructive snapshot. Positions belong only to this ring's
+/// accepted events, not kernel mutation sequences. The stream owner must
+/// validate its generation before reading and attach it to exported material.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CaptureWindow {
+    pub positions: Range<u64>,
+    pub events: Vec<CaptureEvent>,
+}
+
+impl std::fmt::Debug for CaptureWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureWindow")
+            .field("positions", &self.positions)
+            .field("event_count", &self.events.len())
+            .finish()
+    }
+}
+
+/// Retention or snapshot admission failed without changing existing history.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum HistoryError {
+    #[error("capture limits must all be greater than zero")]
+    InvalidLimits,
+    #[error("MIDI message has {bytes} bytes; limit is {limit}")]
+    MessageTooLarge { bytes: usize, limit: usize },
+    #[error("capture event requires {bytes} retained bytes; limit is {limit}")]
+    EventTooLarge { bytes: usize, limit: usize },
+    #[error("capture window is inverted: {requested:?}")]
+    Inverted { requested: Range<u64> },
+    #[error("capture window {requested:?} is unavailable; retained positions are {available:?}")]
+    Unavailable { requested: Range<u64>, available: Range<u64> },
+    #[error("capture snapshot requires {bytes} bytes; limit is {limit}")]
+    SnapshotTooLarge { bytes: usize, limit: usize },
+    #[error("capture position exhausted; start a new stream generation")]
+    PositionExhausted,
+}
+
+fn event_bytes(event: &CaptureEvent) -> usize {
+    std::mem::size_of::<CaptureEvent>()
+        .saturating_add(event.source.capacity())
+        .saturating_add(event.bytes.capacity())
+}
+
 /// Fixed-capacity ring of captured events. Push-side is the capture thread's
 /// drain; cut-side is each consumer's tracker. Overwrites oldest when full
 /// and *counts* what each tracker missed (loud, per-tracker `lost`).
@@ -163,21 +217,43 @@ pub struct Tracker {
 pub struct CaptureRing {
     buf: VecDeque<CaptureEvent>,
     capacity: usize,
+    max_bytes: usize,
+    max_message_bytes: usize,
+    retained_bytes: usize,
     /// Total events ever pushed; sequence number of the next push. The
     /// oldest event still buffered has sequence `pushed - buf.len()`.
     pushed: u64,
 }
 
 impl CaptureRing {
-    /// `capacity` is in events. At jam density (a few hundred events per
-    /// phrase) a few thousand covers minutes; MIDI is tiny, size generously.
+    /// Bound event count only. Variable-size messages require `with_limits`
+    /// for byte-bounded retention.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "a zero-capacity ring can only lose events");
         Self {
             buf: VecDeque::with_capacity(capacity),
             capacity,
+            max_bytes: usize::MAX,
+            max_message_bytes: usize::MAX,
+            retained_bytes: 0,
             pushed: 0,
         }
+    }
+
+    /// Construct a byte- and count-bounded ring without selecting policy
+    /// defaults. Use `try_push` to handle admission errors explicitly.
+    pub fn with_limits(limits: CaptureLimits) -> Result<Self, HistoryError> {
+        if limits.max_events == 0 || limits.max_bytes == 0 || limits.max_message_bytes == 0 {
+            return Err(HistoryError::InvalidLimits);
+        }
+        Ok(Self {
+            buf: VecDeque::with_capacity(limits.max_events.min(limits.max_bytes / std::mem::size_of::<CaptureEvent>())),
+            capacity: limits.max_events,
+            max_bytes: limits.max_bytes,
+            max_message_bytes: limits.max_message_bytes,
+            retained_bytes: 0,
+            pushed: 0,
+        })
     }
 
     /// Append one stamped event, overwriting the oldest when full. Events
@@ -185,11 +261,66 @@ impl CaptureRing {
     /// sequence order is authoritative, `epoch_ns` is assumed monotone
     /// modulo clock adjustments.
     pub fn push(&mut self, ev: CaptureEvent) {
-        if self.buf.len() == self.capacity {
-            self.buf.pop_front();
+        self.try_push(ev).expect("capture push failed; bounded callers must use try_push");
+    }
+
+    /// Admit one event, evicting oldest events as needed. A rejected event
+    /// does not receive a position or evict history. The ingress owner must
+    /// count rejected messages as loss; positions alone cannot express it.
+    pub fn try_push(&mut self, ev: CaptureEvent) -> Result<(), HistoryError> {
+        if ev.bytes.len() > self.max_message_bytes {
+            return Err(HistoryError::MessageTooLarge {
+                bytes: ev.bytes.len(), limit: self.max_message_bytes,
+            });
+        }
+        let bytes = event_bytes(&ev);
+        if bytes > self.max_bytes {
+            return Err(HistoryError::EventTooLarge { bytes, limit: self.max_bytes });
+        }
+        let next = self.pushed.checked_add(1).ok_or(HistoryError::PositionExhausted)?;
+        while self.buf.len() == self.capacity || self.retained_bytes > self.max_bytes - bytes {
+            let oldest = self.buf.pop_front().expect("retention accounting requires a buffered event");
+            self.retained_bytes -= event_bytes(&oldest);
         }
         self.buf.push_back(ev);
-        self.pushed += 1;
+        self.retained_bytes += bytes;
+        self.pushed = next;
+        Ok(())
+    }
+
+    /// The half-open interval of retained local event positions.
+    pub fn positions(&self) -> Range<u64> {
+        self.pushed - self.buf.len() as u64..self.pushed
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Copy a complete position window without touching any tracker. Both
+    /// expired and future positions fail; partial reads are not implicit.
+    /// Budget admission happens before cloning, counting event metadata and
+    /// source/payload bytes. The caller owns aggregate concurrent-export limits.
+    pub fn read_positions(&self, requested: Range<u64>, max_bytes: usize) -> Result<CaptureWindow, HistoryError> {
+        if requested.start > requested.end {
+            return Err(HistoryError::Inverted { requested });
+        }
+        let available = self.positions();
+        if requested.start < available.start || requested.end > available.end {
+            return Err(HistoryError::Unavailable { requested, available });
+        }
+        let start = (requested.start - available.start) as usize;
+        let end = (requested.end - available.start) as usize;
+        let bytes = self.buf.range(start..end).fold(0usize, |total, event| {
+            total.saturating_add(std::mem::size_of::<CaptureEvent>())
+                .saturating_add(event.source.len()).saturating_add(event.bytes.len())
+        });
+        if bytes > max_bytes {
+            return Err(HistoryError::SnapshotTooLarge { bytes, limit: max_bytes });
+        }
+        let mut events = Vec::with_capacity(end - start);
+        events.extend(self.buf.range(start..end).cloned());
+        Ok(CaptureWindow { positions: requested, events })
     }
 
     /// A new consumer cursor starting at the current head (it will see only
@@ -262,6 +393,95 @@ mod tests {
             source: "24:0".into(),
             bytes: bytes.to_vec(),
         }
+    }
+
+    #[test]
+    fn retrospective_windows_are_independent_and_ignore_wallclock_rollback() {
+        let mut ring = CaptureRing::new(4);
+        let mut tracker = ring.tracker_at(0);
+        ring.push(ev(20, &[0x90, 60, 100]));
+        ring.push(ev(10, &[0x80, 60, 0]));
+        let first = ring.read_positions(0..2, usize::MAX).unwrap();
+        assert_eq!(first.events.iter().map(|e| e.epoch_ns).collect::<Vec<_>>(), vec![20, 10]);
+        assert_eq!(ring.read_positions(1..2, usize::MAX).unwrap().events, first.events[1..]);
+        assert_eq!(ring.read_positions(0..2, usize::MAX).unwrap(), first);
+        assert_eq!(ring.cut(&mut tracker, 100).events, first.events);
+    }
+
+    #[test]
+    fn retrospective_coverage_and_snapshot_budget_fail_explicitly() {
+        let mut ring = CaptureRing::new(2);
+        for n in 0..3 { ring.push(ev(n, &[0xFA])); }
+        assert_eq!(ring.positions(), 1..3);
+        assert!(matches!(ring.read_positions(0..2, usize::MAX), Err(HistoryError::Unavailable { .. })));
+        assert!(matches!(ring.read_positions(1..4, usize::MAX), Err(HistoryError::Unavailable { .. })));
+        let inverted = std::ops::Range { start: 3, end: 2 };
+        assert!(matches!(ring.read_positions(inverted, usize::MAX), Err(HistoryError::Inverted { .. })));
+        assert!(matches!(ring.read_positions(1..3, 1), Err(HistoryError::SnapshotTooLarge { .. })));
+        assert!(ring.read_positions(3..3, 0).unwrap().events.is_empty());
+        assert_eq!(ring.positions(), 1..3);
+    }
+
+    #[test]
+    fn byte_bounds_evict_and_rejections_preserve_retained_history() {
+        let event = ev(1, &[0xFA]);
+        let bytes = event_bytes(&event);
+        let mut ring = CaptureRing::with_limits(CaptureLimits {
+            max_events: 8, max_bytes: bytes * 2, max_message_bytes: 3,
+        }).unwrap();
+        let mut tracker = ring.tracker_at(0);
+        for _ in 0..3 { ring.try_push(event.clone()).unwrap(); }
+        assert_eq!(ring.positions(), 1..3);
+        assert_eq!(ring.retained_bytes(), bytes * 2);
+        assert_eq!(ring.cut(&mut tracker, 10).lost, 1);
+        assert!(matches!(ring.try_push(ev(2, &[0xF0, 1, 2, 0xF7])), Err(HistoryError::MessageTooLarge { .. })));
+        let mut oversized_source = event.clone();
+        oversized_source.source = "x".repeat(bytes * 3);
+        assert!(matches!(ring.try_push(oversized_source), Err(HistoryError::EventTooLarge { .. })));
+        assert_eq!(ring.positions(), 1..3);
+        assert_eq!(ring.retained_bytes(), bytes * 2);
+    }
+
+    #[test]
+    fn retained_byte_budget_counts_spare_payload_capacity() {
+        let mut event = ev(1, &[0xFA]);
+        event.bytes.reserve(1024);
+        let mut ring = CaptureRing::with_limits(CaptureLimits {
+            max_events: 4, max_bytes: 512, max_message_bytes: 3,
+        }).unwrap();
+        assert!(matches!(ring.try_push(event), Err(HistoryError::EventTooLarge { .. })));
+        assert!(ring.is_empty());
+        assert_eq!(ring.total_pushed(), 0);
+    }
+
+    #[test]
+    fn admitted_snapshot_survives_overwrite_without_pinning_ring() {
+        let event = ev(1, &[0xFA]);
+        let bytes = event_bytes(&event);
+        let mut ring = CaptureRing::with_limits(CaptureLimits {
+            max_events: 1, max_bytes: bytes * 10, max_message_bytes: 1,
+        }).unwrap();
+        ring.try_push(event.clone()).unwrap();
+        let snapshot = ring.read_positions(0..1, bytes).unwrap();
+        for n in 2..10 { ring.try_push(ev(n, &[0xFC])).unwrap(); }
+        assert_eq!(snapshot.events, vec![event]);
+        assert_eq!(ring.positions(), 8..9);
+        assert_eq!(ring.retained_bytes(), bytes);
+    }
+
+    #[test]
+    fn zero_limits_and_position_exhaustion_are_explicit() {
+        for limits in [
+            CaptureLimits { max_events: 0, max_bytes: 100, max_message_bytes: 3 },
+            CaptureLimits { max_events: 1, max_bytes: 0, max_message_bytes: 3 },
+            CaptureLimits { max_events: 1, max_bytes: 100, max_message_bytes: 0 },
+        ] {
+            assert!(matches!(CaptureRing::with_limits(limits), Err(HistoryError::InvalidLimits)));
+        }
+        let mut ring = CaptureRing::new(1);
+        ring.pushed = u64::MAX;
+        assert_eq!(ring.try_push(ev(1, &[0xFA])), Err(HistoryError::PositionExhausted));
+        assert!(ring.is_empty());
     }
 
     #[test]

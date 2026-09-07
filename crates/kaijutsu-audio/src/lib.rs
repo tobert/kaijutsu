@@ -14,7 +14,8 @@ use std::time::Duration;
 
 pub mod capture;
 pub use capture::{
-    keep_at_ingest, CaptureBatch, CaptureError, CaptureEvent, CaptureRing, Tracker,
+    keep_at_ingest, CaptureBatch, CaptureError, CaptureEvent, CaptureLimits, CaptureRing,
+    CaptureWindow, HistoryError, Tracker,
     MIDI_CAPTURE_MIME, MIDI_CAPTURE_VERSION,
 };
 
