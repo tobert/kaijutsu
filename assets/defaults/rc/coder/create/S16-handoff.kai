@@ -1,0 +1,61 @@
+# S16-handoff.kai — inject this character's recent handoff notes at context
+# create (docs/character.md, "The handoff is an ordinary context").
+#
+# S15-recall injects what the fleet knows; this injects what the last
+# session left. Together they are the morning window: who I am, what I was
+# doing, what is waiting.
+#
+# Constraints this script exists to satisfy, same family as S15-recall:
+#
+#  - NEVER exit nonzero. A nonzero exit inserts a non-ephemeral
+#    BlockKind::Error the model sees on EVERY context create
+#    (kj/lifecycle.rs "Failure semantics"). `kj handoff tail` legitimately
+#    fails when the context's principal has no character sheet — a
+#    pre-character principal is not an error condition — so its exit is
+#    guarded and `exit 0` is the literal last line.
+#  - NOTIFICATION, never (Role::System, BlockKind::Text). This content
+#    differs on every create, and the System+Text slot folds into the
+#    CACHED system prompt (llm/system_prompt.rs), so writing there would
+#    invalidate the --target=system cache breakpoint on every context
+#    creation. Notification hydrates as an ordinary appended turn
+#    (llm/hydrate.rs) and is never swept into the system prompt.
+#  - Bounded. A single builtin's stdout is capped at 8192 bytes
+#    (OutputLimitConfig::agent(), runtime/embedded_kaish.rs); crossing it
+#    silently splices head+tail rather than erroring. Twelve notes sit far
+#    under that, and --window keeps it that way.
+#  - kj-and-VFS only. No network, no external process.
+#
+# `$(...)` assignment cannot be guarded with a trailing `||` — kaish never
+# fires it (gotcha_kaish). Every fallback below is therefore a separate
+# `test -z` statement, not an `||` tail.
+set -e
+
+window=12
+
+# `kj handoff tail` prints "[when] author: text" per note, or a bare
+# "<name> has no handoff notes yet" line. It errors only when the calling
+# principal has no character sheet at all.
+notes="$(kj handoff tail --window $window)"
+
+if test -z "$notes"; then
+  notes="(no handoff log reachable — this context's principal may have no character sheet yet; 'kj character create <name>' mints one)"
+fi
+
+stamp="$(date -u --iso-8601=seconds)"
+
+content="=== Handoff — the last $window notes on your character's log (auto-injected at create) ===
+Read $stamp. Notes are append-only and carry their own author, so a note
+signed by someone else was left FOR you by another character.
+
+$notes
+
+Leave one before you go cold:
+    kj handoff note 'what you did, what is next'
+Write to another character's log with:
+    kj handoff note --for <name> 'your message'
+A note you write for someone else still lands under your own name."
+
+kj block create --role system --kind notification --content "$content" || true
+
+echo "handoff: injected window=$window stamp=$stamp"
+exit 0
