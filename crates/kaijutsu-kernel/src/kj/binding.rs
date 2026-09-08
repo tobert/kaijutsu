@@ -312,7 +312,9 @@ impl KjDispatcher {
             }
             binding.revoke_cap(&cap);
         }
-        broker.set_binding(ctx_id, binding).await;
+        if let Err(e) = broker.set_binding(ctx_id, binding).await {
+            return KjResult::Err(format!("kj binding: {e}"));
+        }
 
         let verb = if allow { "allowed" } else { "revoked" };
         KjResult::ok(format!("{verb} {} on context {}", cap_label(&cap), ctx_id.short()))
@@ -331,7 +333,9 @@ impl KjDispatcher {
         if let Err(e) = self.authorize_binding_write(caller, ctx_id, false).await {
             return KjResult::Err(e);
         }
-        self.kernel().broker().clear_binding(&ctx_id).await;
+        if let Err(e) = self.kernel().broker().clear_binding(&ctx_id).await {
+            return KjResult::Err(format!("kj binding reset: {e}"));
+        }
         KjResult::ok(format!(
             "reset context {} — now denies all (deny-by-default; grant with `kj binding allow`)",
             ctx_id.short()
@@ -429,7 +433,7 @@ mod tests {
 
         let mut binding = crate::mcp::ContextToolBinding::new();
         binding.grant(Capability::AllInstances);
-        d.kernel().broker().set_binding(ctx, binding).await;
+        d.kernel().broker().set_binding(ctx, binding).await.unwrap();
 
         let out = d
             .dispatch(&argv(&["binding", "revoke", "builtin.file"]), &caller)
@@ -460,7 +464,7 @@ mod tests {
         let ctx = register_context(&d, Some("bind-test"), None, PrincipalId::system());
         // register_context grants a broad test loadout; clear it so this test
         // starts from the real deny-by-default state it asserts about.
-        d.kernel().broker().clear_binding(&ctx).await;
+        d.kernel().broker().clear_binding(&ctx).await.unwrap();
         // Widening (`allow`) requires a privileged (rc) or admin caller — the
         // rc lifecycle is what assigns loadouts. Simulate the rc path here.
         let caller = KjCaller {
@@ -514,8 +518,8 @@ mod tests {
         let other = register_context(&d, Some("other"), None, PrincipalId::system());
         // Clear the broad test loadout: this guard is about deny-by-default and
         // self-narrow-only, so both contexts must start from a clean slate.
-        d.kernel().broker().clear_binding(&ctx).await;
-        d.kernel().broker().clear_binding(&other).await;
+        d.kernel().broker().clear_binding(&ctx).await.unwrap();
+        d.kernel().broker().clear_binding(&other).await.unwrap();
         let file = InstanceId::new("builtin.file");
 
         // Seed a loadout as the rc lifecycle would (privileged).
@@ -561,8 +565,8 @@ mod tests {
         let target = register_context(&d, Some("managed"), None, PrincipalId::system());
         // Clear the broad test loadout so the admin grant + widening below are
         // the only grants in play (otherwise both start fully capable).
-        d.kernel().broker().clear_binding(&admin_ctx).await;
-        d.kernel().broker().clear_binding(&target).await;
+        d.kernel().broker().clear_binding(&admin_ctx).await.unwrap();
+        d.kernel().broker().clear_binding(&target).await.unwrap();
 
         // Make admin_ctx an admin (privileged rc bootstrap).
         let rc = KjCaller {

@@ -365,7 +365,7 @@ mod tests {
         if exec {
             binding.grant(crate::mcp::Capability::Exec);
         }
-        d.kernel().broker().set_binding(ctx, binding).await;
+        d.kernel().broker().set_binding(ctx, binding).await.unwrap();
     }
 
     /// The invariant, exec-less flavor: an unknown command in a Deny context

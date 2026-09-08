@@ -314,7 +314,7 @@ mod tests {
             InstanceId::new(BuiltinResourcesServer::INSTANCE),
             InstanceId::new("target"),
         ]);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
 
         let mut call_ctx = CallContext::test();
         call_ctx.context_id = ctx_id;
@@ -344,7 +344,7 @@ mod tests {
         // which must call unsubscribe on every tracked entry (D-44). If the
         // broker did not record the subscribe, clear_binding would be a no-op
         // on the target's `subscribed` set.
-        broker.clear_binding(&ctx_id).await;
+        broker.clear_binding(&ctx_id).await.unwrap();
         assert!(
             !target.subscribed.lock().unwrap().contains("file:///hello"),
             "clear_binding should have unsubscribed via the broker table",

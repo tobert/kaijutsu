@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use kaijutsu_kernel::block_store::{DocumentKind, SharedBlockStore, shared_block_store_with_db};
 use kaijutsu_kernel::execution::ExecContext;
-use kaijutsu_kernel::kernel_db::{DocumentRow, KernelDb};
+use kaijutsu_kernel::kernel_db::{ContextRow, DocumentRow, KernelDb};
 use kaijutsu_kernel::llm::hydrate_from_blocks;
 use kaijutsu_kernel::mcp::{
     CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
@@ -26,8 +26,8 @@ use kaijutsu_kernel::mcp::{
 };
 use kaijutsu_kernel::Kernel;
 use kaijutsu_types::{
-    now_millis, BlockFilter, BlockKind, ContextId, KernelId, NotificationKind, PrincipalId,
-    RefusalKind, SessionId,
+    now_millis, BlockFilter, BlockKind, ConsentMode, ContextId, ContextState, KernelId,
+    NotificationKind, PrincipalId, RefusalKind, SessionId,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +38,43 @@ struct Fixture {
     exec_ctx: ExecContext,
     store: SharedBlockStore,
     _tmp: tempfile::TempDir,
+}
+
+/// Insert the context row a binding row references by foreign key. The
+/// document row must already exist; `set_binding` cannot persist a
+/// binding for a context the DB does not know.
+fn insert_context_row(
+    db: &KernelDb,
+    ctx_id: ContextId,
+    ws_id: kaijutsu_types::WorkspaceId,
+    creator: PrincipalId,
+) {
+    db.insert_context(&ContextRow {
+        context_id: ctx_id,
+        label: None,
+        provider: None,
+        model: None,
+        system_prompt: None,
+        consent_mode: ConsentMode::Collaborative,
+        context_state: ContextState::Live,
+        context_type: "default".to_string(),
+        created_at: now_millis() as i64,
+        created_by: creator,
+        forked_from: None,
+        fork_kind: None,
+        archived_at: None,
+        workspace_id: Some(ws_id),
+        preset_id: None,
+        concluded_at: None,
+        last_activity_at: None,
+        promoted_at: None,
+        demoted_at: None,
+        paused_at: None,
+        cast_id: None,
+        origin_host: None,
+        played_by: None,
+    })
+    .unwrap();
 }
 
 async fn setup() -> Fixture {
@@ -66,6 +103,7 @@ async fn setup() -> Fixture {
             created_by: creator,
         })
         .unwrap();
+        insert_context_row(&g, ctx_id, ws_id, creator);
     }
     store.create_document(ctx_id, DocumentKind::File, None).unwrap();
 
@@ -88,7 +126,7 @@ async fn setup() -> Fixture {
                 ..Default::default()
             },
         )
-        .await;
+        .await.unwrap();
 
     let exec_ctx = ExecContext::new(
         creator,
@@ -226,7 +264,7 @@ async fn tool_granular_binding_hides_ungranted_sibling_tools() {
         instance: InstanceId::new("builtin.file"),
         tool: "read".into(),
     });
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
 
     let call_ctx = CallContext::new(
         fx.exec_ctx.principal_id,
@@ -267,7 +305,7 @@ async fn call_tool_refuses_ungranted_tool_directly() {
         instance: InstanceId::new("builtin.file"),
         tool: "read".into(),
     });
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
 
     let call_ctx = CallContext::new(
         fx.exec_ctx.principal_id,
@@ -330,7 +368,7 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
     let fx = setup().await;
     // setup() seeds a broad loadout for happy-path tests; start this one from
     // deny-all so the kj-set narrow binding is the only grant under test.
-    fx.kernel.broker().clear_binding(&fx.ctx_id).await;
+    fx.kernel.broker().clear_binding(&fx.ctx_id).await.unwrap();
 
     // Build a dispatcher over the fixture's kernel so `kj binding` mutates the
     // very broker we then inspect. Current-ref (default) resolves to the
@@ -404,7 +442,7 @@ async fn check_facade_denies_by_default_and_permits_when_granted() {
     let fx = setup().await;
     let broker = fx.kernel.broker();
     // setup() seeds a broad loadout; reset to deny-all to test the gate.
-    broker.clear_binding(&fx.ctx_id).await;
+    broker.clear_binding(&fx.ctx_id).await.unwrap();
 
     // Never-bound context: deny-by-default — facades refused.
     assert!(
@@ -418,7 +456,7 @@ async fn check_facade_denies_by_default_and_permits_when_granted() {
     // Grant just that facade → it passes, siblings still refused.
     let mut b = ContextToolBinding::new();
     b.grant(Capability::Facade("shell".into()));
-    broker.set_binding(fx.ctx_id, b).await;
+    broker.set_binding(fx.ctx_id, b).await.unwrap();
     assert!(broker.check_facade(&fx.ctx_id, "shell").await.is_ok());
     assert!(
         matches!(
@@ -431,7 +469,7 @@ async fn check_facade_denies_by_default_and_permits_when_granted() {
     // `facade:*` (all_facades) grants every facade surface.
     let mut b2 = broker.binding(&fx.ctx_id).await.unwrap();
     b2.grant(Capability::AllFacades);
-    broker.set_binding(fx.ctx_id, b2).await;
+    broker.set_binding(fx.ctx_id, b2).await.unwrap();
     assert!(broker.check_facade(&fx.ctx_id, "submit_input").await.is_ok());
 }
 
@@ -717,7 +755,7 @@ async fn tool_resolution_error_truncates_over_the_cap_and_says_how_many_were_omi
     for inst in fx.kernel.broker().list_instances().await {
         binding.allow(inst);
     }
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
     let seed_ctx = CallContext::new(
         fx.exec_ctx.principal_id,
         fx.ctx_id,
@@ -781,7 +819,7 @@ async fn denied_tool_call_names_the_tool_and_context_not_an_empty_or_confusing_e
         instance: InstanceId::new("builtin.file"),
         tool: "read".into(),
     });
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
 
     let err = fx
         .kernel
@@ -865,7 +903,7 @@ async fn is_error_result_maps_to_exec_failure() {
     for inst in fx.kernel.broker().list_instances().await {
         binding.allow(inst);
     }
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
     let seed_ctx = CallContext::new(
         fx.exec_ctx.principal_id,
         fx.ctx_id,
@@ -920,7 +958,7 @@ async fn a_failing_tool_with_no_text_still_reports_through_stderr() {
     for inst in fx.kernel.broker().list_instances().await {
         binding.allow(inst);
     }
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
     let seed_ctx = CallContext::new(
         fx.exec_ctx.principal_id,
         fx.ctx_id,
@@ -1162,7 +1200,7 @@ async fn server_notification_reaches_llm_hydrator() {
     // behavior — so the test has to bind first for the emission to land.
     let mock_id = InstanceId::new("test.hydrator");
     let binding = ContextToolBinding::with_instances(vec![mock_id.clone()]);
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
 
     // Runtime-register an MCP instance → broker emits a `ToolAdded`
     // notification block into every bound context (exit criterion #1).
@@ -1265,7 +1303,7 @@ async fn resource_updated_threads_child_block_and_llm_sees_it() {
 
     let mock_id = InstanceId::new("test.resource");
     let binding = ContextToolBinding::with_instances(vec![mock_id.clone()]);
-    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await.unwrap();
 
     let mock = Arc::new(LocalMock::new(mock_id.as_str()).with_text_resource(
         "file:///note.md",
@@ -1374,7 +1412,7 @@ async fn resource_updated_threads_child_block_and_llm_sees_it() {
     assert!(joined.contains("uri=\"file:///note.md\""));
 
     // Exit #4: clear_binding must unsubscribe cleanly on the server side.
-    fx.kernel.broker().clear_binding(&fx.ctx_id).await;
+    fx.kernel.broker().clear_binding(&fx.ctx_id).await.unwrap();
     assert!(
         !mock_handle.is_subscribed("file:///note.md"),
         "clear_binding must tear down live subscriptions",
@@ -1398,9 +1436,6 @@ use kaijutsu_kernel::mcp::servers::bindings_builtin::KERNEL_TOOLS_URI;
 /// a kernel and stand up a second one against the same DB. Sets
 /// `broker.set_db()` so `ContextToolBinding` mutations persist.
 async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
-    use kaijutsu_kernel::kernel_db::ContextRow;
-    use kaijutsu_types::{ConsentMode, ContextState};
-
     let tmp = tempfile::tempdir().unwrap();
 
     let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
@@ -1495,7 +1530,7 @@ async fn binding_persists_across_kernel_restart() {
             ctx_id,
             ContextToolBinding::with_instances(vec![InstanceId::new("builtin.file")]),
         )
-        .await;
+        .await.unwrap();
 
     // Sanity: live broker sees the curated binding (one instance).
     let loaded_live = fx.kernel.broker().binding(&ctx_id).await.unwrap();
@@ -1550,7 +1585,7 @@ async fn list_tools_deny_hides_and_blocks_but_keeps_discovery_honest() {
     fx.kernel
         .broker()
         .bind(ctx_id, InstanceId::new("builtin.file"))
-        .await;
+        .await.unwrap();
 
     // Register a ListTools Deny for write.
     fx.kernel
@@ -1652,7 +1687,7 @@ async fn kernel_tools_resource_end_to_end() {
     fx.kernel
         .broker()
         .bind(ctx_id, InstanceId::new("builtin.block"))
-        .await;
+        .await.unwrap();
 
     let call_ctx = {
         let mut c = CallContext::test();
@@ -1732,6 +1767,23 @@ async fn kernel_tools_resource_end_to_end() {
 async fn hooks_persist_across_kernel_restart() {
     let (fx, db) = setup_with_db().await;
     let sys = CallContext::system();
+    // The system context is a bare id; give it the rows its binding needs.
+    {
+        let g = db.lock();
+        let creator = PrincipalId::system();
+        let ws_id = g.get_or_create_default_workspace(creator).unwrap();
+        g.insert_document(&DocumentRow {
+            document_id: sys.context_id,
+            workspace_id: ws_id,
+            doc_kind: DocumentKind::File,
+            language: None,
+            path: None,
+            created_at: now_millis() as i64,
+            created_by: creator,
+        })
+        .unwrap();
+        insert_context_row(&g, sys.context_id, ws_id, creator);
+    }
     // Grant the admin context the broad loadout on kernel A so the capability
     // gate passes — this test is about hook persistence, and we want the *hook*
     // to be what denies builtin.block, not deny-by-default.
@@ -1745,7 +1797,7 @@ async fn hooks_persist_across_kernel_restart() {
                 ..Default::default()
             },
         )
-        .await;
+        .await.unwrap();
 
     // --- Kernel A: install a PreCall Deny on builtin.block via admin. ---
     let add = fx
@@ -1830,7 +1882,7 @@ async fn hooks_persist_across_kernel_restart() {
                 ..Default::default()
             },
         )
-        .await;
+        .await.unwrap();
 
     // Kernel B: same Deny fires on the same instance. No new hook_add
     // was issued — if this passes, the hook came back from the DB.

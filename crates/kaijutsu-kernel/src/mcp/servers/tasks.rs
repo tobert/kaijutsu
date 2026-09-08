@@ -566,7 +566,7 @@ mod tests {
         let visible = {
             let mut binding = crate::mcp::ContextToolBinding::new();
             binding.allow(InstanceId::new(BuiltinTasksServer::INSTANCE));
-            broker.set_binding(ctx.context_id, binding).await;
+            broker.set_binding(ctx.context_id, binding).await.unwrap();
             broker.list_visible_tools(ctx.context_id, &ctx).await.unwrap()
         };
         let names: Vec<_> = visible.iter().map(|(n, _)| n.as_str()).collect();

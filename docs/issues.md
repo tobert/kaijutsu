@@ -8,18 +8,10 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Found during the 2026-09-08 sweep (lead-verified)
 
-- **A `*` binding gets no tool-diff notifications.**
-  `binding_visible_tool_pairs` (`mcp/broker.rs:1107`) walks
-  `candidate_instances()` while `list_visible_tools` (`:1455`) expands
-  `all_instances`; a context bound to every instance sees the tools but never
-  the `ToolAdded`/`ToolRemoved` blocks.
 - **`background_exec.rs` and CLAUDE.md disagree.** The module header says
   kaish's job system is not reusable here and treats the migration as
   rejected; CLAUDE.md "Host exec has one owner" still names it as the
   ad-hoc exec site being retired. One of them is wrong; decide which.
-- **`docs/hooks.md` does not exist** but `kaijutsu-mcp/src/hook_types.rs:3`
-  cites it as the schema. Either write the page or point the comment at
-  `docs/cc-peer.md`.
 - **Code comments name issues.md entries that no longer exist** (`rg
   'docs/issues.md' crates` lists ~30; "latch nonce on stderr", "MCP shell
   delay", "msdfgen-rs" were dead before this sweep). CLAUDE.md says comments
@@ -80,12 +72,6 @@ MacBook is a supported client and nobody has confirmed the PPID chain and
 `$XDG_RUNTIME_DIR` fallback under macOS's launchd-spawned shells and Claude
 Code's process model. Run a bridge session on the Mac with `RUST_LOG` on and
 read what the resolver picked.
-
-## Hook command: pass `--socket` from settings (2026-09-05)
-
-Still not done: `~/.claude/settings.json` / `contrib/claude-hooks.json`'s hook
-command does not pass `--socket`, so the PPID-derived socket only outranks
-routing when routing falls through rather than on every call.
 
 ## Character: two hand tasks for Amy (rollout in `docs/character.md`)
 
@@ -328,16 +314,6 @@ the `( … ) &` subshell planning gap (kaish cannot plan it, S45 denies "no
 execution plan") is an ask to the kaish lead; an export verb for corpus
 builders was ruled "later" — they read the ledger directly for now.
 
-## Three MCP compose tools report failure as success (2026-09-01)
-
-`write_input`, `edit_input`, `submit_input` (`kaijutsu-mcp/src/lib.rs:2328,2368,2399`)
-still return a plain `String`, not `CallToolResult` — confirmed unchanged.
-Every failure on that path, gate/capability refusals included, still reaches
-the model inside an MCP *success* envelope with no `is_error: true` to key
-on. Fix: return `CallToolResult` with `is_error` set (updates the local-mode
-test that asserts the `String` shape), and surface `refusal.ask_id()` while
-there.
-
 ## A secret source that runs a command has no home yet (2026-08-31)
 
 `env.TOKEN = { command = "..." }` is still rejected —
@@ -368,16 +344,6 @@ the app (`ToggleSurface` still the same shape, `input/systems.rs:105`). Queued
 for the app/UI session — start at `ActiveSurface`/`FocusArea` duplication
 (128 references across `kaijutsu-app/src/`, still two pieces of state that
 must agree and are set in different places).
-
-## `persist_binding` swallows a failed write (2026-08-23)
-
-`Broker::persist_binding` (`mcp/broker.rs:1268`) still only `tracing::warn!`s
-an `upsert_context_binding` failure and returns — confirmed unchanged. The
-in-memory cache updates either way, so a caller cannot tell whether a written
-loadout is durable. Found because it hid a test: an unregistered
-`ContextId`'s binding write fails its foreign key, persists nothing, and
-stayed green with the fix removed. `kj binding reset`/`allow`/`revoke` and the
-MCP bind/unbind tools would have to carry the error.
 
 ## Binding review: unfixed items (2026-08-23)
 
@@ -462,15 +428,6 @@ only the last one, so "JSON on stdout" needs a rule for which line before
 this is buildable. Replying inline (a seat relays a human's reply from its
 own conversation into a ledger decision, after checking the reply's principal
 is human) is a real, undesigned option worth keeping in view.
-
-## `kj context set` applies its fields one write at a time (2026-08-21)
-
-`apply_context_config` (`kj/context.rs:359-440`) still issues separate
-sequential `db.update_model`/`update_cast`/`update_settings`/
-`upsert_context_shell`/`set_context_env` calls with `?` early-return between
-them, confirmed no transaction. A failure on a later field leaves earlier ones
-durably committed. Reachable since `--env` validates its key at write time:
-`kj context set --model x --env 1BAD=y` commits the model, then fails.
 
 ## Tech-debt audits, 2026-08-20 — what is still open
 
@@ -1328,15 +1285,6 @@ tested (`drive_refuses_an_archived_context` and siblings,
   (`context_usage.updated_at` vs. the shortest `cache_breakpoints` TTL,
   `kj/cache.rs:138-141`) but not implemented. Refusals must be loud, with a
   way to insist (cold-cache is a cost signal, not a correctness one).
-
-## Graceful-shutdown WAL checkpoint on SIGTERM
-
-`SharedKernelState::drop`'s checkpoint runs only on clean exit
-(`kaijutsu-server/src/rpc.rs:384-407`; the comment there points at this
-entry by name). Proactive compaction covers durability; the gap affects
-bare-file forensics between the last compaction and shutdown. Related:
-`kj db backup`/`checkpoint` exist (`kernel_db.rs:3236`), an export/import
-round-trip that rewrites every record in the current codec does not.
 
 ## App: `kj drive` on a non-OODA-armed musician silently discards its ABC
 

@@ -191,6 +191,12 @@ pub enum McpError {
     #[error("could not load context {context}'s tool binding: {reason}")]
     BindingUnavailable { context: ContextId, reason: String },
 
+    /// A binding write reached the in-memory cache but not the kernel DB.
+    /// The caller's loadout change is live for this process and lost on the
+    /// next boot, so the write must be reported as failed, not warned about.
+    #[error("could not persist context {context}'s tool binding: {reason}")]
+    BindingNotPersisted { context: ContextId, reason: String },
+
     #[error("hook recursion depth exceeded ({depth})")]
     HookRecursionLimit { depth: u32 },
 

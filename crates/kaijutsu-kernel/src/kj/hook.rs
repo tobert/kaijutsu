@@ -686,7 +686,12 @@ mod tests {
         // a different gate than the one this test is about. Bind a context
         // to `builtin.hooks` so the call clears the capability check and the
         // Deny("*") hook is what actually stops it.
-        let mcp_ctx = kaijutsu_types::ContextId::new();
+        let mcp_ctx = test_helpers::register_context(
+            &d,
+            None,
+            None,
+            kaijutsu_types::PrincipalId::system(),
+        );
         d.kernel()
             .broker()
             .set_binding(
@@ -695,7 +700,7 @@ mod tests {
                     "builtin.hooks",
                 )]),
             )
-            .await;
+            .await.unwrap();
         let call_ctx = CallContext::new(
             kaijutsu_types::PrincipalId::new(),
             mcp_ctx,

@@ -411,7 +411,7 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
@@ -527,7 +527,7 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
 
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
@@ -612,7 +612,7 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
 
         // First read: wait for "AAAA" to land, then read from the start.
         let start = std::time::Instant::now();
@@ -674,7 +674,7 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
         let start = broker
@@ -720,11 +720,11 @@ mod tests {
         let mut owner_binding = ContextToolBinding::new();
         owner_binding.grant(Capability::Facade("shell_write".into()));
         owner_binding.grant(Capability::Exec);
-        broker.set_binding(owner_ctx, owner_binding).await;
+        broker.set_binding(owner_ctx, owner_binding).await.unwrap();
         let mut other_binding = ContextToolBinding::new();
         other_binding.grant(Capability::Facade("shell_write".into()));
         other_binding.grant(Capability::Exec);
-        broker.set_binding(other_ctx, other_binding).await;
+        broker.set_binding(other_ctx, other_binding).await.unwrap();
 
         let owner_cc = CallContext::new(principal, owner_ctx, SessionId::new(), d.kernel_id());
         let other_cc = CallContext::new(principal, other_ctx, SessionId::new(), d.kernel_id());
@@ -792,7 +792,7 @@ mod tests {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("nofacade"), None, principal);
-        broker.set_binding(ctx_id, ContextToolBinding::new()).await;
+        broker.set_binding(ctx_id, ContextToolBinding::new()).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
         let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
@@ -825,7 +825,7 @@ mod tests {
         let mut owner_binding = ContextToolBinding::new();
         owner_binding.grant(Capability::Facade("shell_write".into()));
         owner_binding.grant(Capability::Exec);
-        broker.set_binding(owner_ctx, owner_binding).await;
+        broker.set_binding(owner_ctx, owner_binding).await.unwrap();
         let owner_cc = CallContext::new(principal, owner_ctx, SessionId::new(), d.kernel_id());
 
         let start = broker
@@ -847,7 +847,7 @@ mod tests {
         // against the SAME owner context using a binding without exec).
         let mut no_exec = ContextToolBinding::new();
         no_exec.grant(Capability::Facade("shell_write".into()));
-        broker.set_binding(owner_ctx, no_exec).await;
+        broker.set_binding(owner_ctx, no_exec).await.unwrap();
 
         let err = broker
             .call_tool(
@@ -862,7 +862,7 @@ mod tests {
         let mut with_exec = ContextToolBinding::new();
         with_exec.grant(Capability::Facade("shell_write".into()));
         with_exec.grant(Capability::Exec);
-        broker.set_binding(owner_ctx, with_exec).await;
+        broker.set_binding(owner_ctx, with_exec).await.unwrap();
         broker
             .call_tool(call(BackgroundServer::TOOL_KILL, serde_json::json!({"id": bg_id})), &owner_cc, CancellationToken::new())
             .await
@@ -890,7 +890,7 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
         let start = broker
@@ -999,7 +999,7 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
         let cap = crate::background_exec::DEFAULT_OUTPUT_CAP;
@@ -1088,7 +1088,7 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
 
         let heartbeat = std::env::temp_dir().join(format!("kaijutsu-bg-tree-hb-{}", uuid::Uuid::new_v4()));

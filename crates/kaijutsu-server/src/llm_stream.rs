@@ -3558,7 +3558,7 @@ mod tool_dispatch_timeout_tests {
                 ctx,
                 ContextToolBinding::with_instances(vec![InstanceId::new("napper")]),
             )
-            .await;
+            .await.unwrap();
         let tool_ctx = kaijutsu_kernel::ExecContext::new(
             PrincipalId::new(),
             ctx,

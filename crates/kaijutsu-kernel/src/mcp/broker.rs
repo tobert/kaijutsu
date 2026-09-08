@@ -953,7 +953,11 @@ impl Broker {
     /// R1 mitigation: the diff is per-pair, not per-instance, so
     /// `unbind → rebind` of the same instance is a no-op emission
     /// (identical pairs, empty set difference).
-    pub async fn set_binding(&self, context_id: ContextId, binding: ContextToolBinding) {
+    pub async fn set_binding(
+        &self,
+        context_id: ContextId,
+        binding: ContextToolBinding,
+    ) -> McpResult<()> {
         let old = self
             .bindings
             .read()
@@ -977,12 +981,15 @@ impl Broker {
             .filter(|i| !kept.contains(i))
             .collect();
 
+        // Durable row first, cache second: a caller that gets `Ok` holds a
+        // loadout that survives a restart, and one that gets `Err` holds
+        // the loadout it had.
+        self.persist_binding(context_id, &binding).await?;
+
         self.bindings
             .write()
             .await
             .insert(context_id, binding.clone());
-
-        self.persist_binding(context_id, &binding).await;
 
         self.emit_binding_diff(context_id, &old_pairs, &new_pairs)
             .await;
@@ -993,6 +1000,7 @@ impl Broker {
             self.teardown_subscriptions_for_context(context_id, instance)
                 .await;
         }
+        Ok(())
     }
 
     /// Of `uris` (all on `instance`), keep only those no remaining context
@@ -1080,37 +1088,44 @@ impl Broker {
 
     /// Add an instance to a context's binding (idempotent). Triggers the
     /// same diff + persistence + notification pipeline as `set_binding`.
-    pub async fn bind(&self, context_id: ContextId, instance: InstanceId) {
+    pub async fn bind(&self, context_id: ContextId, instance: InstanceId) -> McpResult<()> {
         let mut binding = self
             .binding(&context_id)
             .await
             .unwrap_or_default();
         binding.allow(instance);
-        self.set_binding(context_id, binding).await;
+        self.set_binding(context_id, binding).await
     }
 
     /// Remove an instance from a context's binding (idempotent if absent).
     /// Also evicts `name_map` entries pointing at the dropped instance so
     /// follow-up calls surface the removed-tool error cleanly.
-    pub async fn unbind(&self, context_id: ContextId, instance: &InstanceId) {
+    pub async fn unbind(&self, context_id: ContextId, instance: &InstanceId) -> McpResult<()> {
         let mut binding = self
             .binding(&context_id)
             .await
             .unwrap_or_default();
         binding.revoke(instance);
-        self.set_binding(context_id, binding).await;
+        self.set_binding(context_id, binding).await
     }
 
     /// Expand a binding into its `(instance, tool_name)` pair set using the
     /// cached `tool_snapshots` map. Used for diff computation on binding
-    /// mutation (R1 mitigation per the plan).
+    /// mutation. A `*` binding spans every snapshotted instance, the same
+    /// expansion `list_visible_tools` applies, because `candidate_instances`
+    /// cannot enumerate the registry.
     async fn binding_visible_tool_pairs(
         &self,
         binding: &ContextToolBinding,
     ) -> HashSet<(InstanceId, String)> {
         let snapshots = self.tool_snapshots.lock().await;
+        let instances: Vec<InstanceId> = if binding.all_instances {
+            snapshots.keys().cloned().collect()
+        } else {
+            binding.candidate_instances()
+        };
         let mut pairs = HashSet::new();
-        for instance in &binding.candidate_instances() {
+        for instance in &instances {
             if let Some(tools) = snapshots.get(instance) {
                 for kt in tools {
                     if binding.allows_tool(instance, &kt.name) {
@@ -1264,20 +1279,24 @@ impl Broker {
     }
 
     /// Persist a binding to the kernel DB. No-op when the DB handle is
-    /// not set (tests, early bootstrap).
-    async fn persist_binding(&self, context_id: ContextId, binding: &ContextToolBinding) {
+    /// not set (tests, early bootstrap). A failed write is the caller's
+    /// error: the in-memory cache is only updated after this succeeds.
+    async fn persist_binding(
+        &self,
+        context_id: ContextId,
+        binding: &ContextToolBinding,
+    ) -> McpResult<()> {
         let db = match self.db.read().await.clone() {
             Some(h) => h,
-            None => return,
+            None => return Ok(()),
         };
         let mut guard = db.lock();
-        if let Err(e) = guard.upsert_context_binding(context_id, binding) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = ?e,
-                "failed to persist context binding",
-            );
-        }
+        guard
+            .upsert_context_binding(context_id, binding)
+            .map_err(|e| McpError::BindingNotPersisted {
+                context: context_id,
+                reason: e.to_string(),
+            })
     }
 
     /// Drop a binding. D-44: walk any live subscriptions for this context
@@ -1288,7 +1307,7 @@ impl Broker {
     /// context still watches: the server call is per resource and knows
     /// nothing about contexts, so sending it while a sibling subscribes
     /// would silently stop that sibling's updates.
-    pub async fn clear_binding(&self, context_id: &ContextId) {
+    pub async fn clear_binding(&self, context_id: &ContextId) -> McpResult<()> {
         // Drain this context's set, then keep only what nobody else watches.
         let pending = {
             let mut subs = self.subscriptions.lock().await;
@@ -1324,8 +1343,10 @@ impl Broker {
             .lock()
             .await
             .retain(|(ctx, _, _), _| ctx != context_id);
+        // Durable row first, cache second, as in `set_binding`.
+        self.forget_persisted_binding(context_id).await?;
         self.bindings.write().await.remove(context_id);
-        self.forget_persisted_binding(context_id).await;
+        Ok(())
     }
 
     /// Delete the durable binding row, so a cleared binding STAYS cleared.
@@ -1337,23 +1358,22 @@ impl Broker {
     /// Both readers agreed, and both were wrong, which is why no divergence
     /// test would have caught it.
     ///
-    /// A write failure is logged and not propagated, matching
-    /// [`Self::persist_binding`] — but note the asymmetry it leaves: a failed
-    /// delete means the row outlives the reset, so the operator's next read
-    /// sees the old loadout. The warning is the only signal.
-    async fn forget_persisted_binding(&self, context_id: &ContextId) {
+    /// A failed delete is the caller's error, as in [`Self::persist_binding`]:
+    /// the row would outlive the reset and the next read would show the old
+    /// loadout, so the reset must not report success.
+    async fn forget_persisted_binding(&self, context_id: &ContextId) -> McpResult<()> {
         let db = match self.db.read().await.clone() {
             Some(h) => h,
-            None => return,
+            None => return Ok(()),
         };
         let guard = db.lock();
-        if let Err(e) = guard.delete_context_binding(*context_id) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = ?e,
-                "failed to delete context binding; the reset will not survive a re-read",
-            );
-        }
+        guard
+            .delete_context_binding(*context_id)
+            .map(|_deleted| ())
+            .map_err(|e| McpError::BindingNotPersisted {
+                context: *context_id,
+                reason: e.to_string(),
+            })
     }
 
     /// Read a context's binding, hydrating from the kernel DB on cache miss.
@@ -3534,6 +3554,10 @@ fn error_to_hook_json(e: &McpError) -> String {
             "BindingUnavailable",
             serde_json::json!({"context": context.to_string(), "reason": reason}),
         ),
+        McpError::BindingNotPersisted { context, reason } => (
+            "BindingNotPersisted",
+            serde_json::json!({"context": context.to_string(), "reason": reason}),
+        ),
         McpError::HookRecursionLimit { depth } => (
             "HookRecursionLimit",
             serde_json::json!({"depth": depth}),
@@ -5271,7 +5295,7 @@ mod tests {
 
     async fn bind(broker: &Arc<Broker>, ctx: ContextId, instance: &str) {
         let binding = ContextToolBinding::with_instances(vec![InstanceId::new(instance)]);
-        broker.set_binding(ctx, binding).await;
+        broker.set_binding(ctx, binding).await.unwrap();
     }
 
     fn notifications_in(store: &SharedBlockStore, ctx: ContextId) -> Vec<NotificationPayload> {
@@ -6082,13 +6106,13 @@ mod tests {
 
         let mut binding = ContextToolBinding::new();
         binding.allow(InstanceId::new("res"));
-        broker.set_binding(ctx, binding).await;
+        broker.set_binding(ctx, binding).await.unwrap();
         assert!(
             d.kernel_db().lock().get_context_binding(ctx).unwrap().is_some(),
             "precondition: the binding reached the durable row, not just the cache"
         );
 
-        broker.clear_binding(&ctx).await;
+        broker.clear_binding(&ctx).await.unwrap();
 
         assert!(
             d.kernel_db().lock().get_context_binding(ctx).unwrap().is_none(),
@@ -6133,7 +6157,7 @@ mod tests {
         assert!(server_handle.was_subscribed("file:///b"));
         assert!(server_handle.was_subscribed("file:///c"));
 
-        broker.clear_binding(&ctx).await;
+        broker.clear_binding(&ctx).await.unwrap();
 
         assert!(!server_handle.was_subscribed("file:///a"));
         assert!(!server_handle.was_subscribed("file:///b"));
@@ -6178,7 +6202,7 @@ mod tests {
         }
         assert!(server_handle.was_subscribed("file:///a"));
 
-        broker.unbind(ctx, &InstanceId::new("res")).await;
+        broker.unbind(ctx, &InstanceId::new("res")).await.unwrap();
 
         assert!(!server_handle.was_subscribed("file:///a"));
         assert!(!server_handle.was_subscribed("file:///b"));
@@ -6223,7 +6247,7 @@ mod tests {
                 .unwrap();
         }
 
-        broker.unbind(ctx, &InstanceId::new("res")).await;
+        broker.unbind(ctx, &InstanceId::new("res")).await.unwrap();
 
         // The server must still hold the subscription: the sibling context
         // is a live subscriber, and `unsubscribe` is per (instance, uri)
@@ -6478,7 +6502,7 @@ mod tests {
                     ctx,
                     ContextToolBinding::with_instances(vec![InstanceId::new("res")]),
                 )
-                .await;
+                .await.unwrap();
         }
 
         let server = Arc::new(
@@ -8717,7 +8741,7 @@ mod tests {
             "silent register should not emit notifications",
         );
 
-        broker.bind(ctx, InstanceId::new("svc")).await;
+        broker.bind(ctx, InstanceId::new("svc")).await.unwrap();
 
         let notifs = notifications_in(&store, ctx);
         assert_eq!(notifs.len(), 1, "expected one coalesced ToolAdded for the instance");
@@ -8740,11 +8764,11 @@ mod tests {
             .register_silently(server, InstancePolicy::default())
             .await
             .unwrap();
-        broker.bind(ctx, InstanceId::new("svc")).await;
+        broker.bind(ctx, InstanceId::new("svc")).await.unwrap();
         // One ToolAdded from bind so far.
         assert_eq!(notifications_in(&store, ctx).len(), 1);
 
-        broker.unbind(ctx, &InstanceId::new("svc")).await;
+        broker.unbind(ctx, &InstanceId::new("svc")).await.unwrap();
 
         let notifs = notifications_in(&store, ctx);
         assert_eq!(notifs.len(), 2, "expected ToolAdded + ToolRemoved");
@@ -8780,7 +8804,7 @@ mod tests {
         // Start with {a}
         broker
             .set_binding(ctx, ContextToolBinding::with_instances(vec![InstanceId::new("a")]))
-            .await;
+            .await.unwrap();
         assert_eq!(
             notifications_in(&store, ctx).len(),
             1,
@@ -8790,7 +8814,7 @@ mod tests {
         // Swap to {b} — expect ToolAdded for b (beta+gamma), ToolRemoved for a (alpha).
         broker
             .set_binding(ctx, ContextToolBinding::with_instances(vec![InstanceId::new("b")]))
-            .await;
+            .await.unwrap();
         // Cumulative blocks across both set_binding calls (D-35 coalesced —
         // one block per instance per mutation, not one block per tool):
         //   first bind  → 1 ToolAdded(a, [alpha])
@@ -8823,6 +8847,68 @@ mod tests {
         assert_eq!(removed, vec![("a", vec!["alpha".to_string()])]);
     }
 
+    /// A `*` binding names no instance, so the diff must expand it over the
+    /// snapshot the way `list_visible_tools` does, or the context sees the
+    /// tools and never hears that they arrived or left.
+    #[tokio::test]
+    async fn set_binding_diff_covers_a_star_binding() {
+        let (broker, store, ctx) = wired_broker().await;
+        let a = Arc::new(MockServer::new("a").with_tool("alpha"));
+        broker
+            .register_silently(a, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let star = ContextToolBinding {
+            all_instances: true,
+            ..Default::default()
+        };
+        broker.set_binding(ctx, star).await.unwrap();
+        let notifs = notifications_in(&store, ctx);
+        assert_eq!(notifs.len(), 1, "one ToolAdded for a.alpha; got {notifs:?}");
+        assert_eq!(notifs[0].kind, kaijutsu_types::NotificationKind::ToolAdded);
+        assert_eq!(notifs[0].tools, vec!["alpha".to_string()]);
+
+        broker
+            .set_binding(ctx, ContextToolBinding::new())
+            .await
+            .unwrap();
+        let removed: Vec<NotificationPayload> = notifications_in(&store, ctx)
+            .into_iter()
+            .filter(|n| n.kind == kaijutsu_types::NotificationKind::ToolRemoved)
+            .collect();
+        assert_eq!(removed.len(), 1, "one ToolRemoved when `*` is revoked; got {removed:?}");
+        assert_eq!(removed[0].tools, vec!["alpha".to_string()]);
+    }
+
+    /// A binding row references its context by foreign key, so writing one
+    /// for a context the DB does not know fails. That failure must reach the
+    /// caller, and must not leave a cache entry the next boot forgets.
+    #[tokio::test]
+    async fn set_binding_that_cannot_persist_is_an_error_and_not_cached() {
+        use crate::kernel_db::KernelDb;
+        let broker = Arc::new(Broker::new());
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        broker.set_db(kernel_db).await;
+        let ctx = ContextId::new();
+
+        let err = broker
+            .set_binding(
+                ctx,
+                ContextToolBinding::with_instances(vec![InstanceId::new("svc")]),
+            )
+            .await
+            .expect_err("an unregistered context cannot hold a durable binding");
+        assert!(
+            matches!(err, McpError::BindingNotPersisted { context, .. } if context == ctx),
+            "{err:?}"
+        );
+        assert!(
+            broker.binding(&ctx).await.is_none(),
+            "a failed write leaves no cache entry"
+        );
+    }
+
     /// R1 mitigation: if an unbind→rebind cycle lands on the same
     /// `(instance, tool_name)` pair set, no spurious diff is emitted. The
     /// plan specifically calls this case out as a pitfall to guard.
@@ -8836,12 +8922,12 @@ mod tests {
             .unwrap();
 
         let b = ContextToolBinding::with_instances(vec![InstanceId::new("svc")]);
-        broker.set_binding(ctx, b.clone()).await;
+        broker.set_binding(ctx, b.clone()).await.unwrap();
         let after_first = notifications_in(&store, ctx).len();
         assert_eq!(after_first, 1, "first set_binding emits ToolAdded");
 
         // Re-apply an identical binding. Pair set is unchanged → no diff.
-        broker.set_binding(ctx, b).await;
+        broker.set_binding(ctx, b).await.unwrap();
         assert_eq!(
             notifications_in(&store, ctx).len(),
             after_first,
@@ -8865,7 +8951,7 @@ mod tests {
             .register_silently(server, InstancePolicy::default())
             .await
             .unwrap();
-        broker.bind(ctx, InstanceId::new("files")).await;
+        broker.bind(ctx, InstanceId::new("files")).await.unwrap();
 
         // Install a ListTools Deny on file_write.
         broker
@@ -8920,7 +9006,7 @@ mod tests {
             .register_silently(server, InstancePolicy::default())
             .await
             .unwrap();
-        broker.bind(ctx, InstanceId::new("files")).await;
+        broker.bind(ctx, InstanceId::new("files")).await.unwrap();
 
         broker
             .hooks()
@@ -8975,7 +9061,7 @@ mod tests {
             .register_silently(server, InstancePolicy::default())
             .await
             .unwrap();
-        broker.bind(ctx, InstanceId::new("files")).await;
+        broker.bind(ctx, InstanceId::new("files")).await.unwrap();
 
         broker
             .hooks()

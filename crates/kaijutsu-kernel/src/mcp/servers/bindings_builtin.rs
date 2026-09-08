@@ -227,7 +227,7 @@ impl McpServerLike for BuiltinBindingsServer {
                     });
                 }
                 let instance = InstanceId::new(p.instance.clone());
-                broker.bind(ctx.context_id, instance).await;
+                broker.bind(ctx.context_id, instance).await?;
                 let json = serde_json::json!({ "instance": p.instance });
                 Ok(KernelToolResult {
                     is_error: false,
@@ -257,7 +257,7 @@ impl McpServerLike for BuiltinBindingsServer {
                         structured: None,
                     });
                 }
-                broker.unbind(ctx.context_id, &instance).await;
+                broker.unbind(ctx.context_id, &instance).await?;
                 let json = serde_json::json!({ "instance": p.instance });
                 Ok(KernelToolResult {
                     is_error: false,
@@ -484,7 +484,7 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await;
+            .await.unwrap();
         let call_ctx = call_ctx_for(ctx_id);
 
         // Initially empty.
@@ -560,7 +560,7 @@ mod tests {
         broker
             .bind(ctx_id, InstanceId::new("builtin.bindings"))
             .await;
-        broker.bind(ctx_id, InstanceId::new("target")).await;
+        broker.bind(ctx_id, InstanceId::new("target")).await.unwrap();
         let call_ctx = call_ctx_for(ctx_id);
 
         broker
@@ -618,7 +618,7 @@ mod tests {
         let ctx_id = ContextId::new();
         let mut binding = crate::mcp::ContextToolBinding::new();
         binding.grant(Capability::AllInstances);
-        broker.set_binding(ctx_id, binding).await;
+        broker.set_binding(ctx_id, binding).await.unwrap();
         let call_ctx = call_ctx_for(ctx_id);
 
         let out = broker
@@ -788,7 +788,7 @@ mod tests {
         };
         assert!(!bound_before, "unbound context should see bound=false");
 
-        broker.bind(ctx_id, InstanceId::new("target")).await;
+        broker.bind(ctx_id, InstanceId::new("target")).await.unwrap();
 
         let read_after = server
             .read_resource(KERNEL_TOOLS_URI, &call_ctx)
