@@ -464,8 +464,10 @@ SSH actor. Transport stop, connection loss and shutdown flush scheduled output.
 Late musical events follow `docs/midi.md`, "The one timebase".
 
 The app has no hardware I/O; `kaijutsu-audiod` is the sole hardware owner.
-The patch bay still reads local ALSA topology; remote topology and daemon
-traffic animations are follow-up work.
+The patch bay reads `/run/audio/<node>/inventory.json`, one table per node,
+and pulses render traffic from that node's own event counters — a remote
+node's fabric (moltar's rack, say) is visible from any connected app the
+same way a local one is.
 
 ## Linux service
 

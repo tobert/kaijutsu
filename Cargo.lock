@@ -6033,7 +6033,6 @@ dependencies = [
 name = "kaijutsu-app"
 version = "0.1.0"
 dependencies = [
- "alsa 0.9.1",
  "arboard",
  "bevy",
  "bevy_brp_extras",
@@ -6054,7 +6053,6 @@ dependencies = [
  "indexmap 2.14.0",
  "kaijutsu-abc",
  "kaijutsu-audio",
- "kaijutsu-audio-runtime",
  "kaijutsu-cas",
  "kaijutsu-client",
  "kaijutsu-diff",

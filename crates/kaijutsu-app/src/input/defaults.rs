@@ -539,7 +539,7 @@ pub fn default_bindings() -> Vec<Binding> {
         KeyCode::KeyR,
         InputContext::PatchBayZoomed,
         Action::Rescan,
-        "Rescan ALSA graph",
+        "Rescan audio inventory",
     ));
     b.push(Binding::key(
         KeyCode::ArrowUp,

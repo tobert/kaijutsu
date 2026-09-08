@@ -39,8 +39,9 @@ observed audio graph is **edge-local reality the kernel does not hold**. The
 split follows existing doctrine — **the kernel holds intent, the edge holds
 reality** ("distribute intent, not pulses" applied to routing):
 
-- *Observed* wires (slice 0) are read by the app from its own local
-  ALSA/PipeWire graph. No kernel state involved.
+- *Observed* wires (slice 0) are read by the app from the kernel's projected
+  `/run/audio/<node>/inventory.json` (`docs/audio-daemon.md`, "One inventory
+  owner") — the app opens no ALSA/PipeWire client of its own; a daemon does.
 - *Declared* wires (slice 2) are kernel-owned, ClientId-keyed; an app-side
   reconciler realizes them against the local graph, **additively** — create
   missing declared wires, never tear down undeclared ones. A neighbor's
@@ -136,6 +137,11 @@ Each shippable alone, in order; 1 is independent and can land any time.
   the RENDER chord pulse. **Verified 2026-07-09** — wires, poll add/remove,
   and the pulse (driven live via `kj play`; the click path is the same
   send seam, its pulse awaits the next jam with the metronome armed).
+- **Migrated 2026-09-08**: the app-side ALSA `PatchGraphReader` is gone — the
+  app has no hardware I/O of its own (`docs/audio-daemon.md`). The circle now
+  reads a node's projected `/run/audio/<node>/inventory.json` over the same
+  poll cadence, which is also what makes a remote node's fabric visible from
+  any connected app for free.
 
 ### Slice 1 — auto-connect on startup ✓ shipped (independent cheap win)
 

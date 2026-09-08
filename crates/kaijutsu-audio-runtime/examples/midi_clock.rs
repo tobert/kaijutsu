@@ -5,12 +5,12 @@
 //! Emits `FA` (Start) then a 24-PPQN `F8` pulse train on an ALSA seq source
 //! port, with optional linear tempo drift and per-pulse uniform jitter — the
 //! exact signal shapes the `ClockEstimator` tests synthesize, now on a real
-//! bus. The app's ear auto-subscribes via System Announce (the client name
+//! bus. The daemon's ear auto-subscribes via System Announce (the client name
 //! is NOT one of the excluded ones), the capture-thread tap locks, and the
 //! estimate stream flows kernel-ward.
 //!
 //! ```sh
-//! cargo run -p kaijutsu-app --example midi_clock -- --bpm 120 --drift 1.0 --jitter-ms 2
+//! cargo run -p kaijutsu-audio-runtime --example midi_clock -- --bpm 120 --drift 1.0 --jitter-ms 2
 //! ```
 //!
 //! `--drift` is BPM per minute (linear ramp, the accelerando the EMA must

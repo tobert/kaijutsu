@@ -1,10 +1,17 @@
 //! Patch bay station — the circle scene, slice 0 (`docs/scenes/patchbay.md`).
 //!
-//! Read-only observed reality: the local ALSA seq graph rendered as a round
+//! Read-only observed reality: a node's ALSA seq graph, projected by the
+//! kernel to `/run/audio/<node-dir>/inventory.json`
+//! (`docs/audio-daemon.md`, "One inventory owner") and rendered as a round
 //! table — brass socket pegs seated around the rim grouped by client, chords
 //! of emissive light bowing around the open center for every live
-//! subscription. Polled every couple of seconds; hand-run `aconnect` changes
-//! appear on the next poll. No write path of any kind (patching stays
+//! subscription. Polled every couple of seconds; a node's own reconciliation
+//! (hotplug, hand-run `aconnect` changes) appears on the next poll. **The app
+//! has no hardware I/O of its own** — every ALSA/PipeWire client (this one
+//! included) lives in `kaijutsu-audio-runtime`/`kaijutsu-audiod`, and this
+//! module reads the kernel's projection like any other VFS consumer, which is
+//! also what makes a remote node's fabric (moltar's rack, from any connected
+//! app) show up here for free. No write path of any kind (patching stays
 //! CLI-only for a long time — the scene is a viewer).
 //!
 //! **The circle IS the west station** (`docs/scenes/shell.md`, Tardis reading
@@ -23,10 +30,11 @@
 //! follows), Up or Esc surfaces to the room, `r` forces a poll.
 
 pub mod geometry;
+mod inventory;
 
 use bevy::prelude::*;
 
-use crate::patch_graph::{EndpointInfo, PatchGraphReader, PatchGraphSnapshot, diff, without_plumbing};
+use crate::connection::{AudioInventoryFetch, RpcActor, RpcResultChannel, RpcResultMessage};
 use crate::shaders::{ChordMaterial, WellCardMaterial};
 use crate::text::ShapingFonts;
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph};
@@ -41,6 +49,7 @@ use crate::view::room::{
 use crate::view::scene_palette::{ScenePalette, lin, lin_scaled};
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
 use geometry::{chord_points, layout_sockets};
+use inventory::{EndpointInfo, PatchGraphSnapshot, diff, without_plumbing};
 
 // ── Station placement seam (Amy-tunable — the ONE knob) ──────────────────────
 // Where the patch-bay wheel stands as the west station itself — MOUNTED ON
@@ -180,17 +189,20 @@ const PULSE_BAND_WIDTH: f32 = 0.16;
 // Peak brightness added at the packet crest (HDR → bloom = "live action")
 // moved onto `ScenePalette::gain_pulse`.
 /// A `pulse_time` sentinel far in the past: no packet, wire solid-lit. Every
-/// wire the app can't observe stays here (the seam slice 4 fills kernel-ward).
+/// wire other than the render port's own stays here — only that port's
+/// `events` counter (`inventory.json`) can trigger a pulse.
 const PULSE_IDLE: f32 = -1.0e6;
 
 /// The inspection card floats this far above the selected chord's apex.
 const INFO_PLATE_LIFT: f32 = 58.0;
 /// The empty-state (no wires) inspection-plate pose — the original edge
-/// placement, kept only for "NO WIRES" / "NO ALSA GRAPH".
+/// placement, kept only for the "NO WIRES"/"NO AUDIO NODES" text.
 const INFO_EDGE_POS: Vec3 = Vec3::new(TABLE_OUTER_R * 0.78, 190.0, TABLE_OUTER_R * 0.35);
 
-/// The app's own render endpoint identity (must match `MidiOut::open` in
-/// `midi.rs`): the source of any chord the app can pulse from its own traffic.
+/// The render endpoint identity (must match `MidiOut::open` in
+/// `kaijutsu-audio-runtime/src/dj/midi.rs` — the daemon's, not the app's;
+/// the app opens no ALSA client of its own): the source of any chord the
+/// patch bay can pulse from a node's reported traffic.
 const RENDER_CLIENT_NAME: &str = "kaijutsu-audio";
 const RENDER_PORT_NAME: &str = "render";
 
@@ -280,46 +292,43 @@ fn placement_to_room(p: &StationPlacement, local: Vec3) -> Vec3 {
 
 // ── State ───────────────────────────────────────────────────────────────────
 
-/// Main-thread-only ALSA handle (the `Seq` is not Send — same NonSend stance
-/// as `MidiSink`). `None` until the first enter; `Some(None)` = open failed
-/// (logged once; the scene shows an empty table rather than crashing —
-/// ALSA-less machines still get the room nav).
-#[derive(Default)]
-pub struct PatchBayAlsa {
-    reader: Option<Option<PatchGraphReader>>,
-}
-
-impl PatchBayAlsa {
-    /// Clear a latched failed open (`Some(None)`) so the next poll retries
-    /// `PatchGraphReader::open()`. A healthy reader (`Some(Some(_))`) is left
-    /// alone — closing and reopening a working handle would churn its ALSA
-    /// client id for no reason. `None` (never opened) is already a no-op.
-    fn clear_failed_open(&mut self) {
-        if matches!(self.reader, Some(None)) {
-            self.reader = None;
-        }
-    }
-}
-
 #[derive(Resource)]
 pub struct PatchBayState {
     pub snapshot: PatchGraphSnapshot,
+    /// The chosen node's peer nick (`inventory::InventoryReport::node`, e.g.
+    /// `"audio/moltar"`) — `None` until the first successful poll. Shown in
+    /// the selection card ([`describe_selection`]); there is no dedicated
+    /// nameplate slot for it (the title/legend plates are a fixed
+    /// `&'static str`).
+    pub node: Option<String>,
     pub selected: usize,
     /// Rebuild the socket/chord entities on the next frame.
     scene_dirty: bool,
     /// Re-lay-out the text plates on the next frame.
     text_dirty: bool,
     timer: Timer,
+    /// The render port's own `events` counter as of the last poll that saw
+    /// it — [`apply_audio_inventory`]'s baseline for
+    /// [`inventory::render_port_advanced`]. `None` until a render port has
+    /// been observed at all (so the very first reading is a baseline, never
+    /// a pulse).
+    prev_render_events: Option<u64>,
+    /// This machine's own preferred node directory (`audio-<hostname>`),
+    /// computed once — [`inventory::choose_node_dir`]'s tie-break input.
+    preferred_node_dir: Option<String>,
 }
 
 impl Default for PatchBayState {
     fn default() -> Self {
         Self {
             snapshot: PatchGraphSnapshot::default(),
+            node: None,
             selected: 0,
             scene_dirty: false,
             text_dirty: true,
             timer: Timer::from_seconds(POLL_SECS, TimerMode::Repeating),
+            prev_render_events: None,
+            preferred_node_dir: inventory::local_preferred_node_dir(),
         }
     }
 }
@@ -393,10 +402,10 @@ pub struct EtchTick;
 
 // ── Plugin ──────────────────────────────────────────────────────────────────
 
-/// A render-port traffic pulse. Nothing writes it today; the daemon-fed
-/// inventory activity (`docs/audio-daemon.md`, "One inventory owner") is the
-/// intended writer once it lands. `pulse_render_chords` stays wired to read
-/// it so the pulse path is ready for that writer.
+/// A render-port traffic pulse — written by [`apply_audio_inventory`]
+/// whenever the render port's `events` counter rose since the last poll
+/// (`inventory::render_port_advanced`), read by `pulse_render_chords` to
+/// restart the traveling packet on every chord leaving that port.
 #[derive(Message)]
 pub struct RenderPortTraffic;
 
@@ -406,7 +415,6 @@ impl Plugin for PatchBayPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<RenderPortTraffic>()
             .init_resource::<PatchBayState>()
-            .insert_non_send(PatchBayAlsa::default())
             .add_plugins(MaterialPlugin::<ChordMaterial>::default())
             // No `OnEnter`/`OnExit(Screen::PatchBay)` any more (2026-07-10
             // evening, the fullscreen-panel pivot): there is no second screen
@@ -433,7 +441,14 @@ impl Plugin for PatchBayPlugin {
                     // seen from room scale (the bearing's promise), so these
                     // can't be gated behind the zoom. `Screen::Room` is now
                     // the only screen this scene graph occupies at all.
-                    poll_patch_graph.run_if(in_state(Screen::Room)),
+                    poll_audio_inventory.run_if(in_state(Screen::Room)),
+                    // UNGATED (unlike its own poll above): a reply can land
+                    // after the player surfaces out of the room, and Bevy
+                    // messages expire after two frames — a screen-gated drain
+                    // would drop it (same reasoning as `view::fsn::sync::
+                    // apply_fsn_snapshot`'s doc comment). Draining on another
+                    // screen only writes the cache; it's free.
+                    apply_audio_inventory,
                     rebuild_patch_scene.run_if(in_state(Screen::Room)),
                     update_wire_selection.run_if(in_state(Screen::Room)),
                     // Zoomed-only detail: the inspection card pose and the text
@@ -480,10 +495,10 @@ fn patch_bay_zoomed(room: Res<RoomState>) -> bool {
 /// (and its `snapshot`) is a `Resource` — it outlives the entities `RoomRoot`
 /// carries. Called from `room::enter_room` when the room (and the W furniture)
 /// first spawns, so the observed graph is polled and its chords built straight
-/// away. Without forcing `scene_dirty`, a room re-entry where the ALSA graph
-/// hasn't changed since last time produces an empty `diff` in `poll_patch_graph`
-/// and `rebuild_patch_scene` never runs — a bare table forever, even though
-/// `state.snapshot` is valid.
+/// away. Without forcing `scene_dirty`, a room re-entry where the observed
+/// graph hasn't changed since last time produces an empty `diff` in
+/// `apply_audio_inventory` and `rebuild_patch_scene` never runs — a bare
+/// table forever, even though `state.snapshot` is valid.
 pub(crate) fn arm_scene(state: &mut PatchBayState) {
     let full = state.timer.duration();
     state.timer.set_elapsed(full);
@@ -653,11 +668,11 @@ fn apply_patch_lod(room: Res<RoomState>, mut lod: Query<&mut Visibility, With<Pa
 /// (Left/Right/Tab) cycle wires; PopLevel (Up/Esc) surfaces to the room —
 /// clearing `RoomState::zoomed` directly, no `Screen` transition
 /// (`room::room_keyboard`'s own doc on why it steps back entirely while
-/// zoomed and leaves these actions to this system); Rescan (`r`) rescans.
+/// zoomed and leaves these actions to this system); Rescan (`r`) forces an
+/// immediate re-poll instead of waiting for the next timer tick.
 fn patch_bay_keyboard(
     mut actions: MessageReader<crate::input::ActionFired>,
     mut state: ResMut<PatchBayState>,
-    mut alsa: NonSendMut<PatchBayAlsa>,
     mut room: ResMut<RoomState>,
 ) {
     use crate::input::Action;
@@ -678,10 +693,6 @@ fn patch_bay_keyboard(
             Action::Rescan => {
                 let elapsed = state.timer.duration();
                 state.timer.set_elapsed(elapsed);
-                // A failed open otherwise latches forever (`poll_patch_graph`'s
-                // `get_or_insert_with` never runs its closure again); an explicit
-                // rescan is the one path allowed to retry it.
-                alsa.clear_failed_open();
             }
             Action::PopLevel => {
                 room.zoomed = None;
@@ -691,54 +702,138 @@ fn patch_bay_keyboard(
     }
 }
 
-/// Poll the observed graph on a slow timer; only mark dirty on real change.
-fn poll_patch_graph(
+/// Fire an audio-inventory fetch on the poll timer — lists `/run/audio` and
+/// reads the chosen node's `inventory.json` inside ONE spawned task, the
+/// same one-task/one-channel-send shape as `connection::roster::
+/// poll_roster_index` (see `AudioInventoryFetch`'s own doc for why the two
+/// VFS calls still land as one message). [`apply_audio_inventory`] applies
+/// the reply; it runs ungated so a reply that lands after the player has
+/// surfaced out of the room is never dropped.
+fn poll_audio_inventory(
+    actor: Option<Res<RpcActor>>,
     time: Res<Time>,
-    mut alsa: NonSendMut<PatchBayAlsa>,
     mut state: ResMut<PatchBayState>,
+    result_channel: Res<RpcResultChannel>,
 ) {
+    let Some(actor) = actor else { return };
     if !state.timer.tick(time.delta()).just_finished() {
         return;
     }
 
-    let reader = alsa.reader.get_or_insert_with(|| match PatchGraphReader::open() {
-        Ok(r) => Some(r),
-        Err(e) => {
-            warn!("patch-bay: ALSA unavailable, showing an empty table: {e}");
-            None
-        }
-    });
-    let Some(reader) = reader.as_ref() else {
-        return;
+    let handle = actor.handle.clone();
+    let tx = result_channel.sender();
+    let preferred = state.preferred_node_dir.clone();
+
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            let fetch = fetch_audio_inventory(&handle, preferred.as_deref()).await;
+            let _ = tx.send(RpcResultMessage::AudioInventoryReceived(fetch));
+        })
+        .detach();
+}
+
+/// Whether a VFS call failed because the path is simply absent, as opposed
+/// to a real fault — same narrow check as `connection::roster::
+/// read_failure_is_absent`, duplicated rather than shared because that one
+/// is private to its module and this is the only other caller.
+fn vfs_failure_is_absent(e: &kaijutsu_client::CallError) -> bool {
+    matches!(e, kaijutsu_client::CallError::Vfs { kind, .. } if kind.is_absent())
+}
+
+/// The two-call fetch `poll_audio_inventory` spawns: list `/run/audio`,
+/// choose a node ([`inventory::choose_node_dir`]), read its
+/// `inventory.json`. A missing `/run/audio` (the projection lane hasn't
+/// landed, or no daemon has published) and a missing chosen file both fold
+/// into [`AudioInventoryFetch::NoNodes`] — "no node inventory yet" is not an
+/// error (`docs/audio-daemon.md`, "One inventory owner").
+async fn fetch_audio_inventory(
+    handle: &kaijutsu_client::ActorHandle,
+    preferred: Option<&str>,
+) -> AudioInventoryFetch {
+    let listing = match handle.vfs_snapshot(inventory::AUDIO_RUN_ROOT, 1, 256).await {
+        Ok(result) => result,
+        Err(e) if vfs_failure_is_absent(&e) => return AudioInventoryFetch::NoNodes,
+        Err(e) => return AudioInventoryFetch::Error { detail: e.to_string() },
+    };
+    let node_dirs: Vec<String> = listing
+        .root
+        .children
+        .iter()
+        .filter(|c| c.kind == kaijutsu_client::VfsFileType::Directory)
+        .map(|c| c.name.clone())
+        .collect();
+    let Some(node_dir) = inventory::choose_node_dir(&node_dirs, preferred) else {
+        return AudioInventoryFetch::NoNodes;
     };
 
-    match reader.snapshot() {
-        Ok(snap) => {
-            // `own_client`: the reader's own client — resolve it as the one
-            // named "kaijutsu-patchview" (the alsa crate exposes no
-            // client_id() on Seq through this path; the name is ours).
-            let own = snap
-                .endpoints
-                .iter()
-                .find(|e| e.client_name == "kaijutsu-patchview")
-                .map(|e| e.client_id)
-                .unwrap_or(-1);
-            let filtered = without_plumbing(&snap, own);
-            let delta = diff(&state.snapshot, &filtered);
-            if !delta.is_empty() {
-                info!(
-                    "patch-bay: graph changed (+{} / -{} wires{})",
-                    delta.added_wires.len(),
-                    delta.removed_wires.len(),
-                    if delta.endpoints_changed { ", endpoints changed" } else { "" },
-                );
-                state.selected = state.selected.min(filtered.wires.len().saturating_sub(1));
-                state.snapshot = filtered;
-                state.scene_dirty = true;
-                state.text_dirty = true;
+    let path = format!("{}/{node_dir}/inventory.json", inventory::AUDIO_RUN_ROOT);
+    match handle.vfs_read_all(&path).await {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(body) => AudioInventoryFetch::Node { body },
+            Err(e) => AudioInventoryFetch::Error { detail: format!("{path}: not UTF-8: {e}") },
+        },
+        Err(e) if vfs_failure_is_absent(&e) => AudioInventoryFetch::NoNodes,
+        Err(e) => AudioInventoryFetch::Error { detail: e.to_string() },
+    }
+}
+
+/// Drain an `AudioInventoryReceived` reply into [`PatchBayState`]: parse,
+/// filter ([`without_plumbing`]), diff, mark dirty on real change, and write
+/// a [`RenderPortTraffic`] pulse when the render port's own `events` counter
+/// rose. Runs ungated (see the plugin's own comment on why).
+fn apply_audio_inventory(
+    mut state: ResMut<PatchBayState>,
+    mut events: MessageReader<RpcResultMessage>,
+    mut traffic: MessageWriter<RenderPortTraffic>,
+) {
+    for event in events.read() {
+        let RpcResultMessage::AudioInventoryReceived(fetch) = event else { continue };
+        match fetch {
+            AudioInventoryFetch::NoNodes => {
+                // No node has published an inventory yet — an empty table,
+                // not a frozen picture of a node that vanished.
+                if state.node.is_some() || !state.snapshot.endpoints.is_empty() {
+                    state.node = None;
+                    state.snapshot = PatchGraphSnapshot::default();
+                    state.selected = 0;
+                    state.prev_render_events = None;
+                    state.scene_dirty = true;
+                    state.text_dirty = true;
+                }
+            }
+            AudioInventoryFetch::Node { body } => {
+                match serde_json::from_str::<inventory::InventoryReport>(body) {
+                    Ok(report) => {
+                        let raw = inventory::snapshot_from_report(&report);
+                        let filtered = without_plumbing(&raw, &report.own_clients);
+
+                        if let Some(current) =
+                            filtered.endpoints.iter().find(|e| is_render_port(e)).map(|e| e.events)
+                        {
+                            if inventory::render_port_advanced(state.prev_render_events, current) {
+                                traffic.write(RenderPortTraffic);
+                            }
+                            state.prev_render_events = Some(current);
+                        }
+
+                        let delta = diff(&state.snapshot, &filtered);
+                        let stale_changed = state.snapshot.stale != filtered.stale;
+                        let node_changed = state.node.as_deref() != Some(report.node.as_str());
+                        if !delta.is_empty() || stale_changed || node_changed {
+                            state.node = Some(report.node.clone());
+                            state.selected = state.selected.min(filtered.wires.len().saturating_sub(1));
+                            state.snapshot = filtered;
+                            state.scene_dirty = true;
+                            state.text_dirty = true;
+                        }
+                    }
+                    Err(e) => warn!("patch-bay: bad inventory.json: {e}"),
+                }
+            }
+            AudioInventoryFetch::Error { detail } => {
+                warn!("patch-bay: audio inventory fetch failed: {detail}");
             }
         }
-        Err(e) => warn!("patch-bay: snapshot failed: {e}"),
     }
 }
 
@@ -1095,7 +1190,7 @@ fn fill_patch_text(
         commit_panel_glyphs(&mut msdf, glyphs);
     }
     if let Ok(mut msdf) = info.single_mut() {
-        let text = describe_selection(&state.snapshot, state.selected);
+        let text = describe_selection(&state.snapshot, state.selected, state.node.as_deref());
         // Shrink-to-fit (not the fixed-size `layout_plate_text`): a long
         // `client:port -> client:port` used to overflow the plate (recorded in
         // `docs/issues.md`); this steps the font down until the wire name fits.
@@ -1105,18 +1200,27 @@ fn fill_patch_text(
     state.text_dirty = false;
 }
 
-/// "SENDER -> RECEIVER" for the inspection plate, run through the SAME
-/// `socket_label` heuristic the rim pegs render — the card names a wire end
-/// exactly the way its peg glyph reads (`RENDER -> TIMIDITY 0`), one visual
-/// language instead of a second, more-verbose name for the same socket.
-/// Empty when no wires exist (a cleared plate, not a placeholder).
-fn describe_selection(snapshot: &PatchGraphSnapshot, selected: usize) -> String {
+/// "NODE: SENDER -> RECEIVER" for the inspection plate — the wire half runs
+/// through the SAME `socket_label` heuristic the rim pegs render, so the
+/// card names a wire end exactly the way its peg glyph reads
+/// (`RENDER -> TIMIDITY 0`), one visual language instead of a second,
+/// more-verbose name for the same socket. `node` is `PatchBayState::node`;
+/// there is no separate nameplate slot for it (the title/legend plates are a
+/// fixed `&'static str`), so the card is where a player sees which node's
+/// fabric they're looking at (`docs/scenes/patchbay.md`). `(STALE)` is
+/// appended whenever the snapshot itself is marked stale
+/// (`docs/audio-daemon.md`: "a retained last observation is labeled stale").
+fn describe_selection(snapshot: &PatchGraphSnapshot, selected: usize, node: Option<&str>) -> String {
+    let suffix = if snapshot.stale { " (STALE)" } else { "" };
+
+    let Some(node) = node else {
+        // No node has published an inventory at all yet.
+        return "NO AUDIO NODES".to_string();
+    };
+
     let Some(wire) = snapshot.wires.get(selected) else {
-        return if snapshot.endpoints.is_empty() {
-            "NO ALSA GRAPH".to_string()
-        } else {
-            "NO WIRES".to_string()
-        };
+        let state = if snapshot.endpoints.is_empty() { "NO ENDPOINTS" } else { "NO WIRES" };
+        return format!("{node}: {state}{suffix}");
     };
     let name = |addr: (i32, i32)| -> String {
         let Some(ep) = snapshot.endpoints.iter().find(|e| (e.client_id, e.port_id) == addr) else {
@@ -1130,7 +1234,7 @@ fn describe_selection(snapshot: &PatchGraphSnapshot, selected: usize) -> String 
         let count = snapshot.endpoints.iter().filter(|e| e.client_id == ep.client_id).count();
         socket_label(&ep.client_name, &ep.port_name, count, ep.port_id)
     };
-    format!("{} -> {}", name(wire.src), name(wire.dst))
+    format!("{node}: {} -> {}{suffix}", name(wire.src), name(wire.dst))
 }
 
 /// Commit glyphs for the per-socket port labels once the font is ready — the
@@ -1241,8 +1345,8 @@ fn nameplate_redundant(client_name: &str, port_label: &str) -> bool {
 
 // ── Live layer + apex helpers ───────────────────────────────────────────────
 
-/// The app's own render port (`kaijutsu-app:render`) — the source of any chord
-/// whose traffic the app can observe. Matches `MidiOut::open`'s client/port names.
+/// The render port (`kaijutsu-audio:render`) — the source of any chord whose
+/// traffic the patch bay can pulse. Matches `MidiOut::open`'s client/port names.
 fn is_render_port(ep: &EndpointInfo) -> bool {
     ep.client_name == RENDER_CLIENT_NAME && ep.port_name == RENDER_PORT_NAME
 }
@@ -1506,7 +1610,7 @@ fn ribbon_mesh(points: &[[f32; 3]], width: f32) -> Mesh {
 mod tests {
     use std::time::Duration;
 
-    use crate::patch_graph::{EndpointInfo, WireInfo};
+    use inventory::WireInfo;
 
     use super::*;
 
@@ -1519,8 +1623,10 @@ mod tests {
                 port_name: "port 0".into(),
                 is_source: true,
                 is_sink: false,
+                events: 0,
             }],
             wires: vec![WireInfo { src: (14, 0), dst: (128, 0) }],
+            stale: false,
         }
     }
 
@@ -1530,10 +1636,13 @@ mod tests {
     fn persisted_after_exit() -> PatchBayState {
         PatchBayState {
             snapshot: non_empty_snapshot(),
+            node: Some("audio/test".to_string()),
             selected: 0,
             scene_dirty: false,
             text_dirty: false,
             timer: Timer::from_seconds(POLL_SECS, TimerMode::Repeating),
+            prev_render_events: None,
+            preferred_node_dir: None,
         }
     }
 
@@ -1671,29 +1780,19 @@ mod tests {
     // deleted this slice) moved to `room::mod`'s `fullscreen_pose_*` tests —
     // the camera pose is computed there now, decoupled from this placement.
 
-    // -- PatchBayAlsa::clear_failed_open --------------------------------
+    // -- vfs_failure_is_absent (the fetch's "no node inventory yet" gate) --
 
     #[test]
-    fn clear_failed_open_resets_a_latched_failure_to_unopened() {
-        let mut alsa = PatchBayAlsa { reader: Some(None) };
-        alsa.clear_failed_open();
-        assert!(
-            alsa.reader.is_none(),
-            "must go back to None so poll_patch_graph's get_or_insert_with retries the open"
-        );
-    }
+    fn vfs_failure_is_absent_recognizes_only_not_found() {
+        use kaijutsu_client::CallError;
+        use kaijutsu_types::VfsErrorKind;
 
-    #[test]
-    fn clear_failed_open_is_a_no_op_when_never_opened() {
-        let mut alsa = PatchBayAlsa { reader: None };
-        alsa.clear_failed_open();
-        assert!(alsa.reader.is_none());
+        let vfs = |kind| CallError::Vfs { kind, path: inventory::AUDIO_RUN_ROOT.to_string() };
+        assert!(vfs_failure_is_absent(&vfs(VfsErrorKind::NotFound)));
+        assert!(!vfs_failure_is_absent(&vfs(VfsErrorKind::PermissionDenied)));
+        assert!(!vfs_failure_is_absent(&vfs(VfsErrorKind::Io)));
+        assert!(!vfs_failure_is_absent(&CallError::Rpc("not found: unrelated".to_string())));
     }
-
-    // The healthy `Some(Some(_))` arm (left alone by `clear_failed_open`) needs
-    // a real `PatchGraphReader`, which needs a live ALSA sequencer — it's
-    // exercised by the `#[ignore]`d `alsa_smoke` path in `patch_graph.rs`, not
-    // here.
 
     // -- socket_label (display heuristic — patchbay.md open question #2 stays open) --
 
@@ -1793,6 +1892,7 @@ mod tests {
                     port_name: "port 0".into(),
                     is_source: false,
                     is_sink: true,
+                    events: 0,
                 },
                 EndpointInfo {
                     client_id: 128,
@@ -1801,6 +1901,7 @@ mod tests {
                     port_name: "port 1".into(),
                     is_source: false,
                     is_sink: true,
+                    events: 0,
                 },
                 EndpointInfo {
                     client_id: 129,
@@ -1809,9 +1910,11 @@ mod tests {
                     port_name: "render".into(),
                     is_source: true,
                     is_sink: false,
+                    events: 0,
                 },
             ],
             wires: vec![WireInfo { src: (129, 0), dst: (128, 0) }],
+            stale: false,
         }
     }
 
@@ -1820,18 +1923,39 @@ mod tests {
         // A meaningful port name on one end (RENDER) and a port-shaped
         // multi-port fallback on the other (TIMIDITY 0) — the exact string a
         // pair of socket_label-driven pegs would show, not a second,
-        // more-verbose name for the same wire.
-        let text = describe_selection(&render_to_multi_port_timidity_snapshot(), 0);
-        assert_eq!(text, "RENDER -> TIMIDITY 0");
+        // more-verbose name for the same wire, prefixed by the node name.
+        let text = describe_selection(&render_to_multi_port_timidity_snapshot(), 0, Some("audio/test"));
+        assert_eq!(text, "audio/test: RENDER -> TIMIDITY 0");
     }
 
     #[test]
     fn describe_selection_falls_back_to_raw_ids_for_a_vanished_endpoint() {
         // `wire.src` in `non_empty_snapshot` names client_id 14, which isn't
-        // in `endpoints` — a transient gap between the ALSA event and the
-        // next poll's snapshot, not a client to invent a label for.
-        let text = describe_selection(&non_empty_snapshot(), 0);
-        assert_eq!(text, "14:0 -> TIMIDITY");
+        // in `endpoints` — a transient gap between the node's poll and this
+        // frame, not a client to invent a label for.
+        let text = describe_selection(&non_empty_snapshot(), 0, Some("audio/test"));
+        assert_eq!(text, "audio/test: 14:0 -> TIMIDITY");
+    }
+
+    #[test]
+    fn describe_selection_reports_no_audio_nodes_when_none_has_published() {
+        assert_eq!(describe_selection(&non_empty_snapshot(), 0, None), "NO AUDIO NODES");
+    }
+
+    #[test]
+    fn describe_selection_appends_stale_when_the_snapshot_is_marked_stale() {
+        let mut snapshot = non_empty_snapshot();
+        snapshot.stale = true;
+        assert_eq!(
+            describe_selection(&snapshot, 0, Some("audio/test")),
+            "audio/test: 14:0 -> TIMIDITY (STALE)"
+        );
+    }
+
+    #[test]
+    fn describe_selection_reports_no_wires_with_the_node_name_when_the_graph_is_empty() {
+        let empty = PatchGraphSnapshot::default();
+        assert_eq!(describe_selection(&empty, 0, Some("audio/test")), "audio/test: NO ENDPOINTS");
     }
 
     // -- is_render_port -------------------------------------------------
@@ -1844,6 +1968,7 @@ mod tests {
             port_name: port_name.into(),
             is_source: true,
             is_sink: false,
+            events: 0,
         }
     }
 
@@ -1901,7 +2026,7 @@ mod tests {
     // -- selected_chord_apex --------------------------------------------
 
     fn render_to_synth_snapshot() -> PatchGraphSnapshot {
-        // Endpoints sorted by (client, port) as `observe`/`snapshot` deliver them.
+        // Endpoints sorted by (client, port) as a node's report delivers them.
         PatchGraphSnapshot {
             endpoints: vec![
                 EndpointInfo {
@@ -1911,6 +2036,7 @@ mod tests {
                     port_name: "port 0".into(),
                     is_source: false,
                     is_sink: true,
+                    events: 0,
                 },
                 EndpointInfo {
                     client_id: 129,
@@ -1919,9 +2045,11 @@ mod tests {
                     port_name: "render".into(),
                     is_source: true,
                     is_sink: false,
+                    events: 0,
                 },
             ],
             wires: vec![WireInfo { src: (129, 0), dst: (128, 0) }],
+            stale: false,
         }
     }
 

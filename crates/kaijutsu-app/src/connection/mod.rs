@@ -13,8 +13,8 @@ pub mod roster;
 pub mod share_dial;
 
 pub use actor_plugin::{
-    ActorPlugin, ContextHydration, ContextHydrationChannel, RpcActor, RpcConnectionState,
-    RosterReadError, RpcResultChannel, RpcResultMessage, ServerEventMessage,
+    ActorPlugin, AudioInventoryFetch, ContextHydration, ContextHydrationChannel, RpcActor,
+    RpcConnectionState, RosterReadError, RpcResultChannel, RpcResultMessage, ServerEventMessage,
 };
 pub use bootstrap::{BootstrapChannel, BootstrapCommand};
 pub use share_dial::ShareDialPlugin;

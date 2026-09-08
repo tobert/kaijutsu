@@ -228,6 +228,28 @@ pub struct RosterReadError {
     pub absent: bool,
 }
 
+/// Outcome of one `view::patch_bay` audio-inventory poll — a listing of
+/// `/run/audio` and, when a node directory exists, one node's raw
+/// `inventory.json` body. Folded into a single enum rather than two
+/// `RpcResultMessage` variants so the poll still lands as ONE task and ONE
+/// message even though it makes two VFS calls in sequence — the same
+/// one-task/one-message shape as `connection::roster::poll_roster_index`.
+/// `view::patch_bay::inventory` owns the JSON parse of the successful body;
+/// this type stays a leaf (raw strings only), same as `RosterReadError`.
+#[derive(Debug, Clone)]
+pub enum AudioInventoryFetch {
+    /// `/run/audio` doesn't exist, or exists with no node directories —
+    /// no daemon has published an inventory yet (`docs/audio-daemon.md`,
+    /// "One inventory owner"). Not an error.
+    NoNodes,
+    /// A node directory was chosen and its `inventory.json` body read
+    /// (the report's own `node` field, not the directory name, is what the
+    /// drain site displays — see `inventory::InventoryReport::node`).
+    Node { body: String },
+    /// A real VFS fault (not a missing path) at either step.
+    Error { detail: String },
+}
+
 #[derive(Message, Debug)]
 #[allow(dead_code)]
 pub enum RpcResultMessage {
@@ -359,6 +381,10 @@ pub enum RpcResultMessage {
     /// [`crate::input::scroll_config::apply_scroll_config`] into the
     /// `ScrollConfig` resource. Carries the resolved TOML body.
     ScrollConfigReceived(String),
+    /// `view::patch_bay::poll_audio_inventory`'s fetch resolved — see
+    /// [`AudioInventoryFetch`]'s own doc for the three outcomes it folds
+    /// together. Drained by `view::patch_bay::apply_audio_inventory`.
+    AudioInventoryReceived(AudioInventoryFetch),
 }
 
 // ============================================================================
