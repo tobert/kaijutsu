@@ -414,11 +414,13 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
     }
 
     // Resolve which of the (possibly many stale) sockets in the runtime dir
-    // is actually ours: ping every live candidate and match on session_id,
-    // with the adapter's explicit --socket (PPID-derived, same process tree)
-    // as the tiebreaker when no session matches.
-    let explicit = args.socket.clone();
-    let candidates = candidate_sockets(args.socket);
+    // is actually ours: ping every live candidate, prefer the explicit
+    // socket, then fall back to a session-id match. Without `--socket` the
+    // PPID-derived default is the explicit candidate: it is the same
+    // derivation the flag would carry, and it must outrank a session-id
+    // match on every call, not only when routing falls through.
+    let explicit = args.socket.clone().or_else(default_socket_path);
+    let candidates = candidate_sockets(explicit.clone());
     let Some(socket_path) = resolve_hook_socket(
         candidates,
         explicit.as_deref(),

@@ -1,7 +1,9 @@
 //! Serde types for the kaijutsu hook protocol.
 //!
-//! These match the schema defined in `docs/hooks.md`. Pure data —
-//! no runtime dependencies beyond serde.
+//! This file is the schema: the adapter-facing JSON shapes are the serde
+//! derives below, and `docs/cc-peer.md`, "Traps in the surrounding code"
+//! lists the other places a new field has to move. Pure data — no runtime
+//! dependencies beyond serde.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -104,7 +104,7 @@ use tree::format_dag_tree;
 /// FlowBus block-event subscriptions by `(principal, instance)`: a literal
 /// constant here would make every MCP process for one principal claim the
 /// same slot, so whichever subscribed last silently steals the block-event
-/// bridge from the others (docs/issues.md, "MCP shell delay"). Mirrors
+/// bridge from the others. Mirrors
 /// `app_peer_instance()` in `kaijutsu-app/src/connection/actor_plugin.rs`.
 fn mcp_peer_instance() -> &'static str {
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -2297,24 +2297,27 @@ impl KaijutsuMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.read_input")]
-    async fn read_input(&self, Parameters(req): Parameters<InputReadRequest>) -> String {
+    async fn read_input(&self, Parameters(req): Parameters<InputReadRequest>) -> CallToolResult {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
             Ok(id) => id,
-            Err(e) => return e,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
         };
 
         match &self.backend {
-            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
+            Backend::Local(_store) => {
+                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
+            }
             Backend::Remote(remote) => {
                 match remote.actor.get_input_state(ctx_id).await {
-                    Ok(state) => serde_json::json!({
-                        "context_id": ctx_id.short(),
-                        "content": state.content,
-                        "length": input_char_len(&state.content),
-                        "version": state.version,
-                    })
-                    .to_string(),
-                    Err(e) => format!("Error: {}", e),
+                    Ok(state) => CallToolResult::success(vec![ContentBlock::text(
+                        serde_json::json!({
+                            "context_id": ctx_id.short(),
+                            "content": state.content,
+                            "length": input_char_len(&state.content),
+                            "version": state.version,
+                        }).to_string(),
+                    )]),
+                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
                 }
             }
         }
@@ -2325,21 +2328,27 @@ impl KaijutsuMcp {
         annotations(destructive_hint = false, open_world_hint = false)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.write_input")]
-    async fn write_input(&self, Parameters(req): Parameters<InputWriteRequest>) -> String {
+    async fn write_input(&self, Parameters(req): Parameters<InputWriteRequest>) -> CallToolResult {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
             Ok(id) => id,
-            Err(e) => return e,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
         };
 
         match &self.backend {
-            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
+            Backend::Local(_store) => {
+                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
+            }
             Backend::Remote(remote) => {
                 // Get current state to know how much to delete — in CHARS,
                 // matching edit_input's char-addressed `delete` (found by the
                 // kaijutsu-acp lane: bytes here over-deletes on non-ASCII).
                 let current_len = match remote.actor.get_input_state(ctx_id).await {
                     Ok(state) => input_char_len(&state.content),
-                    Err(e) => return format!("Error getting current state: {}", e),
+                    Err(e) => {
+                        return CallToolResult::error(vec![ContentBlock::text(format!(
+                            "Error getting current state: {e}"
+                        ))]);
+                    }
                 };
                 // Delete all, then insert new text in one operation
                 match remote
@@ -2347,14 +2356,15 @@ impl KaijutsuMcp {
                     .edit_input(ctx_id, 0, &req.text, current_len)
                     .await
                 {
-                    Ok(version) => serde_json::json!({
-                        "success": true,
-                        "context_id": ctx_id.short(),
-                        "length": input_char_len(&req.text),
-                        "version": version,
-                    })
-                    .to_string(),
-                    Err(e) => format!("Error: {}", e),
+                    Ok(version) => CallToolResult::success(vec![ContentBlock::text(
+                        serde_json::json!({
+                            "success": true,
+                            "context_id": ctx_id.short(),
+                            "length": input_char_len(&req.text),
+                            "version": version,
+                        }).to_string(),
+                    )]),
+                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
                 }
             }
         }
@@ -2365,27 +2375,30 @@ impl KaijutsuMcp {
         annotations(destructive_hint = false, open_world_hint = false)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.edit_input")]
-    async fn edit_input(&self, Parameters(req): Parameters<InputEditRequest>) -> String {
+    async fn edit_input(&self, Parameters(req): Parameters<InputEditRequest>) -> CallToolResult {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
             Ok(id) => id,
-            Err(e) => return e,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
         };
 
         match &self.backend {
-            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
+            Backend::Local(_store) => {
+                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
+            }
             Backend::Remote(remote) => {
                 match remote
                     .actor
                     .edit_input(ctx_id, req.pos, &req.insert, req.delete)
                     .await
                 {
-                    Ok(version) => serde_json::json!({
-                        "success": true,
-                        "context_id": ctx_id.short(),
-                        "version": version,
-                    })
-                    .to_string(),
-                    Err(e) => format!("Error: {}", e),
+                    Ok(version) => CallToolResult::success(vec![ContentBlock::text(
+                        serde_json::json!({
+                            "success": true,
+                            "context_id": ctx_id.short(),
+                            "version": version,
+                        }).to_string(),
+                    )]),
+                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
                 }
             }
         }
@@ -2396,24 +2409,27 @@ impl KaijutsuMcp {
         annotations(destructive_hint = true, open_world_hint = false)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.submit_input")]
-    async fn submit_input(&self, Parameters(req): Parameters<InputSubmitRequest>) -> String {
+    async fn submit_input(&self, Parameters(req): Parameters<InputSubmitRequest>) -> CallToolResult {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
             Ok(id) => id,
-            Err(e) => return e,
+            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
         };
 
         match &self.backend {
-            Backend::Local(_store) => LOCAL_INPUT_UNSUPPORTED.to_string(),
+            Backend::Local(_store) => {
+                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
+            }
             Backend::Remote(remote) => {
                 let is_shell = req.mode.as_deref() == Some("shell");
                 match remote.actor.submit_input(ctx_id, is_shell).await {
-                    Ok(result) => serde_json::json!({
-                        "success": true,
-                        "context_id": ctx_id.short(),
-                        "block_id": result.block_id.to_key(),
-                    })
-                    .to_string(),
-                    Err(e) => format!("Error: {}", e),
+                    Ok(result) => CallToolResult::success(vec![ContentBlock::text(
+                        serde_json::json!({
+                            "success": true,
+                            "context_id": ctx_id.short(),
+                            "block_id": result.block_id.to_key(),
+                        }).to_string(),
+                    )]),
+                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
                 }
             }
         }
@@ -3303,10 +3319,12 @@ mod tests {
         let result = mcp
             .read_input(Parameters(InputReadRequest { context_id: None }))
             .await;
-        assert!(
-            result.contains("Error"),
-            "Should error without context_id in local mode: {result}"
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "Should error without context_id in local mode: {result:?}"
         );
+        assert!(call_result_text(&result).contains("Error"), "{result:?}");
     }
 
     /// Every compose tool refuses in local mode, and refuses the same way.
@@ -3354,20 +3372,28 @@ mod tests {
             ("edit_input", &edit),
             ("submit_input", &submit),
         ] {
+            // The refusal rides the MCP error envelope, so a client can key
+            // on `is_error` instead of parsing prose out of a success.
             assert_eq!(
-                result.as_str(),
+                result.is_error,
+                Some(true),
+                "{name} must refuse through the MCP error envelope"
+            );
+            assert_eq!(
+                call_result_text(result),
                 LOCAL_INPUT_UNSUPPORTED,
                 "{name} must refuse in local mode with the shared message"
             );
         }
+    }
 
-        // And specifically NOT a success envelope an agent would believe.
-        for (name, result) in [("write_input", &write), ("edit_input", &edit)] {
-            assert!(
-                serde_json::from_str::<serde_json::Value>(result).is_err(),
-                "{name} must not return parseable JSON that looks like success"
-            );
-        }
+    /// Concatenated text content of a tool result.
+    fn call_result_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect()
     }
 
     // ========================================================================
