@@ -102,10 +102,10 @@ not a block — `matches_filter` bypasses it.
   live). `bevy_audio` no longer plays anything (`AudioPlugin` disabled;
   dropping its compilation entirely is follow-up hygiene).
 - **`kaijutsu-audiod`** hosts both sinks without Bevy, using the existing
-  SSH actor and render subscription. The app can host the same library with
-  `--audio`. Device ownership, capture and Linux service setup are described
-  in `docs/audio-daemon.md`. Named multi-machine destinations remain open;
-  the current render contract broadcasts to every attached sink.
+  SSH actor and render subscription. It is the sole hardware owner; the app
+  has no hardware I/O. Device ownership, capture and Linux service setup are
+  described in `docs/audio-daemon.md`. Named multi-machine destinations
+  remain open; the current render contract broadcasts to every attached sink.
 
 ## Shipped ledger
 

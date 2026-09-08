@@ -26,7 +26,6 @@ pub mod geometry;
 
 use bevy::prelude::*;
 
-use crate::dj::RenderPortTraffic;
 use crate::patch_graph::{EndpointInfo, PatchGraphReader, PatchGraphSnapshot, diff, without_plumbing};
 use crate::shaders::{ChordMaterial, WellCardMaterial};
 use crate::text::ShapingFonts;
@@ -394,11 +393,19 @@ pub struct EtchTick;
 
 // ── Plugin ──────────────────────────────────────────────────────────────────
 
+/// A render-port traffic pulse. Nothing writes it today; the daemon-fed
+/// inventory activity (`docs/audio-daemon.md`, "One inventory owner") is the
+/// intended writer once it lands. `pulse_render_chords` stays wired to read
+/// it so the pulse path is ready for that writer.
+#[derive(Message)]
+pub struct RenderPortTraffic;
+
 pub struct PatchBayPlugin;
 
 impl Plugin for PatchBayPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<PatchBayState>()
+        app.add_message::<RenderPortTraffic>()
+            .init_resource::<PatchBayState>()
             .insert_non_send(PatchBayAlsa::default())
             .add_plugins(MaterialPlugin::<ChordMaterial>::default())
             // No `OnEnter`/`OnExit(Screen::PatchBay)` any more (2026-07-10

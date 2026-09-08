@@ -478,8 +478,8 @@ fn refetch_config_on_reconnect(
 
 /// Fetch the kernel-owned per-client config trio (theme, metronome, scroll)
 /// and forward each into its existing `RpcResultMessage` sink
-/// (`apply_theme_from_rpc` below; `dj::thread`'s `MetronomeConfigReceived`
-/// handler; `input::scroll_config::apply_scroll_config`).
+/// (`apply_theme_from_rpc` below; `kaijutsu-audio-runtime`'s `dj::thread`
+/// `MetronomeConfigReceived` handler; `input::scroll_config::apply_scroll_config`).
 ///
 /// The ONE fetch path for this trio — called from both the initial
 /// `ActorReady` bootstrap (cold start, `visible_on_failure = false`) and

@@ -49,11 +49,6 @@ struct Cli {
     #[arg(long)]
     insecure: bool,
 
-    /// Own local MIDI and audio devices in this process. Off by default;
-    /// use kaijutsu-audiod for hardware I/O independent of the GUI.
-    #[arg(long)]
-    audio: bool,
-
     /// Start borderless-fullscreen on the primary monitor (runner/gamescope)
     #[arg(long, conflicts_with = "maximize")]
     fullscreen: bool,
@@ -76,7 +71,6 @@ mod commands;
 mod config;
 mod connection;
 mod constants;
-mod dj;
 mod input;
 mod kaish;
 use kaijutsu_audio_runtime::patch_graph;
@@ -254,7 +248,6 @@ fn main() {
         // subsystem on (re)connect and serves any --share directories. A
         // no-op plugin when no --share flag was given.
         .add_plugins(connection::ShareDialPlugin { ssh_config, share_config })
-        .add_plugins(dj::DjPlugin { enabled: cli.audio })
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (single Conversation screen)

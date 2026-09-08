@@ -169,10 +169,10 @@ references") — lives in `docs/midi.md`, "The one timebase".
 
 ### kaijutsu-audio-runtime
 
-Bevy-free MIDI and PCM runtime, hosted by the `kaijutsu-audiod` SSH client
-or opt-in through `kaijutsu-app --audio`. The kernel drives playback; the
-runtime owns local hardware. See [Audio daemon](docs/audio-daemon.md) for
-device selection, capture and systemd setup.
+Bevy-free MIDI and PCM runtime, hosted by the `kaijutsu-audiod` SSH client —
+the sole hardware owner; the app has no hardware I/O. The kernel drives
+playback; the runtime owns local hardware. See [Audio daemon](docs/audio-daemon.md)
+for device selection, capture and systemd setup.
 
 ### kaijutsu-hyoushigi
 

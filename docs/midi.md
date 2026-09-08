@@ -1,9 +1,9 @@
 # MIDI — the clock drifts; we model it, we don't chase it
 
 Current hardware ownership: `kaijutsu-audiod` connects to the kernel over SSH
-and runs the Bevy-free `kaijutsu-audio-runtime`. The app can load that runtime
-with `--audio`; it defaults to no hardware I/O. See `docs/audio-daemon.md`.
-The milestone notes below describe the earlier design.
+and runs the Bevy-free `kaijutsu-audio-runtime`. It is the sole hardware
+owner; the app has no hardware I/O. See `docs/audio-daemon.md`. The
+milestone notes below describe the earlier design.
 
 > **Status:** design direction, captured 2026-06-29 in a co-design session
 > (Amy + Claude). Decisions are *directions*, not commitments — code is truth,

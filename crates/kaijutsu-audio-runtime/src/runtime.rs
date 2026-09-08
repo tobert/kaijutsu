@@ -333,7 +333,7 @@ impl Ownership {
     fn acquire(path: &std::path::Path) -> Result<Self, String> {
         let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
             .map_err(|e| format!("cannot open audio ownership lock {}: {e}", path.display()))?;
-        file.try_lock().map_err(|e| format!("cannot own local audio: {e}; stop the other daemon or app --audio instance"))?;
+        file.try_lock().map_err(|e| format!("cannot own local audio: {e}; stop the other kaijutsu-audiod instance"))?;
         Ok(Self { _file: file })
     }
 }

@@ -16,8 +16,8 @@ give the timing threads an optional Linux scheduling priority.
    `kaijutsu-audio` as the portable data/timebase crate.
 2. `kaijutsu-audiod` owns the SSH connection, explicit optional capture context,
    device selection, presence reporting, reconnect and clean shutdown.
-3. App hardware I/O is opt-in through `--audio` and the same library. One process owns
-   local I/O; an ownership lock prevents accidental duplicate playback.
+3. One process owns local I/O per OS user; the ownership lock guards against
+   two daemons.
 4. App and TUI can use `LocalBeat` without loading the hardware runtime.
 
 ## Scope
@@ -460,9 +460,9 @@ and presence are refreshed after reconnect; reconnect is owned by the existing
 SSH actor. Transport stop, connection loss and shutdown flush scheduled output.
 Late musical events follow `docs/midi.md`, "The one timebase".
 
-The app defaults to no hardware I/O. `kaijutsu-app --audio` loads the runtime
-in-process for a single-process setup. The patch bay still reads local ALSA
-topology; remote topology and daemon traffic animations are follow-up work.
+The app has no hardware I/O; `kaijutsu-audiod` is the sole hardware owner.
+The patch bay still reads local ALSA topology; remote topology and daemon
+traffic animations are follow-up work.
 
 ## Linux service
 
@@ -490,9 +490,8 @@ existing keys are never replaced. Reruns use `--enrolled` to skip the pause.
 no capture context and requested priority 20 by default).
 
 No sudo, device ACL, group membership, RT limit or lingering changes are made.
-Run in the desktop user's session for its PipeWire access. Stop app hardware
-I/O (`--audio`) before starting the daemon. The same-user ownership lock
-rejects a second runtime.
+Run in the desktop user's session for its PipeWire access. The same-user
+ownership lock rejects a second daemon.
 
 `contrib/kaijutsu-audiod.service` is a user-unit example. Install the binary
 under `~/.local/bin/`, copy the unit to `~/.config/systemd/user/`, and set its
