@@ -1067,6 +1067,32 @@ and the devlog. What remains:
 
 ---
 
+## Older app and broker debt, carried out of auto-memory (2026-09-08)
+
+Items that lived only in the lead's memory forest since March–June 2026,
+re-verified against the tree on 2026-09-08 and moved here so the forest can
+forget them. Each is a small lift; none is urgent.
+
+- **Tall blocks lose Y resolution.** A block taller than the GPU's
+  `max_texture_dimension_2d` (16384 here) is squished into the clamped
+  texture and stretched back by the shader (`GpuTextureLimits`,
+  `render_block_textures`). Fix is tiled rendering of the visible portion.
+  HiDPI halves the threshold.
+- **Role-group borders still draw through Vello** (`ImageNode` only, no
+  `MaterialNode<BlockFxMaterial>`), missed in the Vello→MSDF migration.
+- **Broker `register` over an existing instance id drops the old pump
+  `JoinHandle`** instead of aborting it; two lines in `register_inner`.
+  `clear_binding` re-fetches each server Arc inside its loop, so a concurrent
+  register/unregister can misroute an unsubscribe; tolerated today because
+  teardown is idempotent.
+- **Provider cache expiry is not a hydrate boundary.** A long-idle session
+  carries messages the provider no longer has cached; nothing observes it.
+  Decide whether expiry is a fork-equivalent or a price-eaten warning when
+  next touching cache breakpoints.
+- **`ActiveSurface` / `FocusArea` / paired overlay queries** are threaded as
+  separate params through the compose, interrupt and toggle systems; a
+  bundle component or an "active overlay" resolver would collapse them.
+
 ## File buffers: slices 4-5 remain (2026-08-19)
 
 Slices 1, 2 and 3 of `docs/file-buffers.md` shipped (`11c21b69`, `38f77ae2`,

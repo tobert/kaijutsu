@@ -37,3 +37,4 @@ docs/kaijutsu-agent-feedback.md
 # directory would be unrecoverable in review. Local safety net, never
 # versioned; prune it by hand.
 backups/
+__pycache__/
