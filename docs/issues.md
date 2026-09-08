@@ -12,10 +12,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   kaish's job system is not reusable here and treats the migration as
   rejected; CLAUDE.md "Host exec has one owner" still names it as the
   ad-hoc exec site being retired. One of them is wrong; decide which.
-- **Code comments name issues.md entries that no longer exist** (`rg
-  'docs/issues.md' crates` lists ~30; "latch nonce on stderr", "MCP shell
-  delay", "msdfgen-rs" were dead before this sweep). CLAUDE.md says comments
-  are technical, not historical; retire the pointers as each file is touched.
 
 ## Living documents + project contexts (Amy, 2026-09-07)
 
@@ -1263,13 +1259,15 @@ track before an explicit `--track` can move it (no `--track` passthrough on
 (`view/tracker/mod.rs:4`). The dock sparklines' data source is a placeholder
 (events/sec, running-block count); decide what they mean before polishing.
 
-## Control plane (kj): four real gaps
+## Control plane (kj): three real gaps
 
-- **Dead `--json` fields.** `doc list`, `config list|show`, `rc list|show`
-  and `search` declare a local `json: bool` (`kj/doc.rs:48`, `config.rs:53`,
-  `rc.rs:72`, `search.rs:52`) that `KjBuiltin::execute` strips before
-  dispatch, so the richer branch never fires. Wire it or delete it when
-  touching one of those files.
+- **Six more dead local `--json` fields.** kaish owns `--json` and
+  `KjBuiltin::execute` strips it before the per-verb parse, so a local
+  `json: bool` can never be true in production. `doc`/`config`/`rc`/
+  `search`/`midi` lost theirs on 2026-09-08; `kj block` (`kj/block.rs`, four
+  subcommands), `kj roster` and `kj mcp list` still declare one. Same
+  treatment: delete the field and the branch, keep `.data`, move any fact
+  the branch alone showed into the human output.
 - **`--out` writes bypass the VFS.** `kj cas get` (`kj/cas.rs:148`) and
   `kj block cat` (`kj/block.rs:1028,1155`) `std::fs::write` relative to the
   server cwd, never through mounts.

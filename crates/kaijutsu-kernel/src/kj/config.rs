@@ -47,22 +47,15 @@ pub(crate) struct ConfigArgs {
 enum ConfigCommand {
     /// List the config files the kernel currently holds.
     #[command(alias = "ls")]
-    List {
-        /// Emit a JSON array of names instead of a labelled view
-        #[arg(long)]
-        json: bool,
-    },
+    List,
     /// Print one config file's content.
     #[command(alias = "cat")]
     Show {
         /// Config file name (e.g. theme.toml) or full /config/kernel path
         path: String,
-        /// Emit a JSON object instead of a labelled view
-        #[arg(long)]
-        json: bool,
         /// Emit exactly the stored content — no path/length header, no code
         /// fence. Round-trips byte-identical through `builtin.file:write`.
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long)]
         raw: bool,
     },
     // `set` and `edit` are deliberately absent. Config is a file: write it with
@@ -159,8 +152,8 @@ impl KjDispatcher {
             _ => None,
         };
         let result = match parsed.command {
-            ConfigCommand::List { json } => self.config_list(json).await,
-            ConfigCommand::Show { path, json, raw } => self.config_show(&path, json, raw).await,
+            ConfigCommand::List => self.config_list().await,
+            ConfigCommand::Show { path, raw } => self.config_show(&path, raw).await,
             ConfigCommand::Reset { path } => self.config_reset(&path).await,
         };
         if let Some(canonical) = write_path
@@ -203,7 +196,7 @@ impl KjDispatcher {
             .map_err(|e| e.to_string())
     }
 
-    async fn config_list(&self, json: bool) -> KjResult {
+    async fn config_list(&self) -> KjResult {
         use crate::vfs::{VfsError, VfsOps};
         // readdir a directory, mapping "absent" (no mount, nothing seeded yet)
         // to an empty listing rather than an error.
@@ -263,9 +256,6 @@ impl KjDispatcher {
                 .map(serde_json::Value::String)
                 .collect(),
         );
-        if json {
-            return KjResult::ok_with_data(data.to_string(), data);
-        }
         if names.is_empty() {
             return KjResult::ok_with_data("(no config files)".to_string(), data);
         }
@@ -273,7 +263,7 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    async fn config_show(&self, path: &str, json: bool, raw: bool) -> KjResult {
+    async fn config_show(&self, path: &str, raw: bool) -> KjResult {
         let canonical = match config_canonical(path) {
             Ok(c) => c,
             Err(e) => return KjResult::Err(format!("kj config show: {e}")),
@@ -298,9 +288,6 @@ impl KjDispatcher {
             "content_length": content.len(),
             "content": content,
         });
-        if json {
-            return KjResult::ok_with_data(record.to_string(), record);
-        }
         // Fence with the extension so .md renders as markdown and .toml as a
         // config block in surfaces that highlight it.
         let ext = name.rsplit('.').next().unwrap_or("");
@@ -470,7 +457,7 @@ mod tests {
             .expect("theme is writable");
 
         let show = d
-            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--json")], &c)
+            .dispatch(&[s("config"), s("show"), s("theme.toml")], &c)
             .await;
         match show {
             KjResult::Ok { data: Some(v), .. } => {
@@ -507,7 +494,7 @@ mod tests {
             .expect("round-trip write");
 
         let show = d
-            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--json")], &c)
+            .dispatch(&[s("config"), s("show"), s("theme.toml")], &c)
             .await;
         match show {
             KjResult::Ok { data: Some(v), .. } => {
@@ -546,7 +533,7 @@ mod tests {
         );
 
         let show = d
-            .dispatch(&[s("config"), s("show"), s("theme.toml"), s("--json")], &c)
+            .dispatch(&[s("config"), s("show"), s("theme.toml")], &c)
             .await;
         match show {
             KjResult::Ok { data: Some(v), .. } => {

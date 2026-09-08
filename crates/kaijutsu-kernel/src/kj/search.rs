@@ -9,13 +9,11 @@
 //! kj search <pattern> [--context <ref> | --all]
 //!                     [--kind <k>] [--role <r>]
 //!                     [--context-lines N] [--max-matches N]
-//!                     [--json]
 //! ```
 
 use clap::Parser;
 use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, Role};
 use regex::Regex;
-use serde::Serialize;
 
 use super::refs::resolve_context_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
@@ -47,12 +45,8 @@ pub(crate) struct SearchArgs {
     /// Maximum number of matches to return
     #[arg(long = "max-matches", default_value_t = 100)]
     max_matches: usize,
-    /// Emit a JSON envelope instead of grep-style text
-    #[arg(long)]
-    json: bool,
 }
 
-#[derive(Serialize)]
 struct SearchMatch {
     context_id: String,
     block_id: String,
@@ -172,15 +166,6 @@ impl KjDispatcher {
                 .map(|m| serde_json::Value::String(m.block_id.clone()))
                 .collect(),
         );
-
-        if parsed.json {
-            let envelope = serde_json::json!({
-                "matches": matches,
-                "total": matches.len(),
-                "truncated": matches.len() >= max,
-            });
-            return KjResult::ok_with_data(envelope.to_string(), id_array);
-        }
 
         // grep-ish text output: each match prefixed with `ctx_short:block_short:line+1`.
         if matches.is_empty() {
@@ -337,8 +322,11 @@ mod tests {
         assert!(body.contains("line three"), "after-context missing: {body}");
     }
 
+    /// The grep-style human line carries the matched content and its
+    /// 1-indexed line number; `.data` is the iteration array of matched
+    /// block ids — both facts the deleted `--json` envelope duplicated.
     #[tokio::test]
-    async fn search_json_envelope_shape() {
+    async fn search_finds_the_matched_content_and_returns_its_block_id() {
         use crate::kj::KjResult;
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
@@ -346,21 +334,11 @@ mod tests {
         let bid = insert_text_block(&d, ctx, TypesRole::User, "alpha\nbeta\ngamma");
         let c = caller_with_context(ctx);
 
-        let result = d
-            .dispatch(&[s("search"), s("beta"), s("--json")], &c)
-            .await;
-        assert!(result.is_ok());
-        let v: serde_json::Value =
-            serde_json::from_str(result.message()).expect("JSON envelope");
-        assert_eq!(v["total"], 1);
-        assert_eq!(v["truncated"], false);
-        let m = &v["matches"][0];
-        assert_eq!(m["content"], "beta");
-        assert_eq!(m["line"], 1, "0-indexed line in JSON");
-        assert_eq!(m["block_id"], bid.to_key());
-        assert_eq!(m["context_id"], ctx.to_hex());
+        let result = d.dispatch(&[s("search"), s("beta")], &c).await;
+        assert!(result.is_ok(), "search failed: {}", result.message());
+        let body = result.message();
+        assert!(body.contains(":2:beta"), "1-indexed match line missing: {body}");
 
-        // Iteration data is an array of matched block ids.
         match result {
             KjResult::Ok { data: Some(data), .. } => {
                 let arr = data.as_array().expect("data is array");
@@ -373,6 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_kind_filter_excludes_non_matching() {
+        use crate::kj::KjResult;
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context_with_doc(&d, Some("c"), principal);
@@ -395,18 +374,24 @@ mod tests {
         let c = caller_with_context(ctx);
 
         let result = d
-            .dispatch(
-                &[s("search"), s("needle"), s("--kind"), s("text"), s("--json")],
-                &c,
-            )
+            .dispatch(&[s("search"), s("needle"), s("--kind"), s("text")], &c)
             .await;
-        assert!(result.is_ok());
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["total"], 1, "kind=text filter must drop thinking: {v}");
+        assert!(result.is_ok(), "search failed: {}", result.message());
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(
+                    v.as_array().map(|a| a.len()),
+                    Some(1),
+                    "kind=text filter must drop thinking"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn search_max_matches_truncates() {
+        use crate::kj::KjResult;
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context_with_doc(&d, Some("c"), principal);
@@ -414,15 +399,20 @@ mod tests {
         let c = caller_with_context(ctx);
 
         let result = d
-            .dispatch(
-                &[s("search"), s("x"), s("--max-matches"), s("2"), s("--json")],
-                &c,
-            )
+            .dispatch(&[s("search"), s("x"), s("--max-matches"), s("2")], &c)
             .await;
-        assert!(result.is_ok());
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["total"], 2);
-        assert_eq!(v["truncated"], true);
+        assert!(result.is_ok(), "search failed: {}", result.message());
+        assert!(
+            result.message().contains("truncated at 2 matches"),
+            "message: {}",
+            result.message()
+        );
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v.as_array().map(|a| a.len()), Some(2));
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -467,6 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_all_walks_multiple_contexts() {
+        use crate::kj::KjResult;
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx_a = register_context_with_doc(&d, Some("a"), principal);
@@ -477,10 +468,18 @@ mod tests {
         let c = caller_with_context(ctx_a);
 
         let result = d
-            .dispatch(&[s("search"), s("needle"), s("--all"), s("--json")], &c)
+            .dispatch(&[s("search"), s("needle"), s("--all")], &c)
             .await;
         assert!(result.is_ok(), "search --all failed: {}", result.message());
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["total"], 2, "both contexts must contribute: {v}");
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(
+                    v.as_array().map(|a| a.len()),
+                    Some(2),
+                    "both contexts must contribute"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 }

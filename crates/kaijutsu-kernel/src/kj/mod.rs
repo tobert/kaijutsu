@@ -759,11 +759,10 @@ impl KjDispatcher {
     ///
     /// With no explicit `--distill-model` and a caller that differs from the
     /// source, a caller whose own (provider, model) pair does not match the
-    /// source's is REFUSED rather than silently billed on the source's cast
-    /// (docs/issues.md "Distillation picks the source's cast silently when
-    /// the caller differs"). The refusal is skipped — today's behavior keeps
-    /// running — when the caller has no resolvable pair, when the source has
-    /// none, or when caller and source are the same context (always true for
+    /// source's is REFUSED rather than silently billed on the source's
+    /// cast. The refusal is skipped — today's behavior keeps running — when
+    /// the caller has no resolvable pair, when the source has none, or when
+    /// caller and source are the same context (always true for
     /// `fork --compact` and `drift merge`; never true for `drift pull`).
     pub(crate) async fn summarize_with_model_for_caller(
         &self,

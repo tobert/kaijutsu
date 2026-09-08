@@ -99,21 +99,14 @@ pub(crate) struct MidiArgs {
 enum MidiCommand {
     /// List known device profiles (name + title pulled from the doc).
     #[command(alias = "ls")]
-    List {
-        /// Emit a JSON array of {name, title} objects instead of a labelled view
-        #[arg(long)]
-        json: bool,
-    },
+    List,
     /// Print one device's profile document.
     #[command(alias = "cat")]
     Show {
         /// Device name (e.g. minibrute) or full /config/midi/devices path
         name: String,
-        /// Emit a JSON object instead of a labelled view
-        #[arg(long)]
-        json: bool,
         /// Emit exactly the stored document — no path/length header
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long)]
         raw: bool,
     },
     /// Emit raw MIDI at a named device (the sink resolves the port).
@@ -135,9 +128,6 @@ enum MidiCommand {
         /// How long the sink waits for the device's reply, in milliseconds
         #[arg(long, default_value_t = DEFAULT_EXCHANGE_TIMEOUT_MS)]
         timeout_ms: u32,
-        /// Emit a JSON object instead of a labelled view
-        #[arg(long)]
-        json: bool,
     },
     /// All-notes-off + all-sound-off on all 16 channels of <device>, or of
     /// every device the rig currently reports live when omitted.
@@ -479,13 +469,13 @@ impl KjDispatcher {
             }
         };
         match parsed.command {
-            MidiCommand::List { json } => self.midi_list(json).await,
-            MidiCommand::Show { name, json, raw } => self.midi_show(&name, json, raw).await,
+            MidiCommand::List => self.midi_list().await,
+            MidiCommand::Show { name, raw } => self.midi_show(&name, raw).await,
             MidiCommand::Send { device, message, context } => {
                 self.midi_send(&device, &message, context.as_deref(), caller).await
             }
-            MidiCommand::Identify { device, timeout_ms, json } => {
-                self.midi_identify(&device, timeout_ms, json).await
+            MidiCommand::Identify { device, timeout_ms } => {
+                self.midi_identify(&device, timeout_ms).await
             }
             MidiCommand::Panic { device, context } => {
                 self.midi_panic(device.as_deref(), context.as_deref(), caller).await
@@ -677,7 +667,7 @@ impl KjDispatcher {
     /// The reply is parsed strictly — a half-understood identity would be
     /// stored under the most-trusted provenance in the store — and only then
     /// written to `/run/midi/<device>`.
-    async fn midi_identify(&self, device: &str, timeout_ms: u32, json: bool) -> KjResult {
+    async fn midi_identify(&self, device: &str, timeout_ms: u32) -> KjResult {
         use crate::midi_identity::{IDENTITY_REPLY_PREFIX, IDENTITY_REQUEST, hex};
 
         let canonical = match self.midi_device_must_exist("identify", device).await {
@@ -782,9 +772,6 @@ impl KjDispatcher {
             "source": crate::midi_presence::SOURCE_PULLED,
             "warnings": warnings,
         });
-        if json {
-            return KjResult::ok_with_data(data.to_string(), data);
-        }
         let mut message = format!("{bare}: {}\n", identity.summary());
         message.push_str(&format!("raw:      {}\n", hex(&identity.raw)));
         message.push_str(&format!("recorded: /run/midi/{bare} (source: pulled)\n"));
@@ -794,7 +781,7 @@ impl KjDispatcher {
         KjResult::ok_typed_with_data(message, ContentType::Plain, data)
     }
 
-    async fn midi_list(&self, json: bool) -> KjResult {
+    async fn midi_list(&self) -> KjResult {
         use crate::vfs::{VfsError, VfsOps};
         let vfs = self.kernel().vfs();
         let dir = devices_dir();
@@ -870,9 +857,6 @@ impl KjDispatcher {
                 })
                 .collect(),
         );
-        if json {
-            return KjResult::ok_with_data(data.to_string(), data);
-        }
         if rows.is_empty() {
             return KjResult::ok_with_data("(no device profiles)".to_string(), data);
         }
@@ -907,7 +891,7 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    async fn midi_show(&self, name: &str, json: bool, raw: bool) -> KjResult {
+    async fn midi_show(&self, name: &str, raw: bool) -> KjResult {
         use crate::vfs::{VfsError, VfsOps};
         let canonical = match midi_device_canonical(name) {
             Ok(c) => c,
@@ -952,9 +936,6 @@ impl KjDispatcher {
             "presence": label,
             "presence_record": presence.as_ref().map(|r| r.to_json()),
         });
-        if json {
-            return KjResult::ok_with_data(record.to_string(), record);
-        }
         let ports = presence
             .as_ref()
             .filter(|r| r.present)
@@ -1049,7 +1030,7 @@ mod tests {
     async fn list_shows_all_four_shipped_devices_with_titles() {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
-        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 let arr = v.as_array().expect("array");
@@ -1094,7 +1075,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let result = d
-            .dispatch(&[s("midi"), s("show"), s("minibrute"), s("--json")], &c)
+            .dispatch(&[s("midi"), s("show"), s("minibrute")], &c)
             .await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
@@ -1180,7 +1161,7 @@ mod tests {
             .expect("write nested bucket file");
 
         let c = test_caller();
-        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 let arr = v.as_array().expect("array");
@@ -1274,7 +1255,7 @@ mod tests {
     async fn list_presence_is_unknown_until_a_sink_reports() {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
-        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 for row in v.as_array().expect("array") {
@@ -1304,7 +1285,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("row {name} present"))
         };
 
-        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
         let KjResult::Ok { data: Some(v), .. } = result else {
             panic!("expected Ok with data");
         };
@@ -1316,7 +1297,7 @@ mod tests {
 
         // Unplug: the report flips the column, it does not vanish.
         presence.record(sink_report("minibrute", false, 2_000)).unwrap();
-        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
         let KjResult::Ok { data: Some(v), .. } = result else {
             panic!("expected Ok with data");
         };
@@ -1364,7 +1345,7 @@ mod tests {
             .unwrap();
 
         let KjResult::Ok { data: Some(v), .. } =
-            d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await
+            d.dispatch(&[s("midi"), s("list")], &c).await
         else {
             panic!("expected Ok with data");
         };
@@ -1435,7 +1416,7 @@ mod tests {
             .unwrap();
 
         let result = d
-            .dispatch(&[s("midi"), s("show"), s("minibrute"), s("--json")], &c)
+            .dispatch(&[s("midi"), s("show"), s("minibrute")], &c)
             .await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
@@ -1483,7 +1464,7 @@ mod tests {
         d.kernel().midi_presence().reap_connection(connection);
 
         let KjResult::Ok { data: Some(v), .. } =
-            d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await
+            d.dispatch(&[s("midi"), s("list")], &c).await
         else {
             panic!("expected Ok with data");
         };
@@ -2069,7 +2050,7 @@ mod tests {
     async fn list_with_no_midi_mount_is_an_empty_listing_not_an_error() {
         let d = test_dispatcher().await;
         let c = test_caller();
-        let result = d.dispatch(&[s("midi"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("midi"), s("list")], &c).await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {
                 assert_eq!(v.as_array().map(|a| a.len()), Some(0));
@@ -2128,7 +2109,7 @@ mod tests {
         let sink = spawn_fake_sink(&d, connection, Ok(identity_reply()));
 
         let result = d
-            .dispatch(&[s("midi"), s("identify"), s("keystep-pro"), s("--json")], &c)
+            .dispatch(&[s("midi"), s("identify"), s("keystep-pro")], &c)
             .await;
         match result {
             KjResult::Ok { data: Some(v), .. } => {

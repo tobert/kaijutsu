@@ -7,7 +7,7 @@
 //! This namespace is the kj surface that sees them.
 //!
 //! ```text
-//! kj doc list [--kind <k>] [--json]
+//! kj doc list [--kind <k>]
 //! kj doc tree <id> [--max-depth N] [--expand-tools]
 //! kj doc create [--kind <k>] [--language <l>] [--id <hex>]
 //! kj doc delete <id> [--confirm]
@@ -43,9 +43,6 @@ enum DocCommand {
         /// Filter by kind: conversation|file|symlink
         #[arg(long)]
         kind: Option<String>,
-        /// Emit a JSON object instead of a table
-        #[arg(long)]
-        json: bool,
     },
     /// Render a document's block DAG as ASCII tree. Most useful for
     /// conversation docs — non-conversation kinds typically have a
@@ -133,7 +130,7 @@ impl KjDispatcher {
             return denied;
         }
         match parsed.command {
-            DocCommand::List { kind, json } => self.doc_list(kind.as_deref(), json),
+            DocCommand::List { kind } => self.doc_list(kind.as_deref()),
             DocCommand::Tree {
                 doc_id,
                 max_depth,
@@ -153,7 +150,7 @@ impl KjDispatcher {
     /// List documents from KernelDb (storage of record), join with
     /// BlockStore (memory) for block_count, and KernelDb's contexts
     /// table for label/model when the document is also a context.
-    fn doc_list(&self, kind_filter: Option<&str>, json: bool) -> KjResult {
+    fn doc_list(&self, kind_filter: Option<&str>) -> KjResult {
         let kind_p = match kind_filter {
             None => None,
             Some(s) => match DocKind::from_str(s).ok() {
@@ -225,14 +222,6 @@ impl KjDispatcher {
                 .collect(),
         );
 
-        if json {
-            let out = serde_json::json!({
-                "count": rows.len(),
-                "documents": rows,
-            });
-            return KjResult::ok_with_data(out.to_string(), id_array);
-        }
-
         if rows.is_empty() {
             return KjResult::ok_with_data("(no documents)\n".to_string(), id_array);
         }
@@ -262,10 +251,21 @@ impl KjDispatcher {
                     {
                         bits.push(format!("label={l}"));
                     }
+                    if let Some(p) = &c.provider
+                        && !p.is_empty()
+                    {
+                        bits.push(format!("provider={p}"));
+                    }
                     if let Some(m) = &c.model
                         && !m.is_empty()
                     {
                         bits.push(format!("model={m}"));
+                    }
+                    if let Some(f) = &c.forked_from {
+                        let short = ContextId::parse(f)
+                            .map(|c| c.short())
+                            .unwrap_or_else(|_| f.clone());
+                        bits.push(format!("forked_from={short}"));
                     }
                     if bits.is_empty() {
                         String::new()
@@ -672,26 +672,31 @@ mod tests {
         register_doc_in_db(&d, cfg_id, DocKind::File, None, principal);
 
         let c = caller_with_context(conv_ctx);
-        let result = d.dispatch(&[s("doc"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("doc"), s("list")], &c).await;
         assert!(result.is_ok(), "list failed: {}", result.message());
-
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["count"], 3, "must include non-conversation docs: {v}");
+        match &result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let arr = v.as_array().expect("data must be array");
+                assert_eq!(arr.len(), 3, "must include non-conversation docs: {arr:?}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
 
         // The kind filter is honored: `file` returns both files and skips the
         // conversation. The retired tag `code` is an alias for `file`, so it
         // selects the same two rows.
         for kind in ["file", "code"] {
             let result = d
-                .dispatch(
-                    &[s("doc"), s("list"), s("--kind"), s(kind), s("--json")],
-                    &c,
-                )
+                .dispatch(&[s("doc"), s("list"), s("--kind"), s(kind)], &c)
                 .await;
-            let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-            assert_eq!(v["count"], 2, "--kind {kind}: {v}");
-            for doc in v["documents"].as_array().unwrap() {
-                assert_eq!(doc["kind"], "file");
+            match &result {
+                KjResult::Ok { data: Some(v), message, .. } => {
+                    let arr = v.as_array().expect("data must be array");
+                    assert_eq!(arr.len(), 2, "--kind {kind}: {arr:?}");
+                    let file_rows = message.lines().filter(|l| l.contains("file")).count();
+                    assert_eq!(file_rows, 2, "--kind {kind}: {message}");
+                }
+                other => panic!("expected Ok with data, got {other:?}"),
             }
         }
     }
@@ -703,10 +708,78 @@ mod tests {
         let conv = register_context_with_doc(&d, Some("named-conversation"), principal);
         let c = caller_with_context(conv);
 
-        let result = d.dispatch(&[s("doc"), s("list"), s("--json")], &c).await;
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        let doc = &v["documents"][0];
-        assert_eq!(doc["context"]["label"], "named-conversation");
+        let result = d.dispatch(&[s("doc"), s("list")], &c).await;
+        assert!(result.is_ok(), "list failed: {}", result.message());
+        assert!(
+            result.message().contains("label=named-conversation"),
+            "got: {}",
+            result.message()
+        );
+    }
+
+    /// `provider` and `forked_from` used to ride only the (now-deleted)
+    /// `--json` envelope; they show alongside `label`/`model` in the human
+    /// listing now, in the same `[bits]` style.
+    #[tokio::test]
+    async fn doc_list_shows_provider_and_forked_from_in_human_output() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context_with_doc(&d, Some("parent"), principal);
+
+        let child = ContextId::new();
+        {
+            let db = d.kernel_db().lock();
+            let ws_id = db.get_or_create_default_workspace(principal).unwrap();
+            db.insert_document(&crate::kernel_db::DocumentRow {
+                document_id: child,
+                workspace_id: ws_id,
+                doc_kind: DocKind::Conversation,
+                language: None,
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: principal,
+            })
+            .unwrap();
+            db.insert_context(&crate::kernel_db::ContextRow {
+                context_id: child,
+                label: Some("child".to_string()),
+                provider: Some("anthropic".to_string()),
+                model: None,
+                system_prompt: None,
+                consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                context_state: kaijutsu_types::ContextState::Live,
+                context_type: "default".to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: principal,
+                forked_from: Some(parent),
+                fork_kind: Some(kaijutsu_types::ForkKind::Full),
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+                cast_id: None,
+                origin_host: None,
+                played_by: None,
+            })
+            .unwrap();
+        }
+        d.block_store()
+            .create_document(child, DocKind::Conversation, None)
+            .expect("create_document");
+
+        let c = caller_with_context(child);
+        let result = d.dispatch(&[s("doc"), s("list")], &c).await;
+        assert!(result.is_ok(), "list failed: {}", result.message());
+        let message = result.message();
+        assert!(message.contains("provider=anthropic"), "got: {message}");
+        assert!(
+            message.contains(&format!("forked_from={}", parent.short())),
+            "got: {message}"
+        );
     }
 
     #[tokio::test]
@@ -716,10 +789,13 @@ mod tests {
         let conv = register_context_with_doc(&d, Some("c"), principal);
         let c = caller_with_context(conv);
 
-        let result = d.dispatch(&[s("doc"), s("ls"), s("--json")], &c).await;
-        assert!(result.is_ok());
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["count"], 1);
+        let result = d.dispatch(&[s("doc"), s("ls")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v.as_array().map(|a| a.len()), Some(1));
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]

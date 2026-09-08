@@ -65,11 +65,6 @@ enum RcCommand {
         /// Filter by verb (create|fork|attach|drift|tick|rotate)
         #[arg(long = "verb")]
         verb_filter: Option<String>,
-        /// Emit a JSON object (with a per-entry seed_status record) instead
-        /// of the marked human listing. `.data` stays the flat path array
-        /// either way (the kj list-command iteration convention).
-        #[arg(long)]
-        json: bool,
     },
     /// Remove a script.
     #[command(alias = "remove")]
@@ -82,9 +77,6 @@ enum RcCommand {
     Show {
         /// Canonical rc path to show
         path: String,
-        /// Emit a JSON object instead of a labelled view
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -126,17 +118,6 @@ impl RcSeedStatus {
             RcSeedStatus::NoSeed => "no seed",
             RcSeedStatus::NotInstalled => "not installed",
             RcSeedStatus::Dangling => "dangling — target missing",
-        }
-    }
-
-    /// snake_case token for the `--json` structured record.
-    fn as_json_str(&self) -> &'static str {
-        match self {
-            RcSeedStatus::InSync => "in_sync",
-            RcSeedStatus::Differs => "differs",
-            RcSeedStatus::NoSeed => "no_seed",
-            RcSeedStatus::NotInstalled => "not_installed",
-            RcSeedStatus::Dangling => "dangling",
         }
     }
 }
@@ -255,13 +236,12 @@ impl KjDispatcher {
             RcCommand::List {
                 type_filter,
                 verb_filter,
-                json,
             } => {
-                self.rc_list(type_filter.as_deref(), verb_filter.as_deref(), json)
+                self.rc_list(type_filter.as_deref(), verb_filter.as_deref())
                     .await
             }
             RcCommand::Rm { path } => self.rc_rm(&path).await,
-            RcCommand::Show { path, json } => self.rc_show(&path, json).await,
+            RcCommand::Show { path } => self.rc_show(&path).await,
         };
         if let Some(path) = write_path
             && matches!(result, KjResult::Ok { .. })
@@ -421,12 +401,7 @@ impl KjDispatcher {
         Ok(rows)
     }
 
-    async fn rc_list(
-        &self,
-        type_filter: Option<&str>,
-        verb_filter: Option<&str>,
-        json: bool,
-    ) -> KjResult {
+    async fn rc_list(&self, type_filter: Option<&str>, verb_filter: Option<&str>) -> KjResult {
         let rows = match self.rc_status_rows(type_filter, verb_filter).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
@@ -443,30 +418,15 @@ impl KjDispatcher {
         // `kj rc rm`/`show`) per the kj structured-data convention
         // (`project_kj_structured_data.md`: list commands emit an array of
         // identifier strings so `for x in $(kj …)` iterates handles) — the
-        // per-entry seed status below rides `--json`'s message instead of
-        // reshaping `data` into an array of records. A not-installed row has
-        // nothing live to resolve to, so it's excluded here same as before.
+        // per-entry seed status rides the `[marker]` on each line below
+        // instead. A not-installed row has nothing live to resolve to, so
+        // it's excluded here same as before.
         let data = serde_json::Value::Array(
             rows.iter()
                 .filter(|(_, _, status)| *status != RcSeedStatus::NotInstalled)
                 .map(|(p, _, _)| serde_json::Value::String(p.clone()))
                 .collect(),
         );
-
-        if json {
-            let scripts: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|(p, link, status)| {
-                    serde_json::json!({
-                        "path": p,
-                        "link": link,
-                        "seed_status": status.as_json_str(),
-                    })
-                })
-                .collect();
-            let out = serde_json::json!({ "count": rows.len(), "scripts": scripts });
-            return KjResult::ok_with_data(out.to_string(), data);
-        }
 
         let mut lines = Vec::with_capacity(rows.len());
         for (p, link, status) in &rows {
@@ -573,7 +533,7 @@ impl KjDispatcher {
         Ok(out)
     }
 
-    async fn rc_show(&self, path: &str, json: bool) -> KjResult {
+    async fn rc_show(&self, path: &str) -> KjResult {
         let parts = match parse_rc_path(path) {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
@@ -604,10 +564,6 @@ impl KjDispatcher {
             "content_length": content.len(),
             "content": content,
         });
-
-        if json {
-            return KjResult::ok_with_data(record.to_string(), record);
-        }
 
         // A symlink gets an explicit `→ target` header line; the fenced content
         // below is what the link resolves to.
@@ -1286,58 +1242,6 @@ mod tests {
         }
     }
 
-    /// `--json` carries the same per-entry seed_status fact in its message
-    /// object; `.data` stays the flat path-string array regardless (the
-    /// list-command iteration convention — `project_kj_structured_data.md`).
-    #[tokio::test]
-    async fn rc_list_json_carries_per_entry_seed_status() {
-        use crate::kj::test_helpers::*;
-        use crate::kj::KjResult;
-
-        let d = test_dispatcher_rc().await;
-        let c = test_caller();
-        let s = |v: &str| v.to_string();
-
-        let result = d
-            .dispatch(
-                &[
-                    s("rc"),
-                    s("list"),
-                    s("--type"),
-                    s("coder"),
-                    s("--verb"),
-                    s("create"),
-                    s("--json"),
-                ],
-                &c,
-            )
-            .await;
-        match result {
-            KjResult::Ok { message, data: Some(v), .. } => {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&message).expect("--json message is JSON");
-                let scripts = parsed["scripts"].as_array().expect("scripts array");
-                let entry = scripts
-                    .iter()
-                    .find(|e| e["path"] == "/config/rc/coder/create/S00-stance.kai")
-                    .expect("stance entry present");
-                assert_eq!(entry["seed_status"], "in_sync");
-
-                let paths: Vec<&str> = v
-                    .as_array()
-                    .expect("data stays an array")
-                    .iter()
-                    .filter_map(|x| x.as_str())
-                    .collect();
-                assert!(
-                    paths.contains(&"/config/rc/coder/create/S00-stance.kai"),
-                    "data must stay the flat path array even under --json: {paths:?}"
-                );
-            }
-            other => panic!("expected Ok with data, got {other:?}"),
-        }
-    }
-
     /// A seed that ships in this binary with nothing live at its path is
     /// reported as "not installed" rather than being silently absent from the
     /// listing. This is the state a kernel lands in whenever a script is added
@@ -1384,42 +1288,6 @@ mod tests {
                 );
             }
             other => panic!("expected Ok with data, got {other:?}"),
-        }
-    }
-
-    /// The not-installed marker rides `--json` as `not_installed` too, so a
-    /// client can find the gap without parsing the human listing.
-    #[tokio::test]
-    async fn rc_list_json_carries_not_installed_status() {
-        use crate::kj::test_helpers::*;
-        use crate::kj::KjResult;
-
-        let d = test_dispatcher_rc().await;
-        let c = test_caller();
-        let s = |v: &str| v.to_string();
-        let path = "/config/rc/coder/create/S00-stance.kai";
-
-        d.dispatch(&[s("rc"), s("rm"), s(path)], &c).await;
-
-        let result = d
-            .dispatch(
-                &[s("rc"), s("list"), s("--type"), s("coder"), s("--verb"), s("create"), s("--json")],
-                &c,
-            )
-            .await;
-        match result {
-            KjResult::Ok { message, .. } => {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&message).expect("--json message is JSON");
-                let scripts = parsed["scripts"].as_array().expect("scripts array");
-                let entry = scripts
-                    .iter()
-                    .find(|e| e["path"] == path)
-                    .expect("removed seed still appears as an entry");
-                assert_eq!(entry["seed_status"], "not_installed");
-                assert!(entry["link"].is_null(), "nothing live means no link target");
-            }
-            other => panic!("expected Ok, got {other:?}"),
         }
     }
 
