@@ -643,6 +643,33 @@ pub struct MountSpec {
     pub writable: bool,
 }
 
+/// One `ping` answer: liveness plus the kernel's wallclock at the moment it
+/// answered (`docs/midi.md` "The one timebase" — the kernel's clock is the
+/// timebase, and this is how a node learns its offset to it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PingReply {
+    /// Which kernel answered. A change means the server restarted under us.
+    pub kernel_id: KernelId,
+    /// The kernel's wallclock in ms since UNIX_EPOCH.
+    pub server_time_ms: u64,
+    /// The kernel's wallclock in ns since UNIX_EPOCH. `0` from a kernel that
+    /// predates the field — use [`Self::server_epoch_ns`], which falls back
+    /// to the ms field.
+    pub server_time_ns: u64,
+}
+
+impl PingReply {
+    /// The kernel's wallclock in ns, falling back to the ms field for an old
+    /// kernel. `0` when the reply carries neither — no clock sample.
+    pub fn server_epoch_ns(&self) -> u64 {
+        if self.server_time_ns != 0 {
+            self.server_time_ns
+        } else {
+            self.server_time_ms.saturating_mul(1_000_000)
+        }
+    }
+}
+
 /// Handle to a bound kernel capability returned by `bind_kernel`.
 #[derive(Clone)]
 pub struct KernelHandle {
@@ -665,7 +692,8 @@ impl KernelHandle {
         parse_kernel_info(&info)
     }
 
-    /// Cheap liveness probe. Returns `(kernel_id, server_time_ms)`.
+    /// Cheap liveness probe, and the client's one sample of the kernel's
+    /// clock.
     ///
     /// Used by the reconnect FSM's background liveness pinger. The handler
     /// is documented as "must not take per-context locks" so a wedge in
@@ -673,7 +701,7 @@ impl KernelHandle {
     /// A `kernel_id` mismatch vs. what the actor bound to means the server
     /// restarted under us — the FSM treats that as a hard reconnect signal.
     #[tracing::instrument(skip(self), name = "rpc_client.ping")]
-    pub async fn ping(&self) -> Result<(KernelId, u64), RpcError> {
+    pub async fn ping(&self) -> Result<PingReply, RpcError> {
         let mut request = self.kernel.ping_request();
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
@@ -683,9 +711,11 @@ impl KernelHandle {
         }
         let response = request.send().promise.await?;
         let reader = response.get()?;
-        let kernel_id = parse_kernel_id(reader.get_kernel_id()?)?;
-        let server_time_ms = reader.get_server_time_ms();
-        Ok((kernel_id, server_time_ms))
+        Ok(PingReply {
+            kernel_id: parse_kernel_id(reader.get_kernel_id()?)?,
+            server_time_ms: reader.get_server_time_ms(),
+            server_time_ns: reader.get_server_time_ns(),
+        })
     }
 
     // =========================================================================

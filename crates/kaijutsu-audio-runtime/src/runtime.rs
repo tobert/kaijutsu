@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use kaijutsu_audio::{CaptureLimits, CaptureRing, Tracker, MIDI_CAPTURE_MIME};
 use kaijutsu_client::{ActorHandle, ConnectionStatus, SshConfig};
@@ -38,6 +38,9 @@ pub struct Engine {
     join: Option<std::thread::JoinHandle<Result<(), String>>>,
     pub pulses: crossbeam_channel::Receiver<crate::dj::DjPulse>,
     pub(crate) observation: Option<Arc<std::sync::Mutex<Observation>>>,
+    /// The node's model of the kernel's clock, for whatever stamps or reports
+    /// outside the runtime thread (`docs/midi.md` "The one timebase").
+    pub(crate) clock: kaijutsu_client::KernelClockHandle,
 }
 
 impl Engine {
@@ -55,11 +58,14 @@ impl Engine {
         }
         let (stop, stop_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        // Taken before `actor` moves into the runtime thread; clones share
+        // one model, so this reads whatever the pinger has learned.
+        let clock = actor.clock_handle();
         let join = std::thread::Builder::new().name("kaijutsu-audio-node".into()).spawn(move || {
             let result = (|| {
                 let _ownership = Ownership::acquire(&lock_path())?;
                 let mut dj = DjHandle::start(&options)?;
-                let ear = if options.midi { Some(Observer::start(crate::midi_in::spawn_capture_thread(options.rt_priority)?, context.is_some())?) } else { None };
+                let ear = if options.midi { Some(Observer::start(crate::midi_in::spawn_capture_thread(options.rt_priority, actor.clock_handle())?, context.is_some())?) } else { None };
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
                 dj.ctl_tx.send(DjCtl::ActorReady { handle: actor.clone(), ssh_config: ssh, generation: 0 })
                     .map_err(|e| e.to_string())?;
@@ -76,7 +82,7 @@ impl Engine {
             result
         }).map_err(|e| e.to_string())?;
         let (pulses, observation) = ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok(Self { stop, join: Some(join), pulses, observation })
+        Ok(Self { stop, join: Some(join), pulses, observation, clock })
     }
 
     pub fn is_finished(&self) -> bool {
@@ -107,10 +113,13 @@ struct EarState {
 }
 
 impl EarState {
-    fn new() -> Self {
+    /// `at_epoch_ns` is the kernel-domain "now" the ring's tracker starts
+    /// from — every capture stamp is minted on the one timebase
+    /// (`docs/midi.md` "The one timebase").
+    fn new(at_epoch_ns: u64) -> Self {
         let ring = CaptureRing::with_limits(CaptureLimits { max_events: 16_384, max_bytes: 8 * 1024 * 1024, max_message_bytes: 64 * 1024 })
             .expect("valid recording history limits");
-        let tracker = ring.tracker_at(epoch_ns());
+        let tracker = ring.tracker_at(at_epoch_ns);
         Self { ring, tracker, topology: Default::default(), clocks: Default::default(), rejected: 0 }
     }
 
@@ -177,7 +186,11 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
         actor.midi_exchange().install(tx);
         Some(ExchangeWorker { slot: actor.midi_exchange(), stop, join: Some(join) })
     } else { None };
-    let mut state = EarState::new();
+    // Presence, clock estimates and capture cuts are all stamped in the
+    // kernel's domain: the kernel is the sole sequencer, so its clock is the
+    // timebase every receiver ages these against.
+    let clock = actor.clock_handle();
+    let mut state = EarState::new(clock.now_ns());
     let mut status = actor.watch_status();
     let mut connected = false;
     let mut profiles = Vec::new();
@@ -254,7 +267,7 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
                 // Re-state live ports whenever topology changes.
                 for device in matched.devices.keys() { previous.remove(device); }
                 for report in diff_presence(&previous, &matched.devices) {
-                    actor.report_midi_presence(report.device.clone(), report.present, BACKEND, report.ports, epoch_ns(), sink_host())
+                    actor.report_midi_presence(report.device.clone(), report.present, BACKEND, report.ports, clock.now_ns(), sink_host())
                         .await.map_err(|e| e.to_string())?;
                     reported.insert(report.device, report.present);
                 }
@@ -267,7 +280,7 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
                 }
                 if last_cut.elapsed() >= Duration::from_secs(4) {
                     last_cut = std::time::Instant::now();
-                    if let Some(batch) = state.cut(connected, context, epoch_ns()) {
+                    if let Some(batch) = state.cut(connected, context, clock.now_ns()) {
                         if batch.lost > 0 { tracing::warn!(lost = batch.lost, "MIDI capture ring overran"); }
                         let payload = batch.to_json_bytes().map_err(|e| e.to_string())?;
                         if let Err(e) = actor.commit_capture(target, MIDI_CAPTURE_MIME, payload).await {
@@ -295,10 +308,6 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
             }
         }
     }
-}
-
-fn epoch_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock before UNIX epoch").as_nanos() as u64
 }
 
 struct ExchangeWorker {
@@ -344,8 +353,8 @@ mod tests {
 
     #[test]
     fn capture_survives_disconnection_and_missing_target() {
-        let mut state = EarState::new();
-        let now = epoch_ns();
+        let mut state = EarState::new(kaijutsu_client::local_epoch_ns());
+        let now = kaijutsu_client::local_epoch_ns();
         state.ingest(EarEvent::Capture { event: kaijutsu_audio::CaptureEvent { epoch_ns: now, source: "24:0".into(), bytes: vec![0x90, 60, 100] }, observed_at: std::time::Instant::now() });
         assert!(state.cut(false, Some(ContextId::new()), now + 10).is_none());
         assert!(state.cut(true, None, now + 10).is_none());
@@ -356,7 +365,7 @@ mod tests {
 
     #[test]
     fn unplug_removes_the_route_and_clock() {
-        let mut state = EarState::new();
+        let mut state = EarState::new(kaijutsu_client::local_epoch_ns());
         state.ingest(EarEvent::PortUp(crate::midi_match::PortFacts { client_name: "synth".into(), port_name: "synth".into(), address: "24:0".into(), usb_id: None }));
         state.ingest(EarEvent::Clock { source: "24:0".into(), estimate: kaijutsu_audio::ClockEstimate { reference: kaijutsu_audio::BeatRef::new(1.0, 2.0), epoch_ns: 1, residual_ns: 0 }, discontinuities: 0 });
         state.ingest(EarEvent::ClientDown { client_id: 24 });

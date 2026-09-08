@@ -11,7 +11,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source, decoder::DecoderError};
 use tracing::warn;
 
-use kaijutsu_audio::{REF_STALE_MAX, stamp_age};
+use kaijutsu_audio::{REF_STALE_MAX, StampAge, stamp_age};
 
 /// One command the scheduler thread understands. Bevy systems never
 /// construct these directly (see [`AudioSchedulerHandle`]'s convenience
@@ -151,15 +151,16 @@ pub fn output_names() -> Result<Vec<String>, String> {
 /// go/no-go/when decision (a scheduled sound has no event list to partially
 /// drop, unlike a phrase of MIDI events):
 ///
-/// - `epoch_ns == 0` (unstamped): `lead` at face value — `Some(lead)`.
+/// - `epoch_ns == 0` (unstamped), or a stamp from the future (clock skew):
+///   `lead` at face value — `Some(lead)`.
 /// - otherwise: `deficit = age.saturating_sub(lead)`; `deficit >
 ///   REF_STALE_MAX` rejects the WHOLE cue (`None`) rather than firing
 ///   arbitrarily late; otherwise `lead' = lead.saturating_sub(age)` — the
 ///   lead absorbs whatever age it can and clamps at zero (play now) once
 ///   fully spent.
 pub(crate) fn backdated_lead(lead: Duration, epoch_ns: u64, now_epoch_ns: u64) -> Option<Duration> {
-    let Some(age) = stamp_age(epoch_ns, now_epoch_ns) else {
-        return Some(lead); // unstamped: old behavior verbatim
+    let StampAge::Age(age) = stamp_age(epoch_ns, now_epoch_ns) else {
+        return Some(lead); // unstamped or future-stamped: old behavior verbatim
     };
     let deficit = age.saturating_sub(lead);
     if deficit > REF_STALE_MAX {

@@ -25,9 +25,10 @@ pub mod metrics;
 mod otel;
 
 pub use metrics::{
-    TokenCounts, record_beat_fired, record_beat_sync_published, record_cwd_restore_failed,
-    record_dj_clock_transition, record_dj_cue_dropped, record_grid_reseed, record_llm_usage,
-    record_metronome_click, record_phasor_slew, record_roster_transition, record_stale_cue_dropped,
+    TokenCounts, record_beat_fired, record_beat_sync_published, record_clock_offset,
+    record_cwd_restore_failed, record_dj_clock_transition, record_dj_cue_dropped,
+    record_future_stamp, record_grid_reseed, record_llm_usage, record_metronome_click,
+    record_phasor_slew, record_roster_transition, record_stale_cue_dropped,
 };
 pub use otel::{OtelGuard, otel_layer};
 

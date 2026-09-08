@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 
 use opentelemetry::KeyValue;
 use opentelemetry::global;
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
 /// LLM token-usage and operation-count instruments.
 pub struct LlmMetrics {
@@ -358,6 +358,77 @@ pub fn record_dj_clock_transition(to: &str, reason: &str) {
 /// the global meter provider — see [`BeatMetrics::record_dj_cue_dropped`].
 pub fn record_dj_cue_dropped(reason: &str, count: usize) {
     BEAT_METRICS.record_dj_cue_dropped(reason, count);
+}
+
+/// A node's model of the kernel clock, and the skew it exposes
+/// (`docs/midi.md` "The one timebase").
+pub struct ClockMetrics {
+    /// `kaijutsu.clock.offset_ms` — the applied kernel−local offset this node
+    /// stamps and ages with. Zero on a node whose clock already agrees with
+    /// the kernel's; a large steady value is a host without NTP, which is
+    /// supported, not a fault.
+    offset_ms: Gauge<f64>,
+    /// `kaijutsu.clock.uncertainty_ms` — how well the node knows that offset:
+    /// half the best round trip plus the drift allowance since that sample.
+    /// It grows on its own while pings are not landing.
+    uncertainty_ms: Gauge<f64>,
+    /// `kaijutsu.clock.future_stamps` — wire timing artifacts whose emission
+    /// stamp was ahead of the receiver's clock past the tolerance, by
+    /// `consumer`. Nonzero means this node is aging stamps against a clock
+    /// that disagrees with the sender's; the artifacts still play.
+    future_stamps: Counter<u64>,
+}
+
+impl ClockMetrics {
+    /// Build the instruments from a meter. Public so tests can bind a meter
+    /// backed by an in-memory reader.
+    pub fn new(meter: &Meter) -> Self {
+        let offset_ms = meter
+            .f64_gauge("kaijutsu.clock.offset_ms")
+            .with_unit("ms")
+            .with_description("Applied kernel-minus-local clock offset, by node")
+            .build();
+        let uncertainty_ms = meter
+            .f64_gauge("kaijutsu.clock.uncertainty_ms")
+            .with_unit("ms")
+            .with_description("Uncertainty in the applied kernel clock offset, by node")
+            .build();
+        let future_stamps = meter
+            .u64_counter("kaijutsu.clock.future_stamps")
+            .with_unit("{artifact}")
+            .with_description(
+                "Wire timing artifacts stamped ahead of the receiver's clock past the tolerance, \
+                 by consumer",
+            )
+            .build();
+        Self { offset_ms, uncertainty_ms, future_stamps }
+    }
+
+    /// Record one clock sample's applied offset and uncertainty.
+    pub fn record_clock_offset(&self, offset_ms: f64, uncertainty_ms: f64) {
+        self.offset_ms.record(offset_ms, &[]);
+        self.uncertainty_ms.record(uncertainty_ms, &[]);
+    }
+
+    /// Record one future-stamped artifact seen by `consumer` (`"dj"`).
+    pub fn record_future_stamp(&self, consumer: &str) {
+        self.future_stamps.add(1, &[KeyValue::new("consumer", consumer.to_owned())]);
+    }
+}
+
+static CLOCK_METRICS: LazyLock<ClockMetrics> =
+    LazyLock::new(|| ClockMetrics::new(&global::meter("kaijutsu")));
+
+/// Record one clock sample's applied offset and uncertainty to the global
+/// meter provider — see [`ClockMetrics::record_clock_offset`].
+pub fn record_clock_offset(offset_ms: f64, uncertainty_ms: f64) {
+    CLOCK_METRICS.record_clock_offset(offset_ms, uncertainty_ms);
+}
+
+/// Record one future-stamped artifact to the global meter provider — see
+/// [`ClockMetrics::record_future_stamp`].
+pub fn record_future_stamp(consumer: &str) {
+    CLOCK_METRICS.record_future_stamp(consumer);
 }
 
 /// Process-wide LLM instruments, lazily bound to the global meter provider.

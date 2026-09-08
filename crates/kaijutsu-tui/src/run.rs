@@ -303,7 +303,7 @@ async fn event_loop(
                     dirty = true;
                 }
                 if let ServerEvent::BeatSync { context_id, beat_ref } = &event {
-                    observe_beat_sync(app, *context_id, *beat_ref);
+                    observe_beat_sync(app, *context_id, *beat_ref, bridge.actor().kernel_now_ns());
                     dirty = true;
                 }
             }
@@ -407,13 +407,16 @@ async fn event_loop(
 
 /// Fold one `ServerEvent::BeatSync` into `app.beats`, the same
 /// fold/touch/drop routing as the app's `time_well::live::ingest_live_events`
-/// (`docs/tui.md`, "TRACKS + beat").
-fn observe_beat_sync(app: &mut App, context_id: ContextId, beat_ref: kaijutsu_audio::BeatRef) {
+/// (`docs/tui.md`, "TRACKS + beat"). `now_epoch_ns` is the kernel-domain
+/// wallclock (`ActorHandle::kernel_now_ns`), so the age ladder runs on the
+/// one timebase (`docs/midi.md`, "The one timebase").
+fn observe_beat_sync(
+    app: &mut App,
+    context_id: ContextId,
+    beat_ref: kaijutsu_audio::BeatRef,
+    now_epoch_ns: u64,
+) {
     let now_inst = Instant::now();
-    let now_epoch_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
     match beat_ref.disposition(now_inst, now_epoch_ns) {
         RefDisposition::Fold(at) => {
             app.beats.observe(context_id, beat_ref, at, now_inst);

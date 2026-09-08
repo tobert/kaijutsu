@@ -906,6 +906,10 @@ pub struct ActorHandle {
     /// The kernel-wide approval-ledger change stream — a `broadcast` fan-out
     /// (see [`Self::subscribe_ledger_events`] for why).
     ledger_tx: broadcast::Sender<i64>,
+    /// This client's model of the kernel's clock, fed by the liveness pinger
+    /// (`docs/midi.md` "The one timebase"). Shared with the actor, so it
+    /// survives reconnects to the same kernel.
+    clock: crate::KernelClockHandle,
 }
 
 /// The receiving end of a [`ActorHandle::never_answers_for_test`] handle's
@@ -946,6 +950,7 @@ impl ActorHandle {
             status_watch_rx,
             midi_exchange: crate::midi_exchange::MidiExchangeSlot::new(),
             ledger_tx,
+            clock: crate::KernelClockHandle::new(),
         };
         (handle, UnansweredCommands(rx))
     }
@@ -972,6 +977,28 @@ impl ActorHandle {
     /// told so, loudly, rather than waiting on a sink that was never there.
     pub fn midi_exchange(&self) -> Arc<crate::midi_exchange::MidiExchangeSlot> {
         self.midi_exchange.clone()
+    }
+
+    // ── The kernel clock (`docs/midi.md` "The one timebase") ─────────────
+
+    /// This node's wallclock right now, in the kernel's domain — what every
+    /// outgoing timing stamp and every age computation should use, so a node
+    /// whose host clock disagrees with the kernel's still mints and reads
+    /// stamps on the one timebase. Identity until the first ping lands.
+    pub fn kernel_now_ns(&self) -> u64 {
+        self.clock.now_ns()
+    }
+
+    /// The current state of the clock model — offset, uncertainty, sample
+    /// count — for status output and for artifact provenance.
+    pub fn kernel_clock(&self) -> kaijutsu_audio::ClockSnapshot {
+        self.clock.snapshot()
+    }
+
+    /// The shared handle itself, for a thread that stamps without an
+    /// `ActorHandle` in reach (the ALSA capture thread).
+    pub fn clock_handle(&self) -> crate::KernelClockHandle {
+        self.clock.clone()
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<ServerEvent> {
@@ -2154,6 +2181,10 @@ struct RpcActor {
     /// for `EditorEventsForwarder` et al.), no intermediate per-connect
     /// channel + forwarding task needed.
     ledger_tx: broadcast::Sender<i64>,
+    /// Shared with `ActorHandle` and with the liveness pinger: this client's
+    /// model of the kernel's clock. Reset only when the kernel ID changes —
+    /// a restart of the same kernel keeps the same host clock.
+    clock: crate::KernelClockHandle,
 
     /// Context change feeds this client wants, by context
     /// (docs/change-feed.md). The actor keeps the consumer's end of each feed
@@ -2230,6 +2261,7 @@ impl RpcActor {
         status_watch_tx: watch::Sender<ConnectionStatus>,
         midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
         ledger_tx: broadcast::Sender<i64>,
+        clock: crate::KernelClockHandle,
     ) -> Self {
         let (close_tx, close_rx) = mpsc::channel(1);
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
@@ -2247,6 +2279,7 @@ impl RpcActor {
             vfs_activity_interval_ms: None,
             midi_exchange,
             ledger_tx,
+            clock,
             context_feeds: HashMap::new(),
             connection: None,
             ping_task: None,
@@ -2350,6 +2383,14 @@ impl RpcActor {
         // below, once the new connection is fully in place.
         let is_reconnect = self.bound_kernel_id.is_some();
 
+        // A different kernel is a different host clock; the model we learned
+        // is about the old one. The same kernel restarting keeps its clock,
+        // so its model still holds and the node stays dialed in through the
+        // outage.
+        if self.bound_kernel_id.is_some_and(|prior| prior != built.kernel_id) {
+            self.clock.reset();
+        }
+
         self.bound_kernel_id = Some(built.kernel_id);
         self.joined_context_id = built.joined_context;
         self.connection = Some(ConnectionState {
@@ -2396,8 +2437,9 @@ impl RpcActor {
         let close_tx = self.close_tx.clone();
         let expected_kernel_id = built.kernel_id;
         let kernel = built.kernel;
+        let clock = self.clock.clone();
         self.ping_task = Some(tokio::task::spawn_local(async move {
-            run_ping_loop(kernel, expected_kernel_id, close_tx).await;
+            run_ping_loop(kernel, expected_kernel_id, close_tx, clock).await;
         }));
 
         log::info!(
@@ -3367,50 +3409,122 @@ async fn connect_handshake(
 // Liveness pinger
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Round trips in the connect-time burst. Four samples get a node inside its
+/// own uncertainty within a second of connecting, instead of waiting out
+/// three 30 s liveness intervals before it can age a stamp.
+const CLOCK_BURST_PINGS: usize = 4;
+
+/// Gap between the burst's round trips — long enough that each one sees a
+/// different queue state, short enough that the whole burst finishes inside
+/// the first second.
+const CLOCK_BURST_GAP: Duration = Duration::from_millis(250);
+
 /// Run ping forever until aborted or ping fails. Signals `close_tx` on
 /// failure (timeout, RPC error, or kernel ID mismatch).
+///
+/// Every round trip is also one sample of the kernel's clock
+/// (`docs/midi.md` "The one timebase"): a burst of [`CLOCK_BURST_PINGS`]
+/// dials the node in right after connecting, then the liveness cadence keeps
+/// the model fresh against drift.
 async fn run_ping_loop(
     kernel: KernelHandle,
     expected_kernel_id: KernelId,
     close_tx: mpsc::Sender<CloseCause>,
+    clock: crate::KernelClockHandle,
 ) {
+    for n in 0..CLOCK_BURST_PINGS {
+        if n > 0 {
+            tokio::time::sleep(CLOCK_BURST_GAP).await;
+        }
+        if !ping_once(&kernel, expected_kernel_id, &close_tx, &clock).await {
+            return;
+        }
+    }
+
     let mut ticker = tokio::time::interval(PING_INTERVAL);
-    // Skip the first immediate tick — we just connected, no need to ping
-    // right away.
+    // Skip the first immediate tick — the burst above just pinged.
     ticker.tick().await;
 
     loop {
         ticker.tick().await;
-        match tokio::time::timeout(PING_TIMEOUT, kernel.ping()).await {
-            Ok(Ok((got_id, _server_ms))) => {
-                if got_id != expected_kernel_id {
-                    log::warn!(
-                        "Ping returned kernel_id mismatch: expected {}, got {}",
-                        expected_kernel_id, got_id
-                    );
-                    let _ = close_tx
-                        .try_send(CloseCause::KernelIdChanged {
-                            expected: expected_kernel_id,
-                            got: got_id,
-                        });
-                    return;
-                }
-                log::trace!("ping ok for kernel_id={}", expected_kernel_id);
-            }
-            Ok(Err(e)) => {
-                log::warn!("ping rpc error: {e}");
-                let _ = close_tx.try_send(CloseCause::PingFailed(e.to_string()));
-                return;
-            }
-            Err(_) => {
-                log::warn!("ping exceeded {:?}", PING_TIMEOUT);
-                let _ = close_tx.try_send(CloseCause::PingFailed(format!(
-                    "timeout {:?}",
-                    PING_TIMEOUT
-                )));
-                return;
-            }
+        if !ping_once(&kernel, expected_kernel_id, &close_tx, &clock).await {
+            return;
         }
+    }
+}
+
+/// One liveness round trip, which is also one clock sample. Returns `false`
+/// when the loop should stop — a close cause has already been signalled.
+async fn ping_once(
+    kernel: &KernelHandle,
+    expected_kernel_id: KernelId,
+    close_tx: &mpsc::Sender<CloseCause>,
+    clock: &crate::KernelClockHandle,
+) -> bool {
+    // Sampled as close to the wire as this loop can get: the round trip is
+    // measured on the monotonic clock, the wallclock pair brackets it.
+    let sent = Instant::now();
+    let sent_epoch_ns = crate::local_epoch_ns();
+    match tokio::time::timeout(PING_TIMEOUT, kernel.ping()).await {
+        Ok(Ok(reply)) => {
+            let received = Instant::now();
+            let received_epoch_ns = crate::local_epoch_ns();
+            if reply.kernel_id != expected_kernel_id {
+                log::warn!(
+                    "Ping returned kernel_id mismatch: expected {}, got {}",
+                    expected_kernel_id, reply.kernel_id
+                );
+                let _ = close_tx.try_send(CloseCause::KernelIdChanged {
+                    expected: expected_kernel_id,
+                    got: reply.kernel_id,
+                });
+                return false;
+            }
+            observe_clock_sample(
+                clock,
+                kaijutsu_audio::ClockSample {
+                    sent,
+                    sent_epoch_ns,
+                    kernel_epoch_ns: reply.server_epoch_ns(),
+                    received,
+                    received_epoch_ns,
+                },
+            );
+            log::trace!("ping ok for kernel_id={}", expected_kernel_id);
+            true
+        }
+        Ok(Err(e)) => {
+            log::warn!("ping rpc error: {e}");
+            let _ = close_tx.try_send(CloseCause::PingFailed(e.to_string()));
+            false
+        }
+        Err(_) => {
+            log::warn!("ping exceeded {:?}", PING_TIMEOUT);
+            let _ = close_tx.try_send(CloseCause::PingFailed(format!(
+                "timeout {:?}",
+                PING_TIMEOUT
+            )));
+            false
+        }
+    }
+}
+
+/// Fold one round trip into the clock model and publish the result. A sample
+/// the model refuses (a kernel too old to carry a wallclock at all) leaves
+/// the node stamping with its own clock, which is what it did before the
+/// model existed.
+fn observe_clock_sample(clock: &crate::KernelClockHandle, sample: kaijutsu_audio::ClockSample) {
+    if !clock.observe(sample) {
+        return;
+    }
+    let snapshot = clock.snapshot();
+    if let (Some(offset_ns), Some(uncertainty_ns)) =
+        (snapshot.offset_ns, snapshot.uncertainty_ns)
+    {
+        kaijutsu_telemetry::record_clock_offset(
+            offset_ns as f64 / 1_000_000.0,
+            uncertainty_ns as f64 / 1_000_000.0,
+        );
     }
 }
 
@@ -3982,6 +4096,11 @@ pub fn spawn_actor(
     // a reconnect untouched.
     let (ledger_tx, _) = broadcast::channel::<i64>(LEDGER_BROADCAST_CAPACITY);
 
+    // One model, shared by the actor's pinger (which feeds it) and the handle
+    // (which reads it). Outside the reconnect loop for the same reason as
+    // `event_tx`: a reconnect to the same kernel must not lose the offset.
+    let clock = crate::KernelClockHandle::new();
+
     let actor = RpcActor::new(
         config,
         context_id,
@@ -3993,6 +4112,7 @@ pub fn spawn_actor(
         status_watch_tx,
         midi_exchange.clone(),
         ledger_tx.clone(),
+        clock.clone(),
     );
     tokio::task::spawn_local(actor.run());
 
@@ -4003,6 +4123,7 @@ pub fn spawn_actor(
         status_watch_rx,
         midi_exchange,
         ledger_tx,
+        clock,
     }
 }
 
@@ -4262,6 +4383,96 @@ mod tests {
         assert!(s.contains("3"), "got: {s}");
     }
 
+    /// A ping's clock sample must reach the model the handle reads, and
+    /// nothing else: before any ping the handle stamps with the local clock,
+    /// after one it stamps in the kernel's domain. The moltar↔zorak skew is
+    /// the case that matters — 100.9 s is far larger than every staleness
+    /// bound in `kaijutsu-audio::timebase`, so a node that fails to learn it
+    /// silently degrades every fold.
+    #[test]
+    fn a_ping_sample_lands_in_the_clock_the_handle_reads() {
+        let (handle, _cmds) = ActorHandle::never_answers_for_test();
+        let local = crate::local_epoch_ns();
+        assert_eq!(handle.kernel_clock().samples, 0, "unsampled at construction");
+        assert!(
+            handle.kernel_now_ns().abs_diff(local) < Duration::from_secs(1).as_nanos() as u64,
+            "identity before any ping"
+        );
+
+        let skew_ns = 100_900_000_000u64;
+        let sent = Instant::now();
+        observe_clock_sample(
+            &handle.clock_handle(),
+            kaijutsu_audio::ClockSample {
+                sent,
+                sent_epoch_ns: local,
+                kernel_epoch_ns: local + skew_ns + 1_000_000,
+                received: sent + Duration::from_millis(2),
+                received_epoch_ns: local + 2_000_000,
+            },
+        );
+
+        let snapshot = handle.kernel_clock();
+        assert_eq!(snapshot.samples, 1, "the sample landed");
+        let offset = snapshot.offset_ns.expect("an offset was learned");
+        assert!(
+            offset.abs_diff(skew_ns as i64) <= 1_000_000,
+            "learned the skew within half a round trip, got {offset}"
+        );
+        assert!(
+            handle.kernel_now_ns() > local + skew_ns - Duration::from_secs(1).as_nanos() as u64,
+            "the handle now stamps in the kernel's domain"
+        );
+    }
+
+    /// A kernel too old to carry a wallclock leaves the model unsampled
+    /// rather than teaching it an offset of minus fifty-six years.
+    #[test]
+    fn a_stampless_reply_teaches_the_clock_nothing() {
+        let (handle, _cmds) = ActorHandle::never_answers_for_test();
+        let local = crate::local_epoch_ns();
+        let sent = Instant::now();
+        let reply = crate::rpc::PingReply {
+            kernel_id: KernelId::new(),
+            server_time_ms: 0,
+            server_time_ns: 0,
+        };
+        observe_clock_sample(
+            &handle.clock_handle(),
+            kaijutsu_audio::ClockSample {
+                sent,
+                sent_epoch_ns: local,
+                kernel_epoch_ns: reply.server_epoch_ns(),
+                received: sent + Duration::from_millis(2),
+                received_epoch_ns: local + 2_000_000,
+            },
+        );
+        assert_eq!(handle.kernel_clock().samples, 0, "no sample from a stampless reply");
+        assert!(
+            handle.kernel_now_ns().abs_diff(crate::local_epoch_ns())
+                < Duration::from_secs(1).as_nanos() as u64,
+            "the node keeps stamping with its own clock"
+        );
+    }
+
+    /// An old kernel that carries only the millisecond field still gives a
+    /// usable sample — the ns field falls back to it.
+    #[test]
+    fn ping_reply_falls_back_to_the_millisecond_field() {
+        let ms_only = crate::rpc::PingReply {
+            kernel_id: KernelId::new(),
+            server_time_ms: 1_700_000_000_000,
+            server_time_ns: 0,
+        };
+        assert_eq!(ms_only.server_epoch_ns(), 1_700_000_000_000_000_000);
+        let both = crate::rpc::PingReply {
+            kernel_id: KernelId::new(),
+            server_time_ms: 1_700_000_000_000,
+            server_time_ns: 1_700_000_000_123_456_789,
+        };
+        assert_eq!(both.server_epoch_ns(), 1_700_000_000_123_456_789, "ns wins when present");
+    }
+
     /// Build a bare `RpcActor` for state-machine unit tests. No network I/O:
     /// `RpcActor::new` only wires in-memory channels, so the state transition
     /// methods (`start_closing`/`finish_closing`/...) are exercisable without
@@ -4283,6 +4494,7 @@ mod tests {
             status_watch_tx,
             crate::midi_exchange::MidiExchangeSlot::new(),
             ledger_tx,
+            crate::KernelClockHandle::new(),
         )
     }
 

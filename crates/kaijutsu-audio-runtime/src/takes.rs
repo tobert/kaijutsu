@@ -86,11 +86,15 @@ pub struct CaptureControl {
     pool: Arc<Mutex<Pool>>,
     node: String,
     instance: String,
+    /// Read at keep time so the artifact carries the offset its window's
+    /// stamps were minted with (`docs/midi.md` "The one timebase") — a reader
+    /// reconciling wallclock anchors later needs to know which clock they are.
+    clock: kaijutsu_client::KernelClockHandle,
 }
 
 impl CaptureControl {
     pub fn new(engine: &crate::Engine, ssh: kaijutsu_client::SshConfig, node: String, instance: String) -> Self {
-        Self { observation: engine.observation.clone(), ssh, pool: Arc::new(Mutex::new(Pool::default())), node, instance }
+        Self { observation: engine.observation.clone(), ssh, pool: Arc::new(Mutex::new(Pool::default())), node, instance, clock: engine.clock.clone() }
     }
 
     pub fn shutdown(&self) {
@@ -186,6 +190,7 @@ impl CaptureControl {
         let selection = request.clone();
         let node = self.node.clone();
         let instance = self.instance.clone();
+        let clock = self.clock.snapshot();
         let result = tokio::task::spawn_blocking(move || {
             let (window, epoch) = {
                 let mut observation = observation.lock().expect("MIDI observation lock poisoned");
@@ -197,10 +202,11 @@ impl CaptureControl {
             #[derive(Serialize)]
             struct Artifact {
                 v: u32, kind: &'static str, request_id: Uuid, node: String, instance: String,
-                window_end_ns: u64, window_start_ns: u64, window: crate::history::HistoryWindow,
+                window_end_ns: u64, window_start_ns: u64, clock: kaijutsu_audio::ClockSnapshot,
+                window: crate::history::HistoryWindow,
             }
             let artifact = Artifact { v: 1, kind: "midi-history", request_id: selection.id, node, instance,
-                window_end_ns: epoch, window_start_ns: epoch.saturating_sub(selection.seconds as u64 * 1_000_000_000), window };
+                window_end_ns: epoch, window_start_ns: epoch.saturating_sub(selection.seconds as u64 * 1_000_000_000), clock, window };
             let mut writer = LimitedWriter(Vec::new());
             serde_json::to_writer(&mut writer, &artifact).map_err(|e| e.to_string())?;
             Ok::<Arc<[u8]>, String>(writer.0.into())
@@ -325,7 +331,7 @@ mod tests {
     }
 
     fn controller() -> CaptureControl {
-        CaptureControl { observation: None, ssh: kaijutsu_client::SshConfig::default(), pool: Arc::new(Mutex::new(Pool::default())), node:"audio/test".into(), instance:"test".into() }
+        CaptureControl { observation: None, ssh: kaijutsu_client::SshConfig::default(), clock: kaijutsu_client::KernelClockHandle::new(), pool: Arc::new(Mutex::new(Pool::default())), node:"audio/test".into(), instance:"test".into() }
     }
 
     #[tokio::test]

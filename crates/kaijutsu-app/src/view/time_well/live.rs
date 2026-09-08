@@ -291,12 +291,16 @@ pub fn ingest_live_events(
     mut tails: ResMut<ContextTails>,
     mut beats: ResMut<WellBeatsRes>,
     time: Res<Time>,
+    actor: Option<Res<crate::connection::actor_plugin::RpcActor>>,
 ) {
     let now_inst = Instant::now();
-    let now_epoch_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    // Ages are computed in the kernel's clock domain (`docs/midi.md` "The one
+    // timebase"). `Option<Res<_>>`: the well runs before bootstrap inserts
+    // the actor, and until then this node's own clock is the best it has.
+    let now_epoch_ns = match &actor {
+        Some(actor) => actor.handle.kernel_now_ns(),
+        None => kaijutsu_client::local_epoch_ns(),
+    };
     let now = time.elapsed_secs_f64();
     for ServerEventMessage(ev) in events.read() {
         match ev {

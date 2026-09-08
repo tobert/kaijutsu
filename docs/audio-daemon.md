@@ -443,7 +443,10 @@ not create contexts, attach tracks or start model turns on its own.
 
 The daemon registers as an `audio/<hostname>` peer. Its `status` action reports
 enabled I/O, the selected output, capture context and requested RT priority.
-The priority field is the request, not proof that the OS granted it.
+The priority field is the request, not proof that the OS granted it. `status`
+also reports the node's model of the kernel's clock — applied offset,
+uncertainty, sample count and whether it is dialed in (`docs/midi.md`, "The one
+timebase").
 
 ## Lifetime and ownership
 

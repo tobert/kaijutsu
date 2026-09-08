@@ -302,9 +302,19 @@ What those two findings hardened into, stated as doctrine:
   fallback to receipt). `Instant`s still never cross the wire — only wallclock
   stamps do, and only ever as *age*: the sink computes `age = its own wallclock −
   stamp` and back-dates receipt, so the Θ-cancellation of the relative-lead
-  scheme survives intact while variable transit latency stops mattering. On one
-  box the stamp is exact; across boxes it is as good as NTP, which is the same
-  trust the `reportClockEstimate` reverse path already runs on.
+  scheme survives intact while variable transit latency stops mattering.
+- **The kernel's clock is the timebase, and every node models its offset to
+  it.** The kernel is the sole sequencer, so its wallclock is what a stamp
+  means. A node learns its offset from the ping round trip — the sample with
+  the smallest round trip wins, and the applied offset moves only when a new
+  estimate lands further away than the current uncertainty, as a step, never
+  a slew (musical scheduling runs on `Instant` and is untouched). Stamps are
+  minted and aged in that domain, so a box whose host clock is minutes off
+  still reads the one timebase. NTP is welcome and not required. A stamp more
+  than 250 ms in the future says the receiver and the sender disagree about
+  what time it is: it still folds, at receipt — skew never costs a beat — and
+  it is counted (`kaijutsu.clock.future_stamps`), never silently floored at
+  age zero.
 - **Stale timing data is rejected, on a ladder** (Amy, 2026-07-15: throw away
   adjustments when the data is too stale): a reference folds phase only while
   young (`REF_FOLD_MAX`, ~1 s); older-but-plausible it only proves liveness

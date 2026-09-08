@@ -19,6 +19,9 @@ pub use capture::{
     MIDI_CAPTURE_MIME, MIDI_CAPTURE_VERSION,
 };
 
+pub mod clock;
+pub use clock::{ClockSample, ClockSnapshot, KernelClock, DIALED_IN_UNCERTAINTY, DRIFT_PPM};
+
 pub mod clip;
 pub use clip::{Clip, ClipError, CLIP_MIME, CLIP_VERSION};
 
@@ -32,8 +35,8 @@ pub use midi_control::{
 
 pub mod timebase;
 pub use timebase::{
-    beat_onsets_in, stamp_age, BeatRef, LocalBeat, RefDisposition, Slew, REF_FOLD_MAX,
-    REF_STALE_MAX,
+    beat_onsets_in, stamp_age, BeatRef, LocalBeat, RefDisposition, Slew, StampAge,
+    REF_FOLD_MAX, REF_STALE_MAX, STAMP_FUTURE_TOLERANCE,
 };
 
 /// A committed ABC score, rendered to MIDI at the sink (`docs/midi.md` "Render

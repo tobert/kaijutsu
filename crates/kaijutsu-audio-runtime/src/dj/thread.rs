@@ -4,13 +4,13 @@
 
 #![allow(dead_code)]
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, warn};
 
-use kaijutsu_audio::{Slew, RENDER_FLUSH_MIME};
-use kaijutsu_client::{ActorHandle, ConnectionStatus, ServerEvent, SshConfig};
+use kaijutsu_audio::{Slew, StampAge, stamp_age, RENDER_FLUSH_MIME};
+use kaijutsu_client::{ActorHandle, ConnectionStatus, KernelClockHandle, ServerEvent, SshConfig};
 
 use crate::audio_sched::AudioSchedulerHandle;
 
@@ -95,6 +95,12 @@ pub(crate) trait ActorSource: Send + 'static {
     /// "no live connection" warn — until the next real transition. Same
     /// remedy as `poll_connection_status`'s `current_status()` seed.
     fn current_status(&self) -> ConnectionStatus;
+    /// The client's model of the kernel's clock (`docs/midi.md` "The one
+    /// timebase"). Every stamp the DJ mints and every age it computes runs
+    /// through it, so a node whose host clock disagrees with the kernel's
+    /// still reads the one timebase. A test double returns an unsampled
+    /// handle, which is the identity.
+    fn clock_handle(&self) -> KernelClockHandle;
 }
 
 impl ActorSource for ActorHandle {
@@ -106,6 +112,9 @@ impl ActorSource for ActorHandle {
     }
     fn current_status(&self) -> ConnectionStatus {
         ActorHandle::current_status(self)
+    }
+    fn clock_handle(&self) -> KernelClockHandle {
+        ActorHandle::clock_handle(self)
     }
 }
 
@@ -193,6 +202,39 @@ pub(crate) enum DjEffect {
     /// task's scope (constrained to `dj::thread` only; `docs/issues.md` "DJ
     /// thread arc").
     CueDropped { reason: &'static str, count: usize },
+    /// `kaijutsu.clock.future_stamps`, consumer `"dj"` — a wire timing
+    /// artifact arrived stamped ahead of this node's clock by more than
+    /// [`kaijutsu_audio::STAMP_FUTURE_TOLERANCE`]. The artifact still plays
+    /// (folding at receipt); the count says this node is aging stamps
+    /// against a clock that disagrees with the kernel's. `first` marks the
+    /// transition into skew, so the warn fires once per episode rather than
+    /// once per beat.
+    FutureStamp { by: Duration, first: bool },
+}
+
+/// Edge-triggered gate over future-stamped artifacts: every one is counted,
+/// only the first of an episode is worth a log line.
+#[derive(Debug, Default)]
+struct FutureStampGate {
+    active: bool,
+}
+
+impl FutureStampGate {
+    /// `skew` is what [`kaijutsu_audio::BeatRef::skew`] reported for this
+    /// artifact. `None` clears the episode.
+    fn observe(&mut self, skew: Option<Duration>) -> Option<DjEffect> {
+        match skew {
+            Some(by) => {
+                let first = !self.active;
+                self.active = true;
+                Some(DjEffect::FutureStamp { by, first })
+            }
+            None => {
+                self.active = false;
+                None
+            }
+        }
+    }
 }
 
 /// Production `record_effect`: forward straight to `kaijutsu_telemetry`'s
@@ -212,18 +254,43 @@ fn record_effect_via_telemetry(effect: DjEffect) {
         DjEffect::CueDropped { reason, count } => {
             kaijutsu_telemetry::record_dj_cue_dropped(reason, count);
         }
+        DjEffect::FutureStamp { by, first } => {
+            if first {
+                warn!(
+                    "kernel timing stamps are {:.1}s ahead of this node's clock; \
+                     stamps are being aged against a clock that disagrees with the kernel's",
+                    by.as_secs_f64()
+                );
+            }
+            kaijutsu_telemetry::record_future_stamp("dj");
+        }
     }
 }
 
 // ── Translation functions — the testable core of the select! loop ──────────
 
-/// Wallclock epoch-ns "now" for [`kaijutsu_audio::BeatRef::disposition`]'s
-/// staleness math — mirrors `metronome.rs::ingest_beat_signals`'s reads.
-fn now_epoch_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/// Kernel-domain "now" in epoch-ns, for [`kaijutsu_audio::BeatRef::disposition`]'s
+/// staleness math and for every stamp this thread mints. The kernel is the
+/// sole sequencer, so its clock is the timebase (`docs/midi.md` "The one
+/// timebase"); an unsampled handle reads this node's own clock, which is what
+/// it did before the model existed.
+fn now_epoch_ns(clock: &KernelClockHandle) -> u64 {
+    clock.now_ns()
+}
+
+/// How far this event's emission stamp is ahead of `now_epoch_ns`, when that
+/// is past the tolerance. Only artifacts that carry an emission stamp answer:
+/// a `BeatSync`'s reference and a `RenderCue`.
+fn artifact_skew(event: &ServerEvent, now_epoch_ns: u64) -> Option<Duration> {
+    let epoch_ns = match event {
+        ServerEvent::BeatSync { beat_ref, .. } => beat_ref.epoch_ns,
+        ServerEvent::RenderCue { cue, .. } => cue.epoch_ns,
+        _ => return None,
+    };
+    match stamp_age(epoch_ns, now_epoch_ns) {
+        StampAge::Future(ahead) => Some(ahead),
+        StampAge::Unstamped | StampAge::Age(_) => None,
+    }
 }
 
 /// Translate one server event into `DjCore` calls + the resulting effects —
@@ -407,6 +474,11 @@ async fn run_loop<H, F, M>(
     // conn.connected`) — read from the status-watch arm's *level*, exactly
     // as `handle_status_change` already does for `on_disconnect`.
     let mut connected = false;
+    // Unsampled until the first `ActorReady`, and the identity while it is:
+    // a DJ with no actor stamps with this node's own clock.
+    let mut clock = KernelClockHandle::new();
+    // One log line per skew episode, every artifact counted.
+    let mut future_stamps = FutureStampGate::default();
 
     loop {
         if sinks.audio.as_ref().is_some_and(|audio| audio.failed()) {
@@ -448,6 +520,11 @@ async fn run_loop<H, F, M>(
                         debug!("kaijutsu-dj: new actor (generation {new_generation}) — resubscribing");
                         // Assigning drops whatever receiver was here before —
                         // "drop any previous subscription" from the spec.
+                        // Taken before the subscriptions: the status seed
+                        // below races a status change already in flight, and
+                        // anything between `watch_status` and
+                        // `current_status` widens that window.
+                        clock = handle.clock_handle();
                         events_rx = Some(handle.subscribe_events());
                         status_rx = Some(handle.watch_status());
                         ssh_config = Some(cfg);
@@ -499,7 +576,12 @@ async fn run_loop<H, F, M>(
                         // reaction and the cue dispatch below age against
                         // the SAME instant.
                         let event_now = Instant::now();
-                        let event_epoch_ns = now_epoch_ns();
+                        let event_epoch_ns = now_epoch_ns(&clock);
+                        if let Some(effect) =
+                            future_stamps.observe(artifact_skew(&ev, event_epoch_ns))
+                        {
+                            record_effect(effect);
+                        }
                         for effect in handle_server_event(&mut core, &ev, event_now, event_epoch_ns) {
                             record_effect(effect);
                         }
@@ -655,7 +737,7 @@ async fn run_loop<H, F, M>(
                 // `Vec` `due_cues.due` was drained from.
                 for due_cue in due_cues.due {
                     let dispatch_now = Instant::now();
-                    let dispatch_epoch_ns = now_epoch_ns();
+                    let dispatch_epoch_ns = now_epoch_ns(&clock);
                     let mut cue = due_cue.cue;
                     cue.lead = due_cue.offset;
                     cue.epoch_ns = dispatch_epoch_ns;
@@ -798,7 +880,7 @@ mod tests {
         });
         let (events, _keep_events) = broadcast::channel(16);
         let (status, _keep_status) = watch::channel(connected_status());
-        ctl_tx.send(DjCtl::ActorReady { handle: TestSource { events: events.clone(), status: status.clone() }, ssh_config: SshConfig::default(), generation: 1 }).unwrap();
+        ctl_tx.send(DjCtl::ActorReady { handle: TestSource { events: events.clone(), status: status.clone(), clock: KernelClockHandle::new() }, ssh_config: SshConfig::default(), generation: 1 }).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while events.receiver_count() < 2 && Instant::now() < deadline { std::thread::yield_now(); }
         assert_eq!(events.receiver_count(), 2);
@@ -856,6 +938,71 @@ mod tests {
                 onset_beat: None,
             },
         }
+    }
+
+    // ── Clock skew: future stamps are counted, never silently floored ──
+
+    /// A stamped `BeatSync` from a kernel whose clock runs ahead of this
+    /// node's (the 100.9 s moltar↔zorak case) must be reported once per
+    /// episode and counted every time — and an in-tolerance stamp must clear
+    /// the episode so the next one warns again.
+    #[test]
+    fn a_future_stamped_reference_warns_once_and_counts_every_time() {
+        let now_epoch_ns: u64 = 500_000_000_000;
+        let skewed = ServerEvent::BeatSync {
+            context_id: ContextId::new(),
+            beat_ref: BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns + 100_900_000_000 },
+        };
+        let fresh = ServerEvent::BeatSync {
+            context_id: ContextId::new(),
+            beat_ref: BeatRef { beat: 2.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns - 1_000_000 },
+        };
+
+        let mut gate = FutureStampGate::default();
+        assert_eq!(
+            gate.observe(artifact_skew(&skewed, now_epoch_ns)),
+            Some(DjEffect::FutureStamp { by: Duration::from_millis(100_900), first: true }),
+            "the first of an episode warns"
+        );
+        assert_eq!(
+            gate.observe(artifact_skew(&skewed, now_epoch_ns)),
+            Some(DjEffect::FutureStamp { by: Duration::from_millis(100_900), first: false }),
+            "the rest are counted, not logged"
+        );
+        assert_eq!(gate.observe(artifact_skew(&fresh, now_epoch_ns)), None, "an aged stamp clears it");
+        assert_eq!(
+            gate.observe(artifact_skew(&skewed, now_epoch_ns)),
+            Some(DjEffect::FutureStamp { by: Duration::from_millis(100_900), first: true }),
+            "a fresh episode warns again"
+        );
+    }
+
+    /// Only artifacts that carry an emission stamp can be skewed, and a
+    /// stamp inside the tolerance is ordinary sampling jitter, not skew.
+    #[test]
+    fn unstamped_in_tolerance_and_untimed_events_report_no_skew() {
+        let now_epoch_ns: u64 = 500_000_000_000;
+        assert_eq!(artifact_skew(&beat_sync(1.0, 2.0), now_epoch_ns), None, "unstamped");
+        let just_ahead = ServerEvent::BeatSync {
+            context_id: ContextId::new(),
+            beat_ref: BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns + 5_000_000 },
+        };
+        assert_eq!(artifact_skew(&just_ahead, now_epoch_ns), None, "5ms ahead is jitter");
+        let cue_ahead = ServerEvent::RenderCue {
+            context_id: ContextId::new(),
+            cue: RenderCue {
+                mime: "text/vnd.abc".into(),
+                payload: CuePayload::Inline(vec![]),
+                lead: Duration::ZERO,
+                epoch_ns: now_epoch_ns + 30_000_000_000,
+                onset_beat: None,
+            },
+        };
+        assert_eq!(
+            artifact_skew(&cue_ahead, now_epoch_ns),
+            Some(Duration::from_secs(30)),
+            "a render cue's own stamp is checked too"
+        );
     }
 
     // ── handle_server_event ────────────────────────────────────────────
@@ -1145,6 +1292,7 @@ mod tests {
     struct TestSource {
         events: broadcast::Sender<ServerEvent>,
         status: watch::Sender<ConnectionStatus>,
+        clock: KernelClockHandle,
     }
 
     impl ActorSource for TestSource {
@@ -1158,6 +1306,11 @@ mod tests {
             // The level, exactly as `ActorHandle::current_status` reads its
             // own watch — so the seed path behaves identically under test.
             self.status.borrow().clone()
+        }
+        fn clock_handle(&self) -> KernelClockHandle {
+            // Unsampled: the loop then stamps with the test host's own
+            // clock, which is what these tests' hand-picked stamps assume.
+            self.clock.clone()
         }
     }
 
@@ -1205,7 +1358,10 @@ mod tests {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match effect_rx.recv_timeout(remaining) {
                 Ok(DjEffect::Transition(t)) => return t,
-                Ok(DjEffect::Slew(_)) | Ok(DjEffect::Click) | Ok(DjEffect::CueDropped { .. }) => continue, // harness-induced, not the observable
+                Ok(DjEffect::Slew(_))
+                | Ok(DjEffect::Click)
+                | Ok(DjEffect::CueDropped { .. })
+                | Ok(DjEffect::FutureStamp { .. }) => continue, // harness-induced, not the observable
                 Err(_) => panic!("no clock transition observed within {timeout:?}"),
             }
         }
@@ -1235,7 +1391,7 @@ mod tests {
         let (status_a, _keep_sa) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events_a.clone(), status: status_a.clone() },
+                handle: TestSource { events: events_a.clone(), status: status_a.clone(), clock: KernelClockHandle::new() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1260,7 +1416,7 @@ mod tests {
         let (status_b, _keep_sb) = watch::channel(ConnectionStatus::Idle);
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events_b.clone(), status: status_b.clone() },
+                handle: TestSource { events: events_b.clone(), status: status_b.clone(), clock: KernelClockHandle::new() },
                 ssh_config: SshConfig::default(),
                 generation: 2,
             })
@@ -1361,7 +1517,7 @@ mod tests {
         let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status: status.clone() },
+                handle: TestSource { events: events.clone(), status: status.clone(), clock: KernelClockHandle::new() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1424,7 +1580,7 @@ mod tests {
         let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status: status.clone() },
+                handle: TestSource { events: events.clone(), status: status.clone(), clock: KernelClockHandle::new() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1541,7 +1697,7 @@ mod tests {
         let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status: status.clone() },
+                handle: TestSource { events: events.clone(), status: status.clone(), clock: KernelClockHandle::new() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })
@@ -1606,7 +1762,7 @@ mod tests {
         let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx
             .send(DjCtl::ActorReady {
-                handle: TestSource { events: events.clone(), status: status.clone() },
+                handle: TestSource { events: events.clone(), status: status.clone(), clock: KernelClockHandle::new() },
                 ssh_config: SshConfig::default(),
                 generation: 1,
             })

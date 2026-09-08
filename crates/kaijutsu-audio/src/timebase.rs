@@ -78,16 +78,53 @@ pub enum RefDisposition {
     Drop,
 }
 
-/// The shared age computation behind [`BeatRef::backdated_at`] and
-/// [`BeatRef::disposition`]: `None` for an unstamped reference (`epoch_ns ==
-/// 0`, e.g. an old peer or a synthetic test `BeatRef`), `Some(age)` otherwise.
-/// `saturating_sub` floors a future-stamped ref (clock skew, or `now_epoch_ns`
-/// sampled a hair before `epoch_ns`) at age zero rather than underflowing.
-pub fn stamp_age(epoch_ns: u64, now_epoch_ns: u64) -> Option<Duration> {
+/// A stamp this far ahead of the receiver's clock is reported as
+/// [`StampAge::Future`] rather than floored at age zero. It has to sit above
+/// the sampling inversion two threads on one box can produce and above a
+/// dialed-in node's residual uncertainty
+/// ([`crate::clock::DIALED_IN_UNCERTAINTY`], 25 ms) plus a wire hop, and well
+/// below [`REF_FOLD_MAX`] so a skewed clock is counted long before it costs
+/// the phasor anything.
+pub const STAMP_FUTURE_TOLERANCE: Duration = Duration::from_millis(250);
+
+/// How old a wire timing artifact's emission stamp is, in the receiver's
+/// clock domain — the shared computation behind [`BeatRef::backdated_at`] and
+/// [`BeatRef::disposition`].
+///
+/// `Future` is the observable form of clock skew: a stamp minted ahead of the
+/// receiver's clock by more than [`STAMP_FUTURE_TOLERANCE`] means the two
+/// clocks disagree, and the receiver is aging every stamp against the wrong
+/// timebase. Music is never dropped for it (a `Future` stamp still folds, at
+/// receipt), but it is counted — see `docs/midi.md` "The one timebase".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampAge {
+    /// `epoch_ns == 0` — an old peer or a synthetic test artifact.
+    Unstamped,
+    /// The stamp is at or before the receiver's clock, by this much.
+    Age(Duration),
+    /// The stamp is ahead of the receiver's clock by more than
+    /// [`STAMP_FUTURE_TOLERANCE`], by this much.
+    Future(Duration),
+}
+
+/// Age one emission stamp against the receiver's `now_epoch_ns`. A stamp
+/// ahead by at most [`STAMP_FUTURE_TOLERANCE`] reads as age zero; further
+/// ahead than that it reads as [`StampAge::Future`].
+pub fn stamp_age(epoch_ns: u64, now_epoch_ns: u64) -> StampAge {
     if epoch_ns == 0 {
-        return None;
+        return StampAge::Unstamped;
     }
-    Some(Duration::from_nanos(now_epoch_ns.saturating_sub(epoch_ns)))
+    match now_epoch_ns.checked_sub(epoch_ns) {
+        Some(age) => StampAge::Age(Duration::from_nanos(age)),
+        None => {
+            let ahead = Duration::from_nanos(epoch_ns - now_epoch_ns);
+            if ahead > STAMP_FUTURE_TOLERANCE {
+                StampAge::Future(ahead)
+            } else {
+                StampAge::Age(Duration::ZERO)
+            }
+        }
+    }
 }
 
 impl BeatRef {
@@ -102,16 +139,17 @@ impl BeatRef {
     /// - `epoch_ns == 0` (unstamped) → `Some(now)`, the old receipt-time
     ///   behavior.
     /// - Otherwise the age is computed in the u64-ns wallclock domain via
-    ///   [`stamp_age`] (a future-stamped ref saturates to age `0` rather than
-    ///   underflowing) and only the *final* subtraction crosses into the
+    ///   [`stamp_age`] and only the *final* subtraction crosses into the
     ///   `Instant` domain (mirrors `beat.rs::apply_clock_estimate`'s `at =
     ///   Instant::now() - Duration::from_nanos(age_ns)` — cross-reference, not
     ///   a refactor of it).
+    /// - A stamp from the future ([`StampAge::Future`], clock skew) → `Some(now)`:
+    ///   it anchors at receipt, never drops. [`Self::skew`] reports it.
     /// - Age `> REF_STALE_MAX` → `None`: the ref is too old to trust: the
     ///   caller should drop it (never fold it) and let the phasor free-run.
     pub fn backdated_at(&self, now: Instant, now_epoch_ns: u64) -> Option<Instant> {
-        let Some(age) = stamp_age(self.epoch_ns, now_epoch_ns) else {
-            return Some(now);
+        let StampAge::Age(age) = stamp_age(self.epoch_ns, now_epoch_ns) else {
+            return Some(now); // unstamped or future-stamped → receipt time
         };
         if age > REF_STALE_MAX {
             return None;
@@ -121,12 +159,27 @@ impl BeatRef {
         Some(now.checked_sub(age).unwrap_or(now))
     }
 
+    /// How far this reference's stamp is ahead of the receiver's clock, when
+    /// that is more than [`STAMP_FUTURE_TOLERANCE`]. `None` is the normal
+    /// case (unstamped, or a stamp at or behind the receiver's clock).
+    ///
+    /// A consumer counts these rather than acting on them: the reference
+    /// still folds, but a node seeing them is aging every stamp against a
+    /// clock that disagrees with the kernel's.
+    pub fn skew(&self, now_epoch_ns: u64) -> Option<Duration> {
+        match stamp_age(self.epoch_ns, now_epoch_ns) {
+            StampAge::Future(ahead) => Some(ahead),
+            StampAge::Unstamped | StampAge::Age(_) => None,
+        }
+    }
+
     /// The three-way disposition (see [`RefDisposition`]): fresh/unstamped →
     /// `Fold` at the back-dated instant; `(REF_FOLD_MAX, REF_STALE_MAX]` →
-    /// `Touch` (liveness only); beyond `REF_STALE_MAX` → `Drop`.
+    /// `Touch` (liveness only); beyond `REF_STALE_MAX` → `Drop`. A
+    /// future-stamped reference folds at receipt — skew never costs a beat.
     pub fn disposition(&self, now: Instant, now_epoch_ns: u64) -> RefDisposition {
-        let Some(age) = stamp_age(self.epoch_ns, now_epoch_ns) else {
-            return RefDisposition::Fold(now); // unstamped → fold at receipt time
+        let StampAge::Age(age) = stamp_age(self.epoch_ns, now_epoch_ns) else {
+            return RefDisposition::Fold(now); // unstamped or future → receipt time
         };
         if age <= REF_FOLD_MAX {
             RefDisposition::Fold(now.checked_sub(age).unwrap_or(now))
@@ -643,13 +696,61 @@ mod tests {
 
     #[test]
     fn backdated_at_clamps_a_future_stamp_to_now() {
-        // A ref stamped slightly ahead of the receiver's clock (skew, or
-        // `now_epoch_ns` sampled a hair before `epoch_ns`) must not underflow
-        // into a huge age — `saturating_sub` floors it at age 0 → `now`.
+        // A ref stamped a hair ahead of the receiver's clock (`now_epoch_ns`
+        // sampled just before `epoch_ns`) must not underflow into a huge age
+        // — inside the tolerance it reads as age 0 → `now`.
         let now = Instant::now();
         let now_epoch_ns: u64 = 10_000_000_000;
         let r = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns + 5_000_000 };
         assert_eq!(r.backdated_at(now, now_epoch_ns), Some(now), "future stamp clamps to now");
+        assert_eq!(r.skew(now_epoch_ns), None, "5ms ahead is inside the tolerance");
+    }
+
+    // ── Clock skew: a future stamp is observable, never silently floored ────
+
+    #[test]
+    fn stamp_age_names_unstamped_aged_and_future() {
+        let now_epoch_ns: u64 = 200_000_000_000;
+        assert_eq!(stamp_age(0, now_epoch_ns), StampAge::Unstamped);
+        assert_eq!(
+            stamp_age(now_epoch_ns - 500_000_000, now_epoch_ns),
+            StampAge::Age(Duration::from_millis(500))
+        );
+        // Inside the tolerance: age zero, not a skew report.
+        assert_eq!(
+            stamp_age(now_epoch_ns + STAMP_FUTURE_TOLERANCE.as_nanos() as u64, now_epoch_ns),
+            StampAge::Age(Duration::ZERO),
+            "the tolerance boundary is inclusive"
+        );
+        // Past it: the receiver's clock disagrees with the sender's.
+        assert_eq!(
+            stamp_age(now_epoch_ns + STAMP_FUTURE_TOLERANCE.as_nanos() as u64 + 1, now_epoch_ns),
+            StampAge::Future(STAMP_FUTURE_TOLERANCE + Duration::from_nanos(1))
+        );
+    }
+
+    #[test]
+    fn a_hundred_second_skew_is_reported_and_still_folds() {
+        // The moltar↔zorak case: the kernel's stamps land 100.9s in this
+        // receiver's future. Music must not stop for it — the ref folds at
+        // receipt, exactly as an unstamped one does — but `skew` reports it
+        // so a consumer can count it.
+        let now = Instant::now();
+        let now_epoch_ns: u64 = 500_000_000_000;
+        let r = BeatRef { beat: 1.0, tempo_bps: 2.0, epoch_ns: now_epoch_ns + 100_900_000_000 };
+        assert_eq!(
+            r.skew(now_epoch_ns),
+            Some(Duration::from_millis(100_900)),
+            "the skew is reported, not floored"
+        );
+        assert_eq!(r.disposition(now, now_epoch_ns), RefDisposition::Fold(now));
+        assert_eq!(r.backdated_at(now, now_epoch_ns), Some(now));
+    }
+
+    #[test]
+    fn an_unstamped_ref_has_no_skew() {
+        let unstamped = BeatRef::new(1.0, 2.0);
+        assert_eq!(unstamped.skew(500_000_000_000), None);
     }
 
     #[test]

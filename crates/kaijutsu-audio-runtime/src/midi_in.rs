@@ -3,6 +3,8 @@ use tracing::{debug, error, info, warn};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
+use kaijutsu_client::KernelClockHandle;
+
 const INGRESS_EVENTS: usize = 128;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_INVENTORY_PORTS: usize = 256;
@@ -100,18 +102,19 @@ fn is_own_client(name: &str) -> bool {
     matches!(name, "kaijutsu-audio" | "kaijutsu-app" | "kaijutsu-ear" | "kaijutsu-exchange" | "kaijutsu-patchview" | "Midi Through")
 }
 
-fn epoch_ns_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/// Kernel-domain "now" in epoch-ns for a capture stamp (`docs/midi.md` "The
+/// one timebase"). The read is a lock and an add, cheap enough for the ALSA
+/// read thread to take one per event; an unsampled handle reads this node's
+/// own clock.
+fn epoch_ns_now(clock: &KernelClockHandle) -> u64 {
+    clock.now_ns()
 }
 
 /// Spawn the ALSA capture thread: its own seq client ("kaijutsu-ear"), a
 /// capture port, ambient subscriptions, readiness-driven reads and bounded
 /// nonblocking ingress. Exits when the receiver closes or shutdown is set.
 #[cfg(target_os = "linux")]
-pub(crate) fn spawn_capture_thread(priority: u8) -> Result<EarWorker, String> {
+pub(crate) fn spawn_capture_thread(priority: u8, clock: KernelClockHandle) -> Result<EarWorker, String> {
     use alsa::seq::{Addr, PortCap, PortSubscribe, PortType};
     use std::ffi::CString;
 
@@ -161,14 +164,14 @@ pub(crate) fn spawn_capture_thread(priority: u8) -> Result<EarWorker, String> {
             if let Err(e) = crate::scheduling::set_priority(priority) {
                 warn!("{e}; continuing at the current scheduling priority");
             }
-            capture_loop(seq, dest, tx, worker_stop)
+            capture_loop(seq, dest, tx, worker_stop, clock)
         })
         .map_err(|e| e.to_string())?;
     Ok(EarWorker { rx: Some(rx), losses, stop, join: Some(join) })
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn spawn_capture_thread(_priority: u8) -> Result<EarWorker, String> {
+pub(crate) fn spawn_capture_thread(_priority: u8, _clock: KernelClockHandle) -> Result<EarWorker, String> {
     Err("MIDI capture is Linux/ALSA-only".into())
 }
 
@@ -295,6 +298,7 @@ fn capture_loop(
     dest: alsa::seq::Addr,
     tx: EarSender,
     stop: Arc<AtomicBool>,
+    clock: KernelClockHandle,
 ) {
     use alsa::seq::EventType;
     use kaijutsu_audio::{ClockEstimator, ClockEvent};
@@ -333,7 +337,7 @@ fn capture_loop(
         let ev = match input.event_input() {
             Ok(ev) => ev,
             Err(e) if e.errno() == libc::EAGAIN => {
-                if tx.send(EarEvent::Watermark { observed_at: Instant::now(), epoch_ns: epoch_ns_now() }).is_err() {
+                if tx.send(EarEvent::Watermark { observed_at: Instant::now(), epoch_ns: epoch_ns_now(&clock) }).is_err() {
                     return;
                 }
                 if let Err(e) = alsa::poll::poll(&mut descriptors, 20)
@@ -396,7 +400,7 @@ fn capture_loop(
 
         // The clock tap, BEFORE the ring's door filter — its stamps are the
         // estimator's measurements, taken here at receipt, per source.
-        let now_ns = epoch_ns_now();
+        let now_ns = epoch_ns_now(&clock);
         let observed_at = Instant::now();
         let source_addr = ev.get_source();
         let source = format!("{}:{}", source_addr.client, source_addr.port);

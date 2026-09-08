@@ -114,6 +114,9 @@ async fn run(cli: Cli) -> Result<()> {
     let node = format!("audio/{}", hostname::get()?.to_string_lossy());
     actor.attach_peer(PeerConfig { nick: node.clone(), instance: instance.clone() }, peer_tx)
         .await.context("register audio peer")?;
+    // Taken before `actor` moves into the engine; `status` reports what the
+    // pinger has learned about the kernel's clock.
+    let clock = actor.clock_handle();
     let mut engine = Engine::start(actor, ssh.clone(), context, options.clone()).map_err(anyhow::Error::msg)?;
     let capture = kaijutsu_audio_runtime::CaptureControl::new(&engine, ssh.clone(), node, instance);
     tracing::info!(host = ssh.host, port = ssh.port, ?context, ?options, "audio node running; kernel drives playback");
@@ -134,6 +137,7 @@ async fn run(cli: Cli) -> Result<()> {
                             "audio": options.audio, "midi": options.midi,
                             "output": options.output, "context": context.map(|id| id.to_string()),
                             "rt_priority_requested": options.rt_priority,
+                            "clock": clock.snapshot(),
                         })).map_err(|e| e.to_string())
                     } else {
                         let capture = capture.clone();
