@@ -375,14 +375,13 @@ pub struct SharedKernelState {
     /// roster's scheduled-periodic refresh loop is the first and, today, only
     /// subscriber.
     ///
-    /// Fired from `Drop`, with exactly the same reach as the WAL checkpoint
-    /// there: it runs when the LAST `Arc<SharedKernelState>` drops — a clean
-    /// process exit or a test teardown — and **not** on SIGKILL/SIGTERM,
-    /// where the process dies without unwinding. That is acceptable for a
-    /// task whose only cost on abrupt death is its own tokio task going away
-    /// with the runtime; it would NOT be acceptable for anything that must
-    /// flush. The SIGTERM gap is the same one filed under
-    /// "graceful-shutdown WAL checkpoint" in docs/issues.md.
+    /// Fired from `Drop`: it runs when the LAST `Arc<SharedKernelState>`
+    /// drops — a clean process exit or a test teardown — and **not** on
+    /// SIGKILL/SIGTERM, where the process dies without unwinding. That is
+    /// acceptable for a task whose only cost on abrupt death is its own
+    /// tokio task going away with the runtime; it would NOT be acceptable
+    /// for anything that must flush. The WAL checkpoint has its own signal
+    /// handler (`ssh.rs`, `spawn_signal_checkpoint`) for that reason.
     pub shutdown: CancellationToken,
 }
 
@@ -400,12 +399,10 @@ impl Drop for SharedKernelState {
         // Best-effort WAL checkpoint on clean teardown so the main `.db` file
         // doesn't linger behind committed history after exit. This fires only
         // when the LAST `Arc<SharedKernelState>` drops — a clean process exit
-        // or test teardown. It does NOT run on SIGKILL/SIGTERM: the server's
-        // run loop never returns and the process dies without unwinding. So
-        // this is insurance, not the primary durability path — the proactive
-        // checkpoint after each compaction is (see `BlockStore::compact_*`).
-        // The remaining gap (a SIGTERM handler for systemd `stop`) is tracked
-        // in docs/issues.md under "graceful-shutdown WAL checkpoint".
+        // or test teardown. SIGTERM/SIGINT are covered by the signal handler
+        // in `ssh.rs`; SIGKILL by nothing, which is why the proactive
+        // checkpoint after each compaction (see `BlockStore::compact_*`) is
+        // the primary durability path and this is insurance.
         let db = self.kernel_db.lock();
         match db.checkpoint() {
             Ok((busy, _, _)) if busy != 0 => {

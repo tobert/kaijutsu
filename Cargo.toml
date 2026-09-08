@@ -97,7 +97,7 @@ capnp-rpc = "0.25"
 capnpc = "0.25"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "process", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "process", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 

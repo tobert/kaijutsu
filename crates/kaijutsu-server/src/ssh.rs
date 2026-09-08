@@ -261,6 +261,39 @@ pub struct SshServer {
     config: SshServerConfig,
 }
 
+/// On SIGTERM or SIGINT, run a WAL checkpoint on the kernel database and
+/// exit 0. Holds only the database handle, never the `SharedKernel`, so the
+/// clean-exit `Drop` path stays reachable. A failed handler install is
+/// logged and the process keeps the default signal disposition.
+fn spawn_signal_checkpoint(kernel_db: Arc<Mutex<kaijutsu_kernel::kernel_db::KernelDb>>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (mut term, mut int) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(t), Ok(i)) => (t, i),
+        (Err(e), _) | (_, Err(e)) => {
+            log::warn!("signal handler not installed; WAL is not checkpointed on stop: {e}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let name = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        log::info!("{name} received; checkpointing the kernel database before exit");
+        match kernel_db.lock().checkpoint() {
+            Ok((busy, _, _)) if busy != 0 => {
+                log::warn!("{name} wal_checkpoint(TRUNCATE) busy; WAL left for next open");
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("{name} wal_checkpoint failed: {e}"),
+        }
+        std::process::exit(0);
+    });
+}
+
 impl SshServer {
     pub fn new(config: SshServerConfig) -> Self {
         Self { config }
@@ -391,6 +424,11 @@ impl SshServer {
         if let Some(kernel_tx) = kernel_tx {
             let _ = kernel_tx.send(shared_kernel.clone());
         }
+
+        // systemd `stop` and a terminal Ctrl-C arrive as signals, and the
+        // process dies without unwinding, so `SharedKernelState::drop` never
+        // runs there. Checkpoint the WAL on the signal, then exit.
+        spawn_signal_checkpoint(shared_kernel.kernel_db.clone());
 
         // External MCP servers (mcp.toml — kaibo, bevy_brp, …) start HERE,
         // not inside `create_shared_kernel`: they need the kernel's VFS
