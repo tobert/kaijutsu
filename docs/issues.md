@@ -6130,8 +6130,6 @@ there rather than maintaining a second checklist here.
 
 - Named render destinations: playback currently broadcasts to every attached
   render client. Multiple machines need an explicit destination contract.
-- Remote patch-bay topology and traffic: the app still observes local ALSA;
-  the daemon's in-process traffic pulse does not reach another process.
 - Kept-take recovery after kernel restart and explicit handling of a
   permanently lost daemon instance: jobs are ephemeral and private staging may
   remain. Do not add a broad `/tmp` sweep; ownership recovery must name exact
