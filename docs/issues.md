@@ -59,11 +59,13 @@ coder` both raise an ask (`hook:lfm2d-advisory`, classifier
 verdict `escalate`, because the seat's `LFM2D_BENIGN_LABEL=informative` and
 only that label passes. The previous session's first note (09:49) never
 landed for this reason, and a same-seat allow is refused, so every note
-from an MCP seat needs a second seat to approve it. Options, in order of
-size: exempt `kj handoff note` in the scorer's exemption table (see
-"The scorer cannot see a redirect, only the exemption can"); widen the
-benign set to include `situation-normal`; or teach the classifier the verb.
-Amy's call on which.
+from an MCP seat needs a second seat to approve it.
+
+**Decided (Amy, 2026-09-08): option 1, through the general mechanism.**
+The layered gate-policy design — one evaluator over builtin/config/learned
+tiers, `handoff note` in the global allow tier as its first tuning pass —
+is `docs/gate-policy-tuning.md`, slice 5. Delete this entry when that
+slice ships.
 
 ## Two outbound HTTP clients still call out anonymously (2026-09-06)
 
@@ -6130,6 +6132,8 @@ there rather than maintaining a second checklist here.
 
 - Named render destinations: playback currently broadcasts to every attached
   render client. Multiple machines need an explicit destination contract.
+- Remote patch-bay topology and traffic: the app still observes local ALSA;
+  the daemon's in-process traffic pulse does not reach another process.
 - Kept-take recovery after kernel restart and explicit handling of a
   permanently lost daemon instance: jobs are ephemeral and private staging may
   remain. Do not add a broad `/tmp` sweep; ownership recovery must name exact
