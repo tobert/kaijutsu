@@ -4,7 +4,7 @@
 > morning's conversation with Amy about her restart-every-session routine
 > and what kaijutsu needs so the morning is smooth, then revised through two
 > model reviews the same afternoon ("Review", below) and a readiness pass
-> the next day. **Slices 0a, 1 and 2 are built and verified; slices 3–6 are not.**
+> the next day. **Slices 0a, 1, 2 and 4 are built and verified (2026-09-06/07); slices 3 and 5–8 are not.**
 > Every code claim carries a `file:line`; re-read it before relying on it.
 > Amy's statements are guidance, not rulings.
 
