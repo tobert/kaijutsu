@@ -239,7 +239,31 @@ existing spans via the `spanmetrics` connector — no app instrumentation. This 
 free and retroactive to all spans, but it counts only **sampled** spans:
 `engine.`/`drift.`/`llm.` at 100% are accurate; `rpc` at 10% is a ×10 estimate.
 Drive "is the kernel busy" dashboards off the 100% namespaces, not raw `rpc`
-counts. (Connector config is collector-side — see the deploy notes.)
+counts. If accurate `rpc` RED is needed, lift `rpc` sampling or count
+app-side.
+
+The connector config is collector-side (`/etc/otelcol/config.yaml`,
+root-owned, mounted into the `otel-collector` quadlet container; apply with
+`sudo systemctl restart otel-collector`). Add a `connectors:` block and wire
+it as an exporter on the traces pipeline and a receiver on the metrics one:
+
+```yaml
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 5s]
+    dimensions:
+      - name: rpc.method
+    metrics_flush_interval: 15s
+
+service:
+  pipelines:
+    traces:
+      exporters: [otlp/backend, file/traces, spanmetrics]
+    metrics:
+      receivers: [otlp, otlp/tls, spanmetrics]
+```
 
 ## Logs
 

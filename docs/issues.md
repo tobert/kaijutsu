@@ -1375,6 +1375,13 @@ track before an explicit `--track` can move it (no `--track` passthrough on
   will not load. The `kaijutsu-abc` MidiWriter leaves pitch/velocity
   unmasked (`midi.rs:970-995`), safe while the one caller uses velocity 80.
 
+## `docs/abc-reference.md`'s support matrix is four months stale
+
+The ABC v2.1 reference maps notation to `kaijutsu-abc` support status as of
+2026-05-25; 27 commits have touched the crate since, including the June 30
+conformance push. The crate's tests are truth; re-derive the matrix from
+them or drop the status columns.
+
 ## Time well: two stubs (`docs/timewell.md`)
 
 The horizon dive handler logs "not yet built" (`view/time_well/scene.rs:1293`)

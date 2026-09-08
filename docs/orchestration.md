@@ -317,24 +317,24 @@ register_session label="orchestrator"
 kaish_exec whoami                              # confirm registered context
 shell "kj context list --tree"         # see the DAG (read result block)
 
-# 2. Fork an explorer with a different binding
-shell "kj fork --name explorer --model anthropic/claude-haiku-4-5-20251001"
+# 2. Fork a scout with a different binding
+shell "kj fork --name scout --model anthropic/claude-haiku-4-5-20251001"
 # fork auto-switches — switch back:
 shell "kj context switch orchestrator"
 
-# 3. Send the explorer a starting prompt via drift
-shell 'kj drift push explorer "investigate the auth module"'
+# 3. Send the scout a starting prompt via drift
+shell 'kj drift push scout "investigate the auth module"'
 shell "kj drift flush"
 
-# 4. Move to the explorer and let it think
-shell "kj context switch explorer"
+# 4. Move to the scout and let it think
+shell "kj context switch scout"
 write_input text="investigate as instructed; report findings"
 submit_input
 # wait, then block_list to see the binding's response
 
-# 5. Pull the explorer's findings back
+# 5. Pull the scout's findings back
 shell "kj context switch orchestrator"
-shell 'kj drift pull explorer "summarize what you found"'
+shell 'kj drift pull scout "summarize what you found"'
 # new drift block in orchestrator's history; submit again to use it
 ```
 
