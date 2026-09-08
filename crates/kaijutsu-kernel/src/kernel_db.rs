@@ -1179,8 +1179,8 @@ CREATE TABLE IF NOT EXISTS embedding_config (
 
 -- ── Roster (`crates/kaijutsu-kernel/src/roster.rs`) ─────────────────────
 -- The live roster: who's around right now, agents and humans alike. A
--- MATERIALIZED VIEW, not a log — `docs/issues.md`/the design record: "current
--- only, we have otel traces & logs for history." Every presence transition
+-- MATERIALIZED VIEW, not a log: current state only, otel traces and logs
+-- carry the history. Every presence transition
 -- emits an otel event (`kaijutsu-telemetry`) instead of accumulating rows
 -- here; these four tables hold only what is true *now*.
 --

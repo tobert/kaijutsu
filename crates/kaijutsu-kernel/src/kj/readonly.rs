@@ -150,8 +150,11 @@ pub(crate) const READ_ONLY_TABLE: &[(&str, &str)] = &[
     // subcommand alone, never a flag's presence — see the module doc.
     ("cc", "list"),
     // -- audio: `beats` is pure offline analysis of a caller-given file —
-    // no kernel/db/context/filesystem write.
+    // no kernel/db/context/filesystem write. `devices` and `keep-status`
+    // read a node's inventory and a keep job's state.
     ("audio", "beats"),
+    ("audio", "devices"),
+    ("audio", "keep-status"),
     // -- midi: `list`/`show` read the device-profile tree; `send`/
     // `identify`/`panic` emit real MIDI (a write to attached hardware).
     ("midi", "list"),
@@ -327,6 +330,12 @@ const MUTATING_TABLE: &[(&str, &str)] = &[
     ("binding", "reset"),
     ("policy", "set"),
     ("mcp", "reload"),
+    ("mcp", "restart"),
+    // -- audio: `keep` protects material in daemon RAM and uploads it to
+    // CAS; `keep-retry`/`keep-cancel` drive that job.
+    ("audio", "keep"),
+    ("audio", "keep-retry"),
+    ("audio", "keep-cancel"),
     ("hook", "remove"),
     ("hook", "add"),
     ("doc", "create"),

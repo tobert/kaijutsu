@@ -2243,7 +2243,7 @@ async fn process_llm_stream(
                                 "LLM stream ended with stop_reason=refusal for {context_id} \
                                  — the model declined to answer; reported to the turn \
                                  outcome as EndTurn until the wire has a dedicated \
-                                 Refusal stop reason (docs/issues.md)"
+                                 Refusal stop reason"
                             );
                         }
                         Some("stop_sequence") => {

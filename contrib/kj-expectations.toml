@@ -50,6 +50,28 @@ mutates = true
 expect = "informative"
 mutates = false
 
+["audio devices"]
+expect = "informative"
+mutates = false
+
+["audio keep"]
+expect = "situation-normal"
+mutates = true
+note = "Protects recent MIDI in daemon RAM and uploads it to CAS; a keep can be cancelled."
+
+["audio keep-cancel"]
+expect = "situation-normal"
+mutates = true
+note = "Releases protected material after acknowledgement; the material is gone from the daemon, but nothing durable in the kernel is destroyed."
+
+["audio keep-retry"]
+expect = "situation-normal"
+mutates = true
+
+["audio keep-status"]
+expect = "informative"
+mutates = false
+
 ["backend default set"]
 expect = "situation-normal"
 mutates = true
@@ -558,6 +580,11 @@ mutates = false
 ["mcp reload"]
 expect = "situation-normal"
 mutates = true
+
+["mcp restart"]
+expect = "situation-normal"
+mutates = true
+note = "Stops one external server then reconciles; if the start fails the server stays down until the next reload/restart."
 
 ["midi identify"]
 expect = "situation-normal"

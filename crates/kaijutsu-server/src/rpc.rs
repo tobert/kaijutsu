@@ -8533,8 +8533,7 @@ impl kernel::Server for KernelImpl {
 
             if !cas_hash.is_empty() {
                 return Err(capnp::Error::failed(
-                    "commitCapture: CAS payloads are not built yet (docs/issues.md \
-                     'CAS write surface') — send the batch inline"
+                    "commitCapture: CAS payloads are not built yet — send the batch inline"
                         .into(),
                 ));
             }
@@ -12839,7 +12838,7 @@ mod subscription_registry_tests {
             "two distinct instances for the same principal must coexist as \
              two live entries — this is the exact case the pre-fix hardcoded \
              instance literal collapsed into one, causing the silent \
-             block-event-bridge theft in docs/issues.md",
+             block-event-bridge theft",
         );
 
         let a_alive = registry

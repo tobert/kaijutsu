@@ -227,8 +227,7 @@ impl ClientHandler for BrokerClientHandler {
             };
 
             tracing::warn!(
-                "MCP elicitation declined (no collector wired yet — docs/issues.md \
-                 slice 1b): {message}"
+                "MCP elicitation declined (no collector wired yet): {message}"
             );
             let _ = tx.send(ServerNotification::Elicitation(ElicitationRequest {
                 message: std::borrow::Cow::Owned(message),

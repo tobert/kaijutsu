@@ -733,8 +733,8 @@ impl KjDispatcher {
                 tracing::warn!(
                     origin = %drift.origin.short(),
                     target = %drift.target_ctx.short(),
-                    "drift flush: peer-origin delivery is not wired yet (needs block_store.rs \
-                     — docs/issues.md), requeuing instead of fabricating a source context"
+                    "drift flush: peer-origin delivery is not wired yet, \
+                     requeuing instead of fabricating a source context"
                 );
                 failed.push(drift);
                 continue;
@@ -890,7 +890,7 @@ impl KjDispatcher {
                     tracing::warn!(
                         origin = %item.origin.short(),
                         "drift flush: peer-origin dead letter can't be written to lost+found \
-                         yet (needs block_store.rs — docs/issues.md), retaining"
+                         yet, retaining"
                     );
                     unwritten.push(item);
                     continue;
