@@ -3219,6 +3219,19 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Run `f` as one SQLite transaction on this connection. Commits when
+    /// `f` returns `Ok`; an `Err` rolls back every write `f` made. Fails if a
+    /// transaction is already open on the connection.
+    pub fn in_transaction<T>(
+        &self,
+        f: impl FnOnce(&Self) -> KernelDbResult<T>,
+    ) -> KernelDbResult<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// Run a WAL checkpoint in TRUNCATE mode: flush committed WAL frames into
     /// the main database file and shrink the `-wal` file back to zero.
     ///

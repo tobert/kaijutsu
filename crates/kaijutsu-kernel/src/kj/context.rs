@@ -363,86 +363,91 @@ impl KjDispatcher {
         resolved_model: Option<&ResolvedModel>,
         resolved_cast: Option<kaijutsu_types::CastId>,
     ) -> Result<Vec<String>, String> {
+        // One transaction: a failure on a later field (an `--env` key is
+        // validated at write time) must not leave an earlier one committed.
         let (changes, model_for_drift) = {
-            let db = self.kernel_db().lock();
-            let mut changes = Vec::new();
-            let mut model_for_drift: Option<(String, String)> = None;
+            let guard = self.kernel_db().lock();
+            let applied = guard.in_transaction(|db| {
+                let mut changes = Vec::new();
+                let mut model_for_drift: Option<(String, String)> = None;
 
-            if let Some(rm) = resolved_model {
-                db.update_model(target_id, rm.provider.as_deref(), rm.model.as_deref())
-                    .map_err(|e| e.to_string())?;
-                // `model_spec` is the original argv string — guaranteed present
-                // here since `resolved_model` is Some only when it was given.
-                let spec = cfg.model_spec.as_deref().unwrap_or("?");
-                changes.push(format!("model={spec}"));
-                if let (Some(p), Some(m)) = (&rm.provider, &rm.model) {
-                    model_for_drift = Some((p.clone(), m.clone()));
+                if let Some(rm) = resolved_model {
+                    db.update_model(target_id, rm.provider.as_deref(), rm.model.as_deref())?;
+                    // `model_spec` is the original argv string — guaranteed present
+                    // here since `resolved_model` is Some only when it was given.
+                    let spec = cfg.model_spec.as_deref().unwrap_or("?");
+                    changes.push(format!("model={spec}"));
+                    if let (Some(p), Some(m)) = (&rm.provider, &rm.model) {
+                        model_for_drift = Some((p.clone(), m.clone()));
+                    }
                 }
-            }
 
-            if let Some(cast_id) = resolved_cast {
-                db.update_cast(target_id, Some(cast_id))
-                    .map_err(|e| e.to_string())?;
-                // `cast_spec` is the original argv label — guaranteed present
-                // here since `resolved_cast` is Some only when it was given.
-                let label = cfg.cast_spec.as_deref().unwrap_or("?");
-                changes.push(format!("cast={label}"));
-            }
-
-            // consent_spec is validated upstream; treat a parse miss as absent.
-            let consent_mode = cfg
-                .consent_spec
-                .as_ref()
-                .and_then(|s| s.parse::<ConsentMode>().ok());
-
-            if cfg.system_prompt.is_some() || consent_mode.is_some() {
-                let current = db
-                    .get_context(target_id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "context not found".to_string())?;
-                let new_prompt = cfg
-                    .system_prompt
-                    .as_deref()
-                    .or(current.system_prompt.as_deref());
-                let new_consent = consent_mode.unwrap_or(current.consent_mode);
-                db.update_settings(target_id, new_prompt, new_consent)
-                    .map_err(|e| e.to_string())?;
-                if cfg.system_prompt.is_some() {
-                    changes.push("system-prompt".to_string());
+                if let Some(cast_id) = resolved_cast {
+                    db.update_cast(target_id, Some(cast_id))?;
+                    // `cast_spec` is the original argv label — guaranteed present
+                    // here since `resolved_cast` is Some only when it was given.
+                    let label = cfg.cast_spec.as_deref().unwrap_or("?");
+                    changes.push(format!("cast={label}"));
                 }
-                if let Some(ref spec) = cfg.consent_spec
-                    && consent_mode.is_some()
-                {
-                    changes.push(format!("consent={spec}"));
+
+                // consent_spec is validated upstream; treat a parse miss as absent.
+                let consent_mode = cfg
+                    .consent_spec
+                    .as_ref()
+                    .and_then(|s| s.parse::<ConsentMode>().ok());
+
+                if cfg.system_prompt.is_some() || consent_mode.is_some() {
+                    let current = db
+                        .get_context(target_id)
+                        ?
+                        .ok_or_else(|| {
+                            crate::kernel_db::KernelDbError::NotFound(format!(
+                                "context {}",
+                                target_id.short()
+                            ))
+                        })?;
+                    let new_prompt = cfg
+                        .system_prompt
+                        .as_deref()
+                        .or(current.system_prompt.as_deref());
+                    let new_consent = consent_mode.unwrap_or(current.consent_mode);
+                    db.update_settings(target_id, new_prompt, new_consent)?;
+                    if cfg.system_prompt.is_some() {
+                        changes.push("system-prompt".to_string());
+                    }
+                    if let Some(ref spec) = cfg.consent_spec
+                        && consent_mode.is_some()
+                    {
+                        changes.push(format!("consent={spec}"));
+                    }
                 }
-            }
 
-            if let Some(ref cwd) = cfg.cwd_spec {
-                let shell = ContextShellRow {
-                    context_id: target_id,
-                    cwd: Some(cwd.clone()),
-                    updated_at: kaijutsu_types::now_millis() as i64,
-                };
-                db.upsert_context_shell(&shell).map_err(|e| e.to_string())?;
-                changes.push(format!("cwd={cwd}"));
-            }
-
-            if let Some(ref env) = cfg.env_spec {
-                // KEY=VALUE shape validated upstream.
-                if let Some((key, value)) = env.split_once('=') {
-                    db.set_context_env(target_id, key, value)
-                        .map_err(|e| e.to_string())?;
-                    changes.push(format!("env {key}={value}"));
+                if let Some(ref cwd) = cfg.cwd_spec {
+                    let shell = ContextShellRow {
+                        context_id: target_id,
+                        cwd: Some(cwd.clone()),
+                        updated_at: kaijutsu_types::now_millis() as i64,
+                    };
+                    db.upsert_context_shell(&shell)?;
+                    changes.push(format!("cwd={cwd}"));
                 }
-            }
 
-            if let Some(ref t) = cfg.type_spec {
-                db.update_context_type(target_id, t)
-                    .map_err(|e| e.to_string())?;
-                changes.push(format!("type={t}"));
-            }
+                if let Some(ref env) = cfg.env_spec {
+                    // KEY=VALUE shape validated upstream.
+                    if let Some((key, value)) = env.split_once('=') {
+                        db.set_context_env(target_id, key, value)?;
+                        changes.push(format!("env {key}={value}"));
+                    }
+                }
 
-            (changes, model_for_drift)
+                if let Some(ref t) = cfg.type_spec {
+                    db.update_context_type(target_id, t)?;
+                    changes.push(format!("type={t}"));
+                }
+
+                Ok((changes, model_for_drift))
+            });
+            applied.map_err(|e| e.to_string())?
         };
         // db lock released here
 
@@ -2423,6 +2428,51 @@ mod tests {
         let handle = router.get(ctx).unwrap();
         assert_eq!(handle.provider.as_deref(), Some("mock"));
         assert_eq!(handle.model.as_deref(), Some("test-model"));
+    }
+
+    /// `--env` validates its key at write time, after `--model` has already
+    /// been written. One failed field must leave the row as it was.
+    #[tokio::test]
+    async fn context_set_partial_failure_commits_nothing() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("atomic"), None, principal);
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", mock);
+        }
+        let before = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
+        assert!(before.model.is_none(), "fixture starts without a model");
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("set"),
+                    s("."),
+                    s("--model"),
+                    s("mock/test-model"),
+                    s("--env"),
+                    s("1BAD=y"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "an invalid env key must fail the whole set");
+
+        let after = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
+        assert_eq!(
+            after.model, before.model,
+            "model must not be committed when a later field fails"
+        );
+        assert!(
+            d.kernel_db().lock().get_context_env(ctx).unwrap().is_empty(),
+            "no env row either"
+        );
     }
 
     #[tokio::test]
