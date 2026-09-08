@@ -1438,8 +1438,11 @@ context; resource/prompt handlers hardcode `kind: "Conversation"` for Remote
   still needs `kaijutsu-server` and `kaijutsu-mcp` rebuilt by hand
   (`docs/operating.md`).
 - `docs/kj-help/` siblings (`kj-cache/context/drift/fork/preset/workspace.md`)
-  predate the clap migration and have no consumer. Delete or wire as
-  `kj <cmd> help` bodies.
+  predate the clap migration and nothing in `crates/` reads them; only
+  `kj.md` is `include_str!`'d. They drift: `kj-context.md` lacks seven
+  subcommands, `kj-preset.md` lacks `reseed`, `kj-fork.md` still teaches
+  the retired `--shallow`/`--depth`. Delete them or wire them as
+  `kj <cmd> help` bodies and regenerate from the clap tree.
 
 ## `ExecResult.output` cannot carry structured data past kaish's output limiter (found 2026-07-18)
 
