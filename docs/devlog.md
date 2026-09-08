@@ -10,7 +10,8 @@ Maintenance: fold new work into the chapter it belongs to; open a new chapter
 only for a genuinely new arc; compress chapters as they cool. Commit hashes,
 test counts, and day-by-day detail live in git history — including this file's
 own history, where the fine-grained entries this narrative was melted from
-survive intact.
+survive intact. Compressed 2026-09-08; the pre-melt text is one `git log -p`
+away.
 
 ## Prologue — the first five months (January–May 2026)
 
@@ -21,28 +22,20 @@ ancestry is sshwarma — an SSH MUD that grew an equipment system for models and
 nerdsniped its author into the context problem — and hootenanny, a retired pile
 of music-model experiments. The README's developer note tells that part.
 
-The months after built the body a layer at a time:
+February consolidated the type system and taught contexts to survive a
+restart. March made the block store correct (Lamport clocks, fork semantics,
+order keys), unified two databases into one, and moved the app onto MSDF text
+plus per-block Vello textures. April redesigned the tool system around the
+MCP broker — everything routes through it, builtins included, as a virtual
+in-process server — and landed CAS. May was the ABC crate's first deep spec
+push, a Haiku-driven live-eval harness, and a kernel-wide timeout policy.
 
-- **February** — the type system consolidated (`kaijutsu-types`, `ContextId`
-  everywhere), contexts learned to survive server restarts, and a first
-  constellation view drew contexts as a radial graph.
-- **March** — block-store correctness (Lamport clocks, fork semantics, order
-  keys),
-  DocumentDb + KernelDb unified into one database, and the app moved to MSDF
-  text + per-block Vello textures — the rendering stack it still rides.
-- **April** — the tool system was redesigned around the MCP broker (everything
-  routes through it, builtins included, as a virtual in-process MCP), and the
-  CAS crate landed.
-- **May** — the ABC crate's first deep spec push (lyrics, repeats, endings), a
-  Haiku-driven live-eval harness, kernel-wide timeout policy.
-
-Two demolitions shaped the toolchain along the way: the Rhai engine was removed
-outright once kaish could carry scripting alone, and rig-core was dropped for
-hand-rolled LLM providers (Claude + OpenAI-compat + DeepSeek) — the "unrig" —
+Two demolitions shaped the toolchain: the Rhai engine went once kaish could
+carry scripting alone, and rig-core was dropped for hand-rolled providers,
 because owning the wire layer is what later made cache breakpoints, CAS image
-memoization, and per-role model routing tractable. The sibling projects matured
-alongside: kaish grew up rapidly inside kaibo, which is in many ways the
-pragmatic take on what kaijutsu explores maximally.
+memoization and per-role routing tractable. kaish grew up rapidly inside
+kaibo, which is in many ways the pragmatic take on what kaijutsu explores
+maximally.
 
 ## The stance arrived mid-flight
 
@@ -53,2455 +46,754 @@ being a metaphor.
 **Instrument, not harness.** Kaijutsu is something you play — you, a model,
 anyone with a connected app; many hands on one keyboard. The kernel is the
 instrument's body: it supplies what a turn needs without playing the turn.
-That reframe (and the composer→musician, explorer→toolie renames that came
-with it) lives in `docs/instrument-design.md`.
+That reframe, and the composer→musician, explorer→toolie renames, live in
+`docs/instrument-design.md`.
 
-**Shared trust, crosstalk-as-feature** (settled late June). The
-privilege-asymmetry question — should sibling contexts be defended from each
-other? — resolved as won't-fix-by-design: every player is inside the trust
-boundary; the kernel runs as one unix user and the real boundaries live
-outside it. Capabilities and loadouts are ergonomic nudges for focus and
-mistake-prevention, never security; your neighbor's wrong note is one you
-cover.
+**Shared trust, crosstalk-as-feature** (settled late June). Should sibling
+contexts be defended from each other? Won't-fix-by-design: every player is
+inside the trust boundary, the kernel runs as one unix user, and the real
+boundaries live outside it. Capabilities and loadouts are ergonomic nudges
+for focus and mistake-prevention, never security; your neighbor's wrong note
+is one you cover.
 
 **Context vs conversation** is the load-bearing invariant underneath
-everything: the context is the durable, multi-writer side; the
-conversation is the append-only live session hydrated from it at boundary
-events. `stage exclude`/`block edit` land at the next hydrate — remediate a
-poisoned conversation by excluding in context, then forking. The per-context
-mailbox is the atomicity gate that keeps must-travel-together blocks from
-being split by unrelated writers.
+everything: the context is the durable, multi-writer side; the conversation is
+the append-only live session hydrated from it at boundary events. `stage
+exclude` and `block edit` land at the next hydrate — remediate a poisoned
+conversation by excluding in context, then forking.
 
-**No first-class "agent."** An actor is always a Principal; agent-ness emerges
-from fork and drift, not from a noun in the schema.
+**No first-class "agent."** An actor is always a principal; agent-ness
+emerges from fork and drift, not from a noun in the schema. Later, a
+principal with a sheet became a **character** (September).
 
-## The kernel becomes sole owner of itself, then gives it back (mid-June → August 29)
+## Config: the kernel owned it, then gave it back (June → August 29)
 
-A silent-fallback bug in rc loading turned into the biggest structural decision
-of June: rather than patch the dual-ownership cluster (stale-bytes reads,
-append file-wipes, mtime no-ops, stale rc seeds), we **deleted the class** —
-the kernel became the sole owner of `/etc/rc` and `/etc/config`, seeded once from
-embedded defaults under `assets/defaults/`, with no host file and no
-write-through. There is nothing to `vim`; `kj rc edit` / `kj config set` are
-the surfaces, and `kj rc reset` restores an embedded default. The bespoke
-debounced-flush/watcher backend was deleted rather than fixed. It bought real
-things — the corruption class above stopped being reachable — at a real cost:
-nothing on disk for git or an editor's remote-FS plugin to see, and a growing
-list of surfaces (SFTP, the file tools, the vi editor) that had to special-case
-config paths to reach a block instead of a file.
+A silent-fallback bug in rc loading turned into the biggest structural
+decision of June: rather than patch the dual-ownership cluster (stale-bytes
+reads, append file-wipes, mtime no-ops, stale seeds), we deleted the class.
+The kernel became the sole owner of `/etc/rc` and `/etc/config`, seeded once
+from embedded defaults, nothing on disk to `vim`. It bought the corruption
+class's absence at a real cost: nothing for git or an editor to see, and a
+growing list of surfaces that had to special-case config paths.
 
 That ownership did not survive the summer. **Permission to get simpler**
-(Amy, August 15): *"if the agent can see the files and edit them, that's fine,
-we don't need to complicate it just because it's config."* rc melted back onto
-disk first (`docs/rc-on-disk.md`, ruled August 21), then the other three roots
-followed it under one mount registry — `/config/rc`, `/config/kernel`,
-`/config/client`, `/config/midi`, each an ordinary host directory reached
-through `LocalBackend`, seeded once when empty and never again
-(`docs/config-namespace.md`, `be9244c1`). The dual-ownership bug the June
-decision fixed does not reopen: git stays a choice about a directory, never a
-mechanism the kernel runs, so there is still exactly one place the content
-lives.
+(Amy, August 15): *"if the agent can see the files and edit them, that's
+fine, we don't need to complicate it just because it's config."* rc melted
+back onto disk first (`docs/rc-on-disk.md`), then all four roots followed
+under one mount registry — `/config/rc`, `/config/kernel`, `/config/client`,
+`/config/midi`, each an ordinary host directory through `LocalBackend`
+(`docs/config-namespace.md`). The June bug does not reopen: git is a choice
+about a directory, never a mechanism the kernel runs, so there is still one
+place the content lives. The case for dropping the `rc-write` guard was
+first argued as "a gate that gates nothing," which was false; the right
+argument was that rc had stopped being a special category.
 
-The same weeks put teeth in the fail-loud posture:
-
-- **builtin.file corruption post-mortem.** The kernel's `edit` tool fed BYTE
-  offsets into the character-indexed text engine — a silent splice on any file with
-  multibyte UTF-8 before the edit site, while honestly reporting success.
-  Fixed with byte→char conversion, fail-loud post-write verification (crash
-  over corruption), and hashline addressing (`read` prints `LINE:hash→`,
-  `edit` re-verifies anchors before writing).
-- **The external MCP shell hang** was root-caused to executor starvation on
-  the client's single-threaded RPC LocalSet, made *permanent* by a server reap
-  that broke subscriptions on the first 5s stall. Fixes: tolerate transient
-  stalls (reap only after consecutive failures), client re-subscribes on
-  timeout, and the MCP's block subscription scoped to its joined context. A
-  300s command dropped to 285ms against a busy 24-context kernel.
-- **`FileAttr.generation`** split the cache-coherence stamp from display
-  mtime: a monotonic per-backend counter is the coherence primitive; mtime is
-  for humans. Two writes in one clock tick can no longer alias, `cp -p` stops
-  silently losing mtime, and SFTP's future TOCTOU re-verify shares the same
-  primitive.
-
-June 24's cache/cost design session added the lens that still guides prompt
-plumbing: the Anthropic prompt cache is a prefix match, so *where* a byte lands
-matters more than whether. The per-turn hook seam splits mechanics (Rust) from
-policy (data) from decisions (kaish hooks), and hook output is append-only so a
-hook physically can't rewrite the cached prefix.
+The same weeks put teeth in the fail-loud posture. The kernel's `edit` tool
+had fed byte offsets into a character-indexed engine — a silent splice on
+any multibyte file, reported as success — and came back with byte→char
+conversion, post-write verification that crashes over corruption, and
+hashline addressing. The external MCP shell hang was executor starvation on
+the client's single-threaded LocalSet, made permanent by a server reap on the
+first stall; a 300 s command dropped to 285 ms. `FileAttr.generation` split
+the coherence stamp from display mtime. And June 24's cache/cost session
+added the lens that still guides prompt plumbing: the prompt cache is a
+prefix match, so *where* a byte lands matters more than whether.
 
 ## The music stack — from one loop to a band on the wire (June 13 → July 3)
 
 The longest arc, and the one that forced most of the system's ideas to get
-real. Canonical designs: `docs/chameleon.md`, `docs/tracks.md`, `docs/midi.md`,
-`docs/pcm.md` (which absorbed `docs/clips.md`, 2026-07-16), `docs/hyoushigi.md`.
+real. Canonical designs: `docs/chameleon.md`, `docs/tracks.md`,
+`docs/midi.md`, `docs/pcm.md`, `docs/hyoushigi.md`.
 
-The next hardware owner became a separate audio daemon (September 7).
-Amy wanted MIDI presence and music to survive closing the 3D app, then widened
-the task to PCM: "a realtime audio daemon we can put on various machines that
-have audio hardware." She clarified that realtime meant an ordinary service
-with Linux RT priority available, not a new scheduling architecture. The DJ,
-PCM scheduler and MIDI workers moved into a reusable library. Each node
-connects over SSH and performs kernel cues. The kernel remains the sole sequencer, while clients retain local beat
-phasors for display. Device-open failure is explicit, RT-priority failure is
-a warning, and the hardware lifetime no longer depends on a window.
-`docs/audio-daemon.md` is the deployment guide.
-
-The daemon's first fitness review (September 8) settled two things. The
-app's opt-in in-process host was deleted and the last ALSA read left the
-app with it: the patch bay now reads the kernel's projected audio inventory,
-so a remote node's rack is visible from any app. And the live probe found
-moltar's clock 100.9 s behind zorak's with NTP on neither host, which the
-one-timebase doctrine had quietly assumed away — stamps from the kernel were
-being floored to age zero. Amy: "I want to consider if we can be resilient
-to some clock skew, even lean into it a lil." The answer made the kernel's
-clock the timebase by definition: every node models its offset from the
-ping round trip and mints and ages stamps in the kernel's domain, and NTP
-became optional. The same morning explained a ghost peer registration —
-the bridge task's self-detach lived on a LocalSet that was dropped before
-it could run — and moved that cleanup onto the connection's own Drop.
-
-Retrospective recording followed from Amy's wish to "grab a happy accident real
-quick." MIDI input now feeds bounded, per-source RAM history independently of
-recording a context. A keep copies a complete recent window, protects the copy
-from history eviction, and exports it through the existing SSH/SFTP path. The
-kernel accepts the artifact into CAS before releasing that RAM. Hashing and
-upload run outside the hardware reader; neither happens continuously. Source
-generations and explicit loss reject incomplete windows instead of claiming a
-complete recording. This first step keeps RAM history and kernel jobs ephemeral;
-PCM history, configurable retention and restart recovery remain separate work.
-
-**The chameleon loop (June 13).** The first loop reached MIDI end to end:
-models playing to a beat, a player's turn text *being* the score
-(`on_turn_completed` eager-parses ABC). The hard-won constraint: players must
-be tool-free — a small local model handed the full palette stalls the turn.
-Players are rc programs; a musician is a context attached to a beat track.
+**The chameleon loop (June 13).** Models playing to a beat, a player's turn
+text *being* the score. The hard-won constraint: players must be tool-free —
+a small local model handed the full palette stalls the turn. Players are rc
+programs; a musician is a context attached to a beat track.
 
 **Tracks: the score outlives the players (June 28–30).** Three stages moved
-the music substrate off contexts and onto a durable per-track model. Stage 1
-moved the clock (playhead, transport, scheduler heap); Stage 2 moved the score
-itself — its container is a real, app-viewable per-track **score context**
-(minted the lost+found way), which reused the entire per-context block
-machinery and embodies the thesis: *the track persists, the players come and
-go*. N producers share one open future; failures route back per-`played_by` so
-each player reads its own mistakes. Stage 3 generalized the clock behind
-`ClockSourceKind` and made tempo mutable — and the landed-code review caught
-three places that had quietly assumed tempo was constant for all time,
-including a silent-fallback restart data-loss (exactly the class we crash
-over). Along the way `context_type` decomposed into rc: musician-ness became
-"your create/ rc arms you" rather than a string the kernel matches, and the
-rotate page-turn became a five-line rc script (fork → arm → rotate → play)
-riding beat-state that now travels with a fork.
+the music substrate off contexts onto a durable per-track model: the clock,
+then the score itself — a real, app-viewable per-track score context, minted
+the lost+found way, reusing the whole per-context block machinery — then a
+generalized clock with mutable tempo. The landed-code review caught three
+places that had assumed tempo constant for all time, one a silent-fallback
+restart data loss. `context_type` decomposed into rc along the way: musician-
+ness became "your create rc arms you," and the rotate page-turn became a
+five-line rc script.
 
-**First sound (June 30).** A Haiku musician composed a line and it came out of
-a synth: ABC turn → track timeline → materialize → ALSA seq → TiMidity →
-speakers. The unit tests had been green for weeks; the acceptance test was
-audible. Then a *local* model took the chair: a gemma4-e4b bass, dialed in by
-making the prompt small-model-foolproof (`L:1/4`, one note per beat, no
-duration numbers, low register) and having the tick rc precompute bar targets
-in kaish — continuous bar-filling bass, "lovely harmony." The gig itself
-(key, register, vamp) is still hardcoded in the tick prompt; the producer's
-chart layer is future work.
+**First sound (June 30).** A Haiku musician's line came out of a synth: ABC
+turn → track → materialize → ALSA → TiMidity → speakers. The unit tests had
+been green for weeks; the acceptance test was audible. Then a local
+gemma4-e4b bass took the chair, dialed in by making the prompt small-model-
+foolproof and having the tick rc precompute bar targets in kaish.
 
-**The docs learned to stay present-tense (July 1).** After three intense weeks
-the music docs taught superseded mechanisms as current — "living" had come to
-mean *stratified*: direction notes on top of superseded status on top of good
-design. The fix wasn't more banners; it was moving chronology to the devlog and
-git history and letting each doc state the present. `playback.md` was retired
-outright (its surviving ideas moved to `pcm.md`, each marked with what
-superseded the rest). A tri-model review of the harmonized suite then settled
-the render question below.
+**Docs learned to stay present-tense (July 1).** Three intense weeks had
+left the music docs teaching superseded mechanisms as current; "living" had
+come to mean stratified. The fix was not banners but moving chronology here
+and to git, and letting each doc state the present.
 
-**Render convergence: bytes never ride the track (July 1–2).** Two decisions,
-named out loud in `docs/midi.md`: we take real time seriously by *refusing to
-chase it* — micro-batch, promise only what we can hit, a speculation lead of
-seconds; only the final sub-lead scheduling on the node that owns the gear is
-hard-realtime. And MIDI + samples converge on one mime-keyed wire cue,
-`RenderCue { mime, payload: Inline | Cas, lead }` — a placed sample is a *clip
-cell* (CAS ref + placement); bytes prefetch out-of-band. The app became the
-first MIDI sink (it already had the ABC crate, so it renders symbolic ABC at
-the sink), the materialize crossing publishes cues, stop/pause publish a flush
-cue — and once parity was proven by ear, the entire in-process render path was
-demolished (~1000 lines: `RenderTarget`, `AlsaMidiOut`, the server's `alsa`
-dep). The kernel binary links no audio FFI; a headless kernel makes no sound,
-but the score is preserved and replayable — silence-now is never lost work.
+**Render convergence: bytes never ride the track (July 1–2).** Two
+decisions, named in `docs/midi.md`: we take real time seriously by refusing
+to chase it — micro-batch, promise only what we can hit, a speculation lead
+of seconds, hard-realtime only at the node that owns the gear — and MIDI and
+samples converge on one mime-keyed wire cue, `RenderCue { mime, payload:
+Inline | Cas, lead }`. A placed sample is a clip cell: CAS ref plus
+placement, bytes prefetched out of band. Once the app proved parity by ear,
+the in-process render path was demolished whole (~1000 lines). The kernel
+links no audio FFI; a headless kernel makes no sound, but the score is
+preserved and replayable. The metronome built to settle a reviewer split
+went from 50 ms inter-click stddev to 0.7 ms once integrator wind-up was
+replaced by feedforward tempo with bounded phase correction.
 
-**The metronome (July 2).** Built to settle a reviewer split about whether the
-per-cue anchor and a continuous timebase compose (measure, don't assume). The
-first cut sloshed — integrator wind-up in the slew — replaced by a
-feedforward-tempo P-phase controller: run at the reference tempo directly,
-correct only phase by a small bounded step. Inter-click stddev fell from 50ms
-to 0.7ms. Clicks are pre-scheduled into the ALSA queue (not fired at frame
-time), references are low-rate, and a flush cue silences the phasor on stop.
+**Clips and `/v/cas` (July 1–2).** A seven-industry survey
+(`docs/cue-prior-art.md`) found every cue system re-inventing the same six
+field clusters, half already on hyoushigi's `Cell`, so Cell does not expand;
+a clip is a versioned JSON payload. Making the CAS pool reachable went
+design → audible demo in one arc: harden `kaijutsu-cas` (a torn object in a
+multi-process cache would be truth forever), a read-only `CasFs` at
+`/v/cas`, a client resolver over its own SFTP connection that re-hashes every
+fetch. Gemini caught two real concurrency bugs both the author and deepseek
+missed.
 
-**Clips (July 1).** A seven-industry survey of cue systems
-(`docs/cue-prior-art.md`) found every industry re-inventing the same six field
-clusters — half already on hyoushigi's `Cell`. So **Cell does not expand**;
-Shape A is a versioned `application/vnd.kaijutsu.clip+json` payload (media hash
-+ mime + required human label + source range + gain + extension bag), tempo
-default tick-anchored/no-stretch, trigger semantics in the transport, never
-the committed record. No standalone format unless interchange knocks: OTIO won
-model-first, AES31 stalled format-first.
-
-**`/v/cas` — the CAS pool made reachable (July 2)** *(originally shipped as
-`/v/blobs`; renamed `/v/cas` 2026-07-06 for naming consistency).* The clip
-design needed "sync the CAS to the client," and track B went design → audible
-demo in one arc: harden `kaijutsu-cas` first (atomic store, TOCTOU-free
-retrieve, validating `ContentHash` deserialization — the client cache is
-multi-process and a cache hit never re-hashes, so a torn object would be truth
-forever); a read-only `CasFs` VFS backend at `/v/cas` where immutability makes
-the hard problems trivial; a client `BlobResolver` over its own SFTP connection
-(SFTP futures are Send, the capnp world is !Send — they must not mix) that
-re-hashes every fetch and hard-errors on mismatch; and the app sink consuming
-CAS cues off a dedicated runtime. The review earned its keep: gemini caught
-two real concurrency bugs (a transport-error handler that could wipe a fresh
-connection, a single-flight lock leaked on cancellation) that both the author
-and deepseek missed. Verified by ear: `kj cas put` → `kj play --cas <hash>` →
-SFTP fetch → hash-verified XDG cache → speakers. One scar worth the telling:
-kaish's overlay *reserves* `/v/cas`, so `kaish ls` shows an empty shadow
-while SFTP serves the real pool — an hour lost, a gotcha memory written.
-
-**Music demo #1 post-mortem (July 3).** The first attempt to run the whole
-band as a demo burned a director's turns on stale docs advertising the
-demolished `kj transport render`, then found the app's ALSA port unwired, then
-found kaish couldn't run `aconnect` at all. The docs got supersession banners;
-the deeper fix was **subprocess exec** (below).
+**Demo #1 post-mortem (July 3)** burned a director's turns on stale docs,
+then found kaish could not run `aconnect` at all. The deeper fix was
+subprocess exec behind an `exec` loadout authority, deny-by-default;
+coder/mcp/director carry it, musician/toolie never.
 
 ## ABC grows up (May, then June 30)
 
-The notation crate got its second, harder conformance push as a kaibo
-three-model audit with the verbatim ABC v2.1 spec in context — which paid off
-twice over, once by finding bugs and once by *rejecting* a confident wrong
-finding (the code's accidental propagation was already spec-correct). Fourteen
-real bugs fell TDD-first: tempo beat-units, compound-meter rests, tuplets
-dropping inner rests/chords, key-signature accidentals never reaching MIDI, a
-tie carrying an accidental across a bar line leaving a hung note, and variant
-endings not expanding at all. A robustness net followed (parse→midi→abc→parse
-must never panic; NoteOns/NoteOffs must balance) and immediately caught a real
-divide-by-zero (`L:1/0`) — a parser over untrusted ABC degrades, never panics.
-Grace notes now sound (steal-from-next, beat grid preserved). The engraver
-turned out to carry exact copies of two MIDI bugs, fixed at the root by
-extracting one shared `Key::signature()` both call — so they can't drift again
-— followed by a rendering sweep (augmentation dots, H-bar rests, tuplet
-brackets, mid-staff `[K:]` clef changes).
+A kaibo three-model audit with the verbatim ABC v2.1 spec in context paid
+off twice: fourteen real bugs fell TDD-first, and one confident wrong finding
+was rejected because the code's accident was already spec-correct. A
+robustness net (parse→midi→abc→parse never panics; NoteOns and NoteOffs
+balance) immediately caught a real `L:1/0`. The engraver carried exact copies
+of two MIDI bugs, fixed at the root by one shared `Key::signature()` so they
+cannot drift again.
 
-## The app — text, wells, and carousels
+## The app — text, wells, and carousels (June–August)
 
-**The vi editor (June 23).** Editing is a kernel-owned session — `EditorCore`
-(pure modalkit vim) behind kernel `EditorSessions`, with the Bevy app one
-renderer among many drivers. Three front doors (`vi` builtin, `kj rc edit`,
-MCP) share one primitive. The feared render-path collision evaporated by
-decision: the app renders from a kernel-served editor-state channel and never
-joins the editor context into its document cache. The app-id addressing
-infrastructure (per-window instance, server-stamped principal, identity-guarded
-self-detach) landed as its groundwork.
+**The vi editor (June 23)** is a kernel-owned session — pure modalkit behind
+kernel `EditorSessions`, the Bevy app one renderer among many drivers — and
+the feared render-path collision evaporated by decision: the app renders from
+a kernel-served editor-state channel and never joins the editor's context
+into its document cache. `docs/vi.md`.
 
-**The time well.** The context browser went through more visible evolution
-than anything else in the project — the constellation of February became a
-compacting spiral, then a tilted vortex with an accretion-disk throat and
-odometer navigation; cards moved off `StandardMaterial` onto a full-GPU SDF
-card material with MSDF text crisp at any zoom; HDR + bloom collapsed onto one
-shared always-on camera so only the card FX bloom. Kernel-derived live status
-rides the existing poll (thin client, smart kernel); drift endpoints shimmer.
+**The time well** evolved more visibly than anything else: constellation,
+spiral, tilted vortex with an accretion throat, then rings. Idle-age bands
+lasted two days. **Placement you can't control isn't an instrument** (Amy,
+July 5): two hand-curated rings sandwiching two automatic ones, ten seats
+each, digits addressing the focused ring; promote by keystroke or by
+visiting; demote steps one ring out and archives off the end; promoting an
+archived context resurrects it, because the archive is memory to drift back
+from, not trash. The HUD's four edge panels melted into the instrument a week
+later (selection drapes the bowl wall, the reading card carries specs and
+ancestry) and `hud.rs` died whole. On August 1 the rings lay parallel to the
+floor and the arithmetic indicted the design: two lower rings rendered in the
+room's basement, and asked what they were *for*, the honest answer was the
+same thing. Two rings and a floor: ACTIVE, RECENT, and an accretion disc on
+the room floor that is the event horizon. The reusable lesson: a geometry
+change is a proof obligation against the design it renders.
 
-Then July 3 made it navigable in one long live-tuned day: idle-age **bands**
-keyed on a new `last_activity_at` (stamped at the one journal chokepoint;
-status reads became an O(1) cached bump instead of an every-5s full rescan) —
-resurfacing proven live by drifting a probe into the second-oldest context and
-watching it jump to the mouth. Terraces grew ornate counter-rotating
-magic-circle rings ("it looks so cool"), cards stood up as slides radiating
-from the funnel; and the terraces became a **Kodak-Carousel** the user drives:
-one ring per band, left/right spins the focused ring so the selected card eases
-face-on to a gate angle, up/down changes rings, non-focused rings dim
-("fantastic… I'm delighted").
+**Conversation view hardening (July 3)** found error blocks stuck at the
+bottom were Bevy child-ordering choreography, and "text loads with holes" was
+a full MSDF atlas respawning generation tasks every frame — infinite CPU
+churn wearing a missing-glyph costume. The atlas grows to a cap now, and
+kanji-heavy conversations keep their glyphs.
 
-Two days later (July 5) the idle-age bands themselves were replaced: **placement
-you can't control isn't an instrument.** Amy's model — two hand-curated rings
-sandwiching two automatic ones, every ring exactly ten seats, digits addressing
-the focused ring's seats — landed end-to-end in an afternoon of lead + two
-sonnet lanes: ACTIVE (promote by keystroke or by visiting; the kernel
-auto-promotes in `setLastContext`, which the app already called), RECENT and
-BUMPED (pure recency competition for ten seats each — the age constants and the
-running-forces-hot override died outright; liveness is *light*, never
-placement), DEMOTED (an explicit push-away), and past all four, a real event
-horizon: unseated cards get no entity, just a "+N" in the throat. The demote
-ladder steps one ring outward per press and archives off the end; promote on an
-archived context *resurrects* it (Amy: the archive is memory to drift back
-from, not trash — the door Stage-5 search will feed). Pause landed as designed
-state only — a `paused_at` stamp, a toggle, a dimmed card — with its real
-meaning (suspend activity: no beat wakeups, refuse turn-starts) documented on
-the column for a later slice. A legend HUD names the verbs in the well itself;
-the keys are declared provisional. Ring 0 is the Stage-2 rank arriving in ring
-clothing: append-ordered, kernel-owned, ten seats, digit-addressed.
+## Wires and surfaces (June–July)
 
-**The HUD melts into the instrument (July 11–12).** Amy's first look at the
-room's hero shot named the problem: the four camera-parented edge panels read
-as floating flat UI over a diegetic scene. Four slices melted them into the
-instrument — selection drapes down the bowl wall (mockup 27's silk threads,
-finally built), a live-tail band on the selected card's own face, the reading
-card absorbing specs + ancestry as pure shared text (`specs_text`/
-`ancestry_text`, extracted so panel and card rendered byte-identical content
-while both existed) — then `hud.rs` (851 lines) died whole. Live-driving the
-reading card before the cut caught a real bug the panels had been masking: the
-absorbed specs duplicated the card header's model/fork lines and pushed
-ancestry + tail past the glyph budget, silently dropped by the overflow guard
-— exactly the content the slice existed to show. The keyboard legend survived
-as the one panel with no scene-native home, reborn as a transient `?` toggle
-(dismissed by `?`, zoom-out, or leaving the room). Every readout now lives on
-the thing that owns it; the well's mouth is open browser space again.
-
-**Four rings become two and a floor (August 1).** The well moved into the
-room's center as furniture, and Amy asked for the magic circles to lie
-parallel to the floor. That one rotation quietly turned funnel depth into
-plain height — `world_y = 160 + 0.5·depth` — and the arithmetic indicted the
-design: BUMPED landed at world y −70 and DEMOTED at −185, two rings of cards
-rendering in the room's basement, with the deck and the "+N" label deeper
-still. The fix wasn't to lift them. Asked what those two rings were *for*, the
-honest answer was: the same thing. Demoted, concluded and overflow contexts
-all read as one category to the eye — work you have pushed away — and the
-four-ring scheme had been paying two rings of prime real estate for a
-distinction nobody navigates by. So ACTIVE stayed on top, RECENT rose to just
-clear the tabletop, and the two lower rings collapsed into the destination
-they had always been heading for. The ring deck moved onto the room floor and
-stopped being a "throat floor": it became the **event horizon**, an
-accretion disc lying on the room floor, encircling the plinth of the table the
-rings hover over — a shader that had always looked like accretion finally put
-where that reading is literal. The "+N" moved onto the disc it counts, which
-is also why it stopped being hidden at room scale (it used to float mid-air as
-an unreadable chip). None of it touched the kernel: `p`/`d`/`z`/`a`/`c`, the
-demote ladder and the stamps are unchanged — `d` still means "pushed away," it
-just stopped earning a ring. Card entities halved to ≤20, and `h` went in as
-the front door to a horizon dive nobody has built yet. The reusable lesson: a
-geometry change is a *proof obligation* against the design it renders, and the
-test that catches it is the one composing the real placement math to assert a
-card ring never sinks below the floor it hangs over.
-
-**Conversation view hardening (July 3).** Two long-standing irritations fell
-in one arc. Error blocks stuck to the bottom traced to Bevy child-ordering
-choreography: three mutations changed order without bumping the re-sort gate,
-and `replace_children` silently un-parented missing entries into leaked root
-nodes — now fail-loud. The "text loads with holes" bug split into a benign
-self-healing transient and two silent forever-failures: a full MSDF atlas
-respawned generation tasks every frame — infinite CPU churn wearing a
-missing-glyph costume — and missing font data retried unbounded. The atlas now
-grows to a 4096 cap, terminal failures land loud, and kanji-heavy documents
-(the motivating case — 日本語 conversations) keep their glyphs.
-
-## Wires and surfaces
-
-**One channel, named subsystems (June 26).** The RPC transport moved off a
-positional three-channel scheme (two of which existed only to pad the ordinal)
-onto a single channel requesting the `kaijutsu-rpc` subsystem by name — the
-shared retention-and-dispatch scaffold SFTP and future subsystems hang off as
-additional match arms. A flag-day cutover, no compat shim; early dev, single
-user. The client actor also stopped lazy-connecting: it dials as soon as it
-can, because the early connected/failed signal is worth more than deferring —
-the first call after a cold start no longer bounces.
-
-**SFTP + the VFS.** The full SFTP server adapter serves `kernel.vfs()`
-directly; the generation counter (above) is its coherence primitive; `/v/cas`
-(music chapter) is its first growing pool. Track V (`/v/ctx`, `/v/session`)
-and adapter limits are the open follow-ups in `docs/slash-v.md` / issues.md.
-
-**Subprocess exec (July 3).** The music-demo post-mortem's real fix: kaish's
-`subprocess` feature turned on behind a new `exec` loadout authority
-(deny-by-default at materialization; coder/mcp/default/director seeds carry
-it, musician/toolie never), `MountBackend::resolve_real_path` made real, and
-`$PATH` seeded from the kernel env. Verified live from inside a context shell
-— including re-making the TiMidity wire with `aconnect`. The direction locked
-with Amy inverts the mount posture entirely: an *opaque host* — drop the
-read-only `/` mount, curate PATH-dir bin mounts per context_type, VFS-mediated
-resolution upstream in kaish.
+The RPC transport moved off a positional three-channel scheme onto one
+channel requesting the `kaijutsu-rpc` subsystem by name, a flag-day cutover
+with no shim. The SFTP adapter serves `kernel.vfs()` directly with the
+generation counter as its coherence primitive. Subprocess exec (above) locked
+a direction with Amy that inverts the mount posture: an opaque host, PATH-dir
+bin mounts curated per context_type.
 
 ## How we work — the ritual and its lessons
 
-The practices that survived contact, recorded because they're the real product
-of six months:
+The practices that survived contact, recorded because they are the real
+product:
 
-- **The house review ritual:** two models outside our family read the *whole
-  files*, no diff — typically a gemini-pro batch plus a deepseek agent over the
-  same surface — so they evaluate holistically. Cross-model divergence is the
-  point: each has caught real bugs the other and the author missed. Batch is
-  the resilient path for gemini-pro; interactive 503s under load, batch
-  capacity sails.
-- **When two competent readers model the topology differently, that is the
-  signal to go look.** The transport-ACK review's reviewers disagreed on
-  threading; tracing it found a no-deadlock property that held only because
-  one function stayed fully synchronous — now a documented invariant rather
-  than an accident. Diagnose from the code, not a reviewer's summary.
-- **Two voices at design time.** Big cuts (Tracks Stage 2, the render
-  convergence) get stress-tested by independent models *before* code; the
-  findings fold into the tracker, not a rewrite later.
+- **The house review ritual:** two models outside our family read the
+  *whole files*, no diff, so they evaluate holistically. Cross-model
+  divergence is the point; each has caught real bugs the other missed. When
+  two competent readers model the topology differently, that is the signal to
+  go look, and you diagnose from the code, not a reviewer's summary. Reviewer
+  claims about engine scheduling get verified against the local Bevy checkout
+  before any code moves.
+- **Two voices at design time.** Big cuts get stress-tested by independent
+  models before code; the findings fold into the tracker, not a rewrite.
 - **TDD, red-first, and crash over corruption.** The recurring bug class is
-  the silent fallback — restart tempo loss, byte/char splices, torn CAS
-  objects — and the recurring fix is fail-loud verification plus a test that
-  fails against the old code.
+  the silent fallback; the recurring fix is fail-loud verification plus a
+  test that fails against the old code. Falsification is the lead's job: a
+  lane that writes a test against the code it is building will honestly
+  report green; only a targeted fault shows whether the test guards anything.
 - **Demolition as practice.** Rhai, rig-core, the config flush backend, the
-  in-process MIDI path, dead viz layout code, and the KV store (July 4: its
-  one production caller moved to a typed per-client row first, then ~1,600
-  lines deleted whole — the VFS namespace is the shared-state store) —
-  parity first, then delete whole, never strand a transitional path. The
-  score being durable is what makes deleting renderers cheap.
+  in-process MIDI path, the KV store (its one caller moved first, then 1,600
+  lines deleted whole), the CRDT replica in the MCP, the text engine itself
+  — parity first, then delete whole, never strand a transitional path.
 - **Docs are living, not stratified.** Chronology belongs here and in git;
-  design docs state the present. `docs/issues.md` deletes entries when they
-  ship. And the acceptance test for music is the ear.
-- **Shared docs get edited, never re-emitted from model memory.** Twice now a
-  stale in-context copy of issues.md has been whole-file-written over a
-  groomed HEAD (hallucinated dates included). The reconcile ritual: title-diff
-  forensics against HEAD, graft only the genuinely new entries, discard the
-  ghost.
+  design docs state the present; `docs/issues.md` deletes entries when they
+  ship. Shared docs get edited, never re-emitted from model memory.
+- **Run the exact thing against the real system.** Twice in one afternoon a
+  thing that appeared dead was merely never asked a question it could answer.
+  Verify against the binary you think you shipped. `git log -S` a comment
+  before building on it.
+- **Fan-out and merge.** Sonnet lanes in disjoint file territories, no git
+  from lanes, the lead commits path-scoped and re-runs every red-test
+  mutation. It held on a single shared file with explicit region ownership.
 
 ## The instrument gets kinder to its players (July 4)
 
-A player's-eye sweep of the kj surface, picked by asking one question of the
-backlog: what does a model hit mid-turn that a human wouldn't tolerate? Five
-lanes ran as parallel worktree subagents (two Opus, three Sonnet) with the
-lead context coordinating, merging, and keeping the docs honest — the first
-real test of the fan-out-and-merge shape, and it held. What shipped, and what
-the digging taught:
+A player's-eye sweep of the kj surface, picked by one question: what does a
+model hit mid-turn that a human wouldn't tolerate? Five parallel worktree
+lanes; the first real test of fan-out-and-merge. `kj fork` worked from kaish
+again once the kaish→kj bridge learned `Value::Json`. Contexts learned what
+day it is through datetime rc seeds, and the load-bearing choice was the
+block kind: a Notification hydrates as an appended message, while a System
+block would invalidate the cached prefix daily. Config stopped lying about
+unknown provider types. `kj block cat --latest <mime>` answers "give me this
+turn's artifact" in one call. The unknown-command 300 s hang closed as a
+proof that the dispatch fall-through is bounded at every await. Two kaish
+bumps were zero-source because we ride the embedder API through low-level
+primitives; the second fixed the `/v/cas` shadow where kaish's overlay had
+reserved the whole `/v` tree.
 
-- **`kj fork` works from kaish again.** The `--include` range parser was
-  never broken — the kaish→kj bridge had no arm for `Value::Json`, so every
-  repeatable `Vec<String>` flag arrived Debug-formatted. One general fix
-  repaired fork ranges and every other repeatable kj flag that rides through
-  kaish. Label conflicts now fail *before* the billed distill and name the
-  existing context; compact-fork distillation defaults to the caller's own
-  provider+model, and `--distill-model` speaks `--model`'s grammar — that
-  last one because the coordinator caught the new error message recommending
-  syntax the parser rejected.
-- **Contexts know what day it is.** Datetime rc seeds (kaish's `date` builtin
-  → `kj block create --kind notification`) fire at create/fork for
-  coder/director/mcp/default; musicians deliberately never — musical time is
-  their only clock. The load-bearing choice was the block kind: Notification
-  hydrates as an appended message, while System/Text would be swept into the
-  cached system prefix and invalidate it daily, and `.kai` stdout is
-  model-hidden Trace. Both mechanism halves already existed; zero kernel
-  logic changed. Motivated by three hallucinated-date incidents in durable
-  docs.
-- **Config lies less.** Unknown provider types are rejected at `kj config
-  set`/`edit` with the supported list (the boot-time drop was
-  silent-until-a-turn-hung); "missing API key?" only appears on a real auth
-  error; piped stdin works as the help always claimed (the gate was an
-  rc-only hardcode); `kj config edit` mirrors `kj rc edit`.
-- **Artifacts are one verb away.** `kj block cat` resolves a block's CAS
-  content (binary refuses the terminal; `--out` for bytes), and `--latest
-  <mime>` answers "give me this turn's rendered artifact" in one call. `kj
-  rc list` marks every script in-sync/differs/no-seed against its embedded
-  seed — detection for the stale-seed class without touching live-is-truth.
-- **A "bug" that wasn't.** The unknown-command 300 s hang closed as a proof:
-  the dispatch fall-through is bounded at every await (tests across all
-  three shell flavors, a cross-model audit, a live probe). The observed hang
-  was almost certainly the stale-FlowBus observation gap wearing a costume.
-  And `$HOME` is now seeded in every shell — the dig found `~` was broken
-  too; both read one scope var, so they agree by construction.
-- **The awaited kaish release closed two of these loose ends.** The 0.10 → 0.11
-  bump was zero-source — we ride the embedder API through low-level primitives,
-  so all four of the release's breaking changes miss us — but it carried the
-  rewrite we'd parked two papercuts against. The confirmation-latch nonce, an
-  explicit machine protocol whose token was buried in human prose (a batch loop
-  had to `2>&1` and regex-scrape it), now rides a typed `ExecResult.latch`; we
-  emit it structurally on both the MCP shell envelope and `kj --json`, so
-  automation reads `latch.nonce` and re-runs with `--confirm`. And kj's
-  synthetic root `help` param — a crutch that existed only to stop kaish's outer
-  help router from swallowing `kj <verb> --help` — retired the moment 0.11 gated
-  that router on `owns_output` (an owned-output tool re-parses its own argv and
-  is never intercepted). Same theme as the rest of the chapter: the surface a
-  model hits mid-turn stops fighting it.
-- **0.12 (July 12) closed the third.** Zero-source again — `LatchRequest`
-  picked up a `job_id` back-reference we don't construct, everything else
-  landed on surface we don't touch — but it fixed the `/v/cas` scar from the
-  CAS chapter above: kaish's `VirtualOverlayBackend` used to reserve the whole
-  `/v` tree for itself regardless of what an embedder had actually mounted
-  there, so `kaish ls`/`cat /v/cas/...` saw an empty shadow while SFTP and `kj
-  cas` (which bypass the kaish VFS) saw the real pool. Routing is now purely
-  mount-coverage based — an unclaimed `/v/*` path falls through to the
-  embedder's backend — so kaish's view of `/v/cas` finally agrees with
-  everyone else's. Pinned by a new regression test
-  (`kaish_ls_and_cat_reach_the_real_cas_mount_at_v_cas`) so a future bump
-  can't quietly reopen it.
+## The kernel gets an interior (July 7–10)
 
-## The kernel gets an interior (July 7–9)
+The time well had proven kernel state could be a *place*; the scenes charter
+(`docs/scenes/`) asked what building the rest would mean. Two days of design
+(28 mockups culled to one canonical image per surface), then three days from
+spec to a finished station.
 
-The time well had proven that kernel state could be a *place*; the scenes
-charter (`docs/scenes/`) asked what building the rest of the place would
-mean. Two days of design — 28 image-model mockups culled to one canonical
-image per decided surface, every discarded lesson melted into prose — then
-three days that took the first station from spec to a finished instrument.
+Navigation grew one level up without a new grammar: Up/Down between detail
+levels, Left/Right within one, Esc always walks up, and the well's mouth
+exits through a double-tap speedbump. The camera taught the room's first hard
+lesson: in a radial room every pose is a claim about what stands between you
+and the center, so a focused station is approached from its own side, looking
+outward. The patch bay went from black blob to instrument on a round table.
+A two-hour hunt for a "missing" traffic pulse ended with staged shader probes
+proving every layer correct — the 0.42 s default was faster than screenshot
+sampling. Distinguish "the mechanism is broken" from "my observation can't
+see it" before touching the mechanism.
 
-- **The room exists, and the arrows just keep going.** Navigation grew one
-  level up without a new grammar: Up/Down move between detail levels,
-  Left/Right within one, Esc always walks up — and the well's mouth ring
-  exits upward through a *speedbump* (double-tap, the app's existing 500ms
-  pattern pointed at a new axis) so habitual ring nav never ejects you.
-  Slice A made the blockout a chamber: vault, trace floor bowed around the
-  console emblem, bearing pylons with engraved nameplates, violet radiator
-  placeholders, and per-bearing activity glow fed by the same event stream
-  the well already ingests — the shell adds renderers, not wire.
-- **The camera taught us the room's first hard lesson.** The focused-station
-  pose originally stood diametrically across the chamber — and cardinal
-  bearings are colinear through the center, so the opposite pylon and the
-  console stacked on the sight line and hid the very station being focused.
-  The fix is an *approach* pose: stand on the focused station's side,
-  looking outward. Same family: the reserved South marker shrank to a stub
-  because the overview camera lives at South. In a radial room, every
-  camera pose is a claim about what may stand between you and the center.
-- **The patch bay went from black blob to instrument.** Slice 0 (observed
-  ALSA graph on a round table, read-only) shipped with the nav skeleton;
-  the visual wave made it parseable: etched gold guide rings and seat
-  ticks, short ALL-CAPS port labels from a display heuristic that
-  deliberately is *not* the symbolic-endpoint registry (that question
-  stays open), nameplates receded to a supporting tier, and the
-  inspection card blooming at the selected chord's apex with
-  shrink-to-fit text, speaking the same label language as the pegs.
-- **Slice 1 killed the oldest papercut.** The app auto-connects its render
-  port to a name-matched GM synth on startup — deferential (any existing
-  outbound wire means stand down) and one-shot with patient retry, so a
-  human's later `aconnect -d` stays cut: the metronome click rides that
-  port with no off-switch yet, and a continuously-reconciling ensure would
-  have made the wire uncuttable. Continuous reconciliation stays slice 2's
-  kernel-owned job. Names, never client numbers.
-- **Live traffic is light.** The render port's send seams raise one message
-  per frame-with-traffic; chords the app can observe carry a GPU-animated
-  packet (one uniform write per pulse, `globals.time` does the rest).
-  The two-hour hunt for the "missing" pulse ended in the best possible
-  verdict: staged shader probes (stamp-arrival, age-window, UV paint)
-  proved every layer correct — nothing was broken. The 0.42s default is
-  just faster than screenshot sampling, and the only chord was always
-  selected, masking the band in its own glow. Lesson: distinguish "the
-  mechanism is broken" from "my observation can't see it" *before*
-  touching the mechanism.
-- **The fan-out held on a single file.** Two opus lanes built the
-  instrument face and the live layer in the same `mod.rs` under explicit
-  region ownership; the merge was three keep-both conflicts. Every lane
-  got a kaibo round (gemini batch + deepseek, whole files, no diff) —
-  which caught two real moderates (a cold retry timer; unmasked MIDI data
-  bytes in the pre-existing click path) and one real HIGH (room nameplates
-  blank on re-entry: a process-lifetime latch guarding per-visit
-  entities — the same bug family as the patch bay's own re-entry fix that
-  morning). It also produced confident "criticals" asserting pre-0.12
-  Bevy folklore — non-recursive despawn, no sync points between chained
-  systems. Bevy source is checked out locally; reviewer claims about
-  engine scheduling get verified there before any code moves.
-- **One scene graph, and the lifecycle bill for it (July 9–10).** Amy
-  settled the shell's biggest open question — shared, not separate: the
-  patch bay is room furniture behind one placement transform, and diving
-  is a continuous camera descent inside the persistent room, with LOD
-  (room chrome hides on dive, the label/card layer shows only dived)
-  recovering the budget the scene-cut used to provide. The review round
-  on that slice earned its keep once: with `OnExit(Room)` no longer
-  firing on a dive-first exit, a context switch landing mid-dive leaked
-  the whole room into the next screen. The fix made the dive's own exit
-  share the room's teardown — and the *same* round re-asserted the same
-  pre-0.12 scheduling folklore as last time, now formally a pattern:
-  engine claims get checked against the local Bevy checkout first.
-- **Furnishing day (July 10).** With the grammar proven, one sonnet lane
-  moved the room from blockout toward the concept renders: a ~35-route
-  deterministic circuit-board floor (pure generators, keepout locked by
-  tests against the production route table — "the floor is the wiring"
-  made literal), an inscribed gold ring the routes depart from, the well
-  emblem grounded on a real table whose plinth physically fills the trace
-  keep-out, framed radiators with thread-strips, pylons with plinths and
-  caps. Amy's dials: boring labels (TRACKER, not RHYTHM GATE — plates
-  should *recede* as real detail arrives), more solidness, aurora paused
-  until the drift layer knows what information it carries. The lead's
-  live tuning pass then earned two lessons worth keeping: **inhabitable
-  is mostly camera height** (dropping the overview from bird's-eye to
-  human-eye did more than any geometry), and **you cannot light a 1%
-  albedo** — pixel-sampled screenshots proved no point-light intensity
-  lifts a near-black metallic surface; the material's diffuse response,
-  not the lamp, was the knob. The dived table stays gold-etch-on-black
-  by choice.
-- **The room closes over (July 10, afternoon).** Amy asked for enclosure
-  and a camera cutaway, and both turned out to be one rendering rule:
-  build the wall shell single-sided, facing inward, back-faces culled —
-  near walls vanish from any outside camera, the dollhouse cut for free.
-  Her shape call made the walls *mean* something: an octagon of eight
-  content-surface panels ("the surface gets taken over by its content"),
-  neon-trimmed in each bearing's hue, the free-floating radiators
-  retiring into the diagonal panels. In the same wave the patch wheel
-  stopped being a labeled exhibit and became the west station itself —
-  sign and pylon deleted, the live circle seated on a dais at furniture
-  scale, floor traces terminating at its foot — and the whole scene
-  family unified on one palette module and the all-unlit discipline (the
-  patch bay's point light and lit metals deleted outright; the albedo
-  lesson made them dead weight). First light found the honest bugs taste
-  can't: the wheel's tabletop seated exactly coplanar with its dais
-  (full-surface z-fighting starburst) and a "one shade up" surface that
-  washed the gold etch grey. Both are contract fixes now, not tweaks —
-  the dais agreement lives in the palette module where neither file can
-  drift from the other silently.
+Amy settled one scene graph, not separate ones, and the lifecycle bill came
+due immediately (a context switch mid-dive leaked the room). Furnishing day
+taught that inhabitable is mostly camera height and that you cannot light a
+1% albedo — the material's diffuse response, not the lamp, is the knob. Then
+walls became screens: eight content panels in an octagon, and "we could
+almost drop the dive if the walls were 16:9" turned out to be structural.
+With fullscreen as a camera pose plus a zoom field inside one Room state,
+`Screen::PatchBay` dissolved and took the dive-exit lifecycle machinery with
+it, including the leak fix built that morning. Deleting a state to delete a
+bug class is the day's best trade.
 
-- **Walls become screens, and a state dies (July 10, evening).** Amy kept
-  pulling the same thread: mount the patch wheel ON the wall instead of in
-  front of it (a transform edit — the placement seam's third re-placement,
-  though typography taught us the one thing a similarity transform can't
-  right is which way text reads); then "we could almost drop the dive if
-  the walls were 16:9 and you could fullscreen them." She was right, and
-  the payoff was structural: with fullscreen as a camera pose plus a zoom
-  field inside the one Room state, `Screen::PatchBay` dissolved — and with
-  it the entire dive-exit lifecycle machinery, including the leak fix
-  built that same morning. The careful teardown special-casing lived one
-  day, replaced by a design in which the bug cannot exist. Bounded
-  stations are now panel content (the wheel owns the W panel at 82% of
-  its height; the tracker's falling notes and the radiators' message
-  walls are born screens); only worlds too big for the room — the fsn
-  landscape — keep a true dive-through door. Deleting a state to delete
-  a bug class is the day's best trade.
+## The app learns to mean its colors (July 12)
 
-## The app learns to mean its colors
+The terrace glyphs shipped ornate and Amy named the real problem: "muted like
+the rest of the octagon… more synthwave than anything." The mutedness was
+structural. Hues were governed, brightness was thirty scattered constants,
+and the tonemapper had never been chosen. One kernel-owned `theme.toml` now
+carries both lanes — sRGB UI and linear-HDR scene with a brightness ladder
+and a hot-applying post chain — a `ScenePalette` resource absorbed every
+scene constant, and a live A/B over BRP picked ACES; the muted look was
+literally TonyMcMapface. `docs/color.md` is the contract. The mirror test
+between compiled and file defaults caught a palette 13× off on one channel
+family on its first run.
 
-The terrace glyphs came first (2026-07-12): the placeholder dashed dial
-became a per-ring variant family — barcode graduations, braided rosettes,
-a Fibonacci moiré dial, orbiting motes — with hash-seeded gem glints
-twinkling gold on every ring. Amy looked at it and named the real problem:
-"I see it, but it's muted like the rest of the octagon… maybe the goal for
-the vibe overall is more synthwave than anything." The mutedness turned
-out to be structural, not aesthetic: palette.rs governed hues and the
-glow-discipline caps, but *brightness* was thirty scattered per-site
-constants, and the tonemapper had never been chosen — the app's look was
-the accidental sum of local decisions.
+## The index learns to keep itself honest (July 12)
 
-The color pass made color a decision again. One kernel-owned theme.toml now
-carries both color lanes — the sRGB post-tonemap UI lane (the old Tokyo
-Night token system, kept) and a new linear-HDR scene lane (`[scene]`:
-identity hues, a named brightness ladder, live-signal gains, and a
-`[scene.post]` camera chain that hot-applies). App-side, a `ScenePalette`
-resource absorbed every scene constant; palette.rs shrank to geometry
-contracts. The synthwave skin shipped as the default across file, data
-layer, and compiled fallback (Tokyo Night retired to contrib/themes/),
-and a live tonemapper A/B over BRP picked ACES + raised bloom — the muted
-look was literally TonyMcMapface. docs/color.md is the contract: one
-identity, two lanes, threshold 1.0 stays the line between decoration and
-live activity.
+Three quiet debts in the semantic index went in one afternoon: HNSW cannot
+delete, so eviction left dead vectors forever; nothing noticed a model swap;
+synthesized gists evaporated at restart. The design that made rebuild
+tractable is that **slots are never renumbered**, and a red test proved they
+must never be *reused* either. First boot on the live kernel reclaimed eight
+dead slots the real index had been carrying. Sonnet lanes wrote the code;
+the lead's review, the outside models and the running kernel each found bugs
+the other two missed. That triangle is the lesson.
 
-Two lessons worth the ink. The mirror test between compiled defaults and
-file defaults caught a real sRGB-as-linear bug on its first run — the
-palette had been quietly 13× off on one channel family. And when a
-round-tripped `kj config show` poisoned the live theme with its own
-decoration, the app's refuse-loudly parse path (toast + keep current
-theme) turned what could have been a silent skin corruption into a
-ten-minute diagnosis — the observable-write-failures discipline paying
-for itself.
+## The filesystem becomes a world, then ambient (July 12–13)
 
-## The index learns to keep itself honest
+The fsn landscape went from vocabulary to a rendering world in one evening of
+three lanes: relaxed-Voronoi layout in `kaijutsu-viz`, a `Vfs.snapshot` RPC
+with generation stamps, and a dive-through scene. The live pass taught that
+the unit trees were too polite: the real host tree killed the walker three
+ways in an hour (a root-only directory, `/v` existing only in the mount
+table, `/proc` PIDs vanishing between readdir and getattr), and each fix was
+a design decision — denial renders as a seam, the mount table answers for its
+own namespace, churn under the walk is operational.
 
-The semantic index — bge-small over ONNX, an HNSW graph, a SQLite sidecar —
-had grown real consumers (well-card gists, constellation clusters, kj
-synth) on top of three quiet debts: HNSW can't delete points so eviction
-left dead vectors forever (`rebuild()` was a TODO), nothing noticed when
-the embedding model changed under an existing index, and every synthesized
-gist evaporated at kernel restart because nothing re-warms a memory-only
-cache when content hashes say "unchanged." One afternoon (2026-07-12)
-retired all three, plus a live ABBA deadlock between search and indexing
-that a stress test could summon on demand.
+Then Amy reframed it: the fsn world is **not a file browser**. Agents work
+at the file level and the shell covers the rest; the filesystem is a free
+source of ambient data that looks good in 3D. That sentence deprioritized
+bloom, dive-to-vi and search, and promoted heat from the kernel's own hands
+(the MountTable chokepoint already sees every mediated op), recency from the
+wire, and the vessel inhabiting the world through two wall panels rendered by
+an off-screen camera. `docs/scenes/vfs.md` is canonical.
 
-The design decision that made rebuild tractable: **slots are never
-renumbered**. A rebuild re-inserts only live slots into a fresh graph at
-their existing numbers, so SQLite is never touched and crash-consistency
-collapses to atomic file publication (dump `.new` → fsync files, marker,
-and directory → rename → recover idempotently at boot). The corollary took
-a red test to believe: slot numbers must also never be *reused*, because
-MAX+1 allocation regresses when the highest slot is evicted and the dead
-vector still in the graph would answer for the new context. A monotonic
-allocator table closed the class. First boot on the live kernel vindicated
-the whole shape immediately — the real index was carrying 51 graph points
-against 43 metadata rows, and startup auto-rebuild silently reclaimed all
-eight dead slots.
+## The filesystem joins the band — /r client shares (July)
 
-Live verification earned its keep twice more. `kj synth all` on real data
-blew ort's never-shrinking arena past 9 GB — one BatchLongest-padded
-embed_batch of every block in a large context — fixed by chunking at the
-embedder seam, where every call site inherits the bound. And the
-whole-file kaibo ritual (deepseek consult + gemini-pro deliberate, no
-diff) caught what unit tests hadn't: eviction cleared persisted synthesis
-but left the memory cache serving ghosts, and the rename dance fsynced
-files but not the directory. Sonnet lanes wrote the code; the lead's
-review, the outside models, and the running kernel each found bugs the
-other two missed. That triangle is the lesson.
+Reverse the SFTP we already have, so a client can share `~/src` into the
+kernel the way `code .` shares a directory: the client opens a channel and
+speaks the *server* role, and the share describes itself with an in-band
+`index` manifest. Gemini's pre-build review reshaped slice 0: `VfsOps::read`
+is stateless and SFTP is stateful, so a naive pump pays OPEN/READ/CLOSE per
+chunk; `open_read_stream` became the first thing built. A post-build
+deepseek pass found six bugs the tests missed, the worst a `readlink` stub
+that lied. `docs/slash-r.md`.
 
-## The filesystem becomes a world (July 12, evening)
+## The beat learns to carry its own clock (July 15)
 
-The fsn landscape went from baked vocabulary to a rendering world in one
-evening of three parallel Sonnet lanes with the lead reviewing seams:
-pure layout math in kaijutsu-viz (CellId quadtree + relaxed-Voronoi with
-fixed-k Lloyd — the blast-radius promise turned into a trajectory-compared
-test), a `Vfs.snapshot` RPC with generation stamps and
-gitignore-as-metadata, and the Bevy scene behind the N archway — a genuine
-`Screen::Fsn` dive-through, wireframe prisms and vertex points in exactly
-frame 45's grammar. Reviews earned their keep in both directions: the lead
-caught a fetch-queue wedge, a truncated-dir refetch loop, and
-guaranteed-overlapping subdir fields before merge; kaibo verified the
-fixes but also *mis-blessed* one thing (Bevy messages don't wait for a
-gated reader — they expire), which became the fourth fix.
+The TRACKER station replaced a promissory nameplate with the instrument —
+a pattern grid where each column scrolls at its own tempo past one fixed
+playhead, because tracks are independent clock domains — and the first jam
+on it found the clock bug. Amy heard the metronome "bumping a few times, not
+evenly spaced." Beat references were stalling behind a musician's streamed
+output on the single callback stream, arriving in bursts, and the receivers
+folded every buffered reference against one frame-now. The burst behavior
+had been encoded in a unit test as correct.
 
-The deepest lesson came from the live pass: the unit trees were too
-polite. The real host tree killed the walker three ways in an hour —
-root-only directories (one EACCES failed the whole walk), `/v` existing
-only in the mount table (intermediate mount dirs had never had
-getattr/readdir semantics), and `/proc` PIDs vanishing between readdir
-and getattr. Each fix was a design decision, not a patch: denial is a
-fact about the tree and renders as a seam (truth-seams rule), the mount
-table now answers for its own synthetic namespace, and churn under the
-walk is claim 4 made operational. Then the arch opened onto violet
-districts over a dark plane, the basalt pattern plainly visible, and a
-selection-ring pass over `/etc` pulled `/etc/iptables` out of the
-unbuilt shell — enumeration-on-demand working exactly as designed.
-
-## The world becomes ambient (July 13)
-
-Slice 1 opened with a reframe from Amy that rewrote the roadmap: the fsn
-world is **not a file browser** — agents work at the file level and the
-shell covers the rest. It's the space the octagon vessel inhabits, and the
-filesystem is a free source of ambient data that looks good in 3D. That
-single sentence deprioritized the bloom grammar, dive-to-vi, and search,
-and promoted three reaches: heat from the kernel's own hands, recency from
-data already on the wire, and the vessel actually *inhabiting* the world.
-
-The heat design fell out of a distinction worth keeping: the MountTable
-chokepoint already sees every kaijutsu-mediated file op, so the kernel can
-light the world where *it* is working with no new dependencies — inotify
-and host weather (cargo-build storms) stay a later reach, and arguably a
-different statement. The wire is the vfs.md digest design made real minus
-depth-keying: absolute per-directory totals from per-connection timer
-bridges, where the subscription is just parameters against rolling
-counters. Absolute totals proved their worth three times in review — the
-lead caught cap-dropped entries stranding on a quiet kernel, kaibo caught
-a Relaxed-ordering torn read that could strand a bump behind its own
-epoch, and both fixes were the same shape: never advance the cursor past
-what was actually delivered, and the stream self-heals by construction.
-
-On the app side, one composition law kept two ambient signals from
-fighting over one material: recency bakes into vertex colors as a
-relative tint (`tint × base = lerp(base, gold, recency)` exactly), heat
-rides the material hue/gain, and `apply_fsn_lod` stays the sole writer.
-The room got its long-promised N-archway churn glow (recorded from the
-digest's global delta — the stateless `event_bearing` seam was wrong for
-absolute counters, and saying so in its doc mattered), a gold ship
-silhouette hangs overhead as the you-are-never-lost landmark, and the
-walls opened: two panels flanking DATA HORIZON render a sparse world
-impression from an off-screen orbiting camera — the app's first true
-second-camera render-to-texture, which promptly taught the pre-existing
-`single()` camera queries that a second `Camera3d` exists (the fix rode
-the same lane). Live-verify closed the loop end to end: `kj vfs activity`
-counted a kaish write storm exactly, the windows showed the world from
-the room, and a parked-camera A/B caught the gold district cooling back
-to violet as the heat decayed. The slip worth remembering: the first
-live pass ran an app binary built *before* the ingest stitch — recency
-gold masqueraded as heat until the log showed no subscription. Verify
-against the binary you think you shipped.
-
-As of 2026-07-13: the Tardis room is furnished, lit, AND windowed — the
-fsn world renders the real host tree, warms where the kernel works, and
-shows through the N wall without a dive. The kernel publishes its own
-activity as lossy-safe digests; `kj vfs activity` reads the counters raw.
-Ambient-reframe survivors for later: heat drama tuning (Amy's eyeball),
-stage-2 inotify for host weather, the solid/materialized tier, bloom and
-search if the browser reading ever returns. The tracks bearing's
-breathe-on-jam acceptance and the metronome-click chord pulse still await
-the next live jam; theme push-on-change and the remaining compiled-only
-color families remain in issues.md. Open work is in `docs/issues.md`; the
-live handoff in `signoff.md` (ephemeral, repo root).
-
-## The filesystem joins the band — /r client shares (July 2026)
-
-The idea arrived as one sentence from Amy: reverse the SFTP we already
-have, so a client can share `~/Downloads` or `~/src` into the kernel the
-way `code .` shares a directory with an editor — patch cables for
-filesystems, to sit beside the MIDI ones. The design conversation settled
-the load-bearing lines fast: heavy IO stays off capnp (control verbs and
-light metadata are fine — the rule was never purity), file bytes ride
-SFTP with the roles swapped (the client opens a `kaijutsu-share` channel
-and speaks the *server* role; subsystem requests only travel one way, so
-the swap is the whole trick), and the share session describes itself with
-an in-band `index` TSV manifest instead of a capnp token handshake — the
-slash-v "index is the resolver" ethos applied to negotiation, which
-dissolved the pairing problem outright.
-
-Two pre-build reviews earned their keep before a line of code existed.
-DeepSeek confirmed the role swap and flagged session serialization;
-Gemini Pro caught the finding that reshaped slice 0: `VfsOps::read` is
-stateless, SFTP is stateful, so a naive pump over a share would pay
-OPEN/READ/CLOSE per 256 KiB — ~1.7 MB/s at 50 ms RTT. The fix became the
-first thing built: `open_read_stream` on the trait, loop-`read` by
-default, held-handle when it matters. Gemini also pointed out that owning
-both protocol ends means we can ship nanosecond generations in a vendor
-extension rather than accepting SFTP v3's one-second mtime; the built
-form landed as a sibling `SSH_FXP_EXTENDED` request (russh-sftp's attrs
-have no extension slot) with the required-check riding INIT extension
-advertisement — an accidental improvement, since INIT is where version
-negotiation belongs anyway.
-
-The build ran the FSN slice-1 playbook: two worktree lanes, Sonnet
-subagents on the code, lead reviewing every diff and re-running every
-suite. The pump lane landed clean. The share lane built the whole loop —
-jailed client server (openat2 `RESOLVE_BENEATH`, ENOSYS-only fallback),
-registration with token-guarded unregister, `ShareFs` behind the frozen
-mount table — and caught two of its own bugs by running tests (a FIFO
-open that blocks forever without `O_NONBLOCK`; an attrs builder ordering
-clobber that made every share root a non-directory). A post-build
-deepseek pass over the worktree found six more the tests missed, the
-worst being a dead `readlink` stub that *lied* (getattr said symlink,
-readlink said not-a-symlink) and an `index`-by-name attrs override that
-clobbered any real file named `index`. The same agent fixed all six with
-regression tests, then stitched the held-handle override — proven by a
-counting harness asserting exactly ONE remote OPEN for a four-chunk
-transfer, with per-chunk lock scoping so the keepalive and sibling ops
-interleave with a long copy. One day, design to stitch: `ad4b212e`
-(pump), `99d4e5cd` (share). Live verification against a real kernel is
-the open loop; slices 2–4 (`kj share` verbs, `:rw`, notify) wait in
-issues.md.
-
-## The beat gets a face — the TRACKER station (July 15)
-
-The East wall had worn a promissory nameplate since the octagon existed:
-"TRACKER", a dim marker breathing with the well's loudest beat. Slice 0
-of the tracker station replaced the promise with the instrument. Amy
-picked the **pattern grid** over a DAW lane-wall and a staff-notation
-score wall — the classic-tracker homage turned honest to kaijutsu's own
-model: tracks are independent clock domains (`docs/tracks.md`), so each
-column scrolls at *its own* tempo past one fixed playhead row, and no
-shared row-grid pretends there's a band conductor. Slice 0 shows track
-state only (transport, tempo, phrase lines, attached-context dots, the
-per-column beat pulse); note cells wait for the score-sync plumbing
-decision.
-
-Two design facts carried the build. First, **zero new wire**: the roster
-was already polled (`WellTracks`) and the beat phasors already ingested
-(`WellBeats`) — the one new API is `beat_position()`, whose `None` *is*
-the freeze signal, so a stopped track's rows hold exactly (through the
-5-second poll rebuild via an entity carry, and through room re-entry via
-a durable map kaibo's review demanded). Second, the render split: rows
-move by Transform writes (per-frame-free), text is MSDF plates, the
-pulse is quantized change-guarded material writes — Vello RTT was
-rejected because a continuously-scrolling face would re-raster its whole
-texture every frame.
-
-The review ladder earned its keep in one afternoon: the lead's diff pass
-caught a Bevy B0001 query-conflict panic the whole unit suite was
-structurally blind to (schedules never initialize in tests — the app
-would have died at first frame), plus rows drawing outside the grid band
-and the freeze snapping to zero after the stop-poll rebuild. The live
-pass caught the phrase-emphasis tiers *inverted* (boundaries read as
-gaps in a wall of bright bars) and a header wrapping onto a clipped
-third line. kaibo deepseek then confirmed all six design contracts and
-found the room-re-entry freeze loss neither earlier pass had. Two tracks
-at 120 and 60 BPM scrolling independently on the E wall closed the loop.
-
-## The beat learns to carry its own clock (July 15, afternoon)
-
-Amy's ear caught it during the first tracker-station jam: the metronome
-"bumping a few times, not evenly spaced, like some midi is stuck." A
-timestamped port tap made it concrete — bursts of ten simultaneous C6
-note-ons, then five seconds of silence, cycling — while the bass on the
-same wire stayed metronomic. The asymmetry was the whole diagnosis: bass
-notes ride render cues with a phrase-length lead into the ALSA queue, so
-delivery jitter vanishes; the click follows raw BeatSync references with
-no lead at all.
-
-The kernel was innocent — beats fired on time; ticks are fire-and-forget.
-The references were stalling behind the musician turn's streamed-output
-flood on the single per-connection callback stream, then arriving all at
-once, and the receivers folded every buffered reference against one
-frame-now, walking the phasor beats at a time. The click scheduler then
-amplified the walk: replay-the-backlog on a forward lurch (the blob),
-stranded monotonic next_beat on a backward one (the starve). The repo
-already knew the answer in the other direction: the MIDI-clock-in path
-ships `epoch_ns` with every estimate and back-dates at the consumer. The
-forward path even latched the per-beat wallclock — and dropped it on the
-floor while building the reference.
-
-So the fix was symmetry: `BeatRef.epochNs` on the wire, each reference
-re-anchored to its own emission instant before folding (stale ones
-dropped, the phasor free-running on exact feedforward tempo), a liveness
-split so a backlogged-but-alive track never gets pruned, and a click
-policy worth stating as law — a metronome never stacks clicks and never
-silences past a bounded slack; missed beats are missed. The burst
-behavior had been *encoded in a unit test* as correct; the test was
-rewritten, not preserved. Live verify: 149 consecutive intervals between
-499 and 510 ms straight through the model's turns, where the morning's
-trace showed zero-millisecond blobs and six-second holes.
-
-The jam also surfaced the next lesson, filed for its own arc: the track's
-score outlives every player by design, but injecting the *whole* committed
-score into each wake means a long-lived track eventually drowns every
-musician that sits down at it — a fresh chair at the morning-old track
-opened at 190k tokens. The band view needs a window.
-
-The phase story closed the same day. With the clicks honest, Amy heard
-the next layer: click and bass drifting apart — the exact
-boundary-jitter failure the 2026-07-02 timebase analysis had predicted
-and posted a validator for. Three more fixes landed as one doctrine
-(docs/midi.md, "The one timebase"): the kernel grid went
-scheduled-periodic (re-arm on the deadline, not the wakeup — lateness
-stopped compounding into the musical timeline), render cues got the
-same emission stamp beat references had (a late cue now spends its
-lateness out of its own lead instead of shifting the phrase), and the
-phasor earned Amy's principle as a mechanism — a deadband inside which
-it takes zero steps and simply IS the local clock, with stale references
-demoted to liveness signals on a ladder. The measurement went from
-zero-millisecond click blobs and six-second holes in the morning to,
-by late afternoon, four hundred click-to-bass pairs across three-plus
-continuous minutes holding a +0.2 ms mean offset with a slope
-indistinguishable from zero — and a click grid averaging 500.00 ms
-exactly. The day also kept teaching on the side: the track-delete verb's
-four live uses found two real gaps in itself (cold tracks after restart,
-persisted rows after manual detach), and the jam demonstrated that any
-track played continuously for a few hours drowns every musician that
-sits down at it — the windowed-band-view problem now filed as the next
-real design arc.
+The fix was symmetry with the clock-in path: every timing artifact carries
+its emission wallclock, sinks back-date, stale ones are demoted on a ladder,
+and a metronome never stacks clicks — missed beats are missed. Then the
+kernel grid went scheduled-periodic (re-arm on the deadline, not the wakeup)
+and the phasor earned a deadband inside which it simply *is* the local
+clock. From zero-millisecond click blobs and six-second holes in the morning
+to four hundred click-to-bass pairs holding +0.2 ms with zero slope by late
+afternoon. `docs/midi.md` "The one timebase" is that day written as
+doctrine. The jam also showed that a track played for hours drowns every
+musician who sits down at it, which filed the windowed band view.
 
 ## The stolen bridge (August 2–3)
 
-For weeks the MCP shell carried an intermittent ~5-second tax that read
-like a haunting: the kernel finished every command in milliseconds, the
-reply just didn't arrive until a stall-fallback resubscribe went and
-fetched it. The 2026-07-17 `SubscriberHealth` rewrite had already fixed
-the *long* hangs, but this residue survived reboots and defied the usual
-staleness stories. The diagnosis, when it landed, was one line reading
-another: the server dedupes block-event subscriptions by (principal,
-instance) — correct, so a reconnect replaces its own dead bridge — but
-`kaijutsu-mcp` passed the literal `"mcp-server"` as its instance, so
-every concurrent MCP process for one principal was *the same client*.
-Whoever subscribed last silently evicted the rest, and an evicted client
-was never told; its channel just went quiet until its own next call
-stole the slot back. Five live processes, measured: 5419 ms for a
-146 ms echo. The app had the identical bug spelled `"bevy-client"` —
-two windows trampling each other — while the correct shape,
-`app_peer_instance()`, sat one layer above it minting per-process UUIDs
-for the peer registry. The fix was to let both clients use that shape
-for the subscription too, and the lasting lesson rode along as
-observability: the registry now remembers *which connection* registered
-each bridge and warns when a different one displaces a live entry,
-carrying the evicted subscription's age — the signal that turns this
-class of theft from an afternoon of forensics into one journal line.
-Truncation honesty shipped the same day: a kaish result that spilled its
-output (exit remapped to 3) no longer reads as failure on the MCP path —
-error-ness is judged by the command's real exit, with `[output
-truncated]` and a structural `did_spill` keeping the cap unmissable, so
-a model neither retries a command that succeeded nor reasons over a
-head+tail excerpt as if it were whole. And kernel.db — 287 MB of every
-conversation we've ever had, one WAL-mode file with no backup story —
-got its first: `kj db backup` (SQLite's `VACUUM INTO`, consistent
-against a live writer), `kj db checkpoint` for the snapshot-your-own
-crowd, and restore deliberately left a documented procedure instead of a
-verb, because a live file swap under a kernel full of in-memory state is
-a lie waiting to be discovered.
+An intermittent five-second tax on the MCP shell turned out to be one line
+reading another: the server dedupes block subscriptions by (principal,
+instance), and `kaijutsu-mcp` passed a literal `"mcp-server"` as its
+instance, so every concurrent process for one principal was the same client
+and whoever subscribed last silently evicted the rest. The app had the same
+bug spelled `"bevy-client"`. Both now use per-process instances, and the
+registry warns when a different connection displaces a live bridge. The same
+day `kernel.db` got its first backup story (`kj db backup`, `VACUUM INTO`
+against a live writer) and restore stayed a documented procedure, because a
+live file swap under a kernel full of in-memory state is a lie waiting to be
+discovered.
 
 ## Contexts join a band — SQL-native model config and casts (August 3)
 
-The afternoon's seed ("consider adopting kaibo's config and cast concept?")
-became the evening's renovation. Reading kaibo's resolved config against our
-`llm/` layer made the gaps obvious: the provider table's NAME was its TYPE, so
-a second openai-compatible endpoint needed a blessed name; tunables (effort,
-thinking budgets, sampling) existed nowhere; and the hosted-OpenAI path had
-been quietly broken since GPT-5.x started rejecting `max_tokens` — a live
-probe confirmed it in one curl.
-
-The design conversation took two turns that mattered. First, Amy pushed past
-"adopt kaibo's TOML": *"I'd like to see the cast data modeled in SQL directly
-and that's the source."* models.toml — the kernel document, the embedded asset, the
-whole TOML parse layer — was demolished, replaced by normalized tables
-(backends with a name/kind split, casts, cast_slots, aliases, llm_defaults)
-edited through `kj backend`/`kj cast`/`kj alias`, with the registry rebuilt
-live on every write. No restart to change which model runs. Bootstrap is
-agent-driven: read a colleague's config, run the verbs. Second, presets
-survived on purpose. The near-miss was absorbing them into casts; reading the
-actual code showed presets are patch recall over verb args (fork bases,
-consent), of which model-pinning was only the underused corner. So the
-concepts split cleanly — **cast = who plays, preset = the patch** — and a
-preset now references a cast instead of pinning provider/model itself.
-
-Roles are context_types, the same word rc dispatch already keys on, so `kj
-context create --cast house --type coder` seats a context in the band and the
-turn path resolves explicit override → cast slot → default through one pure
-function. Existing contexts rolled over idempotently (keep the surviving
-backend names, rename openai→gpt, toss the rest to deepseek-v4-flash). Three
-lanes ran it: Opus built the schema/registry/verbs, two Sonnets in one tree
-with file fences did tunables-to-the-wire and cast-on-context, and the lead
-stitched the seam where they met. The first live proof was a `budget`-cast
-probe context resolving `deepseek/deepseek-v4-pro via CastSlot` in the
-journal on its first turn. Old aliases didn't make the trip — Amy: "they were
-guesses" — the floor ships four backends, zero aliases, zero casts, and every
-row above it is something someone chose.
+Reading kaibo's cast concept against our `llm/` layer made the gaps obvious,
+and Amy pushed past "adopt kaibo's TOML": *"I'd like to see the cast data
+modeled in SQL directly and that's the source."* `models.toml` was demolished
+for normalized tables edited through `kj backend|cast|alias`, registry rebuilt
+live on every write. Presets survived on purpose once the code showed they
+are patch recall over verb args: **cast = who plays, preset = the patch.**
+Roles are context_types. Old aliases didn't make the trip — "they were
+guesses" — so every row above the floor is something someone chose.
 
 ## Errors that were only strings (August 3–4)
 
-Amy's rule arrived as a one-liner — *DB errors are P1, we fix them now* —
-and the kernel spent two days proving why. It started with a warn that had
-been scrolling past every restart since mid-July: `UNIQUE constraint failed:
-contexts.context_id`, once per archived context. Not a race, as everyone
-assumed, but two different definitions of "KernelDb already knows this
-context" sitting a few lines apart: the presence check asked the *active*
-set while the primary key covered the whole table, so every archived
-context looked missing forever and got re-offered on every cold start. The
-PK had been quietly doing the real work — and quietly preventing an
-archived context from being *resurrected* by a placeholder row, which is
-why the obvious idempotent-insert "fix" would have been the dangerous one.
+Amy's rule arrived as a one-liner — *DB errors are P1, we fix them now* — and
+the kernel spent two days proving why. A warn scrolling past every restart
+since mid-July was two definitions of "already knows this context" a few
+lines apart. `create_document` decided whether a failed insert was benign by
+asking `e.to_string()` for "UNIQUE constraint", and two failures wore that
+disguise: a benign PK conflict and a different document claiming a taken
+path. The fix refuses to read messages at all: on a violation the DB layer
+reads itself back and returns a typed answer, so classification depends on
+the database's state rather than its prose.
 
-Pulling that thread surfaced the sibling one file over. `create_document`
-decided whether a failed insert was benign by asking `e.to_string()`
-whether it contained "UNIQUE constraint" or "already exists" — and the
-string it was matching came from `map_unique_violation`, which flattens
-*every* constraint violation into one message. Two failures wore that one
-disguise: a primary-key conflict (the same document, genuinely benign) and
-a partial-unique conflict on `(workspace_id, path)` — a *different*
-document claiming a taken path, which is divergence. Both got the same
-cheerful "recovering" warn. And the whole recovery hung on wording: reword
-the message and every duplicate-document recovery becomes a hard error, no
-test the wiser. The fix refuses to read messages at all. On a constraint
-violation the DB layer *reads itself back* — is there a row at this id? is
-there a row at this path? — and returns a typed answer, so classification
-depends on the database's state rather than its prose. Above it, the benign
-arm now compares the persisted row against the one it meant to write; kind,
-workspace, or path differing is `DocumentDiverged`, never a recovery.
+The drift router's dead letters were being written by a caller that logged
+and carried on; three lines above sat the invariant being broken (a
+registered handle implies a row). Then the live run found the joke: restart,
+orphan a drift, flush — *nothing to flush*, because the early return for an
+empty caller queue sat above the global dead-letter half. The existing test
+had met this and accommodated it in a comment that reads like a confession.
+All three fixes were unit-green before that flush ran.
 
-The same day's third strand was the drift router's lost+found. Its dead
-letters — drifts that failed every retry — were written into a context the
-router minted and registered itself, then persisted by a caller that logged
-`tracing::error!` and carried on when the row wouldn't write. Three lines
-above sat the comment explaining the invariant being broken: a registered
-handle implies a KernelDb row. The router turned out to be the wrong place
-to hold the pen, since it has no DB handle and can only ever produce a
-rowless handle; it now *claims* an id whose row someone else has already
-written, and `ensure_lost_found` is gone so the old shape can't be
-rebuilt. The flush secures the sink before draining, returns an error
-naming what it flushed instead of a log line nobody reads, and hands a
-failed dead-letter write back to the queue — the one code path whose whole
-purpose is not losing failed drifts had been dropping them on the floor.
+## Tasks join the block model — the household-agent arc (August 4)
 
-Then the live run found the joke in it. Restart the kernel, orphan a staged
-drift, ask for a flush: *nothing to flush*. The staged queue drains
-per-caller; the dead-letter queue is kernel-global; and the early return for
-an empty caller queue sat above the global half, so dead letters were only
-ever written when the same caller happened to have something else staged —
-never in the case the sink exists for, which is everything having failed. The
-existing test had met this behavior and *accommodated* it, in a comment that
-reads, now, like a confession: "the flush early-returns when the caller's
-staging is empty, so we need both a deliverable item AND a dead letter
-present at flush time." All three fixes were unit-green before that flush
-ever ran, and none of them would have found it. What did was typing the
-command on a live kernel and reading the answer.
-
-## Tasks join the block model — the household-agent arc opens (August 4)
-
-A gap-analysis session against two flagship agent harnesses — hermes-agent
-and QwenPaw, both cloned and read cover to cover — turned up one gap kj
-actually had to fix: no task state. Both harnesses lean on a todo tool
-writing JSON to disk; Amy's read was immediate — *"Task BlockKind and tool
-is a great idea"* — and the reason why fell out of the block model itself.
-A task that's a block gets the block log for free: create it here, watch it
-appear everywhere, no second store to keep honest.
-
-The design took less debate than expected once the precedent was found.
-`content_type` had already solved "one more mutable field on every block,
-independently LWW-clocked, cheap to add" — a `Copy` field on `BlockHeader`
-plus its own Lamport timestamp, merged by the same `field_wins` tiebreak
-every other per-field register uses. `task_status` is that mechanism
-again, verbatim, which meant the block plumbing — `content.rs`'s
-`set_task_status`, `block_store.rs`'s wrapper, the wire fields on
-`BlockSnapshot` and the `MetadataChanged` bundle — was less a design
-problem than a typing exercise. The one real decision was what status
-even means: reusing the existing `Status` enum (Pending/Running/Done/
-Error) was tempting and wrong, because `Error` means "the tool crashed"
-and a cancelled task isn't a crash, it's a choice. `TaskStatus` got its
-own four values and its own tie-break order — Cancelled outranks Done on
-a timestamp tie, the same way Error outranks Done in the original —
-documented rather than left to accident.
-
-The nuance the task brief flagged in advance turned out to be the real
-one: tasks get edited constantly, mid-conversation, and kaijutsu already
-has a hard rule against exactly that shape of block — the daily
-system-prompt-cache invalidation `BlockKind::Notification` was built to
-dodge in July. The Notification precedent transferred clean once its
-actual mechanism was understood, not just its name: it isn't that
-Notification blocks are special, it's that `ConversationMailbox` only
-ever translates a given `BlockId` once, so a block whose fields mutate in
-place after that translation simply never gets re-rendered into the live
-conversation — the already-sent bytes stay the already-sent bytes,
-cache-safe by construction, no special hydration path required. Task
-inherited that for free. What it does *not* get for free — and what got
-written down rather than built — is the case of Amy completing a task
-from the app while the model isn't looking; that one wants a companion
-Notification block on the same pattern that already exists, deferred
-because nothing forces it yet.
-
-The MCP surface turned into a smaller decision than the doc comments
-suggest it should have been: a fifth builtin server, `builtin.tasks`,
-sitting next to `block.rs` rather than inside it, for the same reason
-`builtin.shell`/`builtin.shell_readonly` already split — a household
-agent should be grantable "groom tasks" without also getting arbitrary
-block surgery. Reaching Claude Code needed nothing at all: the MCP
-slim-down from a few weeks back had already turned the external server
-into a generic `kaish_exec` dispatcher gated by broker capability, so a
-new builtin instance is visible to every `*`-loadout role the moment it
-registers. The tests found two real bugs on the way in — a Lamport-tie
-test that wasn't actually testing a tie (the second peer's clock starts
-one tick ahead after a one-way sync; the fix was an equalizing round trip
-before the race, now called out by name in the test comment so nobody
-"fixes" it back into a false pass), and a `task_list` filter that
-validated the filter string per-candidate instead of up front, so an
-invalid filter silently passed on an empty task list. Both are exactly
-the shape of bug a fresh feature is supposed to shake out before anyone
-depends on it.
-
-Codex later joined this same instrument through two deliberately separate
-channels: its MCP subprocess receives `CODEX_THREAD_ID` for stable identity,
-while command hooks translate Codex lifecycle events into the existing generic
-hook protocol. The split matters because MCP identifies the player but cannot
-observe prompts, compaction, or session boundaries. A source-aware model map
-keeps Codex models on `codex-app` and Claude models on `anthropic`; unknown
-sources leave the provider alone instead of guessing. Codex hooks use a tight
-fail-open budget so a slow kernel never makes the coding loop feel sticky.
+A gap analysis against hermes-agent and QwenPaw found one gap kj had to fix:
+no task state. Both harnesses write JSON to disk; a task that is a block gets
+the block log for free. `task_status` reused the per-field LWW register
+`content_type` had already established, and got its own enum because `Error`
+means the tool crashed and a cancelled task is a choice. Mid-conversation
+edits are cache-safe for the same reason Notification blocks are: the mailbox
+translates a block id once. `builtin.tasks` sits beside `block.rs` so a
+household agent can be grantable "groom tasks" without block surgery. Codex
+later joined through two deliberately separate channels — its MCP subprocess
+for identity, command hooks for lifecycle — because MCP identifies the player
+but cannot observe prompts or session boundaries.
 
 ## The day toad played kaijutsu (August 5)
 
-The household-agent foundations were one night old when Amy opened the day
-with a verdict and a wish: *"Using toad with kaibo was a delight. I'd like
-to have some subagents work on the ACP adapter."* Four lanes launched
-before lunch — the deferred cast toil, the deepseek review queue (where
-soft-cancel crystallization got decided on purpose rather than left as an
-accident of the variant), the Ask pathway for permissions, and the
-headline: `kaijutsu-acp`, a thin ACP v1 bridge in the exact image of
-kaijutsu-mcp. The adapter lane had prior art nobody had planned for — the
-kaibo ACP worktree was sitting in ~/src/wt, the very adapter toad had been
-talking to the day before — and it returned the day's most satisfying
-finding: the session picker could serve the app's ring-0 rank with zero
-schema changes, because the ring stamps already rode the wire and the
-seating function was pure. One seating engine, two frontends; seat 2 on
-the desk is seat 2 anywhere.
+*"Using toad with kaibo was a delight."* Four lanes before lunch; the
+headline was `kaijutsu-acp`, a thin ACP bridge in kaijutsu-mcp's image, whose
+session picker served the app's ring-0 rank with zero schema changes. Then
+Amy bounced the kernel and the first flight died on its first prompt: the
+task merge had added an at-rest CBOR field without a serde default, and the
+breakage sat latent until the bounce — every pre-task document undecodable,
+rc unreadable, no create-time bindings, deny-by-default locking the
+operator's own kj. A missing attribute became a total lockout through four
+links of chain. New at-rest fields decode old bytes or they don't merge.
 
-Then Amy bounced the kernel and the first toad flight died on its first
-prompt — and pulling that thread found the day's real monster. The
-task-blockkind merge had added a field to a struct that rides the at-rest
-oplog CBOR, without a serde default. Nobody had restarted the kernel
-across that merge, so the breakage sat latent until the bounce, then
-detonated all at once: every pre-task document undecodable, rc scripts
-unreadable, therefore no create-time capability bindings, therefore
-deny-by-default locking every facade including the operator's own kj. A
-missing attribute became a total lockout through four links of chain. The
-skip-not-truncate durability design held — nothing lost, everything
-replayed once decode was fixed — and the lessons went straight into the
-backlog: new at-rest fields decode old bytes or they don't merge; forty
-quiet per-document errors should be one loud aggregate; and an unbound
-context that denies its own operator is mistake-prevention behaving like
-an auth wall, which the instrument stance explicitly forbids.
-
-The afternoon became the best shakedown this project has had. Toad flew;
-things broke; every break was real. Four incidents traced to one kernel
-defect — the FlowBus was a shared broadcast ring, so one slow subscriber's
-overflow silently evicted events for everyone — and the adapter grew
-defensive layers (a quiet-poll on the turn wait, catch-up resync, a
-trailing-edge sweep) that each taught the true shape of the problem before
-the real fix landed. Amy set the doctrine in one sentence: *"no lossy
-solutions. I'd rather be disconnected."* The Opus rework built exactly
-that: per-subscription bounded queues, lossless-or-terminated for ordered
-topics, an explicit kick that drops the connection so even a version-blind
-old client recovers through ordinary reconnect-resync. Musical time kept
-its own law — timing topics stay latency-first and drop-oldest, missed
-beats stay missed — and the token firehose got coalesced at the forwarder,
-batching calls but never concatenating buffers. The quiet contract
-underneath is the part worth keeping: sequence numbers mean a gap can now
-only be "terminated or resubscribed," so a gap without a termination is by
-definition a kernel bug, and the client logs it as one. Silent loss
-stopped being a representable state.
-
-Losslessness had one more lesson to teach: per-lane guarantees say nothing
-about ordering *across* lanes, and the turn-completion event started
-beating the final text chunks to the bridge — truncating exactly the
-report the user was waiting for. The bridge learned to settle delivery
-before answering the prompt. Then the arcs converged: Task blocks, one day
-old, wired into ACP's plan updates — cancelled tasks omitted because a
-plan is what the agent intends to do, subtasks flattened, identical
-rebuilds silent — and Amy's flight report closed the loop: *"that task
-tracker worked perfectly though."* Grooming a task block anywhere now
-moves a checklist in every connected frontend.
-
-What toad taught that wasn't ours to fix: it doesn't consume ACP's session
-list (its picker is its own database), and its thought widget accumulates
-upward where nobody is looking. What it taught that is ours: a fresh coder
-context with a full toolbelt answers a simple question with a 63k-token
-expedition, rediscovering kaish's parse rules the hard way every session —
-the coder stance owes the model both proportionality and a primer, and
-connecting clients want identity-keyed presets (ACP's initialize already
-says who's calling). Review earned its keep all day — a hydration-skip
-suggestion from an external reviewer that would have made the leak worse,
-a chained-lock self-deadlock in a merged lane, a settled behavior change
-pinned by test instead of comment. And the crosstalk stance stopped being
-theory: while the model toured the repo in Amy's toad session, the lead
-watched the same blocks from the kj side and Amy watched from the app —
-three players reading one score, which is what the instrument was for.
+The afternoon was the best shakedown the project has had. Four incidents
+traced to one defect — the FlowBus was a shared broadcast ring, so one slow
+subscriber's overflow evicted events for everyone — and Amy set the doctrine
+in a sentence: *"no lossy solutions. I'd rather be disconnected."*
+Per-subscription bounded queues, lossless-or-terminated for ordered topics;
+timing topics keep their own law and drop oldest. Sequence numbers mean a gap
+without a termination is by definition a kernel bug. Per-lane guarantees say
+nothing about ordering across lanes, and the completion event beat the final
+text to the bridge until the bridge learned to settle before answering. And
+the crosstalk stance stopped being theory: the model toured the repo in
+Amy's toad session while the lead watched the same blocks from kj and Amy
+from the app — three players reading one score.
 
 ## The instrument changes its strings (August 12)
 
-Two upgrades landed in a day that a scouting report had said would take
-several, and the interesting part is why the estimate was wrong in that
-direction.
-
-The Bevy 0.19 plan was written by reading all 104 official migration guides
-against the app rather than from memory — deliberately, because model
-training data predates even 0.18's own event-system rename, so any
-recalled claim about 0.19 is suspect by construction. The verdict:
-**seven of 104 guides touched us.** The framework's headline reworks —
-the text stack onto parley, resources-as-components, render-graph-as-
-systems, the extract refactor — were all near-misses, because we had never
-used the APIs they changed. We own our shaping and our MSDF atlas, our
-render-world code was already written as plain systems on `ExtractSchedule`,
-our UI is hand-rolled, and our 687 `Res`/`ResMut` sites kept their sugar.
-The upgrade was small; it had only been wearing a scary hat.
-
-What was actually load-bearing was a dependency whose version number lied.
-`bevy_brp_extras = "0.19"` reads perfectly current and requires
-`bevy 0.18.1`; the release that wants Bevy 0.19 is 0.21. So the one crate
-pinning us to the old engine was the one that looked most up to date — and
-because BRP is how agents drive the live GUI, it was pinning the testing
-loop too. The lesson generalizes past this crate: **read a dependency's
-manifest, never its version number**, and prefer the cargo registry cache
-as truth, because a working checkout of upstream can be five months stale
-while you plan against it. That one nearly bit us too.
-
-The second blocker was invisible to every guide, because it was ours:
-`avian2d` had been declared and never used — no import, no symbol, one line
-in a manifest — and it hard-pinned Bevy 0.18. A physics engine nobody
-called was the thing standing between us and the upgrade. Amy ruled delete
-over bump, which took 440 lines of lockfile with it. Dead dependencies are
-not free; they vote on your version constraints.
-
-Sequencing was the other real decision, and it was made before any code
-moved. Bevy 0.19's `bevy_audio` wants rodio 0.22, which deleted
-`OutputStream` and `Sink` outright — the exact API the 868-line scheduled
-playback engine was built on. The tempting order was to bump Bevy and let a
-second rodio copy sit in the tree. Amy ruled the opposite: **migrate rodio
-first, on its own, then upgrade onto an already-converged audio stack.**
-That kept the "one copy of rodio/cpal" invariant true throughout instead of
-briefly false and then repaired, and it let the playback rewrite be
-reviewed and bisected as itself rather than as noise inside a framework
-bump. The manifest comment that had promised dedupe would return "when Bevy
-0.19 brings bevy_audio onto rodio ^0.22" got to become simply true.
-
-The upgrade found exactly one thing no guide mentioned, and it was a real
-API split rather than a rename: 0.19 divided `UiDebugOptions` into a
-per-node `Component` and a new `GlobalUiDebugOptions` resource, so asking
-for the old one as a resource stops compiling in a way that says "not a
-`Resource`" rather than "moved." Everything else was mechanical, and the
-widest change — 25 `Assets::get_mut` sites now returning `AssetMut<A>` so
-that `AssetEvent::Modified` only fires on real mutation — was applied from
-rustc's own machine-applicable spans rather than by hand. The compiler
-knows where the bindings are; there is no reason to guess and no reason to
-take credit for finding them.
-
-One habit paid for itself twice. A workspace test failed after the bump, in
-a crate with no Bevy anywhere in its tree. The cheap move is to reason that
-it can't be related and move on. Instead it got checked out at the pre-bump
-commit in a worktree and run there, where it failed identically — so it went
-into the backlog as a pre-existing drift-lane regression with proof, rather
-than as a suspicion. Inference would have reached the same answer here.
-Sooner or later it won't, and the worktree costs two minutes.
+The Bevy 0.19 plan was written by reading all 104 migration guides against
+the app rather than from memory, because training data predates the rename
+that matters. Seven of 104 touched us. What was load-bearing was a dependency
+whose version number lied: `bevy_brp_extras = "0.19"` requires Bevy 0.18.1.
+**Read a dependency's manifest, never its version number**, and prefer the
+cargo registry cache as truth over a checkout that can be five months stale.
+An unused `avian2d` was hard-pinning the old engine; dead dependencies vote
+on your version constraints. Amy ruled rodio migrates first, on its own, so
+the one-copy invariant stays true throughout. A workspace test that failed
+after the bump in a crate with no Bevy got checked at the pre-bump commit in
+a worktree, where it failed identically, and went into the backlog with proof.
 
 ## The denial that pointed at a locked door (August 12)
 
-The sharpest item in the kernel backlog had been sitting there since the
-task_status boot flood in early August, wearing a description that was
-wrong. When a context's `create` rc lifecycle failed at its binding step,
-the context was created anyway, holding nothing — and the entry called that
-a total lockout. It isn't. `kj context switch` and every read verb are
-ungated *by design*, and the code says so in as many words, so the operator
-can always walk out of a broken context and can always read the Error blocks
-the failed lifecycle left behind. Diagnosis works. Only action is blocked.
-
-Amy's question was the one that unlocked it: **when would `create` actually
-need to abort?** Almost never, it turns out. A failed stance script costs a
-system prompt; a failed cache script costs tokens; only the binding step
-leaves something inert. And even there, a freshly-created context holds
-nothing worth saving, so abort and create-then-discard cost about the same.
-The case for aborting was ergonomic, not safety — and aborting has a cost
-the bug doesn't: it destroys the Error blocks that explain *why*, which is
-the one part of the story that currently works.
-
-Reading the gate turned up something sharper than the entry recorded. The
-denial didn't merely fail to mention the exit; it advised one that was
-locked. Every refusal ended with *grant with `kj binding allow`*, and the
-binding-write authorizer refuses widening from any caller that is neither
-privileged nor binding-admin — which is exactly the caller reading the
-message. Underneath it, the same line was collapsing a KernelDb read
-*failure* into "denied," so a database fault and a missing grant were the
-same sentence. That is the August 3–4 lesson resurfacing in authz clothes,
-in the one copy of it the broker's fix hadn't reached. And a third: a failed
-lifecycle was a `tracing::warn!` under a plain "created context" success
-line, so the operator was told it worked and found out at their first real
-verb.
-
-So the fix came in two halves that meet. The gate now has three outcomes
-and keeps them three — DB failure, no usable loadout, missing capability —
-and the unbound case names exits that exist: `kj context rebind`, or
-create-switch-remove, which had worked all along as oral tradition and was
-written down nowhere. Creation stays un-aborted and simply stops lying,
-reporting the outcome it produced. And `kj context rebind` re-runs the
-`create` lifecycle on a context that has none, ungated on precisely the
-argument that leaves `create` ungated: the loadout comes from rc, not from
-the caller, so a rebind grants what birth would have granted and nothing
-else. Gating it on `Operator` would have put the repair behind a capability
-the broken context cannot hold — the lockout itself, rebuilt as a feature.
-
-Both halves gate on the *outcome* — "does this context have a usable
-loadout?" — never on which script failed. Keying on script identity would
-hard-code rc layout into the kernel and would miss the quieter case: a
-binding step that ran to completion and bound nothing. The test that matters
-most is the one asserting `rebind` is not capability-gated, because that is
-the decision a future refactor is most likely to undo while tidying.
-
-One test earned its keep by failing for an honest reason. The repair test's
-rc script reported success while the loadout stayed empty: `test_dispatcher`
-leaves the broker's DB handle unset, so `kj binding allow` had written to a
-cache the authorization path never reads. Wiring the handle as production
-does made the test faithful — and made the fixture's own gap visible instead
-of letting a green run paper over it.
+A failed `create` rc lifecycle left a context holding nothing, and the backlog
+called that a lockout. It isn't: switch and every read verb are ungated by
+design, so diagnosis works and only action is blocked. Amy's question — when
+would `create` actually need to abort? — answered almost never, and aborting
+destroys the Error blocks that explain why. Reading the gate found the sharper
+defect: every refusal advised `kj binding allow`, which the caller reading the
+message could not run, and a KernelDb read failure was collapsing into
+"denied." The gate now keeps three outcomes three, the unbound case names
+exits that exist, and `kj context rebind` re-runs `create` ungated on the
+same argument that leaves `create` ungated: the loadout comes from rc, not
+the caller. Gating the repair on a capability the broken context cannot hold
+would have rebuilt the lockout as a feature.
 
 ## The mirror that stopped being a mirror (August 13)
 
-`kaijutsu-mcp` was a CRDT replica. It held a `SyncedDocument` of the joined
-context, authored blocks into it, pushed the resulting ops upstream, and
-maintained the whole apparatus that keeps a replica honest: a sole-writer task,
-a command channel, resync coalescing, a pushed-frontier, an event bridge. By
-the end of one day it held none of that, and the thing that replaced it is a
-single integer going up.
+`kaijutsu-mcp` was a CRDT replica with a sole-writer task, resync coalescing
+and an event bridge. By the end of the day it held none of that. Amy's
+framing made the shape right: a tool call takes a quick lock at startup, then
+runs independently — so the atomic part is only the reservation, and a
+ToolCall at `Running` is a legitimate pending state. **Reserve, then flow.**
+`authorBlock` and `completeBlock` replaced the raw-op path. Then the layers
+came off in order, each smaller because the previous had removed its reason,
+and the last inversion was the key: **polling became the guarantee and events
+became a hint.** A dead feed is no longer a condition to detect; it just
+means nothing arrives early. 624 lines went. The hook boundary consolidated
+the same way later — `kaijutsu-mcp hook claude|codex` absorbed both native
+protocols and two Bash-plus-jq wrappers disappeared.
 
-The day did not start as a demolition. It started with a schema question —
-there was no block-authoring verb anywhere in the `Kernel` interface, and the
-tempting shortcut (`block_create` via `executeTool`) hardcodes `after`, status
-and content-type, and parses a `metadata` argument it never reads. Tool blocks
-routed through it would arrive with no name and no input **and nothing would
-error**. So `authorBlock`/`completeBlock` were appended at the next free
-ordinals, refusing two things rather than papering over them: an unparseable
-principal, and a ToolResult without its call's id.
-
-Amy's framing is what made the shape right. The earlier design had wanted an
-atomic `authorToolPair`, on the theory that a ToolCall without its result is
-corruption. Her model dissolved that: *a tool call should have a quick lock at
-startup, then run independently of other tool calls* — so the atomic part is
-only the **reservation**, and a ToolCall sitting at `Running` is a legitimate
-pending state, not an orphan. Reserve, then flow.
-
-Then the layers came off in order, and each one was smaller than it looked
-because the previous one had removed the reason for it. Authoring moved to RPC,
-which meant the mirror had no local writer, which meant the resync's pre-fetch
-flush and its abort-on-failure guard were protecting against a hazard that
-could no longer arise — two documented races gone by construction rather than
-by guard. The cold readers moved to server queries. The shell completion poll
-moved last, and inverting it was the key: **polling became the guarantee and
-events became a hint**. Before, the event feed was the mechanism and an
-authoritative catch-up was the emergency — so the common path trusted a cache
-fed by exactly the feed whose death the emergency path existed to detect. After,
-a dead feed is not a condition to detect and recover from; it just means nothing
-arrives early. Nothing to detect is nothing to get wrong. Two filed bugs died in
-that inversion without being fixed.
-
-With the last reader gone the mirror was write-only — maintained for nobody —
-and 624 lines of replica machinery went with it.
-
-The same consolidation later reached the hook boundary. Claude Code and Codex
-hooks had entered through two Bash programs and two jq maps before reaching a
-Rust client that already owned compaction, socket discovery, session matching,
-transport, and deny handling. `kaijutsu-mcp hook claude|codex` absorbed both
-native protocols, including their response envelopes, and the wrappers
-disappeared. The identity distinction stayed explicit at that boundary:
-`session_id` is the hosting conversation/thread used to select and stabilize a
-listener, while `agent_id`/`subagent_id` is only the principal acting inside
-that session. Collapsing those two would route a subagent event to a different
-conversation; preserving them made the adapter deletion an ownership cleanup,
-not a protocol change.
-
-**What the day was really about was tests that cannot fail.** Every defect found
-passed careful reading and died on execution, and there were five. A cancellation
-leak the refactor itself created: `with_hook_budget` is `tokio::time::timeout`,
-which *drops* the future, so a budget expiry between the reservation and its
-completion stranded a ToolCall at `Running` forever — the old design could not
-have that bug, because the pair was written under one lock with no await between
-them to cancel at. Splitting a local critical section into sequential awaits
-creates cancellation windows that did not exist. Worse, the design doc had argued
-`Running` was acceptable *because it was transient*; the refactor falsified the
-premise and left the argument standing.
-
-A wire field nobody read — `completeBlock` shipped with an `isError` the server
-ignored, which is precisely the `block_create` defect that justified building the
-verb, written down in the schema and the commit message and reproduced one
-ordinal later anyway. Writing the rule down did not prevent it; a reviewer
-reading the handler did. Made a refused-on-contradiction check, it caught a live
-inconsistency in our own hook path on its first run.
-
-And the sharpest one, because it was invisible until something forced it: the
-test guarding "shell survives a dead event feed" ran `echo`, which finishes
-server-side before the first poll. Under the old design the mirror *could not*
-hold the answer with the feed dead, and that alone is what made a fast command
-exercise anything; the moment the poll asked the server instead, the test proved
-"one query works" and nothing else. It was found by deleting the poll floor and
-watching the test pass anyway.
-
-The habit that worked every time was not review. It was **running the exact
-thing against the real system** — falsifying each new assertion by breaking the
-code under it, and probing idioms in a live kernel instead of reasoning about
-them. That is also how the day's other lane found that our own bug report was
-too kind: we reported a shell expansion yielding empty, and their re-probe found
-the word vanishing from the AST entirely, so inside quotes it produced a *wrong
-path* rather than a missing one. A report describes what was visible from where
-you stood; a probe finds the shape.
-
-An untested mechanism is a claim, however carefully its prose is worded.
+What the day was really about was tests that cannot fail. Five defects passed
+careful reading and died on execution: a `tokio::time::timeout` that drops
+its future stranded a ToolCall at `Running` in a cancellation window the old
+single-lock design could not have; a wire field the server ignored,
+reproducing one ordinal later the exact defect that justified the verb; a
+"survives a dead feed" test running `echo`, which finishes before the first
+poll. An untested mechanism is a claim, however carefully its prose is
+worded.
 
 ## The instrument could not say who was in the room (August 15)
 
-The day's first task was a function that was correct, tested, and called from
-nowhere. `roster_sources::spawn_periodic_refresh` had shipped with the live
-roster the evening before — unit-tested against `refresh_once`, and never
-wired into the server's boot, because the branch that built it could not start
-a live kernel and declined to add an unverified call. That is a shape unit
-tests structurally cannot catch: the function is right, its caller is absent,
-and every test of the function still passes.
+`spawn_periodic_refresh` was correct, tested, and called from nowhere. Proof
+it ticks came from the live kernel: samples of `/run/roster/index` landed on
+the loop's own grid, ten thousand milliseconds apart.
 
-So the test that fixes it reads no roster surface at all. Both read paths
-self-heal the boot rule inline, which means a test that touched one would have
-passed with the spawn deleted — the only honest assertion is the one that
-refuses to look. Proof it ticks came from the live kernel rather than the
-suite: sampling `/run/roster/index` at twelve-second intervals returned
-`recorded_at` values exactly ten thousand milliseconds apart. The samples land
-on the loop's own grid instead of on the read times, which is the difference
-between scheduled-periodic and read-triggered, and no unit test can show it.
+Then a `cat` of that index exited 3 and the thread ran all day. kaish caps
+captured output by replacing it with a preview and remapping the exit code,
+which is right, but its audience was wrong: it also reaches `$?`, so inside
+an rc or hook body a command that merely printed a lot reads as failed, and
+the gate's classifier would have escalated on a *good* long answer. The fix
+asked who consumes the output: model-facing shells keep the cap; rc, hooks
+and the editor's `:r !cmd` get a runaway backstop. The test pins kaish's
+current wrong behavior so the workaround can go when upstream fixes it.
 
-Then a `cat` of that index returned exit code 3, and the thread it pulled ran
-all day.
+The part worth keeping is what the machine could not do. Clearing 194 stale
+contexts needed a safety filter, and roster liveness is not it: `recent`
+means "appended a block in fifteen minutes," not "someone is attached." It
+reported four live contexts while a Codex lane sat mid-review, connected and
+thinking. Amy held the fact — *"there should be moltar app, this claude code,
+maybe subagents, and a codex session"* — and the instrument had no way to
+represent it. Use last-activity age, and treat "attached" as a question the
+roster cannot yet answer.
 
-kaish caps captured output by replacing it with a preview and remapping the
-exit code — deliberately, so an embedder can tell. The remap is right. Its
-*audience* was wrong: it also reaches the running script's `$?`, so inside a
-kaish program a command that succeeded and merely printed a lot reads as
-failed, and `set -e` and `cmd || fallback` both take the error branch. Our MCP
-tool already unwrapped it correctly; rc bodies and hook bodies did not — and
-the approval gate's classifier escalator is designed to be an rc script that
-branches on a captured response. It would have escalated on a *good* long
-answer.
-
-The fix was to stop asking "how much do we trust this caller" and start asking
-**who consumes this output**. Model-facing shells keep the cap, because bounded
-output is the point there. rc bodies, hook bodies, and the editor's `:r !cmd`
-splice — which pastes command output into a document, where a head-and-tail
-preview is not truncation but forgery — get a runaway backstop instead. The
-test pins both halves, including kaish's current wrong behaviour, so that when
-upstream fixes it the test fails and says the workaround can go.
-
-The same investigation falsified our own filed report in both directions. We
-had recorded that truncation set no failure code (it does) and that command
-substitution silently truncated at 8 KB (108896 bytes now round-trip intact).
-The correction deliberately does not conclude the original was imagined —
-someone watched that happen, and a negative probe is a claim about the probe.
-
-The roster's size turned out not to be a leak but a shape: its `recent` source
-is one row per non-archived context, so it rendered 199 rows to report three
-live entities, over the model-facing output cap, which is how a model asking
-who was around got a truncated splice of mostly-dead rows. Filtering it to
-"who is around" — hiding only what we positively know is dead, because
-`live == None` means *unknown* and a status-only entity has exactly that shape
-— dropped it to four rows. And the filter immediately exposed a bug the 195
-idle rows had been burying: the CLI rendered the same principal twice, because
-presence rows are per-connection and the VFS had always grouped by entity while
-the CLI never did. Two surfaces disagreeing about the same data is how "the
-roster is flaky" starts.
-
-**The part worth keeping is what the machine could not do.** Clearing 194
-stale contexts needed a safety filter, and roster liveness looked like exactly
-the right one. It is not: `recent` means "appended a block in fifteen minutes",
-not "someone is attached". It reported four live contexts while twenty-four had
-been active that day and a Codex lane sat mid-review, connected and thinking.
-Archiving on roster-idle would have soft-deleted attached sessions' contexts.
-Nothing in the instrument said so. Amy did — *"there should be moltar app, this
-claude code, maybe subagents, and a codex session working on acp"* — and
-checking that against the process table found every one of them. The rule that
-came out is dull and the way it arrived is not: **use last-activity age, and
-treat "attached" as a question the roster currently cannot answer.**
-
-Replacing ROOT then made the same point structurally. ROOT is special by
-convention — a label plus a promotion — while every generic mechanism treats it
-as an ordinary context. The three-hour sweep would have taken it at 29 days
-idle. Label uniqueness locked its own name against reuse, reporting the label
-both "already in use" and "not found". And archive cascades to structural
-children, so parenting the new root under the old one for honest lineage and
-then archiving the old one destroyed the new one — the confirm prompt had said
-`1 children`, which is inventory where it needed to be consequence. None of
-those are bugs in those mechanisms. Each is correct for an ordinary context.
-
-Amy settled the shape: *"I had thought to make it a dag but the data is
-naturally a forest and drifts create cycles if you count them."* The code
-already agreed — `insert_edge` cycle-checks `Structural` edges only, leaving
-drift exempt by construction. Checking that invariant was actually enforced
-turned up a real bug: `kj context move` deletes the old parent edge before
-inserting the new one, with no transaction and with cycle detection inside the
-insert, so a *refused* move orphans the context it refused to move. Which is
-also, wryly, the only way to make a detached context from `kj` today.
-
-Anchors are the answer, and their justification is not tidiness but fork cost:
-an anchor is what you fork from, and forks copy history, so every block that
-lands in one is paid for again by every descendant forever. The old ROOT
-carried ninety.
-
-Three weeks later the cascade itself went. Rotating ROOT again, this time by
-create rather than fork, ran into the same wall from the other side: the
-successor is a child of the old root, so the old root could never be
-archived without taking the new one, and five live contexts with it. Amy's
-answer was that the premise was wrong. Archive is a fact about one context,
-and a lineage is worth more intact than tidy: most of the past archived,
-all of it still in one graph, the root moving under it daily. With that,
-the anchor idea shrinks to "never swept by age", and rotation is four plain
-steps.
-
-Two lessons, and they are the same lesson from opposite ends. A mechanism can
-be correct in isolation and wrong in place — a function with no caller, a
-signal aimed at the wrong audience, a specialness that lives only in a label.
-And the loop is not decoration: the fact that prevented the day's one
-irreversible mistake was held by the human, because the instrument had no way
-to represent it.
+Replacing ROOT made the same point structurally: special by convention,
+ordinary to every mechanism. Amy settled the graph — *"I had thought to make
+it a dag but the data is naturally a forest and drifts create cycles if you
+count them"* — and checking that invariant found `kj context move` orphaning
+a context it refused to move. Anchors exist for fork cost: forks copy history,
+so every block in a root is paid for by every descendant forever. Three weeks
+later the archive cascade itself went: archive is a fact about one context,
+and a lineage is worth more intact than tidy.
 
 ## The melt begins, and finds two armed fields (August 15)
 
-The CRDT position paper had already ruled: one authoritative kernel sequencer,
-rich RPC authoring, projected event streams, no client dependency on the text
-engine. What began this day was the migration itself, and it went one step past
-the paper — replacing CRDT-shaped durable storage wherever semantic kernel
-operations are sufficient, rather than only closing the client boundary.
+The CRDT position paper had ruled: one authoritative sequencer, rich RPC
+authoring, projected event streams, no client dependency on the text engine.
+The migration began, and went one step past the paper — replacing CRDT-shaped
+storage wherever semantic operations suffice. Amy declined to gate the git
+work on principal provenance: the gap is a pattern across seams, not a config
+bug, and fixing it under whichever lane stands there fixes it in one place.
 
-Amy's rulings came first, because the config half could not start without them.
-The four config roots melt into one git worktree, one commit per accepted
-mutation — the git log *is* the config oplog, which is the whole reason to
-prefer files over documents. Seeding stays bootstrap-only through the migration:
-a deleted file stays deleted, new shipped defaults do not appear, and the
-migration does not also introduce tombstones. And no client outside the repo
-uses the raw push/sync RPCs, so they could be frozen outright instead of
-carrying an open-ended compatibility promise.
+The MCP shell-completion path had a Phase 2 that decoded the whole oplog to
+re-read a block, justified by a careful comment about three reorderable
+topics. The argument was sound and about a mirror the August 13 demolition
+had already replaced; the variable was still named `local`. A stale comment
+is a false premise parked where the next reader will pick it up. Two more
+were corrected the same day, one citing three schema ordinals that were all
+wrong.
 
-One ruling was a correction. The plan had made honest per-mutation provenance a
-precondition for the git work, since a commit is supposed to record who asked.
-Amy declined the gating: *"I don't think the principal plumbing should gate the
-git work. Let's make a local note to do a sweep across the code and look at
-principal plumbing holistically."* The gap is real but it is a pattern across
-seams, not a config bug, and fixing it under whichever lane happens to be
-standing there fixes it in exactly one place.
+A throwaway question — does a projected block query match a decoded sync
+payload? — found two fields the server wrote and no client read, `excluded`
+and `created_at`. Harmless only because the clients that care still read the
+other path, which the migration was about to move them off. A wire field no
+client reads is not dormant; it is armed, and the migration pulls the pin.
+The zero case for `created_at` is the house style in miniature: propagate a
+1970 faithfully rather than substitute "now." And a "flaky" kernel test was
+reproducing a real bug: `mount` printed past the output cap, and the durable
+record of a capped command carried a failure code under a healthy status.
 
-### Phase 2, and the comment that kept it alive
+## The day the wire stopped being a storage engine (August 15–16)
 
-The MCP shell-completion path had two phases. Phase 1 waited for a tool result
-to reach terminal status; Phase 2 then pulled the entire context snapshot,
-decoded the oplog into a throwaway document, and re-read the same block. Its
-comment justified the second read carefully: content, exit code and status ride
-three independently-reorderable topics, so an observed terminal status does not
-prove the rest has replicated.
+Everything until then assumed the wire was near-frozen. Amy lifted it in a
+sentence: every client is in-repo and rebuilt together, so flag-day changes
+are fine where they reduce debt. Freezing collapsed into deleting: `pushOps`
+and `pushInputOps` went, a thousand lines, and with them `merge_ops`' only
+caller. Concurrent merge into kernel documents became **impossible**, and the
+instrument built that morning to measure whether it ever happened was deleted
+hours later, because a structural impossibility beats a metric reading zero
+forever.
 
-The argument was sound. It was also about a local mirror that the August 13
-demolition had already replaced with an authoritative server query — a fact
-visible in the variable still named `local`. Phase 1's result had been complete
-for two days. The comment kept arguing for machinery that no longer fed it, and
-because the argument read as current, nobody re-derived it.
+The replacement design was right in shape and wrong in placement. A DeepSeek
+review confirmed append-or-replace events and refuted the reasoning (content
+comparison, never a list of tool names). A Gemini review, asked to counter our
+anchoring, found that classification had been specified at the wire against
+per-subscription state, where the bridge would have to link the library being
+removed; it belongs inside the mutation lock where both texts are in hand.
+The same review found gap recovery unimplementable because the snapshot query
+returned no version, and argued for one ordered per-context change feed
+carrying events and the version they bring the client to. Amy: *"it's been
+creeping around my thoughts and is the right move."* Timing artifacts keep
+their own path; the timebase doctrine forbids the batching trade for them.
+`docs/change-feed.md`.
 
-Two independent traces — an outside model reading the real code, and the
-implementing agent — checked field parity, write ordering, lock coverage and
-output caps before anything was removed, and agreed. Phase 2 was deleted rather
-than reimplemented, and with it the last production oplog decode in the MCP
-crate. The lesson generalizes past this one function: a stale comment is not
-cosmetic debt, it is a false premise parked where the next reader will pick it
-up. Two more were found and corrected the same day, one of them citing three
-schema ordinals that were all wrong.
+Building it taught two things. The snapshot query hides that `BlockSnapshot`
+has no ordering key, which is exactly what ACP had been using the CRDT for,
+so the insert event carries a position. And a client cannot edit a block's
+text at all — `pushOps` was the only path — which "all authoring goes through
+rich RPC" had been written as though the verbs existed. The client-side
+follower is written once and refuses rather than guesses; its own tests
+caught a stale-index bug in the move path. All three clients moved the same
+evening and each deleted a staleness apparatus that had been load-bearing for
+a replica that could quietly diverge. The one bug needed no concurrency: the
+version rode a *delivery* while the rule reasoned per *event*, and a delivery
+is a batch. The last holdout on the old surface was the time well's activity
+glow, which counted events and never looked inside them; Amy disabled it
+rather than migrate it, and four thousand lines went.
 
-### The fields nobody read
+The renumber exposed an assumption the least visible way available: the
+client crate's build script had never declared the schema as a dependency,
+and every previous change had been additive enough to hide it. Amy reading
+the test output rather than the code found the shipped default `mcp.toml`
+pointing at her own kaibo, so every test kernel opened her live state
+database. A shipped default is a decision made on every machine that has not
+overridden it.
 
-The audit that mattered came out of a throwaway question — whether a projected
-block query returns the same snapshot as a decoded sync payload. Field for
-field, almost. Two exceptions: `excluded` and `created_at` were both serialized
-by the server and never read back by the client. Every block that arrived over
-the projected path reported itself as not excluded, and reported the moment it
-was parsed as the moment it was created.
-
-Neither was doing damage, and that is precisely why they had survived. The app
-and ACP still read blocks off the sync payload, which carries both fields
-correctly. But the remaining work in this lane is moving those two clients onto
-projected queries — which would have converted both gaps, on the same day, into
-silent loss of user-curated exclusions and the corruption of every block's
-creation time. The time well seats contexts on rings by idle age; exclusions are
-an explicit invariant of the migration.
-
-So: a wire field that no client currently reads is not dormant. It is armed, and
-the migration is what pulls the pin. Both were fixed before the clients moved,
-and a full field-by-field sweep confirmed they were the only two — with the
-nested payload structs recorded honestly as spot-checked rather than audited.
-
-The zero case for `created_at` got its own decision, and it is the house style
-in miniature: propagate a zero faithfully rather than substituting "now". A
-visibly absurd 1970 timestamp is debuggable. A silent substitution makes an
-upstream defect indistinguishable from a correct fresh block.
-
-### A flake that was not one
-
-A kernel test was failing on main, and the first agent to meet it reported a
-pre-existing flake. The claim was true and the explanation was not. The test
-asserts that `mount` runs and exits zero in an exec-granted shell; `mount` on
-that host prints fifteen kilobytes against an eight-kilobyte output cap, and
-kaish remaps a capped command's exit code to signal the truncation. The test was
-reproducing a real bug, and it passes anywhere `mount` happens to print less —
-which is exactly why it reads as noise.
-
-Following it found the durable half. An earlier investigation had concluded that
-the tool-facing callers were safe, on the strength of one call site that consults
-the preserved original code. The path that writes the durable record does not:
-a command that exits zero but prints past the cap records a failure code on its
-result block, permanently, while its status still reads as done. Wrong data, at
-rest, wearing a healthy status — filed rather than patched, because the fix
-belongs with whoever also makes that test's dependence on the host's mount table
-explicit instead of incidental.
-
-## The day the wire stopped being a storage engine (August 15, later)
-
-The melt's first day ended somewhere its plan had not imagined, because the
-constraint the plan was written under turned out to be optional.
-
-Everything until then assumed the wire was near-frozen: additive changes only,
-freeze a method before deleting it, negotiate a capability bit so old and new
-clients could coexist. Amy lifted it in a sentence — the protocol is not locked,
-flag-day changes are fine where they reduce technical debt, every client is
-in-repo and rebuilt together. Later she added that the app could break and be
-rebuilt, and that ACP could break too, since it is still experimental.
-
-Three things fell out immediately, and the third was the one that mattered.
-
-The first was that freezing collapsed into deleting. `pushOps` and
-`pushInputOps` let a client push raw CRDT operations into kernel documents; they
-had no production callers and had not for some time. Deleting them removed about
-a thousand lines.
-
-The second was that the deletion was worth more than its line count. The
-kernel's `merge_ops` had exactly one caller — the `pushOps` handler. Oplog replay
-does not use it; replay applies a document's own history in order and never
-reconciles a concurrent branch. So removing that handler did not merely retire
-dead code, it made concurrent merge into kernel documents **impossible**. The
-migration plan had listed, as the gate on replacing the CRDT text engine, an
-instrumentation task to measure whether non-trivial merge ever happened inside
-the kernel. That instrument had been built earlier the same day. It was deleted
-a few hours later, along with a sibling counter in the same position, because a
-structural impossibility is a better answer than a metric reading zero forever —
-and an unreachable instrument is worse than none, since it implies something was
-measured.
-
-### The design that was right in shape and wrong in placement
-
-The third consequence took two reviews and a wrong turn to find.
-
-Replacing the raw-operation text projection needed a replacement, and the first
-proposal was two events: append a suffix, or replace the whole content, chosen
-structurally by whether the new text starts with the old. A DeepSeek review
-confirmed the shape and refuted the reasoning — the document claimed one tool
-could produce a non-append change and there were five, and it never said *how*
-the server would classify. The safe rule is content comparison, not a list of
-tool names, because a list can be wrong and a comparison cannot.
-
-Then a Gemini review, asked specifically to counter our anchoring now that the
-additive constraint was gone, found the deeper error. Classification had been
-specified *at the wire*, against a per-subscription record of the last text sent.
-That is impossible and expensive at once: the internal event carries opaque CRDT
-bytes, so a bridge cannot classify without linking the very library being
-removed, and per-subscription tracking means one string buffer per block per
-subscriber. Classification belongs inside the mutation lock, where both texts are
-already in hand.
-
-The same review found that gap recovery could not be implemented at all as
-written, because the snapshot query returns no version — so a client cannot know
-whether a queued append is already included, and applying it twice corrupts the
-text.
-
-And it argued for something larger: not two events bolted onto an interface of
-thirteen, but one ordered per-context change feed carrying a list of events and
-the version they bring the client to. That shape gets three things the pair
-cannot. Coalescing becomes native, so the batching special-case that exists today
-disappears rather than being reimplemented. A tool's final output and its
-completion status arrive in one delivery, closing a race where a client renders a
-finished tool with no output. And two clocks — an operation counter and a
-delivery counter — collapse into one version.
-
-Amy took it immediately: *"it's been creeping around my thoughts and is the right
-move."*
-
-One hazard came from the house's own doctrine rather than from any review. Two of
-the thirteen events are musical: render cues and beat sync. Batching trades
-latency for fewer messages, and the timebase doctrine forbids exactly that trade
-for timing artifacts. They keep their own path, written into the specification as
-its own rule rather than left to be remembered.
-
-### What the day was actually about
-
-Three bugs found that day shared a shape. A block's `excluded` flag and its
-`created_at` were written by the server and never read by the client, harmless
-only because the clients that would care still read a different path — and the
-migration was about to move them onto the path where it stopped being harmless. A
-shell command that printed more than eight kilobytes recorded a failure code on
-its durable record while its status still read as done. And an ACP session
-watching a spliced block appended a bogus suffix to stale text, rendering
-characters no one wrote.
-
-None of the three was visible as a failure. Each was a place where the system
-said something confidently and wrongly, and stayed plausible while doing it. The
-instrument's own stances are about being able to say who is in the room and what
-happened; a projection that quietly disagrees with the kernel is that promise
-failing quietly. The wire changes are the interesting engineering, but the reason
-to make them is that the fewer things a client has to reconstruct, the fewer
-places it can be confidently wrong.
-
-### The kernel learns to say what a change was (August 15, evening)
-
-Building the first slice of the feed was mostly unremarkable — the kernel now
-decides append-or-replace where the mutation happens, and the snapshot query
-reports the version it read at. Two things about it are worth keeping.
-
-The first is a rule the specification had already written and the code had to
-honor in an inconvenient place. Classification must not consult *who* made the
-edit, only the coordinates: an insert at the end with nothing deleted is an
-append, everything else is a replace. That is easy on the edit path, where the
-length is already measured for a bounds check. It is not free on the streaming
-path, where measuring the text before each token would restore an O(n²) that had
-been removed a day earlier for exactly that reason. The append primitive is an
-append by construction, so it asserts rather than measures — and a test appends
-multibyte chunks and compares the published suffix against what the engine
-actually stored, so the assertion is pinned to behavior instead of to a comment.
-
-The second was found by a test that had no obvious relationship to the change.
-While the old wire still carries raw operations, the kernel publishes both kinds
-of event, and the old bridge simply does not send the new ones. Not sending them
-was not enough. A batching test dropped from twelve batches to zero: the bridge
-collapses a *run* of consecutive text operations for one block into one call, and
-the new events, sitting between them in the queue, broke every run into
-singletons. Worse and quieter, the bridge allocates a per-subscription sequence
-number before it sends; allocating one for an event that never goes out punches a
-hole in a lane whose whole contract is that a hole means the subscription died.
-The fix was to drop them at ingress rather than at send time — an event nobody
-sends still does damage while it waits in line.
-
-The feed itself followed the same evening, additive, so nothing broke yet. Two
-things it taught while being built are worth more than the code.
-
-The design had said an insert event carries the block's snapshot. Writing the
-client half showed that a snapshot is not enough: the wire's `BlockSnapshot` has
-no ordering key, so a client receiving one learns that a block exists and not
-where it goes. The snapshot query hides this by returning blocks already
-ordered. That is precisely the thing ACP had been using the CRDT for — document
-order, not text — so the insert event now carries a position, like the move
-event beside it and like the old event it replaces.
-
-The other was a question the tests could not avoid asking: how does a *client*
-edit a block's text? It cannot. `pushOps` was the only path and it was deleted
-that morning; text edits reach the kernel through tools, `kj`, the shell, and
-the model's own stream, all of them kernel-side. Nothing is broken by that today
-because no client edits text — but "all authoring goes through rich RPC" had
-been written as though the verbs existed, and they do not.
-
-The client half ended up larger than plumbing, deliberately. Following a context
-correctly is a short list of rules — apply in order, append a suffix, replace on
-a replace, never compare lengths, subscribe before fetching, discard what the
-snapshot already has — and every one of those rules exists because ignoring it
-corrupted something real. Written three times, in ACP and MCP and the app, it
-would be three chances to get one subtly wrong. So it is written once, tested
-once, and it refuses rather than guesses: a foreign context, an unknown anchor,
-and a version that fails to advance are all errors. Its own tests immediately
-caught a stale-index bug in the move path, which is the argument for building it
-that way, made without anyone having to make it.
-
-### What the clients gave up (August 15, night)
-
-All three clients moved onto the feed the same evening, and the striking thing
-is how much each deleted. ACP lost a five-second sweep that existed to paper
-over silently dropped events, a connection-status resync, and its whole
-event-routing layer. The app lost a generation counter and the periodic scan
-that asked "has anything gone stale?". None of that was accidental complexity —
-each piece was load-bearing for a replica that could quietly diverge with
-nothing to announce it. A feed that says *resubscribed*, *terminated*, or
-*desynced* out loud leaves a staleness poll with nothing to look for.
-
-Two things were learned by building rather than by planning.
-
-The first was a bug, and it needed no concurrency at all. The version was
-attached to a *delivery* while the recovery rule was written per *event* — and a
-delivery is a batch. A burst of five mutations is one message, a client's
-snapshot can be served in the middle of it, and then the client must take all
-five or none: taking all replays what the snapshot already holds, taking none
-loses the rest. A review by a second model found it, and it reproduced on the
-first try as a duplicated string. The fix is small — every event carries its own
-version — but the shape of the mistake is worth keeping: the unit the protocol
-counted in was not the unit the rule reasoned about.
-
-The second is where the migration stopped. After every client moved, nothing in
-the system decodes a text-engine operation off the wire anymore. Yet the old
-event cannot be deleted, because one consumer still wants it — the time well's
-activity glow, which counts events as a pulse and never looks inside them. The
-app has been receiving every token of every context, kernel-wide, to decide how
-brightly to shine. It is the last dependency on the old surface and it is not a
-migration at all; it is a missing three-field event. There is something apt
-about a project spent replacing an encoding with meaning discovering that its
-final holdout wanted neither.
-
-### The flag day, and the assumption underneath it (August 15, late)
-
-Amy disabled the activity glow rather than migrate it — *"we'll be doing
-embeddings for a lot of that content kernel side and maybe we can emit something
-more useful and derived"* — and with its last consumer gone, the deletion could
-happen. Four thousand lines: the raw-operation events, the sync-state query, the
-capability negotiation, the coalescing path that existed only to batch those
-events, and finally the two client types that could decode an operation at all.
-Ordinals compacted, eight tombstones closed.
-
-Renumbering had been argued about earlier in the day, and the argument against
-it was that a stale binary would call the wrong method instead of failing
-cleanly. It was accepted on the grounds that every binary here is rebuilt
-together. Within minutes of the renumber, a test failed with *"Message contains
-non-list pointer where data was expected"* — a client asking for one method and
-being answered by another. The cause was not a stale binary on some other
-machine. The client crate's build script had never declared the schema as a
-dependency: the schema lives outside the package, so cargo's rerun rule never
-fired for it. Every previous schema change had been additive, where a stale
-client merely cannot see a new method, and in practice the client's own sources
-changed alongside anyway, which retriggered the build. The one change that could
-expose it was the one that finally happened.
-
-So the assumption was false in the least visible way available — not "we forgot
-to rebuild something" but "our build had never been rebuilding it, and nothing
-we had done before could tell." One line fixed it. The server's build script had
-carried that line all along.
-
-It surfaced through a second small failure worth its own note: the test that
-caught it retried registration a hundred times and then panicked with "never
-became ready", discarding every error it had seen on the way. Five seconds spent
-proving something was broken, with nothing to say about what. It carries the
-last response into the panic now.
-
-A third thing happened alongside, prompted by Amy reading the test output rather
-than the code: *"did I see tests accessing my ~ XDG path?"* She had. The shipped
-default `mcp.toml` carried a server entry pointing at her own kaibo build, and
-every kernel a test booted spawned it, whereupon kaibo opened her live state
-database — the one a running kaibo was already using. An earlier fix had moved
-external server startup off kernel construction onto the serving path for exactly
-this reason, which had helped and had not been enough, because the tests that
-boot a server take the serving path. The default now ships empty, with the real
-entries kept in the file as commented reference, and the test asserting the
-default configures *nothing* says why in its name. A shipped default is not
-inert: it is a decision made on every machine that has not overridden it.
-
-### The text engine itself leaves (August 16)
-
-One question from the plan was still open going into the next day: whether to
-replace diamond-types-extended as the block-text representation at all. The
-plan had gated that on instrumentation — measure whether real merge ever
-happened inside the kernel, then decide. The measurement never ran, because
-the question it would have answered was already closed by construction: with
-`pushOps` gone, `merge_ops` had exactly one caller, and that caller was the
-one just deleted. Two independently-diverged stores editing the same block
-had gone from unmeasured to impossible to construct. An instrument built to
-watch for something that cannot happen is not a pending task; it is a stale
-question, and the day's work treated it as one.
-
-What decided the timing, rather than the principle, was a number. A
-read-only copy of an 861 MB production `kernel.db` (Amy's permission, opened
-`immutable=1`, never the live file) showed diamond-types-extended's own
-snapshot encoding running 564 MB against 141 MB for those same documents'
-materialized text and 137 MB of oplog — the text engine was costing about
-four times the text it stored. The multiplier did not accumulate with age or
-size: bucketed by version count it read 4.34x under ten versions, 4.82x
-under a hundred, 4.95x under a thousand, and 4.32x for the two documents
-over a thousand — a document with four versions carried nearly the same
-overhead as one with 1,942. Flat across that range is what marked it as a
-structural cost, paid by every block for reconciliation machinery most
-blocks never used, rather than debt that had built up over time. The
-sole-sequencer ruling was already reason enough to remove the text engine;
-the measurement is why removing it also gives back roughly 560 of the 861
-megabytes.
-
-One migration had to land first to make the removal safe rather than merely
-plausible. `doc_snapshots.content` — the column holding a document's
-materialized text — is written only by compaction. Any document edited since
-its last compaction held its newer text solely as operations in the oplog,
-so deleting the engine without materializing everything first would have
-discarded those edits, silently, with `content` still present and still
-parsing — the exact failure shape the whole migration had spent the day
-closing, reappearing as its own last act. A forced compaction pass, run once
-at boot with the compaction code already in service, closed the gap: walk
-every document, write its current text into `content`, truncate its oplog.
-Against a live 909 MB database it compacted all 1,569 documents with zero
-failures — the same work ordinary compaction already does, run once,
-deliberately, ahead of the change that depended on it.
-
-With every document's text proven current, block content became a plain
-`String`. Streaming is a hundred percent append, and `String::push_str` is
-amortized O(1) — the bound a rope was offering, without the rope. The
-representation question turned out to matter more for what a rope would have
-cost than for what it would have gained: `ropey::Rope`'s tree node allocates
-roughly a kilobyte even for an empty rope, and a conversation context holds
-thousands of small tool-call and short-turn blocks, most nowhere near that
-floor. A rope earns its allocation on large, splice-heavy text, which
-describes the editor and file-document surfaces exactly — modalkit already
-runs on `ropey` underneath, so those keep it — and describes compose input
-not at all, so a draft stays a `String` with a revision counter beside it.
-Three surfaces ended up with three representations, each chosen against what
-it actually does to its own text rather than handed one engine to share.
+Then the text engine left. A read-only copy of the 861 MB production database
+showed diamond-types-extended's snapshot encoding costing about four times
+the text it stored, flat across version counts — a structural cost, not
+debt. A forced compaction pass materialized every document's text first,
+because any document edited since its last compaction held newer text only
+in the oplog. Block content became a plain `String`: streaming is all append
+and `push_str` is amortized O(1). The editor and file surfaces keep ropey,
+where splice-heavy text earns it; a draft stays a `String` with a revision
+counter. Three surfaces, three representations, each chosen against what it
+does to its own text. `docs/crdt-position-2026-08.md`.
 
 ## Two doorbells, one ledger (August 18)
 
-The approval ledger had been carrying a second, quieter system beside it for
-months, and nobody had said so out loud. `kj cc send` and `shell_write` went
-through `run_gate`: a durable row, rules that could auto-decide, an answer
-reachable from any shell. A hook's `Ask` action went somewhere else entirely
-— a `Uuid::new_v4`, a thirty-second budget, a blocking round trip over its
-own wire, and no durable record at all. Two mechanisms for one idea, and the
-seam between them was invisible because each worked.
+The approval ledger had carried a second, quieter system beside it for
+months: `kj cc send` and `shell_write` went through `run_gate` with durable
+rows and rules; a hook's `Ask` went to a `Uuid::new_v4`, a thirty-second
+budget and a blocking round trip with no record. Three pieces of evidence sat
+in the ledger's own source — `Origin::Hook` never constructed, `hook_id`
+never populated, `NewOption` mapping one-to-one onto ACP's permission
+options — so the ledger had been built to absorb the hook path and never
+told. Amy retired the doorbell.
 
-What settled it was not an argument but three pieces of evidence sitting in
-the ledger's own source. `Origin::Hook` existed, documented *"a hook's `ask`
-action fired"*, and had never once been constructed. `NewAsk.hook_id` had
-been nullable and unpopulated since the schema was written. And `NewOption`'s
-`{option_id, label, kind}` mapped one-to-one onto ACP's `PermissionOption`,
-while the code that fired an Ask passed `options: Vec::new()` and let the far
-end invent allow and deny for itself. The ledger had been built to absorb the
-hook path and never told. Amy's ruling was to retire the doorbell rather than
-merge into it: one durable record, one announcement, one write path.
-
-The melt was the easy half. The instructive half was what fell out of it.
-
-`GateOutcome` could say `allowed: false` and nothing more, so `run_gate` had
-been reporting its own faults — a rules read that errored, an ask row that
-went missing — as `status: Denied`. The `shell_write` caller rendered both as
-one error, so it had never mattered. The hook path could not afford that: a
-ruling from the day before required a model to distinguish a refusal from an
-absent control, and a database fault arriving as a refusal would have
-defeated that ruling at precisely the seam it protected. The fix was a
-three-way verdict, and then a second look showed `status` carrying the same
-lie one layer down — typed `ApprovalStatus`, so the two faults that happen
-before any row exists had to name some status, and they named `Denied` beside
-a `request_id` of `""`. Both became one `Option<AskRef>`: a row exists with
-an id and a status, or there is no row. Two separate `Option`s could have
-expressed a third state that cannot happen.
-
-Then the deployment taught the rest. A gated call held for eighty-one seconds
-and returned only after a human answered it from an entirely different
-surface — the loop working end to end for the first time. But the same day,
-driving kaijutsu from an editor over ACP, the seams showed themselves in a
-row. A turn died on the model provider refusing an assistant message whose
-tool calls had no matching results, and the cause was a repair pass that
-enumerated one vector while looking the previous message up in another; the
-first fully-orphaned message it skipped desynchronised the two, and every
-later pair was checked against the wrong assistant and dropped. One skip, and
-the rest of the conversation was collateral. The session list took
-sixty-eight round trips because `ContextInfo` carried fifteen fields and not
-the one the caller needed, so the client had no choice but to assemble by
-looping. And no approval ever reached the editor, because the editor launches
-a build artifact that had been compiled two minutes before the wire it spoke
-was retired — Cap'n Proto tolerating a call to a retired ordinal, so the
-feature went missing rather than failing.
-
-That last one is the lesson worth keeping. The failure did not look like a
-version problem; it looked like an editor that could not find its adapter,
-and it sent a morning in the wrong direction. The answer was a handshake that
-refuses a mismatched peer and names which side is stale — and a flag day to
-install it, because a client old enough to cause the problem is old enough
-not to know to check. It caught a real mismatch within minutes of shipping,
-on a path nobody had thought about, and it named it exactly.
-
-The through-line of the day is that four separate primitives — `Origin::Hook`,
-`decide::abandon`, `rules::learn_from_approval`, and the whole `rc_runs`
-table — were built, tested, and never called. None of them were wrong. Each
-had been written slightly ahead of the thing that would need it, and nothing
-in a green test suite says *this code has no caller*. The gate that fired and
-was never announced was the same shape a week earlier. It is worth asking, of
-any primitive that ships with its tests and without its wiring, what will
-tell us when it is finally needed — because the answer today was a morning
-spent reading logs in an editor.
+The instructive half was what fell out. `GateOutcome` could say `allowed:
+false` and nothing more, so `run_gate` had been reporting its own faults as
+denials, and a ruling from the day before required a model to distinguish a
+refusal from an absent control. Both became one `Option<AskRef>`: a row
+exists with a status, or there is no row. Then a gated call held eighty-one
+seconds and returned after a human answered from another surface, the loop
+working end to end for the first time — and the same day, driving kaijutsu
+from an editor, no approval ever reached it because the editor launched a
+binary compiled two minutes before the wire it spoke was retired. The answer
+was a handshake that refuses a mismatched peer and names which side is stale.
+Four primitives that day had been built, tested and never called; nothing in
+a green suite says *this code has no caller*.
 
 ## The conversation stops being a widget tree (August 16–18)
 
-The scroll-feel work of the 16th ended with a diagnosis rather than a tuning:
-no gain or ease constant could make a wheel detent cheap while its cost
-scaled with block size. The conversation was a Bevy UI flex column of
-per-block RTT textures — taffy in the scroll path, `replace_children` churn,
-five ungated document walks a frame, and a silent 8192px clamp that
-truncated any block taller than ~273 lines. `docs/conversation-surface.md`
-named the target: *scrolling changes one number*.
-
-Amy's opening idea on the 18th was to cache the blocks as textures and
-composite them. The survey moved the cache one level up: the expensive step
-was Parley shaping, not pixels — the shared MSDF atlas already existed, the
-render pass was already surface-agnostic, and per-block textures were where
-the defects lived. So blocks became **cached shaped glyph runs** — chunked
-on hard lines, keyed by (content version, wrap width, collapse, indent,
-metrics epoch) — assembled into document-space instanced buffers over a
-±1-screen window, drawn into a viewport-sized RTT with scroll as a 64-byte
-uniform and baselines snapped to physical rows in the vertex shader.
-
-Five slices in one sitting, each review-gated (gemini deliberation +
-deepseek agents over whole files, the house combo) and live-verified over
-BRP before its commit. The reviews earned their keep every round: the
-shape-band/window ordering race (blank bands on big jumps — found twice
-independently), the dead reveal-from-top anchor, cache mutations that never
-reached the GPU without a WindowKey move, the incremental tail's unsoundness
-for markdown (a setext underline retro-colors frozen bytes), a stale SVG
-raster surviving its block changing kind. Chrome became instanced SDF quads
-sharing the scroll uniform — borders, captions straddling the stroke,
-focus ring keyed off `FocusTarget` alone. Streaming re-shapes one chunk per
-append; backlog shapes off-thread; theme swaps recolor in place instead of
-rebaking the document.
-
-Slice 5 deleted the legacy path the same day — Amy: "no reason to keep
-legacy in this project," no soak — taking with it `view/render.rs` entire,
-the band lifecycle, the spacer machinery, the taffy readback, the flag
-itself. The deletion surfaced two features the flip had silently orphaned
-(rainbow user text, timeline dimming — issues.md) and the checkbox tofu
-that both paths had always shared. The tall block that started it scrolls
-one detent at a time now.
-
-Side quests the lane forced: reconstructing the kaish-integration worktree
-on moltar (the Cargo.toml comment's warning came true), and a peer-to-peer
-merge of zorak's unpushed wire-handshake line after its deployed kernel
-locked out every origin-built client mid-verification.
+No gain constant could make a wheel detent cheap while its cost scaled with
+block size: the conversation was a Bevy flex column of per-block textures,
+taffy in the scroll path and a silent clamp truncating blocks over ~273
+lines. Amy's idea was to cache blocks as textures; the survey moved the cache
+one level up, because the expensive step was shaping, not pixels. Blocks
+became cached shaped glyph runs, assembled into instanced buffers over a
+±1-screen window and drawn with scroll as a 64-byte uniform. Five slices in
+one sitting, each review-gated and live-verified over BRP, and slice 5
+deleted the legacy path the same day — Amy: "no reason to keep legacy in
+this project." `docs/conversation-surface.md`.
 
 ## The file cache learns what vim already knew (August 18–20)
 
-The file tools had a cache that nobody had asked to be authoritative, and for
-a while it was. A cold miss served a kernel document written in June and
-wrote it back over a file that had moved on since — the kernel was the one
-player on the instrument that could revert a human's work and call it a save.
-The first reaction was a warning in the docs: do not edit through the kernel
-file tools or `vi`. The second was `docs/file-buffers.md`, whose thesis is
-that disk is the source of truth and vim solved the rest of this decades ago:
-a buffer is a view of a file, an unsaved buffer is a swap, and a swap that
-survives a crash is announced, never silently served.
+A cold miss served a kernel document written in June and wrote it back over
+a file that had moved on: the kernel was the one player that could revert a
+human's work and call it a save. `docs/file-buffers.md`'s thesis is that disk
+is the source of truth and vim solved the rest decades ago: a buffer is a
+view, an unsaved buffer is a swap, a swap that survives a crash is announced.
+A dirty buffer leaves a durable row whose presence *is* the flag; `:w`
+refuses when the disk generation moved unless the player types `!`. `Kernel`
+came to own its block store and file cache by construction, deleting a
+`OnceLock` pair that had let two caches exist over the same documents. The
+test database stopped being `:memory:` across 228 call sites, because the
+in-memory path was a second code path production could never reach. The
+20th's audit found an evicted entry had made `:w` a silent no-op, and every
+new test was broken once, on purpose, by the lead before it was kept.
 
-Three slices carried that into the kernel in two days. A cold miss now
-reconciles against disk. A dirty buffer leaves a durable row whose presence
-*is* the flag — no dirty column to drift — so it survives a restart as a
-recovered swap that every flush refuses until a player acknowledges it, and
-the unsaved text is readable at `/v/swap/<kernel_id>/<path>` because the
-kernel id is the one thing that persists across the restart that stranded it.
-Then the editor was wired to the cache: `:w` flushes through it, an edit marks
-the buffer dirty, a failed `:w` leaves the buffer honestly dirty instead of
-reporting clean, and `:w` refuses when the disk generation moved under the
-buffer unless the player types the `!` — vim's W12, with the kernel as the
-place the rule lives rather than a renderer.
+## The scripts that shipped and never arrived (August 20)
 
-The refactor underneath mattered as much as the slices. `Kernel` came to own
-its block store and file cache by construction, which deleted a `OnceLock`
-pair that had let two caches exist over the same documents with independent
-dirty flags — the incident's shape, one level up. A patch batch became
-all-or-nothing by separating compute from commit, urgent because kaish's
-coming `edit` builtin will not lower to a whole-file write. And the test
-database stopped being `:memory:`: 228 call sites moved to a real file,
-because the in-memory path was a second code path production could never
-reach and tests could never trust.
-
-The method lesson from those days is the one that keeps earning its place:
-**falsification is the lead's job, not the lane's.** A lane that writes a
-test against the code it is building will honestly report green; only a
-targeted fault — flip the branch, pin the flag, drop the call — shows whether
-the test guards anything. It caught two tests written that way on the first
-day, and on the 20th it was how a morning's audit turned into fixes by noon:
-an evicted cache entry had made `:w` a silent no-op (the two halves of the
-protocol both returned `Ok` on a path they had never seen), and the
-acknowledgment the swap design assumed had never been given a surface. An
-open editor session now pins its entry, `kj swap list|ack|discard` is the
-surface, and every one of the new tests was broken once, on purpose, by the
-lead before it was kept.
-
-The audits that found those also named the debt the churn left behind, and
-the stance about it is the learning-space rule: a guard for a state that can
-no longer occur is deleted, not wrapped; a second mechanism for one question
-— config ownership answered by a path prefix *and* a mount table — is the
-kind of thing that reverts a human's edit when the two disagree, and one of
-them goes.
-
-## The scripts that shipped and never arrived (August 20, afternoon)
-
-The morning's hook work ended with a guard against `sh -c` and a risk scorer
-wired to every shell call. Both were written, tested, reviewed, committed, and
-deployed. Neither had ever run.
-
-The kernel owns `/etc/rc`, and it seeds that tree from the binary's embedded
-defaults only when the tree is entirely empty. That rule is deliberate and
-worth keeping: a script you deleted stays deleted, and a repo-dropped seed does
-not resurrect behind your back. What nobody had noticed is its other half — a
-script *added* to the embedded set after a kernel was first seeded never lands
-either, and no surface said so. `kj rc list` walks the live tree and marks each
-entry against its seed, so a path with nothing at it has no entry to walk. The
-absence was not reported as an absence. It was reported as nothing at all.
-
-Three scripts had been sitting in that gap, one of them for days. The way it
-surfaced is worth keeping: a handoff note claimed the seeding was per-path and
-ran at every boot, and it named the file and line. Reading that line said
-otherwise, in a comment that had been describing the real behavior the whole
-time. The note was written from what the change was supposed to do; the code
-said what it did.
-
-The fix was not to seed harder. Seeding harder resurrects deleted scripts, and
-the once-only rule exists to prevent exactly that. The fix was to make the
-discrepancy visible: an anti-join between the embedded set and the live tree,
-and a fourth status that says a seed exists here and nothing is installed. The
-choice of a status over a repair verb was Amy's, and the reasoning generalizes
-— a verb only helps someone who already suspects there is something to run it
-for, while a status announces itself to anyone who looks. It proved itself
-within the hour: the next change moved a script between directories, and the
-listing named the three paths that had not landed before anyone had to wonder.
-
-The same afternoon turned up its sibling defect. A symlink whose target had
-been removed still reported in-sync, because the comparison matched target
-*strings* and never asked whether the target was there — while the lifecycle
-loader treats an unreadable script as fatal. A green marker sitting on top of a
-hard failure. Resolving the link before comparing anything fixed it, and the
-status it now reports is its own word rather than "differs", because the two
-want opposite repairs: resetting a dangling link rebuilds the link and leaves
-the target missing.
-
-Then the scorer, which had been reported as recording nothing. It was recording
-nothing, and it was not broken. It armed itself only in the seat whose rc
-exported its mode, and every other seat fell through a `case` to a silent exit.
-Unarmed and broken looked identical from outside, which is the actual defect in
-that shape. Once armed the whole path lit up on the first try. The classifier
-had looked inert for the same reason the hook had: everything sampled while
-diagnosing was benign, so every verdict came back the least severe label. On
-adversarial input it separates them correctly. Twice in one afternoon, a thing
-that appeared dead was merely never asked a question it could answer.
-
-The last piece was unwinding a temp-file detour that existed to dodge a parser
-rule stated too broadly — a heredoc round-tripped through `mktemp` because a
-lane had generalized "double quotes at both levels fail" into "any quote
-fails". Probing the constructs against the live shell before writing them paid
-for itself immediately: the obvious validation guard, `test -z "$x" -o "$x" =
-"null"`, silently returns false instead of or-ing. Writing it would have
-reproduced the exact failure mode the change was there to remove — a check that
-never fires, at exit zero.
-
-What ties the afternoon together is that every one of these was silent. Not one
-produced an error, a warning, or a wrong answer anyone could see. The recurring
-work was not fixing behavior but building the surface that would have said
-something was wrong, and the recurring lesson is that a system which cannot
-report an absence will keep the absence.
+A guard against `sh -c` and a risk scorer were written, tested, reviewed and
+deployed, and neither had ever run. The kernel seeds rc only when the tree is
+entirely empty — deliberately, so a deleted script stays deleted — and the
+other half of that rule is that a script *added* to the embedded set after
+first seeding never lands, and no surface said so. The fix was not to seed
+harder but to make the discrepancy visible: a fourth status, "a seed exists
+here and nothing is installed," which Amy chose over a repair verb because a
+status announces itself to anyone who looks. It proved itself within the
+hour. The scorer had armed itself only in one seat and fallen silent
+everywhere else; unarmed and broken looked identical, which is the actual
+defect. A system that cannot report an absence will keep the absence.
 
 ## The turn that said it had finished (August 22)
 
-The coder became something you could hand a job to. `kj fork` makes the
-context, `kj drive` starts its turn, `kj wait` joins it — three verbs that
-compose, so a context can delegate to a child and block on the answer the way
-a caller blocks on a function. It was driven end to end against a real
-worktree, and the first thing it produced was not code. It was a bug that
-reading had never found.
+The coder became something you could hand a job to: `kj fork`, `kj drive`,
+`kj wait`. The first thing it produced was a bug reading had never found:
+`kj wait` reported `completed` mid-flight, because between a tool result
+reaching `Done` and the next model block there is a provider round trip
+during which nothing anywhere is `Running`. An instantaneous read of a
+multi-writer log cannot tell "finished" from "between two blocks"; the
+information is not in the log. Amy's ruling was to stop inferring: the
+kernel owns a registry of turns in flight, set where a turn is committed and
+cleared at every one of the stream processor's exits.
 
-`kj wait` reported `completed` while the model was still working. Not once, and
-not late: three seconds into one turn, thirty-nine into another, both mid
-flight. The tail it returned looked like an answer. The last thing the model
-had said was "Still compiling. Polling again:".
+The day's rule, sharpened with kaish's lead who found the same shape twice in
+their own tree: the dangerous comment is the one that is **the reason
+something else is switched off** — an append path excluded from a gate
+because "append never destroys content." A test asserts behavior at one
+point; a load-bearing comment asserts reachability, and nothing checks
+those. Green tests are the condition under which they rot unnoticed. The day
+closed with a delegated coder concluding git was not installed when it was
+on a shell that refuses external execution, and the shell said both with one
+sentence; each project now names the condition it owns.
 
-The mechanism is the shape of an agentic turn. A turn alternates: the model
-writes, calls a tool, the tool result lands, the model writes again. Between
-the tool result reaching `Done` and the next model block being inserted, there
-is a live round trip to the provider during which **nothing anywhere is
-Running** — and a model block already sits after the anchor, because the model
-spoke before it called the tool. The resolver asked "is anything running, and
-has the model said something?" Both answers were yes-shaped at exactly the
-wrong instant. An instantaneous read of a multi-writer log cannot tell
-"finished" from "between two blocks," and no amount of care in the reading
-fixes that, because the information is not in the log.
+Then the gate went next. A gated call had been holding an RPC open while a
+human decided, and the ask was asked to last an hour, an errand, a night. It
+cannot: the client's deadline is a compile-time constant in a process that
+cannot read kernel config. Amy: *"perhaps we should consider a state machine
+and not actually having anything block on the wire."* The kernel announces,
+the client may block locally, and when the answer lands the kernel performs
+the action itself. The next day she killed restart survival too — *"the
+kernel is really reliable and the only reason it restarts a lot right now is
+because we're actively advancing it"* — because the one outcome that design
+could produce, an approved destructive action running twice, was reachable
+only on that path. `docs/gate-resume.md`.
 
-The existing test covered the case where a block *is* running. Nothing covered
-the gap between two. That is the honest description of the whole class: the
-guard protected the start of a turn, and the middle had never been considered
-a place where a turn could be.
+## The seat you ssh into (August 30 → September 8)
 
-Amy's ruling was to stop inferring: *"probably very old code,"* and it was
-wrong in two places. The kernel now owns a registry of which turns are in
-flight, and both `kj wait` and the ACP bridge ask it instead of reading
-statuses. Two decisions inside that are worth keeping. The flag is set where a
-turn is **committed**, in `publish_turn_request`, never in the driver that
-consumes the request — so "drive returned" implies "the flag is set," and a
-`kj wait` issued immediately after cannot win a race against it. And there is
-no single choke point for clearing it: the stream processor is documented as
-publishing exactly one terminal event and does so from six different exits,
-all six now paired, plus two more for a request no driver consumes and a
-driver that fails to spawn. A cross-model review found four more windows of
-the original shape — thinking-end to text-start, text-end to tool-use,
-stream-done to tool-start, tool-only iterations — and all four were already
-closed, because covering the whole turn is not the same as covering a list of
-gaps.
+Where should a terminal client live? The client crate has no Bevy in it, the
+ACP bridge proves it renders anywhere, and of the app's ninety thousand lines
+the part a terminal could reuse fits in three thousand. So the tui is a
+standalone binary in the ACP bridge's shape with ratatui as the edge; a
+kernel-served tui was feasible and declined because a client inside the
+kernel process reaches around the wire rules the first time they are
+inconvenient. Amy: inline viewport, not fullscreen; one `bindings.toml` for
+both clients keyed by vim notation. The ssh-shell design retired into it.
 
-The ACP bridge could not reuse any of it; it depends on the client and types
-crates, not the kernel, so it asks over the wire. Deriving liveness from
-events was considered and rejected for a reason that generalizes: the quiet
-poll exists *because* a completion event can go missing, so event-derived
-state is stale in precisely the case the poll was built for, and would hang
-forever instead of firing early.
-
-The afternoon found the same class twice more, and neither came from a failing
-test. Both came from reading a claim against the code it described.
-
-A relay narrating a delegated turn's progress refcounts a shared watch set.
-One relay releasing the last reference decremented to zero and *spawned* its
-narrowing call; another relay acquiring the same context sent its widening
-inline. The actor applies those in arrival order, so the widen could overtake
-the narrow it had to follow, and the second relay lost a watch it still
-needed. The fix reserves each transition a place in a chain under the same
-lock that changes the count, so arrival order and count order cannot disagree.
-The test pins what the actor sees — add, remove, add — and falsifying it
-reproduces the original bug exactly.
-
-The other was a comment that reasoned correctly from a false premise. It said
-a dropped early-warning event costs "no fact," because the outcome still
-arrives on its own push or by polling. Nothing that consumes that callback
-polls, and the loss is larger than the comment allowed: a client that never
-widens its subscription gets none of that turn's blocks pushed and has to read
-them back. The conclusion — do not disconnect over it — survived. The reasoning
-did not.
-
-That turned into the day's rule, sharpened with kaish's lead, who found the
-same shape twice in their own tree the same afternoon. The dangerous comment
-is not the stale one. It is the comment that is **the reason something else is
-switched off**: an append path excluded from a safety gate because "append
-never destroys prior content"; a handler that keeps a connection because "the
-loss costs no fact." A test asserts behavior at one point. A load-bearing
-comment asserts reachability — a claim about everything that does *not*
-happen — and nothing in any repository checks those. Green tests are not
-evidence about them; green tests are the condition under which they rot
-unnoticed. Reading three branches' contract comments adversarially found one
-more defect, in a claim that turned out to be true: verifying it was what
-exposed the thing next to it that nobody had claimed at all.
-
-The day closed on a delegated coder that had read `command not found: git`,
-concluded git was not installed, and abandoned a path it could have finished.
-git was on `PATH` the whole time. It was on a shell that refuses external
-execution, and the shell reported both conditions with one sentence. Fixing it
-took both projects and neither named the other's half: the shell now says the
-condition it owns, and the tool description says the binary is installed and
-names the tool that can run it. A structural signal was offered and declined —
-going to look for the call site that would consume it, and reporting back that
-there wasn't one, was cheaper than the field would have been.
-
-Everything the day found was in a seam that reports state: is this turn
-running, is this watch held, is this program here. A system that answers those
-questions wrongly is worse than one that declines to answer, because the
-caller acts on the answer. Delegation is what made them visible, because a
-delegating caller is a consumer that believes what it is told.
-
-Which is where the gate went next. A gated call had been holding an RPC open
-while a human decided — verified live at eighty-one seconds four days earlier
-— and the ask was asked to last longer than that: an hour, an errand, a night.
-It cannot, and the reason is not a number. The client's deadline is a
-compile-time constant in a process that, by its own documentation, cannot read
-the kernel's configuration, because they communicate only over the wire that
-deadline bounds. Amy's answer removed the question: *"perhaps we should
-consider a state machine and not actually having anything block on the wire."*
-The kernel announces, the client may block locally, and when the answer lands
-the kernel performs the action itself. An approval at 3am runs at 3am. The
-four-hop ladder built to keep a call alive across human thinking time becomes
-dead code, four days after it shipped.
-
-## The seat you ssh into (August 30)
-
-The question was where a terminal client should live. Kaijutsu had an ACP
-bridge that "sorta works", a design note for a kaish shell served as an SSH
-subsystem, and a Bevy app whose conversation view is a custom render pass. A
-survey settled it faster than argument would have: the client crate has no
-Bevy in it and the ACP bridge is proof it renders anywhere; the server
-implements no PTY at all; and of the app's ninety thousand lines, the part a
-terminal could reuse fits in three thousand.
-
-So the TUI is a standalone binary in the ACP bridge's exact shape — kernel
-side, pure mapper, edge — with ratatui as the edge. A kernel-served TUI was
-feasible (russh ships the example) and declined for the reason the wire rules
-were written: a client inside the kernel process reaches around them the first
-time they are inconvenient. Amy ruled inline viewport, not fullscreen; one
-process as the mux, so `ssh -t zorak kaijutsu-tui` replaces the terminal
-multiplexer rather than living inside it; and one `bindings.toml` for both
-clients, keyed by vim notation, which the TUI ships first and the app inherits.
-
-The ssh shell design retired into it. Its hardest open question — which
-context a contextless login lands in — dissolved, because a picker needs no
-context. Two paragraphs survived the melt, the two cursors and the principal
-model, and they are in `docs/tui.md` now. The beat phasor everyone assumed
-would need extracting turned out to have been in `kaijutsu-audio` since July;
-only a map of them was still app-side. Reading before planning, again.
+The first cut shipped September 2 from five lanes in one day, live against
+zorak: transcript printed once into the terminal's own scrollback, a
+static-height band pinned at the bottom, vi compose over the kernel draft,
+the Ctrl+Z shell with real suspend, the picker, the ask card, editor and
+diff on alternate screens (`docs/tui.md`). Amy played it that evening and
+her notes drove the next week: the thinking pane, the in-flight strip as one
+fixed row, the draft that grows the band, an ask answered from another seat
+the client holds. On September 8 a switch marker and a per-context copy mode
+were tried and shelved — "marker and copy mode aren't gonna work" — and the
+buffer question is open: a single-context app that composes with tmux, or
+the tui *is* the mux on the alternate screen "all modern like in rust." A
+session of its own.
 
 ## The answer that travelled as an error (September 1–2)
 
-Probing a gated surface minted five asks. Not one probe five times: one
-probe, whose refusal arrived as a transport error, and a transport error
-means *"I could not tell you what happened"*, so the caller retried with
-slightly different text, and each retry with different text minted a new
-durable row. That is the whole defect in one receipt. A verdict is a result:
-the machinery worked and reached an answer, even when the answer is no, and
-the caller must not retry. A fault is an error: the machinery broke, the
-caller learned nothing, and a retry is reasonable. The gate had been
-delivering the first on the channel that means the second.
+Probing a gated surface minted five asks from one probe, because its refusal
+arrived as a transport error, and a transport error means *"I could not tell
+you what happened,"* so the caller retried with different text and each
+retry minted a row. A verdict is a result: the machinery worked and reached
+an answer, even no, and the caller must not retry. A fault is an error. The
+kernel knew the difference; the return path had nowhere to put it, because
+every `capnp::ErrorKind` describes a fault, and a careful comment above the
+collapse said exactly what was being lost.
 
-The kernel already knew the difference. `McpError` drew the line in its own
-doc comments, and the durable projection was right: a pending ask settled its
-blocks `Waiting`, because an unanswered question is not a refusal. It was the
-*return path* that had nowhere to put the distinction. The same error object
-went two directions, and only the one into the block store kept its type. The
-one back to the caller became `capnp::Error::failed(reason)`, and there is no
-`capnp::ErrorKind` that describes a verdict, because every one of them
-describes a fault. This was not a careless implementation. It was a careful
-one, with a comment above the collapse saying exactly what was being lost.
+An inventory of 152 RPC methods found one in eight with any second channel;
+throwing was the default and the gate was merely where it hurt most. Amy's
+ruling: **no general verdict facility**; the unit of work is the family. The
+VFS family shrank from seventeen wire methods to four with callers (SFTP had
+superseded the rest months earlier and nobody said so in the schema), and its
+errno crosses the wire as POSIX semantics under a stable encoding because
+`ENOTEMPTY` differs between Linux and macOS. The gate family got a `Refusal`
+union. Then the fix that stopped at the wire bought nothing: the client's own
+actor flattened the typed error back into a string one hop later, and the
+receipt was in the tree, a roster function lowercasing kernel prose to search
+for "not found." **Every boundary that stringifies is a place the type
+dies**, and counting the methods in a family is not counting the work.
 
-An inventory followed, because the obvious move was a general verdict type
-and the obvious move deserved a look before it got built. One hundred and
-fifty-two RPC methods; about one in eight had any second channel at all. The
-other seven-eighths had exactly one way to say anything went wrong, which was
-to throw. So this was not a gate bug that leaked. Throwing was the default,
-and the gate was merely where it hurt most. Amy's ruling closed the general
-question: **no general verdict facility.** The unit of work is the family.
-The inventory made that concrete: the VFS wants an errno, validation and
-policy already have a `(success, error)` pair on fourteen methods and needed
-nothing invented, and only the gate and capability family wanted a shape of
-its own. Six families, four changes.
+The state-machine ruling had said that when an answer lands the kernel
+performs the action; nothing had. Amy ruled it the rest of the way: **approval
+triggers execution.** `kj ledger allow <id>` runs it and fills the command
+and output blocks already sitting `Waiting`. The driver reserves the rc
+thread stack after the first heavy approval aborted the live kernel
+mid-rotation of ROOT. The digest match was found to be the authorization key
+for the retry path, not duplication, and stayed. For a free `${VAR}` Amy
+asked *"how hard would it be to snapshot kaish state along with the
+request?"* — easy, since both gated paths run on a single-use shell seeded
+from durable state — so the names are captured with their values, restored
+before the source runs, and shown to the human and the classifier alike. The
+executor claims the redemption row first because the primary key is the only
+exactly-once there is; a crash between claim and run loses the action rather
+than doubling it. Its archived-context test went red on the first try and
+found a bug older than the lane: archiving stamped a timestamp and left the
+state column at `live`.
 
-The VFS family went first and was smaller than its count. Of seventeen wire
-methods, four had a caller. General filesystem access over that interface had
-been superseded by SFTP months earlier and nobody had said so in the schema.
-Thirteen retired to stubs. One got fixed: `read` returns an error kind beside
-its data, the way `snapshot` had already modelled a denied node as a seam
-rather than a failed walk. The errno idea survived and its encoding did not: a
-raw platform number cannot cross this wire, because `ENOTEMPTY` is one number
-on Linux and another on macOS, and a Mac client talks to a Linux kernel. So
-the wire carries POSIX semantics under a stable encoding and each side maps
-to its own numbers.
+The first live probe said the ending was not there yet: only the shell gate
+recorded executable source, and with hooks installed every production ask
+comes from the hook gate, whose doc said a hook ask has no free variables —
+false in a way sharper than the executor, since an allow rule on `dd
+of=${DEV}` would have redeemed every future value. The hook gate plans a
+shell call the way the shell gate does now. And the hook feeding the scorer
+from Amy's terminal was shelling to whichever `kaish` was on the path, which
+the 0.17 bump had swapped underneath it. *"Let's use kaish as a library which
+mcp already does so there's no way to have version skew."* `docs/gate-shape-b.md`.
 
-Then the fix that stopped at the wire turned out to buy nothing. The client's
-own actor repeated the collapse one hop later, flattening the freshly typed
-error back into a string in `CallError::Rpc`. The chain had a fifth layer
-nobody had named, and the receipt for why it mattered was already in the
-tree, written by its own victim: a roster function that lowercased kernel
-prose and searched it for "not found", with a doc comment explaining that
-text was all the wire carried, and a test pinning the exact wording including
-the transport prefix. It matches on a typed kind now. **Every boundary that
-stringifies is a place the type dies.**
-
-The gate family got its shape: a `Refusal` with a kind, a reason, a subject,
-an optional handle to the ask and an optional remedy, declared once in the
-schema and returned as a union with each method's old result, so a caller
-cannot miss it by forgetting to check a flag. Ordinals did not move. That was
-the plumbing, and the plumbing was the smaller half. Four things the
-inventory had not predicted cost more than all of it.
-
-A mandatory hook id had kept the model's own shell path off the type
-entirely: the direct `shell_write` gate has no hook, so it had been reporting
-every verdict as a protocol fault. The ask id was born as prose, formatted
-out of a typed reference one line away, and every consumer carried the
-string; a test recovered it by splitting a `kj ledger list` line. A denial
-had been dropping its reason, which is why a hook that could not read its
-own body after the config melt moved it presented to every caller as a bare
-"denied by hook shell-escape-guard" while the real reason sat one layer away
-in the journal; the earlier argument that hiding gate state assumes an
-adversary, and there is none inside the trust boundary, finally had a cost
-attached to it. And there was a seventh block-settling site. The model's own
-tool path derived block status from an `is_error` boolean and never reached
-the one mapping everything else used, so a pending ask reached the model as
-"Execution error" no matter how carefully the kernel had typed it, on the
-surface where a retry loop costs the most.
-
-Both families paid for the same lesson and it is the one to carry forward.
-**Counting the methods in a family is not counting the work.** The inventory
-listed RPC methods, and the type dies wherever anything stringifies: one hop
-past the wire, and in any consumer that derives one fact from another.
-
-Which left the part of the gate that had been waiting since August. The
-state-machine ruling, made when the wire stopped blocking, had said that when
-an answer lands the kernel performs the action itself. Nothing had. The
-approved caller still had to run the same command again, and the ledger
-matched the resubmission by digest. Amy ruled it the rest of the way:
-**approval triggers execution.** `kj ledger allow <id>` runs it, and fills
-the command and output blocks already sitting `Waiting` on that ask. There is
-nothing for a caller to present, so the tool parameter and the redeem verb
-from the earlier sketch never got built.
-
-One edge showed up only when a human approved something heavier than a
-shell line. The driver that runs an approved command has its own thread, and
-an approved `kj context create` runs the new context's rc lifecycle there —
-the same deep kaish re-entry that had already pushed the SSH session and
-beat-scheduler threads onto a 16 MiB stack. The driver still had the default
-2 MiB, and the first such approval aborted the live kernel mid-rotation of
-ROOT. It reserves the same stack now, and a test pins every rc-driving
-thread to it, so the next thread that forgets fails in CI rather than in
-production.
-
-Three things had to be true first, and one plan turned out wrong. The ask
-had to know its blocks, and nothing on the gate path could tell it: the RPC
-shell path authors its pair *before* gating and reaches the gate through the
-broker's hook evaluation, which never sees a block id. The ruling was that
-the caller records the link after escalation, in the one scope where the ask
-id and both block ids are together, so nothing threads through the broker.
-The cwd moved onto the ask row, replacing an in-memory pin that a restart
-had been quietly discarding. And the plan to delete the digest match was
-found wrong and recorded rather than done: the subscriber never calls it,
-but every origin that still retries does, and `kj cc send` renders the
-concrete message into its statement precisely so that an approval for one
-message cannot redeem a send of any other. The matcher was the authorization
-key for the retry path, not the duplication the lane had set out to remove.
-
-The last open question was a free `${VAR}`. The text a human approves and
-the bytes kaish runs can differ if a variable is set between the two, and
-the gate already refused to *learn a rule* for such a statement. The
-proposal on the table was to refuse to execute one. Amy asked instead:
-*"how hard would it be to snapshot kaish state along with the request?"* It
-was easy, and it made the case better than it had been, because both gated
-shell paths run on a single-use shell seeded only from the context's durable
-state, so "kaish state" at ask time is the `context_env` rows and the cwd,
-and the cwd was already on the ask. The free names are captured with their
-value or an explicit unset, restored verbatim before the source runs, and
-appended to the review so the human sees the expansion and not just the
-name. Amy added the constraint that made it one function rather than two:
-the classifier that scores the plan has to see the same data. So the
-snapshot is computed once in the kernel and rides both the ask row and the
-plan the hook reads.
-
-An archived context is inert at two levels, because one was not enough: an
-answer is refused on request, and the executor checks again before running,
-since the gap between answer and execution is exactly where a context can be
-archived. Archiving sweeps the context's unresolved asks the way a boot does.
-
-The executor landed the same afternoon as a branch inside the driver that
-already listened for answers. Its order is the design: claim the redemption
-row first, because the primary key is the only exactly-once there is; check
-the context is live again after the claim, because the window between an
-answer and its execution is where a context gets archived; move to the cwd
-the human was asked about and refuse if it is gone; restore the values the
-human read and refuse if that fails; run into the pair that was waiting. A
-crash between the claim and the run loses the action rather than doubling
-it, and that is the side of the trade the August ruling chose. The test for
-the archived case went red on the first try and found a bug older than the
-lane: archiving stamps a timestamp and leaves the state column at `live`,
-so the driver's guard had been reading the wrong half and had never once
-seen an archived context.
-
-The first live probe after deploy said the ending was not there yet. Only
-the shell gate recorded executable source, and with hooks installed no
-production ask comes from the shell gate; they all come from the hook gate,
-whose module doc said a hook ask has no free variables. For a shell-shaped
-call that was false in a way sharper than the executor: an allow rule
-remembered on `dd of=${DEV}` would have redeemed every future value of
-`DEV`, the exact hazard the rule refusal exists for. The hook gate now
-plans a shell call the way the shell gate does, and the ask carries the
-source, the plan and the names. The lesson from the morning held to the
-end: the count of prerequisites was not the count of the work, and the
-inventory that missed this one listed origins, not the paths a live
-kernel actually routes through.
-
-The alignment question had one more turn in it. The scorer sees an
-unexpanded variable as a middle guess — measured that afternoon, a
-`chmod -R 777` on a variable scored a quarter as dangerous, on `/` almost
-certain, on a build cache almost nothing — so the values the human now
-sees should reach the classifier too. They do, as a field beside the plan.
-Whether the scorer substitutes them into what it judges is a different
-question, because kaish's plan is declared parse information and the
-classifier is meant to judge what was asked. That went to the kaish lead
-as a request for a second, expanded rendering rather than being rebuilt
-here in jq. And the hook that feeds the scorer from Amy's own terminal
-turned out to be shelling to whichever `kaish` was on the path, which the
-0.17 bump had swapped underneath it the day before. Amy's answer was the
-one the rest of the day had been circling: *"let's use kaish as a library
-which mcp already does so there's no way to have version skew."* The hook
-began moving into kaijutsu-mcp that evening, planning in process against
-the lockfile and replying to Claude Code before it scores.
-
-## The name that had no home (September 5)
+## The name that had no home (September 5–8)
 
 Amy opened a Saturday with her own routine on the table: she restarts every
 Claude Code session each morning, and again whenever a context's prompt
@@ -2540,71 +832,89 @@ because *"the session's own model is both the best summarizer and the
 cheapest one."*
 
 The code review at the end changed the plan more than the design did. A
-principal already has an opaque id, a unique username, a display name, and
-many credentials mapping into it; Amy's keys from every machine already
-resolve to one. The roster already knows principals and contexts, liveness,
-and self-reported availability. So a character is a principal with a sheet,
-and the design adds no new identity type. The lead first read the turn path
-as stamping a model's blocks with the human who drove the turn; a kaibo
-review the same afternoon corrected it: the blocks carry the system
-principal, because there has never been a principal for the model to be, and
-the only thing that reads a block's principal is the wire's author field.
-A frontier deliberation that evening moved the handoff off the track's
-score and onto an ordinary context with a hydration window, split every
-turn's identity into the requester who caused it and the character who
-performs it, and asked for an explicit address when a note is meant for a
-character rather than a live context. `docs/character.md` carries the
-slices; slice one is a column and that stamp.
+principal already has an opaque id and many credentials mapping into it; the
+roster already knows principals, contexts and liveness. So a character is a
+principal with a sheet, and the design adds no new identity type. The lead
+first read the turn path as stamping a model's blocks with the human who
+drove the turn; a kaibo review corrected it: the blocks carry the system
+principal, because there has never been a principal for the model to be. A
+frontier deliberation that evening moved the handoff onto an ordinary context
+with a hydration window and split every turn's identity into the requester
+who caused it and the character who performs it. `docs/character.md` carries
+the slices.
 
-The prework went out the same afternoon as six small lanes, each in its own
-files, committed by the lead one at a time. Two of them turned into
-corrections instead of fixes: a comment said the roster's refresh loop was
-never called, and it had been called since August; the lead had read the
-turn path as stamping the driving human on model blocks, and it stamped the
-system principal. Both had been gated on in the design. The rule that came
-out of the day is small: run `git log -S` on a comment before building on
-it. The third lane found the restart mystery from Thursday, which was never
-the kernel: the hook listener archived its own context on any session's
-end, because the id it thought was its own came from a transcript scrape
-that named the session before. Amy reconnected to the fixed binary before
-lunch.
+The prework went out as six small lanes, and two turned into corrections: a
+comment said the roster's refresh loop was never called, and it had been
+called since August. The rule that came out is small: run `git log -S` on a
+comment before building on it. The third lane found the restart mystery from
+Thursday, which was never the kernel: the hook listener archived its own
+context on any session's end, because the id it thought was its own came
+from a transcript scrape that named the session before.
 
 The sheet and the keyring shipped the next day, and the keyring changed
 shape while it was being built. The reading that moved it was that the
 kernel never reads `auth.db`: the join key was always a bare principal id,
 and every name in the system was a display label cached wherever the
-identity had been seen. So `characters.name` did not compete with the
-keyring for a truth it held. Amy took it further in two steps, first
-*"maybe authdb should bind a key to a principal id only, and nicks melt
-into the character,"* then *"why have a name in principal at all at that
-point?"* The struct lost its name fields and then its reason to exist.
-`add-key --as <character>` binds and never mints; retire takes a
-character's contexts with it, which deleted the reassign gap rather than
-patching it; a fresh kernel seeds `hajime`, a character built to be
-retired, with a minted id because *"deterministic feels like a choice we'd
-regret."* The migration ran on Monday morning after a full rehearsal on a
-snapshot, and every rehearsed number held: six principals became six
-characters and no key binding moved. The one thing found on the way was
-that an unmigrated restart would have come up half-working and silent,
-since the old table satisfied `CREATE TABLE IF NOT EXISTS`; the server
-now refuses to start on a pre-melt keyring, and the first draft of that
-test proved the guard by hanging.
+identity had been seen. Amy took it further in two steps, first *"maybe
+authdb should bind a key to a principal id only, and nicks melt into the
+character,"* then *"why have a name in principal at all at that point?"*
+The struct lost its name fields and then its reason to exist. `add-key --as
+<character>` binds and never mints; retire takes a character's contexts with
+it; a fresh kernel seeds `hajime`, a character built to be retired, with a
+minted id because *"deterministic feels like a choice we'd regret."* The
+migration ran on Monday morning after a full rehearsal on a snapshot, and
+every rehearsed number held. The one thing found on the way was that an
+unmigrated restart would have come up half-working and silent, since the old
+table satisfied `CREATE TABLE IF NOT EXISTS`; the server now refuses to start
+on a pre-melt keyring, and the first draft of that test proved the guard by
+hanging.
 
-The handoff followed the same afternoon, two lanes in disjoint files. A
-note is ordinary authoring, so it is not gated; a `tail` never mints,
-because a read-only verb's whole flag surface must be incapable of a
-write, and the lane found the exhaustiveness test that enforces it;
-`--for` lets one character write into another's log under its own name,
-which makes "a message board is this log read by someone else" true
-before addressing exists. `S16-handoff.kai` injects the character's
-recent notes at create. Its last mile was a power cut: zorak lost power
-mid-verification, the unit restarted itself on the right binary, and the
-only write in flight had never run, because the advisory gate had
-escalated `kj handoff note` from an MCP seat. That escalation became the
-next design. Amy asked for a health survey of the safety hooks and then
-for layered allow and deny lists, and a Crush session driven by qwen
-wrote `docs/gate-policy-tuning.md`: one evaluator over builtin, global,
-per-type and learned tiers, consulted at the two pinch points that
-already exist, with the user's explicit list outranking everything
-shipped. `signoff.md` gave up its durable third to `docs/operating.md`
-the same day, on the way to being retired by the log it described.
+The handoff followed the same afternoon. A note is ordinary authoring, so it
+is not gated; a `tail` never mints, because a read-only verb's whole flag
+surface must be incapable of a write; `--for` lets one character write into
+another's log under its own name, which makes "a message board is this log
+read by someone else" true before addressing exists. `S16-handoff.kai`
+injects the character's recent notes at create. Its last mile was a power
+cut: zorak lost power mid-verification, the unit restarted itself on the
+right binary, and the only write in flight had never run, because the
+advisory gate had escalated `kj handoff note` from an MCP seat. That
+escalation became the next design: Amy asked for a health survey of the
+safety hooks and then for layered allow and deny lists, and a Crush session
+driven by qwen wrote `docs/gate-policy-tuning.md` — one evaluator over
+builtin, global, per-type and learned tiers, with the user's explicit list
+outranking everything shipped. `signoff.md` gave up its durable third to
+`docs/operating.md` the same day, on the way to being retired by the log it
+described.
+
+## The hardware gets its own body (September 7–8)
+
+Amy wanted MIDI presence and music to survive closing the 3D app, then
+widened the task to PCM: "a realtime audio daemon we can put on various
+machines that have audio hardware." Realtime meant an ordinary service with
+Linux RT priority available, not a new scheduling architecture. The DJ, the
+PCM scheduler and the MIDI workers moved into a reusable library; each node
+connects over SSH and performs kernel cues; the kernel remains the sole
+sequencer while nodes keep local beat phasors for display. Device-open
+failure is explicit, RT-priority failure is a warning, and the hardware
+lifetime no longer depends on a window. `docs/audio-daemon.md`.
+
+Retrospective recording followed from *"grab a happy accident real quick."*
+MIDI input feeds bounded per-source RAM history independently of recording
+a context; a keep copies a complete recent window, protects it from
+eviction, and exports it through the existing SFTP path into CAS before the
+RAM is released. Source generations and explicit loss reject incomplete
+windows instead of claiming a complete recording.
+
+The daemon's first fitness review settled two things. The app's opt-in
+in-process host was deleted and the last ALSA read left the app with it: the
+patch bay now reads the kernel's projected audio inventory, so a remote
+node's rack is visible from any app. And the live probe found moltar's clock
+100.9 s behind zorak's with NTP on neither host, which the one-timebase
+doctrine had quietly assumed away. Amy: "I want to consider if we can be
+resilient to some clock skew, even lean into it a lil." The answer made the
+kernel's clock the timebase by definition: every node models its offset from
+the ping round trip and mints and ages stamps in the kernel's domain, and NTP
+became optional. The same morning explained a ghost peer registration — the
+bridge task's self-detach lived on a LocalSet that was dropped before it
+could run — and moved that cleanup onto the connection's own Drop, the only
+teardown that runs.
