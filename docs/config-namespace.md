@@ -182,8 +182,6 @@ documents in `kernel.db` is not carried forward, on Amy's decision that
 those documents were not worth one — see `docs/devlog.md`, "Config: the
 kernel owned it, then gave it back."
 
-## Settled since
-
 - **`Kernel::invalidate_config_file_cache` (`kernel.rs:1875`) has nothing to
   do with `ConfigDocFs`.** It exists because a composition symlink's write
   can defeat the disk-generation staleness check `try_get_or_load` relies on
@@ -203,9 +201,10 @@ kernel owned it, then gave it back."
 
 ## The one thing that gets worse
 
-Config leaves `kernel.db`. Today a config edit is a kernel-sequenced block
-mutation inside the durable store, so it travels with a database backup.
-Afterward it is a file in a directory, and backing it up is a separate act.
+Config lives outside `kernel.db`. A config edit is a file write in a host
+directory, so a database backup does not carry it; backing up the config
+root is a separate act (`docs/operating.md`). The documents config left
+behind in `kernel.db` have no reader and are not migrated.
 
 Same trade rc already took, and no production reader reaches config content
 through the block store — every consumer goes through the VFS, including
