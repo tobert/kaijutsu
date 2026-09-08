@@ -76,6 +76,13 @@ impl PatchGraphReader {
         Ok(Self { seq })
     }
 
+    /// This reader's own ALSA client id (`"kaijutsu-patchview"`) — an
+    /// `own_clients` entry for the inventory report
+    /// (`docs/audio-daemon.md` "One inventory owner").
+    pub fn client_id(&self) -> Result<i32, String> {
+        self.seq.client_id().map_err(|e| e.to_string())
+    }
+
     /// Enumerate every client/port and every subscription, in one pass.
     ///
     /// Subscriptions are queried in both directions
@@ -143,6 +150,10 @@ impl PatchGraphReader {
 
     pub fn snapshot(&self) -> Result<PatchGraphSnapshot, String> {
         Ok(PatchGraphSnapshot::default())
+    }
+
+    pub fn client_id(&self) -> Result<i32, String> {
+        Err("patch-bay topology reads are Linux/ALSA-only".into())
     }
 }
 

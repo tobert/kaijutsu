@@ -12,13 +12,21 @@ pub(crate) struct Observation {
     pub ingress_lost: u64,
     pub legacy_lost: u64,
     pub head: Option<(Instant, u64)>,
+    /// Monotonic per-source MIDI event count, keyed by ALSA address
+    /// (`"client:port"`) — the inventory report's `events` field for an
+    /// input endpoint (`docs/audio-daemon.md` "One inventory owner").
+    /// Counts every observed Capture event, independent of whether the
+    /// bounded retention ring admitted it — this is "did the ear see
+    /// traffic", not "is it still retained".
+    pub event_counts: std::collections::BTreeMap<String, u64>,
     ingress_floor: Option<Instant>,
 }
 
 impl Observation {
     pub fn new() -> Self {
         Self { history: HistoryStore::new(HistoryLimits::default()).expect("valid MIDI history defaults"),
-            ports: Vec::new(), ready: false, error: None, ingress_lost: 0, legacy_lost: 0, head: None, ingress_floor: None }
+            ports: Vec::new(), ready: false, error: None, ingress_lost: 0, legacy_lost: 0, head: None,
+            event_counts: std::collections::BTreeMap::new(), ingress_floor: None }
     }
 
     pub fn inventory(&mut self) -> serde_json::Value {
@@ -41,6 +49,7 @@ impl Observation {
         match event {
             EarEvent::Watermark { observed_at, epoch_ns } => self.head = Some((*observed_at, *epoch_ns)),
             EarEvent::Capture { event, observed_at } => {
+                *self.event_counts.entry(event.source.clone()).or_insert(0) += 1;
                 if let Err(error) = self.history.ingest(event.clone(), *observed_at) { self.error = Some(error); }
             }
             EarEvent::Inventory { ports, observed_at } => {

@@ -2517,4 +2517,25 @@ interface Kernel {
   #
   # docs/gate-and-shell-split.md, "Dry-run mode".
   shellDryRun @103 (contextId :Data, command :Text, trace :TraceContext) -> (report :ShellDryRunReport);
+
+  # ── Sink-fed audio inventory (docs/audio-daemon.md "One inventory owner") ──
+
+  # An audio daemon's full inventory report: every ALSA endpoint and wire it
+  # observes, plus its own plumbing client ids. Chatty and connection-bound,
+  # the same shape as reportMidiPresence: no facade gate (inventory is inert
+  # sensor data about the rig, every player is inside the trust boundary),
+  # and attribution is stamped from the connection, never from anything the
+  # daemon says about itself — a crashed daemon cannot send a final report,
+  # so its inventory must not outlive the connection it arrived on. The
+  # kernel projects the accepted report at
+  # `/run/audio/<node-dir>/inventory.json`, overwriting `received_epoch_ns`
+  # and `stale` with its own values before serving it — a daemon sends
+  # `stale: false` and `received_epoch_ns: 0` because only the kernel knows
+  # either. `revision` orders reports from the SAME connection (a report
+  # with a revision no greater than the one on file is dropped); a report
+  # from an OLDER connection than the one currently holding `node` cannot
+  # replace or reap the newer one, mirroring reportMidiPresence's
+  # connection-bound rule. `observedEpochNs` is the daemon's own wallclock
+  # at observation, in the kernel's clock domain.
+  reportAudioInventory @104 (node :Text, revision :UInt64, observedEpochNs :UInt64, report :Data) -> ();
 }

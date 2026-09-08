@@ -2,6 +2,7 @@
 
 mod audio_sched;
 pub mod dj;
+mod inventory_report;
 mod midi_exchange;
 mod midi_in;
 pub mod midi_match;

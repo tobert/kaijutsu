@@ -618,6 +618,13 @@ enum RpcCommand {
         sink_host: String,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    ReportAudioInventory {
+        node: String,
+        revision: u64,
+        observed_epoch_ns: u64,
+        report: Vec<u8>,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
     VfsReadAll {
         path: String,
         reply: oneshot::Sender<Result<Vec<u8>, CallError>>,
@@ -836,6 +843,7 @@ impl RpcCommand {
             Self::CommitCapture { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ReportClockEstimate { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ReportMidiPresence { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ReportAudioInventory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::VfsReadAll { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1686,6 +1694,30 @@ impl ActorHandle {
             ports,
             epoch_ns,
             sink_host,
+            reply,
+        })
+        .await
+    }
+
+    /// Report one audio daemon's full inventory (`docs/audio-daemon.md` "One
+    /// inventory owner"). Kernel-global, not context-scoped: inventory is a
+    /// fact about the rig, not a conversation. `revision` orders reports from
+    /// this connection; the kernel drops an older connection's report for a
+    /// node a newer connection already holds.
+    #[tracing::instrument(skip(self, report))]
+    pub async fn report_audio_inventory(
+        &self,
+        node: impl Into<String> + std::fmt::Debug,
+        revision: u64,
+        observed_epoch_ns: u64,
+        report: Vec<u8>,
+    ) -> Result<(), CallError> {
+        let node = node.into();
+        self.send(|reply| RpcCommand::ReportAudioInventory {
+            node,
+            revision,
+            observed_epoch_ns,
+            report,
             reply,
         })
         .await
@@ -3809,6 +3841,12 @@ async fn dispatch_kernel_command(
             dispatch!(
                 kernel, reply, close_tx, k,
                 k.report_midi_presence(&device, present, &backend, &ports, epoch_ns, &sink_host)
+            );
+        }
+        RpcCommand::ReportAudioInventory { node, revision, observed_epoch_ns, report, reply } => {
+            dispatch!(
+                kernel, reply, close_tx, k,
+                k.report_audio_inventory(&node, revision, observed_epoch_ns, &report)
             );
         }
         RpcCommand::VfsReadAll { path, reply } => {

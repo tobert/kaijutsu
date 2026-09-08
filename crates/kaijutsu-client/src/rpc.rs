@@ -2839,6 +2839,31 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Report one audio daemon's full inventory (`docs/audio-daemon.md` "One
+    /// inventory owner" — the daemon observes, the kernel records and
+    /// projects it at `/run/audio/<node-dir>/inventory.json`). `report` is
+    /// the daemon's already-serialized JSON body; the kernel re-stamps
+    /// `received_epoch_ns`/`stale` and re-serializes on the way out.
+    #[tracing::instrument(skip(self, report), name = "rpc_client.report_audio_inventory")]
+    pub async fn report_audio_inventory(
+        &self,
+        node: &str,
+        revision: u64,
+        observed_epoch_ns: u64,
+        report: &[u8],
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.report_audio_inventory_request();
+        {
+            let mut p = request.get();
+            p.set_node(node);
+            p.set_revision(revision);
+            p.set_observed_epoch_ns(observed_epoch_ns);
+            p.set_report(report);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
     /// Clear the input document for a context (discard draft).
     ///
     /// The server clears the draft block; there is no dedicated clear event —

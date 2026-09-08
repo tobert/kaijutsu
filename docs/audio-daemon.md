@@ -45,9 +45,12 @@ Use an actual address and generation from `devices`; `24:0` is illustrative.
 `sources` lists retained input histories and their generations. Capabilities,
 listening success, errors, available coverage and input-loss counts are separate
 facts. A generation changes when its endpoint is replaced or restarted. The
-inventory is read through the kernel's existing named-peer RPC; the consolidated
-`/run/audio` projection remains planned, not implemented. `kj midi list` still
-shows the older profile-matched presence view.
+inventory above is read through the kernel's existing named-peer RPC; the
+consolidated `/run/audio/<node-dir>/inventory.json` projection ("One inventory
+owner" below) is a second, VFS-readable path to a related but distinct picture
+— the whole local seq graph plus per-endpoint event counts, not `devices`'
+retention-and-capabilities detail. `kj midi list` still shows the older
+profile-matched presence view.
 
 Each listening source retains up to 60 seconds, 1 MiB and 64 KiB per message,
 within 16 MiB of node history and 64 source slots. These are implementation
@@ -136,26 +139,61 @@ old role or program merely because a familiar device returns.
 
 ### One inventory owner
 
-Evolve the existing kernel `MidiPresenceStore` and `/run/midi` projection;
-do not add a competing presence authority. Target projection:
-`/run/audio/<node>/inventory.json`, with stream status and summaries alongside
-it. The exact node path encoding and migration of existing readers must be
-settled in slice 1. Display names are not unvalidated filesystem components.
+Shipped, alongside `MidiPresenceStore`/`/run/midi` rather than competing with
+it: `AudioInventoryStore` (`crates/kaijutsu-kernel/src/audio_inventory.rs`)
+and the read-only view it mounts at `/run/audio`. Node path encoding:
+`/run/audio/<node-dir>/inventory.json`, where `<node-dir>` is the daemon's
+peer nick with every `/` replaced by `-` (`audio/moltar` → `audio-moltar`,
+`kaijutsu_types::paths::audio_node_dir`) — a directory per node, one
+`inventory.json` leaf each. Display names inside the body are not filesystem
+components; only the node segment of the path is derived from one, and
+that derivation is the one place doing it.
 
-The daemon sends a full snapshot on connection and versioned replacements
-on topology change. The kernel associates reports with its connection id,
-assigns an acceptance sequence, and exposes one coherent snapshot. An old
-connection cannot replace or reap a newer connection's observations. Two
-nodes matching the same profile remain separate entries. Reports carry source
-observation time and kernel receipt time, not a cross-host last-wallclock-wins
-ordering. Disconnect invalidates current presence; a retained last observation
-is labeled stale. Kernel restart clears ephemeral state.
+The daemon sends a full report on every (re)connection and whenever its
+observed topology, its own client set, or any endpoint's event count changes,
+rate-limited to at most one report per second and at least one every ten
+seconds while connected (`kaijutsu-audio-runtime/src/runtime.rs`'s `serve`
+loop, cadence decided by `inventory_report::report_due`). The kernel
+associates each report with its connection id and a daemon-assigned
+`revision`: a report from an older connection than the one currently holding
+a node cannot replace or reap the newer one, and a same-connection report
+whose revision does not exceed the one on file is dropped — see
+`AudioInventoryStore::record`. Two nodes remain separate entries regardless of
+profile. The daemon sends `received_epoch_ns: 0` and `stale: false`; the
+kernel overwrites both with its own values before serving the projection —
+only the kernel knows either. Disconnect does not remove a node's last report:
+`ConnectionState::drop` calls `AudioInventoryStore::reap_connection`, which
+marks every node that connection held `stale: true` and keeps the body (the
+audio-daemon rule differs from `MidiPresenceStore::reap_connection`'s removal
+on purpose — a node's last known wiring is still useful once the daemon
+disappears). Kernel restart clears the ephemeral store entirely.
 
-Distinguish backend disabled, scan pending, ready and error. A ready empty
-inventory means no endpoints were found. Disconnected means unknown, not
-absent. Observed, opened and usable are different facts. Hotplug is advisory:
-backend errors and periodic reconciliation repair missed notifications.
-The kernel never enumerates host hardware itself.
+`state` distinguishes `pending`, `ready` and `error`, mirrored from the
+runtime's existing MIDI `Observation`; a ready empty inventory means no
+endpoints were found. `own_clients` names the daemon's own plumbing ALSA
+clients only — the ear (`kaijutsu-ear`), the exchange client
+(`kaijutsu-exchange`) and the patch-graph reader (`kaijutsu-patchview`) —
+**never** the render client (`kaijutsu-audio`/`render`, `dj/midi.rs`): that is
+a real musical endpoint, and the patch bay pulses traffic from its `events`
+count. `events` is per-endpoint and monotonic: an input's count is how many
+MIDI events the ear has observed from that address
+(`Observation::event_counts`); the render port's count is how many events the
+DJ has sent out it (`dj::midi::RENDER_EVENTS_SENT`, a process-wide counter
+read from a different thread than the one that increments it, since there is
+exactly one render port per process). The kernel never enumerates host
+hardware itself; `crate::patch_graph::PatchGraphReader` — a second, dedicated
+ALSA client separate from the ear and the DJ's render port — is what lets one
+report reflect the whole local seq graph rather than only what the ear or the
+DJ happen to see.
+
+Unplug/replug address reuse and missed-notification reconciliation are
+already covered by the observer's own reconciliation (see the "Inventory
+audit complete" note below) and are not re-tested here; this slice's own test
+coverage is the store's connection/revision ordering and stale-marking
+(`audio_inventory.rs` unit tests), the wire round-trip and disconnect-to-stale
+timing (`kaijutsu-server/tests/audio_inventory_wire.rs`), and the report
+builder's endpoint/`own_clients`/`events` assembly
+(`kaijutsu-audio-runtime/src/inventory_report.rs` unit tests).
 
 ### Local history and window contract
 
@@ -331,11 +369,23 @@ Implementation progress:
   release. A live synthetic SFTP upload on zorak passed; musical-input capture
   on moltar is not yet verified. No running daemon or kernel was replaced.
 
-- [ ] **1 — inventory.** Diagnose current unknown MIDI presence. Expose raw
-  MIDI and PCM endpoints, per-node/per-connection state and coherent `/run`
-  reads. Tests: unprofiled JD-Xi-shaped endpoint is visible; two equal models
-  on different nodes; unplug/replug address reuse; stale connection cleanup;
-  disabled/empty/error states; missed notification reconciliation.
+- [x] **1 — inventory.** Diagnosis of unknown MIDI presence and the raw
+  per-source retained-MIDI primitive shipped earlier (see the "Inventory audit
+  complete" and pure-primitive notes above); this slice adds the coherent
+  `/run` read: `reportAudioInventory` (`kaijutsu.capnp`), `AudioInventoryStore`
+  + the `/run/audio` projection (`crates/kaijutsu-kernel/src/
+  audio_inventory.rs`), and the daemon-side report builder + cadence
+  (`kaijutsu-audio-runtime/src/inventory_report.rs`, wired into `runtime.rs`).
+  Tests: connection/revision ordering and stale-marking
+  (`audio_inventory.rs`); a report landing at the projected path with the
+  kernel's own `received_epoch_ns`/`stale`, two nodes as separate
+  directories, and a dropped connection's node going stale within the reap
+  window — never removed (`audio_inventory_wire.rs`); `own_clients` carrying
+  ear/exchange/patchview and never render, and `events` reading from the
+  right counter for an input vs. the render port (`inventory_report.rs`).
+  Unplug/replug address reuse and missed-notification reconciliation were
+  already covered by the observer's own periodic/hotplug reconciliation
+  before this slice and are unchanged by it.
 - [x] **2 — retained MIDI windows.** Add independent retrospective reads and
   byte bounds to the existing capture substrate; wire per-source lifecycle
   and bounded ingress. Tests: repeated/overlapping reads; overwrite and
@@ -464,7 +514,7 @@ SSH actor. Transport stop, connection loss and shutdown flush scheduled output.
 Late musical events follow `docs/midi.md`, "The one timebase".
 
 The app has no hardware I/O; `kaijutsu-audiod` is the sole hardware owner.
-The patch bay reads `/run/audio/<node>/inventory.json`, one table per node,
+The patch bay reads `/run/audio/<node-dir>/inventory.json`, one table per node,
 and pulses render traffic from that node's own event counters — a remote
 node's fabric (moltar's rack, say) is visible from any connected app the
 same way a local one is.

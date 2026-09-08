@@ -1,6 +1,6 @@
 //! MIDI capture and hotplug events from the local hardware backend.
 use tracing::{debug, error, info, warn};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
 use kaijutsu_client::KernelClockHandle;
@@ -51,6 +51,14 @@ impl EarSender {
         }
     }
 }
+
+/// This process's `kaijutsu-ear` ALSA client id, or `-1` before the capture
+/// thread has opened its sequencer client — the inventory report's
+/// `own_clients` entry for the ear (`docs/audio-daemon.md` "One inventory
+/// owner"). A plain process-wide cell, mirroring `dj::midi::
+/// RENDER_EVENTS_SENT`: there is exactly one ear per process, and the report
+/// builder runs on a different thread than [`spawn_capture_thread`].
+pub(crate) static EAR_CLIENT_ID: AtomicI32 = AtomicI32::new(-1);
 
 pub(crate) struct EarWorker {
     rx: Option<std::sync::mpsc::Receiver<EarEvent>>,
@@ -131,6 +139,7 @@ pub(crate) fn spawn_capture_thread(priority: u8, clock: KernelClockHandle) -> Re
         )
         .map_err(map)?;
     let own = seq.client_id().map_err(map)?;
+    EAR_CLIENT_ID.store(own, Ordering::Relaxed);
     let dest = Addr { client: own, port };
 
     // Hotplug: System Announce (0:1) tells us when a new port appears.

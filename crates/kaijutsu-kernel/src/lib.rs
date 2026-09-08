@@ -12,6 +12,7 @@
 //! - Has a DriftRouter for cross-context communication (shared across fork/thread)
 
 pub mod ansi_ingest;
+pub mod audio_inventory;
 pub mod background_exec;
 pub mod block_store;
 pub mod blocks;

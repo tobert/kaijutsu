@@ -69,12 +69,14 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let node = format!("audio/{}", hostname::get()?.to_string_lossy());
     let options = Options {
         audio: !cli.no_audio,
         midi: !cli.no_midi && cfg!(target_os = "linux"),
         output: cli.output,
         rt_priority: cli.rt_priority,
         config_client: None,
+        node: node.clone(),
     };
     if !options.audio && !options.midi { bail!("enable audio or MIDI"); }
     if cli.context.is_some() && !options.midi { bail!("MIDI capture requires a Linux MIDI backend"); }
@@ -111,7 +113,6 @@ async fn run(cli: Cli) -> Result<()> {
     }).await.context("kernel connection timed out")??;
 
     let (peer_tx, peer_rx) = std::sync::mpsc::channel();
-    let node = format!("audio/{}", hostname::get()?.to_string_lossy());
     actor.attach_peer(PeerConfig { nick: node.clone(), instance: instance.clone() }, peer_tx)
         .await.context("register audio peer")?;
     // Taken before `actor` moves into the engine; `status` reports what the

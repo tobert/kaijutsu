@@ -16,11 +16,7 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
-/// `/run/audio`'s well-known root. Not yet in `kaijutsu_types::paths` — the
-/// projection lane names the exact node-path encoding as still-to-settle
-/// (`docs/audio-daemon.md`, "One inventory owner"); this constant moves
-/// there once it lands.
-pub const AUDIO_RUN_ROOT: &str = "/run/audio";
+pub use kaijutsu_types::paths::AUDIO_RUN_ROOT;
 
 // ── Wire JSON (the daemon's published report) ───────────────────────────────
 

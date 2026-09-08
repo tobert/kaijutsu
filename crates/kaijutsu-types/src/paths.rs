@@ -99,6 +99,14 @@ pub const RUN_ROOT: &str = "/run";
 /// Ephemeral by construction — see [`RUN_ROOT`].
 pub const MIDI_RUN_ROOT: &str = "/run/midi";
 
+/// Root of the sink-fed audio inventory store (`docs/audio-daemon.md` "One
+/// inventory owner"). `/run/audio/<node-dir>/inventory.json` renders one
+/// audio daemon's accepted inventory report — every observed ALSA endpoint
+/// and wire, plus the daemon's own plumbing client ids — written only by
+/// app→kernel `reportAudioInventory` calls. Ephemeral by construction — see
+/// [`RUN_ROOT`].
+pub const AUDIO_RUN_ROOT: &str = "/run/audio";
+
 /// Root of the live roster view (`crates/kaijutsu-kernel/src/roster.rs`) —
 /// who's around right now, agents and humans alike. `/run/roster/index` is a
 /// generation-stamped TSV of every current row; `/run/roster/<entity_kind>-
@@ -187,6 +195,16 @@ pub fn midi_device_path(name: &str) -> String {
 /// durable and ephemeral halves of one device.
 pub fn midi_presence_path(device: &str) -> String {
     format!("{MIDI_RUN_ROOT}/{device}")
+}
+
+/// `/run/audio`'s node-directory encoding: a peer nick such as
+/// `"audio/moltar"` with every `/` replaced by `-`, giving `"audio-moltar"`.
+/// The nick's own `audio/` prefix already makes the directory name
+/// self-describing; this is the one place the encoding is defined, so a
+/// daemon's own node-directory name and a reader's lookup can never drift
+/// apart.
+pub fn audio_node_dir(nick: &str) -> String {
+    nick.replace('/', "-")
 }
 
 /// A live client's root under `/r`: `/r/<client_id>`.

@@ -77,6 +77,12 @@ pub struct Kernel {
     /// records); read by `kj midi list/show` and, through the read-only
     /// `MidiPresenceFs` mounted at `/run/midi`, by kaish/kai/file tools.
     midi_presence: Arc<crate::midi_presence::MidiPresenceStore>,
+    /// Sink-fed audio inventory (`docs/audio-daemon.md` "One inventory
+    /// owner"). Ephemeral on purpose, same reasoning as `midi_presence`.
+    /// Written solely by `reportAudioInventory` (the daemon observes, the
+    /// kernel records); read by, through the read-only `AudioInventoryFs`
+    /// mounted at `/run/audio`, kaish/kai/file tools and the app's patch bay.
+    audio_inventory: Arc<crate::audio_inventory::AudioInventoryStore>,
     /// Connection → MIDI exchange channel (`docs/midi-next.md` "SysEx: the
     /// exchange pattern"). The addressed counterpart to `midi_presence`'s
     /// records: presence says WHICH connection has a device, this says how to
@@ -319,6 +325,7 @@ impl Kernel {
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
             midi_presence: Arc::new(crate::midi_presence::MidiPresenceStore::new()),
+            audio_inventory: Arc::new(crate::audio_inventory::AudioInventoryStore::new()),
             midi_exchange: Arc::new(crate::midi_exchange::MidiExchangeRegistry::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
@@ -425,6 +432,7 @@ impl Kernel {
             cas: Self::cas_for_data_dir(data_dir),
             share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
             midi_presence: Arc::new(crate::midi_presence::MidiPresenceStore::new()),
+            audio_inventory: Arc::new(crate::audio_inventory::AudioInventoryStore::new()),
             midi_exchange: Arc::new(crate::midi_exchange::MidiExchangeRegistry::new()),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new({
@@ -1075,6 +1083,13 @@ impl Kernel {
     /// sink-fed") — ephemeral, in-memory, `/run/midi`'s backing state.
     pub fn midi_presence(&self) -> &Arc<crate::midi_presence::MidiPresenceStore> {
         &self.midi_presence
+    }
+
+    /// The sink-fed audio inventory store (`docs/audio-daemon.md` "One
+    /// inventory owner") — ephemeral, in-memory, `/run/audio`'s backing
+    /// state.
+    pub fn audio_inventory(&self) -> &Arc<crate::audio_inventory::AudioInventoryStore> {
+        &self.audio_inventory
     }
 
     /// The MIDI exchange registry (`docs/midi-next.md` "SysEx: the exchange

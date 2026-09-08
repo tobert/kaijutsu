@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use kaijutsu_audio::{CaptureLimits, CaptureRing, Tracker, MIDI_CAPTURE_MIME};
@@ -11,8 +12,10 @@ use kaijutsu_types::ContextId;
 use tokio::sync::watch;
 
 use crate::dj::thread::{DjCtl, DjHandle};
+use crate::inventory_report::{ReportInputs, build_report, report_due};
 use crate::midi_in::EarEvent;
 use crate::observer::{Observation, Observer};
+use crate::patch_graph::PatchGraphReader;
 use crate::midi_match::{DeviceMatch, match_ports, parse_profile};
 use crate::midi_presence::{MidiPortTopology, BACKEND, DEVICES_DIR, MAX_PROFILES, routes_from_match, diff_presence, sink_host};
 
@@ -24,11 +27,24 @@ pub struct Options {
     pub rt_priority: u8,
     /// Optional client config layer before the shared metronome default.
     pub config_client: Option<String>,
+    /// This node's peer nick (e.g. `"audio/moltar"`) — the `node` field in
+    /// every `reportAudioInventory` call (`docs/audio-daemon.md` "One
+    /// inventory owner"). Empty disables inventory reporting entirely (no
+    /// node name to report under), same as an absent `context` disables
+    /// capture.
+    pub node: String,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { audio: true, midi: cfg!(target_os = "linux"), output: None, rt_priority: 0, config_client: None }
+        Self {
+            audio: true,
+            midi: cfg!(target_os = "linux"),
+            output: None,
+            rt_priority: 0,
+            config_client: None,
+            node: String::new(),
+        }
     }
 }
 
@@ -200,6 +216,29 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_cut = std::time::Instant::now();
     let mut legacy_seen = 0u64;
+    // Sink-fed audio inventory (`docs/audio-daemon.md` "One inventory
+    // owner"). A second, dedicated ALSA client so the report reflects the
+    // WHOLE local seq graph, not just what the ear or the DJ's render port
+    // happen to see — opened once, best-effort: a box with no sequencer at
+    // all gets no inventory reporting rather than a fatal error, the same
+    // stance `fetch_profiles` takes toward a missing config tree.
+    let inventory_reader = if midi {
+        match PatchGraphReader::open() {
+            Ok(reader) => Some(reader),
+            Err(e) => {
+                tracing::warn!("audio inventory reporting unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let inventory_own_client = inventory_reader.as_ref().and_then(|r| r.client_id().ok());
+    let mut inventory_revision = 0u64;
+    let mut last_inventory_report: Option<std::time::Instant> = None;
+    let mut last_inventory_snapshot: Option<crate::patch_graph::PatchGraphSnapshot> = None;
+    let mut last_inventory_render_events = 0u64;
+    let mut last_inventory_input_events: BTreeMap<String, u64> = BTreeMap::new();
     loop {
         tokio::select! {
             biased;
@@ -212,6 +251,12 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
                 state.clocks.clear();
                 routes.write().expect("MIDI routes lock poisoned").clear();
                 dj.ctl_tx.send(DjCtl::MidiRoutes(BTreeMap::new())).map_err(|e| e.to_string())?;
+                // A reconnect is a new connection to the kernel's audio
+                // inventory store, which enforces its own ordering per
+                // connection — re-send a full snapshot rather than relying
+                // on stale cadence state from the old one.
+                last_inventory_report = None;
+                last_inventory_snapshot = None;
             }
             _ = tick.tick() => {}
         }
@@ -272,6 +317,72 @@ async fn serve(actor: &ActorHandle, context: Option<ContextId>, ear: Option<Obse
                     reported.insert(report.device, report.present);
                 }
                 revision = Some(state.topology.revision());
+            }
+            if let Some(reader) = &inventory_reader
+                && !options.node.is_empty()
+            {
+                match reader.snapshot() {
+                    Ok(snapshot) => {
+                        // Named, not addressed: the render port's ALSA
+                        // client id is assigned dynamically and lives on a
+                        // different thread (the DJ's), but its client/port
+                        // NAME is fixed — the graph already enumerates it
+                        // like any other endpoint.
+                        let render_addr = snapshot
+                            .endpoints
+                            .iter()
+                            .find(|e| e.client_name == "kaijutsu-audio" && e.port_name == "render")
+                            .map(|e| (e.client_id, e.port_id));
+                        let render_events =
+                            crate::dj::midi::RENDER_EVENTS_SENT.load(Ordering::Relaxed);
+                        let render = render_addr.map(|addr| (addr, render_events));
+
+                        let (observed_ports, input_events, inventory_state) = match &ear {
+                            Some(ear) => {
+                                let o = ear.shared.lock().expect("MIDI observation lock poisoned");
+                                let state = if o.error.is_some() { "error" } else if o.ready { "ready" } else { "pending" };
+                                (o.ports.clone(), o.event_counts.clone(), state)
+                            }
+                            None => (Vec::new(), BTreeMap::new(), "ready"),
+                        };
+
+                        let changed = Some(&snapshot) != last_inventory_snapshot.as_ref()
+                            || render_events != last_inventory_render_events
+                            || input_events != last_inventory_input_events;
+                        let elapsed = last_inventory_report.map(|at: std::time::Instant| at.elapsed());
+
+                        if report_due(changed, elapsed) {
+                            inventory_revision += 1;
+                            let own_clients = [
+                                crate::midi_in::EAR_CLIENT_ID.load(Ordering::Relaxed),
+                                crate::midi_exchange::EXCHANGE_CLIENT_ID.load(Ordering::Relaxed),
+                                inventory_own_client.unwrap_or(-1),
+                            ];
+                            let report = build_report(&ReportInputs {
+                                node: &options.node,
+                                revision: inventory_revision,
+                                observed_epoch_ns: clock.now_ns(),
+                                backend: BACKEND,
+                                state: inventory_state,
+                                graph: &snapshot,
+                                own_clients: &own_clients,
+                                observed_ports: &observed_ports,
+                                input_events: &input_events,
+                                render,
+                            });
+                            let bytes = serde_json::to_vec(&report).map_err(|e| e.to_string())?;
+                            actor
+                                .report_audio_inventory(options.node.clone(), inventory_revision, clock.now_ns(), bytes)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            last_inventory_report = Some(std::time::Instant::now());
+                            last_inventory_render_events = render_events;
+                            last_inventory_input_events = input_events;
+                            last_inventory_snapshot = Some(snapshot);
+                        }
+                    }
+                    Err(e) => tracing::warn!("audio inventory snapshot failed: {e}"),
+                }
             }
             if let Some(target) = context {
                 for (source, estimate) in std::mem::take(&mut state.clocks) {

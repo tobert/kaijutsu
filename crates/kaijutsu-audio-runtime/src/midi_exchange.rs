@@ -38,7 +38,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+/// This process's `kaijutsu-exchange` ALSA client id, or `-1` before the
+/// first exchange request lazily opens it — the inventory report's
+/// `own_clients` entry for the exchange client (`docs/audio-daemon.md` "One
+/// inventory owner"). A plain process-wide cell, mirroring `dj::midi::
+/// RENDER_EVENTS_SENT` and `midi_in::EAR_CLIENT_ID`: exactly one exchange
+/// client per process, read from a different thread than the one that opens
+/// it.
+pub(crate) static EXCHANGE_CLIENT_ID: AtomicI32 = AtomicI32::new(-1);
 use std::time::Duration;
 
 use tracing::{debug, info};
@@ -278,6 +287,7 @@ impl ExchangeClient {
             )
             .map_err(map)?;
         let client_id = seq.client_id().map_err(map)?;
+        EXCHANGE_CLIENT_ID.store(client_id, Ordering::Relaxed);
         info!("kaijutsu-exchange MIDI client open on ALSA seq {client_id}:{port}");
         Ok(Self { seq, port, client_id, stop: None })
     }

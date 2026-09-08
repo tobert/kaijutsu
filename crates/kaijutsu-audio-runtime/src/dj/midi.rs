@@ -689,6 +689,19 @@ impl MidiDispatch for MidiSink {
     }
 }
 
+/// Scheduled MIDI events sent out the render port (`addr()`, via
+/// [`MidiOut::schedule`] with `from_port: None` — never a control-port send)
+/// since process start — the inventory report's `events` field for the
+/// render endpoint (`docs/audio-daemon.md` "One inventory owner"). A plain
+/// process-wide counter: there is exactly one [`MidiOut`] per process (`docs/
+/// audio-daemon.md` "One process owns local I/O per OS user"), so the report
+/// builder — running on a different thread — reads this directly instead of
+/// being wired through `DjHandle`. Declared unconditionally so a report
+/// builder compiled for a non-Linux target still reads a value (always `0`,
+/// since nothing off Linux ever increments it).
+pub(crate) static RENDER_EVENTS_SENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// An ALSA-sequencer MIDI-out sink: a subscribe-readable source port + a started
 /// real-time queue. Other clients (`aconnect` → TiMidity, a DAW, `aseqdump`)
 /// connect to `addr()`. Ported from the server's `AlsaMidiOut` but consuming
@@ -893,11 +906,17 @@ impl MidiOut {
             match encoder.encode(data) {
                 Ok((_, Some(mut ev))) => {
                     let when = lead + *offset;
+                    let from_render_port = from_port.is_none();
                     ev.set_source(from_port.unwrap_or(self.port));
                     ev.set_subs();
                     ev.schedule_real(self.queue, true, when);
                     if let Err(e) = self.seq.event_output(&mut ev) {
                         tracing::error!("MIDI event_output failed: {e}");
+                    } else if from_render_port {
+                        // A control-port send (`from_port: Some(_)`) is a
+                        // different endpoint's traffic — only the render
+                        // port's own events count here.
+                        RENDER_EVENTS_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 Ok((_, None)) => continue, // incomplete message — shouldn't happen

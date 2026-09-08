@@ -1468,6 +1468,13 @@ pub struct ConnectionState {
     /// the connection rather than outlive it as a lie. `None` on a connection
     /// that never reported presence, which is most of them.
     midi_presence: Option<Arc<kaijutsu_kernel::midi_presence::MidiPresenceStore>>,
+    /// The kernel's audio inventory store, attached the first time this
+    /// connection reports inventory (`docs/audio-daemon.md` "One inventory
+    /// owner"). Held so `Drop` can mark this connection's nodes stale — a
+    /// daemon that crashes never sends a final report, so its inventory must
+    /// not go on claiming a live connection forever. `None` on a connection
+    /// that never reported inventory, which is most of them.
+    audio_inventory: Option<Arc<kaijutsu_kernel::audio_inventory::AudioInventoryStore>>,
     /// The kernel's MIDI exchange registry, attached when this connection
     /// registered a sink bridge (`docs/midi-next.md` "SysEx: the exchange
     /// pattern"). Held for the same reason as `midi_presence`: a sink that
@@ -1500,6 +1507,7 @@ impl ConnectionState {
             conn_cancel: CancellationToken::new(),
             disconnect: CancellationToken::new(),
             midi_presence: None,
+            audio_inventory: None,
             midi_exchange: None,
             peer_attachments: None,
         }
@@ -1528,6 +1536,18 @@ impl ConnectionState {
     ) {
         if self.midi_presence.is_none() {
             self.midi_presence = Some(store);
+        }
+    }
+
+    /// Remember the inventory store this connection is writing into, so
+    /// `Drop` can mark its nodes stale. Called from `report_audio_inventory`
+    /// on every report (idempotent), same reasoning as `attach_midi_presence`.
+    fn attach_audio_inventory(
+        &mut self,
+        store: Arc<kaijutsu_kernel::audio_inventory::AudioInventoryStore>,
+    ) {
+        if self.audio_inventory.is_none() {
+            self.audio_inventory = Some(store);
         }
     }
 
@@ -1651,6 +1671,23 @@ impl Drop for ConnectionState {
                     self.session_id.short(),
                     reaped.len(),
                     reaped.join(", ")
+                );
+            }
+        }
+        // Un-know what this connection told us about its audio hardware
+        // (`docs/audio-daemon.md` "One inventory owner"). Unlike presence
+        // above, a stale inventory record is kept rather than removed — an
+        // audio node's last known wiring is still useful once the daemon
+        // disappears — but it must be flagged so a reader never mistakes it
+        // for current.
+        if let Some(store) = &self.audio_inventory {
+            let staled = store.reap_connection(self.session_id);
+            if !staled.is_empty() {
+                log::info!(
+                    "audio inventory: connection {} closed — {} node(s) now stale: {}",
+                    self.session_id.short(),
+                    staled.len(),
+                    staled.join(", ")
                 );
             }
         }
@@ -2569,6 +2606,17 @@ pub async fn create_shared_kernel(
     let presence_fs =
         kaijutsu_kernel::midi_presence::MidiPresenceFs::new(kernel.midi_presence().clone());
     kernel.mount(paths::MIDI_RUN_ROOT, presence_fs).await;
+
+    // The ephemeral audio-daemon inventory (`docs/audio-daemon.md` "One
+    // inventory owner"): one directory per node at
+    // /run/audio/<node-dir>/inventory.json. Read-only by construction over
+    // the kernel's in-memory inventory store, the same reasoning as
+    // /run/midi above — the ONLY writer is a `reportAudioInventory` call
+    // from a daemon.
+    let audio_inventory_fs = kaijutsu_kernel::audio_inventory::AudioInventoryFs::new(
+        kernel.audio_inventory().clone(),
+    );
+    kernel.mount(paths::AUDIO_RUN_ROOT, audio_inventory_fs).await;
 
     // The live roster (`kaijutsu_kernel::roster` module doc): who's around
     // right now, agents and humans alike, persisted in kernel.db and read
@@ -8632,6 +8680,62 @@ impl kernel::Server for KernelImpl {
                     "report_midi_presence: {device} {} via {backend} on \
                      connection {}",
                     if present { "live" } else { "absent" },
+                    connection.short()
+                );
+                Promise::ok(())
+            }
+        }
+    }
+
+    fn report_audio_inventory(
+        self: Rc<Self>,
+        params: kernel::ReportAudioInventoryParams,
+        _results: kernel::ReportAudioInventoryResults,
+    ) -> Promise<(), capnp::Error> {
+        use kaijutsu_kernel::audio_inventory::Recorded;
+
+        let p = pry!(params.get());
+        let node = pry!(pry!(p.get_node()).to_str()).to_string();
+        let revision = p.get_revision();
+        let observed_epoch_ns = p.get_observed_epoch_ns();
+        let report = pry!(p.get_report()).to_vec();
+
+        // No facade gate, on purpose (the report_midi_presence stance):
+        // inventory is inert sensor data about the rig, not a context
+        // injection, and every player is inside the trust boundary.
+        //
+        // Attribution is stamped HERE, from the connection, never from
+        // anything the daemon says about itself — the same reasoning that
+        // makes presence perishable when a sink dies without an unplug
+        // report (`ConnectionState::drop` → `reap_connection`).
+        let store = self.kernel.kernel.audio_inventory().clone();
+        let connection = {
+            let mut conn = self.connection.borrow_mut();
+            conn.attach_audio_inventory(store.clone());
+            conn.session_id
+        };
+        let received_epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        match store.record(&node, connection, revision, observed_epoch_ns, &report, received_epoch_ns) {
+            // A malformed node key or a non-JSON report would mint an
+            // unaddressable/unreadable /run/audio path — refuse loudly
+            // rather than project a fiction.
+            Err(e) => Promise::err(capnp::Error::failed(format!(
+                "reportAudioInventory: {e}"
+            ))),
+            Ok(Recorded::Ignored) => {
+                log::debug!(
+                    "report_audio_inventory: ignored report for {node} (revision {revision} \
+                     from connection {} did not advance the record on file)",
+                    connection.short()
+                );
+                Promise::ok(())
+            }
+            Ok(Recorded::Stored) => {
+                log::info!(
+                    "report_audio_inventory: {node} revision {revision} via connection {}",
                     connection.short()
                 );
                 Promise::ok(())
