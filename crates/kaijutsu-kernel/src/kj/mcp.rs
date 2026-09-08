@@ -14,6 +14,7 @@
 //! ```text
 //! kj mcp list [--json]     # alias: status
 //! kj mcp reload            # re-read mcp.toml, reconcile
+//! kj mcp restart <name>    # stop one server, then reconcile so it comes back
 //! ```
 
 use clap::{Parser, Subcommand};
@@ -48,6 +49,13 @@ enum McpCommand {
     /// ones no longer configured, refresh QoS policy on servers that stay
     /// running. Never reconnects an already-running server.
     Reload {},
+    /// Stop one running server, then reconcile, so it comes back from its
+    /// current mcp.toml entry. The way to apply a `command`/`args`/`env`
+    /// edit, which `reload` never does to a running server.
+    Restart {
+        /// The `[servers.<name>]` key in mcp.toml
+        name: String,
+    },
 }
 
 impl KjDispatcher {
@@ -75,7 +83,7 @@ impl KjDispatcher {
         // new content. Gated on `ConfigWrite`, the same capability the
         // SQL-native model-config verbs use, rather than a bespoke one.
         // `list` is a read.
-        if matches!(parsed.command, McpCommand::Reload {})
+        if matches!(parsed.command, McpCommand::Reload {} | McpCommand::Restart { .. })
             && let Err(denied) = self.require_cap(caller, Capability::ConfigWrite, "mcp reload")
         {
             return denied;
@@ -84,6 +92,7 @@ impl KjDispatcher {
         match parsed.command {
             McpCommand::List { json } => self.mcp_list(json).await,
             McpCommand::Reload {} => self.mcp_reload().await,
+            McpCommand::Restart { name } => self.mcp_restart(&name).await,
         }
     }
 
@@ -280,6 +289,42 @@ impl KjDispatcher {
             KjResult::ok_with_data(message, data)
         }
     }
+
+    /// `restart <name>`: unregister the running instance, then run the same
+    /// reconcile `reload` runs, which re-adds every configured server that
+    /// is not running. No new state: the current mcp.toml entry is the
+    /// only source. If the stop succeeds and the start fails, the server is
+    /// down and the error says so.
+    async fn mcp_restart(&self, name: &str) -> KjResult {
+        use crate::mcp::reconcile_external_mcp_servers;
+
+        let broker = self.kernel().broker();
+        let instance = external_instance_id(name);
+        let was_running = broker.list_instances().await.contains(&instance);
+        if was_running && let Err(e) = broker.unregister(&instance).await {
+            return KjResult::Err(format!("kj mcp restart: stop '{name}': {e}"));
+        }
+
+        let report = reconcile_external_mcp_servers(self.kernel()).await;
+        let data = serde_json::json!({
+            "name": name,
+            "was_running": was_running,
+            "added": report.added,
+            "failed": report.failed,
+        });
+        if report.added.iter().any(|n| n == name) {
+            let verb = if was_running { "restarted" } else { "started" };
+            KjResult::ok_with_data(format!("mcp restart: '{name}' {verb}"), data)
+        } else if let Some((_, reason)) = report.failed.iter().find(|(n, _)| n == name) {
+            KjResult::Err(format!(
+                "kj mcp restart: '{name}' is stopped and failed to start: {reason}"
+            ))
+        } else {
+            KjResult::Err(format!(
+                "kj mcp restart: no server named '{name}' in mcp.toml — see `kj mcp list`"
+            ))
+        }
+    }
 }
 
 /// JSON-friendly health projection for `--json`.
@@ -407,12 +452,61 @@ command = "/bin/true"
         assert!(v["servers"][0]["last_failure"].is_string());
     }
 
+    /// `/bin/true` cannot be restarted into a running server, so the verb
+    /// reports the stopped state and the reason instead of a success.
+    #[tokio::test]
+    async fn restart_reports_a_server_that_fails_to_come_back() {
+        let d = test_dispatcher(
+            r#"
+[servers.brp]
+command = "/bin/true"
+"#,
+        )
+        .await;
+        let caller = test_helpers::test_caller();
+
+        let result = d.dispatch_mcp(&[s("restart"), s("brp")], &caller).await;
+        let KjResult::Err(msg) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(msg.contains("'brp'"), "{msg}");
+        assert!(msg.contains("failed to start"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn restart_refuses_a_name_not_in_mcp_toml() {
+        let d = test_dispatcher(
+            r#"
+[servers.brp]
+command = "/bin/true"
+"#,
+        )
+        .await;
+        let caller = test_helpers::test_caller();
+
+        let result = d.dispatch_mcp(&[s("restart"), s("nope")], &caller).await;
+        let KjResult::Err(msg) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        assert!(msg.contains("no server named 'nope'"), "{msg}");
+        assert!(msg.contains("kj mcp list"), "{msg}");
+    }
+
     #[tokio::test]
     async fn reload_denied_without_config_write_capability() {
         let d = test_dispatcher("").await;
         let caller = test_helpers::caller_with_context(kaijutsu_types::ContextId::new());
 
         let result = d.dispatch_mcp(&[s("reload")], &caller).await;
+        assert!(matches!(result, KjResult::Err(_)));
+    }
+
+    #[tokio::test]
+    async fn restart_denied_without_config_write_capability() {
+        let d = test_dispatcher("").await;
+        let caller = test_helpers::caller_with_context(kaijutsu_types::ContextId::new());
+
+        let result = d.dispatch_mcp(&[s("restart"), s("brp")], &caller).await;
         assert!(matches!(result, KjResult::Err(_)));
     }
 

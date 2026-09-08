@@ -813,6 +813,20 @@ impl MountTable {
     }
 }
 
+/// The text a link at `link` (mount-relative) holds to reach `target`
+/// (mount-relative): one `..` per directory between the link and the mount
+/// root, then the target. `coder/create/S45.kai` → `lib/hooks/foo.kai` gives
+/// `../../lib/hooks/foo.kai`.
+fn relative_link(link: &Path, target: &Path) -> PathBuf {
+    let depth = link.parent().map(|p| p.components().count()).unwrap_or(0);
+    let mut out = PathBuf::new();
+    for _ in 0..depth {
+        out.push("..");
+    }
+    out.push(target);
+    out
+}
+
 #[async_trait]
 impl VfsOps for MountTable {
     async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
@@ -1030,6 +1044,22 @@ impl VfsOps for MountTable {
 
     async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
+        // An absolute target on the link's own mount is rewritten relative to
+        // the link, so `ln -s /config/rc/lib/hooks/foo.kai .../S45-foo.kai`
+        // resolves inside the host directory behind the mount instead of
+        // against the host root. A target on another mount, or on none,
+        // passes through unchanged.
+        let rewritten;
+        let target = if target.is_absolute()
+            && let Some((_, target_fs)) = self.owner_of(target).await
+            && Arc::ptr_eq(&fs, &target_fs)
+        {
+            let (_, target_relative) = self.find_mount(target).await?;
+            rewritten = relative_link(&relative, &target_relative);
+            rewritten.as_path()
+        } else {
+            target
+        };
         let attr = fs.symlink(&relative, target).await?;
         self.bump_generation(&Self::parent_dir(path));
         self.bump_activity(&Self::parent_dir(path));
@@ -1837,6 +1867,65 @@ mod tests {
             act_after - act_before,
             3,
             "all three content ops land on the file's parent directory"
+        );
+    }
+
+    /// The rc composition idiom names its target by absolute VFS path.
+    /// On a host-directory mount that text must be rewritten relative to
+    /// the link, or the host resolves it against `/` and finds nothing.
+    #[tokio::test]
+    async fn symlink_rewrites_an_absolute_same_mount_target_relative_to_the_link() {
+        use crate::vfs::backends::LocalBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib/hooks")).unwrap();
+        std::fs::create_dir_all(dir.path().join("coder/create")).unwrap();
+        std::fs::write(dir.path().join("lib/hooks/foo.kai"), "echo foo\n").unwrap();
+        let table = MountTable::new();
+        table.mount("/config/rc", LocalBackend::new(dir.path())).await;
+
+        table
+            .symlink(
+                Path::new("/config/rc/coder/create/S45-foo.kai"),
+                Path::new("/config/rc/lib/hooks/foo.kai"),
+            )
+            .await
+            .unwrap();
+
+        let on_host = std::fs::read_link(dir.path().join("coder/create/S45-foo.kai")).unwrap();
+        assert_eq!(on_host, PathBuf::from("../../lib/hooks/foo.kai"));
+        let body = table
+            .read_all(Path::new("/config/rc/coder/create/S45-foo.kai"))
+            .await
+            .unwrap();
+        assert_eq!(body, b"echo foo\n", "the link resolves through the mount");
+    }
+
+    /// A target on another mount is not the mount's to rewrite; the text
+    /// is stored as given.
+    #[tokio::test]
+    async fn symlink_leaves_a_cross_mount_target_alone() {
+        let table = MountTable::new();
+        table.mount("/scratch", MemoryBackend::new()).await;
+        table.mount("/other", MemoryBackend::new()).await;
+
+        table
+            .symlink(Path::new("/scratch/link"), Path::new("/other/a.txt"))
+            .await
+            .unwrap();
+        let held = table.readlink(Path::new("/scratch/link")).await.unwrap();
+        assert_eq!(held, PathBuf::from("/other/a.txt"));
+    }
+
+    #[test]
+    fn relative_link_climbs_one_level_per_directory() {
+        assert_eq!(
+            relative_link(Path::new("coder/create/S45.kai"), Path::new("lib/hooks/foo.kai")),
+            PathBuf::from("../../lib/hooks/foo.kai")
+        );
+        assert_eq!(
+            relative_link(Path::new("top.kai"), Path::new("lib/x.kai")),
+            PathBuf::from("lib/x.kai")
         );
     }
 

@@ -79,8 +79,7 @@ the old value.
 This is deliberately conservative: a kaibo consultation mid-flight when
 someone edits `mcp.toml` is never interrupted by a reload, at the cost of a
 `command`/`args`/`env` edit not taking effect until the server is
-explicitly restarted. **There is no `kj mcp restart <name>` in this slice**
-(`docs/issues.md`).
+explicitly restarted with `kj mcp restart <name>`.
 
 An `env` or `headers` value sourced from a file or a variable
 (`assets/defaults/mcp.toml`, "Keeping a secret out of this file") resolves at
@@ -113,9 +112,13 @@ options.
 ```
 kj mcp list [--json]     # alias: status — configured vs. running, with health
 kj mcp reload            # re-read mcp.toml, reconcile (see component 4)
+kj mcp restart <name>    # stop one server, then reconcile so it comes back
 ```
 
-`list` is a read, ungated. `reload` materializes `mcp.toml` as running
+`restart` is how a `command`/`args`/`env` edit reaches a running server:
+it unregisters that one instance and runs the same reconcile `reload`
+runs. If the stop succeeds and the start fails, the server is down and the
+error says so. `list` is a read, ungated. `reload` and `restart` materialize `mcp.toml` as running
 processes — spawning and killing subprocesses, not a file edit — so it's
 gated on `Capability::ConfigWrite`, the same authority that gates `kj config
 reset` and the other administrative config verbs (`kj backend`, `kj cast`,

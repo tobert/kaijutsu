@@ -239,16 +239,16 @@ reading `kj/rc.rs`'s `write_path` match.
 need to reproduce it from the caller's client-id, or the policy is gone and
 every per-client write names its full path by hand. Still undecided.
 
-## kaish `ln -s` with an absolute /config path creates a dangling link (2026-08-30)
+## kaish `ln -s` across two /config mounts still creates a dangling link (2026-08-30)
 
-`LocalBackend::symlink` (`vfs/backends/local.rs:553`) still calls
-`std::os::unix::fs::symlink(target, &full_path)` with no absolute→relative
-translation — confirmed still the only path with none; only
-`seed_scripts::reseed_rc_files` (`relative_link`, `seed_scripts.rs:231-332`)
-does the translation. `ln -s /config/rc/lib/hooks/foo.kai .../S45-foo.kai` (the
-documented composition idiom — no `kj rc link`) still writes a link that
-resolves to nothing on a hand-composed tree. Either `symlink` translates an
-in-mount absolute target, or the surface must fail loudly on an absolute one.
+The mount table rewrites an absolute target on the link's own mount relative
+to the link (`vfs/mount.rs`, `symlink`), so the documented same-tree idiom
+resolves. A target on another mount — `docs/midi-next.md`'s
+`ln -s /config/midi/devices/x /config/rc/x/create/S20-device.md` — is stored
+as given and resolves to nothing on the host, because a backend does not
+know another mount's host directory. Either the mount table resolves both
+sides to host paths when both are `LocalBackend`, or the surface fails
+loudly on a cross-mount absolute target.
 
 ## After approval-executes: what is still retry-shaped (2026-09-02)
 
@@ -1160,12 +1160,6 @@ the screen.
 `block_output_data` (`kaijutsu-server/src/rpc.rs:9080`) persists `.data`
 whole with no size check, bypassing kaish's text-only output limiter. A size
 ceiling that fails loud, or CAS routing like `RenderCue`'s `casHash`.
-
-## External MCP servers — no `kj mcp restart <name>` (seeded 2026-07-30)
-
-`reconcile_with_toml` (`mcp/external_registry.rs:122`) never reconnects an
-already-running external server on `kj mcp reload`; only `InstancePolicy`
-refreshes. Tradeoff in `docs/external-mcp.md` "The reload design fork".
 
 ## SFTP over the VFS: appends can clobber each other (`docs/sftp.md`)
 
