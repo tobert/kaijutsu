@@ -8,6 +8,11 @@
 //! Each peer registers under a stable `nick`. Re-attaching with the same
 //! nick replaces the previous registration (so reconnects don't leave a
 //! dead callback in place).
+//!
+//! Every attach mints an attach token. The connection that attached a peer
+//! detaches it by that token when the connection drops, so a registration
+//! never outlives its connection and a reconnect that already replaced the
+//! entry is never clobbered by the old connection's teardown.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,8 +40,8 @@ pub struct PeerConfig {
 
 /// The registry key for a peer: its unique `instance`, or `nick` when no
 /// instance was supplied (single-peer back-compat). Public so the server can
-/// derive the same key a peer was attached under (e.g. for bridge-task
-/// self-detach) without duplicating the rule.
+/// derive the same key a peer was attached under (to detach it when the
+/// connection drops) without duplicating the rule.
 pub fn peer_key(nick: &str, instance: &str) -> String {
     if instance.is_empty() {
         nick.to_string()
@@ -53,6 +58,12 @@ pub struct PeerInfo {
     pub principal: Option<PrincipalId>,
     /// Unix timestamp ms when the peer attached.
     pub attached_at: u64,
+    /// Token minted by [`PeerRegistry::attach`], unique per attach. The
+    /// attaching connection passes it back to
+    /// [`PeerRegistry::detach_attachment`] on drop; a mismatch means the entry
+    /// was replaced by a newer attach and must be left alone. `0` = never
+    /// attached to a registry.
+    pub attach_id: u64,
 }
 
 impl PeerInfo {
@@ -67,6 +78,7 @@ impl PeerInfo {
             instance: config.instance,
             principal: config.principal,
             attached_at: now,
+            attach_id: 0,
         }
     }
 
@@ -105,6 +117,8 @@ pub struct PeerRegistry {
     peers: HashMap<String, PeerInfo>,
     /// Channel senders for peer invocation — stored separately so PeerInfo stays Clone.
     invoke_senders: HashMap<String, mpsc::Sender<InvokeRequest>>,
+    /// The next attach token. Starts at 1 so `0` always means "unattached".
+    next_attach: u64,
 }
 
 impl PeerRegistry {
@@ -135,7 +149,9 @@ impl PeerRegistry {
             self.invoke_senders.remove(&key);
         }
 
-        let info = PeerInfo::from_config(config);
+        let mut info = PeerInfo::from_config(config);
+        self.next_attach += 1;
+        info.attach_id = self.next_attach;
         self.peers.insert(key.clone(), info.clone());
         if let Some(sender) = invoke_sender {
             self.invoke_senders.insert(key, sender);
@@ -198,22 +214,17 @@ impl PeerRegistry {
             .collect()
     }
 
-    /// Detach a peer by key **only if its currently-registered sender is the
-    /// one passed** (same channel). This is the bridge task's self-detach: when
-    /// a re-attach has already replaced the entry under this key (same nick, or
-    /// a reconnect reusing an instance), the *old* task must NOT remove the
-    /// *new* owner's registration — `same_channel` is false, so it's a no-op.
-    /// Returns whether it removed the entry.
-    pub fn detach_if_sender(
-        &mut self,
-        key: &str,
-        sender: &mpsc::Sender<InvokeRequest>,
-    ) -> bool {
+    /// Detach a peer by key **only if it still carries `attach_id`**. This is
+    /// the attaching connection's teardown: when a re-attach has already
+    /// replaced the entry under this key (same nick, or a reconnect reusing
+    /// an instance), the old connection must not remove the new owner's
+    /// registration — the token differs, so it is a no-op. Returns whether it
+    /// removed the entry.
+    pub fn detach_attachment(&mut self, key: &str, attach_id: u64) -> bool {
         let is_mine = self
-            .invoke_senders
+            .peers
             .get(key)
-            .map(|s| s.same_channel(sender))
-            .unwrap_or(false);
+            .is_some_and(|p| p.attach_id == attach_id);
         if is_mine {
             self.invoke_senders.remove(key);
             self.peers.remove(key);
@@ -222,9 +233,9 @@ impl PeerRegistry {
     }
 
     /// Belt-and-suspenders cleanup: drop any peer whose invoke channel is
-    /// closed (its bridge task / receiver is gone). The primary cleanup is the
-    /// bridge task self-detaching on `conn_cancel`; this catches stragglers a
-    /// missed cancel or a panicked task would otherwise leave behind, so a
+    /// closed (its bridge task / receiver is gone). The primary cleanup is
+    /// the connection detaching by attach token when it drops; this catches
+    /// stragglers a panicked bridge task would otherwise leave behind, so a
     /// fan-out never keeps invoking a dead window. Returns how many it reaped.
     pub fn reap_closed(&mut self) -> usize {
         let dead: Vec<String> = self
@@ -406,35 +417,40 @@ mod tests {
         assert_eq!(registry.senders_by_principal(PrincipalId::new()).len(), 0);
     }
 
-    /// The re-attach-replace hazard: an old bridge task self-detaching must not
+    /// The re-attach-replace hazard: an old connection's teardown must not
     /// remove the entry a newer attach installed under the same key.
     #[test]
-    fn detach_if_sender_only_removes_its_own_registration() {
+    fn detach_attachment_only_removes_its_own_registration() {
         let mut registry = PeerRegistry::new();
         let p = PrincipalId::new();
         let (tx_old, _r_old) = mpsc::channel(8);
-        registry
-            .attach(cfg_inst("kaijutsu-app", "win", p), Some(tx_old.clone()))
+        let old = registry
+            .attach(cfg_inst("kaijutsu-app", "win", p), Some(tx_old))
             .unwrap();
         // A reconnect reuses the same key, replacing with a new channel.
         let (tx_new, _r_new) = mpsc::channel(8);
-        registry
-            .attach(cfg_inst("kaijutsu-app", "win", p), Some(tx_new.clone()))
+        let new = registry
+            .attach(cfg_inst("kaijutsu-app", "win", p), Some(tx_new))
             .unwrap();
+        assert_ne!(old.attach_id, new.attach_id, "every attach mints its own token");
+        assert_ne!(new.attach_id, 0, "an attached peer never carries the unattached token");
 
-        // The OLD task's self-detach must be a no-op (it's no longer the owner).
-        assert!(!registry.detach_if_sender("win", &tx_old));
+        // The OLD connection's teardown must be a no-op (it's no longer the owner).
+        assert!(!registry.detach_attachment("win", old.attach_id));
         assert!(
             registry.get_invoke_sender_by_instance("win").is_some(),
-            "new registration must survive the old task's self-detach"
+            "new registration must survive the old connection's teardown"
         );
-        // The NEW owner's self-detach removes it.
-        assert!(registry.detach_if_sender("win", &tx_new));
+        // The NEW owner's teardown removes it.
+        assert!(registry.detach_attachment("win", new.attach_id));
         assert!(registry.get_invoke_sender_by_instance("win").is_none());
+        // And a second teardown with the same token finds nothing.
+        assert!(!registry.detach_attachment("win", new.attach_id));
     }
 
     /// `reap_closed` drops a peer whose invoke receiver has been dropped (its
-    /// bridge task ended) — the belt-and-suspenders backstop to self-detach.
+    /// bridge task ended) — the belt-and-suspenders backstop to the
+    /// connection's own detach.
     #[test]
     fn reap_closed_drops_dead_channels_only() {
         let mut registry = PeerRegistry::new();

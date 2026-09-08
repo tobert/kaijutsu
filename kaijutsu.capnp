@@ -1868,11 +1868,14 @@ interface Kernel {
 
   # Cheap liveness probe used by the client's reconnection FSM.
   # Returns the server-assigned kernel ID (so the client can detect a
-  # silent rebind across kernel restart) and the server's wall-clock time
-  # in milliseconds since the Unix epoch (for clock-skew diagnostics).
-  # Handler must not take any per-context locks — this exists to detect
-  # liveness, not to validate kernel state.
-  ping @1 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64);
+  # silent rebind across kernel restart) and the kernel's wallclock at the
+  # reply, as milliseconds and as nanoseconds since the Unix epoch. The
+  # kernel's clock is the one timebase: a client samples its own clock
+  # around the round trip and models its offset from these
+  # (docs/midi.md, "The one timebase"). Handler must not take any
+  # per-context locks — this exists to detect liveness, not to validate
+  # kernel state.
+  ping @1 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64, serverTimeNs :UInt64);
 
   # ==========================================================================
   # kaish execution

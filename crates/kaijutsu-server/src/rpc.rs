@@ -1475,6 +1475,12 @@ pub struct ConnectionState {
     /// draining would make every exchange wait for the kernel's deadline
     /// instead of answering "that sink is gone" at once.
     midi_exchange: Option<Arc<kaijutsu_kernel::midi_exchange::MidiExchangeRegistry>>,
+    /// Every peer this connection attached, as `(registry key, attach token)`,
+    /// with the kernel that holds the registry. `Drop` detaches each one by
+    /// token. The peer-invoke bridge task cannot do this itself: it lives on
+    /// the connection's `LocalSet`, which is dropped the moment the RPC
+    /// session returns, so nothing written after its loop ever runs.
+    peer_attachments: Option<(Arc<Kernel>, Vec<(String, u64)>)>,
 }
 
 impl ConnectionState {
@@ -1495,6 +1501,18 @@ impl ConnectionState {
             disconnect: CancellationToken::new(),
             midi_presence: None,
             midi_exchange: None,
+            peer_attachments: None,
+        }
+    }
+
+    /// Remember a peer this connection attached so `Drop` can detach it.
+    /// A re-attach under a key this connection already holds replaces the
+    /// token: only the newest attach owns the registry entry.
+    fn record_peer_attachment(&mut self, kernel: Arc<Kernel>, key: String, attach_id: u64) {
+        let (_, attachments) = self.peer_attachments.get_or_insert_with(|| (kernel, Vec::new()));
+        match attachments.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = attach_id,
+            None => attachments.push((key, attach_id)),
         }
     }
 
@@ -1648,6 +1666,25 @@ impl Drop for ConnectionState {
                 "midi exchange: connection {} closed — its sink no longer answers exchanges",
                 self.session_id.short()
             );
+        }
+        // Detach every peer this connection attached, by attach token, so a
+        // registration never outlives its process. A token that no longer
+        // matches means the peer re-attached over a newer connection; that
+        // entry is the new owner's and stays.
+        if let Some((kernel, attachments)) = self.peer_attachments.take() {
+            let mut detached = Vec::new();
+            for (key, attach_id) in attachments {
+                if kernel.detach_peer_attachment(&key, attach_id) {
+                    detached.push(key);
+                }
+            }
+            if !detached.is_empty() {
+                log::info!(
+                    "peers: connection {} closed — detached {}",
+                    self.session_id.short(),
+                    detached.join(", ")
+                );
+            }
         }
         // Clean up per-session context tracking. Mirrors the explicit
         // remove that used to live at the tail of `run_rpc`; the Drop
@@ -5931,9 +5968,13 @@ impl kernel::Server for KernelImpl {
 
         let kernel_arc = self.kernel.kernel.clone();
         // Wake the bridge task when this connection drops (Drop fires
-        // conn_cancel), so it can self-detach instead of lingering on rx.recv()
-        // with a dead callback — the same idiom the FlowBus bridges use.
+        // conn_cancel), so it stops waiting on rx.recv() with a dead callback
+        // — the same idiom the FlowBus bridges use. The registry entry itself
+        // is detached by `ConnectionState::drop`, never by the task: the
+        // LocalSet that hosts the task is dropped as soon as the RPC session
+        // returns, so code after its loop never runs.
         let conn_cancel = self.connection.borrow().cancel_token();
+        let connection = self.connection.clone();
 
         let span = tracing::info_span!("rpc", method = "attach_peer");
         Promise::from_future(
@@ -5942,14 +5983,9 @@ impl kernel::Server for KernelImpl {
                 let invoke_sender = if let Some(callback) = commands_callback {
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<InvokeRequest>(32);
                     let nick_for_task = nick.clone();
-                    let bridge_kernel = kernel_arc.clone();
-                    let detach_key_for_task = detach_key.clone();
-                    // A clone of our own sender, used purely as an identity token
-                    // for self-detach: we remove our registry entry only if it's
-                    // still ours (a re-attach may have replaced it). Holding it
-                    // also keeps `rx` open, so the task exits on conn_cancel, not
-                    // on a transient sender drop.
-                    let tx_self = tx.clone();
+                    // Holding our own sender keeps `rx` open, so the task exits
+                    // on conn_cancel, not on a transient sender drop.
+                    let keep_rx_open = tx.clone();
 
                     // Bridge task: recv InvokeRequest from channel, call capnp callback.
                     // Middle hop of the peer ladder — see
@@ -5995,19 +6031,8 @@ impl kernel::Server for KernelImpl {
                                 );
                             }
                         }
-                        // Self-detach this exact peer so a dropped connection's
-                        // window can't linger in the registry (and out of any
-                        // principal/nick fan-out) — but only if we're still the
-                        // registered owner, so an old task can't clobber a peer
-                        // that re-attached under the same key. reap_closed is the
-                        // backstop for anything this misses.
-                        let removed = bridge_kernel
-                            .detach_peer_if_sender(&detach_key_for_task, &tx_self)
-                            .await;
-                        log::debug!(
-                            "Peer invoke bridge for '{}' ended; self-detach {} = {}",
-                            nick_for_task, detach_key_for_task, removed,
-                        );
+                        drop(keep_rx_open);
+                        log::debug!("Peer invoke bridge for '{}' ended", nick_for_task);
                     });
 
                     Some(tx)
@@ -6019,6 +6044,11 @@ impl kernel::Server for KernelImpl {
                     .attach_peer(config, invoke_sender)
                     .await
                     .map_err(|e| capnp::Error::failed(format!("failed to attach peer: {}", e)))?;
+                connection.borrow_mut().record_peer_attachment(
+                    kernel_arc.clone(),
+                    detach_key,
+                    peer_info.attach_id,
+                );
 
                 let mut info = results.get().init_info();
                 set_peer_info(&mut info, &peer_info);
@@ -8799,13 +8829,13 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
         let _span = extract_rpc_trace(p.get_trace(), "ping").entered();
-        let now_ms = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .unwrap_or_default();
         let mut r = results.get();
         r.set_kernel_id(self.kernel.id.as_bytes());
-        r.set_server_time_ms(now_ms);
+        r.set_server_time_ms(now.as_millis() as u64);
+        r.set_server_time_ns(now.as_nanos() as u64);
         Promise::ok(())
     }
 

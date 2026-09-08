@@ -49,8 +49,9 @@ pub struct Kernel {
     state: RwLock<KernelState>,
     /// LLM provider registry (behind RwLock for interior mutability).
     llm: RwLock<LlmRegistry>,
-    /// Peer registry (behind RwLock for interior mutability).
-    peers: RwLock<PeerRegistry>,
+    /// Peer registry. A synchronous lock: the registry never awaits while
+    /// held, and a connection's `Drop` detaches through it.
+    peers: parking_lot::RwLock<PeerRegistry>,
     /// Consent mode (collaborative vs autonomous).
     consent_mode: RwLock<ConsentMode>,
     /// FlowBus for block events.
@@ -310,7 +311,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             llm: RwLock::new(LlmRegistry::new()),
-            peers: RwLock::new(PeerRegistry::new()),
+            peers: parking_lot::RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(default_flow_capacity()),
             turn_flows: shared_turn_flow_bus(default_flow_capacity()),
@@ -416,7 +417,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             llm: RwLock::new(LlmRegistry::new()),
-            peers: RwLock::new(PeerRegistry::new()),
+            peers: parking_lot::RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
             turn_flows: shared_turn_flow_bus(default_flow_capacity()),
@@ -2050,7 +2051,7 @@ impl Kernel {
         config: PeerConfig,
         invoke_sender: Option<tokio::sync::mpsc::Sender<InvokeRequest>>,
     ) -> Result<PeerInfo, PeerError> {
-        self.peers.write().await.attach(config, invoke_sender)
+        self.peers.write().attach(config, invoke_sender)
     }
 
     /// Invoke a peer by nick.
@@ -2066,7 +2067,7 @@ impl Kernel {
         params: Vec<u8>,
     ) -> Result<Vec<u8>, PeerError> {
         let sender = {
-            let registry = self.peers.read().await;
+            let registry = self.peers.read();
             registry
                 .get_invoke_sender(nick)
                 .ok_or_else(|| PeerError::NotFound(nick.to_string()))?
@@ -2074,10 +2075,10 @@ impl Kernel {
         // RwLock released before the async send
         let result = Self::send_invoke(&sender, action, params, nick).await;
         if matches!(result, Err(PeerError::Disconnected(_))) {
-            // The bridge task is gone — its self-detach on conn_cancel should
-            // have removed it, but reap as a backstop so a dead window can't
+            // The bridge task is gone — the connection's drop should have
+            // detached it, but reap as a backstop so a dead window can't
             // linger in the registry (and out of fan-out).
-            self.peers.write().await.reap_closed();
+            self.peers.write().reap_closed();
         }
         result
     }
@@ -2159,7 +2160,7 @@ impl Kernel {
 
         // Target the submitter's app windows; fall back to the well-known nick.
         let targets = {
-            let reg = self.peers.read().await;
+            let reg = self.peers.read();
             let by_principal = submitter
                 .map(|p| reg.senders_by_principal(p))
                 .unwrap_or_default();
@@ -2240,44 +2241,42 @@ impl Kernel {
 
     /// Detach a peer from this kernel.
     pub async fn detach_peer(&self, nick: &str) -> Option<PeerInfo> {
-        self.peers.write().await.detach(nick)
+        self.peers.write().detach(nick)
     }
 
-    /// Detach a peer by key only if `sender` is still its registered channel —
-    /// the bridge task's self-detach, safe against a re-attach having replaced
-    /// the entry. Returns whether it removed anything.
-    pub async fn detach_peer_if_sender(
-        &self,
-        key: &str,
-        sender: &tokio::sync::mpsc::Sender<InvokeRequest>,
-    ) -> bool {
-        self.peers.write().await.detach_if_sender(key, sender)
+    /// Detach a peer by key only if it still carries `attach_id` — the
+    /// attaching connection's teardown, safe against a re-attach having
+    /// replaced the entry. Synchronous so a `Drop` can call it. Returns
+    /// whether it removed anything.
+    pub fn detach_peer_attachment(&self, key: &str, attach_id: u64) -> bool {
+        self.peers.write().detach_attachment(key, attach_id)
     }
 
     /// Get information about an attached peer.
     pub async fn get_peer(&self, nick: &str) -> Option<PeerInfo> {
-        self.peers.read().await.get(nick).cloned()
+        self.peers.read().get(nick).cloned()
     }
 
     /// List all attached peers.
     pub async fn list_peers(&self) -> Vec<PeerInfo> {
         self.peers
             .read()
-            .await
             .list()
             .into_iter()
             .cloned()
             .collect()
     }
 
-    /// Get the peer registry (for direct access).
-    pub fn peers(&self) -> &RwLock<PeerRegistry> {
+    /// Get the peer registry (for direct access). The lock is synchronous:
+    /// the registry never awaits while held, and a connection's `Drop` must
+    /// be able to detach through it.
+    pub fn peers(&self) -> &parking_lot::RwLock<PeerRegistry> {
         &self.peers
     }
 
     /// Count of attached peers.
     pub async fn peer_count(&self) -> usize {
-        self.peers.read().await.count()
+        self.peers.read().count()
     }
 }
 

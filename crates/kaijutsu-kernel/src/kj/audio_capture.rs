@@ -74,7 +74,7 @@ async fn select_instance(kernel: &Kernel, node: &str) -> Result<String, String> 
 }
 
 async fn invoke(kernel: &Kernel, instance: &str, action: &str, params: Value) -> Result<Value, String> {
-    let sender = kernel.peers().read().await.get_invoke_sender_by_instance(instance)
+    let sender = kernel.peers().read().get_invoke_sender_by_instance(instance)
         .ok_or_else(|| format!("audio instance '{instance}' is disconnected; protected material has not been released"))?;
     let (reply, receiver) = tokio::sync::oneshot::channel();
     let request = InvokeRequest { action: action.into(), params: serde_json::to_vec(&params).map_err(|e| e.to_string())?, reply };
