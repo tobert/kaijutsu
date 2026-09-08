@@ -44,10 +44,10 @@ contexts see which living documents) and the *injection budget* (rc prose is
 the most expensive text in the repo), not a new `DocKind`. CLAUDE.md's
 "permission to get simpler" applies.
 
-Immediate consequence for slice 4, unresolved: `signoff.md`'s durable third
-— the live-environment facts, the deploy recipe, "never pipe a test run
-through `tail`" — is not handoff material and must land somewhere before
-`signoff.md` retires. Melting it into `docs/` is the option available today.
+`signoff.md`'s durable third — the live-environment facts, the deploy
+recipe, "never pipe a test run through `tail`" — is not handoff material.
+It landed in `docs/operating.md` on 2026-09-08; the signoff keeps only what
+a fresh process cannot reconstruct.
 
 ## The lfm2d gate escalates `kj handoff note` from the MCP shell (2026-09-07)
 
@@ -101,34 +101,35 @@ MacBook is a supported client; nobody has confirmed the PPID chain and the
 shells and Claude Code's process model. Sometime: run a bridge session on
 the Mac with `RUST_LOG` on and read what the resolver picked.
 
-## Hook listener fix: deploy and two follow-ups (2026-09-05)
+## Hook command: pass `--socket` from settings (2026-09-05)
 
-The misroute-then-archive bug is FIXED in the tree (`session.end` archives
-only on an event-sourced matching id; ping hides a scraped id; a live peer's
-socket is never stolen or unlinked). Not yet deployed: `~/bin/kaijutsu-mcp`
-needs the rebuild-and-rename, then `/mcp` reconnect in each session.
-Follow-ups:
+The misroute-then-archive bug is fixed and deployed. One follow-up, in
+Amy's settings: pass `--socket` from the hook command
+(`~/.claude/settings.json` / `contrib/claude-hooks.json`) so the
+PPID-derived socket outranks routing on every call, not only when routing
+falls through.
 
-- **Settings, Amy's:** pass `--socket` from the hook command
-  (`~/.claude/settings.json` / `contrib/claude-hooks.json`) so the
-  PPID-derived socket outranks routing on every call, not only when routing
-  falls through.
+## Character: slices 3 and 5–8 remain (rollout in `docs/character.md`)
 
-## Character support (designed 2026-09-05, unbuilt)
+Slices 1 (the sheet), 2 (the keyring melt, migrated live 2026-09-07) and 4
+(the handoff log, `kj handoff note|tail`, `S16-handoff.kai`) shipped
+2026-09-06/07. What is left, in the order the rollout lists:
 
-`docs/character.md` is canonical: a character is a principal with a sheet,
-a context is played by one, rc is a union of the type's and the character's
-directories, the handoff is an ordinary context, drift can address a
-character, and a janitor character runs the proctor sweep. `auth.db` melts
-down to a keyring — fingerprint to principal id, no names, WAL, no bulk
-import — and `characters.name` becomes the only name in the system; a
-fresh kernel seeds one bootstrap character, `hajime`, built to be retired
-once the user has their own. Eight slices there;
-slice 1 is the `characters` table + `contexts.played_by`, slice 2 the
-keyring melt, slice 3 the turn-path attribution. Until slice 3 lands, a
-model's own blocks are stamped `PrincipalId::system()`
-(`kaijutsu-server/src/llm_stream.rs:1837`, `:1862`), and the wire shows
-"system" as their author (`rpc.rs:10234`).
+- **3, attribution** — provider blocks authored by the character. Ships
+  alone because it moves model blocks between `BlockId` sequence lanes.
+  Until it lands a model's own blocks are stamped `PrincipalId::system()`
+  (`kaijutsu-server/src/llm_stream.rs`) and the wire shows "system" as
+  their author. Carries the beat multi-producer test: every producer
+  records `system` today, so a cell failure routes to whichever attachment
+  iterates first.
+- **5, rc union; 6, roster inversion; 7, drift `@name`; 8, janitor then
+  proctor.**
+
+Two hand tasks for Amy, neither urgent: bind a spare key (`kaijutsu-server
+add-key <pub> --as amy`) as lockout insurance, and decide what to do with
+seven characters (`hajime` plays no contexts and is safe to retire;
+consolidating the other six means rebinding keys onto one, and retire takes
+a character's contexts with it).
 
 ## The MCP `shell` path applies no size limit to its envelope (2026-09-04)
 
@@ -617,11 +618,6 @@ note in `drift.md` after its drift did not arrive):**
   holds (`App::answering_seat`), which side-steps the question for the
   human at a tui; the question stands for a model that wants to withdraw
   its own ask — that is the `cancel` verb above.
-
-Also open from the same lane: `archive_context` stamps `archived_at` and
-leaves `context_state` at `live`. The two checks that matter now read both
-halves, but every other reader of `context_state` alone is wrong the same
-way. Either archiving sets the state column too, or the column goes.
 
 ## The scorer and the snapshot: two follow-ups (2026-09-02)
 

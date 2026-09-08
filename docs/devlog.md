@@ -2568,3 +2568,43 @@ the kernel: the hook listener archived its own context on any session's
 end, because the id it thought was its own came from a transcript scrape
 that named the session before. Amy reconnected to the fixed binary before
 lunch.
+
+The sheet and the keyring shipped the next day, and the keyring changed
+shape while it was being built. The reading that moved it was that the
+kernel never reads `auth.db`: the join key was always a bare principal id,
+and every name in the system was a display label cached wherever the
+identity had been seen. So `characters.name` did not compete with the
+keyring for a truth it held. Amy took it further in two steps, first
+*"maybe authdb should bind a key to a principal id only, and nicks melt
+into the character,"* then *"why have a name in principal at all at that
+point?"* The struct lost its name fields and then its reason to exist.
+`add-key --as <character>` binds and never mints; retire takes a
+character's contexts with it, which deleted the reassign gap rather than
+patching it; a fresh kernel seeds `hajime`, a character built to be
+retired, with a minted id because *"deterministic feels like a choice we'd
+regret."* The migration ran on Monday morning after a full rehearsal on a
+snapshot, and every rehearsed number held: six principals became six
+characters and no key binding moved. The one thing found on the way was
+that an unmigrated restart would have come up half-working and silent,
+since the old table satisfied `CREATE TABLE IF NOT EXISTS`; the server
+now refuses to start on a pre-melt keyring, and the first draft of that
+test proved the guard by hanging.
+
+The handoff followed the same afternoon, two lanes in disjoint files. A
+note is ordinary authoring, so it is not gated; a `tail` never mints,
+because a read-only verb's whole flag surface must be incapable of a
+write, and the lane found the exhaustiveness test that enforces it;
+`--for` lets one character write into another's log under its own name,
+which makes "a message board is this log read by someone else" true
+before addressing exists. `S16-handoff.kai` injects the character's
+recent notes at create. Its last mile was a power cut: zorak lost power
+mid-verification, the unit restarted itself on the right binary, and the
+only write in flight had never run, because the advisory gate had
+escalated `kj handoff note` from an MCP seat. That escalation became the
+next design. Amy asked for a health survey of the safety hooks and then
+for layered allow and deny lists, and a Crush session driven by qwen
+wrote `docs/gate-policy-tuning.md`: one evaluator over builtin, global,
+per-type and learned tiers, consulted at the two pinch points that
+already exist, with the user's explicit list outranking everything
+shipped. `signoff.md` gave up its durable third to `docs/operating.md`
+the same day, on the way to being retired by the log it described.

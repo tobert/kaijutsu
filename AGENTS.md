@@ -188,9 +188,12 @@ A **character** is the persistent someone a name like `kaijutsu-lead`
 resolves to. Amy is one; so is every model seat. It is a principal with a
 sheet: accountable-to, default cast, and pointers to an rc directory, a
 memory root, a handoff track and a root context. A context is one
-performance of a character in a `context_type` by a cast. Designed
-2026-09-05, unbuilt; `docs/character.md` is canonical and carries the
-rollout. Not terms: party, chair, seat.
+performance of a character in a `context_type` by a cast. Slices 1, 2
+and 4 shipped 2026-09-06/07: the sheet, the keyring (`auth.db` binds a
+fingerprint to a principal id and nothing else), and the handoff log
+(`kj handoff note|tail`, injected at create by `S16-handoff.kai`).
+`docs/character.md` is canonical and carries the rollout. Not terms:
+party, chair, seat.
 
 ## Machines
 
@@ -203,6 +206,9 @@ Kaijutsu is hacked on across three machines — `hostname` tells you where you a
   machine. Prefer not to burden it with builds.
 - **Amy's work MacBook Pro** — macOS client, already works via Bevy. Mac support
   is expected: no Linux-only assumptions in the app without a mac story.
+
+Operating the live kernel on zorak (deploy, backup, bounce, rebuilding the
+MCP, driving it from an agent, parallel lanes): `docs/operating.md`.
 
 ## Autonomous Development Loop
 

@@ -796,7 +796,7 @@ Each slice is independently shippable and leaves the tree green.
    periodic refresh wired into the server (`rpc.rs:2990`);
    `KJ_CONTEXT_TYPE` seeded for rc (`kj/lifecycle.rs:533`); and the bridge
    identity above (`kaijutsu-mcp/src/main.rs:88–103`).
-1. **The sheet.** `characters` with its first four columns;
+1. **The sheet. Shipped 2026-09-06.** `characters` with its first four columns;
    `contexts.played_by`, copied by fork; `kj character
    create|list|show|retire`, where `create` mints the principal id and
    `retire` concludes and archives every context the character plays;
@@ -806,8 +806,15 @@ Each slice is independently shippable and leaves the tree green.
    Tests: NULL `played_by` preserves today's behavior; fork copies it;
    retiring archives the live contexts and leaves blocks and their authors
    intact; an unmapped character fails loudly.
-2. **The keyring melt. Built and verified 2026-09-06** (the migration and
-   `principals`/FK-cascade findings above are from this pass). `auth.db`
+2. **The keyring melt. Shipped 2026-09-06; the migration ran on zorak
+   2026-09-07** after a full rehearsal on a snapshot: six principals became
+   six characters, `hajime` was seeded as a seventh, and no key binding
+   moved. Found while checking whether an unmigrated restart was safe: it
+   is not, and it does not announce itself, because `CREATE TABLE IF NOT
+   EXISTS` is a no-op against the old table and only a later principal
+   mint hits the legacy `NOT NULL username`. The server now refuses to
+   start on a pre-melt `auth.db` (`tests/auth_db_premelt_guard.rs`). The
+   `principals`/FK-cascade findings above are from this pass. `auth.db`
    drops `username` and `display_name` and
    gains `PRAGMA journal_mode = WAL`; `authenticate` returns a
    `PrincipalId`; `Principal` loses its name fields; `add-key --as
@@ -855,6 +862,23 @@ Each slice is independently shippable and leaves the tree green.
    needs only slice 1 — if the morning is worth more than closing the
    double-mint window early, it can swap with slice 2, as long as nobody
    runs `add-key --nick` in between.
+   **Shipped 2026-09-07**, verified in two real create lifecycles. The
+   decisions, all reversible: `note --for <character>` writes into another
+   character's log under the caller's name, which makes "the message board
+   is this log read by someone else" true before slice 7's addressing
+   exists; `tail` never mints, because a read-only verb's whole flag
+   surface must be incapable of a write (`kj/readonly.rs` holds the
+   invariant and an exhaustiveness test enforces it); `note` is not
+   `ConfigWrite`-gated, since leaving a note is ordinary authoring and the
+   gate would route every handoff through the lfm2d escalation; no
+   character fails loudly and names `kj character create`; `played_by`
+   defaults in `create_context_inner`, NULL without a character, because
+   `register_session` rides `createContext` like every client. The window
+   is 50, set on the first note (a marker needs a block to anchor on).
+   `S16-handoff.kai` guards `kj handoff tail` inside the substitution: a
+   trailing `||` never fires in kaish, and under `set -e` a failing
+   substitution aborts the script, so a principal with no character got an
+   Error block on every create until the guard moved.
 5. **rc union.** Two directories, one sorted list, collision is an error,
    `KJ_CONTEXT_TYPE` and `KJ_CHARACTER` seeded; `characters.rc_dir` arrives.
    Reseed leaves character dirs alone (they are not shipped defaults).
