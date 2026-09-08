@@ -2,7 +2,7 @@
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-server` — SSH
 transport, the Cap'n Proto RPC surface, LLM streaming, the beat scheduler, auth.
-Code is truth; verified 2026-06-16.*
+Code is truth: every pointer below names a symbol — `grep` it.*
 
 `kaijutsu-server` is the only process that holds a live `Kernel`. It authenticates
 SSH clients, multiplexes many RPC sessions onto the one shared kernel, streams LLM
@@ -12,102 +12,133 @@ tokens into blocks, drives the musician beat loop, and persists SSH identity.
 
 ## Transport — SSH + Cap'n Proto (`src/ssh.rs`)
 
-Startup (`SshServer::run_on_listener`, `:223`): load/generate the Ed25519 host
+Startup (`SshServer::run_on_listener`, `:281`): load/generate the Ed25519 host
 key, open `AuthDb`, build a `russh` config with 30 s keepalive × 3 (≈90 s
 dead-peer window), call `create_shared_kernel`, spawn the **turn-driver** and
 **beat-scheduler** threads, then run the russh server.
 
-Per connection (`ConnectionHandler`, `:353`): `auth_publickey` (`:753`) looks up
-the fingerprint in `AuthDb` via `spawn_blocking`; in anonymous mode unknown keys
-auto-register. On the **second** channel (index 1, the RPC channel) it spawns a
-named OS thread.
+Per connection (`ConnectionHandler`, `:480`): `channel_open_session` (`:839`)
+stashes every channel a client opens in a per-connection map; `subsystem_request`
+(`:892`) dispatches by the requested subsystem **name**, not by channel ordinal
+— `"kaijutsu-rpc"` (`SSH_RPC_SUBSYSTEM`) spawns the RPC thread, `"kaijutsu-sftp"`
+and `"kaijutsu-share"` spawn theirs, and an unrecognized name gets
+`channel_failure` + close. An earlier scheme opened three channels
+(control/rpc/events) in a fixed order and keyed the handler by ordinal alone;
+control and events carried no traffic of their own; the client now opens one
+channel and names what it wants. `auth_publickey` (`:1009`) looks up the
+fingerprint in `AuthDb` via `spawn_blocking`; in anonymous mode unknown keys
+auto-register.
 
-RPC thread model (`:711`): each session runs on a dedicated OS thread with a
-`current_thread` Tokio runtime + `LocalSet` — required because `capnp-rpc`
-capabilities are `!Send`. `catch_unwind` contains per-connection panics. `run_rpc`
-(`:421`) wraps the channel in an `ActivityStream` (stamps `last_activity` on every
-byte), builds `ConnectionState`, registers `WorldImpl` as the bootstrap
-capability, and runs the `RpcSystem` over a `twoparty::VatNetwork`. A watchdog
-(`:528`) warns only when idle past 120 s (above the keepalive reap window).
+RPC thread model (`run_rpc`, `:622`): each session runs on a dedicated OS thread
+with a `current_thread` Tokio runtime + `LocalSet` — required because
+`capnp-rpc` capabilities are `!Send`. `catch_unwind` contains per-connection
+panics. `run_rpc` wraps the channel in an `ActivityStream` (stamps
+`last_activity` on every byte), builds `ConnectionState`, registers `WorldImpl`
+as the bootstrap capability, and runs the `RpcSystem` over a
+`twoparty::VatNetwork`. A watchdog (`run_rpc_watchdog`, `:747`) warns only when
+idle past `RPC_IDLE_WARN_THRESHOLD` = 120 s (above the keepalive reap window).
 Connection count is capped (default 100).
 
 ---
 
 ## RPC surface (`src/rpc.rs`)
 
-~7,400 lines, ~162 functions. A two-level capability tree:
+~13,000 lines. A two-level capability tree:
 
-- **`WorldImpl`** (`:1407`) — `world::Server`: `whoami`, `list_kernels`,
+- **`WorldImpl`** (`:3150`) — `world::Server`: `whoami`, `list_kernels`,
   `bind_kernel`. `bind_kernel` returns a `KernelImpl` capability; there is one
   shared kernel, not one per user.
-- **`KernelImpl`** (`:1473`) — `kernel::Server`: the monolith, ~80 methods.
-- **`VfsImpl`** (`:6887`) — `vfs::Server`: 17 filesystem methods.
+- **`KernelImpl`** (`:3242`, trait impl `:3559`–`:12049`) — `kernel::Server`: the
+  monolith.
+- **`VfsImpl`** (`:12050`, trait impl `:12179`) — `vfs::Server`: file operations
+  over the mounted VFS; the family shrank from seventeen wire methods to four
+  with real callers once SFTP superseded the rest (`docs/devlog.md`, "The
+  answer that travelled as an error").
 
-`KernelImpl` methods group by domain (see the report for the full table): lifecycle
-(`get_info`, `ping`), shell exec (`execute`, `interrupt`, `complete`,
-`subscribe_output`), VFS, tools (`execute_tool`, `get_tool_schemas`), **blocks**
-(`subscribe_context`, `subscribe_blocks[_filtered]`, `get_blocks`, `move_block`,
-`set_block_excluded`, `cherry_pick_block`), **LLM** (`prompt`, `configure_llm`,
-`drift_queue`/`cancel`), **context ops**
-(`create`/`join`/`leave`/`conclude`/`compact`/`interrupt_context`), MCP, peers,
-kaish (`shell_execute`, cwd/vars), **per-client view state**
-(`set_last_context`/`get_client_view`),
-**input doc** (`edit_input`/`submit_input`/`clear_input`), semantic index, config,
-and dead letters.
+`KernelImpl` methods group by domain: lifecycle (`get_info`, `ping`), shell exec
+(`execute`, `interrupt`, `complete`, `subscribe_output`), VFS, tools
+(`execute_tool`, `get_tool_schemas`), **blocks** (`subscribe_context`,
+`subscribe_blocks[_filtered]`, `get_blocks`, `move_block`, `set_block_excluded`,
+`cherry_pick_block`), **LLM** (`prompt`, `configure_llm`, `drift_queue`/
+`drift_cancel`), **context ops** (`create_context`/`join_context`/
+`rename_context`/`promote_context`/`demote_context`/`archive_context`/
+`compact_context`/`interrupt_context` — there is no `fork`/`drift` RPC method;
+those stay `kj` verbs per the "administration is a `kj` verb, chatty paths stay
+on RPC" rule), MCP, peers, kaish (`shell_execute`, cwd/vars), **per-client view
+state** (`set_last_context`/`get_client_view`), **input doc**
+(`edit_input`/`submit_input`/`clear_input`), semantic index, config, and dead
+letters.
 
 **The facade gate:** humans (app) and agents (MCP) reach capabilities through the
-same `KernelImpl`. The guard is `broker().check_facade(&context_id, "shell")` —
-keyed on the **context binding**, not on which client called (`:3004`). The
-deny-by-default allow-set is evaluated inside the broker.
+same `KernelImpl`. The guard is `Broker::check_facade(&context_id, "shell")`
+(`kaijutsu-kernel/src/mcp/broker.rs:1441`) — keyed on the **context binding**,
+not on which client called. The deny-by-default allow-set is evaluated inside
+the broker.
 
-The monolith is **deliberate**: a capnp `impl kernel::Server` must be one `impl`
-block (file doc at `:9`). `// ===` banners are the navigation aid. (Splitting it is
-tracked in [issues](../issues.md).)
+The monolith is **deliberate**, not unsplit debt: a capnp `impl kernel::Server`
+must be contiguous, so a mechanical split would produce delegating trait
+methods in a thin file plus per-subject inherent `impl` blocks elsewhere —
+more surface area, no real modularity (file doc, `:9`). `// ===` banners are
+the navigation aid.
 
-`create_shared_kernel` (`:974`) is the whole-stack constructor: FlowBus → KernelDb
-→ Kernel → mounts (RO `/`, RW `~/src`,`/tmp`, the `/config` trees, then freeze) → block store
-→ config backend → LLM registry → optional ONNX semantic index → `KjDispatcher` →
-context recovery from KernelDb.
+`create_shared_kernel` (`:2428`) is the whole-stack constructor: FlowBus →
+KernelDb → Kernel → mounts (RO `/`, an opaque `/dev`, RW `~/src`/`/tmp`, the
+`/config` trees, the ephemeral `/run/midi`+`/run/audio`+`/run/roster` views,
+`/v/cas`, `/r`, then freeze) → block store → config backend → LLM registry →
+optional ONNX semantic index → `KjDispatcher` → context recovery from
+KernelDb.
 
 ---
 
 ## LLM streaming (`src/llm_stream.rs`)
 
-`spawn_llm_for_prompt` (`:184`): resolve provider/model (explicit param >
+`spawn_llm_for_prompt` (`:274`): resolve provider/model (explicit param >
 per-context > kernel default), build tool defs via the broker, assemble the
 system prompt (static base + rc sections + situational addendum), create a
-fresh `ContextInterruptState`, and `spawn_local` `process_llm_stream`.
-(Auto-compaction — M1-A5's block-count-triggered summarize-and-mark-compacted
-pass — was deleted: the project wants a token-usage gauge the user reads, not
-a mechanism that silently melts history. `process_llm_stream` now records
-usage from every `StreamEvent::Done` instead; see `kj context info`.)
+fresh `ContextInterruptState`, and `spawn_local` `process_llm_stream`. There is
+no automatic compaction — a block-count-triggered summarize-and-mark-compacted
+pass would silently melt history; instead `process_llm_stream` records usage
+from every `StreamEvent::Done` into a token-usage gauge the user reads
+(`kj context info`).
 
-`process_llm_stream` (`:575`) is the agentic loop: acquire the per-context
+`process_llm_stream` (`:1360`) is the agentic loop: acquire the per-context
 conversation lock, read hydration policy (full vs windowed), hydrate the mailbox
 (`catch_up` or `rehydrate_windowed`), resolve image blocks from CAS, then loop
-(consent-capped: 50 collaborative / 100 autonomous iterations). Each iteration
-builds `BuildOpts` with cache breakpoints, calls `provider.stream` with
-exponential backoff, and processes `StreamEvent`s under a two-layer timeout
-(per-chunk idle + total wall-clock). Tokens write directly to the block
-store; clients observe via `BlockFlow`. Tool calls run concurrently via
-`dispatch_tool_via_broker_with_cancel` (120 s per-tool). On completion it
-publishes `TurnFlow::Completed { output_block_id }` for autonomous turns.
+(consent-capped: `COLLABORATIVE_MAX_ITERATIONS` = 50 / `AUTONOMOUS_MAX_ITERATIONS`
+= 100). Each iteration builds `BuildOpts` with cache breakpoints, calls
+`provider.stream` with exponential backoff, and processes `StreamEvent`s under
+a two-layer timeout (per-chunk idle + total wall-clock). Tokens write directly
+to the block store; clients observe via `BlockFlow`. Tool calls run
+concurrently via `dispatch_tool_via_broker_with_cancel`, racing the broker's
+own per-instance `call_timeout` (live-configurable, `kj policy set`) against
+the interrupt token — there is no second, hardcoded timeout ceiling; one used
+to clamp every policy timeout to 120s and was removed as redundant with the
+cancel-token race. On completion it publishes
+`TurnFlow::Completed { output_block_id }` for autonomous turns.
 
 ---
 
 ## Beat scheduler (`src/beat.rs`)
 
-`BeatScheduler` (`:261`) is a server-lifetime task on its own OS thread, driving
-musician contexts' hyoushigi timelines. A min-heap of `(Instant, ContextId)`, a
-`BeatCommand` ingress channel, and a `TurnFlow::Completed` subscription. Commands:
-Arm, Play, Pause, Stop, SetTempo, SetOoda, SetRotate, Disarm. `STEP = TickDelta(1)`
+`BeatScheduler` (`:353`) is a server-lifetime task on its own OS thread, driving
+the per-track model's timelines (tracks, not contexts, are what get scheduled —
+a musician context attaches to a track). A min-heap of `(Instant, TrackId,
+generation)` — the generation guards against a stale heap entry from a track
+that was re-armed since it was scheduled — a `BeatCommand` ingress channel, and
+a `TurnFlow::Completed` subscription. Commands: Attach, Detach, Play, Pause,
+Stop, SetTempo, SetOoda, SetRotate, SetClock, Delete. `STEP = TickDelta::new(1)`
 — the playhead is **event-counted, never wall-clock-scaled** (freeze = pause,
-resume = +1, no rewind). Each wake: `fire_due → process_one` advances the
-playhead, materializes committed cells (ABC→MIDI), and drains failures to error
-blocks. The OODA boundary fires the `tick` rc verb then publishes
-`TurnFlow::Requested`. On `TurnFlow::Completed`, `on_turn_completed` crystallizes
-the output as an ABC cell one phrase ahead — guarded by three checks (ephemeral,
-track-bearing, `beat()`-authored). Poison cells get a 3-failure retry budget.
+resume = +1, no rewind; a wakeup more than `GRID_RESEED_AFTER_PERIODS` late
+re-seeds the grid at the actual wakeup rather than catching up — missed beats
+are missed). Each wake, `fire_due` advances the playhead, materializes
+committed cells (ABC→MIDI), and drains failures to error blocks. The OODA
+boundary fires the `tick` rc verb then publishes `TurnFlow::Requested`. On
+`TurnFlow::Completed`, `on_turn_completed` (`:2155`) crystallizes the output as
+an ABC cell one phrase ahead — guarded by three checks (ephemeral/excluded, a
+track-bearing block already off the timeline, a `beat()`-authored legacy
+transport row) that refuse to re-crystallize something that is not a fresh
+player Act. Poison cells get a `MATERIALIZE_RETRY_BUDGET` = 3 retry budget
+before the cell is skipped and the failure surfaces as an error block.
 
 ---
 
@@ -133,18 +164,15 @@ keyring"). Management CLI in `main.rs`: `add-key --as <character>
 
 ## Smells (not fixed — see [issues](../issues.md))
 
-- **`rpc.rs` monolith** (~7,400 lines) — known/documented; navigation is
-  grep/LSP-dependent.
 - **External MCP offline** — `list_mcp_servers` returns empty; admin deferred to
   Phase 2. Clients silently get nothing.
-- **No graceful SIGTERM** — the WAL checkpoint only fires on clean `Arc` drop; a
-  `systemd stop` leaves the WAL for next open.
-- **`unwrap()` on workspace insert** in `create_shared_kernel` (`:1092`) panics
-  rather than `?`-propagating, unlike its neighbors.
-- **Implicit channel-index convention** — only channel 1 gets an RPC thread; the
-  "open exactly 3 channels in order" contract is a comment, not a constant.
+- **No graceful SIGTERM** — no signal handler in `main.rs`; the WAL checkpoint
+  only fires on clean `Arc` drop, so a `systemd stop` leaves the WAL for next
+  open.
 - **`AuthDb` behind one mutex** — concurrent auth attempts serialize; no pooling.
 - **Tool-result visibility gap** — when `insert_tool_result_as` fails the model
-  still gets the result but the user never sees the block (`llm_stream.rs:1339`).
-- **`$HEARD` ergonomics** — pushed as a JSON string (not a kaish array), window
-  hardcoded to 8 phrases (Chameleon batch 2).
+  still gets the result but the user never sees the block (`llm_stream.rs:1226`,
+  `:2386`).
+- **`$HEARD` ergonomics** — pushed as a JSON string (not a kaish array of
+  hashes a script could `for phrase in $HEARD`), window hardcoded to
+  `HEARD_WINDOW_PHRASES` = 8 (`beat.rs:272`).

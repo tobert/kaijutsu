@@ -17,46 +17,30 @@ melted into this doc.
   credentials and its own per-vendor policy read. The kernel never touches
   vendor auth — it just sees players.
 
-  **CONTRADICTED 2026-08-14 — needs Amy's re-read before this lane is
-  built.** This bullet used to read "the Claude Agent SDK runs under Amy's
-  own subscription login (the sanctioned personal-use lane per the
-  2026-08-09 policy read)". Anthropic's current docs say otherwise on both
-  halves: the SDK authenticates from `ANTHROPIC_API_KEY` in the process
-  environment (it does not spawn the `claude` CLI for auth, and does not
-  inherit a logged-in CLI's credentials), and the overview carries an
-  explicit gate — *"Unless previously approved, Anthropic does not allow
-  third party developers to offer claude.ai login or rate limits for their
-  products, including agents built on the Claude Agent SDK."* Managed
-  Agents is the same story: tokens at API rates plus $0.08/session-hour,
-  no subscription path. So the SDK lane is **metered spend, not seat
-  spend**, and pyo3 buys nothing for the subscription question. The
-  OAuth-extraction ban is undisturbed. What survives: the subscription
-  surface is the vendor's *own harness under Amy's login* — a process, not
-  a library (`claude` 2.1.232 and `gemini` 0.45.0 are installed here;
-  `codex` is not) — which is lane (A) below and already works over
-  kaijutsu-mcp. Judge the wheel on lanes 2 and 3.
-
-  **Refined 2026-08-14 (same day): the hinge is library vs binary, and the
-  block above overstates the case against the CLI.** Verified since: the
-  Agent SDKs *do* spawn a `claude` binary as their transport — they bundle
-  their own and expose `pathToClaudeCodeExecutable` — so "does not spawn the
-  CLI" was true of *auth* and false of *transport*. Those are separable and
-  had been fused. The quoted policy line governs third-party developers
-  **offering claude.ai login or rate limits for their products**, i.e.
-  productizing someone else's seat; it is not a statement about Amy driving
-  her own logged-in install on her own machine for herself, which is what
-  the 2026-08-09 read described. So that read stands for the binary seam and
-  the paragraph above stands for the library seam. **The policy call remains
-  Amy's** — this only fixes which question the evidence answers.
+  The Agent SDK authenticates from `ANTHROPIC_API_KEY` in the process
+  environment — it does not inherit a logged-in CLI's credentials, even
+  though it spawns a bundled `claude` binary as its transport (auth and
+  transport are separable, and the SDK lane is metered spend, not seat
+  spend). Anthropic's policy line — *"Unless previously approved, Anthropic
+  does not allow third party developers to offer claude.ai login or rate
+  limits for their products, including agents built on the Claude Agent
+  SDK"* — governs productizing someone else's seat; it says nothing about
+  Amy driving her own logged-in `claude`/`gemini` install on her own machine
+  for herself. That binary-seam case is lane (A) below and already works
+  over kaijutsu-mcp; pyo3 buys nothing for it, and the OAuth-extraction ban
+  stands undisturbed either way. Judge the wheel on lanes 2 and 3.
+  This policy reading is provisional: it corrected the 2026-08-14 text and
+  Amy has not re-read the vendor terms since. Confirm with her before
+  building on it.
 - **Notebooks, science, MIDI.** A Jupyter cell that joins a context, reads
   the score, emits blocks.
 - **Sandbox/venv experiment space** for agent-callable Python (see
-  "Exec ownership" below). **This lane has left this document (2026-08-17.)**
-  It is the *inbound* arrow — kaijutsu runs Python — and it shares only the word
+  "Exec ownership" below) is a different lane, not this doc's concern: it is
+  the *inbound* arrow — kaijutsu runs Python — and it shares only the word
   "Python" with the wheel, which is Python-drives-kaijutsu. Different transport,
-  lifecycle, trust envelope, and exec question. It is now explored in
-  `docs/wasi-ramblings.md` as WASI guest hosting, where the interpreter is a
-  swappable artifact rather than a pyo3 dependency. **Judge the wheel on lane 2
+  lifecycle, trust envelope, and exec question; explored separately as WASI
+  guest hosting, where the interpreter is a swappable artifact rather than a
+  pyo3 dependency. **Judge the wheel on lane 2
   alone.**
 
 ## Doctrine
@@ -71,7 +55,7 @@ melted into this doc.
 - **Players are trusted peers** (shared trust boundary); capabilities
   remain ergonomic nudges.
 
-## Two directions, and only one is solved (named 2026-08-14)
+## Two directions, and only one is solved
 
 "Use my subscriptions" splits into two shapes the doc had been treating as
 one. Keeping them apart is what stops the wheel from being justified by
@@ -151,10 +135,10 @@ case or not at all.
 choice). `broadcast::Lagged` surfaces as a structured resync event —
 never silently dropped (mirror the MCP's `EventsLagged` handling).
 
-**Deferred past slice 1:** SyncedDocument replication (the sole-writer doc
-task is ~1000 lines of hard-won concurrency control — do not port it until
-the connection layer is proven), MIDI capture, VFS surfaces, input-document
-compose, invoke_peer. `shell "kj …"` covers the gaps meanwhile.
+**Deferred past slice 1:** a `ContextMirror`-backed live document view (do not
+port the client's mirror/change-feed machinery until the connection layer is
+proven), MIDI capture, VFS surfaces, input-document compose, invoke_peer.
+`shell "kj …"` covers the gaps meanwhile.
 
 ## kaish data plumbing (audited 2026-08-09)
 

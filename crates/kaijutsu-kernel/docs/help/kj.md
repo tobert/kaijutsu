@@ -47,15 +47,29 @@ alias           list, set, remove — short --model handles → backend/model
                 (the kernel ships none; they're yours to define)
 attach          Attach to an existing context and run its rc attach lifecycle
                 (distinct from `transport attach`, which attaches to a beat track)
-audio           beats — offline audio analysis (beat/downbeat tracking via beat-this)
+audio           devices, keep, keep-status, keep-retry, keep-cancel, beats —
+                read a connected audio node's device inventory; protect
+                recent MIDI in daemon RAM and upload it to CAS (keep), then
+                poll/retry/cancel that job; beats is offline audio analysis
+                (beat/downbeat tracking via beat-this)
 backend         list, show, set, remove, model set|remove, default show|set, reseed —
-                SQL-native LLM endpoints (name + kind), their context windows,
-                and the kernel-wide defaults. Replaces models.toml entirely.
+                SQL-native LLM endpoints (`kernel_db`'s `backends`/`backend_models`/
+                `llm_defaults` tables, no TOML, no host file to edit): a
+                free-form `name` plus a closed `kind` (anthropic | deepseek |
+                openai | codex-app), their context windows, and the
+                kernel-wide defaults. No key material is ever stored — only
+                an env-var name or a file path.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
                 (cap tokens incl. config-write, drive, fork, drift, transport,
-                operator, exec, editor, admin, or <instance>[:<tool>], facade:<name>, *, facade:*)
-block           list, inspect, count, read, cat, append, history, diff, status, create,
-                edit (insert|delete|replace)
+                operator, exec, editor, system, admin, or <instance>[:<tool>],
+                facade:<name>, *, facade:*)
+block           list, inspect, count, read, render, cat, original, reproject,
+                append, history, diff, status, create, edit (insert|delete|replace) —
+                render engraves a music-notation block to SVG; cat resolves a
+                block's payload (following a CAS reference for a derived
+                asset) instead of a hand-assembled inspect→cas-get chain;
+                original/reproject read an ingest transform's stored raw
+                bytes and re-run its style-span parser
 cache           list, add, clear — Claude prompt-cache breakpoints on the active context
 cas             put, get, ls, info, rm — content-addressed blob storage
 cast            list, show, create, remove, set, slot set|remove — named model
@@ -70,17 +84,24 @@ character       create, list, show, retire — the sheet a name resolves to
                 (principal id + given name); create mints a fresh principal
                 and is idempotent on the name; retire concludes and archives
                 every live context the character plays
-config          list, show, set, edit, reset — CRDT-owned config at /config/kernel
-                (system.md, theme.toml, mcp.toml) + per-client at /config/client
-context (ctx)   list, info, current, switch, create, scratch, set, unset, log, move,
-                rename, archive, conclude, promote, demote, pause, resume, remove,
-                retag, hydrate
+config          list, show, reset — config files at /config/kernel (system.md,
+                theme.toml, mcp.toml) + per-client at /config/client, ordinary
+                host files reached through the file tools, `kj editor`, or vim;
+                there is no `set`/`edit` verb — write the file directly. `reset`
+                restores a file to its embedded default.
+context (ctx)   list, info, prompt, current, switch, create, scratch, rebind,
+                set, unset, log, move, rename, archive, conclude, promote,
+                demote, pause, resume, remove, retag, hydrate — prompt renders
+                a context's system prompt; rebind repairs a context left with
+                no usable loadout by re-running `create`'s rc lifecycle,
+                ungated (a broken context can always diagnose and repair
+                itself, never just abort)
 cp              Copy a file between VFS paths via the streaming pump (-r not implemented)
 db              backup <path>, checkpoint — hot SQLite backup (VACUUM INTO, absolute
                 path required) and WAL checkpoint/quiesce; restore is deliberately NOT
                 a verb (see `kj db backup help`)
 diff            <a> [<b>] — unified diff as a typed block: one path diffs disk
-                against the CRDT document that owns it, two paths diff both
+                against the kernel document that owns it, two paths diff both
                 documents, --from/--to address a document's journalled history
 doc             list, tree, create, delete — storage layer (all kinds, not just conversation)
 drift           push, pull, merge, flush, queue, cancel, history, edge rm
@@ -90,6 +111,9 @@ editor          open, keys, state, save, quit, list — kernel-owned vi editor s
                 are ungated)
 fork            Fork current context (--name, --prompt, --preset, --model,
                 --include/--exclude ranges, --compact, --as, --stage, --switch)
+handoff         note [--for <character>], tail [--window] — a character's
+                handoff log (an ordinary context); note is authored by the
+                caller even when writing into someone else's log
 hook            list, show, remove, add — broker hook tables, direct (never
                 through hook evaluation); the recovery path for a self-inflicted
                 PreCall Deny("*") lockout
@@ -106,12 +130,17 @@ ledger          list, show, allow, deny, rules, forget, runs — answer pending
                 `runs <run-id>` shows one run's per-script detail
 mcp             list (alias status), reload — external MCP servers (mcp.toml: kaibo,
                 bevy_brp, …); configured-vs-actually-running visibility + reconcile
-midi            list, show — CRDT-owned MIDI device profiles at
-                /config/midi/devices/<name> (docs/midi-next.md)
+midi            list, show, send note|cc|pc|sysex, identify, panic — device
+                profiles at /config/midi/devices/<name>, ordinary host files
+                (docs/midi-next.md); send/panic emit raw MIDI at a named
+                device (the kernel never touches hardware — a sink resolves
+                the port); identify asks a device what it is and records the
+                answer at /run/midi/<device>
 model           Show a context's effective model (--context <ref>)
 models          List configured providers, their models, and --model aliases
-play            Play a sample now, or commit it as a clip cell onto a track with
-                --track/--at/--label (docs/pcm.md)
+play            Play a sample now (a host path, or --cas <hash> for an object
+                already in the CAS), or commit it as a clip cell onto a track
+                with --track/--at/--label (docs/pcm.md)
 policy          show, set — a registered instance's per-call QoS policy
 preset          list, show, save, remove, reseed
 rc              add, list, rm, show — lifecycle scripts (/config/rc/<type>/<verb>/).
@@ -128,11 +157,24 @@ stage           commit, status, include, exclude — curate a staged (liminal) f
 swap            list, ack, discard — resolve a file buffer recovered after a
                 kernel restart (docs/file-buffers.md rule 4); read it first at
                 /v/swap/<kernel_id>/<path>
-transport       attach, detach, play, pause, stop, tempo <bpm>, ooda <on|off>,
-                clock <system|modeled>, rotate, delete — a track's beat clock
-                (the musician playhead)
+system          status, ps, quiesce [--reason], resume — what the kernel is
+                doing right now: status/ps answer "what is running", quiesce
+                stops new turns from starting (writes and in-flight turns are
+                unaffected; durable across a restart), resume clears it
+transport       list, attach, detach, play, pause, stop, tempo <bpm>,
+                ooda <on|off>, clock <system|modeled>, rotate, delete — a
+                track's beat clock (the musician playhead); list joins the
+                durable track table against the live scheduler snapshot, so
+                a track in the DB with nothing re-attached this session
+                shows as `dormant`
 vfs             snapshot <path> (--depth, --max-entries), activity [path] —
                 recursive listing + generation stamps / per-directory heat totals
+wait            [<target>] [--since, --timeout, --max-blocks, --max-bytes,
+                --include text|tools|all] — park until a context's turn
+                finishes and report what it produced since you last looked;
+                completes the fork/drive/wait delegation quartet. One target
+                context at a time; waiting on several delegated children at
+                once is unbuilt
 workspace (ws)  list, show, create, add, bind, remove
 ```
 

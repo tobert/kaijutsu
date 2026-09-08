@@ -223,7 +223,7 @@ rides.
 
 ### Traps in the surrounding code
 
-1. **`freeze_mounts()`** (`kaijutsu-server/src/rpc.rs:1844`) — the mount must
+1. **`freeze_mounts()`** (`kaijutsu-server/src/rpc.rs:2661`, `kernel.rs:1952`) — the mount must
    join the block above it, and frozen means **one backend per subtree**. Copy
    `ShareFs`'s internal router; never mount-per-session.
 2. **`getattr` sizes the body and `read_all` reads exactly `attr.size`** — a
@@ -289,17 +289,16 @@ Layers 1 and 4 keep 2 and 3 honest. Do not ship the actor without both.
 
 ## Status and build order
 
-Built, on branch `cc-peer-roster` (worktree `~/src/wt/kj-cc-roster`), not
-merged:
+Merged to main:
 
 - `kj cc list` and `kj cc send [--dry-run]`, attribution validated against a
   real receiver.
 - **`crates/claude-code-peer`** — the protocol-only crate this document's
   "Architecture" section calls for: descriptor scan, liveness guard, envelope
-  codec, frame codec, send client, inbox listener. 58 tests + 2 ignored live
-  probes, golden fixtures from a real session (see the crate's `tests/`).
-- **`kj cc send` is ledger-gated** — the "Open decisions" question below is
-  answered (Amy, 2026-08-16). `kj ledger` answers the gate from any shell.
+  codec, frame codec, send client, inbox listener, golden fixtures from a real
+  session (see the crate's `tests/`).
+- **`kj cc send` is ledger-gated.** `kj ledger` answers the gate from any
+  shell.
 
 Order from here: **kernel wiring of the inbox** (the listener exists; connect
 it as a drift/mailbox source, unlocks replies) → **truthful `from`** on the
@@ -311,14 +310,16 @@ on exists.
 
 ## Open decisions
 
-- ~~**Does `--drive` route through the approval ledger?**~~ **Resolved —
-  yes** (Amy, 2026-08-16: *"yeah kj cc send should go through the ledger"*).
-  Implemented as the first consumer of the approval-ledger gate
-  (`crates/kaijutsu-kernel/src/kj/gate.rs`): durable ask row before any wait,
-  fail-closed on `gate_wait_timeout`, answered via `kj ledger`. The message
-  body is a free variable in the gated statement, so allow-always rules can
-  never be learned for it (ledger guarantee 3) — every send stays
-  human-approved until that policy changes deliberately.
+`--drive` routes through the approval ledger (Amy: *"yeah kj cc send should go
+through the ledger"*) — the first consumer of the approval-ledger gate
+(`crates/kaijutsu-kernel/src/kj/gate.rs`): durable ask row before any wait,
+fail-closed on `gate_wait_timeout`, answered via `kj ledger`. The message
+body is a free variable in the gated statement, so allow-always rules can
+never be learned for it (ledger guarantee 3) — every send stays
+human-approved until that policy changes deliberately.
+
+Genuinely open:
+
 - `from-mode` enum beyond `prompting`; `priority` enum beyond `next`. Both
   unknown; hardcode the observed value and comment why.
 - Whether a reply carries any reference to the original `msg_id`. Unprobed, and

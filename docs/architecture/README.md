@@ -1,12 +1,11 @@
 # Kaijutsu Architecture
 
-*A map of the system as it actually is, drawn from the code on 2026-06-16.*
+*A map of the system as it actually is, built by reading the code
+crate-by-crate, not by trusting prose.*
 
-This directory is the synthesized, top-level view of kaijutsu. It was built by
-reading the code crate-by-crate, **not** by trusting prose — several long-standing
-design docs describe things the code no longer does (see
-[Stale docs & surprises](#stale-docs--surprises)). Where this document and an
-older doc disagree, the code wins and this document tries to say so.
+This directory is the synthesized, top-level view of kaijutsu. Where this
+document and an older doc disagree, the code wins and this document tries to
+say so (see [Stale docs & surprises](#stale-docs--surprises)).
 
 ## Contents
 
@@ -19,7 +18,7 @@ older doc disagree, the code wins and this document tries to say so.
   RPC surface, LLM streaming, the beat scheduler, auth.
 - **[client.md](client.md)** — `kaijutsu-client`: the `Send+Sync` actor bridge and
   the client-side context mirror.
-- **[app.md](app.md)** — `kaijutsu-app`: the Bevy 0.18 GUI and its render pipeline.
+- **[app.md](app.md)** — `kaijutsu-app`: the Bevy 0.19 GUI and its render pipeline.
 - **[supporting.md](supporting.md)** — `kaijutsu-mcp`, `-cas`, `-index`,
   `-hyoushigi`, `-abc`, `-viz`, `-telemetry`, `-agent-tools`.
 
@@ -50,28 +49,29 @@ another kernel through the VFS.
 
 ## Process & transport model
 
-> The system-topology diagram was deleted on 2026-08-16: it drew a `Kv` store
-> demolished on 2026-07-04. See `diagrams/README.md`.
-
 There is exactly **one `Kernel` per server process**, shared across every
-connection (`create_shared_kernel`, `kaijutsu-server/src/rpc.rs:974`). Clients do
-not get private kernels; isolation is by *context*, not by process.
+connection (`create_shared_kernel`, `kaijutsu-server/src/rpc.rs:2428`). Clients
+do not get private kernels; isolation is by *context*, not by process.
 
-A connection is an **SSH session that opens three channels**: control, rpc, and
-events (`kaijutsu-client/src/ssh.rs:181`). The rpc channel carries a Cap'n Proto
-`twoparty` RPC system; the events channel carries server→client callbacks
-(block events, resource events).
+A connection opens **one SSH session channel**, bound to the `kaijutsu-rpc`
+subsystem (`SSH_RPC_SUBSYSTEM`, `kaijutsu-client/src/ssh.rs:209`). Cap'n Proto's
+`twoparty` RPC system carries both request/response and server-pushed
+subscription streams over that single channel — an earlier design opened three
+channels (control/rpc/events) keyed by ordinal, but control and events carried
+no traffic of their own, so the subsystem-named single channel replaced them.
+SFTP and the `/r` client-share bridge ride their own named subsystems
+(`SSH_SFTP_SUBSYSTEM`, `SSH_SHARE_SUBSYSTEM`) over the same connection.
 
 Each RPC session runs on its **own OS thread** with a `current_thread` Tokio
-runtime and a `LocalSet` (`kaijutsu-server/src/ssh.rs:711`). This is forced by
-`capnp-rpc`, which stores capabilities in `Rc<RefCell<…>>` (`!Send`). A
-`catch_unwind` contains per-connection panics so one wedged session can't crash
-the server. Dead peers are reaped by SSH keepalive (30 s × 3 ≈ 90 s); an
-activity-gated watchdog warns only on genuine idle wedges
-(`kaijutsu-server/src/ssh.rs`).
+runtime and a `LocalSet` (`kaijutsu-server/src/ssh.rs:553`, `spawn_rpc_thread`
+at `:535`). This is forced by `capnp-rpc`, which stores capabilities in
+`Rc<RefCell<…>>` (`!Send`). A `catch_unwind` contains per-connection panics so
+one wedged session can't crash the server. Dead peers are reaped by SSH
+keepalive (30 s × 3 ≈ 90 s); an activity-gated watchdog warns only on genuine
+idle wedges (`kaijutsu-server/src/ssh.rs`).
 
 On the client side, the same `!Send` constraint is bridged by **`ActorHandle`**
-(`kaijutsu-client/src/actor.rs:617`): a `Clone + Send + Sync` facade that funnels
+(`kaijutsu-client/src/actor.rs:897`): a `Clone + Send + Sync` facade that funnels
 every call through a bounded mpsc into an actor task running on a `LocalSet`. The
 Bevy app runs that actor on a dedicated "bootstrap" thread and talks to it from
 ECS systems via channels.
@@ -87,7 +87,7 @@ capability allow-set on each context (see [Trust model](#trust-model)).
 
 ![Kernel anatomy](diagrams/02-kernel-anatomy.svg)
 
-`Kernel` (`kaijutsu-kernel/src/kernel.rs:40`) is the coordination center. Every
+`Kernel` (`kaijutsu-kernel/src/kernel.rs:41`) is the coordination center. Every
 field is `Arc`/`OnceLock`-wrapped for shared async ownership. It owns or wires
 together:
 
@@ -108,9 +108,8 @@ The kernel **does not run an LLM turn itself** — that is the server's job
 (`llm_stream.rs`). The kernel supplies everything a turn needs: tool dispatch,
 block storage, event broadcast, context lookup, hydration, and drift staging.
 
-Embedded inside the kernel (this is the big change from the old design) is
-**kaish**, the shell. `EmbeddedKaish`
-(`kaijutsu-kernel/src/runtime/embedded_kaish.rs:56`) runs the kaish interpreter
+**kaish**, the shell, runs embedded inside the kernel. `EmbeddedKaish`
+(`kaijutsu-kernel/src/runtime/embedded_kaish.rs:59`) runs the kaish interpreter
 **in-process** against the VFS and a kernel-owned file cache. There is no separate
 kaish process and no Unix socket.
 
@@ -140,7 +139,8 @@ context, then fork; the fork hydrates a clean conversation.
 ### Blocks, ids, ticks, and order
 
 A **block** is the unit of conversation (`BlockKind`: Text, Thinking, ToolCall,
-ToolResult, Drift, File, Error, Notification, Resource, Trace). Three different
+ToolResult, Drift, File, Error, Notification, Resource, Trace, Task — the last
+is the household-agent surface, `builtin.tasks`). Three different
 "coordinates" attach to a block and are routinely confused — they are distinct:
 
 - **`BlockId` = identity.** `(ContextId, PrincipalId, seq)`. Globally unique,
@@ -158,7 +158,8 @@ Two more orthogonal axes that read like overlap but aren't:
 
 - **`BlockKind`** = the structural role of the event (a tool call, a drift, …).
 - **`ContentType`** = how the block's text renders (Plain, Markdown, Svg, Abc,
-  Image). A `ToolResult` can have `ContentType::Svg`; they vary independently.
+  Diff, Image). A `ToolResult` can have `ContentType::Svg`; they vary
+  independently.
 
 Storage is `kaijutsu_kernel::blocks::BlockDocument`: a `BTreeMap<BlockId,
 BlockContent>` per context, each block's content a plain `String`, ordered by
@@ -179,17 +180,18 @@ and `push_str` is amortized O(1), while per-block merge metadata measured about
 The end-to-end path, prompt to pixels:
 
 1. **Client → server.** The app sends a prompt (or submits the compose input)
-   over RPC. `KernelImpl::prompt` (`rpc.rs:2563`) checks the context's facade
+   over RPC. `KernelImpl::prompt` (`rpc.rs:4733`) checks the context's facade
    capability, inserts the user message as a block, and calls
-   `spawn_llm_for_prompt` (`llm_stream.rs:184`).
+   `spawn_llm_for_prompt` (`llm_stream.rs:274`).
 2. **Hydrate.** The turn driver acquires the per-context conversation lock,
    reads the hydration policy (full vs windowed), and hydrates a
    `ConversationMailbox` from the block store. Image blocks are resolved from CAS.
 3. **Stream.** It resolves provider/model, builds the system prompt (static base
    + rc-script sections + situational addendum) and tool definitions (via the
    broker), and calls `provider.stream(...)`. Providers are a closed `enum`
-   (`llm/mod.rs:353`): Claude and OpenAI-compatible/DeepSeek are real; **Gemini is
-   a stub** that returns `Unavailable`.
+   (`llm/mod.rs:405`): Claude, OpenAI-compatible/DeepSeek, and a connect-only
+   Codex app-server client (`docs/codex-app-backend.md`) are real. There is no
+   Gemini provider — an earlier stub was removed rather than finished.
 4. **Blocks.** `StreamEvent`s (Thinking/Text deltas, ToolUse, Done) are written
    **directly into the block store** as they arrive. Thinking blocks keep
    their provider `signature` for cross-turn reasoning continuity.
@@ -199,9 +201,10 @@ The end-to-end path, prompt to pixels:
    or an external rmcp server. The result becomes a `ToolResult` block.
 6. **Fan-out.** Every block mutation publishes a `BlockFlow` event on the
    `FlowBus`. Server-side subscribers push it down the events channel.
-7. **Client mirror.** `kaijutsu-client`'s `ContextMirror` applies events into a
-   local mirror, buffering out-of-order events until their `BlockInserted`
-   arrives (the cross-topic ordering fix).
+7. **Client mirror.** `kaijutsu-client`'s `ContextMirror` tracks a per-context
+   `version` and applies events into a local mirror, refusing rather than
+   guessing at a delivery that doesn't advance that version — never a silent
+   buffer-and-hope (`docs/change-feed.md`).
 8. **Render.** The Bevy app copies mirror blocks into per-block cells and renders
    each to its own GPU texture via the two-pass vello/MSDF pipeline.
 
@@ -219,13 +222,14 @@ hyoushigi timeline.
 
 Every tool call — whether from the in-kernel model, a human over RPC, or an
 external MCP client — flows through **one** pipeline: `Broker::call_tool`
-(`kaijutsu-kernel/src/mcp/broker.rs:1184`). Everything that can be called
+(`kaijutsu-kernel/src/mcp/broker.rs:1560`). Everything that can be called
 implements `McpServerLike`.
 
 - **Virtual builtin servers** are registered in-process under `builtin.*` ids:
-  `builtin.block`, `builtin.file`, `builtin.shell` / `builtin.shell_readonly`,
-  `builtin.bindings`, `builtin.hooks`, `builtin.policy`, `builtin.resources`,
-  `builtin.kernel_info`, `builtin.tool_search`.
+  `builtin.block`, `builtin.file`, `builtin.shell` (tool `shell`) and
+  `builtin.shell_write` (tool `shell_write`), `builtin.bindings`,
+  `builtin.hooks`, `builtin.policy`, `builtin.resources`, `builtin.kernel_info`,
+  `builtin.tool_search`, `builtin.tasks`, `builtin.background`.
 - **External servers** (`ExternalMcpServer`) wrap an `rmcp` client over stdio or
   streamable-HTTP and inject kaijutsu identity (`principal_id`, `context_id`,
   W3C trace) into every call's `_meta`.
@@ -277,21 +281,37 @@ format version then ciborium CBOR, fail-loud, additive-evolution-safe.
 ## Crate dependency map
 
 There is no crate-dependency diagram. The workspace layers cleanly from leaves
-up:
+up. It has grown well past the twelve crates this map once covered — a Bevy-free
+in-app editor, an audio-render seam, a diff viewer, ANSI rendering, a terminal
+client, and standalone approval-ledger/Claude-Code-peer crates all split out on
+their own — but the layering rule still holds:
 
-- **Leaves** (no in-repo deps): `kaijutsu-types`, `kaijutsu-cas`,
-  `kaijutsu-abc`, `kaijutsu-viz`, `kaijutsu-telemetry`, `kaijutsu-agent-tools`.
-- **`kaijutsu-index`** depends only on `-types` (ONNX + HNSW + SQLite).
-- **`kaijutsu-hyoushigi`** depends on `-types` + `-cas`.
-- **`kaijutsu-kernel`** sits on `-types`, `-cas`, `-index`,
-  `-hyoushigi`, `-abc`, `-telemetry`, plus the external `kaish-kernel`. It
-  owns the block/document model directly (`src/blocks/`).
-- **`kaijutsu-server`** depends on `-kernel`, `-types`, `-index`,
-  `-telemetry`.
-- **`kaijutsu-client`** depends on `-types`, `-telemetry`.
-- **`kaijutsu-app`** depends on `-client`, `-types`, `-abc`, `-viz`,
-  `-telemetry`.
-- **`kaijutsu-mcp`** is the terminal consumer: it depends on `-kernel`, `-server`,
+- **Leaves** (no in-repo deps): `kaijutsu-types`, `kaijutsu-cas`, `kaijutsu-abc`,
+  `kaijutsu-viz`, `kaijutsu-telemetry`, `kaijutsu-agent-tools`, `kaijutsu-diff`,
+  `kaijutsu-editor`, `approval-ledger`, `claude-code-peer`.
+- **`kaijutsu-ansi`** and **`kaijutsu-index`** (ONNX + HNSW + SQLite) depend
+  only on `-types`.
+- **`kaijutsu-audio`** depends on `-cas`; **`kaijutsu-hyoushigi`** on `-types` +
+  `-cas`; **`kaijutsu-present`** on `-types` + `-audio` + the external
+  `kaish-kernel`.
+- **`kaijutsu-kernel`** sits on `-types`, `-ansi`, `-editor`, `-cas`, `-audio`,
+  `-hyoushigi`, `-abc`, `-diff`, `-index`, `-telemetry`, `approval-ledger`,
+  `claude-code-peer`, plus the external `kaish-kernel`. It owns the
+  block/document model directly (`src/blocks/`).
+- **`kaijutsu-server`** depends on `-kernel`, `-types`, `-ansi`, `-index`,
+  `-telemetry`, `-abc`, `-audio`.
+- **`kaijutsu-client`** depends on `-types`, `-telemetry`, `-viz`, `-audio`,
+  `-cas`.
+- **`kaijutsu-app`** depends on `-client`, `-types`, `-abc`, `-audio`, `-cas`,
+  `-diff`, `-kernel`, `-present`, `-viz`, `-telemetry`.
+- **`kaijutsu-tui`** (the ssh-shell terminal client, `docs/tui.md`) depends on
+  `-client`, `-diff`, `-editor`, `-present`, `-types`, `-telemetry`, `-viz`,
+  `-audio` — no Bevy anywhere in it. It reaches a kernel only over the wire,
+  like the app; `-server` appears only as a dev-dependency for the pty test
+  harness that runs the real binary against an in-process ephemeral kernel.
+- **`kaijutsu-acp`** (the ACP bridge, `docs/acp.md`) depends on `-client`,
+  `-types`, `-telemetry`.
+- **`kaijutsu-mcp`** is the terminal consumer: it depends on `-kernel`,
   `-client`, `-types`, `-agent-tools`, `-telemetry`.
 
 ---
@@ -306,15 +326,20 @@ because the gap itself is architecturally informative:
   Unix socket with seccomp sandboxing. The code embeds it in-kernel
   (`runtime/embedded_kaish.rs`); there is no socket, no separate process, no
   sandbox — so the crash-isolation and seccomp story from that era does not hold.
-- **Gemini is a stub.** The `unrig` effort planned a bespoke Gemini provider, but
-  `llm/gemini/mod.rs` returns `Unavailable` for both prompt and stream and
-  advertises three models nobody can call. Claude and the OpenAI-compatible core
-  (incl. DeepSeek) are the real providers. (Tracked in `../issues.md`.)
+- **There is no Gemini provider.** The `unrig` effort's planned bespoke Gemini
+  provider was a stub that returned `Unavailable`; it has since been removed
+  entirely, not finished. Claude, the OpenAI-compatible core (incl. DeepSeek),
+  and a connect-only Codex app-server client (`docs/codex-app-backend.md`) are
+  the real providers (`llm/mod.rs`'s `Provider` enum).
 - **`@alias` routing is unbuilt.** The old `@opus`/`@bash`/`@amy` addressing idea
   was never built; the live mechanism is the peer registry + `invoke_peer`, not
   `@`-routing.
-- **External MCP admin is offline.** The capnp methods exist but
-  `list_mcp_servers` returns empty; external-server registration is deferred.
+- **External MCP servers connect, but not through the wire admin methods.**
+  `kaijutsu_kernel::mcp::reconcile_external_mcp_servers` reads
+  `/config/kernel/mcp.toml` and registers/connects servers into the broker at
+  boot and on `kj mcp reload`; the capnp `list_mcp_servers` RPC still always
+  returns an empty list regardless (`kaijutsu-server/src/rpc.rs`) — that admin
+  surface, not external MCP itself, is the thing offline.
 
 ---
 
@@ -323,14 +348,11 @@ because the gap itself is architecturally informative:
 The big-ticket items the code review surfaced (all recorded in
 [`../issues.md`](../issues.md), not fixed here):
 
-- **`rpc.rs` monolith** (~7,400 lines, one `impl kernel::Server`) and **`KernelDb`
-  god-table** (~5,900 lines, ~20 tables behind one mutex) are the two largest
-  single-file concentrations.
-- **Silent fallbacks** in a few kernel paths (broker tool-listing returns empty on
-  error; binding resolve falls back to deny-all) — counter to the "crash over
-  corrupt/confuse" stance.
-- **Cap'n Proto ordinal reuse** after method removals, asserted safe by comment.
-- **UTF-8 byte-vs-char offset hazard** in the file edit path.
+- **`rpc.rs` monolith** (~13,000 lines, one `impl kernel::Server`) and **`KernelDb`
+  god-table** (~14,000 lines, ~20 tables behind one mutex, a deliberate
+  not-yet-split decision recorded in the file's own header) are the two
+  largest single-file concentrations. See [kernel.md](kernel.md#smells-not-fixed--see-issues)
+  for what has already been fixed in this file since the concentration was noted.
 - **App state-flag duplication** (`FocusArea` + `ActiveSurface` + `InputMode`).
 
 See each deep-dive's *Smells* section and `docs/issues.md` for the full list with

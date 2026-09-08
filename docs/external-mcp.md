@@ -1,10 +1,9 @@
 # External MCP servers — `mcp.toml`
 
-> **Status:** SHIPPED. `ExternalMcpServer` (`mcp/servers/external.rs`) was a
-> complete, tested `McpServerLike` implementation with no caller since the
-> old `mcp_pool`/`mcp_config` were deleted — this doc covers the five pieces
-> that closed that gap: config loading, the reconciler that's the actual
-> caller, per-server QoS, visibility, and the `kj mcp` operator surface.
+`ExternalMcpServer` (`mcp/servers/external.rs`) is a tested `McpServerLike`
+implementation; the five pieces below are what actually calls it: config
+loading, the reconciler that's the real caller, per-server QoS, visibility,
+and the `kj mcp` operator surface.
 
 `mcp.toml` (a host file under `/config/kernel`, `docs/config-namespace.md`) declares MCP servers
 the kernel spawns and registers on the broker alongside the in-process

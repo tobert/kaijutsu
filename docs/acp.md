@@ -28,7 +28,7 @@ kaijutsu-acp
 kaijutsu-server / kernel
 ```
 
-Concept mapping — **as built** (`crates/kaijutsu-acp`, prototype 2026-08-05):
+Concept mapping — **as built** (`crates/kaijutsu-acp`):
 
 | ACP v1 | kaijutsu | status |
 |---|---|---|
@@ -291,74 +291,21 @@ alone is empty on a fresh kernel and a picker showing nothing is useless;
 appending ring 1 keeps ring 0's seats stable at the front where the muscle
 memory lives.
 
-## Foundational work before the adapter
+## Open gaps below the adapter
 
-Sonnet assessment done 2026-08-04 (kaijutsu-client/RPC vs. ACP v1 checklist).
+- **ACP's client-declared `mcpServers` is ignored + warned, not wired**
+  (matches the concept-mapping table above) — kaijutsu's own external-MCP
+  reconciler only reads `/config/kernel/mcp.toml`, never a per-session,
+  client-supplied server list. Also v2-proofing: v2 drops `fs/*`/`terminal/*`
+  for client-provided MCP.
+- **`kj wait` is built** (fork/drive/wait composes: fork snapshots, drive execs
+  the child, wait joins it) — a subscription taken before the first state read
+  closes the turn-ended-before-the-waiter-subscribed race against the
+  lossy, un-journaled flow bus, and `--timeout` bounds the park. It waits on
+  one target context at a time; multi-child waits (parking on several
+  delegated children at once) remain unbuilt. Seam: `request_child_turn`.
 
-**Maps cleanly already — no redesign needed:**
-- Session CRUD: `RpcClient::{list,create,join}_context`/`conclude`/`archive`
-  (`kaijutsu-client/src/rpc.rs:432,560,587,1421,1534`).
-- Turn submit + cancel: `submit_input` (`rpc.rs:1923`) and — better than ACP
-  needs — `interrupt_context` with `immediate: Bool` soft/hard semantics
-  (`rpc.rs:1659`, `kaijutsu.capnp:1308-1311`). `session/cancel` is covered.
-- Tool-call reporting: `BlockKind::ToolCall/ToolResult` with Status + engine
-  (`kaijutsu-types/src/block.rs:1011-1020`) streaming as
-  `ServerEvent::BlockInserted/BlockStatusChanged/BlockOutputChanged/...`
-  (`subscriptions.rs:37-169`) — exactly ACP's `tool_call`/`tool_call_update`
-  create+patch shape. Text/Thinking chunks ride the same events.
-- kaijutsu-client is proven reusable: kaijutsu-mcp consumes
-  `ActorHandle`/`connect_ssh` with zero forked RPC code (`kaijutsu-mcp/src/
-  lib.rs:80,451`).
-
-**The gaps, prioritized:**
-1. ~~**Turn-completion event is not on the wire**~~ **SHIPPED, merged to main**
-   (branch `turn-events`, 2026-08-04, Opus agent; 4966 tests green; merge commit
-   `9554602c`). Step-0 finding: interactive turns published NOTHING (an
-   `announce_completion: bool` consumer-filter living in the producer);
-   replaced with `TurnOrigin { Interactive, Autonomous }` on every event —
-   beat.rs filters, everyone publishes. Stop reason:
-   `TurnStopReason { EndTurn, Cancelled{immediate}, MaxTokens,
-   MaxIterations }` on Completed (`Failed` = only "the turn broke");
-   `output_is_complete()` false only for hard cancel. Kernel-wide
-   subscription (event names its contextId), mandatory in the actor's
-   subscription set. Catch-up for late/reconnecting subscribers deliberately
-   deferred (needs a catch-up story, not a journal — noted on the
-   TurnFlow-durability issue).
-2. ~~**No Ask pathway for `session/request_permission`**~~ **SHIPPED**
-   (2026-08-05), then **melted into the approval ledger** (2026-08-18,
-   `docs/gate-and-shell-split.md` "The shared seam: one ledger, one
-   announcement, one write path"). `HookAction::Ask(AskSpec)` now runs
-   through `kj::gate::run_gate` with `Origin::Hook` — the same gate
-   `shell_write` uses — so an Ask is a durable `approval_ledger` row
-   answerable from any surface (`kj ledger allow|deny <id>`), not a
-   per-connection blocking round trip. See "Permission asks, ledger-driven"
-   below for the current mechanism.
-3. ~~**`register_session` reconnect/label-conflict**~~ **SHIPPED, merged to
-   main** (branch `register-session-upsert`, 2026-08-04, Sonnet agent; 2440
-   tests green; merge commit `7670d72e`). Upsert semantics: DB-driven `resolveContextLabel`
-   RPC → attach-if-live (`resumed: true` + timestamps for the stale-id
-   hazard), suffix-fresh if concluded (`previous_context` in reply). Bonus
-   finding: boot-time recovery already re-registers non-archived contexts,
-   so the "invisible after restart" divergence only genuinely bit ARCHIVED
-   contexts — `join_context` now heals from the durable row; issues.md entry
-   corrected with verified findings.
-4. **External MCP wiring — MEDIUM.** `external.rs` implemented, no caller
-   (issues.md MCP audit). Blocks ACP's optional client-declared `mcpServers`;
-   also v2-proofing (v2 drops `fs/*`/`terminal/*` for client-provided MCP).
-5. **Delegation join — substrate SHIPPED with #1; `kj wait` itself still
-   unbuilt, deliberately.** The bus is now subscribable; what remains is
-   semantics, not plumbing: timeout policy, the turn-that-ended-before-the-
-   waiter-subscribed race (bus is lossy + un-journaled), and multi-child
-   waits. Documented seam on `request_child_turn`; issues.md entry rewritten.
-
-Suggested order: #1 (+#5 riding along) → #3 → #2 → adapter prototype can
-start with `request_permission` stubbed to auto-allow → #4 and real
-permissions before any untrusted frontend. #1–#3 are now all shipped and
-merged to main; #2's `HookAction::Ask` is real permission plumbing, not the
-stub the original order assumed — an adapter polls the approval ledger
-(`subscribeLedgerEvents` + `kj ledger`) from day one instead of auto-allowing.
-
-## The adapter, as built (2026-08-05)
+## The adapter, as built
 
 `crates/kaijutsu-acp` — one binary, no forked RPC code, `kaijutsu-client`
 consumed exactly as `kaijutsu-mcp` consumes it.
@@ -438,21 +385,18 @@ per-ask kernel-supplied options are all gone with the old wire: the ledger
 sends no options, so every real ask gets the synthesized Allow/Deny pair
 (`build_options`).
 
-**Gaps found while building** (also in issues.md):
+**Gaps** (also in issues.md):
 
-- ~~**No catch-up after a resync.**~~ **SHIPPED 2026-08-05.** The mapper keeps
-  its high-water marks while the mirror rebuilds, then emits exactly the gap.
-  Quiet-poll turn recovery and the trailing-edge sweep remain dormant
-  defence-in-depth after the kernel FlowBus backpressure fix; remove them
-  together only after real ACP flights show that neither fires.
+- **Catch-up after a resync.** The mapper keeps its high-water marks while
+  the mirror rebuilds, then emits exactly the gap. Quiet-poll turn recovery
+  and the trailing-edge sweep remain dormant defence-in-depth after the
+  kernel FlowBus backpressure fix; remove them together only after real ACP
+  flights show that neither fires.
 - **`TurnCompleted` has no turn id.** The prompt wait matches on
   `context_id` + `TurnOrigin::Interactive`, which is correlation by ordering.
   Two interactive turns racing in one context would confuse it. Already noted
   P3 in issues.md ("no turnId/endedAt … revisit with the adapter") — the
   adapter now says: yes, we want it.
-- **`kaijutsu-mcp`'s `write_input` deletes by byte length** (`lib.rs:1434`,
-  `state.content.len()`), so a non-ASCII input doc is corrupted or truncated.
-  `kaijutsu-acp` uses `chars().count()`. mcp should too.
 - **Stable session controls remain incomplete.** `session/set_mode` and
   `session/set_config_option` are in the pinned v1 schema and unimplemented.
   Neither is advertised, so a conforming client will not call its setter yet.
@@ -536,17 +480,17 @@ so it can never silently vanish from the plan.
 kernel-side signal — do not read anything into it, and do not invent a
 priority field on the kernel side just to feed this mapping.
 
-**Ordering** is document order (`SyncedDocument::blocks()` →
-`block_ids_ordered()`), not `BlockId`/`BTreeMap` iteration, which is
-principal-major and would scramble both plan order and subtask nesting
-(`gotcha_blockid_vs_document_order` — the same trap this crate's other
-block-ordered reads already avoid).
+**Ordering** is document order (`ContextMirror::blocks()`), not
+`BlockId`/`BTreeMap` iteration, which is principal-major and would scramble
+both plan order and subtask nesting (`gotcha_blockid_vs_document_order` — the
+same trap this crate's other block-ordered reads already avoid). There is no
+`SyncedDocument` here — `session.rs`'s own doc comment says so explicitly:
+this crate reads through `kaijutsu_client::ContextMirror`, never a
+`SyncedDocument`.
 
-**Deletion bug found here, fixed in `833f951c`.** `session::run_pump`'s
-`BlockDeleted` arm once forgot the mapper mark but skipped
-`doc.apply_event(&event)`, leaving deleted blocks in the live mirror until a
-resync. The arm now applies the deletion before rebuilding a Task plan; Task
-and non-Task cases are both pinned by tests.
+`session::run_pump`'s `BlockDeleted` arm applies the deletion before
+rebuilding a Task plan, so a deleted block cannot linger in the live mirror
+until a resync; Task and non-Task cases are both pinned by tests.
 
 ## Context window usage
 
@@ -738,9 +682,6 @@ that remain genuinely open:
   live, or should the bridge warn/refuse when a turn is currently executing?
   Start with the deterministic reset rule above; revisit only after a real
   collision, not in anticipation.
-- ~~Permission UX on mobile~~ **SHIPPED 2026-08-18** — ACP now answers
-  through the shared approval ledger, the same system `kj`/CLI/app approval
-  management uses. See "Permission asks, ledger-driven" above.
 - Happy's relay architecture (E2E-encrypted sync server) vs. plain
   ACP-over-local-bridge: if we want push notifications to the phone, we may
   end up wanting a relay too. Study the clone before deciding.

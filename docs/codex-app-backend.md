@@ -1,10 +1,9 @@
 # Experimental Codex app-server backend
 
-> **Status (2026-08-14): phase 0, connect-only backend with broker tools.** The
-> wire and provider are implemented against `codex-cli 0.147.0`. Amy
-> authorized a persistent sidecar as the target; systemd now owns its lifecycle
-> and the context-session adapter is the next slice. The backend is deliberately
-> not seeded or selected by default yet.
+This is **phase 0: a connect-only backend with broker tools**, implemented
+against `codex-cli 0.147.0`. A persistent sidecar is the target, systemd owns
+its lifecycle, and the context-session adapter (below, "Next slices") is the
+next phase. The backend is deliberately not seeded or selected by default yet.
 
 Kaijutsu can use a user-managed Codex app-server as an experimental LLM
 backend without adding another kernel subprocess launcher. Start the sidecar

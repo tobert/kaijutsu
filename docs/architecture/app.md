@@ -1,12 +1,8 @@
 # The app
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-app` — the
-Bevy GUI and its render pipeline. Code is truth; this page was re-derived
-2026-08-21 against the current tree. The plugin list, `Screen` enum, module
-map, and render pipeline below are read from source, not carried over from
-the pre-conversation-surface version of this page — see each section for
-where. One thing below is still asserted rather than verified: the "Smells"
-section beyond the four bullets marked checked.*
+Bevy GUI and its render pipeline. Code is truth: every pointer below names a
+symbol — `grep` it.*
 
 `kaijutsu-app` connects to a remote kernel over SSH (via `kaijutsu-client`),
 maintains a multi-context document mirror, and renders conversation blocks
@@ -142,10 +138,9 @@ worth reading directly for more detail than fits here.
 
 ## The conversation surface (`view/surface/`)
 
-The conversation's sole renderer. Full design rationale and history:
-`docs/conversation-surface.md` (status: shipped, all slices landed
-2026-08-18 — the legacy per-block-cell Bevy-UI column is deleted, along with
-its `ConversationRenderPath` flag). This section is the module map;
+The conversation's sole renderer — the legacy per-block-cell Bevy-UI column
+and its `ConversationRenderPath` flag are gone. Full design rationale:
+`docs/conversation-surface.md`. This section is the module map;
 `view/surface/mod.rs`'s own doc comment is more complete and should be read
 directly for schedule-placement reasoning.
 
@@ -185,10 +180,9 @@ scroll ease, not before):
    (markdown) blocks can't take that path and reshape instead. This
    bookkeeping — key-equality reshape gating, LRU eviction under budget,
    frozen-chunk reuse, recolor-without-reshape, generation tracking for cache
-   invalidation — is pinned by tests added 2026-08-21 in
-   `view/surface/shape_cache.rs` (`#[cfg(test)] mod tests`, ~1800 lines);
-   read them for the exact guarantees rather than trusting this paragraph's
-   summary.
+   invalidation — is pinned by tests in `view/surface/shape_cache.rs`
+   (`#[cfg(test)] mod tests`, ~1900 lines); read them for the exact
+   guarantees rather than trusting this paragraph's summary.
 3. **Measure** (`shape_cache.rs::apply_shaped_measurements`) — feeds shaped
    heights back into `ConversationGeometry` and anchor-compensates the scroll
    offset so a late-landing async shape doesn't visibly shift the viewport.
@@ -296,17 +290,17 @@ bootstrap thread and a `SpawnActor` command; on `ActorReady`, an
 the last-viewed context. Context switches travel `ContextSwitchRequested →
 handle_context_switch` (join on cache miss). Ongoing block events drain from
 `subscribe_events` each frame and route by `context_id` into the matching
-`SyncedDocument`. `persist_current_context` writes the active id back via
-`set_last_context` on change.
+`kaijutsu_client::ContextMirror`, installed per context via `DocumentStore`
+(there is no `SyncedDocument` in this crate — that replica machinery is gone;
+see `docs/architecture/client.md`, "Client-side mirror"). `persist_current_context`
+writes the active id back via `set_last_context` on change.
 
 ---
 
 ## Smells (not fixed — see [issues](../issues.md))
 
-Checked against source 2026-08-21 unless noted:
-
 - **`BlockScene` misnomer** — `view/block_render.rs`'s `BlockScene` doc
-  comment now says so itself: "Carries no rasterizable scene of its own …
+  comment says so itself: "Carries no rasterizable scene of its own …
   The name is historical; rename to `BlockContent` is a tracked follow-up."
   Only used by the legacy path now — the conversation surface keeps the
   equivalent state in `content::BlockContentCache` instead.
@@ -314,28 +308,23 @@ Checked against source 2026-08-21 unless noted:
   (`cell/mod.rs`: "All component types and systems now live in
   `crate::view`. This module re-exports them so existing `crate::cell::X`
   imports continue to work.").
-- **83 `#[allow(dead_code)]`** suppressors across `kaijutsu-app/src`
-  (counted 2026-08-21: `grep -rc '#\[allow(dead_code)\]' src/**/*.rs` summed)
-  for future-phase API (error-block UI, syntax highlight, inline editing,
-  …) — inhibits dead-code discovery; prefer `#[cfg(feature)]`.
-- **Tall-block single-texture cap (8192 px)** — confirmed still live, but
-  **only for the legacy path's four consumers** (editor, dock, diff view,
-  overlay); the conversation surface's viewport-sized RTT (`target.rs`)
-  structurally cannot hit it. Large tool output in the editor/dock/diff/
-  overlay still gets lossy Y-compression; tiled rendering is the fix if it's
-  ever prioritized there.
-- **Image blocks are placeholders** — confirmed still true on both paths
-  (legacy `RichContentKind::Image` and surface `content.rs`'s
+- **43 `#[allow(dead_code)]`** suppressors across `kaijutsu-app/src`
+  (`grep -rc '#\[allow(dead_code)\]' src/**/*.rs`, summed) for future-phase
+  API (error-block UI, syntax highlight, inline editing, …) — inhibits
+  dead-code discovery; prefer `#[cfg(feature)]`.
+- **Tall-block single-texture cap (8192 px)** — live, but **only for the
+  legacy path's four consumers** (editor, dock, diff view, overlay); the
+  conversation surface's viewport-sized RTT (`target.rs`) structurally cannot
+  hit it. Large tool output in the editor/dock/diff/overlay still gets lossy
+  Y-compression; tiled rendering is the fix if it's ever prioritized there.
+- **Image blocks are placeholders** — true on both paths (legacy
+  `RichContentKind::Image` and surface `content.rs`'s
   `image_placeholder_label`). Full CAS-read + decode pipeline is unbuilt.
-- **Not re-verified this pass** — carried over from the prior version of
-  this page without a fresh check: "Triple Chat/Shell discriminator"
-  (`FocusArea` + `ActiveSurface` + `InputOverlay.mode`; the first two are
-  confirmed still present at `input/focus.rs:35,73` and `InputOverlay` at
-  `view/components.rs:290`, but whether the submit path still reads
-  `InputOverlay.mode` unread-by-anything-else was not re-checked).
-- **Connection race — RESOLVED, remove from future revisions of this list.**
-  The `IdentityReceived`-patches-`connected` workaround is still in the code
-  (`connection/actor_plugin.rs:1340-1352`) but its own comment now says the
-  race it worked around is closed at the source
-  (`poll_connection_status` seeds from `current_status()` on resubscribe) and
-  it is "kept as a harmless belt-and-suspenders backup." Not a live smell.
+- **Triple Chat/Shell discriminator** — `FocusArea` (`input/focus.rs:35`),
+  `ActiveSurface` (`:73`), and `InputOverlay.mode` (`view/components.rs:290`)
+  all carry an overlapping chat-vs-shell distinction. `InputOverlay.mode` is
+  written in exactly one place (`input/systems.rs:68`) and read in exactly
+  one (`InputOverlay::is_shell()`, `view/components.rs:406`, used only to
+  pick the overlay's kaish-validation text color) — it does not gate
+  submission, which reads `ActiveSurface` instead. Three flags for one
+  distinction, one of them nearly vestigial, is the duplication to collapse.
