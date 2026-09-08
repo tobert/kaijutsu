@@ -47,23 +47,6 @@ mechanism**, not a one-off exemption. `docs/gate-policy-tuning.md` (designed
 the global allow tier and names this issue by title to close when slice 5
 ships. Delete this entry then.
 
-## Two outbound HTTP clients still call out anonymously (2026-09-06)
-
-Every LLM provider dialect sends `kaijutsu/<version>`; two clients don't, still
-verified live:
-
-- **MCP streamable-HTTP transport**, `mcp/servers/external.rs:283` —
-  `http_transport()` builds its own `reqwest::Client` from `StreamableHttpClientTransport::from_config`,
-  and reqwest sends no default UA. Needs a way to hand `rmcp` a pre-built
-  client, or fold the UA into `custom_headers`; `llm::http_user_agent()` is
-  already `pub(crate)`.
-- **A live smoke test**, `llm/claude/models_api.rs:270`, builds a bare
-  `reqwest::Client::builder()...build()`. `#[ignore]`d, cosmetic unless wired
-  into CI.
-
-Matters because provider attribution is a precondition for kaijutsu being
-recognized as an agent harness.
-
 ## Check the hook socket's PPID resolution on macOS (2026-09-05)
 
 `candidate_sockets`/`resolve_hook_socket` (`kaijutsu-mcp/src/main.rs`) derive
@@ -774,17 +757,6 @@ like any delivery failure), just can't be delivered or displayed.
 origin representation in the same change** — appending origin fields is
 ordinal-safe, do it then, not before.
 
-## A context's version is unobservable from `kj` (2026-08-15)
-
-Still true: no `inspect`/`show`-with-version verb exists on `kj context`
-(only `list`, `info`, `prompt`, `current`, confirmed in `kj/context.rs`),
-and `kj context info` does not surface version. The `getContextVersion`
-RPC already exists (`rpc.rs:7522`) and is what a `kj context inspect
-<ref>` would read — version is the client's hydration anchor
-(`docs/change-feed.md`) and survives restarts as of `e0bb2076`, but that
-fix has never been checked against production data because there is no
-way to ask.
-
 ## `rc reseed` seeds from the BINARY, not the repo (2026-08-22)
 
 `assets/defaults/rc/` is the in-repo seed, but a reseed installs the
@@ -1146,15 +1118,15 @@ history must not be quoted. Open:
   (`llm/mod.rs:899`) though a live Models API lookup exists for the context
   window (`llm/claude/models_api.rs`).
 
-## Two live-log papercuts (seeded 2026-08-04)
+## An unreadable `api_key_file` falls through to env (seeded 2026-08-04)
 
-Both fire on every kernel boot: "Document already in DB but not in memory,
-recovering" is still `warn!` on every `kj context create`
-(`block_store.rs:420`) though the benign arm is now distinguished from
-`DocumentDiverged`; four backends warn `api_key_file configured but
-unreadable` (`llm/config.rs:281`) for a `~/.openai-key` that does not exist
-and fall through to env silently. Fix the rows or make an unreadable
-`api_key_file` a load error.
+Four backends warn `api_key_file configured but unreadable`
+(`llm/config.rs`, `resolve_api_key`) for a `~/.openai-key` that does not
+exist, then read the env var anyway. The env rule next to it already says
+naming a source is a statement about where the key lives; the file rule
+should match — return `None` and let the registry skip the backend — but
+that changes which of Amy's backends load, so it waits for her to fix the
+rows or agree.
 
 ## MCP subsystem — audit follow-ups (2026-07-29)
 
@@ -1385,12 +1357,6 @@ context; resource/prompt handlers hardcode `kind: "Conversation"` for Remote
 - `contrib/kaijutsu-runner.sh` rebuilds only `kaijutsu-app`; a wire change
   still needs `kaijutsu-server` and `kaijutsu-mcp` rebuilt by hand
   (`docs/operating.md`).
-- `docs/kj-help/` siblings (`kj-cache/context/drift/fork/preset/workspace.md`)
-  predate the clap migration and nothing in `crates/` reads them; only
-  `kj.md` is `include_str!`'d. They drift: `kj-context.md` lacks seven
-  subcommands, `kj-preset.md` lacks `reseed`, `kj-fork.md` still teaches
-  the retired `--shallow`/`--depth`. Delete them or wire them as
-  `kj <cmd> help` bodies and regenerate from the clap tree.
 
 ## `ExecResult.output` cannot carry structured data past kaish's output limiter (found 2026-07-18)
 

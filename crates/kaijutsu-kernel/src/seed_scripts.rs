@@ -8,7 +8,7 @@
 //! These are the defaults a fresh kernel bootstraps with. Two purposes:
 //!
 //! - `/config/rc/default/{create,fork,drift}/*-cache.kai` — the prompt-cache
-//!   recipe documented in `crates/kaijutsu-kernel/docs/help/kj-cache.md`,
+//!   recipe (`kj cache --help`),
 //!   applied to every context that doesn't opt into a different
 //!   `context_type`. Without this seed, fresh kernels miss all cache
 //!   breakpoints until the user installs them by hand.
