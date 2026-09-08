@@ -537,6 +537,14 @@ async fn run_loop<H, F, M>(
                         // consistency (idempotent when already Wallclock).
                         let status = handle.current_status();
                         connected = matches!(status, ConnectionStatus::Connected { .. });
+                        // A disconnect that lands between `watch_status` and
+                        // this read is seen only here: the watch reports the
+                        // change, but by then `connected` is already false and
+                        // the change arm would not flush. Flush on the level.
+                        if !connected {
+                            midi.flush();
+                            if let Some(audio) = &sinks.audio { audio.flush(); }
+                        }
                         for effect in handle_status_change(&mut core, &status, Instant::now()) {
                             record_effect(effect);
                         }
@@ -881,9 +889,15 @@ mod tests {
         let (events, _keep_events) = broadcast::channel(16);
         let (status, _keep_status) = watch::channel(connected_status());
         ctl_tx.send(DjCtl::ActorReady { handle: TestSource { events: events.clone(), status: status.clone(), clock: KernelClockHandle::new() }, ssh_config: SshConfig::default(), generation: 1 }).unwrap();
+        // Readiness is the STATUS watch, not the event subscription: the loop
+        // subscribes to events first, and a disconnect sent before it watches
+        // status is seen only as the seed level — no change, so no flush.
         let deadline = Instant::now() + Duration::from_secs(2);
-        while events.receiver_count() < 2 && Instant::now() < deadline { std::thread::yield_now(); }
+        while (events.receiver_count() < 2 || status.receiver_count() < 2) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
         assert_eq!(events.receiver_count(), 2);
+        assert_eq!(status.receiver_count(), 2, "the DJ must be watching status before the disconnect is sent");
         status.send(ConnectionStatus::Closing { cause: "test disconnect".into() }).unwrap();
         assert!(matches!(audio_rx.recv_timeout(Duration::from_secs(1)), Ok(SchedulerCmd::Flush)));
         assert!(matches!(midi_rx.recv_timeout(Duration::from_secs(1)), Ok(MidiCmd::Flush)));
