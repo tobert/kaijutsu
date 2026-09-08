@@ -6106,11 +6106,21 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   conservative reset stops retention until the next inventory (up to two seconds)
   and replaces generations. Preserve more history only when device continuity
   is established; see the implementation review in `docs/audio-daemon.md`.
-
-- A daemon restart on moltar left two `audio/moltar` peer registrations even
-  though `pgrep` found one daemon and systemd reported that same PID. Raw
-  inventory correctly refuses the ambiguous node. Inspect connection cancellation
-  and peer cleanup; do not weaken instance selection or guess which entry is live.
+  Observed on both nodes: every daemon start logs "MIDI ingress overran"
+  with an idle input (moltar lost=2/3/6/8 in four bursts, zorak lost=1),
+  each starting a new generation. A startup burst is not input loss; the
+  reset fires before the observer has drained the first inventory.
+- Any RPC that times out (10 s) flips the serve loop to `connected=false`,
+  which re-fetches every profile and re-sends `MetronomeConfig` to the DJ
+  (`runtime.rs` serve loop). A slow `commit_capture` re-applies config
+  mid-play. Reload config on reconnect only; a timeout is a retry.
+- `--context` is validated once at startup; a capture context archived
+  later just makes `commit_capture` warn every four seconds forever. Stop
+  capture and say so, or re-resolve the context on the next cut.
+- Keep jobs are in-memory on BOTH sides (`kj/audio_capture.rs` `KeepJobs`,
+  `takes.rs` `Pool`): after a kernel restart nothing can rediscover a
+  job's `/tmp/kaijutsu-audio-<uuid>` staging path. Persist the job row
+  (id, node, instance, path, phase) before this is worth a recovery verb.
 
 `docs/audio-daemon.md` describes the implemented daemon and deployment.
 Its "Evolution: observe once, retain windows, request material" section owns
