@@ -774,3 +774,98 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
     });
     assert!(responsive, "client did not respond after SIGCONT: {}", session.dump("after SIGCONT"));
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// j. A context switch takes the new context's draft with it
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Row index of a picker row naming `label` — a row below the `ACTIVE`
+/// header, never the `kj fork` output that named the same label in
+/// scrollback above it.
+fn picker_row_for(rows: &[String], label: &str) -> Option<usize> {
+    let active = picker_row(rows)?;
+    rows.iter().enumerate().position(|(i, l)| i > active && l.contains(label))
+}
+
+/// How many `Tab` presses reach the section `label`'s row sits in: the
+/// picker opens on ACTIVE, and `Tab` hops ACTIVE → RECENT → TRACKS
+/// (`crates/kaijutsu-tui/src/picker.rs`'s `Section::next`).
+fn tabs_to_section(rows: &[String], label: &str) -> usize {
+    let row = picker_row_for(rows, label).expect("the label has a picker row");
+    let recent = rows.iter().position(|l| l.trim() == "RECENT");
+    match recent {
+        Some(recent) if row > recent => 1,
+        _ => 0,
+    }
+}
+
+/// Switching through the picker loads the new context's draft, the way
+/// `Ctrl+A <digit>` always has.
+///
+/// The picker's own switch used to watch the new context and make it
+/// current without loading its draft, so the compose line kept the previous
+/// context's text — and `Compose::acked`, which only `load_draft` resets,
+/// then refused the change feed's correction, so it stayed there. Both
+/// paths go through `run.rs`'s `switch_seat` now.
+#[test]
+fn switching_through_the_picker_loads_the_new_contexts_draft() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    // A second context to switch to.
+    session.send(":kj fork --name altseat\r");
+    // Type a draft into the context on screen: `i` opens insert on a draft
+    // resting in normal mode.
+    session.send("izzdraftzz\x1b");
+    let typed = session.wait_until(Duration::from_secs(20), |screen| {
+        screen.rows(0, screen.size().1).any(|l| l.contains('❯') && l.contains("zzdraftzz"))
+    });
+    assert!(typed, "the draft never reached the compose row: {}", session.dump("typing"));
+
+    // The picker lists what the last `list_contexts` round returned, so the
+    // fork appears one refresh after it is made: open, look, close, retry.
+    let mut listed = false;
+    for _ in 0..8 {
+        session.send("\x01\"");
+        listed = session.wait_until(Duration::from_secs(3), |screen| {
+            let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+            picker_row_for(&rows, "altseat").is_some()
+        });
+        if listed {
+            break;
+        }
+        session.send("\x1b");
+        let closed = session.wait_until(Duration::from_secs(3), |screen| {
+            !screen_contains_str(screen, "ACTIVE")
+        });
+        assert!(closed, "the picker never closed: {}", session.dump("picker retry"));
+    }
+    assert!(listed, "the fork never reached the picker: {}", session.dump("picker"));
+
+    // Filter to the fork alone, close the filter, hop to its section, and
+    // switch to what is then the only row there.
+    session.send("/altseat\r");
+    let filtered = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        picker_row_for(&rows, "altseat").is_some() && !screen_contains_str(screen, "ROOT")
+    });
+    assert!(filtered, "the filter never narrowed to the fork: {}", session.dump("filter"));
+    for _ in 0..tabs_to_section(&session.screen_text(), "altseat") {
+        session.send("\t");
+    }
+    session.send("\r");
+
+    let switched = session.wait_until(Duration::from_secs(10), |screen| {
+        !screen_contains_str(screen, "ACTIVE") && screen_contains(screen, '❯')
+    });
+    assert!(switched, "the picker never closed on the switch: {}", session.dump("switch"));
+
+    let rows = session.screen_text();
+    let compose = compose_row(&rows).expect("the compose row is drawn again after the switch");
+    assert!(
+        !rows[compose].contains("zzdraftzz"),
+        "the previous context's draft is still on the compose line after switching to the fork:\n{}",
+        session.dump("after switch")
+    );
+}

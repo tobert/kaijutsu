@@ -499,10 +499,10 @@ async fn handle_picker_key(
         PickerOutcome::None => {}
         PickerOutcome::Dismiss => app.picker = None,
         PickerOutcome::Switch(id) => {
-            watch_context(bridge, app, id, feed_tx).await?;
-            app.switch_to(id);
+            // The picker comes down first, so the switch's own notice is
+            // the one on screen and the band shrinks on the same frame.
             app.picker = None;
-            app.clear_notice();
+            switch_seat(bridge, app, id, feed_tx).await;
         }
         PickerOutcome::Placement { context_id, argv } => match bridge.execute_kj(context_id, argv).await {
             Ok(result) if result.latch.is_some() => {
@@ -676,11 +676,11 @@ async fn act(
             return Ok(Acted::Suspend);
         }
         Intent::SwitchSeat(n) => match app.seat_context(n) {
-            Some(id) => switch_seat(bridge, app, id, feed_tx).await?,
+            Some(id) => switch_seat(bridge, app, id, feed_tx).await,
             None => app.note(format!("no context on seat {n}")),
         },
         Intent::StepSeat(step) => match app.seat_neighbor(step) {
-            Some(id) => switch_seat(bridge, app, id, feed_tx).await?,
+            Some(id) => switch_seat(bridge, app, id, feed_tx).await,
             None => app.note("no seats"),
         },
         Intent::Paste => match (app.current, app.paste_buffer.clone()) {
@@ -691,10 +691,11 @@ async fn act(
             (None, _) => app.note("no context attached"),
             (_, None) => app.note("paste buffer empty — Ctrl+A [ then Space, Enter to fill it"),
         },
-        Intent::LastContext => match app.switch_to_previous() {
-            Some(id) => {
-                app.compose.load_draft(&bridge.read_input(id).await.unwrap_or_default());
-            }
+        // `switch_seat` re-watches, which is what makes the toggle work
+        // after a feed ended and dropped the context's view: a context with
+        // no view renders nothing at all.
+        Intent::LastContext => match app.previous {
+            Some(id) => switch_seat(bridge, app, id, feed_tx).await,
             None => app.note("no previous context"),
         },
         Intent::OpenDiff => match open_diff(app) {
@@ -739,17 +740,41 @@ async fn act(
 /// The draft is per context, so the compose buffer follows the switch rather
 /// than carrying the old context's text along — `load_draft` keeps the `:`
 /// line's own history, which is this session's, not this draft's.
+///
+/// **Every path that changes the context on screen goes through here**: the
+/// prefix chords, `Ctrl+A Ctrl+A`, and the picker. A path that watched and
+/// switched on its own got the switch without the draft, and
+/// `Compose::acked` then kept the change feed from correcting it.
+///
+/// A switch never fails silently and never tears the loop down: a context
+/// that cannot be watched leaves the screen where it was with a notice, and
+/// a draft that cannot be read says so rather than blanking the line.
 async fn switch_seat(
     bridge: &KernelBridge,
     app: &mut App,
     id: ContextId,
     feed_tx: &mpsc::Sender<TaggedFeed>,
-) -> Result<()> {
-    watch_context(bridge, app, id, feed_tx).await?;
+) {
+    if let Err(e) = watch_context(bridge, app, id, feed_tx).await {
+        app.note(format!("cannot watch {}: {e}", app.label_for(id)));
+        return;
+    }
+    let draft = bridge.read_input(id).await;
     app.switch_to(id);
-    app.compose.load_draft(&bridge.read_input(id).await.unwrap_or_default());
-    app.clear_notice();
-    Ok(())
+    app.compose.load_draft(draft.as_deref().unwrap_or(""));
+    match draft {
+        Err(e) => app.note(format!("draft of {} unread: {e}", app.label_for(id))),
+        // A context with nothing left to print has had nothing happen since
+        // it was last on screen, so the switch changes only the band: what
+        // stands above it is still the context we just left. Scrollback is
+        // never redrawn, so name where we are instead of letting the old
+        // transcript pass for the new one (`docs/tui.md`, ruling 1).
+        Ok(_) if !render::has_unprinted(app, id) => {
+            let label = app.label_for(id);
+            app.note(format!("{label}: nothing new since you left — Ctrl+A [ reads it"));
+        }
+        Ok(_) => app.clear_notice(),
+    }
 }
 
 /// Mirror what the vi engine did to the draft onto the context's draft
@@ -1180,7 +1205,14 @@ async fn apply_feed(
             // forwarder task ends with it; drop the view so the next switch
             // re-subscribes from scratch.
             app.views.remove(&context_id);
-            app.note(format!("context feed ended ({reason:?}); press Ctrl+A to reattach"));
+            // A context with no view renders nothing — no transcript, no
+            // stream — so name the gesture that re-subscribes rather than
+            // the prefix alone. Any switch does it, including a switch to
+            // the seat already on screen.
+            app.note(format!(
+                "{} feed ended ({reason:?}); Ctrl+A <digit> reattaches",
+                app.label_for(context_id)
+            ));
         }
     }
 }
@@ -1549,6 +1581,66 @@ mod tests {
             origin: TurnOrigin::Interactive,
         };
         assert!(!mark_turn_liveness(&mut app, &event));
+    }
+
+    /// The context on screen changes in one place. `switch_seat` watches
+    /// the new context, switches to it, and loads its draft; a path that
+    /// calls `App::switch_to` itself gets the switch without one of those
+    /// three, and the miss is invisible on the frame it happens — the
+    /// picker's own switch kept the previous context's draft on the compose
+    /// line, and `Compose::acked` then refused the feed's correction.
+    ///
+    /// `run()`'s startup attach is the one sanctioned direct call: there is
+    /// no seat to switch from, and it loads its own draft.
+    #[test]
+    fn every_context_switch_goes_through_switch_seat() {
+        let source = include_str!("run.rs");
+        // The module's own code, not this module's tests — the assertion
+        // below names the pattern it is looking for.
+        let source = source.split_once("\n#[cfg(test)]").expect("run.rs has tests").0;
+        let mut current = "<file scope>";
+        for line in source.lines() {
+            if let Some(name) = top_level_fn_name(line) {
+                current = name;
+            }
+            if line.contains("app.switch_to(") && !line.trim_start().starts_with("//") {
+                assert!(
+                    matches!(current, "run" | "switch_seat"),
+                    "`{current}` switches the context on its own; call `switch_seat`, \
+                     which watches the new context and loads its draft too"
+                );
+            }
+        }
+    }
+
+    /// `Ctrl+A Ctrl+A` re-watches like every other switch. A feed that ends
+    /// drops the context's view (`apply_feed`'s `Terminated`), and a
+    /// context with no view renders nothing at all — no transcript, no
+    /// stream — so a toggle that only set `current` left a blank band under
+    /// the context we came from.
+    #[test]
+    fn the_last_context_toggle_goes_through_switch_seat() {
+        let source = include_str!("run.rs");
+        let arm = source
+            .split_once("Intent::LastContext =>")
+            .expect("run.rs has a LastContext arm")
+            .1;
+        let arm = &arm[..arm.find("Intent::OpenDiff").expect("the next arm follows")];
+        assert!(
+            arm.contains("switch_seat("),
+            "the LastContext arm does not route through `switch_seat`: {arm}"
+        );
+    }
+
+    /// The name of a `fn` declared at the top level of a module — the
+    /// enclosing function for every line until the next one.
+    fn top_level_fn_name(line: &str) -> Option<&str> {
+        let rest = line
+            .strip_prefix("fn ")
+            .or_else(|| line.strip_prefix("pub fn "))
+            .or_else(|| line.strip_prefix("async fn "))
+            .or_else(|| line.strip_prefix("pub async fn "))?;
+        Some(&rest[..rest.find('(')?])
     }
 
     /// The refresh's kernel calls live in `refresh::fetch`, on their own

@@ -237,6 +237,24 @@ pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
     prints
 }
 
+/// Whether `context_id` has anything the next [`take_settled_prints`] will
+/// put into scrollback.
+///
+/// A switch to a context whose blocks have all been printed once prints
+/// nothing at all — `ContextView::printed` is per context and is never
+/// reset, so only the first visit prints a transcript whole. What stands
+/// above the band is then the context we left, and the switch says so
+/// rather than letting the old transcript pass for the new one
+/// (`docs/tui.md`, "Conversation": scrollback is never redrawn).
+pub fn has_unprinted(app: &App, context_id: ContextId) -> bool {
+    app.views.get(&context_id).is_some_and(|view| {
+        view.mirror
+            .blocks()
+            .iter()
+            .any(|b| is_settled(b) && !view.printed.contains(&b.id) && b.status != Status::Draft)
+    })
+}
+
 /// Whether a blank row goes above a block's divider: one row of air between
 /// speakers, and none above the first speaker of a transcript or a copy
 /// buffer, where there is nothing to separate from (`docs/tui.md`,
@@ -740,6 +758,32 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// A revisited context prints nothing: `printed` is per context and is
+    /// never reset, so only the first visit puts a transcript into
+    /// scrollback. `switch_seat` reads this to decide whether the switch
+    /// has a word to say about the transcript standing above the band.
+    #[test]
+    fn a_context_whose_blocks_have_all_printed_has_nothing_left_to_print() {
+        let (mut app, id) = fixture();
+        assert!(has_unprinted(&app, id), "a fresh view holds its whole transcript");
+        let _ = take_settled_prints(&mut app, 80);
+        assert!(!has_unprinted(&app, id), "a second visit prints nothing");
+    }
+
+    /// A context this client is not watching renders nothing at all — no
+    /// transcript, no stream. It is the state a switch that skipped
+    /// `watch_context` reached, and the state a feed that ended leaves
+    /// behind (`run.rs`'s `apply_feed`, `FeedEvent::Terminated`).
+    #[test]
+    fn an_unwatched_context_prints_nothing_and_streams_nothing() {
+        let (mut app, _) = fixture();
+        let unwatched = ContextId::new();
+        app.switch_to(unwatched);
+        assert!(!has_unprinted(&app, unwatched));
+        assert!(take_settled_prints(&mut app, 80).is_empty());
+        assert!(live_plan(&app).is_empty(), "the stream band is empty too");
     }
 
     #[test]

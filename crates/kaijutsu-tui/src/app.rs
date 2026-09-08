@@ -233,6 +233,16 @@ impl App {
         self.current.and_then(|id| self.views.get(&id))
     }
 
+    /// What a status-line notice calls a context: its label, or its short id
+    /// when it has none — the same name the status line's seat cells and
+    /// copy mode's header use.
+    pub fn label_for(&self, id: ContextId) -> String {
+        self.info(id)
+            .map(|c| c.label.clone())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| id.short())
+    }
+
     /// The context sitting on seat `digit`, or `None` when the rank is
     /// shorter than that.
     pub fn seat_context(&self, digit: usize) -> Option<ContextId> {
@@ -276,14 +286,6 @@ impl App {
         // it aside. The ask stays pending and the refresh raises the card
         // again on return.
         self.ask_card = None;
-    }
-
-    /// `Ctrl+A Ctrl+A`. Returns the context switched to, or `None` when
-    /// there is nowhere to go back to.
-    pub fn switch_to_previous(&mut self) -> Option<ContextId> {
-        let target = self.previous?;
-        self.switch_to(target);
-        Some(target)
     }
 
     /// Who a block's divider names: the local user for their own text, the
@@ -737,9 +739,12 @@ mod tests {
         app.switch_to(aid);
         app.switch_to(bid);
         assert_eq!(app.current, Some(bid));
-        assert_eq!(app.switch_to_previous(), Some(aid));
+        // `Ctrl+A Ctrl+A` reads `previous` and switches to it (`run.rs`'s
+        // `Intent::LastContext`), so the toggle is `previous` alternating.
+        assert_eq!(app.previous, Some(aid));
+        app.switch_to(aid);
         assert_eq!(app.current, Some(aid));
-        assert_eq!(app.switch_to_previous(), Some(bid));
+        assert_eq!(app.previous, Some(bid));
     }
 
     #[test]
@@ -754,7 +759,7 @@ mod tests {
     fn there_is_nowhere_to_go_back_to_at_startup() {
         let (mut app, aid, _) = app_with_two();
         app.switch_to(aid);
-        assert_eq!(app.switch_to_previous(), None);
+        assert_eq!(app.previous, None);
     }
 
     #[test]
