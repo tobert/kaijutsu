@@ -1,11 +1,11 @@
 # Shared state — the VFS *is* the namespace
 
-> **Status:** high-level sketch, captured 2026-06-28 from a framing conversation
-> (the same session that sketched the now-retired myaku pulse facility).
-> Directions, not commitments. Companion to `docs/slash-v.md` (the `/v` sysfs and
-> document surfaces); the pulse/sampling design that lived in `docs/myaku.md` is **retired —
-> recover its detail from git history** and migrate it here (see *Open* below).
-> Code is truth; this is where we're aiming.
+> **Status:** high-level sketch, directions not commitments. Companion to
+> `docs/slash-v.md` (the `/v` sysfs and document surfaces). `docs/myaku.md`
+> — the probe/metrics facility this doc's OODA section builds on — was
+> retired when the MIDI clock-drift design absorbed its pulse-clock content
+> (`docs/midi.md`); the metrics/probe half was never migrated anywhere and
+> stays unbuilt design here. Code is truth; this is where we're aiming.
 
 ## The thesis
 
@@ -22,45 +22,46 @@ below.
 
 ## Tiers are mounts, not abstractions
 
-| Need | Mount | Backend | Semantics |
+| Need | Mount | Backend today | Semantics |
 |------|-------|---------|-----------|
-| **Ephemeral, shared-within-kernel, read-write** | `/run` | `MemoryBackend` (exists, `vfs/backends/memory.rs`) | tmpfs/XDG `RUNTIME_DIR` vibe. `/run/pulse/` = metric/probe data (design in git history, removed `docs/myaku.md`); `/run/<…>/` = agent/user scratchpad + OODA working trees. KV-replacement. |
-| **Durable, peer-synced, introspectable** | `/v/...` | Kernel documents plus synthesized backends (`/v/docs`, `/v/ctx`, `/v/session`). | The durable and sysfs namespace `slash-v.md` designs. |
+| **Ephemeral, sink-fed, read-only** | `/run/midi`, `/run/audio`, `/run/roster` | three separate synthesized backends, each its own leaf mount — not a bare `/run` mount routing internally | tmpfs/XDG `RUNTIME_DIR` vibe: liveness/inventory facts written only by their one sink (a presence report, an audio node, roster refresh), never trusted as a stored fact across a restart. |
+| **Ephemeral, shared-within-kernel, general read-write** | none yet | unbuilt — a generic `/run` `MemoryBackend` scratchpad (probe/metrics data, agent/OODA working trees) is still just direction | KV-replacement, if built. |
+| **Durable, peer-synced, introspectable** | `/v/cas` | Kernel documents plus the shipped `CasFs`; `/v/ctx` is designed but unbuilt (`docs/slash-v.md`). | The durable and sysfs namespace `slash-v.md` designs. |
 
-`/run` is its **own** mount (the existing `/scratch` `MemoryBackend` is likely
-retired — nothing uses it; `/run` is the better-named home for all ephemeral
-read-write state). One backend, two top-level uses: `/run/pulse/` written by probes,
-the rest a general scratchpad.
+The generic scratchpad idea below (`/run/pulse/` for probe metrics,
+`/run/<…>/` for agent/OODA working trees) has no mount behind it today —
+only the three purpose-built read-only trees above exist. Where this section
+says "goes on `/run`," read it as direction: the metrics story is what
+`docs/myaku.md` sketched before it was retired, never built, and reconstructable
+from git history if picked back up.
 
-Two clean lines fall out:
+Two clean lines, if it gets built:
 
-- **Synthesized `/v` is for non-file kernel state; file-born data lives in
-  MemoryFS.** `slash-v.md`'s read-only synthesized backends (`/v/ctx`, `/v/session`)
-  earn their keep because the block store and peer registry **aren't files** — they
-  have to be *rendered*. Metrics are the opposite: a probe **writes them as files**,
-  so there is nothing to synthesize. They go on a plain `MemoryBackend` mount
-  (`/run`), not a `/v/ctx`-style backend. (This reverses an earlier draft that put
-  metrics under a read-only `/v` backend — it was ceremony; see below.)
-- **Read-only is a nudge, not a boundary — and metrics don't need it.** In the
+- **Synthesized state is for non-file kernel state; file-born data would live in
+  MemoryFS.** The kernel's read-only synthesized backends earn their keep because
+  what they render — the block store, the roster, a device's presence — **isn't
+  files**; it has to be rendered. Metrics are the opposite: a probe would **write
+  them as files**, so there would be nothing to synthesize. They'd go on a plain
+  `MemoryBackend` mount, not a synthesized-backend tree.
+- **Read-only is a nudge, not a boundary — and metrics wouldn't need it.** In the
   shared-trust model read-only isn't security, and metric data **self-heals**: clobber
   `/run/pulse/cpu/history` and the probe rewrites it within a tick. Paying for a Rust
   `VfsBackend` to protect continuously-regenerated data is a bad trade. Writable
-  MemoryFS is fine.
-- **Persistence is a copy, not a store type.** Ephemeral → durable is
-  `cp /run/foo /v/docs/foo` (or out to the host FS). The tiers compose through plain
-  file ops; no write-through, no dual ownership. (XDG framing: a probe's volatile
-  data is `RUNTIME_DIR` → `/run`; if one ever wants persistence, `STATE_DIR` → a `/v`
-  mount.)
+  MemoryFS would be fine.
+- **Persistence is a copy, not a store type.** Ephemeral → durable would be
+  `cp /run/foo /v/docs/foo` (or out to the host FS). The tiers would compose through
+  plain file ops; no write-through, no dual ownership.
 
 Sharing needs no merge machinery *within one kernel*: every app, agent, and MCP
-session talks to the one kernel, so they all see the one `MemoryBackend`. The
+session talks to the one kernel, so they'd all see the one `MemoryBackend`. The
 `/v` tier earns its keep for **durability and cross-kernel peer sync** — exactly
 what `slash-v.md` already builds.
 
 ## The file-layout convention (a kaish helper, not a backend)
 
 Because metrics are just files a probe writes, uniformity comes from a **shared
-kaish helper** (`pulse_emit`, designed in the removed `docs/myaku.md` — git history) that every probe calls — *convention,
+kaish helper** (`pulse_emit`, sketched in the retired `docs/myaku.md`,
+recoverable from git history) that every probe would call — *convention,
 not enforcement*. It still honors `slash-v.md`'s hard-won sysfs principles, just in
 userspace:
 
@@ -83,10 +84,10 @@ HUD. A future OODA context that watches system state ("how's the GPU doing?") us
 the shared space as its **Observe surface**, built entirely from existing primitives:
 
 - **Observe = an `rc` verb.** `/config/rc/<ooda-type>/observe/SXX-*.kai` runs kaish that
-  `cat`s `/run/pulse/...` (and `/v/ctx`, `/v/session`) and **assembles blocks**: `.kai`
-  stdout already routes to `Trace` blocks, `.md` to the system-prompt slot. No new
-  machinery — rc + kaish + blocks composed. (myaku design in git history; rc lifecycle in
-  `crates/kaijutsu-kernel` `/config/rc`.)
+  `cat`s `/run/pulse/...` (and, once built, `/v/ctx`; `/run/roster` today) and
+  **assembles blocks**: `.kai` stdout already routes to `Trace` blocks, `.md`
+  to the system-prompt slot. No new machinery needed — rc + kaish + blocks
+  compose.
 - **Pull and push.** The agent *pulls* by reading a file when it decides to look; the
   space can *push* by drifting a threshold crossing (`temp_c > 85`) into the
   context's mailbox to flush next turn — the async-event path that already exists.
@@ -95,32 +96,36 @@ the shared space as its **Observe surface**, built entirely from existing primit
 - **Reductions** — an OODA context wants *"GPU 95% for 5 min, VRAM 22/24, trending
   up"*, not 120 raw `history` rows. Open who computes it: a probe-written summary file
   (kernel-side, shared, thin agent) vs the agent reducing `history` itself
-  (thin-client tension). Deferred to the myaku session.
+  (thin-client tension) — open if the metrics facility gets built.
 
-## KV retired (deleted 2026-07-04)
+## KV is retired
 
-`KvDocument`/`Kv`, the capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`,
-@79–83, ordinals retired not reused), and `kj kv` are gone. The one real production
-use — the app's `<client-id>.current_context` restore-on-reconnect — split in two
-first: the *live* acting context stayed in the already-ephemeral `SessionContextMap`
-(no KV needed), and the *durable* restore moved to a small typed per-client store
-(`client_views` `KernelDb` row + `setLastContext`/`getClientView` RPC, cb69a81a).
-Everything else KV might have held becomes a `/run` file.
+`KvDocument`/`Kv`, the capnp surface (`kvGet`/`kvSet`/`kvDelete`/`kvKeys`/`kvWatch`),
+and `kj kv` are gone — no callers anywhere in the tree, and their old ordinals
+(79–83) are reassigned to unrelated methods (`subscribeEditor`,
+`setLastContext`, `getClientView`, `listTracks`, `promoteContext`), not left
+as `retiredNN` stubs. The one real production use — the app's
+`<client-id>.current_context` restore-on-reconnect — split in two: the *live*
+acting context stays in the already-ephemeral `SessionContextMap` (no KV
+needed), and the *durable* restore is a small typed per-client store
+(`client_views` `KernelDb` row + `setLastContext`/`getClientView` RPC).
+Everything else KV might have held becomes a `/run` file, if `/run` is ever
+built as a general scratchpad.
 
 Open: `kvWatch`'s successor for the `/v/clients` steering surface (see *Open
 questions* below) — does a steered client poll `generation` or get a new push
-primitive? Full design history and the split rationale are in git
-(this section, pre-2026-07-04, and `docs/issues.md`).
+primitive?
 
 ## Open questions (deferred)
 
-- **`/run` shape** — settled: its **own** `MemoryBackend` mount (not `/scratch/run`;
-  `/scratch` likely retired), metrics as plain files (no synthesized `/v` backend),
-  death certificate as a `status` file in `/run/pulse/<probe>/`. Remaining: the
-  scratchpad/OODA-working-tree layout under `/run` outside `/run/pulse/`. → myaku
-  session.
-- **Reduction ownership** — which summaries the kernel projects vs the agent derives
-  (the thin-client tension). → myaku session.
+- **`/run` shape — still open, nothing built.** A generic writable
+  `MemoryBackend` mount for probe metrics and agent/OODA scratch has no
+  mount behind it today; only the three read-only sink-fed trees
+  (`/run/midi`, `/run/audio`, `/run/roster`) exist. If built: one mount, a
+  death certificate as a `status` file per probe, and the
+  scratchpad/OODA-working-tree layout still to design.
+- **Reduction ownership** — which summaries the kernel projects vs. the agent
+  derives (the thin-client tension) — open if the metrics facility gets built.
 - **`current_context` split — settled in shape, open in surface.** The *live* render
   reads `SessionContextMap`; the *durable* restore moved to a typed per-client
   `KernelDb` store (see *KV retired*). The store's `/v` projection is sketched as
@@ -130,7 +135,7 @@ primitive? Full design history and the split rationale are in git
   different contexts; players at them can also drive). Open: the typed RPC shape, how a
   steered client observes the change (poll `generation` vs. a `kvWatch` successor, now
   that KV itself is gone), and which other fields (theme, layout, spotlight) join `context`.
-- **Append gap** — `VfsOps` has no `append()`; `write_all`/`>>` are O(n). myaku
-  sidesteps it (bounded rewrite) and OODA writes are turn-cadence, but a real
-  `append()` (O(1) on `MemoryBackend` via `write(offset=size)`) is worth it someday.
-  Tracked in `docs/issues.md`.
+- **Append gap** — `VfsOps` still has no `append()`; `write_all`/`>>` are O(n). A
+  rewrite-bounded metrics facility would sidestep it and OODA writes are
+  turn-cadence, but a real `append()` (O(1) on `MemoryBackend` via
+  `write(offset=size)`) would be worth it someday.

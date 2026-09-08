@@ -1,17 +1,12 @@
 # The config namespace — `/config` as a bind-mount registry
 
-**Status: built 2026-08-29, `ConfigDocFs` deleted 2026-08-30.** The registry,
-the namespace move and the melt of all four trees landed 2026-08-29;
-`ConfigDocFs` itself — the document-backed backend every tree mounted before
-the melt — was deleted the next day (`dc8a5e92`), on Amy's ruling that the
-documents it served were not worth a migration path (see "There is no
-migration" below). `DocKind::Symlink` was **not** retired alongside it — see
-"Settled since". This supersedes the earlier kernel-owned-config design,
-whose premise — the kernel is the sole owner and there is no host file —
-stopped being true when this landed (that design's history is in
-`docs/devlog.md`, "The kernel becomes sole owner of itself, then gives it
-back"). It continues `docs/rc-on-disk.md`, which melted rc and left the
-other three roots.
+All four config trees — `/config/rc`, `/config/kernel`, `/config/client`,
+`/config/midi` — are ordinary host directories reached through `LocalBackend`.
+None of them has a config-owning backend or a document behind it; the kernel
+once owned config as documents in its durable store, then gave that back
+(`docs/devlog.md`, "Config: the kernel owned it, then gave it back"). This
+continues `docs/rc-on-disk.md`, which melted rc first; here the other three
+roots follow it under one mount registry.
 
 ## The rule
 
@@ -38,13 +33,13 @@ where that lands.
 
 ## Why not `/etc`, and why not `/v`
 
-**Not `/etc`, because it is the host's.** Squatting it costs a guard that
-exists for no other reason: `deny_etc_write`
-(`crates/kaijutsu-kernel/src/file_tools/path.rs:77`) says in its own doc that
-`/etc` is shared ground, kaijutsu's mounts sit alongside the host root where
-`/etc/passwd` lives, and the function is "the line between them." Move off and
-there is no line to draw. The guard deletes, and `/etc` goes back to being the
-host's read-only `/etc`.
+**Not `/etc`, because it is the host's.** The host's `/etc` is refused like
+any other read-only host path, with no guard of its own — `/usr` and `/boot`
+are equally the host's and equally covered by the read-only `/` mount
+(`crates/kaijutsu-server/tests/config_mount_boot.rs`,
+`the_hosts_etc_is_refused_by_the_read_only_root_like_any_host_path`).
+Squatting `/etc` would have cost a guard drawing a line inside it that no
+other host path needs.
 
 **Not `/v`, because these are not virtual.** `/v` holds things the kernel
 synthesizes — `/v/cas`, `/v/ctx`, `/v/session`, `/v/swap`, `/v/docs`,
@@ -102,7 +97,7 @@ bind mount does — `/config/theme.toml` through the base, `/config/rc/...`
 through the override. No precedence logic to write.
 
 **Synthetic mount children in a parent listing**
-(`crates/kaijutsu-kernel/src/vfs/mount.rs:854-886`). `readdir` merges a
+(`crates/kaijutsu-kernel/src/vfs/mount.rs:844`). `readdir` merges a
 backend's own entries with the mount points beneath it, and tolerates a backend
 miss when synthetic children exist. So `ls /config` lists `rc`, `midi` and
 `client` even where no backend serves `/config` itself.
@@ -110,12 +105,10 @@ miss when synthetic children exist. So `ls /config` lists `rc`, `midi` and
 **Freeze after bootstrap** (`mount.rs:119`) is already the right lifetime:
 declare once at startup, immutable thereafter.
 
-And the pattern already exists for rc. `default_rc_dir()`
-(`crates/kaijutsu-server/src/ssh.rs:148`) is documented as "the one place the rc
-tree's default location is decided. Everything else takes the path it is
-handed," and `rc_dir: &Path` is threaded through bootstrap
-(`crates/kaijutsu-server/src/rpc.rs:1779-1782`). This generalizes that to every
-root and makes it declarative.
+`create_shared_kernel` takes a `config_mounts: &ConfigMounts`
+(`crates/kaijutsu-server/src/rpc.rs:2439`), the registry threaded declaratively
+through bootstrap; `default_rc_dir()` (`crates/kaijutsu-server/src/ssh.rs:153`)
+is a thin wrapper over it for the one caller that only wants rc's default.
 
 ## What it buys beyond tidiness
 
@@ -158,94 +151,48 @@ parameter.
 `mcp.toml` and `client/` are machine-local snowflakes. Today they are forced
 into one tree.
 
-## `client/default/` — removing a live ambiguity
+## `client/default/`
 
-`kaijutsu_types::paths::client_config_path` (`paths.rs:126`) maps `None` to
-`<root>/<name>` and `Some(id)` to `<root>/<id>/<name>`. A segment after the root
-is a *filename* or a *client id* depending on which happens to be there.
-
-On kernel documents that was survivable. On a real filesystem it breaks the
-first time a client id collides with a config filename — one becomes a directory
-where the other expects a file.
+`kaijutsu_types::paths::client_config_path` (`paths.rs:180`) maps `None` to
+`<root>/default/<name>` and `Some(id)` to `<root>/<id>/<name>` — every
+segment after the root is a client id, never a bare filename, so a client id
+can never collide with a config filename the way it could on the earlier
+`<root>/<name>` shape.
 
 ```
 /config/client/default/metronome.toml     # the shared default
 /config/client/<client-id>/metronome.toml # one client's override
 ```
 
-One-line change; the app's two-step resolution
-(`crates/kaijutsu-app/src/connection/actor_plugin.rs:564`) is unaffected.
+The app's two-step resolution (`fetch_layered_config`,
+`crates/kaijutsu-app/src/connection/actor_plugin.rs:591`) tries the client-id
+path first and falls back to `default/`.
 
-## What this deletes
+## Seeding needs no new machinery
 
-| Thing | Lines | Why it goes |
-|---|---|---|
-| `runtime/config_doc_fs.rs` | 1339 | The backend itself. Nothing left to back. |
-| `config_export.rs` | 657 | Built for a migration that was never run; zero production callers. |
-| `config_doc.rs` | 60 | The shared config-document model. |
-| `deny_etc_write` + tests | — | Only exists to draw a line inside `/etc`. |
-| `VfsOps::owns_config_docs` | — | Only ever `true` on `ConfigDocFs`. |
-| `EditorTarget::config_owned` + its branch | — | Binds to a block because there was no file. There is a file. |
-
-Above 2000 lines. `ConfigDocFs` went away entirely rather than shrinking
-again — deleted (`dc8a5e92`, 2026-08-30), not shrunk. `DocKind::Symlink` was
-planned as part of this table but survived; see "Settled since".
-
-**What replaces the machinery is nothing.** Absent-only seeding already exists
-as `ensure_rc_seed_files`; reset-to-embedded already exists as
-`config_seed_body`; and `config_seed_override`
-(`crates/kaijutsu-server/src/rpc.rs:1267`) already reads a config file from a
-host directory at bootstrap. That last one is this design in miniature, written
-months ago and used once per install.
-
-## There is no migration
-
-Every root seeds from its embedded default (`assets/defaults/`) while it is
-empty, the same way `ensure_rc_seed_files` already seeded rc. A fresh
+Absent-only seeding is `ensure_rc_seed_files`
+(`crates/kaijutsu-kernel/src/seed_scripts.rs:132`); reset-to-embedded is
+`config_seed_body` (`crates/kaijutsu-kernel/src/config_seed.rs:129`); and
+`config_seed_override` (`crates/kaijutsu-server/src/rpc.rs:1900`) reads a
+config file from a host directory at bootstrap. Every root seeds from its
+embedded default (`assets/defaults/`) while it is empty; a fresh
 `--config-root` picks up the shipped defaults with no export, import, or
-flag day.
-
-`kj config export` was built to carry the pre-melt documents in `kernel.db`
-forward, on the theory that a real theme edit or a MIDI profile pulled from
-actual hardware was worth keeping. Amy ruled otherwise: those documents are
-not worth a migration path. The `rc` tree's own documents were already found
-orphaned and measured — `docs/issues.md`, "The rc melt orphaned its documents
-and nothing deletes them" — at under 1 MB across all of `/etc/*`, and the
-same is true of the other three roots now that they have melted too. What is
-in them is stale besides: the `mcp.toml` document is the pre-2026-08-15
-default (the current shipped one is better), and the `system.md` document
-still claims the workspace is shared "over a CRDT substrate," which stopped
-being true when the CRDT was removed. Nothing reads these documents any
-more — `ConfigDocFs` is gone, so they are unreachable through the VFS — and
-nothing deletes them either; they simply sit in `kernel.db` as dead rows.
-`config_export.rs` is deleted with no migration ever having run against it.
-
-## `docs/slash-v.md` principle 7
-
-Principle 7 reads: *"Resist the `/proc` junk-drawer. `/v/ctx` is only the
-context/block model; `/v/session` is only live participants. Config stays at
-`/etc/config`."*
-
-The junk-drawer rule stands and this design obeys it — config does not move into
-`/v`. Only the last sentence changes: config lives at `/config`, a sibling
-top-level tree, the same way `/r` is a sibling because it names remote clients
-rather than kernel-local virtual filesystems (`paths.rs:95-100`).
+flag day. There is no other migration path: config's earlier life as
+documents in `kernel.db` is not carried forward, on Amy's decision that
+those documents were not worth one — see `docs/devlog.md`, "Config: the
+kernel owned it, then gave it back."
 
 ## Settled since
 
-- **`Kernel::invalidate_config_file_cache` survives, for a different reason
-  than the one that was in question.** `dc8a5e92` (2026-08-30) rewrote
-  `file_tools/cache.rs:706`'s rationale: the explicit call has nothing to do
-  with `ConfigDocFs`. It is required because a composition symlink's write
+- **`Kernel::invalidate_config_file_cache` (`kernel.rs:1875`) has nothing to
+  do with `ConfigDocFs`.** It exists because a composition symlink's write
   can defeat the disk-generation staleness check `try_get_or_load` relies on
   for everything else, so a cache entry still resident in memory has no
   coherence signal telling it the file changed underneath it. `kj rc
-  add`/`rm` and `kj config reset` still call it explicitly for that reason.
-- **`DocKind::Symlink` was not retired.** `dc8a5e92` kept it — a persisted
-  enum with zero callers, on the same reasoning that kept
-  `BlockStore::create_document_with_path` and `documents_under_path`:
-  generic primitives, not config machinery. Removing it stays possible later
-  (it still touches the schema, and `migrate()` has no ALTER-TABLE path, and
+  add`/`rm` and `kj config reset` call it explicitly for that reason.
+- **`DocKind::Symlink` was not retired.** It survives as a persisted enum
+  variant with no non-test callers. Removing it stays possible later (it
+  still touches the schema, `migrate()` has no ALTER-TABLE path, and
   interface ordinals must stay sequential) but it is not part of this arc.
 
 ## Still open
@@ -263,6 +210,6 @@ Afterward it is a file in a directory, and backing it up is a separate act.
 Same trade rc already took, and no production reader reaches config content
 through the block store — every consumer goes through the VFS, including
 `getConfig`, which a client calls at bootstrap before it has a context
-(`crates/kaijutsu-server/src/rpc.rs:5589` reads via `vfs().read_all`). Nothing
+(`crates/kaijutsu-server/src/rpc.rs:6337` reads via `vfs().read_all`). Nothing
 breaks. It is named because "config is in the kernel's durable store" stops
 being true, and someone will assume it still is.

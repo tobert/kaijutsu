@@ -180,7 +180,7 @@ it — the "permission to get simpler" stance in `AGENTS.md`.
 ### `write` is removed
 
 `write` is `create_or_replace` with **no precondition at all**
-(`file_tools/cache.rs`, `mcp/servers/file.rs:477`). It is the flush-back that
+(`file_tools/cache.rs`, `mcp/servers/file.rs:482`). It is the flush-back that
 destroys a file, and it is the only call that can lose a whole file in one
 shot. Meanwhile `edit`'s hashline mode reverifies a hash before writing, so
 "a stale edit fails loud instead of corrupting". The careful path was guarded
@@ -262,41 +262,38 @@ via a file tool gets a tool *result*; the announcement rides that text.
 
 ## Slices
 
-1. **Load path.** On miss, always reconcile against disk: when the document
-   exists, replace its block content with the text just read instead of
-   discarding it. Match the specific `DocumentAlreadyExists` variant — `Err(_)`
-   currently swallows the kind, so a real store failure reads as "already
-   exists". Also stop letting `dirty` short-circuit the staleness check before
-   it is reached (`cache.rs:255`).
-2. **Swap semantics.** Persist only dirty buffers as recoverable. A clean entry
-   is a cache, discarded and re-read. Announce a recovery; do not serve it as
-   authoritative until acknowledged.
-
-   The cold path cannot tell a swap from a stale cache without a durable
-   marker, and slice 1 reconciles both — so until this lands, unsaved work is
-   discarded on restart rather than silently served. **A KernelDb row carries
-   the marker** (Amy, 2026-08-19): one normalized row per path holding the
-   dirty flag and `loaded_generation`. A dirty row means announce; no row
-   means reconcile. Slice 3 needs a restart-surviving generation anyway.
+1. **Load path — done.** On miss, always reconcile against disk: when the
+   document exists, replace its block content with the text just read
+   instead of discarding it, matching the specific `DocumentAlreadyExists`
+   variant rather than swallowing every `Err(_)` as "already exists".
+2. **Swap semantics — done.** Persist only dirty buffers as recoverable. A
+   clean entry is a cache, discarded and re-read. A recovery is announced,
+   never served as authoritative until acknowledged (`kj swap`). **A
+   `dirty_file_buffers` row carries the marker** (Amy, 2026-08-19): one
+   normalized row per path holding the dirty flag and `loaded_generation`. A
+   dirty row means announce; no row means reconcile.
 
    The eventual model is lazy document creation — a clean buffer never becomes
    a document, so a document existing *means* unsaved work, with no marker at
-   all. Deferred for cost (`block_id` becomes optional across every caller) and
-   filed in `docs/issues.md`; the row goes away if it lands.
-3. **`:w` guard.** Implement W12 — `:w` refuses when the disk generation moved
-   past the load generation, `:w!` overrides. Retires "`:w!` == `:w` today".
-4. **Tool surface.** Remove `write` and `grep`; make `edit` hashline-only; add
-   `create_file` if wanted. Update `docs/kj-help/` and every published `///`.
-5. **Wire fields.** `swapRecovered` / `diskChangedSinceLoad` on `EditorState`,
-   and the renderer work to show them.
-
-Slice 1 is the containment and should land alone, first. Slices 2–3 make it
-correct; 4 removes the remaining ways to trip it; 5 is UI.
+   all. Deferred for cost (`block_id` becomes optional across every caller) —
+   the row goes away if it lands.
+3. **`:w` guard — done.** W12 is implemented as `flush_one_guarded`: `:w`
+   refuses when the disk generation moved past the load generation, `:w!`
+   overrides.
+4. **Tool surface — open.** `write` and `grep` still exist as MCP tools;
+   `edit` still has both string mode (`old_string`/`new_string`) and hashline
+   mode. Removing `write` and `grep`, making `edit` hashline-only, and adding
+   `create_file` if wanted are still ahead, along with updating
+   `docs/kj-help/` and every published `///`.
+5. **Wire fields — open.** `swapRecovered` / `diskChangedSinceLoad` are not
+   yet on `EditorState` in `kaijutsu.capnp`; renderer work to show them
+   follows.
 
 ## Testing
 
-The unit suite could not have caught this — it exercised the cache without a
-durable document surviving across a load. Two tests are non-negotiable:
+The unit suite could not have caught the incident — it exercised the cache
+without a durable document surviving across a load. Two tests closed that
+gap and are now in the suite:
 
 - A document that already exists in the block store with **stale** content, plus
   a newer file on disk, must serve the disk content. This is the incident,
@@ -304,4 +301,5 @@ durable document surviving across a load. Two tests are non-negotiable:
 - A flush after the disk moved under the buffer must **refuse**, and `:w!` must
   override. Assert on typed outcomes, not on message substrings.
 
-Falsify both against the current code first. Both should fail today.
+Falsify both against the code before trusting a future change here — verify
+they can still go red.

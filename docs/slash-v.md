@@ -1,13 +1,14 @@
-# The `/v` virtual filesystem: `/v/cas`, `/v/ctx`, `/v/session`
+# The `/v` virtual filesystem: `/v/cas`, `/v/ctx`
 
-*Design note. Proposed 2026-06-26 (extracted from `docs/sftp.md`); redesigned
-2026-06-27 with Amy and simplified hard — the per-session `bound` capability
-apparatus is gone (see "Capability"), navigation is a TSV `index` rather than human
-symlink farms, and the canonical pools are sharded. **Track B (`/v/cas` + client
-CAS sync) shipped, live-verified 2026-07-02**; its `index` TSV (B2) was deliberately
-deferred by Amy — see track B. Track V (`/v/ctx` + `/v/session`) remains the active
-unbuilt plan. Compressed 2026-07-04: `docs/devlog.md` carries the track-B story, git
-history keeps every cut line.*
+**`/v/cas` is shipped** — the CAS pool and client sync below are live. **`/v/ctx`**
+(context + block introspection) is designed here but unbuilt. **`/v/session`**,
+this doc's original sketch for a per-session view exposing each connection's
+currently-acting context, did not ship as such: the live-participant roster
+shipped instead as `/run/roster` (`crate::roster`), a broader `kernel_db`-backed
+liveness view over principals and contexts (`docs/devlog.md`, "The instrument
+could not say who was in the room"). It answers "who and what is around," not
+"which session is driving which context" — the `/v/session` idea below remains
+open, kept as design record rather than duplicated work.
 
 `/v` is kaijutsu's virtual namespace. This note covers three **sysfs-style**
 surfaces under it:
@@ -27,7 +28,7 @@ literal: `grep`, `less`, `ls -l` over live kernel state.
 and `/v/input` are **kaish-side** mounts (`embedded_kaish.rs:300` — objects on each
 materialized kaish's own VFS), *not* kernel-`MountTable` backends, and therefore not
 visible over SFTP. The surfaces in this doc mount on the **kernel `MountTable`**
-(like `/config/rc`'s `ConfigCrdtFs` and the shipped `/v/cas` `CasFs`), the table every
+(like `/config/rc`'s `LocalBackend` and the shipped `/v/cas` `CasFs`), the table every
 surface reaches: SFTP serves it directly (`SftpSession::new(principal, vfs)`), kaish
 through `MountBackend` longest-prefix routing. Note for implementers: the kernel
 mount table **freezes** after setup (`MountTable::freeze()`) — new mounts must land
@@ -103,17 +104,11 @@ driver it was in the first draft (see "Capability").
     for the instrument: `awk -F'\t' '$6==1' /v/ctx/*/*/blocks/index` lists every
     excluded block (the `excl` column is `0`/`1`), one read per context.
 
-## `/v/cas` — the CAS pool (read-only) + client sync — track B, SHIPPED
+## `/v/cas` — the CAS pool (read-only) + client sync
 
-*Renamed from `/v/blobs` to `/v/cas` on 2026-07-06 for naming consistency with the
-rest of the CAS surface (the crate, the store, `kj cas`) — no design change, same
-`CasFs` backend.*
-
-*Landed and live-verified 2026-07-02: `kj cas put` → SFTP fetch → hash-verified XDG
-cache → speakers. The driver was clips — a sink resolves a clip's `media` hash
-locally and pulls misses from the kernel under the prepare horizon
-(`docs/pcm.md`). No new RPC. The slice-by-slice execution plan (B0–B4) lives in git
-history; `docs/devlog.md` tells the story. The landed design:*
+`kj cas put` → SFTP fetch → hash-verified XDG cache → speakers, with no new RPC.
+The driver is clips: a sink resolves a clip's `media` hash locally and pulls
+misses from the kernel under the prepare horizon (`docs/pcm.md`). The design:
 
 **`CasFs`** (`crates/kaijutsu-kernel/src/vfs/backends/cas.rs`) — a read-only
 `VfsBackend` over the kernel's `Arc<FileStore>` (`kaijutsu-cas`: 128-bit BLAKE3 as 32
@@ -181,8 +176,8 @@ decided at the sink).
 
 ## `/v/ctx` — context + block introspection (read-only)
 
-A new `VfsBackend` (sibling to `ConfigCrdtFs`,
-`crates/kaijutsu-kernel/src/runtime/config_crdt_fs.rs:47`) that synthesizes
+A new `VfsBackend` (in the style of the kernel's other synthetic backends —
+`CasFs`, `RosterFs`) that synthesizes
 `getattr`/`readdir`/`read`/`readlink` from the kernel's context + block stores and
 returns `EROFS` on every write.
 
@@ -218,17 +213,17 @@ dirs on text blocks).
 its `BlockId` (`{ctx}_{principal}_{seq}`, `crates/kaijutsu-types/src/block.rs:67` —
 stable and unique, but *principal-major*) and its timeline position (a derived view
 that shifts on every insert/exclude). Timeline order comes from
-`block_ids_ordered()` (`crates/kaijutsu-kernel/src/blocks/block_store.rs:238`) and must never
+`block_ids_ordered()` (`crates/kaijutsu-kernel/src/blocks/block_store.rs:213`) and must never
 be confused with `BlockId` iteration order — a standing gotcha. So the block-key dir
 is canonical and **the ordered view is `blocks/index` row order** — no `by-time/NNNN`
 farm whose ordinals would be unstable under multi-writer.
 
 **Enumeration — per-context stores, not a global filter.** The kernel's
 `SharedBlockStore` is a `DashMap<ContextId, DocumentEntry>`
-(`crates/kaijutsu-kernel/src/block_store.rs:182`) — **one inner `BlockStore`
+(`crates/kaijutsu-kernel/src/block_store.rs:191`) — **one inner `BlockStore`
 per context**, each with its own `block_ids_ordered()`; there is no global block
 list to filter. The canonical context roster is `KernelDb::list_all_contexts()`
-(`kernel_db.rs:1823`), which also surfaces non-resident/archived contexts the
+(`kernel_db.rs:3880`), which also surfaces non-resident/archived contexts the
 resident-only `DriftRouter.contexts` would miss; fall back to the resident
 `documents` keys when no DB is configured (test mode). The fork tree (`children/`,
 the `parent` column) resolves from the `context_edges` table via
@@ -274,8 +269,8 @@ track B. The trailing-byte rule is a UUIDv7 fact, not a house style.)
 **Coherence stamp — reuse `DocumentEntry::version()`.** A live `content` file grows
 as a block streams; there is no change notification, so a re-`stat` is how a reader
 learns of growth. Map `FileAttr.generation` straight to `DocumentEntry::version()`
-(`block_store.rs:153`) — an `AtomicU64` bumped on every local write (`touch()`)
-**and** restored from the doc version on remote `merge_ops` (`block_store.rs:2020`),
+(`block_store.rs:162`) — an `AtomicU64` bumped on every local write (`touch()`)
+**and** restored from the doc version on remote `merge_ops` (e.g. `block_store.rs:2587`),
 so it advances on local edits *and* sync. O(1) and free. (`sync_generation` is a
 narrower sync-protocol counter — wrong for this.) *Verify at impl* with a TDD pair: a
 streaming append strictly increases a hot block's generation; a `done` block's is
@@ -310,7 +305,7 @@ A `VfsBackend` view over the kernel's **live participant registry**, `/proc`-sty
 `PeerRegistry` (`crates/kaijutsu-kernel/src/peers.rs:103`) already tracks the app and
 MCP servers with `nick`, a unique-per-process `instance`, a **server-stamped
 `principal`** (never trusted from the client), and `attached_at` (`PeerInfo`,
-`peers.rs:50`); it gains a session *kind* field (none today). SFTP and terminal
+`peers.rs:55`); it gains a session *kind* field (none today). SFTP and terminal
 client connections register as new kinds (`docs/tui.md`).
 
 ```
@@ -513,14 +508,15 @@ write/capability work this surface used to drive is gone — SFTP is a read cons
    papercut in track B — verify the mount is not similarly shadowed.
 2. **`/v/session` read-only roster.** View over the participant registry
    (`PeerRegistry` generalized to carry a session *kind* — `PeerInfo` has none today,
-   `peers.rs:50`); rows render each session's **live** acting context from
+   `peers.rs:55`); rows render each session's **live** acting context from
    `SessionContextMap` as a read-only `context` edge (never KV); `self` resolution
    wired per surface; `index` TSV. (`conversation/` is namespace-reserved, not built
    here.)
 3. **SFTP mounts `/v` read-only.** The SFTP adapter exposes the same backends so an
-   sshfs session can browse context/block/session state. No write path, no guard
-   injection — privileged writes stay lexically denied (`sftp.rs:234`) and happen via
-   the shell/MCP where context is ambient.
+   sshfs session can browse context/block/session state. `/v/ctx` and `/v/session`
+   are `EROFS` by construction (the backend itself refuses writes), same as `/v/cas` —
+   no guard injection needed, and no lexical deny (SFTP carries none; see
+   "Capability").
 
 **Dependency order:** 0 → 1 → 2; slice 3 depends only on 1–2.
 
@@ -530,24 +526,24 @@ Track B (`/v/cas`, landed):
 
 - `crates/kaijutsu-cas/src/{hash,store,config}.rs` — `ContentHash` (32-hex BLAKE3-128, `prefix()`/`remainder()`, validated `try_from` deserialization), `FileStore`/`ContentStore` (the backend's substrate **and** the client cache; atomic staging+rename `store()`), `objects/`+`metadata/`+`staging/` layout
 - `crates/kaijutsu-kernel/src/vfs/backends/cas.rs:59` — `CasFs` (EROFS, leading-two-hex shards, constant generation, `real_path` None)
-- `crates/kaijutsu-kernel/src/kernel.rs:164,697` — `cas_for_data_dir` (`{data_dir}/cas/`), `Kernel::cas()`; `kj/cas.rs` — `kj cas put/get/ls/info/rm` (the ingest path)
-- `crates/kaijutsu-server/src/rpc.rs:1167–1179` — server bootstrap: `/v/cas` mount, then `freeze_mounts()` (`MountTable::freeze()`, `vfs/mount.rs:68`)
-- `crates/kaijutsu-server/src/ssh.rs:832` / `sftp.rs:121` — `SftpSession::new(principal, vfs)` serves the kernel `MountTable` (so `/v/cas` is SFTP-visible, zero adapter work)
+- `crates/kaijutsu-kernel/src/kernel.rs:285,1078` — `cas_for_data_dir` (`{data_dir}/cas/`), `Kernel::cas()`; `kj/cas.rs` — `kj cas put/get/ls/info/rm` (the ingest path)
+- `crates/kaijutsu-server/src/rpc.rs:2645–2661` — server bootstrap: `/v/cas` mount, then `freeze_mounts()` (`MountTable::freeze()`, `vfs/mount.rs:119`)
+- `crates/kaijutsu-server/src/ssh.rs:958` / `sftp.rs:107` — `SftpSession::new(principal, vfs)` serves the kernel `MountTable` (so `/v/cas` is SFTP-visible, zero adapter work)
 - `crates/kaijutsu-client/src/ssh.rs:210` — `connect_subsystem` (the `SftpClient` transport); `sftp.rs` — `SftpClient`/`BlobFetch`/`BlobResolver` (sharded `blob_path`, single-flight, read-to-EOF, `HashMismatch`)
 - `crates/kaijutsu-app/src/audio.rs` — the B4 consumer; `Cargo.toml:63` — `russh-sftp = "2.3"` (workspace; client + server halves of one crate)
 
-Track V (`/v/ctx` + `/v/session`):
+Track V (`/v/ctx` + `/v/session`, unbuilt):
 
 - `crates/kaijutsu-kernel/src/runtime/embedded_kaish.rs:300` — `/v/docs`, `/v/input` (**kaish-side** mounts, not kernel-`MountTable` — not SFTP-visible; see "The mount-table reality")
-- `crates/kaijutsu-kernel/src/runtime/config_crdt_fs.rs:47` — `VfsBackend` pattern to mirror
+- `crates/kaijutsu-kernel/src/vfs/backends/cas.rs`, `roster.rs` — synthetic `VfsBackend`s to mirror the pattern of
 - `crates/kaijutsu-types/src/ids.rs:54` — all ids are `Uuid::now_v7()` (the trailing-byte sharding rule)
-- `crates/kaijutsu-kernel/src/peers.rs:50,103` — `PeerInfo` / `PeerRegistry` (the session seed; `PeerInfo` needs a `kind` field)
+- `crates/kaijutsu-kernel/src/peers.rs:55,115` — `PeerInfo` / `PeerRegistry` (the session seed; `PeerInfo` needs a `kind` field)
 - `crates/kaijutsu-kernel/src/runtime/context_engine.rs:31` — `SessionContextMap` (the live acting-context source `context` renders; KV is retired, see `docs/shared-state.md`)
-- `crates/kaijutsu-app/src/connection/actor_plugin.rs:301,319` — the app's *durable* per-client restore (via the typed per-client store `set_last_context`/`get_client_view`, **not** `/v/session`)
-- `crates/kaijutsu-types/src/block.rs:67,134` — `BlockId::to_key()`; `BlockHeader` (gains `content_len`)
-- `crates/kaijutsu-kernel/src/blocks/block_store.rs:238` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
-- `crates/kaijutsu-kernel/src/block_store.rs:182,153,2020` — `documents: DashMap<ContextId, DocumentEntry>`; `DocumentEntry::version()` (coherence stamp; bumped on local write, restored on remote `merge_ops`)
-- `crates/kaijutsu-kernel/src/kernel_db.rs:1823,284` — `list_all_contexts()` (context roster → `index`); `contexts.label` UNIQUE (the `label` column)
+- `crates/kaijutsu-app/src/connection/actor_plugin.rs:924,1144` — the app's *durable* per-client restore (via the typed per-client store `set_last_context`/`get_client_view`, **not** `/v/session`)
+- `crates/kaijutsu-types/src/block.rs:67,134` — `BlockId::to_key()`; `BlockHeader` (would gain `content_len` — not landed)
+- `crates/kaijutsu-kernel/src/blocks/block_store.rs:213` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
+- `crates/kaijutsu-kernel/src/block_store.rs:191,162` — `documents: DashMap<ContextId, DocumentEntry>`; `DocumentEntry::version()` (coherence stamp; bumped on local write, restored on remote `merge_ops`, e.g. `block_store.rs:2587`)
+- `crates/kaijutsu-kernel/src/kernel_db.rs:3880` — `list_all_contexts()` (context roster → `index`); `contexts.label` (`kernel_db.rs:603`) is not unique
 - `crates/kaijutsu-kernel/src/mcp/binding.rs` — `Capability` (`ConfigWrite`; `RcWrite` and `context_allows_rc_write` are deleted)
 - `crates/kaijutsu-server/src/sftp.rs` — `SftpSession` (the lexical deny it once carried is deleted)
 - `crates/kaijutsu-kernel/src/vfs/types.rs` — `FileAttr.generation` coherence stamp

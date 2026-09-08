@@ -1,15 +1,14 @@
 # The `/r` remote-mount namespace: client shares over reverse SFTP
 
-*Design note. Proposed 2026-07-13 (Amy + Claude co-design session); reviewed
-pre-build by DeepSeek + Gemini Pro (provenance footers). **Slices 0+1 +
-stitch SHIPPED same day** (merges `ad4b212e` pump, `99d4e5cd` share — two
-Sonnet-subagent worktree lanes + a post-build deepseek review round; sections
-below updated to the as-built reality, deviations marked). Not yet
-live-verified on a real kernel; remaining slices (kj share verbs, `:rw`,
-notify) tracked in `docs/issues.md`. Companions: `docs/sftp.md` (the landed
-forward direction), `docs/slash-v.md` (the `/v` surfaces + the index-TSV
-house style this reuses), `docs/mounts.md` (the opaque-host inversion `/r`
-sits beside).*
+*Design note, reviewed pre-build by DeepSeek + Gemini Pro (provenance
+footers). Slices 0 and 1 (the streaming pump and the read-only reverse-SFTP
+share) are built; sections below describe the as-built reality, deviations
+marked. Not yet live-verified on a real kernel; remaining slices (`kj share`
+verbs, `:rw`, notify — none built yet) are tracked below, in "Implementation
+slices". Companions: `docs/sftp.md`
+(the forward direction), `docs/slash-v.md` (the `/v` surfaces + the
+index-TSV house style this reuses), `docs/mounts.md` (the opaque-host
+inversion `/r` sits beside).*
 
 A client shares a slice of its local filesystem into the kernel's VFS —
 the exact reverse of the SFTP we already ship. `kaijutsu-app --share ~/Downloads`
@@ -60,10 +59,10 @@ pure negotiation:
   subsystem request, the client speaks the SFTP *server* role and the kernel
   speaks the *client* role on the same channel.
 - The name `sftp` is taken with the opposite meaning: the kernel's existing
-  handler (`subsystem_request` dispatch, `crates/kaijutsu-server/src/ssh.rs:764`,
-  match at `:802`) serves the kernel VFS on it. `kaijutsu-share` is one more
+  handler (`subsystem_request` dispatch, `crates/kaijutsu-server/src/ssh.rs:892`,
+  match arms from `:931`) serves the kernel VFS on it. `kaijutsu-share` is one more
   match arm on the landed named-subsystem scaffold and a new constant beside
-  `SSH_RPC_SUBSYSTEM`/`SSH_SFTP_SUBSYSTEM` (`crates/kaijutsu-types/src/lib.rs:69`).
+  `SSH_RPC_SUBSYSTEM`/`SSH_SFTP_SUBSYSTEM` (`crates/kaijutsu-types/src/lib.rs:72,79`).
 
 ## Session shape: self-describing, manifest-in-band
 
@@ -242,7 +241,7 @@ kaish's `cp` slurps whole files — `backend.read(src, None)` then write
 (kaish-kernel 0.12 `tools/builtin/cp.rs:202`). Fine for configs; wrong for a
 4 GB ISO crossing two network channels through kernel memory. `VfsOps` already
 has `read(path, offset, size)` / `write(path, offset, data)`
-(`crates/kaijutsu-kernel/src/vfs/ops.rs:20`), so the primitive is a chunked
+(`crates/kaijutsu-kernel/src/vfs/ops.rs:29`), so the primitive is a chunked
 pump in `kaijutsu-kernel/src/vfs/` :
 
 - **The pump rides a streaming read primitive, not raw `read` calls**
@@ -304,23 +303,24 @@ shares are cables the clients plug in.
 
 ## Implementation slices
 
-0. **Streaming pump + streaming CAS store + the `VfsOps` stream primitive.**
-   ✅ **SHIPPED 2026-07-13** (`ad4b212e`): `open_read_stream` + loop-`read`
-   default + `MountTable` delegation, `vfs/pump.rs` (`PumpSink`/`VfsSink`/
-   `CasSink`), `StreamingWriter` (drop-unlinks-staging), `kj cp`, `kj cas
-   put` streams; fault-injection tests.
-1. **Reverse-SFTP share, read-only.** ✅ **SHIPPED 2026-07-13** (`99d4e5cd`,
-   including the stitch: `ShareFs::open_read_stream` holds ONE remote handle
-   per transfer with per-chunk lock scoping + a drop-guard `CLOSE`; proven
-   by a counting harness). All of: subsystem constant + arm, jailed client
-   share server + manifest + generation extension, repeatable `--share
-   [name=]path`, `ShareFs` pre-freeze with registry/timeouts/keepalive,
-   `/r/index`, `read_all` override, attr squashing, crawl opacity.
+0. **Streaming pump + streaming CAS store + the `VfsOps` stream primitive —
+   built.** `open_read_stream` + loop-`read` default + `MountTable`
+   delegation, `vfs/pump.rs` (`PumpSink`/`VfsSink`/`CasSink`),
+   `StreamingWriter` (drop-unlinks-staging), `kj cp`, `kj cas put` streams;
+   fault-injection tests.
+1. **Reverse-SFTP share, read-only — built.** Including the stitch:
+   `ShareFs::open_read_stream` holds ONE remote handle per transfer with
+   per-chunk lock scoping + a drop-guard `CLOSE`; proven by a counting
+   harness. All of: subsystem constant + arm, jailed client share server +
+   manifest + generation extension, repeatable `--share [name=]path`,
+   `ShareFs` pre-freeze with registry/timeouts/keepalive, `/r/index`,
+   `read_all` override, attr squashing, crawl opacity.
    **Not yet live-verified** on a real kernel — kaish `ls /r`, `cp` out of a
    share, and the kaish shadow-overlay papercut check (which bit `/v/cas`)
    are the outstanding verification steps.
-2. **`kj share` verbs + polish.** `kj share ls` (registry TSV), eject;
-   `/v/session` rows gain the share channel kind.
+2. **`kj share` verbs + polish — not built.** `kj share ls` (registry TSV),
+   eject; the live-participant roster (`/run/roster`) gains the share
+   channel kind.
 3. **Writable shares.** `:rw` suffix, both-ends enforcement, TOCTOU stance
    documented against the weak generation stamp.
 4. **Notify push.** Client-side `notify` watcher batches change events up the
@@ -342,13 +342,13 @@ shares are cables the clients plug in.
 
 ## File references
 
-- `crates/kaijutsu-kernel/src/vfs/ops.rs:20` — `VfsOps` (the pump's substrate)
+- `crates/kaijutsu-kernel/src/vfs/ops.rs:29` — `VfsOps` (the pump's substrate)
 - `crates/kaijutsu-kernel/src/vfs/mount.rs:119,134` — `MountTable::freeze` / `mount` (why `/r` is one backend)
-- `crates/kaijutsu-server/src/ssh.rs:764,802` — named-subsystem dispatch (the new match arm)
+- `crates/kaijutsu-server/src/ssh.rs:892` — named-subsystem dispatch (`subsystem_request`, match arms from `:931`)
 - `crates/kaijutsu-server/src/sftp.rs` — the forward adapter (jail/REALPATH discipline, 256 KiB `MAX_READ_LEN`, 64-entry `READDIR_CHUNK` to mirror)
 - `crates/kaijutsu-client/src/ssh.rs:210` — `connect_subsystem` (own-connection pattern)
 - `crates/kaijutsu-client/src/sftp.rs` — `SftpClient` (read-to-EOF loop the `ShareFs` `read_all` override mirrors)
-- `crates/kaijutsu-types/src/lib.rs:69,76` — subsystem name constants (gains `SSH_SHARE_SUBSYSTEM`)
+- `crates/kaijutsu-types/src/lib.rs:72,79,89` — `SSH_RPC_SUBSYSTEM`/`SSH_SFTP_SUBSYSTEM`/`SSH_SHARE_SUBSYSTEM`
 - `crates/kaijutsu-app/src/connection/client_id.rs:45` — the stable installation id naming `/r/<id>`
 - `crates/kaijutsu-cas/src/store.rs` — `FileStore` staging+rename (gains the streaming store)
 - kaish-kernel 0.12 `tools/builtin/cp.rs:202` — the whole-file slurp the pump replaces (upstream candidate)

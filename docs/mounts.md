@@ -1,15 +1,13 @@
 # Mounts & subprocess — the opaque host
 
-> **Status:** design direction, captured 2026-07-03 in a co-design session
-> (Amy + Claude), after the Music Demo #1 post-mortem found external exec
-> compiled out three layers deep. **Slice 1 (subprocess enablement) shipped
-> the same day** — see "Slice 1" below. The rest is direction, not
-> commitment; code is truth. Companions: `docs/instrument-design.md` (the
-> shared-trust doctrine this leans on), `docs/config-namespace.md`
-> (the config mount registry, since melted onto host directories under
-> `/config`), and the kaish-side
-> mounts rework in flight for the next kaish release (`/dev` kernel-owned in
-> the `with_backend` path — fixes `> /dev/null` under our read-only root).
+> **Status:** design direction; slice 1 (subprocess enablement) is built —
+> see "Slice 1" below. The rest is direction, not commitment; code is truth.
+> Companions: `docs/instrument-design.md` (the shared-trust doctrine this
+> leans on), `docs/config-namespace.md` (the config mount registry, since
+> melted onto host directories under `/config`). `/dev` already has a
+> read-only, opaque-to-sweeps kernel mount (fixing an empty FSN view); a
+> kaish-side rework making `/dev` writable enough for `> /dev/null` under
+> our read-only root is still open, tracked as "Later slices" below.
 
 ## The inversion
 
@@ -20,8 +18,9 @@ The direction inverts the default:
 
 - **Nothing visible by default.** Drop the host-root mount. The VFS
   namespace is the curated set: `/mnt/project` (or `~/src`), `/tmp`,
-  `/config/rc` + `/config/kernel` (kernel-owned), `/v/*`, `/dev` (kaish-owned, next
-  release), plus the bin mounts below.
+  `/config/rc` + `/config/kernel` (kernel-owned), `/v/*`, `/dev` (already a
+  read-only kernel mount; writable enough for `> /dev/null` is still kaish
+  work), plus the bin mounts below.
 - **PATH dirs mounted deliberately.** At kernel startup, read the host
   `PATH`, canonicalize + dedupe its directories, and hold them as the
   kernel's *bin-mount catalog*. Contexts get them **surgically**: which
@@ -68,7 +67,7 @@ Which set a type gets should be rc/loadout-driven (the same place the
 `exec` authority is granted), so a live director can be widened without a
 rebuild.
 
-## Slice 1 — subprocess enablement (SHIPPED 2026-07-03)
+## Slice 1 — subprocess enablement (built)
 
 The minimal cut, independent of the kaish release; everything in it
 survives the inversion (later slices only narrow what's visible and what
@@ -126,10 +125,9 @@ create-rc; existing coder/director contexts need a one-time
 
 - Does `mcp`/`default` keep the full catalog, or narrow once the catalog
   exists? (Slice 1 grants them exec via the shared lib seed.)
-- `kj audio` / `kj midi` verbs (issues.md, from Music Demo #1): still
-  worth having so a *musician-adjacent* flow never needs raw `aconnect`,
-  even with exec working — the ALSA wiring is kernel-owned state, not a
-  shell errand.
-- The `aconnect 128:0 129:0` wire itself: nothing owns it; it dies on
-  every app restart. The app auto-connecting its render port to TiMidity
-  (when present) is likely the right home — tracked in issues.md.
+- `kj audio` / `kj midi` verbs: still worth having so a *musician-adjacent*
+  flow never needs raw `aconnect`, even with exec working — the ALSA wiring
+  is kernel-owned state, not a shell errand.
+- The `aconnect 128:0 129:0` wire itself: nothing owns it; it dies on every
+  app restart. The app auto-connecting its render port to TiMidity (when
+  present) is likely the right home.

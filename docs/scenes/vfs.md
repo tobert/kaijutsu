@@ -200,9 +200,10 @@ content is outside" — fits panels-as-screens cleanly but is undecided.
 4. **Zone tint reconciliation** (above).
 5. **Search**: `/` over the landscape (labels/paths, maybe
    `search_similar`) — flying to results vs teleporting.
-6. **Truth seams**: the kaish `/v/blobs` overlay shadowing
-   (`gotcha_kaish_v_blobs_shadow`) is exactly the kind of split the
-   landscape must not paper over — if two surfaces disagree, show the seam.
+6. **Truth seams**: the kaish `/v/cas` overlay-shadow papercut (fixed once,
+   pinned by a regression test — `docs/slash-v.md` "Fixed papercut") is
+   exactly the kind of split the landscape must not paper over — if two
+   surfaces disagree, show the seam.
 
 ## Status
 
@@ -213,24 +214,21 @@ plumbing), quadtree layout + hash-seeded relaxed-Voronoi fields rendered as
 line-list wireframe + vertex points, three LOD tiers live, fly + select
 only — no interaction beyond that, no solid tier, no fsnotify.
 
-**Layout math (Lane A) SHIPPED 2026-07-12** (`feat/fsn-layout`):
-`kaijutsu-viz::fsn` — `CellId` quadtree addressing (explicit-level u64,
+**Layout math (Lane A) — built.** `kaijutsu-viz::fsn` — `CellId` quadtree addressing (explicit-level u64,
 cube-sphere-ready, prefix containment), FNV-1a seeds, voronator-backed
 Voronoi with fixed k=2 Lloyd (blast radius bounded + trajectory-tested),
 `FsnCell::edges()` for line-list meshes. Determinism scope: per compiled
 binary (FMA/predicate caveat in the module doc). CellId assignment for
 subdir sub-cells is a documented placeholder pending open question 2.
 
-**Kernel plumbing (stage 0 + stage-1 groundwork) SHIPPED 2026-07-12**
-(`feat/fsn-snapshot`): `Vfs.snapshot` RPC + `MountTable::snapshot`
+**Kernel plumbing (stage 0 + stage-1 groundwork) — built.** `Vfs.snapshot` RPC + `MountTable::snapshot`
 (`crates/kaijutsu-kernel/src/vfs/mount.rs`), per-directory listing-generation
 stamps, `kj vfs snapshot <path>`, client wrapper. `ignored` classification is
 real for LocalBackend-backed subtrees, best-effort precision (see
 `docs/issues.md`). Stage 2 (inotify → event stream) not started. Lane C (the
 Bevy world renderer) consumes this next.
 
-**Bevy world renderer (Lane C) SHIPPED 2026-07-12** (`feat/fsn-world`,
-`crates/kaijutsu-app/src/view/fsn/`): `layout` (pure — world placement,
+**Bevy world renderer (Lane C) — built** (`crates/kaijutsu-app/src/view/fsn/`): `layout` (pure — world placement,
 `height_channel`'s first-candidate mapping, prism/seam/point mesh vertex
 builders, the LOD-tier decision, camera clamps; unit-tested), `sync` (the
 `vfs_snapshot` poll → `FsnState` cache, one in-flight request at a time,
@@ -246,9 +244,8 @@ candidate against the real tree, per this doc's Open Question 1). Follow-ups
 (staleness invalidation, the seam-grid simplification, subdir bloom, search,
 zone tint) tracked in `docs/issues.md`.
 
-**Slice 1 — the ambient world — SHIPPED 2026-07-13** (merges `680ac984` Lane K,
-`92d677f0` Lane A, stitch `5cdaf773`; live-verified on zorak). Amy's reframe
-set the scope: the scene is **ambient instrumentation, not a file browser** —
+**Slice 1 — the ambient world — built and live-verified on zorak.** Amy's
+reframe set the scope: the scene is **ambient instrumentation, not a file browser** —
 the space the vessel inhabits, surfacing the filesystem's ambient data. What
 landed:
 

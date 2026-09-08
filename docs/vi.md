@@ -189,7 +189,7 @@ scope):
   `subscribeEditor` push (own keystrokes, peer merges) and pops to Conversation
   on close.
 - The editor gets its **own dedicated 2D full-screen surface**, superseding
-  the earlier time-well reuse (commit 49e1163e): `EditorSurfaceRoot`/
+  the earlier time-well reuse: `EditorSurfaceRoot`/
   `EditorSurface` in `view/editor/render.rs` are a full-window dark "page" node
   with an MSDF text child on `BlockFxMaterial` — the same material the
   conversation/compose surfaces use, so the cursor/selection shader path is
@@ -248,8 +248,7 @@ The same surface a test drives is what a model plays.
    explicitly joins, block ops for an un-joined context are dropped
    (`view/sync.rs`), so no `DocKind` discriminator is needed on the wire.
    (Rejected Design B: joining the editor context into the cache.)
-5. **Surface: dedicated full-screen `EditorSurface`** (superseded 2026-06-24,
-   commit 49e1163e). Originally decided (2026-06-22) to reuse the time-well's
+5. **Surface: dedicated full-screen `EditorSurface`.** Originally decided to reuse the time-well's
    MSDF panel substrate; that didn't survive contact with the editor's actual
    needs — full-screen layout, the conversation-matched font, and a real
    cursor quad, none of which the time-well's 3D card could give it — so the
@@ -284,19 +283,19 @@ file-doc that owns the path's text, and the editor binds to its
 the same as any other path, so there is no second branch to route a config
 path down.
 
-**The ownership-aware branch is gone** (`dc8a5e92`, 2026-08-30):
-`ConfigDocFs`, `EditorTarget::config_owned`, `VfsOps::owns_config_docs`,
-`config_doc.rs`, and the four-argument
-`resolve_editor_target(path, blocks, file_cache, mounts)` signature all went
-together. What that branch guarded against — a config path running through
+**There is no ownership-aware branch.** `ConfigDocFs`,
+`EditorTarget::config_owned`, `VfsOps::owns_config_docs`, `config_doc.rs`,
+and a four-argument `resolve_editor_target(path, blocks, file_cache,
+mounts)` signature that once routed config paths separately are all gone.
+What that branch guarded against — a config path running through
 `get_or_load` and minting a *separate* `FileDocumentCache` copy shadowing a
 kernel-owned document, the dual-ownership write-through bug class the
-kernel-owned design existed to prevent (`docs/devlog.md`, "The kernel
-becomes sole owner of itself, then gives it back") — cannot happen once
-every config tree is an ordinary host file: there is exactly one owner, the
-file cache, for any path. A missing file still **fails loud** (no empty
-editor) — `try_get_or_load` surfaces the open error rather than serving a
-phantom block.
+kernel-owned design existed to prevent (`docs/devlog.md`, "Config: the
+kernel owned it, then gave it back") — cannot happen once every config tree
+is an ordinary host file: there is exactly one owner, the file cache, for
+any path. A missing file still **fails loud** (no empty editor) —
+`try_get_or_load` surfaces the open error rather than serving a phantom
+block.
 
 ---
 
