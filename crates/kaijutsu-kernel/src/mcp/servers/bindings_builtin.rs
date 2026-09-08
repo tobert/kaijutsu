@@ -559,7 +559,8 @@ mod tests {
         // narrowed allow-set, the admin tool included).
         broker
             .bind(ctx_id, InstanceId::new("builtin.bindings"))
-            .await;
+            .await
+            .unwrap();
         broker.bind(ctx_id, InstanceId::new("target")).await.unwrap();
         let call_ctx = call_ctx_for(ctx_id);
 

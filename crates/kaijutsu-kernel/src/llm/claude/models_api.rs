@@ -267,7 +267,11 @@ mod tests {
             "anthropic-version",
             reqwest::header::HeaderValue::from_static("2023-06-01"),
         );
-        let http = reqwest::Client::builder().default_headers(headers).build().unwrap();
+        let http = reqwest::Client::builder()
+            .user_agent(crate::llm::http_user_agent())
+            .default_headers(headers)
+            .build()
+            .unwrap();
         let source = HttpModelCapabilitySource::new(http, "https://api.anthropic.com");
 
         // A model genuinely missing from models.toml (postdates it) and

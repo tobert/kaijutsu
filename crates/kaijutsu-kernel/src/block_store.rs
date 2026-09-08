@@ -417,7 +417,9 @@ impl BlockStore {
                 "Document language differs from persisted row; not treated as divergence"
             );
         }
-        tracing::warn!(context_id = %id.to_hex(), "Document already in DB but not in memory, recovering");
+        // The routine case: `kj context create` writes the row, then the
+        // document is created here. Divergence returned above; this is not it.
+        tracing::debug!(context_id = %id.to_hex(), "Document already in DB but not in memory, recovering");
         Ok(())
     }
 

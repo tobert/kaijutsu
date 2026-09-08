@@ -782,6 +782,13 @@ impl KjDispatcher {
             info.push_str(&format!("\nResolved: {display} ({resolved_source})"));
         }
 
+        // The document version a client hydrates against (`docs/change-feed.md`).
+        // Absent when the document is not resident in this kernel.
+        let version = self.blocks.version(row.context_id).ok();
+        if let Some(v) = version {
+            info.push_str(&format!("\nVersion: {v}"));
+        }
+
         if let Some(ref s) = shell
             && let Some(cwd) = &s.cwd
         {
@@ -850,6 +857,7 @@ impl KjDispatcher {
             "forked_from": row.forked_from.map(|id| id.to_hex()),
             "fork_kind": row.fork_kind.as_ref().map(|k| format!("{k:?}")),
             "children_count": children_count,
+            "version": version,
             "drift_count": drift_from + drift_to,
             "is_current": is_current,
             "workspace_id": row.workspace_id.map(|id| id.to_hex()),
@@ -2225,12 +2233,22 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx_id = register_context(&d, Some("myctx"), None, principal);
+        // `register_context` writes the rows only; a resident document is
+        // what carries a version.
+        d.blocks
+            .create_document(ctx_id, crate::block_store::DocumentKind::Conversation, None)
+            .unwrap();
 
         let c = caller_with_context(ctx_id);
         let result = d.dispatch(&[s("context"), s("info")], &c).await;
         assert!(result.is_ok());
         let msg = result.message();
         assert!(msg.contains("myctx *"), "output: {msg}");
+        assert!(msg.contains("\nVersion: "), "the hydration anchor is shown: {msg}");
+        let KjResult::Ok { data: Some(data), .. } = &result else {
+            panic!("info carries a record: {result:?}");
+        };
+        assert!(data["version"].is_u64(), "version rides the record: {data}");
     }
 
     #[tokio::test]

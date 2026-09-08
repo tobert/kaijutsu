@@ -272,21 +272,17 @@ impl ClientHandler for BrokerClientHandler {
     }
 }
 
-/// Build the streamable-HTTP transport for one server: its URL plus any
-/// configured headers.
+/// The request headers for one streamable-HTTP server: the configured
+/// headers plus a `User-Agent` of `kaijutsu/<version>` when none is
+/// configured. Every outbound HTTP client identifies itself as kaijutsu.
 ///
 /// An unusable header name or value fails the connection rather than being
 /// dropped — a request that silently goes out without its credential comes
 /// back as an authentication error far from the mistake.
-fn http_transport(
+fn http_headers(
     config: &McpServerConfig,
-) -> McpResult<rmcp::transport::StreamableHttpClientTransport<reqwest::Client>> {
-    let url = config
-        .url
-        .as_deref()
-        .ok_or_else(|| McpError::Protocol("StreamableHttp transport requires url".to_string()))?;
-
-    let mut headers = HashMap::with_capacity(config.headers.len());
+) -> McpResult<HashMap<http::HeaderName, http::HeaderValue>> {
+    let mut headers = HashMap::with_capacity(config.headers.len() + 1);
     for (name, value) in &config.headers {
         let header = http::HeaderName::try_from(name.as_str()).map_err(|e| {
             McpError::Protocol(format!("header '{name}' is not a valid header name: {e}"))
@@ -299,7 +295,22 @@ fn http_transport(
         })?;
         headers.insert(header, header_value);
     }
+    headers
+        .entry(http::header::USER_AGENT)
+        .or_insert_with(|| http::HeaderValue::from_static(crate::llm::http_user_agent()));
+    Ok(headers)
+}
 
+/// Build the streamable-HTTP transport for one server: its URL plus
+/// [`http_headers`].
+fn http_transport(
+    config: &McpServerConfig,
+) -> McpResult<rmcp::transport::StreamableHttpClientTransport<reqwest::Client>> {
+    let url = config
+        .url
+        .as_deref()
+        .ok_or_else(|| McpError::Protocol("StreamableHttp transport requires url".to_string()))?;
+    let headers = http_headers(config)?;
     let transport_config =
         rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
             .custom_headers(headers);
@@ -1215,6 +1226,40 @@ mod tests {
         let rendered = format!("{err:?}");
         assert!(rendered.contains("x-api-key"), "{rendered}");
         assert!(!rendered.contains("sk-leak"), "the error leaked the credential: {rendered}");
+    }
+
+    #[test]
+    fn http_headers_default_the_user_agent_to_kaijutsu() {
+        let config = McpServerConfig {
+            name: "exa".into(),
+            transport: McpTransport::StreamableHttp,
+            url: Some("https://mcp.exa.ai/mcp".into()),
+            headers: HashMap::from([("x-api-key".to_string(), "secret".to_string())]),
+            ..Default::default()
+        };
+        let headers = http_headers(&config).unwrap();
+        assert_eq!(
+            headers.get(&http::header::USER_AGENT).and_then(|v| v.to_str().ok()),
+            Some(crate::llm::http_user_agent()),
+        );
+        assert_eq!(headers.len(), 2, "the configured header is kept: {headers:?}");
+    }
+
+    /// A configured `User-Agent` is the operator's statement; keep it.
+    #[test]
+    fn a_configured_user_agent_wins_over_the_default() {
+        let config = McpServerConfig {
+            name: "exa".into(),
+            transport: McpTransport::StreamableHttp,
+            url: Some("https://mcp.exa.ai/mcp".into()),
+            headers: HashMap::from([("User-Agent".to_string(), "custom/1".to_string())]),
+            ..Default::default()
+        };
+        let headers = http_headers(&config).unwrap();
+        assert_eq!(
+            headers.get(&http::header::USER_AGENT).and_then(|v| v.to_str().ok()),
+            Some("custom/1"),
+        );
     }
 
     #[test]
