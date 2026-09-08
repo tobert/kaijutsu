@@ -219,15 +219,14 @@ that, opportunistic, never required for correctness.
 
 ## A context owns a timeline, over one store
 
-> **Landed (2026-06-29/30, `docs/tracks.md` Stages 1–3 M1):** the beat moved
-> off the context and onto the **track** — the track is the clock domain and
-> owns the clock, playhead, transport, and score (a durable **score context**,
-> `context_type="score"`, holds the materialized blocks; producers attach,
-> come, and go). So today: a **beaten** (musician) context produces into its
-> *track's* timeline, while a plain coder context owns a per-context timeline
-> exactly as described below. Read this section as the substrate — true
+> The beat lives on the **track**, not the context: the track is the clock
+> domain and owns the clock, playhead, transport, and score (a durable
+> **score context**, `context_type="score"`, holds the materialized blocks;
+> producers attach, come, and go). A **beaten** (musician) context produces
+> into its *track's* timeline; a plain coder context owns a per-context
+> timeline exactly as described below. Read this section as the substrate —
 > per-context for coders, per-track for music — with `docs/tracks.md` as the
-> implementation tracker.
+> implementation record.
 
 Each kaijutsu context (`ContextId`, a node in the fork/drift DAG) owns a timeline: its
 block log *with a temporal structure over it*. Hyoushigi does **not** invent its
@@ -372,12 +371,13 @@ hardware-clocked, never network-clocked.** The DAC's clock drives the callback; 
 kernel timebase only aligns *musical* position, and the audio path slews loosely to it.
 Network jitter never enters an audio callback.
 
-> **Reused for external clock masters (2026-06-29, `docs/midi.md`).** This same
+> **Reused for external clock masters** (`docs/midi.md`). This same
 > local-phasor + slew is the substrate for slaving a track to an *external* MIDI
 > clock (e.g. a KeyStep Pro): observe the master's pulses, fit a drift model that
 > emits `Timebase`-shaped corrections, and discipline the same local phasor — so a
-> WiFi/USB/RPC hop carries a *model*, never raw pulses. MIDI is `tracks.md` Stage 3's
-> `ClockSource`; the regenerate-locally half is here, only the estimator is new.
+> WiFi/USB/RPC hop carries a *model*, never raw pulses. MIDI clock-in is a
+> `ClockSource` (`docs/tracks.md`); the regenerate-locally half lives here, and
+> the estimator is the only new part.
 
 ### One coalescing scheduler; virtual tickers and jobs
 
@@ -548,8 +548,8 @@ queryable and well-ordered, which is exactly what writing it into the block log 
   too strict thrashes, too loose commits stale content. The first production resolver
   exists (`CasCommitResolver`) and deliberately hashes only its recipe param — its squash
   path is **dormant by design** (absolute notation: two players landing notes at one tick
-  should both commit, not cancel each other; the Stage 2 two-cast review confirmed this is
-  the feature). The open part is a basis that *reads committed state*, for a future
+  should both commit, not cancel each other — a two-cast review confirmed this is the
+  feature). The open part is a basis that *reads committed state*, for a future
   resolver that reacts to what siblings landed.
 - **Beat cadence (the residue of beat policy).** The *policy* — quantize vs. advance-now
   — is settled above; what stays open is the tuning: the beat *period* per context, and
@@ -565,12 +565,9 @@ speculation engine that has never speculated. So the first proof is a **musician
 context: the smallest thing whose clock *can't block*, so speculation, squash, and
 fallback are exercised by their first user.
 
-> **Status — as landed (rewritten to present tense 2026-07-01; the build
-> chronology lives in `docs/devlog.md` — the Tracks Stage 1/2/3 and musician
-> entries — and in this file's git history).** Steps 1–4 below are done; step
-> 5's musician half is done and its external-MIDI half is `docs/midi.md` M3;
-> step 6 is designed in `docs/pcm.md` + `docs/midi.md`. What exists, verified
-> against code:
+> **As landed** (build chronology: `docs/devlog.md`, "The music stack — from
+> one loop to a band on the wire" and "The hardware gets its own body"; this
+> file's own git history holds the rest). What exists, verified against code:
 >
 > - **The coordinate:** `Tick`/`TickDelta` in `kaijutsu-types/src/tick.rs`
 >   (+ a `trybuild` compile-fail guard on `Tick + Tick`); `tick: Option<Tick>`
@@ -606,12 +603,11 @@ fallback are exercised by their first user.
 >   **notation itself** (a validating `cas_commit` resolver commits
 >   `text/vnd.abc` at the tick); a mime-keyed **`DeriverRegistry`**
 >   (`kaijutsu-kernel/src/hyoushigi/mod.rs`) inserts derived siblings at the
->   barrier — ABC→MIDI as a `Role::Asset` block, `parent_id` = the source,
->   ≲1 ms measured; anything heavier stays a timeline resolver, never a
->   deriver. Score blocks are `ephemeral` (hydration-silent), so `KJ_HEARD` is
->   the player's *only* window onto the score — a player's memory of its own
->   output flows entirely through it (`docs/chameleon.md` § The stamp-turn
->   process model).
+>   barrier — ABC→MIDI as a `Role::Asset` block, `parent_id` = the source;
+>   anything heavier stays a timeline resolver, never a deriver. Score blocks
+>   are `ephemeral` (hydration-silent), so `KJ_HEARD` is the player's *only*
+>   window onto the score — a player's memory of its own output flows
+>   entirely through it (`docs/chameleon.md` § The stamp-turn process model).
 > - **The transport:** the beat scheduler (`kaijutsu-server/src/beat.rs`) is
 >   the single coalescing driver described above — one `(Instant, TrackId)`
 >   heap + ingress, generation tokens against stale entries. Surface:
@@ -619,46 +615,34 @@ fallback are exercised by their first user.
 >   track-scoped. The tick is **event-counted**: pause freezes musical time
 >   and resume picks up at +1 — no wall-clock catch-up, no rewind (revisiting
 >   the past is an export, not a seek). Tracks arm **stopped** (no surprise
->   token spend). The OODA (observe–orient–decide–act) loop is closed: on `turn.completed` for an
->   OODA-armed attachment, the scheduler validates the model's ABC and
->   schedules a notation cell **one phrase ahead** (`beats_per_phrase` on the
->   policy; `phrase_delta()`/`is_phrase_boundary()` are the consumers). Clock
->   sources are pluggable behind `ClockSourceKind`
->   (`kaijutsu-server/src/clock.rs` — `SystemClock` today, the drift-modeled
->   MIDI source at `docs/midi.md` M3), and committed cells publish as
->   `RenderCue`s consumed by the app sink (`docs/pcm.md` 5c; the in-process
->   `RenderTarget`/`render.rs`/`kj transport render` path was demolished
->   2026-07-02).
+>   token spend). The OODA (observe–orient–decide–act) loop is closed: on
+>   `turn.completed` for an OODA-armed attachment, the scheduler validates the
+>   model's ABC and schedules a notation cell **one phrase ahead**
+>   (`beats_per_phrase` on the policy; `phrase_delta()`/`is_phrase_boundary()`
+>   are the consumers). Clock sources are pluggable behind `ClockSourceKind`
+>   (`kaijutsu-server/src/clock.rs` — `SystemClock`, and the drift-modeled
+>   `ModeledClock` for an external MIDI master, `docs/midi.md`), and committed
+>   cells publish as `RenderCue`s: `kaijutsu-audiod` (the DJ thread in
+>   `kaijutsu-audio-runtime`) is the hardware sink, and the app consumes the
+>   same cue stream only to drive its own display — the app itself has no
+>   hardware I/O (`docs/audio-daemon.md`).
 >
 > **Not yet:** the UI timeline render + transport buttons/spacebar + a capnp
-> transport surface (today `kj transport` is the only surface); external-MIDI
-> clock discipline (`docs/midi.md` M3); disarm-on-archive and the cold-start
-> re-attach sweep (restart resets to stopped; re-attach is manual, and arming
-> is restart-safe by construction — playhead and committed log rehydrate from
-> the score context); a richer `compute_basis` / section-placement policy
-> (cells schedule a fixed phrase ahead); a `Midi` `ContentType` render
-> variant; audio (step 6 — `docs/pcm.md`); the `hyoushigi.tick` span
-> attribute on the materialize→insert spans.
+> transport surface (today `kj transport` is the only surface); disarm-on-
+> archive and the cold-start re-attach sweep (restart resets to stopped;
+> re-attach is manual, and arming is restart-safe by construction — playhead
+> and committed log rehydrate from the score context); a richer
+> `compute_basis` / section-placement policy (cells schedule a fixed phrase
+> ahead); a `Midi` `ContentType` render variant. Other open work:
+> `docs/issues.md`, "Hyoushigi / Musician — open remainder".
 
-1. ✅ **Generalize position first** — land the `Tick` / `TickDelta` split as the
-   logical-coordinate-with-pluggable-binding generalization, per the spec'd algebra under
-   "PPQ is resolution." Both `i64` newtypes in `kaijutsu-types`; the binding is stubbed.
-   TDD: assert the arithmetic, plus a compile-fail check (`trybuild`) that `Tick + Tick`
-   is rejected. Per-context PPQ rides on the binding, not the coordinate.
-2. ✅ **Create the crate** `crates/kaijutsu-hyoushigi`, depending on `kaijutsu-cas` for
-   content refs and on the block model for materialization. (New surface — the doc no
-   longer assumes anything is latent in the block model; see "the reuse is structural.")
-3. ✅ **Plumb materialization** — committed cells → blocks. This is where the open data-model
-   questions get answered, not deferred: `order_key`-vs-`tick`, and `content`/`output`/
-   `ContentType` vs. `ContentRef`. Single-writer to start, so the write-barrier problem
-   is sidestepped (and gated before any collaborative timeline).
-4. ✅ **First proof — musician-lite.** A context driven by a minimal *internal* beat (no
-   external MIDI yet) whose playhead can't block, one `Resolver`, and a real
-   speculate→commit-or-squash→fallback loop against a first `compute_basis`. This forces
-   the hard core to actually run. (The UI timeline render is the one piece still open.)
-5. ◐ **Real musician** — the musician `context_type` (rc scripts, tool policy) and the
-   ABC path (`kaijutsu-abc` via the `DeriverRegistry`) landed — a local model played the
-   room live 2026-06-30; disciplining the beat to an *external* MIDI clock is
-   `docs/midi.md` M3.
-6. **Then the fast end** — audio drivers (hardware-clocked, `docs/pcm.md`), and the
-   distributed timebase for clients that need to follow a track's beat.
+The coordinate (`Tick`/`TickDelta`), the engine crate, materialization into
+blocks, and a musician-lite proof (an internal beat, one `Resolver`, a real
+speculate→commit-or-squash→fallback loop) all landed in that order — position
+first, because a coding-only proof never runs the speculative apparatus at
+all. The real musician followed: the `context_type` (rc scripts, tool
+policy), the ABC path through the `DeriverRegistry`, and disciplining the
+beat to an external MIDI clock (`docs/midi.md`) are all built, per the
+"As landed" status above. Audio drivers (`docs/pcm.md`) and MIDI hardware I/O
+(`docs/audio-daemon.md`) are hardware-clocked, live outside this crate, and
+consume the same `RenderCue` wire cue this engine emits.

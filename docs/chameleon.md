@@ -3,11 +3,13 @@
 > **Living document.** This is how the band works *right now* — the
 > load-bearing facts a new player or session needs, kept current as the
 > instrument grows. Code is truth: when this doc and the kernel disagree, the
-> doc is wrong; fix it. Last rework 2026-08-16 (tempo map + jam plan).
-> Companions: `docs/tracks.md` (the track substrate), `docs/midi.md` (clock
-> doctrine + the wire), `docs/pcm.md` (samples on the same seam),
-> `docs/midi-next.md` (device profiles + `kj midi`), `docs/hyoushigi.md` (the
-> `Cell`/timeline primitive).
+> doc is wrong; fix it. History of how this arrived lives in `docs/devlog.md`
+> ("The music stack", "The beat learns to carry its own clock", "The hardware
+> gets its own body"). Companions: `docs/tracks.md` (the track substrate),
+> `docs/midi.md` (clock doctrine + the wire), `docs/pcm.md` (samples on the
+> same seam), `docs/midi-next.md` (device profiles + `kj midi`),
+> `docs/hyoushigi.md` (the `Cell`/timeline primitive), `docs/audio-daemon.md`
+> (the hardware I/O node — MIDI and PCM I/O live there, not in the app).
 
 ## The instrument in one paragraph
 
@@ -60,44 +62,40 @@ Doctrine, from `docs/midi.md`: **a clock you don't own drifts — model it, neve
 chase it.** The kernel runs a tight *local* clock per track; an external master
 is observed and modeled, and only low-rate *references* (never pulses) cross
 the wire. And the one timebase: every cue's `at` derives from the **scheduled**
-beat grid, never a wakeup wallclock (`docs/midi.md` "The relative-lead timebase,
-analyzed"; `docs/pcm.md` "Timing rides the one timebase").
+beat grid, never a wakeup wallclock (`docs/midi.md` "The one timebase";
+`docs/pcm.md` "Timing rides the one timebase").
 
 Two drivers, switchable per track with `kj transport clock --track <t>`:
 
 - **`system`** — a local fixed-tempo timer (`SystemClock`, `now + period`).
   Set it with `kj transport tempo --track <t> <bpm>`. Everything starts here.
 - **`modeled`** — phase-locked to an observed external MIDI master
-  (`ModeledClock`, `docs/midi.md` M3, landed 2026-07-06). An edge observer (the
-  app's "ear") learns the master's tempo + phase + drift and ships low-rate
-  `ClockEstimate` references; the track free-runs at its last tempo until the
-  first reference arrives, then **fires on the master's integer beats** with
-  slew-limited corrections, a loud starvation warn if references go quiet, and
-  a 5 s stale-drop on the receiving end. The current period carries over on the
-  switch; `kj transport tempo` while slaved is an honest manual nudge — the
-  master then re-corrects.
+  (`ModeledClock`, `docs/midi.md` "Distribute tempo, not pulses"). The node
+  owning the master's USB runs the "ear" (`kaijutsu-audio-runtime`'s capture
+  thread — `docs/audio-daemon.md`), which learns tempo + phase + drift and
+  ships low-rate `ClockEstimate` references; the track free-runs at its last
+  tempo until the first reference arrives, then **fires on the master's
+  integer beats** with slew-limited corrections, a loud starvation warn if
+  references go quiet, and a 5 s stale-drop on the receiving end. The current
+  period carries over on the switch; `kj transport tempo` while slaved is an
+  honest manual nudge — the master then re-corrects.
 
-**How the rack's tempo reaches the kernel — the map (verified 2026-08-16):**
+**How the rack's tempo reaches the kernel:**
 
-| Path | Status | Evidence |
-|---|---|---|
-| Read it off the gear → `kj transport tempo --track <t> <bpm>` | **WORKS TODAY** | system clock, shipped since 2026-06-30 |
-| Record a few bars → `kj audio beats <file>` → set the measured BPM | **WORKS TODAY** | Beat This! (ISMIR 2024) via the pure-Rust `beat-this` crate; models in `~/.local/share/kaijutsu/models/beat-this/`; verified live (120 BPM click → `bpm=120.0`) |
-| Live MIDI clock-in: rack → app ear → estimator → RPC → `modeled` track | **BUILT — NEEDS A WIRE** | `kaijutsu_audio::clockin::ClockEstimator` (`crates/kaijutsu-audio/src/clockin.rs` — EMA tempo, phase-exact pulse counting, dropout recount, stall flags); app pre-ring tap + `ship_clock_estimates` (`kaijutsu-app/src/midi_in.rs:306`); kernel `BeatRequest::ClockEstimate` (`kaijutsu-server/src/beat.rs:2423`, track resolved by the seat's attachment) → `ModeledClock::apply_estimate` (`clock.rs:154`) |
+| Path | Evidence |
+|---|---|
+| Read it off the gear → `kj transport tempo --track <t> <bpm>` | system clock |
+| Record a few bars → `kj audio beats <file>` → set the measured BPM | Beat This! (ISMIR 2024) via the pure-Rust `beat-this` crate; models in `~/.local/share/kaijutsu/models/beat-this/`; verified live (120 BPM click → `bpm=120.0`) |
+| Live MIDI clock-in: rack → daemon's ear → estimator → RPC → `modeled` track | `kaijutsu_audio::clockin::ClockEstimator` (`crates/kaijutsu-audio/src/clockin.rs` — EMA tempo, phase-exact pulse counting, dropout recount, stall flags); the daemon's capture thread ships estimates (`kaijutsu-audio-runtime/src/runtime.rs`, `report_clock_estimate`); kernel `BeatRequest::ClockEstimate` (`kaijutsu-server/src/beat.rs:2425`, track resolved by the seat's attachment) → `ModeledClock::apply_estimate` (`clock.rs:154`) |
 
-The missing wire for live clock-in is **operational, not code**: the app must
-run on the box that owns the rack's USB (moltar), its session attached to a
-`modeled` track, and the master must send MIDI clock on the bus the app hears.
-zorak itself cannot hear MIDI today — no reachable `/dev/snd` (`aconnect -l` →
-permission denied, `amidi -l` → no sound card, PipeWire down, TiMidity service
-inactive). moltar is reachable on the tailnet (sub-ms ping) but its app status
-is unverifiable from zorak. The `ear` track (modeled, 338 BPM, dormant) is
-evidence the path was exercised at least once — provenance unconfirmed.
-
-Until the live wire is proven, the jam procedure is: **read the tempo off the
-gear, set it on the track, and optionally verify with `kj audio beats`** on any
-recording of the rack. Measure, don't receive — the modeled lock is a bonus,
-not a prerequisite.
+Live clock-in needs `kaijutsu-audiod` running on the box that owns the rack's
+USB, its capture context attached to a `modeled` track, and the master
+sending MIDI clock on the bus the daemon hears — `kj audio devices --node
+audio/<host>` (`docs/audio-daemon.md`) shows whether a node can currently see
+the rack. Until that's confirmed for a given room, the jam procedure is:
+**read the tempo off the gear, set it on the track, and optionally verify
+with `kj audio beats`** on any recording of the rack. Measure, don't receive
+— the modeled lock is a bonus, not a prerequisite.
 
 ## Players — a context_type is an rc bundle
 
@@ -138,10 +136,10 @@ player role exactly the shape small models are good at.
 ## The score & the sound
 
 - **Notation is the score; MIDI is a render of it.** Committed cells are
-  `text/vnd.abc`; the sink renders ABC→MIDI *at the sink*
-  (`kaijutsu-app/src/midi.rs`), scheduling into its local ALSA queue at
-  `receipt + lead` — the speculation lead is the jitter buffer, and intra-phrase
-  timing is sub-ms off one anchor.
+  `text/vnd.abc`; `kaijutsu-audiod` renders ABC→MIDI *at the sink*
+  (`kaijutsu-audio-runtime/src/dj/midi.rs`), scheduling into its local ALSA
+  queue at `receipt + lead` — the speculation lead is the jitter buffer, and
+  intra-phrase timing is sub-ms off one anchor.
 - **Phrases, not bars, in the kernel**: `beats_per_phrase` on the track policy
   (16 or 32 in practice); barlines are a notation/human affordance translated at
   the edge.
@@ -150,14 +148,14 @@ player role exactly the shape small models are good at.
 - **Samples ride the same seam**: a clip cell
   (`application/vnd.kaijutsu.clip+json`, `kj play --track`) renders like ABC
   through the same `RenderCue` (`docs/pcm.md`). The mime IS the dispatch key.
-- **Hearing** (M2, landed 2026-07-06): the app's ear captures incoming MIDI,
-  stamps it with ALSA receipt time, and batches it to the kernel as score
-  blocks (telemetry, not realtime). Device knowledge lives in profiles
-  (`/config/midi/devices/`, `kj midi list/show/send/identify/panic`); device
-  contexts are **side channels** — they tweak the gear while the band plays,
-  never on the beat (`docs/midi-next.md`).
+- **Hearing**: `kaijutsu-audiod`'s ear captures incoming MIDI, stamps it with
+  ALSA receipt time, and batches it to the kernel as score blocks (telemetry,
+  not realtime). Device knowledge lives in profiles (`/config/midi/devices/`,
+  `kj midi list/show/send/identify/panic`); device contexts are **side
+  channels** — they tweak the gear while the band plays, never on the beat
+  (`docs/midi-next.md`).
 
-## When a player needs permission (2026-08-21, designed not built)
+## When a player needs permission (designed, not built)
 
 The beat model has an answer for a turn that is *slow* — the grid fires anyway,
 the vamp covers, `UseLastGood` holds the floor. It has no answer for a turn that
@@ -188,7 +186,8 @@ no human turn — that reads the tool plan and the classifier's signals and
 *prepares* the ask, writing a clear description and a recommendation. It does
 not decide; a human still answers. A cast slot is keyed by `context_type`, so
 casting that seat is a config line, exactly like casting a chair. Full record
-and the open pieces: `docs/issues.md`, "The escalation seat".
+and the open pieces: `docs/issues.md`, "The escalation seat: a small model
+that prepares the ask".
 
 Nothing here contradicts the beat doctrine — a musician on the grid should
 never hold a capability that can escalate in the first place. This is for
@@ -198,7 +197,7 @@ players whose work is not quantized.
 
 - **Per-track MIDI channel + per-track flush** — the sink is whole-queue today:
   every cue plays on MIDI channel 0 and stop flushes everything. Two tracks
-  sounding at once collide (`docs/midi.md` open questions).
+  sounding at once collide (`docs/midi.md`).
 - **`$HEARD` as a real kaish array + push→pull** — still the stopgap JSON
   string.
 - **Quantized mailbox flush** — async inbound events digest on the grid
@@ -213,33 +212,15 @@ players whose work is not quantized.
   shipped, traps designed.
 - **Archive RPC** — closed segments have no archive verb yet.
 
-## Today's jam plan (2026-08-16)
+## Starting a jam
 
-Cast: **Amy's hands + the rack** (moltar — the master clock), **kaijutsu-chan**
-(me — arranger/bass), **TiMidity on zorak** (FF4 soundfont — the kaijutsu
-voice, IF the zorak audio stack comes up: `systemctl --user start pipewire
-wireplumber timidity`, then verify with `aconnect -l`; otherwise the rack
-sounds alone and the score plays silent-until-a-sink, which is correct), **the
-kernel** (transport).
-
-- **One track**: `jam`, 16-beat phrases, `system` clock to start.
-- **Tempo source**: read the clock off the gear (KSP display / rack clock
-  module) → `kj transport tempo --track jam <N>`; verify with `kj audio beats`
-  on a short recording when we have one; upgrade to `kj transport clock --track
-  jam modeled` the moment the app's ear on moltar is confirmed — the wire we
-  most want to prove today.
-- **Who plays what**: the rack lays down the groove (Amy's hands + its
-  sequencer); the bassist context writes the bass — the Chameleon vamp
-  (B♭m7–E♭7) if the rack sits in a friendly key, else a two-note drone under
-  whatever it is doing; I steer phrases and keep the loop honest; TiMidity
-  voices the score.
-- **The first loop**: one bar of rack groove + a two-bar bass phrase. Loop =
-  rack + bass.
-- **First thing when the rack comes up**:
-  1. Power the rack; let its clock run. Amy tells me the BPM (or I measure).
-  2. Bring up the zorak voice (pipewire + timidity) and check `aconnect -l`.
-  3. Create the player: `kj context create --type bassist --name jam` (the
-     create rc attaches it to track `jam`, stopped).
-  4. `kj transport tempo --track jam <N>`; `kj transport play --track jam`.
-  5. I seed the first phrase (`kj drive --prompt` on the bassist), then listen:
-     the vamp locks to the rack and we play.
+1. Create the track and player: `kj context create --type bassist --name
+   <track>` (the create rc attaches it to the track, stopped).
+2. Set the tempo: read it off the gear (or a rack's clock module) →
+   `kj transport tempo --track <track> <bpm>`; verify with `kj audio beats`
+   on a short recording if unsure. Upgrade to `kj transport clock --track
+   <track> modeled` once `kj audio devices` confirms the daemon can hear the
+   rack's clock.
+3. `kj transport play --track <track>`, then seed the first phrase with
+   `kj drive --prompt` on the player. The vamp (`UseLastGood`, or the house
+   first-loop above) covers until the band locks in.

@@ -1,20 +1,17 @@
 # トラック tracks — the beat belongs to the track, not the player
 
-> **Status:** SHIPPED — Stages 1–3 M1 landed 2026-06-29/30 (clock on the track,
-> score on the track, `ClockSource` generalised + first sound out the door). This
-> doc states the design as built; `docs/devlog.md` ("The music stack") carries the
-> build story and git history keeps the stage-by-stage trackers and review logs.
-> Companions: `docs/hyoushigi.md` (the `Tick`/`Timeline` primitive underneath),
-> `docs/chameleon.md` (the music application on top), `docs/midi.md` (network/drift
-> clock design + the M2–M4 roadmap), `docs/pcm.md` (the render/wire-cue side),
-> `docs/shared-state.md` (the `/run` substrate a probe attachment writes).
->
-> **Update:** the `Modeled` clock (M3) is no longer future work — it shipped with a
-> full body, a live MIDI-in → `apply_estimate` producer, and `kj transport clock
-> <track> modeled` as the selector; see "Clock sources" below. **Ahead** (per
-> `docs/midi.md` / `docs/midi-next.md`, the live roadmap): M4 cross-node + the edge
-> node. Also deferred: the cold-start re-arm sweep (a kernel restart resets tracks
-> to stopped).
+This doc states the design as built — `docs/devlog.md`, "The music stack —
+from one loop to a band on the wire", carries how it got here. Companions:
+`docs/hyoushigi.md` (the `Tick`/
+`Timeline` primitive underneath), `docs/chameleon.md` (the music application
+on top), `docs/midi.md` (network/drift clock design), `docs/midi-next.md`
+(device routing), `docs/pcm.md` (the render/wire-cue side),
+`docs/audio-daemon.md` (the hardware node that owns rendering today),
+`docs/shared-state.md` (the `/run` substrate a probe attachment writes).
+
+Open: the cold-start re-arm sweep (a kernel restart resets tracks to
+stopped, and cross-restart counter durability) — no `docs/issues.md` entry
+yet, so recorded here until one exists.
 
 ## The insight
 
@@ -140,16 +137,16 @@ persisted `clock_kind` column):
 - **`System(SystemClock)`** — a wall-period timer at a tempo. `next_fire(last,
   now)` returns `now + period`; `set_period` is the tempo knob. The default
   variant (tracks arm on it unless `Modeled` is selected).
-- **`Modeled` (`ModeledClock`, `kaijutsu-server/src/clock.rs`)** — the MIDI/drift-
-  modeled clock, live since M3 (2026-07-06). A `ClockSource` is a *proxy* for a
-  clock that may be *remote* and *drift-modeled*: `crates/kaijutsu-app/src/midi_in.rs`
-  observes the master and reports `{beat, tempo}` estimates over
-  `reportClockEstimate`, `beat.rs::apply_clock_estimate` folds them into
-  `ModeledClock::apply_estimate` (tempo slew-limited, phase slewed or re-anchored
-  on a seek), and the kernel regenerates a tight local clock phase-locked to that
-  estimate. Free-runs like `SystemClock` until the first reference lands; select it
-  with `kj transport clock <track> modeled`. Distribute tempo and intent, never
-  pulses.
+- **`Modeled` (`ModeledClock`, `kaijutsu-server/src/clock.rs`)** — the MIDI/
+  drift-modeled clock. A `ClockSource` is a *proxy* for a clock that may be
+  *remote* and *drift-modeled*: `kaijutsu-audio-runtime/src/midi_in.rs`
+  (`kaijutsu-audiod`, `docs/audio-daemon.md`) observes the master and reports
+  `{beat, tempo}` estimates over `reportClockEstimate`,
+  `beat.rs::apply_clock_estimate` folds them into `ModeledClock::apply_estimate`
+  (tempo slew-limited, phase slewed or re-anchored on a seek), and the kernel
+  regenerates a tight local clock phase-locked to that estimate. Free-runs like
+  `SystemClock` until the first reference lands; select it with `kj transport
+  clock <track> modeled`. Distribute tempo and intent, never pulses.
 - **arbitrary external signals** — solar-power peaks, compute-availability
   cycles, "good cluster / bad cluster." The track is the seam between an
   exogenous beat and whoever's attached: the world beats the track, the track
@@ -160,10 +157,11 @@ generative-local — the scheduler's `BinaryHeap<(Instant, TrackId)>`, the
 generation/stale-drop logic (a `stop` then `play` within one period never
 double-beats; `play` bumps a generation token that invalidates stale heap
 entries), and zero-CPU idle all survive every clock kind. A drift clock corrects
-an out-of-band estimate; it never streams pulses at the kernel. At M3,
-`apply_estimate` returning "fire moved earlier" must bump the generation and push
-a fresh heap entry so the scheduler doesn't sleep through a forward phase
-correction — the trait is already shaped for it.
+an out-of-band estimate; it never streams pulses at the kernel. Open: when
+`apply_estimate` moves a fire earlier, the scheduler needs to bump the
+generation and push a fresh heap entry so it doesn't sleep through a forward
+phase correction — the trait is already shaped for it, but no scheduler-side
+hookup was found in `beat.rs::apply_clock_estimate` as of this doc.
 
 **`clock_kind` is MUTABLE and persisted per driver swap.** A track's *identity*
 is durable but its clock *source* is circumstantial: you sketch on the system
@@ -206,7 +204,7 @@ convention, cf. `KJ_PARENT_BLOCK_COUNT`):
 | `KJ_PULSE` | per-attachment monotonic counter | ordering key *within a run* (resets on restart — the documented contract, consistent with conversation re-hydration) |
 | `KJ_EPOCH_NS` | wall clock, latched once per beat | human "when" + cross-context join — identical for every context woken on the same beat |
 
-`KJ_EPOCH_NS` (phase-align, Slice 1): the value is the beat's **scheduled**
+`KJ_EPOCH_NS` (phase-align): the value is the beat's **scheduled**
 wallclock, not the actual wakeup's. `fire_due` computes it by back-dating the
 raw `SystemTime::now()` reading by however late the actual wakeup ran against
 the grid's own deadline (`last_fire_scheduled`) — so within the catch-up cap
@@ -354,14 +352,13 @@ durability lands with the deferred cold-start re-arm sweep.
 
 Rendering the score to sound is **not the track's job**. A mime-keyed
 `RenderCue { mime, payload, lead }` is published at the materialize crossing and
-consumed by an off-box sink — the app first, which renders `text/vnd.abc` → MIDI
-and schedules into its local ALSA seq port at `receipt + lead`. The speculation
-lead IS the jitter buffer. See `docs/pcm.md` (5c) and `docs/midi.md`; `kj play
-<file.abc>` is the standalone trigger. (An in-process first cut —
-`RenderTarget`/`AlsaMidiOut`/`kj transport render` — shipped with Stage 3 M1 and
-was demolished 2026-07-02 when render moved to the wire; git history holds that
-design record. The seam's *home on the track* — render fed from the materialize
-crossing, as a score consumer, never a producer — survived the move exactly.)
+consumed by an off-box sink: `kaijutsu-audiod` renders `text/vnd.abc` → MIDI and
+schedules into its local ALSA seq port at `receipt + lead` (`docs/audio-daemon.md`
+— the kernel and the app own no hardware I/O). The speculation lead IS the
+jitter buffer. See `docs/pcm.md` and `docs/midi.md`; `kj play <file.abc>` is the
+standalone trigger. The seam's home on the track — render fed from the
+materialize crossing, as a score consumer, never a producer — is unchanged from
+the design; how it got here is `docs/devlog.md`, "The music stack".
 
 The ABC crate exposes the per-event stream a renderer needs:
 `kaijutsu-abc/src/midi.rs::events(tune, params) -> Vec<MidiEvent>`, with

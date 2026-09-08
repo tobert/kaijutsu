@@ -1,23 +1,19 @@
 # MIDI — the clock drifts; we model it, we don't chase it
 
-Current hardware ownership: `kaijutsu-audiod` connects to the kernel over SSH
-and runs the Bevy-free `kaijutsu-audio-runtime`. It is the sole hardware
-owner; the app has no hardware I/O. See `docs/audio-daemon.md`. The
-milestone notes below describe the earlier design.
-
-> **Status:** design direction, captured 2026-06-29 in a co-design session
-> (Amy + Claude). Decisions are *directions*, not commitments — code is truth,
-> this is where we're aiming. **M1 shipped 2026-06-30**; its in-process render
-> half was **demolished 2026-07-02** when render became a wire cue to the app
-> sink (`docs/pcm.md` 5c — `kj play <file.abc>` is the trigger; `kj transport
-> render` no longer exists). M2–M4 are future work. Companions: `docs/tracks.md`
-> (the clock-domain substrate;
-> MIDI is its Stage 3 `ClockSource` + a render target — Stage 3 M1 landed on
-> the decisions below), `docs/chameleon.md` (the music application — "MIDI is
-> a render of the score"), `docs/hyoushigi.md` (the `Tick`/`Timeline` primitive
-> and the speculation lead this leans on), `docs/pcm.md` (the samples half:
-> PCM through the same render seam), `docs/shared-state.md` (the `/run`
-> substrate a probe writes).
+`kaijutsu-audiod` connects to the kernel over SSH and runs the Bevy-free
+`kaijutsu-audio-runtime`. It is the sole hardware owner — MIDI in/out, PCM
+playback, clock estimation — and the app has no hardware I/O. See
+`docs/audio-daemon.md` for the daemon itself. This document is the design
+doctrine the daemon implements: the real-time stance, the wire-cue
+mechanism, and the one-timebase rules. History of how it got here —
+`docs/devlog.md`, "The music stack", "The beat learns to carry its own
+clock", and "The hardware gets its own body".
+Companions: `docs/tracks.md` (the clock-domain substrate; MIDI is a
+`ClockSource` plus a render target), `docs/chameleon.md` (the music
+application — "MIDI is a render of the score"), `docs/hyoushigi.md` (the
+`Tick`/`Timeline` primitive and the speculation lead this leans on),
+`docs/pcm.md` (the samples half: PCM through the same render seam),
+`docs/midi-next.md` (device profiles and channel bindings).
 
 ## The insight
 
@@ -94,8 +90,8 @@ A NoteOn is 3 bytes; on idle wired 1G/2.5G through the Ubiquiti switch transit i
 
 **1. Output: the speculation lead *is* the network jitter buffer.** `hyoushigi`
 already stages content *ahead* of the playhead (`speculate_at = start −
-beats_for(lead_time)`); the `tracks.md` Stage-1 rotation-gap argument already
-leans on it. So the node that owns the MIDI out receives the *committed* score
+beats_for(lead_time)`); `tracks.md`'s "Rotation is a gap, not an overlap"
+already leans on it. So the node that owns the MIDI out receives the *committed* score
 over RPC (non-realtime, loss-tolerant, retryable) and schedules NoteOn events
 **locally** into the ALSA sequencer queue against its local clock. The network
 only has to deliver **ahead of time**, never **just in time**. The DAC never sees
@@ -131,8 +127,8 @@ realtime transport, no jitter budget — just timestamped chunks landing as scor
 The one principle to lock: **the wire carries *intent* (tempo, transport
 Start/Continue/Stop = MIDI realtime `FA`/`FB`/`FC`, occasional bar/beat
 phase-align points); the node near the gear carries *timing* (regenerates the
-fine clock locally).** This is the natural shape of `tracks.md` Stage 3's
-`ClockSource` trait — **a MIDI clock source is a *proxy* for a clock that lives
+fine clock locally).** This is the natural shape of `tracks.md`'s
+`ClockSource` trait ("Clock sources") — **a MIDI clock source is a *proxy* for a clock that lives
 on an edge node**, and it can be *remote* and *drift-modeled*. Design the trait
 so a clock source can be remote + estimate-driven and the whole network story
 slots in without touching attachments. (RTP-MIDI's own clock-sync covers the rare
@@ -159,79 +155,55 @@ No new abstractions — MIDI in/out reduce to `tracks.md` primitives:
   attachment writing the score, not new machinery.
 - **Publish to the bus** = a **render target.** `chameleon.md` already says "MIDI
   is a render of the score"; MIDI-**out**-to-hardware is just another renderer
-  alongside app-display and audio-samples. The score stays symbolic (ABC + data);
-  a **wire sink** renders committed cells to hardware — see "Render is a wire cue"
-  below for where that sink lives and why it's off the kernel.
+  alongside audio-samples, both hosted by `kaijutsu-audiod` — see "Render is a
+  wire cue" below for the mechanism.
 
 So MIDI input and output are both "a track with a clock source / render target
-that happens to live on a node." Which makes the MIDI edge node **the first
-kernel-owned compute node** — the resource-offered-wholly-owned-by-the-kernel
-fleet idea, deliberately scoped down to one well-defined resource (ALSA MIDI +
-a realtime scheduler). Building it prototypes that future, small.
+that happens to live on a node." Which makes an audio node **a kernel-owned
+compute node** — the resource-offered-wholly-owned-by-the-kernel fleet idea,
+scoped to one well-defined resource (ALSA MIDI + PCM + a realtime scheduler).
 
-## Render is a wire cue; the sink owns the hardware (2026-07-01; LANDED 2026-07-02)
+## Render is a wire cue; the sink owns the hardware
 
-> **Status: shipped (PCM slice 5c, live on zorak).** The app is the MIDI sink;
-> the materialize crossing publishes `RenderCue`s; the in-process `AlsaMidiOut` +
-> `RenderTarget` trait + the server `alsa` dep are demolished. Below is the
-> design as decided; the headless edge-node sink (M4) is the remaining piece.
+The real-time stance says in-process hardware emit buys nothing the lead
+doesn't already buy: timing precision comes from scheduling into a *local*
+device queue ahead of time, and any sink — including one across the wire —
+has a local queue. So hardware emit lives off the kernel entirely, in the
+sink: `kaijutsu-audiod`, today. The kernel stays what it always was — a
+durable orchestrator with no audio FFI.
 
-M1 shipped MIDI-out **in-process** — `AlsaMidiOut` in `kaijutsu-server` opened an
-ALSA seq port and scheduled NoteOns locally. The real-time stance says that was a
-convenience, not a requirement: in-process buys nothing the lead doesn't already
-buy, because timing precision comes from scheduling into a *local* device queue
-ahead of time, and any sink — including one across the wire — has a local queue.
-So the direction (decided 2026-07-01, with `docs/pcm.md`) is to **move the
-hardware emit off the kernel/server binary entirely** and make it a *wire sink*:
-the app first (it already renders samples this way — `pcm.md` slice 3), a
-headless edge-node agent later. The server binary sheds its `alsa` dependency;
-the kernel stays what it always was — a durable orchestrator with no audio FFI.
-
-**MIDI and samples become one path.** A render is a **mime-keyed symbolic cue**
+**MIDI and samples are one path.** A render is a **mime-keyed symbolic cue**
 scheduled on the lead. The committed score stays symbolic (ABC / a clip record,
 `docs/pcm.md`); what crosses to the sink is a small cue, never the score:
 
-- **`RenderCue { mime, payload, lead }`** — `payload` is inline symbolic content
-  or a CAS ref; `lead` is a *relative* `Duration` (a process-local `Instant`
-  can't cross the wire), and the sink schedules at `receipt + lead`. This
-  generalizes slice-3's play-now `PlayAudio` directive. An ABC/MIDI cue and a
-  clip cue are the same directive with different mimes; the sink dispatches by
-  mime. This is the wire form of `tracks.md`'s in-process `RenderTarget` seam,
-  which dissolves into it as the sink moves off-box.
+- **`RenderCue { mime, payload, lead, epoch_ns }`** — `payload` is inline
+  symbolic content (`text/vnd.abc`, a clip mime, `RENDER_FLUSH_MIME`) or a CAS
+  ref; `lead` is a *relative* `Duration` (a process-local `Instant` can't
+  cross the wire); `epoch_ns` is the emission wallclock (see "The one
+  timebase" below). The sink schedules at `receipt + lead`, back-dated by the
+  cue's age. An ABC/MIDI cue and a clip cue are the same directive with
+  different mimes; the sink dispatches by mime.
 
-**Three phases, each its own micro-batch** — the pipeline named so we can move a
-phase without a rewrite:
+**Three phases, each its own micro-batch** — the pipeline named so a phase can
+move without a rewrite:
 
 1. **Compose** — a producer turn commits an ABC (or clip) cell on the track. The
    score. Micro-batch = the OODA phrase.
 2. **Render** — `abc→midi` (or clip→resolved-sample). Near-**pure CPU**: no
-   hardware, only a CAS read. Its *placement is flexible* — kernel, sink, or a
-   compute node — and naming it a distinct phase is what lets us relocate it.
-   **For now it stays kernel/server-side** (reuse the proven
-   `kaijutsu_abc::midi::events`): the server renders `abc→midi` and the cue
-   carries the timed MIDI events, so the app sink stays dumb (queue events, no
-   ABC crate). Later we may ship the ABC symbolically and render at the sink —
-   the cue's mime says which, and a sink advertises the mimes it can consume vs.
-   needs pre-rendered.
+   hardware, only a CAS read. It runs at the sink today
+   (`kaijutsu-audio-runtime/src/dj/midi.rs`, reusing `kaijutsu_abc::midi::events`)
+   — the cue carries the raw ABC text (`text/vnd.abc`), not pre-rendered
+   events, so the kernel needs no ABC crate on its own render path.
 3. **Emit** — the sink schedules the cue into its local hardware queue at
-   `receipt + lead` (ALSA seq for MIDI, `bevy_audio`/ALSA-PCM for samples).
-   Micro-batch = the scheduled play-out. `AlsaMidiOut` splits along this phase
-   boundary: its *render* half (abc→events) stays server-side for now; its *emit*
-   half (events → ALSA-seq queue on the lead) moves to the sink.
+   `receipt + lead` (ALSA seq for MIDI, PipeWire for samples). Micro-batch =
+   the scheduled play-out.
 
-**MIDI becomes sink-dependent, and that is fine.** With the emit off-box, a track
-whose clock is rolling with no sink attached makes no sound — exactly like
-samples today. That is correct, not a regression: **the track is preserved** (its
-committed score is durable, `KJ_HEARD`-queryable, replayable), so silence-now is
-never lost work — attach a sink later and replay. The kernel (a headless systemd
-service) never needs an audio stack to keep a band playing into the score.
-
-**The app is the first MIDI sink — so the edge node (M4) is not a prerequisite.**
-Getting MIDI off the server no longer waits on the node-agent RPC model: the app
-proves the whole wire-cue path on zorak (app renders/queues MIDI → ALSA seq →
-`aconnect` → TiMidity, same box, no capability loss). The edge-node agent then
-becomes *just another sink* speaking the same cue protocol — and it is the
-**headless** sink for *everything*, MIDI and PCM alike, not a PCM-only errand.
+**MIDI is sink-dependent, and that is fine.** A track whose clock is rolling
+with no sink attached makes no sound — exactly like samples. That is correct,
+not a regression: **the track is preserved** (its committed score is durable,
+`KJ_HEARD`-queryable, replayable), so silence-now is never lost work — attach
+a sink later and replay. The kernel (a headless systemd service) never needs
+an audio stack to keep a band playing into the score.
 
 ## The relative-lead timebase, analyzed (2026-07-02)
 
@@ -280,22 +252,15 @@ slew limiting, phase-slew-not-step, reference-jitter outlier rejection. The full
 findings list (incl. the `beat.rs:940` random-walk cadence one-liner and the PCM
 guardrails) lives in `docs/issues.md` → Hyoushigi / Musician.
 
-## The one timebase — emission stamps, back-dating, and the locked phasor (2026-07-15)
+## The one timebase — emission stamps, back-dating, and the locked phasor
 
-**The validator fired.** The metronome slice above was built to *measure*
-divergence between the per-cue trigger path and the continuous timebase, and on
-2026-07-15 it did its job twice in one day, by ear (Amy) and then by port tap:
-
-1. First the click itself burst-and-starved while the bass stayed even —
-   references were queuing behind a turn's block flood, then flooding, and the
-   receiver folded every buffered reference at one frame-`now`. That landed the
-   first half of this doctrine (`BeatRef.epochNs` + receiver back-dating).
-2. Then, with the click honest, click and bass **wandered apart** — exactly the
-   boundary-jitter failure the 2026-07-02 correction predicted: the cue's
-   `receipt + lead` anchor *passes arrival jitter through*, one ΔL per phrase,
-   while the click now tracked kernel-true time.
-
-What those two findings hardened into, stated as doctrine:
+The metronome slice above exists to *measure* divergence between the per-cue
+trigger path and the continuous timebase; it found real divergence twice in
+one day (`docs/devlog.md`, "The beat learns to carry its own clock") — a
+click burst-and-starve from buffered references folding at one frame-`now`,
+then click and bass wandering apart from the boundary-jitter the "relative-lead
+timebase" correction above predicted. What those findings hardened into,
+stated as doctrine:
 
 - **Every wire timing artifact carries its emission wallclock.** `BeatRef.epochNs`
   and `RenderCue.epochNs` (ns since UNIX_EPOCH; `0` = unstamped, old-peer
@@ -347,46 +312,23 @@ tick-domain scheduling against the phasor — only if the metronome validator
 shows residual boundary error after this lands (PCM transients and multi-sink
 flam remain the likely triggers, as before).
 
-## The DJ thread — musical dispatch off the frame (2026-07-18; slice 1 SHIPPED + live-verified same day)
+## The DJ thread — musical dispatch off the frame
 
-**The finding (Amy, by feel, confirmed by survey):** with a track playing,
-scene rebuilds interrupt the flow. The transport layer was never the problem —
-the RPC actor lives on its own thread, rodio has its own scheduler thread, and
-ALSA's seq queue fires MIDI precisely. But the *decision layer* between them
-rode the Bevy frame: `poll_server_events` drained the actor's broadcast once
-per `Update`, and `play_render_cues` / `play_midi_cues` / the metronome's
-phasor+clicks were all `Update` systems behind it. winit runs reactive (10 Hz
-idle), so "cue receipt" meant "whenever a frame ran." The whole back-dating
-doctrine above absorbed that jitter — but only up to the cue's lead, and the
-click horizon was 250 ms. A frame stalled past that by synchronous text
-shaping (a streaming turn dirtying dozens of blocks) audibly interrupted the
-music *while the data sat already-arrived on the actor thread*. Worse, the
-cascade: a long stall overflows the 256-slot broadcast → `Lagged` → generation
-bump → full document re-sync → a bigger dirty burst → a longer stall.
+A dedicated thread — the **DJ** — owns everything musically time-critical,
+end to end: `RenderCue` parse + deadline math + dispatch, ABC→MIDI render +
+the ALSA MIDI sink (incl. patch-bay auto-connect), the `LocalBeat` phasor +
+click scheduling, and CAS prefetch dispatch. ("Conductor" is reserved for the
+human at the instrument; the DJ is the one placing cues on a running clock.)
+It lives in `kaijutsu-audio-runtime` (`dj/{core,thread,audio,prefetch,midi}.rs`),
+part of `kaijutsu-audiod` — originally built to get cue dispatch off the Bevy
+app's frame loop, then it moved with the rest of hardware I/O into the
+standalone daemon (`docs/devlog.md`, "The hardware gets its own body"). One
+std thread, current-thread tokio, one `select!` over {events, a control
+channel, the click-horizon timer, prefetch outcomes}. The decision core is a
+pure state machine (`handle_event(now, now_epoch, event) → Vec<DjAction>`)
+so the TDD surface needs no threads and no devices.
 
-**The move:** a dedicated thread — the **DJ** — owns everything musically
-time-critical, end to end. ("Conductor" is reserved for the human at the
-instrument; the DJ is the one placing cues on a running clock.) It holds its
-*own* `broadcast::Receiver` off the `ActorHandle` (independent cursor — a
-stalled UI drain costs it nothing), and owns: RenderCue parse + deadline math
-+ dispatch to the rodio thread, ABC→MIDI render + the ALSA `MidiSink` (incl.
-patch-bay auto-connect), the `LocalBeat` phasor + click scheduling, and CAS
-prefetch dispatch (that runtime moves in wholesale). Shape: one std thread,
-current-thread tokio, one `select!` over {events, a Bevy control channel
-(actor generation / metronome config / shutdown), the click-horizon timer,
-prefetch outcomes}. The decision core stays a pure state machine
-(`handle_event(now, now_epoch, event) → Vec<DjAction>`) so the TDD surface
-needs no threads and no devices — the existing pure ladder functions
-(`backdate_events`, `effective_deadline`, `schedule_due`, `decide_deadline`)
-slot in unchanged.
-
-**Bevy keeps the decorative copies.** `poll_server_events` still drains for
-the UI consumers (time-well live layer, room glow, block sync) — those are
-legitimately frame-coupled. Back-flow from the DJ is one small crossbeam
-channel (patch-bay traffic pulses); nothing else in the app read `Metronome`
-or `MidiSink`, so the migration is clean by construction.
-
-**The clock is modal, and transitions are first-class (Amy, 2026-07-18).**
+**The clock is modal, and transitions are first-class.**
 The DJ *starts on wallclock, dials into the beat grid, and falls back* — a
 regular transition, crossed on every track start/stop, so the fallback path
 stays exercised by real use instead of rotting untested:
@@ -415,234 +357,99 @@ Every transition emits telemetry (`kaijutsu.dj.clock_transition`, attrs
 reasons are the health signal for the whole timing path, same stance as the
 phasor's slew histogram.
 
-**Slices:** (1) move the sinks — app-only, no wire change,
-behavior-equivalent (wallclock ladder only); receipt latency drops from
-frame-scale to thread-wakeup-scale, which also feeds the phasor cleaner
-references. **Shipped 2026-07-18** (`bb9224f1`→`2d377278`, net −433
-lines): `dj/{core,thread,audio,prefetch,midi}.rs`; `audio.rs`/`midi.rs`/
-`metronome.rs` deleted whole. Live-verified same day: with `bassline`
-rolling at 120 BPM, an `aseqdump` port tap measured **every click
-inter-arrival at 500 ms ± 2 ms through repeated zoomed-well opens (the
-heaviest scene build in the app), detaches, and context toggles** — the
-stutter Amy heard by ear is structurally gone, and the old
-"metronome stops when the app is backgrounded" issue died with it (clicks
-no longer touch the frame loop at all). Auto-connect wired render→TiMidity
-on its own; `kaijutsu.dj.clock_transition` flows.
-(2) beat-grid placement — additive `RenderCue` onset-beat field
-(capnp + kernel stamps the playhead beat at emission) + the BeatGrid rung in
-the DJ; the ALSA-decoupling constraint (push placed cues just-in-time
-within the horizon, never fire-and-forget) is recorded in `docs/issues.md`.
-The frame-cost work this surfaced (uncached markdown re-parse,
-synchronous Parley shaping on the then-current conversation renderer) is a
-separate arc — `docs/issues.md`.
+Beat-grid placement rides an additive `RenderCue.onset_beat` field, stamped
+by the kernel at emission; a cue carrying one is placed at the phasor's
+predicted instant for that beat instead of the wallclock ladder.
 
-## The topology (Amy's room, 2026-06-29)
+## The topology (Amy's room)
 
 - **KeyStep Pro (KSP) — usual clock master**, on a long-range USB3 hub with the
-  **1010 Bitbox** mixer (deliberately *not* on MIDI for now — it's the recording
+  **1010 Bitbox** mixer (deliberately *not* on MIDI — it's the recording
   path). KSP is usually plugged into the **laptop** over USB while jamming.
 - Occasionally a Steinway interface or a PC is the master instead; usually KSP.
 - **Eurorack** in the loft; **Polyend Poly 2** + other USB-MIDI modules bridge it.
-- **zorak** (GPU box) in the basement; **Amy's laptop** in the great room (WiFi).
+- **zorak** (GPU box) in the basement, running `kaijutsu-audiod`; **moltar**
+  (office/gaming rig) also runs the daemon; **Amy's laptop** in the great
+  room is WiFi and stays an observer/control surface, never a realtime node.
 - **Loft edge node: the 2008 Lenovo workstation laptop** (quad Xeon, 32 GB,
-  NVIDIA, gigabit) — already there, repurposed later as the loft MIDI node.
+  NVIDIA, gigabit) — already there, not yet running the daemon.
 - Wired 1G/2.5G between fixed nodes via a Ubiquiti DMSE switch/router, idle most
   of the time.
 
-**Dev loop for now:** a **virtual MIDI clock on zorak** (software ALSA clock
-source) + a virtual MIDI out — no network at all for the first slices. Link the
-real KSP / loft node in later.
+A virtual MIDI clock (software ALSA clock source) plus a virtual MIDI out
+still works as a no-hardware dev loop for the estimator and the DJ's clock
+modes: `cargo run -p kaijutsu-audio-runtime --example midi_clock -- --bpm 120
+--drift 1.0 --jitter-ms 2`.
 
-## Decided (2026-06-29 design round)
+## Where the pieces live today
 
-- **Model clock drift; don't slave to pulses.** Observe → model tempo/phase/drift
-  → regenerate a tight local clock. Learning the drift is the design, not a
-  workaround.
-- **No MIDI-over-SSH subsystem.** Crypto cost is noise; TCP HOL-blocking is the
-  problem. Realtime crosses the wire as RTP-MIDI (UDP + recovery journal) only
-  when it must; everything else is the existing RPC control plane.
-- **Distribute tempo/intent, not pulses.** The wire carries tempo + transport +
-  phase-align points; the node near the gear regenerates fine timing.
-- **ALSA for MIDI, PipeWire for samples.** Split by job; no graph tax on MIDI.
-- **Output first.** The speculation lead absorbs network latency, so output is the
-  low-risk, high-payoff first slice.
-- **Input is batched telemetry over the control plane**, not realtime — chunks of
-  timestamped events landing as score blocks.
-- **Edge node = the loft Lenovo**, repurposed later; not blocking the dev loop.
-- **The MIDI edge node is the first kernel-owned compute node** (fleet idea,
-  scoped to one resource).
-- **Render is a wire cue; the sink owns the hardware (2026-07-01).** MIDI-out
-  moves off the server binary to a wire sink (app first, edge node later); MIDI
-  and samples share one mime-keyed `RenderCue` on the lead; `abc→midi` is a
-  distinct, relocatable micro-batch phase (kernel-side for now). Sink-dependency
-  is intended — the track is preserved and replayable. See the section of that
-  name; supersedes M1's in-process emit.
-- **The ear is the sink's twin (2026-07-06).** MIDI-in capture lives in the app
-  (later the headless edge sink), never the server — ring buffer at the device,
-  the app's musical timer cuts phrase-aligned batches, a `commitCapture` verb
-  (reverse `RenderCue`, `Inline | Cas` payload) pushes them to the kernel, which
-  quantizes to the track grid and commits data-only cells. Client push, not
-  kernel pull: once the cell commits, every consumer reads kernel-local state on
-  its own schedule; the kernel never fetches from a client that can disconnect
-  mid-jam. Score first, perception later — `KJ_HEARD` untouched in M2. Bonus by
-  construction: the loft works with the app on a laptop over WiFi (batched
-  telemetry is exactly what WiFi is allowed to carry) — no edge node needed to
-  jam.
+A track renders its committed score to a wire cue; `kaijutsu-audiod`
+schedules it into local ALSA MIDI (`kj play <file.abc>` is the standalone
+trigger). MIDI-in capture, the drift estimator and clock-in all live in the
+same daemon (`kaijutsu-audio-runtime`'s `midi_in.rs`, `clockin.rs`,
+`dj/midi.rs`), never the server or the app:
 
-## Staging
+- **The ear is the sink's twin.** MIDI-in capture: a ring buffer at the
+  device, the daemon's musical timer cuts phrase-aligned batches, and a
+  `commitCapture` verb (reverse `RenderCue`, `Inline | Cas` payload) pushes
+  them to the kernel, which quantizes to the track grid and commits
+  data-only cells. Client push, not kernel pull — the kernel never fetches
+  from a client that can disconnect mid-jam. Score first, perception later:
+  `KJ_HEARD` stays notation-only, so a captured MIDI window is durable but
+  not yet readable by a model (`docs/issues.md`, "Hyoushigi / Musician —
+  open remainder").
 
-- **M1 — Output on zorak, virtual MIDI, system clock. ✅ SHIPPED 2026-06-30**
-  (`tracks.md` Stage 3 WIs 1–7, commits `2e3dc6c5`→`508bc0c4`). A track renders its
-  committed score (ABC→MIDI) to a local ALSA MIDI out, scheduled with the
-  speculation lead. No network, no external clock. The render-target seam
-  (`RenderTarget` on the track, fed from the materialize crossing, jitter-free
-  scheduled-instant reference, `flush_scheduled_after` on stop/pause) and the one
-  real target (`AlsaMidiOut`, relative real-time queue scheduling) both landed; the
-  ALSA loopback ran live on zorak. The lead-covers-scheduling property holds by
-  construction (cells commit ahead → `at` is in the near future). Canonical record:
-  `tracks.md` "Status — M1 landed". The full attach/detach surface landed too:
-  **`kj transport render --track <t> [--to alsa-midi] [--port <name>]`** to attach,
-  **`--off [--port]`** to detach one or all (silencing the removed target first),
-  **`--replace`** to clear-then-add (`BeatCommand::RenderTarget { Add|Replace|Remove }`).
-  Live-verified on zorak end-to-end (command → beat → NoteOns at a subscribed reader,
-  and an attach→off→replace walk against `/proc/asound/seq/clients`).
-  **Superseded 2026-07-02 (`docs/pcm.md` 5c):** the wire-sink move landed — the app
-  is the MIDI sink (it renders `text/vnd.abc` cues and schedules into its local ALSA
-  seq port at `receipt + lead`; `kj play <file.abc>` is the standalone trigger), and
-  the in-process pieces above — `AlsaMidiOut`, the `RenderTarget` trait, the
-  `kj transport render` verb, the server `alsa` dep — were demolished. The attach
-  surface described in this bullet is a historical record, not a live verb.
-- **M2 — Input telemetry, batched. (Re-speced 2026-07-06; the 2026-07-01 spec's
-  server placement predated the 5c demolition and is void.)** The ear lives in
-  the *sink*, not the server — the app is the first MIDI ear, exactly as it is
-  the first MIDI sink; the server keeps zero audio FFI. Shape (hear → collate →
-  commit, the render pipeline run backwards, each phase its own micro-batch):
-  - **Hear (app):** a dedicated capture thread owns its *own* ALSA seq client
-    (separate from the render client — no `!Send` sharing across the frame
-    loop, and echo-exclusion by construction), input port with capture caps
-    (`WRITE | SUBS_WRITE`), ambient subscribe policy: all external source
-    ports, own clients + Midi Through excluded, System Announce driving
-    hotplug auto-subscribe. Events are stamped epoch-ns at receipt and
-    appended to a **ring buffer**; realtime spam (`F8` clock, `FE` active
-    sensing) is dropped at ingest.
-  - **Collate (app, pure data in `kaijutsu-audio`):** the app's musical timer
-    — the same `LocalBeat` phasor that drives metronome + sample scheduling —
-    **cuts snapshots** from the ring and advances per-consumer **trackers**
-    (independent read cursors): the score batcher per phrase (wall-clock
-    cadence fallback while the transport is stopped; slice 1 ships
-    wall-clock-only — phrase-aligned cuts are a recorded residual), analysis
-    windows (beat-tracking models over longer overlapping clips) later, a
-    time-well live spray later. One producer, N consumers, nothing chases
-    realtime.
-  - **Commit (kernel):** a cut batch crosses the control plane as
-    `commitCapture` — the structural reverse of `RenderCue`, payload enum
-    `Inline | Cas(hash)` mirroring `CuePayload`. Phrase-scale MIDI is
-    score-scale data and **rides inline**; the CAS *write* surface (client→
-    kernel put — `/v/cas` is read-only by construction today) is deferred to
-    the first heavy payload (audio windows, recorded clips) and slots in
-    without changing the verb's shape. The **kernel quantizes** epoch-ns →
-    the track grid at commit (thin client — the app never computes ticks),
-    **keeping the raw offset as block metadata** (the M3 drift model's food,
-    and chameleon's groove-as-data micro-timing). Cells are **data-only**
-    (`DeriverRegistry::empty()` — no derived sibling), versioned-JSON event
-    lists per the clip-record precedent (jq-able, model-readable) under a
-    capture mime (not `audio/midi`, which implies SMF), with
-    `played_by` mapped per source port so KSP / Eurorack / the audio2midi mic
-    land as distinct lanes. The MIDI-in context attaches as a probe
-    (`ooda_armed: false`) — a producer that never takes a turn.
-  - **Perception is deliberately out of scope for M2.** Capture lands in the
-    *score* first, available to every later stage; `KJ_HEARD` stays ABC-only
-    for now. Expanding perception (a `MidiToAbcDeriver` notation sibling, new
-    heartbeat vars, a coder-context "the room is playing" whisper) is
-    follow-on work — `docs/issues.md`.
-- **M3 — Drift-modeled clock-in. Substrate SHIPPED 2026-07-06 (same-day session
-  as M2; live virtual-clock verify pending, KSP-over-USB pending Amy-near-gear).**
-  Observe the clock master locally, fit tempo/phase/drift, phase-lock a local
-  `ClockSource`. As landed:
-  - **Estimator = EMA candidate** (`kaijutsu-audio/src/clockin.rs`), chosen over
-    the two-state Kalman with the Kalman recorded as the drop-in upgrade if real
-    playing shows EMA lag on tempo ramps (the consumer only sees
-    `ClockEstimate`s, so the swap is contained; `residual_ns` is the health
-    signal that makes the call). The gift that shaped it: **MIDI clock phase is
-    a count, not an estimate** — pulse *n* is beat *n/24* by definition, so
-    only the count→wallclock mapping is learned. Intervals classify by ratio
-    to the learned period: ~1× learns, ~integer 2–4× is dropout inference
-    (count += k, phase never slips), >4.5× is a loud discontinuity, short is
-    jitter (count, don't learn). Start/Continue/Stop/SongPosition follow the
-    MIDI spec (position frozen on Stop while tempo keeps learning).
-  - **The tap is pre-ring** (`midi_in.rs` capture thread, per-source
-    estimators keyed on ALSA `EventType`, not bytes): `F8` never enters the
-    ring; Start/Stop/Continue/SPP feed the tap AND fall through as score
-    capture. This resolved the filter-placement question the ear left open.
-  - **Wire = `reportClockEstimate @88`** — the reverse of the `BeatSync` push,
-    third mirror in the set (RenderCue↔CaptureBatch, BeatSync↔ClockEstimate).
-    ~2 Hz fire-and-forget from the app (`ClockSense` latest-wins shipping);
-    ungated on purpose: an estimate is inert sensor data unless the track was
-    slaved, and the slaving (`kj transport clock <track> modeled|system`) is
-    the gated authority moment.
-  - **`ModeledClock` got its body** (`server/clock.rs`; the variant sat
-    uninhabited from Stage 3 until its producer existed): free-runs like
-    SystemClock until anchored, then fires on the *master's* integer beats.
-    PLL guards from the 2026-07-02 analysis are one line each: tempo step
-    ≤5%/reference, phase slew ≤0.05 beat with ≥0.5-beat seeks stepping
-    outright, starvation (>10 s silent) warns once and free-runs. Estimates
-    re-slave the speculation TickClock per reference (the set_tempo pattern);
-    a persisted `"modeled"` row reconstructs free-running (anchor is
-    process-local). `kj transport tempo` while slaved is an honored manual
-    nudge the next reference re-corrects.
-  - **Dev loop:** `cargo run -p kaijutsu-app --example midi_clock -- --bpm 120
-    --drift 1.0 --jitter-ms 2` — a virtual master with the exact drift/jitter
-    shapes the estimator tests synthesize, on a real ALSA bus.
-- **M4 — Cross-node + the edge node.** Stand up the loft Lenovo as a kaijutsu
-  compute node owning the Eurorack's USB-MIDI; RTP-MIDI for any realtime hop;
-  KSP-on-laptop hosts the clock observer and ships the model to the kernel.
-  **Named prerequisite (shared with `docs/pcm.md` slice 4):** the node-agent
-  attach/discovery/ownership RPC model exists only by analogy today ("the
-  first kernel-owned compute node") — write its companion design before either
-  consumer lands.
-- **Later — sense all the clocks; samples-with-MIDI; MIDI 2.0/UMP.** Model the
-  drift of every clock we have an app on (multi-clock observation). Sampler nodes
-  (MIDI trigger → PipeWire sample). UMP is already in ALSA rawmidi; the symbolic
-  score maps onto its per-note pitch / hi-res velocity when wanted — keep the
-  `ClockSource`/render seams from assuming MIDI-1.0 bytes forever.
+- **Clock-in.** `kaijutsu-audio/src/clockin.rs`'s estimator: MIDI clock phase
+  is a count, not an estimate — pulse *n* is beat *n/24* by definition, so
+  only the count→wallclock mapping is learned. Intervals classify by ratio to
+  the learned period: ~1× learns, ~integer 2–4× is dropout inference (count
+  += k, phase never slips), >4.5× is a loud discontinuity, short is jitter
+  (count, don't learn). Start/Continue/Stop/SongPosition follow the MIDI spec
+  (position frozen on Stop while tempo keeps learning). `reportClockEstimate`
+  ships estimates to the kernel fire-and-forget (~2 Hz); an estimate is inert
+  sensor data unless a track is slaved to it, and `kj transport clock <track>
+  modeled|system` is the gated authority moment.
+- **`ModeledClock`** (`crates/kaijutsu-server/src/clock.rs`) free-runs like
+  `SystemClock` until anchored, then fires on the master's integer beats. PLL
+  guards: tempo step ≤5%/reference, phase slew ≤0.05 beat with ≥0.5-beat
+  seeks stepping outright, starvation (>10 s silent) warns once and
+  free-runs. `kj transport tempo` while slaved is an honored manual nudge the
+  next reference re-corrects.
+- **Cross-node + additional edge nodes** — `docs/audio-daemon.md` is the
+  daemon design (SSH connection, presence, ownership, RT priority); open
+  follow-ups after the daemon's extraction from the app live in
+  `docs/issues.md`, "Audio nodes — follow-up after daemon extraction".
+- **Later — sense all the clocks; samples-with-MIDI; MIDI 2.0/UMP.** Model
+  the drift of every clock we have a node on (multi-clock observation).
+  Sampler nodes (MIDI trigger → PipeWire sample). UMP is already in ALSA
+  rawmidi; the symbolic score maps onto its per-note pitch / hi-res velocity
+  when wanted — keep the `ClockSource`/render seams from assuming MIDI-1.0
+  bytes forever.
 
-## Open questions (for the implementation sessions)
+## Open questions
 
-- **Drift-model shape — RESOLVED 2026-07-06 (M3 substrate).** EMA + exact
-  pulse-count phase landed (`kaijutsu-audio/src/clockin.rs`; decision record
-  in the M3 staging bullet). Still open from the original question:
-  *observability placement* — `residual_ns` rides every estimate and the app
-  logs it, but nothing writes it to `/run` yet for sibling probes to read.
-- **Where the clock observer process lives** when KSP is on the WiFi laptop — a
-  kaijutsu node agent on the laptop is fine (it ships a model, not pulses), but
-  confirm the laptop runs a node agent vs. moving KSP's USB to a wired node.
-- **MIDI-in on the same lane as a model producer** — the *substrate* answer
-  landed with `tracks.md` Stage 2's concurrent-producer model: N producers on
-  one track coexist by construction (each committed cell carries `played_by`;
-  ties at a tick are allowed; nothing squashes a co-producer's absolute
-  notation). Music keeps one *playing* binding per track as **loadout policy**,
-  not structure. What's still open is the *musical* policy when Amy plays with
+- **Observability placement.** `residual_ns` rides every clock estimate and
+  is logged, but nothing writes it to `/run` yet for sibling probes to read.
+- **Where the clock observer process lives** when KSP is on the WiFi laptop —
+  a node running `kaijutsu-audiod` there is fine (it ships a model, not
+  pulses), but confirm that vs. moving KSP's USB to a wired node.
+- **MIDI-in on the same lane as a model producer.** N producers on one track
+  coexist by construction (each committed cell carries `played_by`; ties at a
+  tick are allowed; nothing squashes a co-producer's absolute notation).
+  Music keeps one *playing* binding per track as **loadout policy**, not
+  structure. What's still open is the *musical* policy when Amy plays with
   the band on one lane: does the human's MIDI-in share the model's lane
   (two `played_by`s, one track) or ride a parallel track — and what
   `UseLastGood` should repeat in the mixed case (today it's lane-scoped,
   producer-blind — a decision, not a bug).
 - **Per-track channel + per-track render-cue routing** (the moment two tracks
-  sound at once). The wire-cue sink landed single-track (slice 5c): every cue
-  plays on MIDI **channel 0**, and a `RENDER_FLUSH_MIME` cue flushes the sink's
-  *whole* queue, so a second simultaneous track would collide on the channel and
-  cross-flush on stop. The cue already carries the track's score `context_id`;
-  the sink needs to schedule + flush *per context* and assign a channel per
-  track/lane (drums → ch 9). Full write-up + fix sites: `docs/chameleon.md`
-  "Open items" (per-track MIDI channel; per-track render-cue routing). Same
-  routing gap as `docs/pcm.md` "Distributed listening" — solve together.
-  **Channel-assignment vocabulary now lives in `docs/midi-next.md`** (device
-  profiles + bindings, 2026-07-15): a track binds to a *device.role* resolved
-  through a profile, not a raw channel int — build the fix on that.
-
-Resolved since the design round (kept here so old readers don't re-open them):
-the **`ClockSource` trait surface** landed 2026-06-30 with `tracks.md` Stage 3 M1
-(`ClockSourceKind`/`SystemClock` in `crates/kaijutsu-server/src/clock.rs`) and
-stands. The **render-target seam** landed the same day and was **demolished
-2026-07-02** when render became a wire cue to the app sink (`docs/pcm.md` 5c):
-`RenderTarget`/`AlsaMidiOut`/`render.rs` and the `kj transport render` verb are
-gone; the app consumes `RenderCue`s and `kj play <file.abc>` is the trigger.
+  sound at once). Every cue plays on MIDI **channel 0**, and a
+  `RENDER_FLUSH_MIME` cue flushes the sink's *whole* queue, so a second
+  simultaneous track collides on the channel and cross-flushes on stop. The
+  cue already carries the track's score `context_id`; the sink needs to
+  schedule + flush *per context* and assign a channel per track/lane (drums →
+  ch 9). Full write-up: `docs/chameleon.md` "Open items". Same routing gap as
+  `docs/pcm.md` "Distributed listening" — solve together. The
+  channel-assignment vocabulary lives in `docs/midi-next.md` (device
+  profiles + bindings): a track binds to a *device.role* resolved through a
+  profile, not a raw channel int — build the fix on that.

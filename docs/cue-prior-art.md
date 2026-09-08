@@ -1,11 +1,11 @@
 # Cue prior art — what the industry learned about clip/cue metadata
 
-> **Status:** compressed form of the 2026-07-01 research survey (the full
-> ~1000-line version, with inline source URLs and per-format field tables,
-> lives in git history). Written to answer one question from Amy: *do we
-> need a cue format at all, or just a cue data model on the track?* The
-> synthesis landed in `docs/pcm.md`'s clip record (Shape A payload, tick-anchored
-> no-stretch tempo default, triggers in the transport, late binding as
+> This is a compressed research survey (the full ~1000-line version, with
+> inline source URLs and per-format field tables, lives in git history).
+> Written to answer one question from Amy: *do we need a cue format at all,
+> or just a cue data model on the track?* The synthesis landed in
+> `docs/pcm.md`'s clip record (Shape A payload, tick-anchored no-stretch
+> tempo default, triggers in the transport, late binding as
 > `Deferred(Recipe)`, no standalone format). This doc keeps the survey's
 > evidence: one paragraph per industry, the convergent field-cluster
 > analysis, and the compressed conclusions.
