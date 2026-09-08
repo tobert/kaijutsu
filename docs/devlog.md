@@ -139,12 +139,25 @@ Amy wanted MIDI presence and music to survive closing the 3D app, then widened
 the task to PCM: "a realtime audio daemon we can put on various machines that
 have audio hardware." She clarified that realtime meant an ordinary service
 with Linux RT priority available, not a new scheduling architecture. The DJ,
-PCM scheduler and MIDI workers moved into a reusable library; the app retains
-an opt-in in-process host. Each node connects over SSH and performs kernel
-cues. The kernel remains the sole sequencer, while clients retain local beat
+PCM scheduler and MIDI workers moved into a reusable library. Each node
+connects over SSH and performs kernel cues. The kernel remains the sole sequencer, while clients retain local beat
 phasors for display. Device-open failure is explicit, RT-priority failure is
 a warning, and the hardware lifetime no longer depends on a window.
 `docs/audio-daemon.md` is the deployment guide.
+
+The daemon's first fitness review (September 8) settled two things. The
+app's opt-in in-process host was deleted and the last ALSA read left the
+app with it: the patch bay now reads the kernel's projected audio inventory,
+so a remote node's rack is visible from any app. And the live probe found
+moltar's clock 100.9 s behind zorak's with NTP on neither host, which the
+one-timebase doctrine had quietly assumed away — stamps from the kernel were
+being floored to age zero. Amy: "I want to consider if we can be resilient
+to some clock skew, even lean into it a lil." The answer made the kernel's
+clock the timebase by definition: every node models its offset from the
+ping round trip and mints and ages stamps in the kernel's domain, and NTP
+became optional. The same morning explained a ghost peer registration —
+the bridge task's self-detach lived on a LocalSet that was dropped before
+it could run — and moved that cleanup onto the connection's own Drop.
 
 Retrospective recording followed from Amy's wish to "grab a happy accident real
 quick." MIDI input now feeds bounded, per-source RAM history independently of

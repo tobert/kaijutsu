@@ -984,3 +984,15 @@ subsystem.
   line in the transcript is still open.
 - Internal splits. Set aside for v1; wezterm splits with
   `kaijutsu-tui --context <id>` cover it. Revisit when the itch is real.
+- **The buffer question** (Amy, 2026-09-08). The inline model prints every
+  context into one terminal scrollback that no terminal reports the depth
+  of, and switching contexts interleaves them with no boundary. A printed
+  marker row per switch and a per-context copy-mode view were tried and
+  shelved: "marker and copy mode aren't gonna work." Two shapes remain,
+  and the choice is a session of its own: (a) the tui is a
+  **single-context app** that composes with a mux — tmux or wezterm owns
+  windows, one tui per context, the terminal's scrollback is that
+  context's alone; or (b) the tui **is the mux** and goes alternate-screen
+  all the way, owning its buffer, scroll and search the way vim and tmux
+  do, "but all modern like in rust". The switch path itself is one
+  function now (`switch_seat`) whichever shape wins.
