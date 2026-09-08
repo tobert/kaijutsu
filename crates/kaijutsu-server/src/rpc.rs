@@ -274,9 +274,9 @@ enum SubscriptionRegistration {
     /// A prior LIVE subscription from a DIFFERENT connection was displaced.
     /// Could be a legitimate reconnect (same logical client, new SSH
     /// session) or two live clients sharing one hardcoded `instance` literal
-    /// (docs/issues.md, "MCP shell delay" — the bug this registry exists to
-    /// catch). The caller should warn, including `prior_session_id` and
-    /// `age` so an operator can tell the two apart.
+    /// — the failure mode this registry exists to catch. The caller should
+    /// warn, including `prior_session_id` and `age` so an operator can tell
+    /// the two apart.
     ReplacedDifferentConnection {
         prior_session_id: SessionId,
         age: std::time::Duration,
@@ -3064,12 +3064,12 @@ pub async fn create_shared_kernel(
     let shutdown = CancellationToken::new();
 
     // Drive the roster's scheduled-periodic reconcile (`roster_sources`
-    // module doc; design record in signoff/`docs/issues.md`). Spawned here
-    // rather than left to the read surfaces because `kj/roster.rs`'s
-    // `ensure_refreshed` only self-heals the boot rule *on a read* — without
-    // this loop, staleness between reads grows unbounded past the ~10s design
-    // target, and `/run/roster` would report presence that stopped being true
-    // whenever nobody happened to be looking.
+    // module doc). Spawned here rather than left to the read surfaces
+    // because `kj/roster.rs`'s `ensure_refreshed` only self-heals the boot
+    // rule *on a read* — without this loop, staleness between reads grows
+    // unbounded past the ~10s design target, and `/run/roster` would report
+    // presence that stopped being true whenever nobody happened to be
+    // looking.
     //
     // `tokio::time::interval` fires its first tick immediately, so this also
     // satisfies the boot rule proactively: the first `refresh_once` lands at
@@ -3307,13 +3307,9 @@ fn write_context_row_to_handle_info(
 /// `list_active_contexts`, its registry entry does not survive a restart,
 /// even though its KernelDb row and BlockStore document both do. Before this
 /// fix, joining it after a restart was a hard failure here ("use
-/// createContext first") despite the context plainly existing — this is the
-/// narrow, real remainder of the divergence docs/issues.md originally
-/// described more broadly ("MCP-created context invisible to `kj context
-/// list` after kernel restart" — the live/concluded case in that report does
-/// not reproduce against current code; see the docs update alongside this
-/// change). Healing here — the one place every attach/reconnect funnels
-/// through (the `joinContext` RPC handler, and via that RPC,
+/// createContext first") despite the context plainly existing. Healing
+/// here — the one place every attach/reconnect funnels through (the
+/// `joinContext` RPC handler, and via that RPC,
 /// `register_session`'s attach path) — fixes it generally: the join succeeds
 /// AND the now-re-registered context reappears in `listContexts` for
 /// everyone else.
@@ -3419,18 +3415,16 @@ async fn create_context_inner(
         )));
     }
 
-    // Neither creation path stamps provider/model onto the row (closed
-    // 2026-08-10; was `docs/issues.md` "Two context-creation paths disagree
-    // about stamping the model"). `row.provider`/`row.model` are the
-    // explicit per-context override only — leaving them `None` here matches
-    // `kj context create` and lets `resolve_context_model`'s ladder
-    // (explicit override → cast slot → registry default) do the one job it
-    // exists to do: resolve live, every call, so a later registry-default
-    // change reaches every context uniformly instead of stamped rows
-    // freezing whatever the default happened to be at creation time. A
-    // context with nothing configured anywhere still gets a clear "No LLM
-    // backend configured" error on use (llm_stream.rs) rather than a
-    // silently-injected hardcoded model.
+    // Neither creation path stamps provider/model onto the row.
+    // `row.provider`/`row.model` are the explicit per-context override
+    // only — leaving them `None` here matches `kj context create` and lets
+    // `resolve_context_model`'s ladder (explicit override → cast slot →
+    // registry default) do the one job it exists to do: resolve live, every
+    // call, so a later registry-default change reaches every context
+    // uniformly instead of stamped rows freezing whatever the default
+    // happened to be at creation time. A context with nothing configured
+    // anywhere still gets a clear "No LLM backend configured" error on use
+    // (llm_stream.rs) rather than a silently-injected hardcoded model.
 
     // Write-through: KernelDb first, then DriftRouter. Both must succeed or we
     // roll in-memory state back — never a ghost live-in-memory-but-missing-from-DB
@@ -5117,8 +5111,7 @@ impl kernel::Server for KernelImpl {
     /// on `resolveContextLabel` for the full rationale (an indexed lookup
     /// vs. a registry scan, and the one real registry gap — archived
     /// contexts — this also happens to sidestep). `registerSession`'s
-    /// upsert/attach decision (docs/issues.md, "register_session hard-fails
-    /// on label conflict") needs this durable truth before it decides
+    /// upsert/attach decision needs this durable truth before it decides
     /// whether to attach, suffix, or create.
     fn resolve_context_label(
         self: Rc<Self>,
@@ -7681,9 +7674,9 @@ impl kernel::Server for KernelImpl {
                 // slot. Could be a legitimate reconnect (same logical client,
                 // new SSH session) or two live clients sharing one hardcoded
                 // `instance` literal silently stealing the block-event bridge
-                // from each other (docs/issues.md, "MCP shell delay") — we
-                // can't fully tell those apart from here, so surface both the
-                // replaced session and its age: a young age with both
+                // from each other — we can't fully tell those apart from
+                // here, so surface both the replaced session and its age: a
+                // young age with both
                 // connections still live reads as theft, a multi-second/
                 // minute age reads as an ordinary reconnect.
                 SubscriptionRegistration::ReplacedDifferentConnection {
@@ -8394,8 +8387,8 @@ impl kernel::Server for KernelImpl {
         // Shipping a new verb with its own quietly-ignored parameter would
         // repeat that defect at the next ordinal. So: disagreement is a caller
         // bug, and it is refused rather than silently resolved in favor of one
-        // side. (Cross-model review caught this; see docs/issues.md for the
-        // alternative — dropping the field in a future schema revision.)
+        // side. A future schema revision could drop the redundant `isError`
+        // field instead of validating it.
         let is_error = p.get_is_error();
         if is_error != (status == Status::Error) {
             results.get().set_success(false);
@@ -12730,8 +12723,7 @@ mod connection_state_tests {
 ///   (`crates/kaijutsu-app/src/connection/actor_plugin.rs:239,633`) used to
 ///   pass a hardcoded literal instance ("mcp-server" / "bevy-client"), so
 ///   every process of that client claimed the same registry slot and
-///   silently evicted each other's block-event bridge (docs/issues.md, "MCP
-///   shell delay" — measured 5.4s tax on MCP shell calls). A test built
+///   silently evicted each other's block-event bridge. A test built
 ///   directly against `register_subscription` — the exact map mutation the
 ///   live RPC path calls — reproduces that failure mode without a live SSH
 ///   session: construct it with the *old* buggy call shape (same literal

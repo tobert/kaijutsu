@@ -36,9 +36,8 @@ fn origin_host_tag(origin_host: &Option<String>) -> String {
 /// Marks the current context with `*` and ring-0 (promoted) contexts with a
 /// trailing `[ring0]` tag; `casts` resolves each row's `cast_id` to its label
 /// for an additional `[cast:<label>]` tag (omitted when uncast). A
-/// `[host:<name>]` tag follows when `origin_host` is known (docs/issues.md
-/// "cc-* hook re-registration..." — makes the fleet board self-evident from
-/// `kj context list` alone).
+/// `[host:<name>]` tag follows when `origin_host` is known — makes the
+/// fleet board self-evident from `kj context list` alone.
 pub fn format_context_table(
     contexts: &[ContextRow],
     current: Option<ContextId>,

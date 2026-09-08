@@ -199,8 +199,7 @@ pub(crate) enum DjEffect {
     ///
     /// Fixing either needs `dj::core` to grow a `dropped_cues` count on
     /// `DueClicks` and/or `decide_placement`'s return shape — out of this
-    /// task's scope (constrained to `dj::thread` only; `docs/issues.md` "DJ
-    /// thread arc").
+    /// task's scope (constrained to `dj::thread` only).
     CueDropped { reason: &'static str, count: usize },
     /// `kaijutsu.clock.future_stamps`, consumer `"dj"` — a wire timing
     /// artifact arrived stamped ahead of this node's clock by more than
@@ -465,9 +464,9 @@ async fn run_loop<H, F, M>(
     let mut ssh_config: Option<SshConfig> = None;
     // Log/telemetry correlation only (`DjCtl::ActorReady`'s doc) — a genuine
     // cross-generation guard on a prefetch outcome that started under a
-    // since-replaced actor is a real follow-up (`docs/issues.md`), not yet
-    // needed: `CasPrefetch` reconnects lazily per-dispatch `SshConfig`
-    // rather than holding a connection keyed to one actor generation.
+    // since-replaced actor doesn't exist yet, and isn't needed yet:
+    // `CasPrefetch` reconnects lazily per-dispatch `SshConfig` rather than
+    // holding a connection keyed to one actor generation.
     let mut _generation: u64 = 0;
     // The other half of the old `conn.connected` check
     // (`play_render_cues`/`drain_prefetch_results`'s `Some(conn) if

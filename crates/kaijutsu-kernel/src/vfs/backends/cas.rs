@@ -17,7 +17,7 @@
 //! resolver addresses objects by exact hash, never by browsing), and a naive
 //! walk-the-pool-per-read index is under-designed for scale. It lands with a
 //! real consumer and a cache (keyed on a pool-version stamp, or split per
-//! shard) — see `docs/issues.md`.
+//! shard).
 //!
 //! ## Read-only by construction, not by flag
 //!

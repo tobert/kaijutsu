@@ -138,9 +138,8 @@ pub struct MsdfBlockGeometry {
 /// plain UI geometry: sparkline, image placeholder, SVG raster — spawned as
 /// sibling child entities instead). Kept as a component/bundle marker
 /// (`msdf_surface_bundle`) rather than collapsed away; a `Vello` variant
-/// existed here until it was retired as dead weight (docs/issues.md,
-/// 2026-08-12) — nothing had assigned it since ABC and SVG both moved off
-/// vello.
+/// existed here until it was retired as dead weight — nothing had
+/// assigned it since ABC and SVG both moved off vello.
 #[derive(Component, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockRenderMethod {
     /// MSDF renders text glyphs (or nothing, for a block whose content is

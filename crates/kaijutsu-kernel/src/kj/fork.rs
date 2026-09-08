@@ -1450,11 +1450,11 @@ impl KjDispatcher {
     /// view) subscribes and matches on the child's `context_id`; nothing needs
     /// to poll the child's block log any more.
     ///
-    /// What is still missing is the *command* — `kj wait` itself (docs/issues.md,
-    /// "Delegation has no join"). Deliberately not half-built here: a waiter also
-    /// needs a timeout policy, a story for the turn that ends before the waiter
-    /// subscribes, and a decision about waiting on several children at once. The
-    /// substrate is ready; the semantics are a separate conversation.
+    /// What is still missing is the *command* — `kj wait` itself. Deliberately
+    /// not half-built here: a waiter also needs a timeout policy, a story for
+    /// the turn that ends before the waiter subscribes, and a decision about
+    /// waiting on several children at once. The substrate is ready; the
+    /// semantics are a separate conversation.
     fn request_child_turn(
         &self,
         new_id: ContextId,

@@ -11,7 +11,7 @@
 //! This module was also vello's offscreen-rasterizer home (a `UiVectorScene`
 //! carrying a `vello::Scene`, extracted and rasterized by
 //! `VelloRasterizer`) until the dock chrome — the last consumer — moved onto
-//! MSDF (retiring vello, docs/issues.md, 2026-08-12). What's left is purely
+//! MSDF. Vello is gone from the app entirely; what's left here is purely
 //! the content-neutral texture primitive + its sizing helpers.
 //!
 //! Consumers own two things the primitive deliberately does *not*:

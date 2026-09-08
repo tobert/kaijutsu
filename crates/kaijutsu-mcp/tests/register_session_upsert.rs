@@ -1,12 +1,11 @@
 //! End-to-end tests for `register_session`'s upsert/attach behavior.
 //!
-//! The bug (docs/issues.md, "register_session hard-fails on label
-//! conflict"): `register_session_impl` used to check idempotency only for
+//! The bug: `register_session_impl` used to check idempotency only for
 //! the CURRENT process (`remote.joined`), then unconditionally call
 //! `create_context_typed(&label, ...)`. The label defaults to the harness's
 //! agent-session id, so a reconnect after a dropped MCP session reused the
 //! exact same label and hit KernelDb's label-uniqueness constraint as a
-//! fatal `insert_context failed ... label conflict` — hit live 2026-07-29.
+//! fatal `insert_context failed ... label conflict`.
 //!
 //! Fix: `register_session_impl` resolves the label against the durable
 //! KernelDb first (`resolve_context_label`, DB-driven — not the in-memory

@@ -73,7 +73,7 @@ pub fn is_bare_modifier(key: KeyCode) -> bool {
 /// flash). Digits accept Ctrl held or released — screen users do both.
 ///
 /// The table (docs/input.md; `'` switch-by-prompt and `A` rename are
-/// deferred until the kj verbs they prefill exist — docs/issues.md):
+/// deferred until the kj verbs they prefill exist):
 pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
     match key {
         KeyCode::Digit0 => Some(Action::SwitchToActiveSeat(0)),

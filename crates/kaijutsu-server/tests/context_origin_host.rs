@@ -1,8 +1,6 @@
 //! `setContextOriginHost` — the advisory "which machine did this context's
-//! registering client run on" wire round trip (docs/issues.md "cc-* hook
-//! re-registration mints a new context per MCP relaunch", last paragraph:
-//! "Host field on registration ... would make the fleet board
-//! self-evident").
+//! registering client run on" wire round trip. A host field on
+//! registration makes the fleet board self-evident.
 //!
 //! `register_session` (kaijutsu-mcp) calls this once, right after
 //! `createContext`, with its own `gethostname()`. These tests exercise the

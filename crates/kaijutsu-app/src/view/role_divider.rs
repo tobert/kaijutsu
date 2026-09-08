@@ -17,9 +17,8 @@
 /// Deliberately distinct from `theme.label_font_size` (11.0, used for
 /// tool-call/thinking fieldset labels) — a role transition is a more
 /// prominent landmark than a per-block fieldset caption, so it renders
-/// slightly larger. No theme token exists for this yet (see
-/// `docs/issues.md`'s theme-tokenization entry for the same gap on
-/// sparkline/markdown colors).
+/// slightly larger. No theme token exists for this yet (sparkline and
+/// markdown colors have the same gap).
 pub const ROLE_LABEL_FONT_SIZE: f32 = 12.0;
 
 /// Divider stroke thickness — matches the pre-shader Vello `Stroke::new(1.0)`

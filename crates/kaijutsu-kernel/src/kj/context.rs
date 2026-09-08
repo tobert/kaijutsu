@@ -928,8 +928,7 @@ impl KjDispatcher {
     /// want to do while a context's model is still unconfigured.
     ///
     /// Model source and the staging guard both now mirror the turn path
-    /// exactly (closed 2026-08-10; was `docs/issues.md` "`kj context prompt`
-    /// diverges from the turn path in two ways"):
+    /// exactly:
     ///
     /// - **Model source.** Both sides call the same `resolve_context_model`,
     ///   fed the live DriftRouter handle's `provider`/`model` — never the
@@ -1298,7 +1297,8 @@ impl KjDispatcher {
 
     /// `kj context rebind [<ctx>]` — re-run the `create` rc lifecycle against a
     /// context that has no usable loadout. The repair half of the create-time
-    /// rc failure recorded in `docs/issues.md`.
+    /// rc failure: creation succeeds even when its rc lifecycle fails, and
+    /// this verb fixes the result afterward.
     ///
     /// Amy ruled (2026-08-12) against aborting creation when the lifecycle
     /// fails: a fresh context holds nothing worth saving, and aborting would
@@ -3615,9 +3615,9 @@ mod tests {
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
     }
 
-    /// Repro/regression for `docs/issues.md` "`kj context info` human and
-    /// `--json` renders disagree about cwd" (2026-08-07). Filed against the
-    /// pre-kaish-0.13 `--json` envelope, which built a separate JSON shape
+    /// Regression test for `kj context info`: the human-text and `--json`
+    /// renders must agree about cwd. Guards against the pre-kaish-0.13
+    /// `--json` envelope, which built a separate JSON shape
     /// from the human-text render and could show `shell: null` for a
     /// context whose human text showed a real `Cwd:` line. kaish 0.13
     /// retired that separate envelope (`render_json_envelope` is gone —
@@ -4684,12 +4684,12 @@ mod tests {
         );
     }
 
-    /// Regression for `docs/issues.md` "`kj context prompt` diverges from
-    /// the turn path in two ways" — model-source half. Forces the KernelDb
-    /// row and the live DriftRouter handle apart (the divergence
-    /// `apply_context_config` normally prevents by writing both together)
-    /// and asserts the verb reports the handle's model, matching what
-    /// `spawn_llm_for_prompt` would actually pick — not the row's.
+    /// Regression: model-source half of `kj context prompt` matching the
+    /// turn path. Forces the KernelDb row and the live DriftRouter handle
+    /// apart (the divergence `apply_context_config` normally prevents by
+    /// writing both together) and asserts the verb reports the handle's
+    /// model, matching what `spawn_llm_for_prompt` would actually pick —
+    /// not the row's.
     #[tokio::test]
     async fn context_prompt_model_follows_drift_handle_not_row() {
         let d = test_dispatcher().await;
@@ -4737,11 +4737,10 @@ mod tests {
         }
     }
 
-    /// Regression for `docs/issues.md` "`kj context prompt` diverges from
-    /// the turn path in two ways" — staging half. The turn path
-    /// (`spawn_llm_for_prompt`) refuses a `Staging` context outright; the
-    /// preview must refuse the same way instead of rendering a prompt that
-    /// could never actually run.
+    /// Regression: staging half of `kj context prompt` matching the turn
+    /// path. The turn path (`spawn_llm_for_prompt`) refuses a `Staging`
+    /// context outright; the preview must refuse the same way instead of
+    /// rendering a prompt that could never actually run.
     #[tokio::test]
     async fn context_prompt_refuses_staging_context_like_turn_path() {
         let d = test_dispatcher().await;
@@ -4772,9 +4771,9 @@ mod tests {
 
 #[cfg(test)]
 mod rebind_tests {
-    //! `kj context rebind` — the repair half of the create-time rc failure in
-    //! `docs/issues.md`. Creation deliberately still succeeds when its rc
-    //! lifecycle fails (Amy, 2026-08-12: a fresh context holds nothing worth
+    //! `kj context rebind` — the repair half of the create-time rc failure.
+    //! Creation deliberately still succeeds when its rc lifecycle fails
+    //! (Amy, 2026-08-12: a fresh context holds nothing worth
     //! saving, and aborting would destroy the Error blocks that explain the
     //! failure), so this verb has to be able to fix the result afterwards.
 

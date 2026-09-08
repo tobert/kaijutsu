@@ -4825,8 +4825,7 @@ mod tests {
         assert!(!actor.peer_attach_pending);
     }
 
-    /// A `bindKernel` wire-version mismatch (`kaijutsu_types::WIRE_VERSION`,
-    /// docs/issues.md "The ACP binary can silently outlive a wire change")
+    /// A `bindKernel` wire-version mismatch (`kaijutsu_types::WIRE_VERSION`)
     /// must stop the actor cold, not feed the reconnect FSM's Cooldown loop.
     /// Three things have to hold together for that:
     ///

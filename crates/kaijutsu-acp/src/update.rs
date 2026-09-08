@@ -647,8 +647,7 @@ impl UpdateMapper {
     /// split out so tests can assert on a returned value instead of
     /// scraping `tracing` log output for the words "shrank"/"diverged" —
     /// the latter depends on a thread-local `tracing` dispatch that a
-    /// contended `cargo test --workspace` run showed can drop an event
-    /// (docs/issues.md, "Flaky: ACP's tracing-capture test", 2026-08-16).
+    /// contended `cargo test --workspace` run can drop an event from.
     /// `take_delta` still emits the loud `tracing::warn!` for production
     /// diagnostics; this just makes the *outcome* observable without it.
     fn classify_delta(&mut self, block: &BlockSnapshot) -> DeltaOutcome {
@@ -1342,10 +1341,9 @@ mod tests {
         // returned outcome directly — a `DeltaOutcome::Shrank`/`Diverged`
         // value, not a scrape of `tracing` log text. Log-text assertion
         // depends on a thread-local `tracing` dispatch that a contended
-        // `cargo test --workspace` run showed can drop an event roughly 1
-        // run in 9 for an unexplained reason (docs/issues.md, "Flaky: ACP's
-        // tracing-capture test", 2026-08-16) — asserting on the return value
-        // removes that global-state dependency entirely.
+        // `cargo test --workspace` run can drop an event from — asserting
+        // on the return value removes that global-state dependency
+        // entirely.
         let mut m = mapper();
 
         let mut shrinking = block(BlockKind::Text, Role::Model, "abcdef", 1);

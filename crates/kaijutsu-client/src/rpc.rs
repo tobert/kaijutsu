@@ -352,7 +352,7 @@ pub struct KernelInfo {
 ///
 /// Mirrors the wire `PeerInfo` struct (kaijutsu.capnp), which currently
 /// carries only `nick`/`attachedAt` — no `instance`, so two windows sharing a
-/// nick are indistinguishable here (docs/issues.md tracks the schema gap).
+/// nick are indistinguishable here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     pub nick: String,
@@ -2739,7 +2739,7 @@ impl KernelHandle {
     /// grid of whatever track `context_id` is attached to and returns the
     /// score-context block id it landed. The CAS payload arm is reserved
     /// (`casHash` rides empty until the client→kernel CAS write surface
-    /// lands — docs/issues.md).
+    /// lands).
     #[tracing::instrument(skip(self, payload), name = "rpc_client.commit_capture")]
     pub async fn commit_capture(
         &self,

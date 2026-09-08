@@ -50,7 +50,7 @@ pub fn is_modifier_key(key_code: KeyCode) -> bool {
 
 /// Translate a *pressed* Bevy keyboard event into kernel vi notation, or `None`
 /// for keys the notation can't express (arrows / function keys — pass-1 vi
-/// navigates with `hjkl`; `docs/issues.md` tracks widening this).
+/// navigates with `hjkl` only).
 ///
 /// `ctrl` is the live control-modifier state (a chord becomes `<C-x>`). Note
 /// `Z` is an ordinary keystroke here — the app forwards every key, including
@@ -83,7 +83,7 @@ pub fn bevy_to_vi_notation(event: &KeyboardInput, ctrl: bool) -> Option<String> 
     // A literal `<` would be read as the start of a `<...>` token by the kernel's
     // `parse_keys` (which has no `<lt>` escape and silently drops unknown
     // tokens), so we can't forward it faithfully yet. Guard it out rather than
-    // corrupt the buffer. (docs/issues.md)
+    // corrupt the buffer.
     if c == '<' {
         return None;
     }

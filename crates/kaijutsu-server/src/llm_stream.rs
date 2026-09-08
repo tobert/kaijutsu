@@ -2230,15 +2230,13 @@ async fn process_llm_stream(
                     //
                     // `refusal` and `stop_sequence` both fall through to the
                     // `_` arm below and render as a clean `EndTurn` — the wire
-                    // has no dedicated stop reason for either yet (deepseek
-                    // post-merge review, docs/issues.md: adding one is a
-                    // capnp change and capnp is owned by a parallel lane right
-                    // now, so it stays open there). The minimal fix here is to
-                    // at least log each distinctly rather than let them
-                    // silently blend into "the model finished normally" —
-                    // `refusal` in particular means the model declined to
-                    // answer, which is operationally worth a `warn`, not a
-                    // `debug`.
+                    // has no dedicated stop reason for either yet (adding one
+                    // is a capnp change, and capnp is owned by a parallel
+                    // lane right now). The minimal fix here is to at least
+                    // log each distinctly rather than let them silently blend
+                    // into "the model finished normally" — `refusal` in
+                    // particular means the model declined to answer, which is
+                    // operationally worth a `warn`, not a `debug`.
                     match stop_reason.as_deref() {
                         Some("refusal") => {
                             log::warn!(
@@ -2964,8 +2962,8 @@ mod publish_tests {
             .await;
     }
 
-    /// Regression for the deepseek post-merge review (docs/issues.md: "Hard
-    /// cancel + hung provider publishes `Failed`"): after a hard cancel, the
+    /// Regression test: a hard cancel that races a hung provider must still
+    /// publish `Cancelled`, not `Failed`. After a hard cancel, the
     /// drain loop polls the stream once more to let the provider flush its
     /// pending Done event. If the provider is HUNG — the connection stays
     /// open but never delivers that flush — the idle-timeout branch used to

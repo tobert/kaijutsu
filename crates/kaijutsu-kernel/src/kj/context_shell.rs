@@ -11,11 +11,11 @@
 //!
 //! * **Identity is first-class and correct without trickery.** The old
 //!   per-connection kaish baked in a principal and was shared, so a stop/kill
-//!   keyed on "the calling connection" rather than the context (see
-//!   `docs/issues.md`). Because a materialized instance serves a single
-//!   principal for a single command, baking that principal in is accurate, not
-//!   a hack. Telemetry baggage is a separate, parallel concern — never the
-//!   source of truth for authorship.
+//!   keyed on "the calling connection" rather than the context. Because a
+//!   materialized instance serves a single principal for a single command,
+//!   baking that principal in is accurate, not a hack. Telemetry baggage is
+//!   a separate, parallel concern — never the source of truth for
+//!   authorship.
 //! * **No junk builds up.** Durable state changes only through the explicit
 //!   `kj context set --env/--cwd` channel; transient scope evaporates with the
 //!   instance. rc scripts, hooks, the model's `shell` tool, the interactive

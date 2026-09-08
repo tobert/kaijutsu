@@ -81,8 +81,7 @@ pub struct MockClient {
     /// When true, a stream's `next_event()` never resolves once its scripted
     /// events run out — instead of returning `None` (a clean close). Models
     /// an HTTP connection that hangs rather than closing: the provider-side
-    /// stand-in for "hard-cancelled, and the confirming flush never arrives"
-    /// (deepseek review, `docs/issues.md`: hard-cancel-plus-hung-provider).
+    /// stand-in for "hard-cancelled, and the confirming flush never arrives".
     /// Combine with `tokio::test(start_paused = true)` so a caller's idle
     /// timeout fires on virtual-clock auto-advance instead of real wall time.
     hangs_when_exhausted: bool,
@@ -3935,13 +3934,12 @@ mod tests {
             );
         }
 
-        /// Regression for the deepseek post-merge review (docs/issues.md,
-        /// "⛔ Interrupted marker leaks into model context"): the hard-cancel
-        /// marker used to land as `(Role::Model, BlockKind::Text)`, which
-        /// hydration folds straight into `assistant_text` — the model's next
-        /// turn would read its own prior turn as having said "⛔ Interrupted"
-        /// verbatim. `llm_stream.rs` now inserts it as `(Role::System,
-        /// BlockKind::Text)` *and* ephemeral; either alone is enough to be
+        /// Regression: the hard-cancel "⛔ Interrupted" marker used to land as
+        /// `(Role::Model, BlockKind::Text)`, which hydration folds straight
+        /// into `assistant_text` — the model's next turn would read its own
+        /// prior turn as having said "⛔ Interrupted" verbatim. `llm_stream.rs`
+        /// now inserts it as `(Role::System, BlockKind::Text)` *and*
+        /// ephemeral; either alone is enough to be
         /// hydration-skipped, but both apply in practice, so this test pins
         /// each independently plus the real shape together.
         #[test]

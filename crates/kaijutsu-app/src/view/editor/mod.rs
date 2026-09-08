@@ -297,7 +297,7 @@ fn handle_editor_keys_outcome(
             FailureVerdict::Dropped(batch) => {
                 // Never a silent drop: the keystrokes are lost, say so. An
                 // in-editor surface for this (the strip is kernel-owned) is
-                // part of the transient-error UX in docs/issues.md.
+                // not built yet — this warn is the only signal today.
                 warn!(
                     "editor_keys({session}): dropped batch {batch:?} after retry — \
                      keystrokes lost; buffer state re-syncs on the next push"

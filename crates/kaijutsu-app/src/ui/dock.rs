@@ -120,9 +120,9 @@ pub struct DockState {
     pub block_activity: DockText,
     /// Ambient visibility into `background_exec.rs`'s host-process registry
     /// for the active context — "is anything backgrounded still running,
-    /// and how did the last one end" (docs/issues.md "Background shell +
-    /// process management"). Empty text = nothing running and nothing ever
-    /// finished, same "hidden when idle" convention as `block_activity`.
+    /// and how did the last one end". Empty text = nothing running and
+    /// nothing ever finished, same "hidden when idle" convention as
+    /// `block_activity`.
     pub background_jobs: DockText,
     /// Who is around, at a glance: `2\u{25cf} 1\u{25d0}` — connections
     /// observed, plus presence inferred from recent activity
@@ -2324,8 +2324,7 @@ fn format_elapsed_ms(ms: u64) -> String {
 
 /// Update the background-jobs badge — "is anything backgrounded still
 /// running, and how did the last one end" for the active context, Amy's ask
-/// for app visibility into `background_exec.rs` (docs/issues.md
-/// "Background shell + process management"). Reads the SAME kernel-derived
+/// for app visibility into `background_exec.rs`. Reads the SAME kernel-derived
 /// `ContextInfo.background_*` fields the context-usage badge reads its own
 /// fields from — display only, no interaction. Refreshes on the same
 /// ~5s `DriftState` poll cadence the model badge and context-usage badge

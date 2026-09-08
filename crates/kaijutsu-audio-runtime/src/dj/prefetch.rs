@@ -88,8 +88,8 @@ impl CasPrefetch {
     pub(crate) fn new() -> (Self, UnboundedReceiver<PrefetchOutcome>) {
         // One worker: prefetch is latency-tolerant (it runs under the prepare
         // horizon), and a single background thread keeps SFTP + the blocking
-        // FileStore read off the render loop. (spawn_blocking for the cache IO
-        // is the recorded follow-up, `docs/issues.md`.)
+        // FileStore read off the render loop. Moving the cache IO onto
+        // spawn_blocking is a known future improvement, not yet done.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("kaijutsu-cas-prefetch")
@@ -145,8 +145,8 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// not-yet-RST'd transport looks exactly like a slow one from here) drops
 /// the connection so it redials; a per-object failure (NotFound /
 /// HashMismatch) leaves the healthy transport in place. Logs the happy path
-/// too (`docs/issues.md` "Audio sink follow-ups") — hit/miss and timing, so a
-/// live debugging session has something to read instead of silence.
+/// too — hit/miss and timing, so a live debugging session has something to
+/// read instead of silence.
 async fn resolve_with_lazy_connect(
     slot: &AsyncMutex<Option<Arc<CasResolver<SftpClient>>>>,
     hash: &ContentHash,
@@ -192,9 +192,9 @@ async fn resolve_with_lazy_connect(
                 }
                 if transport && !redialed {
                     redialed = true;
-                    // The live failure this closes: the previous single
-                    // redial-retry was silent, so a placed clip just didn't
-                    // sound with nothing in the log (`docs/issues.md`).
+                    // Log the redial — a silent retry here previously meant
+                    // a placed clip just didn't sound, with no trace in the
+                    // log.
                     info!("sftp transport stale; redialing");
                     continue;
                 }

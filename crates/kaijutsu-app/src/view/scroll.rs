@@ -131,7 +131,7 @@ pub fn smooth_scroll(
 /// `content_height` changing) rather than building the fully general
 /// "animation active" vote gate that other animating subsystems (DJ thread,
 /// time-well drift, metronome flash) would also want — that generalization
-/// is tracked in docs/issues.md, DJ thread arc, and deliberately deferred.
+/// is deliberately deferred until another subsystem needs it too.
 pub fn scroll_render_mode(
     scroll_state: Res<crate::cell::ConversationScrollState>,
     time: Res<Time>,

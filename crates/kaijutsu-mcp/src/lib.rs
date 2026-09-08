@@ -76,7 +76,7 @@ use rmcp::{
 // Logging is deprecated by SEP-2577 (rmcp 1.8.0+) — kaijutsu still wants to
 // advertise `logging/setLevel` support for older/unmigrated peers, so this
 // stays wired up rather than being silently dropped; see the matching
-// `#[allow(deprecated)]` at each use site below. Tracked in docs/issues.md.
+// `#[allow(deprecated)]` at each use site below.
 #[allow(deprecated)]
 use rmcp::model::{LoggingLevel, SetLevelRequestParams};
 
@@ -1157,7 +1157,7 @@ impl KaijutsuMcp {
         // Two bugs die with the old shape. The stall backoff was defeated by
         // the doc task bumping `change` after its own fallback resync, so the
         // loop read its own recovery as "delivery is alive" and reset the
-        // ladder (filed in docs/issues.md); there is no ladder to defeat now.
+        // ladder; there is no ladder to defeat now.
         // And `ResyncReason::StallFallback` sat outside `do_coalesced_resync`'s
         // staleness argument because it was the one trigger not caused by the
         // ordered event stream — this path no longer resyncs at all.
@@ -1888,8 +1888,8 @@ impl KaijutsuMcp {
     /// `KernelDbError::LabelConflict` into a plain `capnp::Error::failed`
     /// string (`rpc.rs`), and the client folds that into `CallError::Rpc`
     /// (`actor.rs`) — a capnp schema change would be the principled fix, but
-    /// capnp is owned by a parallel lane right now (docs/issues.md). Matching
-    /// on `CallError::Rpc` first is the load-bearing part: it already rules
+    /// capnp is owned by a parallel lane right now. Matching on
+    /// `CallError::Rpc` first is the load-bearing part: it already rules
     /// out `NotReady`/`Timeout`/`Shutdown`/`PermanentlyFailed`, none of which
     /// a retry could fix. The `"label conflict"` substring inside that
     /// specific variant then narrows to the one `Rpc` failure retrying
@@ -1908,9 +1908,8 @@ impl KaijutsuMcp {
     /// free, then both try to create it — one wins (KernelDb's
     /// label-uniqueness index arbitrates; no corruption), and the loser used
     /// to surface a raw DB constraint error to its caller instead of a clean
-    /// retry (deepseek post-merge review, docs/issues.md). Re-resolving after
-    /// a conflict sees the winner's just-created row and picks the next free
-    /// candidate.
+    /// retry. Re-resolving after a conflict sees the winner's just-created
+    /// row and picks the next free candidate.
     ///
     /// Bounded at `MAX_RETRIES` — a caller should never exhaust this in
     /// practice; it would mean sustained heavy concurrent churn creating
@@ -1987,8 +1986,7 @@ impl KaijutsuMcp {
         // the harness's agent-session id, so a reconnect after a dropped MCP
         // session (or a kernel restart) would otherwise reuse the exact same
         // label and hit KernelDb's label-uniqueness constraint as a fatal
-        // "insert_context failed ... label conflict" (docs/issues.md,
-        // "register_session hard-fails on label conflict"). Upsert instead:
+        // "insert_context failed ... label conflict". Upsert instead:
         // attach to a still-live context, or create fresh under a suffixed
         // label if the prior one concluded/archived.
         let existing = match remote.actor.resolve_context_label(&requested_label).await {
@@ -2001,9 +1999,9 @@ impl KaijutsuMcp {
         let (context_id, label) = match existing {
             Some(ctx) if ctx.concluded_at.is_none() && !ctx.archived => {
                 // Attach: the label already names a live context. Loud on
-                // purpose — docs/issues.md notes "startup agent detection can
-                // report a previous session's id"; a stale id here would
-                // silently attach to the wrong prior conversation, so this
+                // purpose — startup agent detection can occasionally report
+                // a previous session's id; a stale id here would silently
+                // attach to the wrong prior conversation, so this
                 // stays visible in the server log AND in the reply's
                 // `resumed`/`last_activity_at` fields for the caller to
                 // sanity-check rather than trust blindly.
@@ -2095,9 +2093,9 @@ impl KaijutsuMcp {
         // suffixed label" branch above also counts as fresh: `resumed` is
         // never set there). Mirrors `created_by`/`created_at`: an origin
         // fact, set once, never overwritten by a later attach from a
-        // different machine (docs/issues.md "cc-* hook re-registration
-        // mints a new context per MCP relaunch" — fleet-board
-        // self-evidence). The stabilization path is covered too: a
+        // different machine — an operator reading the fleet board must see
+        // the context's real origin, not whichever host most recently
+        // reattached. The stabilization path is covered too: a
         // rename-in-place keeps this row (and stamp); a reattach switches
         // to a context an earlier process stamped at its own creation.
         // Best-effort: a failure here is logged and swallowed rather than
@@ -2156,8 +2154,7 @@ impl KaijutsuMcp {
         // (nick, instance) is the upsert key — attaching there would leave
         // two registrations for one process (placeholder nick + stable
         // nick) rather than replacing one. The cost is a peer nick that
-        // keeps the placeholder label after stabilization; tracked in
-        // docs/issues.md.
+        // keeps the placeholder label after stabilization.
         {
             let nick = peer_nick_for_label(&outcome.label);
             let (peer_tx, peer_rx) = std::sync::mpsc::channel::<PeerInvocation>();
@@ -2780,8 +2777,7 @@ impl ServerHandler for KaijutsuMcp {
         // 3.1.2). This value is the *fallback* a client lands on when it asks for
         // a version rmcp doesn't know; leaving it at the default would drop such
         // a client two steps, past a version we fully support. Bump deliberately
-        // when rmcp learns a newer version. See docs/issues.md "rmcp
-        // protocol-version fallback".
+        // when rmcp learns a newer version.
         .with_protocol_version(ProtocolVersion::V_2026_07_28)
         .with_instructions("Kaijutsu kernel MCP server. Provides tools for collaborative document and block editing with kernel-owned consistency.")
     }
@@ -3244,8 +3240,8 @@ mod tests {
     // register_session TOCTOU retry classification
     // =========================================================================
     //
-    // deepseek post-merge review (docs/issues.md): two concurrent
-    // `register_session` calls racing the same concluded/archived base label
+    // Two concurrent `register_session` calls racing the same
+    // concluded/archived base label
     // can both resolve the same suffixed candidate as free, then race
     // `create_context_typed` — the loser used to get a raw DB constraint
     // error surfaced straight to its caller instead of a clean retry. No
@@ -3290,8 +3286,8 @@ mod tests {
     /// happens to contain the string "label conflict" — otherwise this
     /// degrades into the exact string-only classification trap the codebase
     /// already learned to avoid once (`kernel_db.rs`'s `insert_document`
-    /// classification history, docs/issues.md:361). A retry can't fix a
-    /// connection that's already gone.
+    /// classification history). A retry can't fix a connection that's
+    /// already gone.
     #[test]
     fn non_rpc_variants_are_never_retryable_even_with_matching_text() {
         assert!(!KaijutsuMcp::is_retryable_label_conflict(

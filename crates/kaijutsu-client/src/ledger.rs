@@ -289,7 +289,7 @@ pub struct AskDetail {
     pub remember_scope: Option<String>,
     /// When this decision was redeemed (actually executed), or `None` when
     /// it never was, or the ask is still pending. `docs/tui.md`'s "was this
-    /// consumed" question (`docs/issues.md`, the resolved redemption entry).
+    /// consumed" question.
     pub redeemed_at: Option<i64>,
 }
 

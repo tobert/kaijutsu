@@ -172,10 +172,9 @@ impl KjDispatcher {
     /// row, and run the target's `drift` rc lifecycle.
     ///
     /// This is the shared shape that `push` (immediate), `pull`, `merge`
-    /// and `flush` each used to inline — see the "orchestration bloat"
-    /// entry in `docs/issues.md`. Only the immediate-`push` path is routed
-    /// through it so far; the others are unchanged and can migrate when
-    /// they are next touched.
+    /// and `flush` each used to inline. Only the immediate-`push` path is
+    /// routed through it so far; the others are unchanged and can migrate
+    /// when they are next touched.
     ///
     /// A failed *insert* is returned to the caller so it can decide what to
     /// do with the content (immediate `push` stages it rather than losing
@@ -729,8 +728,7 @@ impl KjDispatcher {
             // requeues and eventually dead-letters like anything else that
             // cannot be delivered, rather than losing or misattributing
             // content. Full peer-origin delivery needs a block_store.rs (and
-            // possibly kaijutsu-types) change and pairs naturally with slice
-            // 4, per docs/issues.md.
+            // possibly kaijutsu-types) change.
             let Some(source_ctx) = drift.origin.as_context() else {
                 tracing::warn!(
                     origin = %drift.origin.short(),
@@ -870,8 +868,7 @@ impl KjDispatcher {
                     ));
                 }
             };
-            // Two-phase drain (Task B, docs/issues.md "Drift drain acks
-            // before the lost+found write..."): `drain_dead_letter` checks
+            // Two-phase drain: `drain_dead_letter` checks
             // each item out WITHOUT marking its durable record consumed.
             // Only `ack_dead_letter`, called below after this loop's write
             // actually succeeds, does that — so a crash anywhere in this
@@ -1570,7 +1567,7 @@ mod tests {
 
     /// `drift push` must refuse an archived target, the same as `kj drive`
     /// (`kj/drive.rs`'s `drive_refuses_an_archived_context`). This used to be
-    /// the receipt FOR the router fallback (`docs/issues.md` item 3): an
+    /// the receipt for a since-deleted router fallback: an
     /// archived-but-still-registered context resolved through
     /// `DriftRouter::resolve_context` and the drift landed anyway. The
     /// fallback is deleted now (see the comment at `drift_push`'s target
@@ -2266,14 +2263,13 @@ mod tests {
         );
     }
 
-    /// docs/issues.md "Distillation picks the source's cast silently when
-    /// the caller differs": `drift pull` is the one call site where caller
-    /// and source are genuinely different contexts, so it is the one place
-    /// the mismatch can actually happen. With no `--distill-model` and the
-    /// puller on a different (provider, model) pair than the source, the
-    /// pull must refuse rather than silently bill the puller on the
-    /// source's (here, more expensive) cast — and the error must name both
-    /// casts plus the flag that resolves it.
+    /// `drift pull` is the one call site where caller and source are
+    /// genuinely different contexts, so it is the one place the source's
+    /// cast could get billed to the caller silently. With no
+    /// `--distill-model` and the puller on a different (provider, model)
+    /// pair than the source, the pull must refuse rather than silently
+    /// bill the puller on the source's (here, more expensive) cast — and
+    /// the error must name both casts plus the flag that resolves it.
     #[tokio::test]
     async fn drift_pull_refuses_cross_cast_without_distill_model() {
         use crate::llm::{MockClient, Provider};

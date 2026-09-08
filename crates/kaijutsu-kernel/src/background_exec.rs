@@ -1,11 +1,10 @@
 //! Background host-process execution + registry.
 //!
-//! `docs/issues.md` ("Background shell + process management"): `builtin.shell`
-//! is synchronous-only — a model can't start `cargo build`/a test suite/a dev
-//! server and get control back. This module is the kernel-owned substrate that
-//! closes the gap: a durable registry of spawned host processes, keyed by an
-//! opaque [`BackgroundId`], with their output streaming into a kernel block as
-//! it arrives.
+//! `builtin.shell` is synchronous-only — a model can't start `cargo
+//! build`/a test suite/a dev server and get control back. This module is
+//! the kernel-owned substrate that closes the gap: a durable registry of
+//! spawned host processes, keyed by an opaque [`BackgroundId`], with their
+//! output streaming into a kernel block as it arrives.
 //!
 //! # Why not kaish's own `&`/`JobManager`?
 //!
@@ -69,10 +68,9 @@
 //! [`BackgroundRegistry::spawn_reaper`] — the read-path reap alone isn't
 //! sufficient (a context can be removed, killing its processes, with no
 //! context ever polling again), so both exist. Long enough for a poller to
-//! observe the final status, bounded so the registry doesn't grow forever
-//! (`docs/issues.md`'s "must reap exited processes rather than leaking
-//! them"). The registry itself is the durable source of truth for exit
-//! status: `mark_exited`/`mark_killed` run unconditionally, even if the
+//! observe the final status, bounded so the registry doesn't grow forever.
+//! The registry itself is the durable source of truth for exit status:
+//! `mark_exited`/`mark_killed` run unconditionally, even if the
 //! block write failed (e.g. the context's document was deleted mid-run) — a
 //! `list_background_processes` poll never silently loses the exit code. A
 //! watchdog task additionally guards against the supervising task itself
@@ -1652,8 +1650,7 @@ mod tests {
     // namespace to observe the reparenting, which no in-process
     // `#[tokio::test]` can honestly simulate. `contrib/isotest`
     // (docs/isotest.md) already covers it against the real binary in a
-    // podman PID namespace, mutation-verified RED without PDEATHSIG
-    // (docs/issues.md, "Functional gate exists (2026-08-09)") — that
+    // podman PID namespace, mutation-verified RED without PDEATHSIG — that
     // suite is the actual pin for this behavior.
 
     /// Preserve-across-the-swap item: output must land in the kernel block

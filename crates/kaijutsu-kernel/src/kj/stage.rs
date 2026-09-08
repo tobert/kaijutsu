@@ -218,8 +218,7 @@ impl KjDispatcher {
                 let key = b.id.to_key();
                 // Suffix/full match on the `to_key()` form, plus the short
                 // `<principal8>#<seq>` form `kj block list`'s table prints
-                // (same addressing-asymmetry fix as `kj block read` et al. —
-                // docs/issues.md 2026-08-16).
+                // (same addressing accepted by `kj block read` et al.).
                 key.ends_with(block_key)
                     || key == block_key
                     || super::block::short_key(&b.id) == block_key

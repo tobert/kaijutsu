@@ -1,10 +1,10 @@
 //! The minimap: a whole diff compressed into one vertical strip.
 //!
-//! `docs/diff.md` Decision 6 put the minimap in scope for a diff — unlike the
-//! conversation, which `docs/issues.md` fences off — because a diff is a
-//! **bounded** document. Bounded means the strip can show all of it at once,
-//! and that is the only thing that makes a minimap honest: a scrollbar over an
-//! unbounded stream is a lie about how much there is.
+//! `docs/diff.md` Decision 6 put the minimap in scope for a diff — the
+//! conversation stays out of scope because it is unbounded, while a diff is
+//! a **bounded** document. Bounded means the strip can show all of it at
+//! once, and that is the only thing that makes a minimap honest: a scrollbar
+//! over an unbounded stream is a lie about how much there is.
 //!
 //! Everything here is pure and knows nothing about rows, pixels, or Bevy. It
 //! takes a sequence of [`MinimapClass`] — one per **drawn** row — and buckets

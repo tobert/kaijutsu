@@ -4,9 +4,8 @@
 //! First consumer: `kj cc send` — injecting a turn into a Claude Code
 //! session is exactly the "agent action a human should authorize" case the
 //! ledger exists for (Amy, 2026-08-16: *"yeah kj cc send should go through
-//! the ledger"*). The shape here is the template gate slice 1a
-//! (`docs/issues.md`) extended, then, to `shell_write`
-//! (`docs/gate-and-shell-split.md`, "Slice 4").
+//! the ledger"*). The shape here is the template gate, extended, then, to
+//! `shell_write` (`docs/gate-and-shell-split.md`, "Slice 4").
 //!
 //! A [`GateSpec`] carries an ORDERED list of [`GatedStatement`]s, not one —
 //! `kj cc send` happens to gate exactly one, `shell_write` gates every

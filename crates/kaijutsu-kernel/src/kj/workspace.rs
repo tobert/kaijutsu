@@ -489,7 +489,7 @@ mod tests {
 
         // `--mount` was never implemented (no DB column); it used to be parsed
         // and silently ignored. It's now removed, so clap rejects it loudly
-        // rather than dropping the value. See docs/issues.md.
+        // rather than dropping the value.
         let rejected = d
             .dispatch(
                 &[s("workspace"), s("add"), s("ws3"), s("/extra2"), s("--mount"), s("/mnt/x")],

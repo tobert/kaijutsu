@@ -179,10 +179,9 @@ async fn bind_kernel_raw_expect_refused(addr: SocketAddr, client_wire_version: u
 
 /// A client older than the kernel (sends a version below
 /// `kaijutsu_types::WIRE_VERSION`) is refused, and the client — the stale
-/// side — gets the rebuild advice. Regression guard for docs/issues.md,
-/// "The ACP binary can silently outlive a wire change", and for the
-/// follow-up defect where the remedy named the wrong side regardless of
-/// which one was actually stale.
+/// side — gets the rebuild advice. Regression guard for the defect where
+/// the remedy named the wrong side regardless of which one was actually
+/// stale.
 #[test]
 fn test_bind_kernel_rejects_stale_client() {
     run_local(async {

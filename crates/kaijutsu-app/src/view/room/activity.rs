@@ -107,8 +107,7 @@ impl BearingActivity {
 /// ([`super::super::time_well::activity::event_signal`] → per-context
 /// ripples + global energy, a model this mapping never had). Dropped the
 /// Center arms rather than leave them accumulating into a resource with no
-/// reader (`docs/issues.md`'s now-resolved "`BearingActivity(Center)` has no
-/// reader left" entry). [`Bearing::Center`] itself stays (room geometry still
+/// reader. [`Bearing::Center`] itself stays (room geometry still
 /// uses it) — only this event mapping stops feeding it.
 /// South (`Station::Switchboard`) joined 2026-08-10 (the switchboard slice):
 /// turn traffic — completions and failures alike — is exactly the "turn
@@ -221,8 +220,7 @@ mod tests {
         // Center bearing for the retired `ConsoleEmblem` placeholder. The
         // real time well now owns chatter/energy entirely through its own
         // richer model — this locks in the drop so a future edit doesn't
-        // quietly resurrect a write with no reader (`docs/issues.md`'s
-        // now-resolved "`BearingActivity(Center)` has no reader left" entry).
+        // quietly resurrect a write with no reader.
         let block = kaijutsu_types::BlockSnapshot::text(
             BlockId::new(ctx(1), PrincipalId::nil(), 0),
             None,

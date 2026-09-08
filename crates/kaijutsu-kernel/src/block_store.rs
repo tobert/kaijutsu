@@ -339,7 +339,7 @@ impl BlockStore {
     }
 
     /// Insert `row` via `db.insert_document`, reconciling the typed conflict
-    /// variant `create_document` can see (docs/issues.md:361).
+    /// variant `create_document` can see.
     ///
     /// - `Ok(())` — inserted cleanly.
     /// - `DuplicateDocument` — a row already exists at this `document_id`.
@@ -1668,9 +1668,8 @@ impl BlockStore {
             let version = entry.version();
             // `order_key` lives on `BlockSnapshot`, not `BlockHeader` — a
             // header-only payload can't carry it through oplog replay
-            // before the next compaction (docs/issues.md "Four write-once
-            // block fields don't survive oplog replay..."). Journal the
-            // full post-move snapshot instead so `merge_ops` can recover it.
+            // before the next compaction. Journal the full post-move
+            // snapshot instead so `merge_ops` can recover it.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -1828,10 +1827,8 @@ impl BlockStore {
             let version = entry.version();
             // `stderr` is a write-once snapshot field, not part of
             // `BlockHeader` — a header-only payload can't carry it through
-            // oplog replay before the next compaction (docs/issues.md
-            // "Four write-once block fields don't survive oplog
-            // replay..."). Journal the full post-mutation snapshot instead
-            // so `merge_ops` can recover it.
+            // oplog replay before the next compaction. Journal the full
+            // post-mutation snapshot instead so `merge_ops` can recover it.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -1876,8 +1873,7 @@ impl BlockStore {
             entry.doc.set_signature(block_id, signature)?;
             entry.touch(self.principal_id());
             // `signature` is a write-once snapshot field, not part of
-            // `BlockHeader` — see the same note on `set_stderr` above and
-            // docs/issues.md.
+            // `BlockHeader` — see the same note on `set_stderr` above.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -1945,7 +1941,7 @@ impl BlockStore {
             entry.touch(principal_id);
             let version = entry.version();
             // Snapshot-only fields, not part of `BlockHeader` — see the same
-            // note on `set_stderr` above and docs/issues.md.
+            // note on `set_stderr` above.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -1985,7 +1981,7 @@ impl BlockStore {
             entry.touch(principal_id);
             let version = entry.version();
             // `output` is a snapshot field, not part of `BlockHeader` — see
-            // the same note on `set_stderr` above and docs/issues.md.
+            // the same note on `set_stderr` above.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -2019,7 +2015,7 @@ impl BlockStore {
             entry.touch(principal_id);
             let version = entry.version();
             // `tool_use_id` is a snapshot field, not part of `BlockHeader`
-            // — see the same note on `set_stderr` above and docs/issues.md.
+            // — see the same note on `set_stderr` above.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -2212,11 +2208,11 @@ impl BlockStore {
         // Measuring the before-length here would materialize the whole block a
         // SECOND time per streamed token. Not a second time in place of none:
         // `BlockContent::append_text` already materializes it once to find the
-        // end (`blocks/content.rs`), which is a real per-token O(n)
-        // this classification neither causes nor cures — it is filed in
-        // docs/issues.md and belongs in the text engine. What this avoids is
-        // doubling it. `append_emits_exact_suffix` pins the by-construction
-        // claim against the engine's real behavior.
+        // end (`blocks/content.rs`), which is a real per-token O(n) cost this
+        // classification neither causes nor cures — it belongs to the text
+        // engine, not here. What this avoids is doubling it.
+        // `append_emits_exact_suffix` pins the by-construction claim against
+        // the engine's real behavior.
         self.emit_text_change(
             context_id,
             block_id,
@@ -2945,8 +2941,7 @@ impl BlockStore {
     /// silent default is *how* the drift-authorship smear stayed invisible
     /// for months — no call site ever had to think about who a block
     /// belonged to. `principal_id: None` is still allowed, but every call
-    /// site must now write it out and say why (see the identity-smear split,
-    /// `docs/issues.md` / commit `b356fc45`).
+    /// site must now write it out and say why.
     pub fn insert_drift_block_as(
         &self,
         context_id: ContextId,
@@ -4741,15 +4736,14 @@ mod tests {
 
     // ── Five write-once snapshot fields must survive replay ──────────────
     //
-    // docs/issues.md "Four write-once block fields don't survive oplog
-    // replay before the next compaction" (+ `move_block`'s `order_key`,
-    // the same gap). Each of these five mutations journals a `SyncPayload`
-    // via `SyncPayload::from_updated_header` — carrying only `BlockHeader`
-    // — for a field that lives on `BlockSnapshot`, not `BlockHeader`.
-    // `replay_journal` (the real restart path: fresh document + real
-    // journaled oplog rows, no compaction snapshot in between) must
-    // reproduce the mutation, exactly like `test_insert_block_journals_
-    // replayable_payload` above proves for insert.
+    // Each of these five mutations journals a `SyncPayload` via
+    // `SyncPayload::from_updated_header` — carrying only `BlockHeader` — for
+    // a field that lives on `BlockSnapshot`, not `BlockHeader` (the same gap
+    // `move_block`'s `order_key` has). `replay_journal` (the real restart
+    // path: fresh document + real journaled oplog rows, no compaction
+    // snapshot in between) must reproduce the mutation, exactly like
+    // `test_insert_block_journals_replayable_payload` above proves for
+    // insert.
 
     #[tokio::test]
     async fn test_set_stderr_survives_oplog_replay_without_compaction() {
@@ -6117,10 +6111,10 @@ mod tests {
     }
 
     // ========================================================================
-    // docs/issues.md:361 — create_document must classify an insert_document
-    // failure via the typed KernelDbError::DuplicateDocument variant, not by
-    // matching error message text, and must tell a genuine benign duplicate
-    // apart from a divergent row claiming the same id.
+    // create_document must classify an insert_document failure via the typed
+    // KernelDbError::DuplicateDocument variant, not by matching error message
+    // text, and must tell a genuine benign duplicate apart from a divergent
+    // row claiming the same id.
     // ========================================================================
 
     /// 5. A matching row already in the DB (same id, kind, path=None) is the

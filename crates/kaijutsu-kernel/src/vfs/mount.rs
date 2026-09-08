@@ -566,7 +566,7 @@ impl MountTable {
     /// KNOWN GAP: generation bumps only observe VFS-mediated mutations — an
     /// external process writing directly into a LocalBackend-backed host
     /// path (e.g. `cargo build` populating `target/`) is invisible to the
-    /// counter until inotify lands (stage 2); tracked in `docs/issues.md`.
+    /// counter until inotify lands (stage 2).
     ///
     /// **`ignored`** (gitignore classification — metadata, never a filter,
     /// see `docs/scenes/vfs.md`) is real for LocalBackend-backed subtrees:
@@ -575,8 +575,7 @@ impl MountTable {
     /// the precision gap vs. git's exact semantics). Only `.gitignore` files
     /// at-or-below the snapshot root are considered — an ancestor
     /// `.gitignore` above the root path is not consulted. Virtual/document
-    /// backends always report `ignored=false`. Both gaps are tracked in
-    /// `docs/issues.md`.
+    /// backends always report `ignored=false`.
     pub async fn snapshot(
         &self,
         path: &Path,

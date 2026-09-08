@@ -99,7 +99,7 @@ impl BrokerClientHandler {
     // wholesale, not superseding them. Kaibo/bevy_brp still negotiate against
     // it today, so keep advertising it rather than silently withdrawing a
     // capability older or unmigrated peers may still probe for; revisit when
-    // rmcp actually removes the API (tracked in docs/issues.md).
+    // rmcp actually removes the API.
     #[allow(deprecated)]
     fn new(tx: broadcast::Sender<ServerNotification>) -> Self {
         let mut info = ClientInfo::default();
@@ -109,8 +109,7 @@ impl BrokerClientHandler {
         // tops out at `V_2026_07_28` (true in both 3.0.1 and 3.1.2). Taking the
         // default silently negotiated every external server (kaibo, bevy_brp)
         // down to 2025-11-25 and dropped the version-gated fields with it.
-        // Bump this deliberately when rmcp learns a newer version; see
-        // docs/issues.md "rmcp protocol-version fallback".
+        // Bump this deliberately when rmcp learns a newer version.
         info.protocol_version = ProtocolVersion::V_2026_07_28;
         info.client_info.name = "kaijutsu".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
@@ -852,8 +851,7 @@ impl McpServerLike for ExternalMcpServer {
     // resources/subscribe is legacy-only per SEP-2577 (superseded by
     // `Peer::listen` / `subscriptions/listen` for peers on protocol version
     // 2026-07-28) — but that's a real subscription-model migration, not a
-    // drop-in swap, and out of scope for this dependency bump. Kept for now;
-    // tracked in docs/issues.md.
+    // drop-in swap, and out of scope for this dependency bump. Kept for now.
     #[allow(deprecated)]
     async fn subscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
         if self.down.load(Ordering::Relaxed) {

@@ -33,7 +33,7 @@
 //! consultation that's mid-flight when someone edits mcp.toml is never
 //! interrupted by a reload, at the cost of a `command`/`args`/`env` edit not
 //! taking effect until the server is explicitly restarted — there is no
-//! `kj mcp restart <name>` in this slice (noted in docs/issues.md).
+//! `kj mcp restart <name>` yet.
 //!
 //! The alternative — diffing `McpServerConfig` and hot-swapping a changed
 //! entry — is also defensible: `Broker::register` already replaces-by-id,

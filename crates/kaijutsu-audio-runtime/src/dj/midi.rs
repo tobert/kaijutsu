@@ -279,8 +279,8 @@ pub(crate) fn dispatch_midi_cue(
         return;
     }
     let CuePayload::Inline(bytes) = &cue.payload else {
-        // CAS-backed ABC (a large score by ref) is a recorded follow-up
-        // (docs/issues.md), not resolved yet — loud, not silently dropped.
+        // CAS-backed ABC (a large score by ref) is not resolved yet — fail
+        // loud, not silently dropped.
         warn!("MIDI cue with a CAS payload not resolved yet (mime={})", cue.mime);
         return;
     };

@@ -1349,9 +1349,8 @@ impl BlockDocument {
         // `move_block` each touch a field that lives on `BlockSnapshot` but
         // not `BlockHeader` (stderr/signature/output/tool_use_id/
         // order_key), so a bare header can't carry the change through
-        // replay — see docs/issues.md "Four write-once block fields don't
-        // survive oplog replay...". A full overwrite here is safe for the
-        // same reason `new_blocks`' overwrite is: replay is strictly
+        // replay. A full overwrite here is safe for the same reason
+        // `new_blocks`' overwrite is: replay is strictly
         // sequential self-application of this document's own history
         // (never a concurrent merge — CLAUDE.md "Durable state and the
         // wire"), so each snapshot already reflects everything journaled
@@ -1745,8 +1744,7 @@ pub struct SyncPayload {
     /// `stderr`/`signature`/`output`/`tool_use_id` (write-once metadata) and
     /// `order_key` (`move_block`). `updated_headers` alone can't carry these
     /// through oplog replay (`merge_ops` never reads a field the header
-    /// doesn't have) — see docs/issues.md "Four write-once block fields
-    /// don't survive oplog replay...".
+    /// doesn't have).
     ///
     /// `#[serde(default)]` is LOAD-BEARING: this struct is journaled as
     /// versioned CBOR (field-name-keyed maps, no `deny_unknown_fields`), so

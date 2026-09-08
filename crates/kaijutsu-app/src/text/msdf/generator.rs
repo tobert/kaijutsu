@@ -223,11 +223,10 @@ fn generate_glyph(
     // latter's accumulator is zero-seeded and only ever shrinks toward an
     // extreme, so `left`/`bottom` silently stay 0 for any glyph whose true
     // left/bottom edge is positive (left-side bearing, glyphs above the
-    // baseline — the common case). See docs/issues.md ("msdfgen-rs
-    // `Shape::get_bound()` / `Contour::get_bound()` zero-seeded"). This is
-    // the control-point bbox, a superset of the true curve bbox
-    // (quadratic/cubic control points always bound their curves) — a hair
-    // loose on curvy glyphs is fine, too small is impossible.
+    // baseline — the common case). This is the control-point bbox, a
+    // superset of the true curve bbox (quadratic/cubic control points
+    // always bound their curves) — a hair loose on curvy glyphs is fine,
+    // too small is impossible.
     let Some(bbox) = face.glyph_bounding_box(glyph_ttf_id) else {
         // No outline (e.g. space) — same terminal path as a missing shape.
         return placeholder_glyph(key);
@@ -441,10 +440,8 @@ mod tests {
     /// NOT `msdfgen::Shape::get_bound()` — the latter has a real,
     /// independent bug (accumulator zero-seeded, only ever shrinks toward
     /// an extreme, so `left`/`bottom` silently stay `0.0` for any glyph
-    /// whose true left/bottom edge is positive). See docs/issues.md
-    /// ("msdfgen-rs `Shape::get_bound()` / `Contour::get_bound()`
-    /// zero-seeded") for the full writeup; `generate_glyph` itself no
-    /// longer calls `get_bound()` at all as of this lane.
+    /// whose true left/bottom edge is positive); `generate_glyph` itself no
+    /// longer calls `get_bound()` at all.
     fn assert_glyph_geometry_matches_bounds(ch: char) {
         let font_data = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),

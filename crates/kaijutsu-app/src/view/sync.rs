@@ -53,9 +53,9 @@ fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
 /// pending switch. It used to also re-enable scroll-follow whenever the view
 /// was near the bottom and layout advanced (streamed block/text changes ride
 /// the per-context change feed now; see `drain_context_feeds`) — that was
-/// the sticky-follow yank bug (docs/issues.md, scroll-relief slice 0):
-/// scrolling up within the 50px `is_at_bottom()` band, pausing one frame, and
-/// the next streamed block silently snapped the view back to the bottom.
+/// the sticky-follow yank bug: scrolling up within the 50px
+/// `is_at_bottom()` band, pausing one frame, and the next streamed block
+/// silently snapped the view back to the bottom.
 /// Follow is sticky now — once the user scrolls away from the tail it stays
 /// off until they explicitly return (`ScrollToEnd`/`start_following`, or
 /// scrolling target back to true bottom, `ConversationScrollState::scroll_by`)

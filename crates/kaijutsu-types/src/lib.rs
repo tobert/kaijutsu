@@ -102,8 +102,7 @@ pub const SSH_SHARE_SUBSYSTEM: &str = "kaijutsu-share";
 /// bump. It shipped without one — a stale `target/debug/kaijutsu-acp` build
 /// artifact kept running against a rebuilt kernel, silently missing the
 /// permission-approval feature instead of failing, and cost a morning to
-/// diagnose. See `docs/issues.md`, "The ACP binary can silently outlive a
-/// wire change (2026-08-18)".
+/// diagnose.
 ///
 /// Starts at 1. 0 is reserved as the "old client that predates this field"
 /// sentinel (capnp's struct default for an unset `UInt32`) and must never be

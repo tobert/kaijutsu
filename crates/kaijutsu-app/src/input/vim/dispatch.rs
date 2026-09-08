@@ -849,8 +849,8 @@ mod tests {
 
     // ── Backspace in Insert mode ──
     //
-    // Verify what modalkit emits when Backspace is pressed in Insert mode.
-    // This is the verification test called out in docs/issues.md:136-137.
+    // Verify what modalkit emits when Backspace is pressed in Insert mode
+    // (a regression guard on that mapping).
     // If the emitted action is `EditAction::Delete` with a `Column(Previous)`
     // motion target, the existing Delete arm in `translate_action` (combined
     // with the exclusive-motion fix) handles it correctly.

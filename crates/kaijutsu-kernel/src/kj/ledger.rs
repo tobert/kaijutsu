@@ -881,7 +881,7 @@ impl KjDispatcher {
                         // context is an expected state, and refusing every
                         // such ask would close the audit path along with the
                         // hazard. Widening this to "no live context" is a
-                        // separate decision — see `docs/issues.md`.
+                        // separate decision.
                         let archived = db
                             .get_context(ask_ctx)
                             .ok()

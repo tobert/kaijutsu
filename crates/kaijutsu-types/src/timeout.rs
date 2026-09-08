@@ -86,9 +86,8 @@ pub mod tiers {
     ///
     /// This is not hypothetical headroom. `AuthorBlocks` queues FIFO in the
     /// doc task behind a resync whose fetch is bounded at the *request* tier,
-    /// so a hook arriving mid-resync could wait far past CC's patience
-    /// (docs/issues.md, the MCP latency entry). The budget converts that from
-    /// "CC kills us" into "we degrade and say so".
+    /// so a hook arriving mid-resync could wait far past CC's patience. The
+    /// budget converts that from "CC kills us" into "we degrade and say so".
     pub const HOOK_PATH: Duration = Duration::from_secs(4);
 
     /// Kaijutsu's reply budget for Codex hooks. Kept inside the shortest host
@@ -242,9 +241,8 @@ pub struct TimeoutPolicy {
     /// (fail-closed). One shared number by design: the gate's poll deadline
     /// and the `ctx.patient(...)` hold that freezes the script clock around
     /// it (see `kj_builtin`) must read the SAME value — two numbers here
-    /// would drift, and the drift is exactly the failure in docs/issues.md
-    /// "Gate slice 1a — three findings", finding #1 (kaish's own watchdog
-    /// killing a blocking gate long before the gate's timeout fires).
+    /// would drift, letting kaish's own watchdog kill a blocking gate long
+    /// before the gate's timeout fires.
     ///
     /// This field is a raw operator setting, not the value a gate hop
     /// should wait on directly — an operator can raise it past what the

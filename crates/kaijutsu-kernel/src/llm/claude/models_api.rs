@@ -2,8 +2,7 @@
 //!
 //! Background: `context_window` in `models.toml` was a hand-maintained
 //! per-model value, deliberately resolving to `Option<u64>` — never a
-//! fabricated default (see `docs/issues.md` "Day-job coding readiness", the
-//! token-accounting entry). A hand-kept table goes stale on every model
+//! fabricated default. A hand-kept table goes stale on every model
 //! launch. Anthropic's Models API returns the window live as
 //! **`max_input_tokens`** — note there is no `context_window` field on the
 //! wire; that name is ours. The API also returns `max_tokens` (the output
@@ -246,9 +245,9 @@ mod tests {
     /// honestly resolves a *retired* model to `None` too (same as
     /// "unknown"), so this specific brief claim ("the live lookup should
     /// close it") does not hold anymore; the mechanism is doing exactly
-    /// the right thing by returning `None` for a model that's gone. See
-    /// `docs/issues.md` for the follow-up this surfaces (the `balanced`/
-    /// `default` aliases point at a retired model).
+    /// the right thing by returning `None` for a model that's gone. This
+    /// surfaces a separate follow-up: the shipped `balanced`/`default`
+    /// model aliases still point at a retired model.
     ///
     /// `claude-sonnet-5` is used instead to verify the mechanism itself: a
     /// model genuinely absent from models.toml (it postdates that file)

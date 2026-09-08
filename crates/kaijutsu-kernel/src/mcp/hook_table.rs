@@ -2,10 +2,10 @@
 //!
 //! **Scope: MCP / tool-broker only.** Every [`McpHookPhase`] variant fires
 //! around the broker — `call_tool`, `list_visible_tools`, notifications. The
-//! per-model-turn seam (`BeforeModelTurn` / `AfterModelTurn`, see
-//! `docs/issues.md` → *Cache & cost — decided direction*) is a **separate
-//! sibling surface** on the LLM turn loop, not a variant here; it shares the
-//! [`HookAction`] verdict vocabulary but lives outside this MCP-scoped enum.
+//! per-model-turn seam (`BeforeModelTurn` / `AfterModelTurn`) is a
+//! **separate sibling surface** on the LLM turn loop, not a variant here;
+//! it shares the [`HookAction`] verdict vocabulary but lives outside this
+//! MCP-scoped enum.
 //!
 //! Phase 4 wires evaluation at the four pinch points:
 //! - `PreCall` / `PostCall` / `OnError` — evaluated around

@@ -179,8 +179,7 @@ pub struct HookListener {
     /// mode). Deliberately NOT gated to `session.start`: that event never
     /// fires again on a same-session MCP relaunch (`/mcp reconnect`, a
     /// kernel restart that killed the process) — exactly the case this
-    /// exists to fix (docs/issues.md "cc-* hook re-registration mints a new
-    /// context per MCP relaunch").
+    /// exists to fix.
     pending_label_base: Mutex<Option<String>>,
     /// Guards `set_context_model` (from `session.start`'s `model` field) to
     /// at most one call per process.
@@ -1177,8 +1176,7 @@ impl HookListener {
     /// same upsert machinery `register_session` uses, so a relaunch that
     /// lands here re-attaches to the SAME context an earlier process in
     /// this session already stabilized, instead of minting another
-    /// placeholder (docs/issues.md "cc-* hook re-registration mints a new
-    /// context per MCP relaunch").
+    /// placeholder.
     async fn maybe_stabilize_label(&self, session_id: &str) {
         let Some(ref remote) = self.remote else { return };
 

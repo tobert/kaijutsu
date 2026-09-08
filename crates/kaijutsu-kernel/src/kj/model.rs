@@ -325,9 +325,9 @@ mod tests {
     /// already expect ("unconfigured → null"): the fake stands in for "the
     /// live API doesn't know this model either," not for exercising the
     /// live-value-found path (that's covered in `llm/mod.rs` and
-    /// `llm/claude/mod.rs`'s own tests). This is the seam from
-    /// `docs/issues.md`'s test-isolation lesson — not a flag — so
-    /// `cargo test` never touches the network here.
+    /// `llm/claude/mod.rs`'s own tests). Substituting the capability
+    /// source at the seam — not a flag — keeps `cargo test` from ever
+    /// touching the network here.
     async fn seed_registry(d: &crate::kj::KjDispatcher) {
         let mut reg = d.kernel().llm().write().await;
         let claude_client = claude::Client::new("fake")

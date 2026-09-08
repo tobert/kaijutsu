@@ -1013,8 +1013,7 @@ fn refuse_missing_cwd(tool: &str) -> ExecResult {
 /// that walk means descending the entire filesystem: above any repository,
 /// so `.gitignore` never applies and the walk falls into build-output trees
 /// until the 120s tool timeout fires. That cost a wasted agentic iteration
-/// every time an autonomous turn tried to orient itself (see
-/// `docs/issues.md`, the 2026-08-07 cwd entry).
+/// every time an autonomous turn tried to orient itself.
 ///
 /// A refusal that names the fix is strictly better than a walk that cannot
 /// finish: the model can retry with a real `path` on the next tool call
@@ -1148,11 +1147,11 @@ mod tests {
     /// fabricated `/` for it, which both violated `CallContext::cwd`'s own
     /// documented contract ("`None` means filesystem tools must reject")
     /// and, concretely, sent autonomous turns walking the entire filesystem
-    /// on a pathless `glob`/`grep` until the 120s tool timeout fired (see
-    /// `docs/issues.md`, the 2026-08-07 cwd entry). Empty `{}` args are
-    /// enough: the check runs before any arg is even deserialized, so a
-    /// tool that would otherwise reject missing-required-field input must
-    /// still surface the cwd refusal first.
+    /// on a pathless `glob`/`grep` until the 120s tool timeout fired. Empty
+    /// `{}` args are enough: the check runs before any arg is even
+    /// deserialized, so a tool that would otherwise reject
+    /// missing-required-field input must still surface the cwd refusal
+    /// first.
     #[tokio::test]
     async fn every_tool_rejects_a_context_with_no_cwd() {
         let (broker, _cache) = broker_with_file("/tmp/a.rs", "fn main() {}\n").await;

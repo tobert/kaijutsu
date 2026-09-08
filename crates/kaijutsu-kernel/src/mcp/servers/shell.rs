@@ -1514,8 +1514,8 @@ mod tests {
         // A latched destructive op (exit 2) carries its gate on kaish's opaque
         // `baggage` channel (kaish 0.14 deleted the typed `.latch` field). The
         // envelope must surface it so a batch loop reads the gate structurally
-        // instead of scraping the confirmation prose out of stdout. Resolves
-        // the on-hold docs/issues.md "latch nonce on stderr" entry.
+        // instead of scraping the confirmation prose out of stdout. This test
+        // is the regression guard for that.
         let r = crate::runtime::kj_builtin::latch_result(
             "kj context remove",
             "doomed",

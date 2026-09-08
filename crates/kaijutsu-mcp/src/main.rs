@@ -186,8 +186,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         // repo-only prefix (`auto_register_base`), NOT the timestamped
         // label used for the initial join — the stable label is
         // `{base}-{sid8}`, deterministic across MCP relaunches within the
-        // same hosting-agent session (docs/issues.md "cc-* hook
-        // re-registration mints a new context per MCP relaunch").
+        // same hosting-agent session.
         let mut pending_label_base: Option<String> = None;
 
         let mcp = if args.connect {

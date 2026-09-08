@@ -1192,8 +1192,8 @@ fn fill_patch_text(
     if let Ok(mut msdf) = info.single_mut() {
         let text = describe_selection(&state.snapshot, state.selected, state.node.as_deref());
         // Shrink-to-fit (not the fixed-size `layout_plate_text`): a long
-        // `client:port -> client:port` used to overflow the plate (recorded in
-        // `docs/issues.md`); this steps the font down until the wire name fits.
+        // `client:port -> client:port` used to overflow the plate; this
+        // steps the font down until the wire name fits.
         let glyphs = layout_info_text(&text, font, atlas, &mut font_data_map);
         commit_panel_glyphs(&mut msdf, glyphs);
     }
@@ -1422,7 +1422,7 @@ const INFO_PLATE_SIZES: [f32; 5] = [PLATE_FONT_SIZE, 26.0, 22.0, 18.0, 15.0];
 ///      *word* to fit (the old, single-pass behavior) let a short string like
 ///      `RENDER -> TIMIDITY 0` land on a size just barely too big for the
 ///      plate — the trailing "0" wrapped onto its own line even though the
-///      whole string would have fit one step down (`docs/issues.md`).
+///      whole string would have fit one step down.
 ///   2. only if no size clears pass 1, the old wrap-allowed fit
 ///      (`wrapped_metrics`: `(content_widths.min, height)`) — a genuinely
 ///      long multi-hop wire name still wraps rather than truncating.
@@ -1453,7 +1453,7 @@ fn choose_info_plate_size(
 /// glyphs at that size via [`collect_plate_glyphs`] — the same brush and
 /// glyph-collection tail `room::layout_plate_text` uses; this only adds the
 /// fit loop the fixed-size helper can't do, so a long wire name no longer
-/// overflows the frame (`docs/issues.md`).
+/// overflows the frame.
 fn layout_info_text(
     text: &str,
     font: &VelloFont,

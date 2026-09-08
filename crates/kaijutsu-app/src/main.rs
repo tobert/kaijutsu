@@ -139,7 +139,7 @@ fn main() {
     // dictionary for the unspaced scripts — so every layout containing Japanese
     // warns `ICU4X data error: No segmentation model ...: ja`, hundreds of lines
     // a minute with 会術 on screen. It is the *expected* result of parley's
-    // configuration, not a fault we can fix from here (docs/issues.md).
+    // configuration, not a fault we can fix from here.
     //
     // This line only bites because `kaijutsu-app`'s Cargo.toml takes a direct
     // `icu_provider` dependency solely to enable its `logging` feature — see the

@@ -167,11 +167,10 @@ pub struct Kernel {
     /// is kernel-wide — and the context feed's delivery filter drops anything
     /// that cannot name one.
     ledger_flows: SharedLedgerFlowBus,
-    /// Background host-process registry (`background_exec.rs`,
-    /// `docs/issues.md` "Background shell + process management"). Kernel-owned
-    /// (not per-materialized-shell) so a process started by one `shell`
-    /// tool call is still queryable/killable from the next — see the module
-    /// docs for the full ownership/cleanup contract.
+    /// Background host-process registry (`background_exec.rs`).
+    /// Kernel-owned (not per-materialized-shell) so a process started by one
+    /// `shell` tool call is still queryable/killable from the next — see the
+    /// module docs for the full ownership/cleanup contract.
     background: Arc<crate::background_exec::BackgroundRegistry>,
     /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
     /// "Order from here: kernel wiring of the inbox"). `OnceLock` like
@@ -2949,8 +2948,8 @@ mod tests {
         );
     }
 
-    // ── A failed `:w` (docs/issues.md, "A failed `:w` reports clean, and
-    // retrying it hits the wrong error") ────────────────────────────────────
+    // ── A failed `:w` must report the failure, not clean, and a retry must
+    // not surface a stale error ─────────────────────────────────────────────
 
     /// A file-backed session over a read-only host mount: `flush_one`'s VFS
     /// write genuinely fails (`VfsError::ReadOnly`), the honest way to

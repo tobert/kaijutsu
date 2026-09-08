@@ -1,22 +1,20 @@
 //! `resolveContextLabel` (DB-driven label lookup) and the `joinContext`
 //! registry-heal it exists to support — server-side halves of the
-//! `register_session` upsert/attach fix (docs/issues.md, "register_session
-//! hard-fails on label conflict").
+//! `register_session` upsert/attach fix.
 //!
 //! `join_context_heals_registry_for_an_archived_context_after_restart` below
-//! also narrows a claim in docs/issues.md ("MCP-created context invisible to
-//! `kj context list` after kernel restart"): boot-time recovery
+//! also narrows an earlier claim that an MCP-created context goes invisible
+//! to `kj context list` after a kernel restart: boot-time recovery
 //! (`create_shared_kernel`'s "Recover contexts" step, `rpc.rs`) already
 //! re-registers every NON-ARCHIVED context into the DriftRouter on every
 //! boot via `KernelDb::list_active_contexts` (`WHERE archived_at IS NULL`) —
 //! confirmed by `list_contexts_recovers_live_context_after_restart` here. So
 //! a live or concluded context surviving a restart is NOT actually
-//! registry-invisible today; that part of the filed issue does not
-//! reproduce against current code and looks stale (see the docs update in
-//! this same change for the correction). The one context state boot recovery
-//! genuinely skips is `archived_at IS NOT NULL` — an archived context's
-//! DriftRouter entry really does not survive a restart, and that's the real,
-//! narrow gap `joinContext`'s heal (added alongside this fix) closes.
+//! registry-invisible today; that claim does not reproduce against current
+//! code. The one context state boot recovery genuinely skips is
+//! `archived_at IS NOT NULL` — an archived context's DriftRouter entry
+//! really does not survive a restart, and that's the real, narrow gap
+//! `joinContext`'s heal (added alongside this fix) closes.
 
 mod common;
 use common::*;

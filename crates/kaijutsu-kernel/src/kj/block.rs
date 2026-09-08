@@ -440,9 +440,9 @@ impl KjDispatcher {
     ///   `block list`'s `-c`) via `resolve_context_arg` — the caller's
     ///   current context when `ctx_ref` is `None`.
     ///
-    /// "A tool's output should be accepted as that tool family's input"
-    /// (Amy, `docs/issues.md` 2026-08-16) — this closes the
-    /// read-your-own-listing gap for every id-taking verb, not just `read`.
+    /// A tool's output should be accepted as that tool family's input —
+    /// this closes the read-your-own-listing gap for every id-taking verb,
+    /// not just `read`.
     ///
     /// Short-form resolution is unambiguous barring an entropy-tail
     /// collision between two principals in the same context (astronomically
@@ -468,7 +468,7 @@ impl KjDispatcher {
             // (probed live 2026-08-17 against 0.14.1; bash and /bin/sh both
             // pass `abc#3` through intact). Without this hint the message
             // names a value the user never typed, so a shell problem reads as
-            // a kj bug. See docs/issues.md.
+            // a kj bug.
             if prefix_looks_like_a_principal_short(id_str) {
                 return Err(format!(
                     "malformed id '{id_str}': looks like a short id whose '#<seq>' was \
@@ -2483,11 +2483,10 @@ mod tests {
         assert!(result.message().contains("malformed"));
     }
 
-    /// The addressing-asymmetry fix: `kj block list`'s plain-text table
-    /// prints `<principal8>#<seq>` (`short_key`), not the full id `read`
-    /// used to require. This must round-trip — the whole point of the fix
-    /// (docs/issues.md "`kj block read` rejects the block id that `kj block
-    /// list` prints").
+    /// Regression: `kj block list`'s plain-text table prints
+    /// `<principal8>#<seq>` (`short_key`), not the full id `read` used to
+    /// require. This must round-trip — `read` must accept exactly what
+    /// `list` prints.
     #[tokio::test]
     async fn block_read_accepts_short_id_from_list() {
         let d = test_dispatcher().await;
@@ -2513,8 +2512,7 @@ mod tests {
 
     /// `-c`/`--context` lets `read` resolve a short id against a context
     /// other than the caller's own, and it must actually redirect the
-    /// search — not silently keep resolving against the caller's context
-    /// (docs/issues.md, "short id has no flag to point it elsewhere").
+    /// search — not silently keep resolving against the caller's context.
     ///
     /// Setup forces a genuine same-numbered collision: the same principal
     /// authors the first block in two different contexts, so both blocks

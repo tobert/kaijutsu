@@ -782,8 +782,7 @@ mod tests {
     /// `read_all` through a symlink must return the *target's* full content, not
     /// truncate to the link-path length. The trait default sizes from `getattr`
     /// (lstat — link-path bytes), so a link to a longer file would read short;
-    /// the override reads to EOF after following. Regression for the issue noted
-    /// in docs/issues.md.
+    /// the override reads to EOF after following. Regression for that bug.
     #[tokio::test]
     async fn read_all_follows_symlink_without_truncating() {
         let (backend, _dir) = setup().await;

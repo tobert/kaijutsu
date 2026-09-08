@@ -311,8 +311,7 @@ async fn handle_new_session(
     }
 }
 
-/// Client-identity presets on connect (docs/issues.md, "ACP adapter
-/// follow-ups", "Client-identity presets on connect").
+/// Client-identity presets on connect.
 ///
 /// Every ACP context otherwise gets the LLM registry's row-stamped default
 /// cast (today `deepseek-v4-flash`) regardless of which frontend connected.

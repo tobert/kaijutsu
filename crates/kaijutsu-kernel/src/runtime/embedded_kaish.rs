@@ -963,7 +963,7 @@ mod tests {
         // writes the target string verbatim as a real host symlink — a
         // host-relative target (what `reseed_rc_files` writes for the
         // embedded seed's own composition) resolves; a VFS-absolute one
-        // would not (see docs/issues.md).
+        // would not.
         let r = run(
             "ln -s ../../lib/create/binding.kai /config/rc/coder/create/S10-binding.kai",
         )
@@ -989,8 +989,8 @@ mod tests {
         assert_eq!(target.to_string_lossy(), "../../lib/create/binding.kai");
     }
 
-    /// `/v/cas` regression (docs/issues.md "kaish `/v/cas` is shadowed"). kaish
-    /// 0.11's `VirtualOverlayBackend` reserved every `/v/*` path for its own
+    /// `/v/cas` regression: kaish 0.11's `VirtualOverlayBackend` reserved
+    /// every `/v/*` path for its own
     /// (always-empty here) overlay regardless of whether the embedder had a
     /// real mount there, so `ls`/`cat /v/cas/...` through kaish silently saw
     /// nothing even with a live `CasFs` mount on the kernel `MountTable` — SFTP

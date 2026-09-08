@@ -1,10 +1,9 @@
 //! The roster's scheduled-periodic refresh is wired into server boot.
 //!
-//! `roster_sources::spawn_periodic_refresh` shipped with slice 2 fully
-//! unit-tested and **called from nowhere** — the branch that built it could
-//! not start a live kernel, so the one production call site was deliberately
-//! left out (docs/issues.md, "Live roster — two things landed without, on
-//! purpose"). That is a shape unit tests structurally cannot catch: the
+//! `roster_sources::spawn_periodic_refresh` shipped fully unit-tested and
+//! **called from nowhere** — the branch that built it could not start a
+//! live kernel, so the one production call site was deliberately left out.
+//! That is a shape unit tests structurally cannot catch: the
 //! function is correct, its caller is absent, and every test of the function
 //! still passes.
 //!

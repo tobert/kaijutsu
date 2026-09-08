@@ -114,15 +114,14 @@ impl KernelBridge {
             // A wire-version mismatch is the one connect failure where the
             // human needs a single unambiguous line on stderr rather than
             // an anyhow chain: an ACP client's only diagnostic channel
-            // before a session exists is stderr, and this is exactly the
-            // failure mode (docs/issues.md, "The ACP binary can silently
-            // outlive a wire change") a rebuild fixes. `msg` already names
-            // both wire versions and, via `wire_version_mismatch_message`,
-            // which side is stale — only append the ACP-specific rebuild
-            // command when THIS binary is the stale side; the kernel-stale
-            // case's message already tells the operator to rebuild and
-            // restart the server, and appending ACP-rebuild advice there
-            // would blame the side that's actually correct.
+            // before a session exists is stderr, and a rebuild is the fix.
+            // `msg` already names both wire versions and, via
+            // `wire_version_mismatch_message`, which side is stale — only
+            // append the ACP-specific rebuild command when THIS binary is
+            // the stale side; the kernel-stale case's message already tells
+            // the operator to rebuild and restart the server, and appending
+            // ACP-rebuild advice there would blame the side that's actually
+            // correct.
             if msg.contains("client is stale") {
                 eprintln!(
                     "kaijutsu-acp: wire version mismatch — {msg} Rebuild this binary: \
@@ -461,8 +460,7 @@ impl KernelBridge {
         let state = self.actor.get_input_state(context_id).await?;
         // Char count, not `.len()`. `edit_input`'s `pos`/`delete` are character
         // offsets; a byte length here truncates or over-deletes the moment
-        // anyone types non-ASCII. (kaijutsu-mcp's `write_input` still uses
-        // bytes — logged in docs/issues.md.)
+        // anyone types non-ASCII.
         let existing = state.content.chars().count() as u64;
         self.actor
             .edit_input(context_id, 0, text, existing)

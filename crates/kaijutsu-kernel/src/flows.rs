@@ -46,9 +46,8 @@ use kaijutsu_types::{BlockEventFilter, BlockFlowKind, ContextId, PrincipalId};
 /// design. That design is gone: the kernel is the sole sequencer and
 /// concurrent merge into kernel documents is structurally impossible
 /// (CLAUDE.md "Durable state and the wire") — no construction site in the
-/// workspace ever produced `Remote`, so it was dead. Removed 2026-08-17
-/// (found during the fit-and-finish sweep, `docs/issues.md`). `Local` is
-/// the only source every `BlockFlow` event carries.
+/// workspace ever produced `Remote`, so it was dead and has been removed.
+/// `Local` is the only source every `BlockFlow` event carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum OpSource {
     /// Generated locally by tool execution or user action

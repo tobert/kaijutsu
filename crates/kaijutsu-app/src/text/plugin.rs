@@ -7,9 +7,8 @@
 //! placeholder are plain UI rectangle geometry (`text::sparkline`); block
 //! borders and the role-group divider are an SDF shader
 //! (`cell::block_border` + `shaders`). No vello rasterization anywhere in
-//! the app any more (retired 2026-08-12, docs/issues.md) — `VelloFont`/
-//! `VelloTextStyle` below name Parley SHAPING types only, the `vello` crate
-//! itself is gone from `Cargo.toml`.
+//! the app any more — `VelloFont`/`VelloTextStyle` below name Parley
+//! SHAPING types only, the `vello` crate itself is gone from `Cargo.toml`.
 
 use std::collections::HashSet;
 

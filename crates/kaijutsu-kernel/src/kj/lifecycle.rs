@@ -2748,7 +2748,7 @@ esac
         );
     }
 
-    // ── Context time awareness (docs/issues.md) ──────────────────────────
+    // ── Context time awareness ────────────────────────────────────────────
     //
     // These exercise the REAL embedded seed tree (assets/defaults/rc), not
     // synthetic install_script fixtures, because the mechanism under test is

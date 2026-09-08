@@ -478,12 +478,11 @@ impl Tool for KjBuiltin {
         // for every tool via `finalize_output`/`apply_output_format`, reading
         // `.data`/`.output`/`.latch` straight off the `ExecResult` kj already
         // returns from `execute()` below. kj no longer builds its own envelope
-        // (the old `render_json_envelope` is gone — see the kaish 0.13 `--json`
-        // migration in docs/issues.md). `owns_output && result.ok()` is exactly
-        // the case `finalize_output` uses to SKIP formatting, so setting it
-        // would silently turn off JSON rendering on every successful `kj`
-        // command — the opposite of what we want (uniform success + failure
-        // formatting, kaish-owned).
+        // (the old `render_json_envelope` is gone). `owns_output && result.ok()`
+        // is exactly the case `finalize_output` uses to SKIP formatting, so
+        // setting it would silently turn off JSON rendering on every
+        // successful `kj` command — the opposite of what we want (uniform
+        // success + failure formatting, kaish-owned).
         //
         // The one behavior `owns_output` used to buy for free: routing
         // `--help`/`-h` through kj's OWN clap parser (leaf help) instead of
@@ -623,7 +622,7 @@ impl Tool for KjBuiltin {
         // this live kaish bridge either way, since --json never survives to
         // here regardless of this filter — only `KjDispatcher::dispatch()`
         // called directly, as the dispatcher-level unit tests do, ever sets
-        // it. See the kaish 0.13 `--json` migration audit in docs/issues.md.)
+        // it.)
         //
         // Using kaish's structured `args.flags` (rather than string-matching
         // "--json" tokens in already-flattened argv, the old approach) also
@@ -707,16 +706,16 @@ impl Tool for KjBuiltin {
         // before the `match result` below re-borrows `ctx`. Only the distill
         // verbs are wrapped — wrapping every `kj` call would freeze the clock
         // through a tight `while true; do kj …; done` and the watchdog would
-        // never catch the runaway. See docs/issues.md (kaish `patient` adoption).
+        // never catch the runaway.
         //
         // Approval-gated verbs (`kj cc send` today) get the same treatment for
         // the same reason, one degree worse: they block on a HUMAN answering
         // from another surface (`kj ledger`), up to `gate_wait_timeout`. The
         // rc/hook kaish budgets are 10–30s, far shorter than that, so without
         // a patient hold the watchdog would kill the gate long before its own
-        // deadline fired — "passes tests, dies in production" (docs/issues.md,
-        // Gate slice 1a, finding #1). The hold and the gate's poll deadline
-        // now both route through `TimeoutPolicy::effective_gate_wait()`
+        // deadline fired — "passes tests, dies in production". The hold and
+        // the gate's poll deadline now both route through
+        // `TimeoutPolicy::effective_gate_wait()`
         // (`kaijutsu_types::timeout::gate`) instead of reading
         // `gate_wait_timeout` raw, so they cannot drift apart — and neither
         // can drift past what the outer MCP/RPC hops of the gate ladder can
@@ -769,7 +768,6 @@ impl Tool for KjBuiltin {
                 // `.data` is the only channel that does. The server bridges
                 // `.data` into the block's OutputData at the persistence seam
                 // instead (`block_output_data` in kaijutsu-server/src/rpc.rs).
-                // See docs/issues.md.
                 if let Some(json) = data {
                     result.data = Some(kaish_kernel::interpreter::json_to_value(json));
                 }
@@ -811,8 +809,7 @@ impl Tool for KjBuiltin {
         // after `execute()` returns, reading `.data`/`.output` exactly as set
         // above — a `Switch` has already switched by this point, so returning
         // `exec` as-is preserves that side effect. kj no longer builds its own
-        // envelope (see `schema()`'s `owns_output` note and the kaish 0.13
-        // `--json` migration in docs/issues.md).
+        // envelope (see `schema()`'s `owns_output` note).
         exec
     }
 }
@@ -1825,7 +1822,7 @@ mod tests {
     /// `execute_with_options` returns, `.output` is back to `None` — `.data`
     /// is the only channel that survives the trip. Block persistence bridges
     /// `.data` → OutputData at the server seam instead (`block_output_data`
-    /// in `kaijutsu-server/src/rpc.rs`). See `docs/issues.md`.
+    /// in `kaijutsu-server/src/rpc.rs`).
     #[tokio::test]
     async fn kj_output_channel_does_not_survive_the_kaish_output_limiter() {
         use kaish_kernel::ast::Value;
@@ -2412,8 +2409,7 @@ mod tests {
     /// `ExecResult::baggage` — which is what the MCP shell layer and the RPC
     /// `execute_kj` path read. This drives a real latched command end-to-end
     /// through the kaish bridge to prove the baggage survives kaish's `--json`
-    /// formatting. Resolves the on-hold docs/issues.md "latch nonce on stderr"
-    /// entry.
+    /// formatting.
     #[tokio::test]
     async fn json_flag_surfaces_and_preserves_latch() {
         let dispatcher = Arc::new(test_dispatcher().await);

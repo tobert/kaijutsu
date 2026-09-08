@@ -789,11 +789,10 @@ fn test_rpc_default_context_type_is_default() {
 // STAMPED the registry-default provider/model onto the new `ContextRow`
 // itself (`crates/kaijutsu-server/src/rpc.rs` `create_context_inner`)
 // whenever no per-context override was given — a divergence from the kj
-// dispatch path below, closed per `docs/issues.md` "Two context-creation
-// paths disagree about stamping the model": neither path stamps now, so
-// `.model` is genuinely null here too and `.resolved_model` is the only
-// thing reading through to the registry default. These two tests still pin
-// something real (tier selection follows the effective model when driven
+// dispatch path below. Neither path stamps now, so `.model` is genuinely
+// null here too and `.resolved_model` is the only thing reading through to
+// the registry default. These two tests still pin something real (tier
+// selection follows the effective model when driven
 // over RPC) but no longer distinguish `.model` from `.resolved_model` reads
 // by themselves — see `test_coder_stance_guided_for_null_row_model_via_kj_dispatch`
 // below for the test that pins the null-row-model case explicitly (now true
@@ -1068,22 +1067,21 @@ fn test_coder_stance_guided_for_null_row_model_via_kj_dispatch() {
 }
 
 // ============================================================================
-// Regression for `docs/issues.md` "Two context-creation paths disagree about
-// stamping the model" (2026-08-07). Through 2026-08-10, `create_context_inner`
-// (the RPC path both `create_context_typed` and `create_context` share) read
-// the registry default and wrote it onto the new `ContextRow`'s
-// `provider`/`model` columns unconditionally — freezing a snapshot of
-// whatever the default happened to be at creation time, and reporting
-// `resolved_source: "context"` (as if an explicit override had been given)
-// even though no caller asked for one. `kj context create` never did this:
-// its row stays `provider: None, model: None` absent an explicit `--model`,
-// so `resolve_context_model` falls through live to the registry default
-// every call (`resolved_source: "default"`) and a later default change
-// reaches it. The decision made closing this entry: neither path stamps —
-// the row is the explicit-override slot only, never a creation-time cache of
-// the default. This test pins that an RPC-created context, with a registry
-// default configured but no explicit model given, has a null row and
-// resolves via "default", matching what `kj context create` has always done.
+// Regression guard: the RPC path both `create_context_typed` and
+// `create_context` share (`create_context_inner`) once read the registry
+// default and wrote it onto the new `ContextRow`'s `provider`/`model`
+// columns unconditionally — freezing a snapshot of whatever the default
+// happened to be at creation time, and reporting `resolved_source:
+// "context"` (as if an explicit override had been given) even though no
+// caller asked for one. `kj context create` never did this: its row stays
+// `provider: None, model: None` absent an explicit `--model`, so
+// `resolve_context_model` falls through live to the registry default every
+// call (`resolved_source: "default"`) and a later default change reaches
+// it. Both paths now agree: the row is the explicit-override slot only,
+// never a creation-time cache of the default. This test pins that an
+// RPC-created context, with a registry default configured but no explicit
+// model given, has a null row and resolves via "default", matching what
+// `kj context create` has always done.
 // ============================================================================
 
 #[test]

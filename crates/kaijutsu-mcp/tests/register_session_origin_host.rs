@@ -1,7 +1,6 @@
-//! End-to-end tests for `register_session`'s `origin_host` stamping
-//! (docs/issues.md, "cc-* hook re-registration mints a new context per MCP
-//! relaunch" — last paragraph: "Host field on registration ... would make
-//! the fleet board self-evident").
+//! End-to-end tests for `register_session`'s `origin_host` stamping —
+//! recording which host registered a context so a fleet of hosts sharing
+//! one kernel stays distinguishable.
 //!
 //! `register_session_impl` calls the new `setContextOriginHost` RPC with its
 //! own `hostname::get()` right after a FRESH context is created — never on

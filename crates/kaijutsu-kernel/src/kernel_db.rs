@@ -12,9 +12,9 @@
 //! recognized "god-table + single-mutex" smell — and we are **deliberately not
 //! splitting it yet**. The pressure that would justify the churn (measured
 //! write-contention under concurrent contexts) is not expected any time soon;
-//! revisit only when it's an actual, observed problem. Tracked, with the
-//! connection-pool angle, in `docs/issues.md` (Persistence & Sync) and
-//! `docs/architecture/kernel.md`. Don't pre-emptively refactor.
+//! revisit only when it's an actual, observed problem. See
+//! `docs/architecture/kernel.md` for the connection-pool angle. Don't
+//! pre-emptively refactor.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -147,9 +147,8 @@ pub struct ContextRow {
     /// baked into `write_context`'s own INSERT) — mirrors `created_by`: an
     /// origin fact, not a "last seen from" one, so a later reconnect from a
     /// different machine does NOT overwrite it. Shared-trust model: this is
-    /// observability, not auth — the server trusts the client's self-report
-    /// (docs/issues.md "cc-* hook re-registration mints a new context per
-    /// MCP relaunch"). Rendered as `"-"` when `None` (`kj context info`,
+    /// observability, not auth — the server trusts the client's self-report.
+    /// Rendered as `"-"` when `None` (`kj context info`,
     /// `kj context list`).
     pub origin_host: Option<String>,
     /// The character whose performance this context is, or `None` when
@@ -2812,9 +2811,9 @@ impl KernelDb {
     /// Classify an `insert_document` constraint-violation failure by READING
     /// THE DB BACK, never by inspecting the SQLite/kaijutsu error message
     /// text — `map_unique_violation` flattens every UNIQUE conflict into the
-    /// same `LabelConflict` string, which used to make a benign PRIMARY KEY
-    /// duplicate indistinguishable from other constraint violations except by
-    /// luck of wording (docs/issues.md:361).
+    /// same `LabelConflict` string, which makes a benign PRIMARY KEY
+    /// duplicate indistinguishable from other constraint violations by
+    /// message text alone.
     ///
     /// FK violations (extended code 787) and anything that isn't a
     /// constraint violation delegate straight to `map_unique_violation`,
@@ -3259,9 +3258,8 @@ impl KernelDb {
     /// native `VACUUM INTO` — a single consistent, already-compacted
     /// snapshot that's safe to run against a live writer (unlike a bare `cp`
     /// of `kernel.db`, which can race the `-wal` file and produce a torn or
-    /// stale copy; see docs/issues.md "Persistence & Sync"). No prior
-    /// `checkpoint()` call is required — `VACUUM INTO` reads a consistent
-    /// snapshot regardless of WAL state.
+    /// stale copy). No prior `checkpoint()` call is required — `VACUUM INTO`
+    /// reads a consistent snapshot regardless of WAL state.
     ///
     /// The path is bound as a query parameter (`VACUUM INTO ?1`), not
     /// string-interpolated, so a path containing `'` or other SQL

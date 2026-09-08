@@ -193,17 +193,18 @@ impl BeatRef {
 
 /// A free-running local beat, corrected toward [`BeatRef`]s as they arrive.
 ///
-/// The controller is **proportional-phase with feedforward tempo** (`docs/issues.md`
-/// "Metronome phasor sloshes"). Because a reference carries the *exact* tempo, we
-/// run the phasor at that tempo directly (feedforward) — never as a *persistent
-/// rate bias*, which is what an earlier slew did and it wound up like an
-/// integrator: a rate correction sized for a 1 s window kept driving until the
-/// next (seconds-later) reference, overshooting ~3.8× and sloshing. Here the rate
-/// is always exactly the reference's, so beats stay evenly spaced by construction;
-/// only *phase* is corrected, by a small **fractional step** toward the reference
-/// (gain `< 1` → always undershoots → never overshoots), bounded so an outlier
-/// reference can't yank the beat. The step is tiny for normal jitter
-/// (gain × a few-ms error) and the loop low-pass-filters reference jitter.
+/// The controller is **proportional-phase with feedforward tempo**. Because a
+/// reference carries the *exact* tempo, we run the phasor at that tempo
+/// directly (feedforward) — never as a *persistent rate bias*, which is what
+/// an earlier slew did and it wound up like an integrator: a rate correction
+/// sized for a 1 s window kept driving until the next (seconds-later)
+/// reference, overshooting ~3.8× and sloshing. Here the rate is always
+/// exactly the reference's, so beats stay evenly spaced by construction;
+/// only *phase* is corrected, by a small **fractional step** toward the
+/// reference (gain `< 1` → always undershoots → never overshoots), bounded
+/// so an outlier reference can't yank the beat. The step is tiny for normal
+/// jitter (gain × a few-ms error) and the loop low-pass-filters reference
+/// jitter.
 ///
 /// [`position`]: LocalBeat::position
 #[derive(Debug, Clone)]

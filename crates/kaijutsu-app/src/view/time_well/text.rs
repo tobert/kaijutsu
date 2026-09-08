@@ -172,8 +172,8 @@ fn wrap_gist(text: &str, line_chars: usize, max_lines: usize) -> Option<String> 
 /// The track transport line rides along here until timewell Stage 3 gives it
 /// a real home on a track surface — see `docs/timewell.md`.
 #[allow(dead_code)] // orphaned by the HUD-melt slice 4 retirement (its only
-// caller was the retired HUD East panel) — kept as a tested pure primitive;
-// `docs/issues.md` tracks the "give it a real home or delete it" follow-up.
+// caller was the retired HUD East panel) — kept as a tested pure primitive
+// pending a real home (see the doc comment above) or deletion.
 pub fn specs_text(d: &super::card::CardData, track: Option<&kaijutsu_client::TrackInfo>) -> String {
     let keys = if d.keywords.is_empty() {
         "—".to_string()

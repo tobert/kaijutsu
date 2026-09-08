@@ -60,7 +60,7 @@ use crate::rpc::ServerRegistry;
 /// remaining job is attach-time rehydration, which rebuilds the committed log
 /// from the score context's **notation** blocks only (a restart drops past
 /// clip cells from the in-memory log; the score context stays the durable
-/// record — see docs/issues.md "Clip cells").
+/// record).
 const ABC_MIME: &str = "text/vnd.abc";
 
 /// Ticks the playhead advances per beat (PPQ 1: one tick per beat). The tick is
@@ -268,7 +268,7 @@ fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(Str
 /// section it last produced; older notation falls out of the window.
 ///
 /// TODO(chameleon batch 2): make this tunable per context (rc-declared and/or a
-/// `kj transport` knob), alongside the cadence/tempo knobs in `docs/issues.md`.
+/// `kj transport` knob), alongside the cadence/tempo knobs.
 const HEARD_WINDOW_PHRASES: u64 = 8;
 
 /// One recent committed score phrase, as `$HEARD` exposes it: where it sits on
@@ -2115,13 +2115,9 @@ impl BeatScheduler {
     /// this gate now lets it through.
     ///
     /// That is a real behavior CHANGE from the old all-cancels-are-Failed
-    /// world for the soft-cancel case, not a preserved one — a deepseek
-    /// post-merge review (`docs/issues.md`) flagged that the surrounding
-    /// comment previously justified only the hard-cancel exclusion and left
-    /// the soft-cancel inclusion unstated, reading as an accidental side
-    /// effect rather than a decision. It is deliberate: the phrase the model
-    /// wrote before a soft cancel took effect IS complete, and a complete
-    /// phrase belongs in the score like any other clean ending.
+    /// world for the soft-cancel case: the phrase the model wrote before a
+    /// soft cancel took effect IS complete, and a complete phrase belongs in
+    /// the score like any other clean ending.
     fn turn_should_crystallize(origin: TurnOrigin, reason: TurnStopReason) -> bool {
         origin == TurnOrigin::Autonomous && reason.output_is_complete()
     }
@@ -2494,7 +2490,7 @@ pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     // `.await`, so the whole nest accumulates on one stack). The default 2 MiB
     // thread stack is too small for that depth with kaish's interpreter — it
     // SIGABRTs the scheduler mid-rotate. Reserve a generous stack; it's virtual
-    // address space, committed page-by-page only as used. See docs/issues.md.
+    // address space, committed page-by-page only as used.
     let builder = std::thread::Builder::new()
         .name("beat-scheduler".to_string())
         .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
@@ -4190,13 +4186,9 @@ mod tests {
         );
     }
 
-    /// Pin for the deepseek post-merge review (`docs/issues.md`): the
-    /// scheduler's `turn_should_crystallize` gate was previously stated only
-    /// in terms of what it excludes (a hard-cancel fragment), leaving the
-    /// soft-cancel case's inclusion unstated — read as an accident rather
-    /// than a decision. Amy's call (2026-08-05): keep it. This pins BOTH
-    /// halves against the real gate + the real scheduling path, not just the
-    /// boolean:
+    /// Regression test for `turn_should_crystallize`: pins BOTH halves of
+    /// the soft/hard-cancel gate against the real scheduling path, not just
+    /// the boolean:
     ///   - a **soft**-cancelled autonomous turn (`immediate: false`) has a
     ///     whole phrase (`output_is_complete()` true) and DOES crystallize.
     ///   - a **hard**-cancelled autonomous turn (`immediate: true`) has a

@@ -1050,8 +1050,7 @@ impl DriftRouter {
     /// Check out every not-already-checked-out item in the dead letter
     /// queue for delivery, without marking its durable record consumed.
     ///
-    /// This is a two-phase drain (docs/issues.md, "Drift drain acks before
-    /// the lost+found write") mirroring [`Self::drain`]'s shape for
+    /// This is a two-phase drain mirroring [`Self::drain`]'s shape for
     /// staging: matched items are flagged
     /// [`in_flight`](StagedDrift::in_flight) and a clone is returned, but
     /// they stay physically in `dead_letter` — so a concurrent
@@ -2448,8 +2447,8 @@ mod tests {
     }
 
     // ========================================================================
-    // In-flight cancel — the flush-blind-spot bug (docs/issues.md "Drift —
-    // June 2026 audit": drift_flush is non-atomic over the router lock).
+    // In-flight cancel — the flush-blind-spot bug: `drift_flush` is
+    // non-atomic over the router lock.
     //
     // `drain` used to *remove* items from `staging` into the caller's local
     // Vec, so a concurrent `cancel` during the async delivery window (block
@@ -2575,8 +2574,7 @@ mod tests {
     // Slice 3 — durable drift queue (docs/drifting-dead-letters.md)
     //
     // The whole point: `DriftRouter.dead_letter`/`staging` used to be
-    // in-memory-only `Vec`s (docs/issues.md, "The dead-letter queue does not
-    // survive a restart") — content the kernel accepted and promised to
+    // in-memory-only `Vec`s — content the kernel accepted and promised to
     // deliver, gone the moment the process exits. These tests drive a real,
     // file-backed `KernelDb` + `BlockStore` — not an in-memory stand-in — and
     // simulate a restart the same way `block_store.rs`'s own
@@ -2771,9 +2769,9 @@ mod tests {
 
         #[test]
         fn restart_recovers_a_dead_lettered_item() {
-            // The other half of the same bug: `docs/issues.md`'s exact
-            // words were "the mechanism whose whole job is 'content is never
-            // silently discarded' silently discards content." This drives an
+            // The other half of the same bug: the dead-letter mechanism,
+            // whose whole job is guaranteeing content is never silently
+            // discarded, was itself losing content on restart. This drives an
             // item past MAX_DRIFT_RETRIES into `dead_letter`, "restarts," and
             // checks it is still there — not lost, not duplicated.
             let dir = tempfile::tempdir().unwrap();
@@ -2829,10 +2827,9 @@ mod tests {
 
         #[test]
         fn drain_dead_letter_alone_does_not_consume_the_durable_record() {
-            // Task B (docs/issues.md, "Drift drain acks before the
-            // lost+found write..."): the two-phase drain leaves the durable
-            // record `Pending` until `ack_dead_letter` confirms the write
-            // into lost+found actually succeeded. Drain alone — no ack —
+            // Task B: the two-phase drain leaves the durable record
+            // `Pending` until `ack_dead_letter` confirms the write into
+            // lost+found actually succeeded. Drain alone — no ack —
             // must NOT consume it, or a crash in the window between the two
             // loses the item exactly like the old single-phase version did.
             let dir = tempfile::tempdir().unwrap();
@@ -2901,10 +2898,8 @@ mod tests {
 
         #[test]
         fn drain_dead_letter_then_crash_before_ack_recovers_on_restart() {
-            // THE test the residual gap asks for (docs/issues.md, "Drift
-            // drain acks before the lost+found write, so a narrow crash
-            // window remains"): drain checks an item out for delivery, the
-            // process dies before the caller can ever call
+            // THE test for the residual gap: drain checks an item out for
+            // delivery, the process dies before the caller can ever call
             // `ack_dead_letter` (or `restore_dead_letters` on failure) —
             // simulating a crash squarely inside the old unsafe window —
             // and a restart must still recover the item. Never both-lost:

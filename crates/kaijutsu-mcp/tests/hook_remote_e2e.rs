@@ -615,8 +615,7 @@ fn rpc_authoring_carries_tool_fields_and_completes_independently() {
     });
 }
 
-/// docs/issues.md "cc-* hook re-registration mints a new context per MCP
-/// relaunch": an MCP process relaunch (process death + respawn, `/mcp
+/// Regression test: an MCP process relaunch (process death + respawn, `/mcp
 /// reconnect`) within the SAME Claude Code session must reattach to the
 /// SAME context an earlier process already stabilized — not mint a fresh
 /// one under a new launch-timestamp label.

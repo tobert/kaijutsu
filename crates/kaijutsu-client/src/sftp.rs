@@ -112,10 +112,9 @@ impl SftpClient {
     /// onto an existing one — see the module docs for why, and the future
     /// optimization.
     ///
-    /// Logs INFO on success (`docs/issues.md` "Audio sink follow-ups" — the
-    /// live fanfare-clip debugging session had no visibility into how long a
-    /// (re)connect took; this is the happy-path counterpart to the redial
-    /// warning `CasResolver`'s callers log on a stale transport).
+    /// Logs INFO on success — the happy-path counterpart to the redial
+    /// warning `CasResolver`'s callers log on a stale transport, so a slow
+    /// or repeated (re)connect is visible without enabling debug logging.
     pub async fn connect(config: SshConfig) -> Result<Self, SftpError> {
         let started = std::time::Instant::now();
         let mut ssh = SshClient::new(config);
@@ -140,8 +139,7 @@ impl SftpClient {
     ///
     /// Reads the whole object into memory. Fine for the symbolic scores and
     /// small clips of the first cut; a large-media streaming path (chunked read
-    /// straight into CAS staging, incremental hash) is a deferred follow-up
-    /// (`docs/issues.md` `/v` Track B — `/v/cas` + client CAS sync).
+    /// straight into CAS staging, incremental hash) is a deferred follow-up.
     pub async fn read(&self, path: &str) -> Result<Vec<u8>, SftpError> {
         self.session.read(path).await.map_err(map_sftp_err)
     }

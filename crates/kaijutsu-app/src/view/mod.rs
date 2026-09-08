@@ -20,7 +20,7 @@
 //!   have to agree on without eyeballing each other.
 //! - Styling: `scene_palette`.
 //! - Render plumbing: `ui_rtt` (the generic render-to-texture primitive +
-//!   sizing helpers; no vello — retired 2026-08-12, docs/issues.md). Bevy
+//!   sizing helpers; vello is gone from the app). Bevy
 //!   Remote Protocol inspector glue lives in `kaish::brp_methods`
 //!   (kaish-adjacent: agents drive both over the same protocol).
 //! - `components` — the component/resource types shared across the above.

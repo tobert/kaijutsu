@@ -16,8 +16,8 @@
 //! time) — no bespoke hierarchy. There is no `task_reparent`/reorder verb:
 //! the block store has no cheap "move to a new parent" primitive today
 //! (`move_block` only reorders siblings under the same parent), so
-//! re-parenting an existing task is deferred (`docs/issues.md`) rather than
-//! built as a bespoke mechanism for this slice.
+//! re-parenting an existing task is deferred rather than built as a
+//! bespoke mechanism for this slice.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
