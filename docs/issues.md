@@ -43,6 +43,38 @@ mechanism**, not a one-off exemption. `docs/gate-policy-tuning.md` (designed
 the global allow tier and names this issue by title to close when slice 5
 ships. Delete this entry then.
 
+## `join_context` heals an archived row and collides with the live label (2026-09-09)
+
+After the 09:14 bounce, the lead session's MCP mirror failed permanently:
+`join_context: failed to heal registry for 01a085ea…: label
+'cc-kaijutsu-c75f64fe' already in use by context e6a4375f`. `kj context
+info 01a085ea` says not found (archived); `e6a4375f` is the live context
+under that label. The heal path (`kaijutsu-server/src/rpc.rs`, "healing
+from its KernelDb row") registers any row `get_context` returns, and
+`DriftRouter::register` enforces label uniqueness across everything
+registered, while the DB scopes uniqueness to live rows
+(`idx_contexts_label … WHERE archived_at IS NULL`). Two fixes, both
+small: the heal refuses an archived row with an error that names the live
+context under the label, and the MCP re-registers instead of retrying a
+context id it cached before the bounce (`register_session` from a fresh
+process reports `already_registered` with a *different* id each time,
+which is a cache, not a kernel fact). Recovery today is `/mcp` in the
+affected session.
+
+## An ask's `exec_source` shows `none` for a positional the executor ran correctly (2026-09-09)
+
+`kj ledger show 01a0864f-a5c1-…` for a hook-origin ask on `kj preset
+remove nonexistent-zz` prints `statement: … {"command":"kj preset remove
+nonexistent-zz"}` and `exec_source: kj preset remove none`. The journal
+shows gate-resume executed `"kj preset remove nonexistent-zz"`, so what
+ran is right and only the stored text is wrong. `kaish_kernel::plan_program`
+renders the command faithfully (checked in a throwaway test);
+`hook_gate.rs`'s `shell_source` stores `command.trim()`; the ledger crate
+stores and reads the column verbatim. Where `nonexistent-zz` becomes
+`none` is not yet found. Same probe: the lfm2d advisory both auto-allowed
+the command (ask `…a5a5…`, `decided: auto_allow`) and escalated it as
+data-critical 0.539 (ask `…a5c1…`); two ledger rows for one statement.
+
 ## Check the hook socket's PPID resolution on macOS (2026-09-05)
 
 `candidate_sockets`/`resolve_hook_socket` (`kaijutsu-mcp/src/main.rs`) derive
