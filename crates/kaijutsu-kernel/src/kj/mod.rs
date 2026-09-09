@@ -21,7 +21,7 @@ pub mod cas;
 pub mod cast;
 pub mod cc;
 pub mod character;
-pub mod corpus;
+pub mod reflect;
 pub mod cp;
 pub mod config;
 pub mod context;
@@ -1745,10 +1745,10 @@ mod published_prose {
 #[cfg(test)]
 mod destroy_latches_at_dispatch_tests {
     //! `docs/kj-verb-class.md` slice 3: `dispatch()` latches every `Destroy`
-    //! verb itself, before routing to a handler. Proven on the whole corpus
-    //! rather than the seven verbs by name, so a future `Destroy` verb is
-    //! covered without a new test: a handler that ran would return `Err` for
-    //! a nonexistent target, never a `Latch`.
+    //! verb itself, before routing to a handler. Proven on every reflected
+    //! leaf rather than the seven verbs by name, so a future `Destroy` verb
+    //! is covered without a new test: a handler that ran would return `Err`
+    //! for a nonexistent target, never a `Latch`.
 
     use super::test_helpers::*;
     use super::*;
@@ -1757,29 +1757,25 @@ mod destroy_latches_at_dispatch_tests {
     async fn every_destroy_clause_latches_unconfirmed() {
         let d = test_dispatcher().await;
         let caller = test_caller();
-        let corpus = super::corpus::corpus().expect("corpus builds");
+        let leaves = reflect::reflect_leaves();
 
         let mut destroy_clauses = 0;
         let mut failed = Vec::new();
-        for verb in &corpus.verbs {
-            let argv: Vec<String> = verb
-                .clause
-                .split_whitespace()
-                .skip(1)
-                .map(String::from)
-                .collect();
+        for leaf in &leaves {
+            let clause = reflect::synthesize_clause(&leaf);
+            let argv = reflect::clause_argv(&clause);
             if !matches!(effect::classify(&argv), Ok(effect::Effect::Destroy)) {
                 continue;
             }
             destroy_clauses += 1;
             let result = d.dispatch(&argv, &caller).await;
             if !result.is_latch() {
-                failed.push(format!("{}: {result:?}", verb.clause));
+                failed.push(format!("{clause}: {result:?}"));
             }
         }
         assert!(
             destroy_clauses > 0,
-            "no Destroy clause found in the corpus — this test would pass vacuously"
+            "no Destroy clause found among reflected leaves — this test would pass vacuously"
         );
         assert!(
             failed.is_empty(),

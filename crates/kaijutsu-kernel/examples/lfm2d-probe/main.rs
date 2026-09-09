@@ -18,13 +18,16 @@
 //! scorer's. Results and the standing arguments: docs/issues.md, "lfm2d
 //! risk scoring".
 
+mod corpus;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use kaijutsu_kernel::kj::corpus::{self, AliasPair, Corpus, Severity};
+use corpus::{Corpus, Severity};
+use kaijutsu_kernel::kj::reflect::AliasPair;
 use serde::Deserialize;
 
 #[derive(Parser, Debug)]
@@ -611,13 +614,17 @@ fn run_measured(path: &Path) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // --measured never touches the corpus or the scorer -- it is an
-    // offline read of a ledger dump.
+    // Build the corpus before anything else, unconditionally -- this is the
+    // coverage check (an override naming no live leaf, or a clause that does
+    // not classify, fails here by name; `--dump-corpus /dev/null` runs
+    // nothing else and is the check's own entry point).
+    let corpus = corpus::corpus().context("corpus::corpus() failed to build the probe corpus")?;
+
+    // --measured never touches the scorer -- it is an offline read of a
+    // ledger dump.
     if let Some(path) = &cli.measured {
         return run_measured(path);
     }
-
-    let corpus = corpus::corpus().context("kj::corpus::corpus() failed to build the probe corpus")?;
 
     if let Some(path) = &cli.dump_corpus {
         return run_dump_corpus(path, &corpus);
@@ -635,7 +642,8 @@ async fn main() -> Result<()> {
     let cascade_url = format!("{}/v1/cascade", cli.url);
 
     if cli.aliases {
-        let pairs = corpus::alias_pairs(&corpus);
+        let leaves = kaijutsu_kernel::kj::reflect::reflect_leaves();
+        let pairs = kaijutsu_kernel::kj::reflect::alias_pairs(&leaves);
         if pairs.is_empty() {
             bail!("alias_pairs() returned zero pairs -- corpus has no alias-pair coverage");
         }

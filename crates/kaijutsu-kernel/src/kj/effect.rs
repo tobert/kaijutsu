@@ -257,6 +257,12 @@ mod tests {
     use clap::CommandFactory;
     use std::collections::BTreeSet;
 
+    /// Split a clause into argv the way this module's tests need it —
+    /// `kj/reflect.rs` owns the definition (`every_live_leaf_classifies`
+    /// lives there now too), aliased so call sites here read the same as
+    /// before the move.
+    use super::super::reflect::clause_argv as argv;
+
     /// Every `path -> [aliases]` leaf under a command, path space-joined
     /// without the root name.
     fn leaves(cmd: &clap::Command) -> BTreeSet<(String, Vec<String>)> {
@@ -276,41 +282,6 @@ mod tests {
         let mut out = BTreeSet::new();
         walk(cmd, &[], &mut out);
         out
-    }
-
-    /// Split a clause the way a shell would for the quoting the corpus
-    /// uses (single quotes only), dropping the leading `kj`.
-    fn argv(clause: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut cur = String::new();
-        let mut quoted = false;
-        let mut pending = false;
-        for c in clause.chars() {
-            match c {
-                '\'' => { quoted = !quoted; pending = true; }
-                ' ' if !quoted => { if pending { out.push(std::mem::take(&mut cur)); pending = false; } }
-                _ => { cur.push(c); pending = true; }
-            }
-        }
-        if pending { out.push(cur); }
-        out.into_iter().skip(1).collect()
-    }
-
-    /// Every live leaf classifies through the clause the corpus synthesizes
-    /// for it. The exhaustive matches make a missing arm a compile error;
-    /// this test is the runtime half — a placeholder that does not fit its
-    /// slot, or a leaf the root enum somehow cannot reach, fails here by
-    /// name.
-    #[test]
-    fn every_live_leaf_classifies() {
-        let corpus = super::super::corpus::corpus().expect("corpus builds");
-        let failed: Vec<String> = corpus
-            .verbs
-            .iter()
-            .filter_map(|v| classify(&argv(&v.clause)).err().map(|e| format!("{}: {e}", v.clause)))
-            .collect();
-        assert!(failed.is_empty(), "{} leaf(ves) do not classify:\n{}", failed.len(), failed.join("\n"));
-        assert!(corpus.verbs.len() > 100);
     }
 
     #[test]
