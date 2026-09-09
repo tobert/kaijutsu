@@ -841,12 +841,16 @@ impl Provider {
     /// (`TextStart → TextDelta → TextEnd → Done`) so tests can exercise the
     /// full streaming turn — including the autonomous fork-and-act path —
     /// without a live provider.
+    ///
+    /// Refuses invalid tool pairing before dispatch, including history
+    /// appended during a live turn after the hydration snapshot.
     #[tracing::instrument(skip(self, opts, messages), fields(llm.provider = self.name()))]
     pub async fn stream(
         &self,
         opts: BuildOpts,
         messages: Vec<Message>,
     ) -> LlmResult<ProviderStream> {
+        hydrate::validate_tool_pairing(&messages)?;
         match self {
             Self::Claude(client) => {
                 let stream = client.stream(opts, messages).await?;
@@ -1389,9 +1393,9 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 /// Preserves `tool_use_id` from blocks when available, falling back to
 /// `BlockId::to_key()` for pre-migration blocks.
 ///
-/// **Trailing-tool-use guard:** If the last message is an assistant with
-/// tool_uses but no following tool_results, synthesizes error results so the
-/// LLM API doesn't reject the request.
+/// Repairs every tool-call batch: missing adjacent results become explicit
+/// interruption errors, and orphan results are dropped with warnings.
+/// `Provider::stream` validates the final pairing before backend dispatch.
 pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Message> {
     // Index for parent lookups — only the Error branch consults it, and
     // only for `parent_id`. Incremental callers pass the parent

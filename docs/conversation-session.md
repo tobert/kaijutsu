@@ -20,12 +20,40 @@ multi-writer record but no longer drives wire history per-turn.
 See `CLAUDE.md` and the `architecture_context_invariants` memory for the
 invariants this implements.
 
-## Current state
+## Tool pairing at send
 
-`process_llm_stream` in `crates/kaijutsu-server/src/llm_stream.rs` calls
-`hydrate_from_blocks` on every prompt and overwrites the per-context cache
-(`ConversationCache` in `crates/kaijutsu-server/src/rpc.rs`). The cache exists
-but is effectively a per-turn scratch buffer.
+`ConversationMailbox::catch_up` discovers new blocks by reading the durable
+block log. It is a pull-based cursor, not an insert-event subscriber.
+`snapshot()` repairs a clone of the accumulated history; it does not change
+the mailbox or the durable blocks.
+
+Hydration closes each assistant call batch in one pass over messages. Each
+`tool_use` gets a `tool_result` in the immediately following user message,
+before ordinary content. Adjacent real results survive; missing results get
+explicit interruption errors. Results outside that adjacent reply are
+dropped with warnings, including late results for a call already answered
+synthetically. Unrelated content remains in order. This preserves the
+existing interruption policy; it does not move later results into earlier
+conversation turns. Duplicate call or result ids within a batch remain
+ambiguous and are refused when sending.
+
+`Provider::stream` validates both directions of the pairing before backend
+dispatch. The check covers snapshots and messages appended by the live
+agentic loop. It returns `LlmError::InvalidRequest` with the message index
+and offending tool ids. The server stops immediately, records a visible
+error, and publishes `TurnFlow::Failed`; it does not retry an invalid request.
+Remediation remains: exclude the offending blocks, then fork.
+
+This is a conversation projection and a send-time check. Writers can still
+interleave blocks in the durable context. Insert-time tool-pair atomicity
+remains the separate follow-up described below.
+
+## Before the session change
+
+`process_llm_stream` in `crates/kaijutsu-server/src/llm_stream.rs` called
+`hydrate_from_blocks` on every prompt and overwrote the per-context cache
+(`ConversationCache` in `crates/kaijutsu-server/src/rpc.rs`). The cache existed
+but was effectively a per-turn scratch buffer.
 
 Consequences:
 
@@ -37,7 +65,7 @@ Consequences:
   provider input cap. This is what surfaced the design gap on Haiku
   (200K input limit).
 
-## Target state
+## Original target
 
 - One **session** per context, in-memory `Vec<LlmMessage>`.
 - Session is hydrated *once* from blocks at boundary events: fork, new

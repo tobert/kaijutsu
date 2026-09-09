@@ -10,18 +10,18 @@
 //! - **Bootstrap.** `super::hydrate_from_blocks` walks a full block
 //!   slice once at boundary events (fork, new context, cold start,
 //!   attach) and returns the resulting `Vec<Message>`.
-//! - **Incremental** *(future)*. The per-context mailbox subscriber
-//!   feeds blocks one at a time as they're inserted, keeping the live
-//!   session in sync without rebuilding from scratch each turn.
+//! - **Incremental.** The per-context mailbox folds unseen blocks from
+//!   the durable log on `catch_up`, keeping the live session in sync
+//!   without rebuilding from scratch each turn.
 //!
 //! Both paths share the same `translate_block` / `into_messages` pair
 //! so the wire-history contract stays identical.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContentType, Role as BlockRole};
 
-use super::{ContentBlock, Message, MessageContent, Role};
+use super::{ContentBlock, LlmError, LlmResult, Message, MessageContent, Role};
 
 /// Project a declared-`Diff` block's content into the body a model reads.
 ///
@@ -454,221 +454,80 @@ impl HydrationState {
         }
     }
 
-    /// Consume the state and emit the final message sequence, repairing
-    /// tool_use/tool_result pairing.
+    /// Consume the state and repair tool pairing in one message-sequence walk.
     ///
-    /// The LLM API requires that every assistant message containing
-    /// `tool_use` blocks is immediately followed by a user message with
-    /// matching `tool_result` blocks for **each** tool_use id, and
-    /// conversely that tool_result blocks only appear after an assistant
-    /// message containing the matching tool_use.
-    ///
-    /// Forks, interrupts, and out-of-order tool execution can break both
-    /// directions:
-    /// - **Orphaned tool_uses**: synthesize `is_error: true` results.
-    /// - **Late tool_results**: drop results whose tool_use already has
-    ///   a (synthetic or real) result earlier in the conversation.
+    /// Each assistant call batch is closed before another message is emitted:
+    /// keep adjacent results, synthesize errors for missing results, and drop
+    /// orphaned results. Non-result content follows the completed result batch.
+    /// Duplicate calls/results are kept for the send-time validator to refuse;
+    /// choosing one could hide conflicting calls or output.
     pub(crate) fn into_messages(mut self) -> Vec<Message> {
         self.flush_all();
+        let mut repaired = Vec::with_capacity(self.messages.len() + 4);
+        let mut pending = Vec::new();
 
-        // ── Pass 1: Forward repair (orphaned tool_uses → synthetic results) ──
-        let mut repaired: Vec<Message> = Vec::with_capacity(self.messages.len() + 4);
-        let len = self.messages.len();
-        let mut i = 0;
-
-        while i < len {
-            let msg = &self.messages[i];
-
-            // Extract tool_use ids from this assistant message (if any).
-            let tool_use_ids: Vec<String> = if msg.role == Role::Assistant {
-                if let MessageContent::Blocks(blocks) = &msg.content {
-                    blocks
-                        .iter()
-                        .filter_map(|b| {
-                            if let ContentBlock::ToolUse { id, .. } = b {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            repaired.push(msg.clone());
-
-            if tool_use_ids.is_empty() {
-                i += 1;
-                continue;
-            }
-
-            // Collect tool_result ids already present in the next message.
-            let covered: std::collections::HashSet<&str> = self
-                .messages
-                .get(i + 1)
-                .and_then(|next| {
-                    if next.role != Role::User {
-                        return None;
-                    }
-                    if let MessageContent::Blocks(blocks) = &next.content {
-                        Some(
-                            blocks
-                                .iter()
-                                .filter_map(|b| {
-                                    if let ContentBlock::ToolResult { tool_use_id, .. } = b {
-                                        Some(tool_use_id.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-
-            let missing: Vec<String> = tool_use_ids
-                .into_iter()
-                .filter(|id| !covered.contains(id.as_str()))
-                .collect();
-
-            if missing.is_empty() {
-                i += 1;
-                continue;
-            }
-
-            tracing::warn!(
-                msg_idx = i,
-                ?missing,
-                covered_count = covered.len(),
-                "hydration repair: synthesizing tool_results for orphaned tool_uses"
-            );
-
-            let error_results: Vec<ContentBlock> = missing
-                .into_iter()
-                .map(|id| ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: "Tool execution was interrupted (context was forked or pruned)"
-                        .into(),
-                    is_error: true,
-                })
-                .collect();
-
-            if covered.is_empty() {
-                // No tool_result message follows at all — insert one.
-                repaired.push(Message::tool_results(error_results));
-            } else {
-                // Next message has *some* results — append the missing ones
-                // into it so all results stay in one user message.
-                i += 1;
-                let mut next = self.messages[i].clone();
-                if let MessageContent::Blocks(ref mut blocks) = next.content {
-                    blocks.extend(error_results);
-                }
-                repaired.push(next);
-            }
-
-            i += 1;
-        }
-
-        // ── Pass 2: Reverse repair (orphaned tool_results → drop) ──
-        // Late-arriving ToolResult blocks that already have a synthetic
-        // error result produce User messages with tool_results that don't
-        // match any tool_use in the preceding assistant message. The API
-        // rejects these. Strip them out.
-        let mut cleaned: Vec<Message> = Vec::with_capacity(repaired.len());
-        for (idx, msg) in repaired.iter().enumerate() {
-            if msg.role == Role::User
-                && let MessageContent::Blocks(blocks) = &msg.content
+        for (msg_idx, mut message) in self.messages.into_iter().enumerate() {
+            let required = std::mem::take(&mut pending);
+            if message.role == Role::User
+                && let MessageContent::Blocks(blocks) = message.content
             {
-                // Get tool_use IDs from the preceding assistant message —
-                // `cleaned.last()`, NOT `cleaned[idx - 1]`.
-                //
-                // `idx` counts `repaired`; `cleaned` is what we are building.
-                // They diverge the moment this loop skips a message (the
-                // fully-orphaned case below), and from then on `cleaned[idx -
-                // 1]` names some earlier message instead of the previous one.
-                // Every following user message then gets checked against the
-                // wrong assistant, so its legitimate tool_results read as
-                // orphans and are dropped — which orphans THEIR tool_uses and
-                // desyncs the index further. One skip cascaded into an
-                // invalid request; live on toad, 2026-08-18, and the provider
-                // was the thing that noticed.
-                //
-                // The previous kept message is the only correct answer here,
-                // and `cleaned.last()` is that by construction — it cannot
-                // drift no matter how many messages this loop drops.
-                let preceding_tool_uses: std::collections::HashSet<&str> = cleaned
-                    .last()
-                    .and_then(|prev| {
-                        if prev.role != Role::Assistant {
-                            return None;
-                        }
-                        if let MessageContent::Blocks(pblocks) = &prev.content {
-                            Some(
-                                pblocks
-                                    .iter()
-                                    .filter_map(|b| {
-                                        if let ContentBlock::ToolUse { id, .. } = b {
-                                            Some(id.as_str())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect(),
-                            )
+                let expected: HashSet<&str> = required.iter().map(String::as_str).collect();
+                let mut results = Vec::new();
+                let mut content = Vec::new();
+                for block in blocks {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = &block {
+                        if expected.contains(tool_use_id.as_str()) {
+                            results.push(block);
                         } else {
-                            None
+                            tracing::warn!(
+                                msg_idx,
+                                tool_use_id,
+                                "hydration repair: dropping orphaned tool_result (late arrival)"
+                            );
                         }
-                    })
-                    .unwrap_or_default();
-
-                // Filter: keep only tool_results that match a preceding tool_use,
-                // plus any non-tool-result blocks (text).
-                let filtered: Vec<ContentBlock> = blocks
-                    .iter()
-                    .filter(|b| match b {
-                        ContentBlock::ToolResult { tool_use_id, .. } => {
-                            if preceding_tool_uses.contains(tool_use_id.as_str()) {
-                                true
-                            } else {
-                                tracing::warn!(
-                                    msg_idx = idx,
-                                    tool_use_id,
-                                    "hydration repair: dropping orphaned tool_result (late arrival)"
-                                );
-                                false
-                            }
-                        }
-                        _ => true,
-                    })
-                    .cloned()
-                    .collect();
-
-                if filtered.is_empty() {
-                    // Entire message was orphaned tool_results — skip it
-                    continue;
+                    } else {
+                        content.push(block);
+                    }
                 }
-                if filtered.len() < blocks.len() {
-                    // Some blocks were dropped — push the filtered version
-                    cleaned.push(Message {
-                        role: Role::User,
-                        content: MessageContent::Blocks(filtered),
-                    });
-                    continue;
+                let has_results = !results.is_empty();
+                complete_tool_results(&required, &mut results, msg_idx);
+                if has_results {
+                    results.extend(content);
+                    repaired.push(Message::tool_results(results));
+                } else {
+                    if !results.is_empty() {
+                        repaired.push(Message::tool_results(results));
+                    }
+                    if !content.is_empty() {
+                        message.content = MessageContent::Blocks(content);
+                        repaired.push(message);
+                    }
                 }
+                continue;
             }
-            cleaned.push(msg.clone());
+
+            let mut results = Vec::new();
+            complete_tool_results(&required, &mut results, msg_idx);
+            if !results.is_empty() {
+                repaired.push(Message::tool_results(results));
+            }
+            if message.role == Role::Assistant
+                && let MessageContent::Blocks(blocks) = &message.content
+            {
+                pending.extend(blocks.iter().filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                }));
+            }
+            repaired.push(message);
         }
 
-        report_unpaired_tool_uses(&cleaned);
-        cleaned
+        let mut results = Vec::new();
+        complete_tool_results(&pending, &mut results, repaired.len());
+        if !results.is_empty() {
+            repaired.push(Message::tool_results(results));
+        }
+        repaired
     }
 
     /// Flush any pending assistant reasoning + text + tool_uses into a message.
@@ -790,70 +649,84 @@ pub(crate) fn estimate_tokens(messages: &[Message]) -> u64 {
         .sum()
 }
 
-/// Log any `tool_use` that no following message answers.
-///
-/// This is the invariant the provider enforces for us today, and badly: it
-/// answers `invalid_request_error: An assistant message with 'tool_calls'
-/// must be followed by tool messages responding to each 'tool_call_id'`,
-/// after three retries, without naming which id — so the operator learns
-/// only that a turn died somewhere. Checking it here turns that into one
-/// line naming the call.
-///
-/// Deliberately a log and not a panic. By the time hydration runs, the
-/// alternative to sending a flawed request is killing a live turn, and a
-/// turn that fails loudly at the provider is strictly better than a kernel
-/// that panics on a conversation shape we did not anticipate. The repair
-/// passes above are what should make this unreachable; this exists to tell
-/// us when they did not.
-fn report_unpaired_tool_uses(messages: &[Message]) {
-    for (idx, msg) in messages.iter().enumerate() {
-        if msg.role != Role::Assistant {
-            continue;
-        }
-        let MessageContent::Blocks(blocks) = &msg.content else {
-            continue;
-        };
-        let uses: Vec<&str> = blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-        if uses.is_empty() {
-            continue;
-        }
-        let answered: std::collections::HashSet<&str> = messages
-            .get(idx + 1)
-            .and_then(|next| match (&next.role, &next.content) {
-                (Role::User, MessageContent::Blocks(nblocks)) => Some(
-                    nblocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                ),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let unpaired: Vec<&str> = uses
-            .into_iter()
-            .filter(|id| !answered.contains(id))
-            .collect();
-        if !unpaired.is_empty() {
-            tracing::error!(
-                msg_idx = idx,
-                ?unpaired,
-                "hydration produced an assistant message whose tool_uses have no \
-                 matching tool_results — the provider will refuse this request. \
-                 This is a hydration-repair bug, not a model or provider fault."
+/// Close a call batch with explicit errors for every missing result.
+fn complete_tool_results(required: &[String], results: &mut Vec<ContentBlock>, msg_idx: usize) {
+    let covered: HashSet<String> = results.iter().filter_map(|block| match block {
+        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+        _ => None,
+    }).collect();
+    for id in required {
+        if !covered.contains(id) {
+            tracing::warn!(
+                msg_idx,
+                tool_use_id = id,
+                "hydration repair: synthesizing tool_result for orphaned tool_use"
             );
+            results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: "Tool execution was interrupted (context was forked or pruned)".into(),
+                is_error: true,
+            });
         }
     }
+}
+
+fn pairing_error(msg_idx: usize, detail: impl std::fmt::Display) -> LlmError {
+    LlmError::InvalidRequest(format!(
+        "Conversation tool pairing is invalid at message {msg_idx}: {detail}. \
+         The turn was stopped before contacting the model. \
+         Exclude the offending blocks and fork to rebuild conversation history."
+    ))
+}
+
+/// Refuse malformed history before provider dispatch, including live appends.
+///
+/// Every assistant tool_use has exactly one result in the immediately next
+/// user message. Results precede ordinary content; both roles and both
+/// directions of the pairing are checked. This does not repair live history.
+pub(crate) fn validate_tool_pairing(messages: &[Message]) -> LlmResult<()> {
+    let mut pending = BTreeSet::new();
+    for (msg_idx, message) in messages.iter().enumerate() {
+        let mut unanswered = std::mem::take(&mut pending);
+        let mut answered = HashSet::new();
+        let mut saw_content = false;
+        if let MessageContent::Blocks(blocks) = &message.content {
+            for block in blocks {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        if message.role != Role::Assistant {
+                            return Err(pairing_error(msg_idx, format_args!("tool_use {id:?} must have assistant role")));
+                        }
+                        if !pending.insert(id.as_str()) {
+                            return Err(pairing_error(msg_idx, format_args!("duplicate tool_use {id:?}")));
+                        }
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        if message.role != Role::User {
+                            return Err(pairing_error(msg_idx, format_args!("tool_result {tool_use_id:?} must have user role")));
+                        }
+                        if saw_content {
+                            return Err(pairing_error(msg_idx, format_args!("tool_result {tool_use_id:?} must precede ordinary content")));
+                        }
+                        if !answered.insert(tool_use_id.as_str()) {
+                            return Err(pairing_error(msg_idx, format_args!("duplicate tool_result {tool_use_id:?}")));
+                        }
+                        if !unanswered.remove(tool_use_id.as_str()) {
+                            return Err(pairing_error(msg_idx, format_args!("tool_result {tool_use_id:?} has no tool_use in the preceding assistant message")));
+                        }
+                    }
+                    _ => saw_content = true,
+                }
+            }
+        }
+        if !unanswered.is_empty() {
+            return Err(pairing_error(msg_idx - 1, format_args!("tool_uses {unanswered:?} lack adjacent tool_results")));
+        }
+    }
+    if !pending.is_empty() {
+        return Err(pairing_error(messages.len() - 1, format_args!("tool_uses {pending:?} lack adjacent tool_results")));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -886,62 +759,232 @@ mod pairing_repair_tests {
         }
     }
 
-    /// Every assistant tool_use is answered by the immediately following
-    /// message. This is the provider's rule, and the only thing hydration
-    /// output has to satisfy.
+    #[test]
+    fn partial_results_precede_interleaved_content() {
+        let mut calls = assistant_with_tool_use("call_a");
+        let MessageContent::Blocks(ref mut blocks) = calls.content else { unreachable!() };
+        let MessageContent::Blocks(extra) = assistant_with_tool_use("call_b").content else { unreachable!() };
+        blocks.extend(extra);
+        let mut reply = results(&["call_a", "ghost"]);
+        let MessageContent::Blocks(ref mut blocks) = reply.content else { unreachable!() };
+        blocks.insert(0, ContentBlock::Text { text: "peer update".into() });
+        let mut state = HydrationState::new();
+        state.messages = vec![calls, reply, assistant_with_tool_use("call_c"), results(&["call_c"])];
+
+        let out = state.into_messages();
+        assert_well_paired(&out);
+        let MessageContent::Blocks(blocks) = &out[1].content else { panic!("expected results") };
+        assert!(matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "call_a"));
+        assert!(matches!(&blocks[1], ContentBlock::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "call_b"));
+        assert!(matches!(&blocks[2], ContentBlock::Text { text } if text == "peer update"));
+        assert_eq!(blocks.len(), 3, "only the orphan is removed");
+    }
+
+    #[tokio::test]
+    async fn provider_refuses_unpaired_history_before_dispatch() {
+        use super::super::{BuildOpts, LlmError, MockClient, Provider};
+
+        let mut duplicate_call = assistant_with_tool_use("duplicate_call");
+        let MessageContent::Blocks(ref mut blocks) = duplicate_call.content else { unreachable!() };
+        blocks.push(blocks[0].clone());
+        let mut text_first = results(&["text_first"]);
+        let MessageContent::Blocks(ref mut blocks) = text_first.content else { unreachable!() };
+        blocks.insert(0, ContentBlock::Text { text: "peer update".into() });
+        let malformed = [
+            ("missing", vec![assistant_with_tool_use("missing")]),
+            ("displaced", vec![assistant_with_tool_use("displaced"), Message::user("peer update"), results(&["displaced"])]),
+            ("orphan", vec![results(&["orphan"])]),
+            ("duplicate_result", vec![assistant_with_tool_use("duplicate_result"), results(&["duplicate_result", "duplicate_result"])]),
+            ("wrong_role", vec![Message { role: Role::User, ..assistant_with_tool_use("wrong_role") }, results(&["wrong_role"])]),
+            ("wrong_result_role", vec![assistant_with_tool_use("wrong_result_role"), Message { role: Role::Assistant, ..results(&["wrong_result_role"]) }]),
+            ("duplicate_call", vec![duplicate_call, results(&["duplicate_call"])]),
+            ("extra", vec![assistant_with_tool_use("call_a"), results(&["call_a", "extra"])]),
+            ("text_first", vec![assistant_with_tool_use("text_first"), text_first]),
+        ];
+        for (id, messages) in malformed {
+            let mock = MockClient::new("").with_scripted_stream(vec![vec![]]);
+            let script = mock.scripted.as_ref().unwrap().clone();
+            let provider = Provider::Mock(mock);
+            let result = provider.stream(BuildOpts::new("mock"), messages).await;
+            match result {
+                Err(LlmError::InvalidRequest(detail)) => {
+                    assert!(detail.contains(id), "error must name {id}: {detail}");
+                    assert!(detail.contains("message"), "error must locate the defect: {detail}");
+                }
+                Err(error) => panic!("unexpected error: {error}"),
+                Ok(_) => panic!("provider accepted malformed pairing for {id}"),
+            }
+            assert_eq!(script.lock().len(), 1, "refusal must precede backend dispatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_accepts_repaired_history() {
+        use super::super::{BuildOpts, MockClient, Provider};
+
+        let mut state = HydrationState::new();
+        state.messages = vec![
+            Message::user("go"),
+            assistant_with_tool_use("interrupted"),
+            Message::user("peer update"),
+            results(&["interrupted"]),
+            results(&["ghost"]),
+            assistant_with_tool_use("next"),
+            results(&["next"]),
+        ];
+        let out = state.into_messages();
+        assert_well_paired(&out);
+        let mock = MockClient::new("").with_scripted_stream(vec![vec![]]);
+        let script = mock.scripted.as_ref().unwrap().clone();
+        let provider = Provider::Mock(mock);
+        assert!(provider.stream(BuildOpts::new("mock"), out).await.is_ok());
+        assert!(script.lock().is_empty(), "valid pairing must reach the backend");
+    }
+
+    #[test]
+    fn interleaved_block_fixture_matches_bootstrap_and_incremental_snapshots() {
+        use kaijutsu_types::{ContextId, PrincipalId, ToolKind};
+        use super::super::{ConversationMailbox, hydrate_from_blocks};
+
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let id = |seq| BlockId::new(ctx, principal, seq);
+        let call = |seq, tool_id: &str| BlockSnapshot::tool_call(
+            id(seq), None, ToolKind::Shell, "shell", serde_json::json!({}),
+            BlockRole::Model, Some(tool_id.into()),
+        );
+        let result = |seq, call_seq, tool_id: &str| BlockSnapshot::tool_result(
+            id(seq), id(call_seq), ToolKind::Shell, "ok", false, Some(0), Some(tool_id.into()),
+        );
+        let blocks = vec![
+            BlockSnapshot::text(id(0), None, BlockRole::User, "go"),
+            call(1, "call_a"),
+            call(2, "call_b"),
+            result(3, 1, "call_a"),
+            BlockSnapshot::text(id(4), None, BlockRole::User, "peer update"),
+            result(5, 2, "call_b"),
+            result(6, 99, "ghost"),
+            call(7, "call_c"),
+            result(8, 7, "call_c"),
+        ];
+        let expected = hydrate_from_blocks(&blocks);
+        assert_well_paired(&expected);
+        let mut mailbox = ConversationMailbox::new();
+        for block in &blocks {
+            mailbox.feed(block, None);
+            let snapshot = mailbox.snapshot();
+            assert_well_paired(&snapshot);
+            assert_eq!(serde_json::to_value(&snapshot).unwrap(), serde_json::to_value(mailbox.snapshot()).unwrap());
+        }
+        assert_eq!(serde_json::to_value(mailbox.snapshot()).unwrap(), serde_json::to_value(&expected).unwrap());
+        let answered: Vec<_> = expected.iter().flat_map(|message| match &message.content {
+            MessageContent::Blocks(blocks) => blocks.iter().filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, is_error, .. } => Some((tool_use_id.as_str(), *is_error)),
+                _ => None,
+            }).collect::<Vec<_>>(),
+            _ => vec![],
+        }).collect();
+        assert_eq!(answered, vec![("call_a", false), ("call_b", true), ("call_c", false)]);
+        assert!(expected.iter().any(|message| message.as_text() == Some("peer update")));
+    }
+
+    fn call_ids(message: &Message) -> Vec<&str> {
+        let MessageContent::Blocks(blocks) = &message.content else { return vec![] };
+        blocks.iter().filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        }).collect()
+    }
+
+    fn result_ids(message: &Message) -> Vec<&str> {
+        let MessageContent::Blocks(blocks) = &message.content else { return vec![] };
+        blocks.iter().filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        }).collect()
+    }
+
+    /// Check both directions independently of the production validator.
     fn assert_well_paired(messages: &[Message]) {
-        for (idx, msg) in messages.iter().enumerate() {
-            if msg.role != Role::Assistant {
-                continue;
-            }
-            let MessageContent::Blocks(blocks) = &msg.content else {
-                continue;
-            };
-            let uses: Vec<&str> = blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-                    _ => None,
-                })
-                .collect();
-            if uses.is_empty() {
-                continue;
-            }
-            let next = messages.get(idx + 1).unwrap_or_else(|| {
-                panic!("message {idx} has tool_uses {uses:?} but nothing follows it")
-            });
-            let answered: std::collections::HashSet<&str> = match (&next.role, &next.content) {
-                (Role::User, MessageContent::Blocks(nblocks)) => nblocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => panic!("message {idx} has tool_uses {uses:?}; message {} is not a tool_result message", idx + 1),
-            };
-            for id in uses {
-                assert!(
-                    answered.contains(id),
-                    "message {idx}'s tool_use {id} is unanswered by message {}",
-                    idx + 1
-                );
+        for (idx, message) in messages.iter().enumerate() {
+            let mut calls = call_ids(message);
+            let mut results = result_ids(message);
+            match message.role {
+                Role::Assistant => {
+                    assert!(results.is_empty(), "assistant results at {idx}");
+                    if calls.is_empty() { continue; }
+                    let next = messages.get(idx + 1).expect("a call batch must have a reply");
+                    assert_eq!(next.role, Role::User);
+                    let mut answers = result_ids(next);
+                    calls.sort();
+                    answers.sort();
+                    assert_eq!(calls, answers, "call batch at {idx} must be answered exactly");
+                    calls.dedup();
+                    assert_eq!(calls.len(), answers.len(), "duplicate call ids at {idx}");
+                }
+                Role::User => {
+                    assert!(calls.is_empty(), "user tool calls at {idx}");
+                    if results.is_empty() { continue; }
+                    assert!(idx > 0, "orphan results at start");
+                    assert_eq!(messages[idx - 1].role, Role::Assistant);
+                    let mut expected = call_ids(&messages[idx - 1]);
+                    results.sort();
+                    expected.sort();
+                    assert_eq!(results, expected, "orphan results at {idx}");
+                    let MessageContent::Blocks(blocks) = &message.content else { unreachable!() };
+                    assert!(blocks[..results.len()].iter().all(|b| matches!(b, ContentBlock::ToolResult { .. })), "results must lead at {idx}");
+                }
             }
         }
     }
 
-    /// The live failure from toad, 2026-08-18, reduced to its mechanism.
-    ///
-    /// One fully-orphaned tool_result message (a late arrival whose call
-    /// already got a synthetic answer) is dropped by the reverse pass. That
-    /// drop used to desync the reverse pass's index — it enumerated
-    /// `repaired` but looked the previous message up in `cleaned` — so every
-    /// later user message was checked against the WRONG assistant, its
-    /// legitimate results were dropped as orphans, and their tool_uses were
-    /// left unanswered. The provider caught it; we did not.
-    ///
-    /// The tell is that the damage is AFTER the drop, so a fixture needs a
-    /// perfectly ordinary exchange following the orphan to show it.
+    #[test]
+    fn repair_is_idempotent_for_short_interleavings() {
+        let choices = [
+            Message::user("peer update"), Message::assistant("thinking"),
+            assistant_with_tool_use("a"), assistant_with_tool_use("b"),
+            results(&["a"]), results(&["b"]), results(&["ghost"]),
+        ];
+        for mut shape in 0..choices.len().pow(4) {
+            let mut state = HydrationState::new();
+            for _ in 0..4 {
+                state.messages.push(choices[shape % choices.len()].clone());
+                shape /= choices.len();
+            }
+            let repaired = state.into_messages();
+            assert_well_paired(&repaired);
+            assert!(validate_tool_pairing(&repaired).is_ok());
+            let mut again = HydrationState::new();
+            again.messages = repaired.clone();
+            assert_eq!(serde_json::to_value(again.into_messages()).unwrap(), serde_json::to_value(repaired).unwrap());
+        }
+    }
+
+    #[test]
+    fn repair_preserves_ambiguous_duplicates_for_refusal() {
+        let mut duplicate_calls = assistant_with_tool_use("duplicate");
+        let MessageContent::Blocks(ref mut blocks) = duplicate_calls.content else { unreachable!() };
+        blocks.push(ContentBlock::ToolUse {
+            id: "duplicate".into(), name: "different_tool".into(), input: serde_json::json!({}),
+        });
+        let mut duplicate_results = results(&["duplicate"]);
+        let MessageContent::Blocks(ref mut blocks) = duplicate_results.content else { unreachable!() };
+        blocks.push(ContentBlock::ToolResult {
+            tool_use_id: "duplicate".into(), content: "conflicting output".into(), is_error: true,
+        });
+        for messages in [
+            vec![duplicate_calls, results(&["duplicate"])],
+            vec![assistant_with_tool_use("duplicate"), duplicate_results],
+        ] {
+            let expected = serde_json::to_value(&messages).unwrap();
+            let mut state = HydrationState::new();
+            state.messages = messages;
+            let repaired = state.into_messages();
+            assert_eq!(serde_json::to_value(&repaired).unwrap(), expected, "repair must not choose a winner");
+            assert!(matches!(validate_tool_pairing(&repaired), Err(LlmError::InvalidRequest(_))));
+        }
+    }
+
     #[test]
     fn a_dropped_orphan_does_not_desync_the_pairs_after_it() {
         let mut state = HydrationState::new();
@@ -985,9 +1028,6 @@ mod pairing_repair_tests {
         );
     }
 
-    /// Two orphans in a row: the desync used to grow with each drop, so one
-    /// is not enough to prove the index is anchored rather than merely
-    /// off-by-one.
     #[test]
     fn several_dropped_orphans_still_leave_later_pairs_intact() {
         let mut state = HydrationState::new();
