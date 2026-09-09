@@ -93,7 +93,7 @@ impl KjDispatcher {
             CharacterCommand::Create { name } => self.character_create(&name),
             CharacterCommand::List { all } => self.character_list(all),
             CharacterCommand::Show { name } => self.character_show(&name),
-            CharacterCommand::Retire { name } => self.character_retire(&name, caller),
+            CharacterCommand::Retire { name } => self.character_retire(&name),
         }
     }
 
@@ -188,12 +188,13 @@ impl KjDispatcher {
 
     /// Retire: stamp `retired_at`, and conclude + archive every live
     /// context the character plays, in the same act
-    /// (`docs/character.md`, "Retire takes its contexts with it"). Latched
-    /// like `kj context archive` — the message names how many contexts the
-    /// confirmed call will take down; the archival loop below is not
-    /// separately confirmed, since this latch already covers the whole
-    /// batch as one act.
-    fn character_retire(&self, name: &str, caller: &KjCaller) -> KjResult {
+    /// (`docs/character.md`, "Retire takes its contexts with it").
+    /// `Destroy`-classed (`docs/kj-verb-class.md`); the dispatcher latches
+    /// an unconfirmed call before this handler runs, whether or not the
+    /// character has anything live to archive — the archival loop below is
+    /// not separately confirmed, since that one latch already covers the
+    /// whole batch as one act.
+    fn character_retire(&self, name: &str) -> KjResult {
         let db = self.kernel_db().lock();
         let row = match db.get_character_by_name(name) {
             Ok(Some(r)) => r,
@@ -212,22 +213,6 @@ impl KjDispatcher {
             Ok(l) => l,
             Err(e) => return KjResult::Err(format!("kj character retire: {e}")),
         };
-
-        // Only the batch of contexts this act would take down is
-        // destructive — a character with nothing live to archive needs no
-        // confirmation, the same way `kj context conclude` (no fan-out)
-        // isn't latched while `kj context archive` (children, drift edges)
-        // is.
-        if !live.is_empty() && !caller.confirmed {
-            return KjResult::Latch {
-                command: "kj character retire".to_string(),
-                target: name.to_string(),
-                message: format!(
-                    "{} live context(s) will be concluded and archived",
-                    live.len()
-                ),
-            };
-        }
 
         // Reuse the archive path `kj context archive` calls
         // (`KernelDb::conclude_context` / `archive_context`) rather than a
@@ -389,14 +374,22 @@ mod tests {
         assert!(d.kernel_db().lock().get_character_by_name("intruder").unwrap().is_none());
     }
 
-    /// `retire` on a character with no live contexts needs no latch —
-    /// there is nothing to archive, so it completes on the first call.
+    /// `retire` latches an unconfirmed call even with no live contexts to
+    /// archive — `Destroy` always latches (`docs/kj-verb-class.md`, slice
+    /// 3), regardless of what the handler would find. Confirmed, it
+    /// completes on the next call.
     #[tokio::test]
-    async fn retire_with_no_contexts_completes_immediately() {
+    async fn retire_with_no_contexts_still_latches_then_completes() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let caller = test_caller();
         d.dispatch(&[s("character"), s("create"), s("hajime")], &caller).await;
-        let result = d.dispatch(&[s("character"), s("retire"), s("hajime")], &caller).await;
+        let latch = d.dispatch(&[s("character"), s("retire"), s("hajime")], &caller).await;
+        assert!(latch.is_latch(), "expected a latch even with no live contexts, got {latch:?}");
+
+        let mut confirmed = caller.clone();
+        confirmed.confirmed = true;
+        let result =
+            d.dispatch(&[s("character"), s("retire"), s("hajime")], &confirmed).await;
         assert!(matches!(result, KjResult::Ok { .. }), "{result:?}");
         let row = d.kernel_db().lock().get_character_by_name("hajime").unwrap().unwrap();
         assert!(row.retired_at.is_some());

@@ -408,6 +408,31 @@ impl KjDispatcher {
             return KjResult::ok_ephemeral(self.help(), ContentType::Markdown);
         }
 
+        // Verb class: docs/kj-verb-class.md. A Destroy verb latches here,
+        // the one place, instead of a handler-local `caller.confirmed`
+        // check — no handler for a Destroy verb runs before this. A
+        // classify failure (help flags, unknown verb, an argument that
+        // doesn't fit its slot) falls through: the domain dispatcher's own
+        // clap error/help rendering stays the user-facing answer.
+        if let Ok(effect::Effect::Destroy) = effect::classify(argv)
+            && !caller.confirmed
+        {
+            let (command, target) = match effect::leaf_path(argv) {
+                Some((path, target)) => (format!("kj {path}"), target.unwrap_or_default()),
+                None => (format!("kj {cmd}"), String::new()),
+            };
+            let message = if target.is_empty() {
+                format!("{command} is permanent; re-run with --confirm")
+            } else {
+                format!("{command} {target} is permanent; re-run with --confirm")
+            };
+            return KjResult::Latch {
+                command,
+                target,
+                message,
+            };
+        }
+
         // Most context/workspace/preset subcommands work without an active context
         if cmd == "context" || cmd == "ctx" {
             return self.dispatch_context(&argv[1..], caller).await;
@@ -973,8 +998,7 @@ pub(crate) fn clap_help_for<T: clap::CommandFactory>() -> KjResult {
 /// docs/monday-clap-upgrades.md §2.1). Aliases (`ctx`, `ws`) ride on the
 /// respective `*Args` as `visible_alias` so kaish's leaf-walker matches them.
 pub fn kj_command() -> clap::Command {
-    use clap::CommandFactory;
-    effect::KjArgs::command()
+    effect::cached_kj_args_command()
 }
 
 #[cfg(test)]
@@ -1714,6 +1738,54 @@ mod published_prose {
                 .map(|(path, _, _)| format!("  {path}"))
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod destroy_latches_at_dispatch_tests {
+    //! `docs/kj-verb-class.md` slice 3: `dispatch()` latches every `Destroy`
+    //! verb itself, before routing to a handler. Proven on the whole corpus
+    //! rather than the seven verbs by name, so a future `Destroy` verb is
+    //! covered without a new test: a handler that ran would return `Err` for
+    //! a nonexistent target, never a `Latch`.
+
+    use super::test_helpers::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn every_destroy_clause_latches_unconfirmed() {
+        let d = test_dispatcher().await;
+        let caller = test_caller();
+        let corpus = super::corpus::corpus().expect("corpus builds");
+
+        let mut destroy_clauses = 0;
+        let mut failed = Vec::new();
+        for verb in &corpus.verbs {
+            let argv: Vec<String> = verb
+                .clause
+                .split_whitespace()
+                .skip(1)
+                .map(String::from)
+                .collect();
+            if !matches!(effect::classify(&argv), Ok(effect::Effect::Destroy)) {
+                continue;
+            }
+            destroy_clauses += 1;
+            let result = d.dispatch(&argv, &caller).await;
+            if !result.is_latch() {
+                failed.push(format!("{}: {result:?}", verb.clause));
+            }
+        }
+        assert!(
+            destroy_clauses > 0,
+            "no Destroy clause found in the corpus — this test would pass vacuously"
+        );
+        assert!(
+            failed.is_empty(),
+            "{} Destroy clause(s) did not latch unconfirmed (a handler ran):\n{}",
+            failed.len(),
+            failed.join("\n")
         );
     }
 }

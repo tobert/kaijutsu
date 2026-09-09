@@ -113,7 +113,7 @@ impl KjDispatcher {
             WorkspaceCommand::Bind { label, context } => {
                 self.workspace_bind(&label, context.as_deref(), caller)
             }
-            WorkspaceCommand::Remove { label } => self.workspace_remove(&label, caller),
+            WorkspaceCommand::Remove { label } => self.workspace_remove(&label),
         }
     }
 
@@ -303,8 +303,10 @@ impl KjDispatcher {
         ))
     }
 
-    /// `kj workspace remove <label>` — archive a workspace (latched).
-    fn workspace_remove(&self, label: &str, caller: &KjCaller) -> KjResult {
+    /// `kj workspace remove <label>` — archive a workspace. `Destroy`-classed
+    /// (`docs/kj-verb-class.md`); the dispatcher latches an unconfirmed call
+    /// before this handler runs.
+    fn workspace_remove(&self, label: &str) -> KjResult {
         let db = self.kernel_db().lock();
 
         let ws = match db.get_workspace_by_label(label) {
@@ -314,17 +316,6 @@ impl KjDispatcher {
             }
             Err(e) => return KjResult::Err(format!("kj workspace remove: {e}")),
         };
-
-        if !caller.confirmed {
-            let usage_count = db
-                .contexts_using_workspace(ws.workspace_id)
-                .unwrap_or(0);
-            return KjResult::Latch {
-                command: "kj workspace remove".to_string(),
-                target: label.to_string(),
-                message: format!("{} context(s) using this workspace", usage_count),
-            };
-        }
 
         match db.archive_workspace(ws.workspace_id) {
             Ok(true) => KjResult::ok(format!("archived workspace '{}'", label)),

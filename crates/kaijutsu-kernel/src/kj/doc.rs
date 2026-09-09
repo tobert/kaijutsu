@@ -79,9 +79,6 @@ enum DocCommand {
     Delete {
         /// Document id (hex UUID)
         doc_id: String,
-        /// Confirm the deletion — it is irreversible
-        #[arg(long)]
-        confirm: bool,
     },
 }
 
@@ -142,9 +139,7 @@ impl KjDispatcher {
                 language,
                 id,
             } => self.doc_create(&kind, language.as_deref(), id.as_deref(), caller),
-            DocCommand::Delete { doc_id, confirm } => {
-                self.doc_delete(&doc_id, confirm, caller)
-            }
+            DocCommand::Delete { doc_id } => self.doc_delete(&doc_id),
         }
     }
 
@@ -388,14 +383,9 @@ impl KjDispatcher {
     }
 
     /// Delete a document and CASCADE-drop its contexts row, oplog,
-    /// snapshots. Latch-gated: the first call refuses with a summary of what
-    /// would go, a second call with `--confirm` actually deletes.
-    fn doc_delete(
-        &self,
-        id_str: &str,
-        confirm: bool,
-        caller: &KjCaller,
-    ) -> KjResult {
+    /// snapshots. `Destroy`-classed (`docs/kj-verb-class.md`); the
+    /// dispatcher latches an unconfirmed call before this handler runs.
+    fn doc_delete(&self, id_str: &str) -> KjResult {
         let ctx_id = match ContextId::parse(id_str) {
             Ok(id) => id,
             Err(e) => {
@@ -405,8 +395,6 @@ impl KjDispatcher {
             }
         };
 
-        // Reject inputs that don't exist before asking for confirmation —
-        // the latch message would otherwise be meaningless.
         let (kind_str, block_count) = {
             let db = self.kernel_db().lock();
             match db.get_document(ctx_id) {
@@ -426,21 +414,6 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj doc delete: {e}")),
             }
         };
-
-        // Without --confirm: emit a Latch so the kaish layer prints the
-        // confirmation summary. `KjBuiltin` strips the root `--confirm` flag
-        // before dispatch and reports it as `caller.confirmed`, so the local
-        // `confirm` only fires for a direct dispatcher call (tests).
-        if !caller.confirmed && !confirm {
-            return KjResult::Latch {
-                command: "kj doc delete".to_string(),
-                target: id_str.to_string(),
-                message: format!(
-                    "{} doc ({block_count} blocks) — cascade-drops contexts/oplog/snapshots",
-                    kind_str
-                ),
-            };
-        }
 
         if let Err(e) = self.blocks.delete_document(ctx_id) {
             return KjResult::Err(format!("kj doc delete: {e}"));

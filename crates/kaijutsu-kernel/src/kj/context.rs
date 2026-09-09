@@ -1721,7 +1721,9 @@ impl KjDispatcher {
         KjResult::ok(format!("moved '{}' under '{}'", ctx_label, parent_label))
     }
 
-    /// `kj context archive <ctx>` — soft-delete one context (latched).
+    /// `kj context archive <ctx>` — soft-delete one context. `Destroy`-classed
+    /// (`docs/kj-verb-class.md`); the dispatcher latches an unconfirmed call
+    /// before this handler runs.
     ///
     /// Never recurses. Children keep their structural edge and their own
     /// state, so a lineage stays walkable after most of it is archived
@@ -1742,39 +1744,6 @@ impl KjDispatcher {
                 .unwrap_or_else(|| target_id.short());
             (target_id, label)
         };
-
-        if !caller.confirmed {
-            // Gather stats for latch message
-            let db = self.kernel_db().lock();
-            let block_count = self
-                .block_store()
-                .get(target_id)
-                .map(|e| e.doc.block_count())
-                .unwrap_or(0);
-            let children_count = db
-                .structural_children(target_id)
-                .map(|c| c.len())
-                .unwrap_or(0);
-            let drift_from = db
-                .edges_from(target_id, Some(EdgeKind::Drift))
-                .map(|e| e.len())
-                .unwrap_or(0);
-            let drift_to = db
-                .edges_to(target_id, Some(EdgeKind::Drift))
-                .map(|e| e.len())
-                .unwrap_or(0);
-
-            return KjResult::Latch {
-                command: "kj context archive".to_string(),
-                target: target_label,
-                message: format!(
-                    "{} blocks | {} drift edges | {} children stay live under it",
-                    block_count,
-                    drift_from + drift_to,
-                    children_count,
-                ),
-            };
-        }
 
         let archived = {
             let db = self.kernel_db().lock();
@@ -1957,7 +1926,9 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj context remove <ctx>` — permanently delete a context (latched).
+    /// `kj context remove <ctx>` — permanently delete a context.
+    /// `Destroy`-classed (`docs/kj-verb-class.md`); the dispatcher latches
+    /// an unconfirmed call before this handler runs.
     async fn context_remove(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
@@ -1979,28 +1950,6 @@ impl KjDispatcher {
             return KjResult::Err(
                 "kj context remove: cannot remove the current context".to_string(),
             );
-        }
-
-        if !caller.confirmed {
-            let db = self.kernel_db().lock();
-            let block_count = self
-                .block_store()
-                .get(target_id)
-                .map(|e| e.doc.block_count())
-                .unwrap_or(0);
-            let children_count = db
-                .structural_children(target_id)
-                .map(|c| c.len())
-                .unwrap_or(0);
-
-            return KjResult::Latch {
-                command: "kj context remove".to_string(),
-                target: target_label,
-                message: format!(
-                    "{} blocks | {} children — this is permanent",
-                    block_count, children_count
-                ),
-            };
         }
 
         // MCP subscription cleanup removed alongside the legacy MCP pool
@@ -2033,8 +1982,10 @@ impl KjDispatcher {
         KjResult::ok(format!("removed context '{}'", target_label))
     }
 
-    /// `kj context retag <label> <ctx>` — move a label to a different context (latched).
     /// `kj context rename <name> [--context <ref>]` — set a context's label.
+    /// Unlike `kj context retag` below, this is not latched: it renames the
+    /// resolved context's own label rather than moving a label between
+    /// contexts.
     ///
     /// DB-first (the UNIQUE constraint on `contexts.label` is the uniqueness
     /// authority — `update_label` maps its violation to a typed "already in
@@ -2079,6 +2030,9 @@ impl KjDispatcher {
         KjResult::ok(format!("renamed {from} → '{name}' ({})", id.short()))
     }
 
+    /// `kj context retag <label> <ctx>` — move a label to a different
+    /// context. `Destroy`-classed (`docs/kj-verb-class.md`); the dispatcher
+    /// latches an unconfirmed call before this handler runs.
     async fn context_retag(&self, label: &str, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         // Resolve the new holder and find old holder (single lock scope)
         let (new_holder_id, old_holder) = {
@@ -2091,26 +2045,6 @@ impl KjDispatcher {
             let old_holder = db.find_context_by_label(label).ok().flatten();
             (new_holder_id, old_holder)
         };
-
-        if !caller.confirmed {
-            let current_holder = old_holder
-                .as_ref()
-                .map(|r| {
-                    let old_short = r.context_id.short();
-                    format!(
-                        "currently held by {} ({})",
-                        r.label.as_deref().unwrap_or(&old_short),
-                        old_short
-                    )
-                })
-                .unwrap_or_else(|| "label is free".to_string());
-
-            return KjResult::Latch {
-                command: "kj context retag".to_string(),
-                target: label.to_string(),
-                message: current_holder,
-            };
-        }
 
         // Apply label changes (single lock scope, no await)
         {

@@ -97,7 +97,7 @@ impl KjDispatcher {
                 consent,
                 desc,
             } => self.preset_save(&label, cast, system_prompt, consent, desc, caller),
-            PresetCommand::Remove { label } => self.preset_remove(&label, caller),
+            PresetCommand::Remove { label } => self.preset_remove(&label),
             PresetCommand::Reseed => self.preset_reseed(caller),
         }
     }
@@ -280,8 +280,10 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj preset remove <label>` — delete a preset (latched).
-    fn preset_remove(&self, label: &str, caller: &KjCaller) -> KjResult {
+    /// `kj preset remove <label>` — delete a preset. `Destroy`-classed
+    /// (`docs/kj-verb-class.md`); the dispatcher latches an unconfirmed call
+    /// before this handler runs.
+    fn preset_remove(&self, label: &str) -> KjResult {
         if crate::seed_presets::is_reserved_preset_label(label) {
             return KjResult::Err(format!(
                 "kj preset remove: '{label}' is a reserved factory preset and cannot be removed"
@@ -295,17 +297,6 @@ impl KjDispatcher {
             Ok(None) => return KjResult::Err(format!("kj preset remove: '{}' not found", label)),
             Err(e) => return KjResult::Err(format!("kj preset remove: {e}")),
         };
-
-        if !caller.confirmed {
-            let usage_count = db
-                .contexts_using_preset(preset.preset_id)
-                .unwrap_or(0);
-            return KjResult::Latch {
-                command: "kj preset remove".to_string(),
-                target: label.to_string(),
-                message: format!("{} context(s) using this preset", usage_count),
-            };
-        }
 
         match db.delete_preset(preset.preset_id) {
             Ok(true) => KjResult::ok(format!("deleted preset '{}'", label)),
@@ -406,9 +397,12 @@ mod tests {
 
     #[tokio::test]
     async fn preset_remove_rejects_reserved_label() {
+        // Confirmed: an unconfirmed call latches before the handler (and its
+        // reserved-label check) ever runs — `Destroy` always latches
+        // (`docs/kj-verb-class.md`, slice 3).
         let d = test_dispatcher().await;
         let ctx = register_context(&d, Some("ctx"), None, PrincipalId::new());
-        let c = caller_with_context(ctx);
+        let c = confirmed_caller(ctx);
         let result = d.dispatch(&[s("preset"), s("remove"), s("spawn")], &c).await;
         assert!(!result.is_ok(), "removing a factory preset must fail");
         assert!(result.message().contains("reserved"), "got: {}", result.message());

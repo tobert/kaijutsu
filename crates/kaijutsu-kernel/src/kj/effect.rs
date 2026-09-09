@@ -7,7 +7,7 @@
 //! a compile error, and an argument that changes the effect (`block cat
 //! --out <path>`) is visible to the arm that classifies it.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 /// What running a `kj` verb does to the world.
@@ -197,8 +197,58 @@ pub enum ClassifyError {
 pub fn classify(argv: &[String]) -> Result<Effect, ClassifyError> {
     let mut argv = argv.to_vec();
     super::parse::strip_flag(&mut argv, &["--confirm", "--json"]);
-    let parsed = KjArgs::try_parse_from(&argv)?;
+    let matches = cached_kj_args_command().try_get_matches_from(argv)?;
+    let parsed = KjArgs::from_arg_matches(&matches)?;
     Ok(parsed.command.effect())
+}
+
+/// A clone of the built `kj` clap tree, built once. Constructing it from
+/// scratch chains one builder call per domain — around 40 of them, several
+/// nested another level deep — into a single expression; in a debug build
+/// that one call's own stack frame is large enough to matter next to a
+/// deeply rc-nested `kj` invocation (`kj fork` re-entering kaish for the
+/// new context's create lifecycle, say), where `classify` now runs at every
+/// re-entry. [`crate::kj::kj_command`] and this module's own parsing both
+/// clone this instead of rebuilding it.
+pub(crate) fn cached_kj_args_command() -> clap::Command {
+    static COMMAND: std::sync::OnceLock<clap::Command> = std::sync::OnceLock::new();
+    COMMAND.get_or_init(KjArgs::command).clone()
+}
+
+/// The canonical leaf path an argv reaches, and the first positional after
+/// it — used to name a `Destroy` latch by the leaf the caller reached
+/// rather than the tokens they typed (`kj ctx archive` names itself
+/// `kj context archive`, aliases resolved for free).
+///
+/// Walks `kj_command()` one token at a time, matching each against the
+/// current node's subcommands (`Command::find_subcommand`, which checks
+/// name and aliases both). The walk stops at the first token that is not a
+/// subcommand of the current node; the path so far is the leaf, and the
+/// first remaining token that does not start with `-` is the target.
+///
+/// Returns `None` when no subcommand matches at all — an unrecognized verb.
+pub fn leaf_path(argv: &[String]) -> Option<(String, Option<String>)> {
+    let mut argv = argv.to_vec();
+    super::parse::strip_flag(&mut argv, &["--confirm", "--json"]);
+
+    let mut current = super::kj_command();
+    let mut path = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        match current.find_subcommand(argv[i].as_str()).cloned() {
+            Some(sub) => {
+                path.push(sub.get_name().to_string());
+                current = sub;
+                i += 1;
+            }
+            None => break,
+        }
+    }
+    if path.is_empty() {
+        return None;
+    }
+    let target = argv[i..].iter().find(|t| !t.starts_with('-')).cloned();
+    Some((path.join(" "), target))
 }
 
 #[cfg(test)]
@@ -281,6 +331,30 @@ mod tests {
     fn an_argument_can_change_the_effect() {
         assert_eq!(classify(&argv("kj block cat 019a2f3c")).unwrap(), Effect::Read);
         assert_eq!(classify(&argv("kj block cat 019a2f3c --out /tmp/x")).unwrap(), Effect::Write);
+    }
+
+    #[test]
+    fn leaf_path_resolves_an_alias_to_its_canonical_name() {
+        assert_eq!(
+            leaf_path(&argv("kj ctx archive abc123")),
+            Some(("context archive".to_string(), Some("abc123".to_string())))
+        );
+    }
+
+    #[test]
+    fn leaf_path_walks_a_nested_subcommand() {
+        assert_eq!(
+            leaf_path(&argv("kj backend model set myback gpt-4")),
+            Some(("backend model set".to_string(), Some("myback".to_string())))
+        );
+    }
+
+    #[test]
+    fn leaf_path_with_no_positional_after_the_leaf() {
+        assert_eq!(
+            leaf_path(&argv("kj preset list")),
+            Some(("preset list".to_string(), None))
+        );
     }
 
     #[test]
