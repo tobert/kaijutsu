@@ -45,6 +45,13 @@ ships. Delete this entry then.
 
 ## `join_context` heals an archived row and collides with the live label (2026-09-09)
 
+Sequence from the journal: 07:25 this session's MCP created `01a085ea`
+and renamed it `cc-kaijutsu-c75f64fe`; 07:43:59 another process archived
+it; 07:44 a second MCP instance created `e6a4375f` and renamed it to the
+same label; 07:55 the first process re-joined the archived `01a085ea` and
+kept working, because archiving does not evict a context from the
+in-memory registry; the bounce did, and the heal then collided.
+
 After the 09:14 bounce, the lead session's MCP mirror failed permanently:
 `join_context: failed to heal registry for 01a085ea…: label
 'cc-kaijutsu-c75f64fe' already in use by context e6a4375f`. `kj context
