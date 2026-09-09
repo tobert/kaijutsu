@@ -55,11 +55,14 @@ from its KernelDb row") registers any row `get_context` returns, and
 registered, while the DB scopes uniqueness to live rows
 (`idx_contexts_label … WHERE archived_at IS NULL`). Two fixes, both
 small: the heal refuses an archived row with an error that names the live
-context under the label, and the MCP re-registers instead of retrying a
-context id it cached before the bounce (`register_session` from a fresh
-process reports `already_registered` with a *different* id each time,
-which is a cache, not a kernel fact). Recovery today is `/mcp` in the
-affected session.
+context under the label, and the client re-registers instead of retrying
+a context id it cached before the bounce: `connect_handshake` in
+`kaijutsu-client/src/actor.rs` classifies the `join_context` failure as
+`ConnectOutcome::Permanent`, and the MCP surfaces it as "permanently
+failed" on every later call (`register_session` from a fresh process
+reports `already_registered` with a *different* id each time, which is a
+cache, not a kernel fact). Recovery today is `/mcp` in the affected
+session.
 
 ## An ask's `exec_source` shows `none` for a positional the executor ran correctly (2026-09-09)
 
