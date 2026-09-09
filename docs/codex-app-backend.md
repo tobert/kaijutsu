@@ -22,10 +22,14 @@ of keeping that command in a terminal:
 ./contrib/install-codex-app-server-systemd.sh
 ```
 
-The generated unit resolves the currently active `codex` binary, listens only
-on `127.0.0.1:4500`, and exports Codex OTel logs, traces, and metrics over
+The generated unit resolves the currently active `codex` binary, listens on
+`unix://$XDG_RUNTIME_DIR/codex-app-server.sock` so the Codex TUI can share
+it (`codex --remote unix://<path>`), and exports Codex OTel logs, traces, and metrics over
 OTLP/gRPC to the local collector on port 4317. Raw user-prompt logging remains
-disabled. The unit owns sidecar restart and reaping; the kernel remains a
+disabled. The kernel's `codex-app` backend still dials only `ws://`, so it
+cannot reach the installed unit until a unix or stdio transport lands; point
+it at a separately started `codex app-server --listen ws://127.0.0.1:4500`
+until then. The unit owns sidecar restart and reaping; the kernel remains a
 client of a configured local service.
 
 The provider opens a fresh connection per Kaijutsu completion, performs

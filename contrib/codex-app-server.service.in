@@ -5,16 +5,19 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=@CODEX_BIN@ app-server --listen ws://127.0.0.1:4500 -c 'otel.environment="zorak"' -c 'otel.exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c 'otel.trace_exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c 'otel.metrics_exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c otel.log_user_prompt=false
+ExecStart=@CODEX_BIN@ app-server --listen unix://%t/codex-app-server.sock -c 'otel.environment="zorak"' -c 'otel.exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c 'otel.trace_exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c 'otel.metrics_exporter={ otlp-grpc = { endpoint = "http://127.0.0.1:4317" } }' -c otel.log_user_prompt=false
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
 KillMode=mixed
 
 # Codex stores auth, configuration, and thread state below ~/.codex. The
-# app-server listens only on loopback; Kaijutsu disables its native exec tools
+# app-server listens on a unix socket under $XDG_RUNTIME_DIR; Kaijutsu disables its native exec tools
 # per thread and routes dynamic tools through the context-bound broker/kaish.
 Environment=RUST_LOG=info
+# API keys for MCP servers the app-server spawns (exa reads EXA_API_KEY).
+# systemd does not read a shell profile; put KEY=value lines in this file.
+EnvironmentFile=-%h/.config/codex-app-server.env
 
 [Install]
 WantedBy=default.target

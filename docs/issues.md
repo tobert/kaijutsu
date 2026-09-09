@@ -131,6 +131,11 @@ From a sibling session's bridge work, not yet folded into
   choice is revisited.
 - `AdditionalContextEntry.kind` is `untrusted | application` — the right slot
   for peer or tool text entering a Codex turn.
+- The installed sidecar unit (`contrib/codex-app-server.service.in`) now
+  listens on `unix://$XDG_RUNTIME_DIR/codex-app-server.sock` so the Codex
+  TUI can share it. The kernel backend dials `ws://` only, so it cannot
+  reach that unit; a unix-socket `JsonlTransport` is the small fix, the
+  stdio proxy above the general one.
 
 ## Synthesis re-embeds the whole context on every block write (2026-09-01)
 

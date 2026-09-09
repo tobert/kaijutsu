@@ -21,6 +21,6 @@ systemctl --user daemon-reload
 systemctl --user enable --now codex-app-server.service
 
 echo "Installed $UNIT"
-echo "Endpoint: ws://127.0.0.1:4500"
+echo "Endpoint: unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/codex-app-server.sock"
 echo "Status:   systemctl --user status codex-app-server"
 echo "Logs:     journalctl --user -u codex-app-server -f"
