@@ -541,25 +541,33 @@ Both need genuine design work to port (theme-driven color derivation and a
 visibility/opacity input both live at the wrong layer for the surface's
 entity-free pipeline), not a one-line fix.
 
-## P1: hydration's tool-pairing repair can poison a live ACP turn (2026-08-18, partially mitigated)
+## Tool-pair atomicity at insert time remains unbuilt
 
-The 2026-08-18 live failure (an assistant message with `tool_calls` and no
-matching `tool_result`, three retries then agent exit) was two adjacent-window
-repair heuristics disagreeing: synthesis looks only at `messages[i+1]` for
-coverage, the drop keeps only results whose `tool_use` is in the immediately
-preceding message, and a result landing further away falls outside both.
+Conversation snapshots repair pairing, and `Provider::stream` refuses an
+invalid message sequence before backend dispatch. Neither holds unrelated
+writers while a tool call is open. Durable blocks can still interleave,
+and hydration preserves the existing interruption policy: synthesize an
+error for a missing adjacent result and drop late results with warnings.
+A writer-side queue needs a separate design with drift and peer tool calls
+as concrete consumers. See `docs/conversation-session.md`, "Out of scope
+for Slice A". `AGENTS.md` already describes the absence of this queue.
 
-**Partial fix landed:** `report_unpaired_tool_uses` (`llm/hydrate.rs:808`)
-now detects and `tracing::error!`s any assistant message whose tool_uses have
-no paired result, naming the message index and the unpaired ids. **Still
-open:** it only logs — the message list is still sent as-is, so the provider
-can still reject the request; the fix called for (one pass establishing the
-invariant, plus a refusal before the request leaves) is not built. Related,
-unchanged: `CLAUDE.md`'s mailbox atomicity claim needs checking against
-whether this gate covers this path or the pairs are split after it.
+## Duplicate tool calls can execute before the next send refuses them
 
-**Remediation for a poisoned context today**: exclude the offending blocks,
-then fork.
+`process_llm_stream` collects `StreamEvent::ToolUse` events in a vector but
+indexes their durable block ids by tool-use id. Repeated ids overwrite that
+index and both calls still reach concurrent dispatch. The provider pairing
+check refuses the next request, after those tools have run. Validate the
+incoming call batch before execution; the send-time check cannot prevent
+those duplicate side effects. The hydration lane's live-loop refusal test
+uses two calls to an unknown tool to exercise this safely.
+
+## Stream-start retries still include permanent failures
+
+`process_llm_stream` now stops immediately on `LlmError::InvalidRequest`.
+Other errors still receive the same retry policy, including `AuthError`
+and `Unavailable`. Classify the remaining variants before retrying; cover transient
+recovery and permanent refusal independently.
 
 ## Flaky: `test_ordering_stress_100_bisections` put a Middle block first, once (2026-08-17)
 
@@ -1470,4 +1478,3 @@ broad facade/exec grants (`assets/defaults/rc/director/create/S10-binding.kai`)
 are worth revisiting once `kj` itself can reach what a shell used to be
 for. "We'll do a cap redesign sweep soon so it's a good time to
 experiment" — treat `Editor` as provisional until that sweep.
-

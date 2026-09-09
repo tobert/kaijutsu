@@ -24,7 +24,7 @@ use kaijutsu_kernel::llm::stream::{
     longest_cache_ttl_secs,
 };
 use kaijutsu_kernel::llm::SlotTunables;
-use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
+use kaijutsu_kernel::llm::{ContentBlock, LlmError, ToolDefinition};
 use kaijutsu_kernel::mcp::{McpError, PolicyError};
 use kaijutsu_kernel::{Kernel, LlmMessage, Provider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
@@ -1653,9 +1653,9 @@ async fn process_llm_stream(
             &default_tunables,
         );
 
-        // Start streaming with exponential backoff retry for transient failures.
-        // Retries cover network blips and rate limits before any content is emitted;
-        // mid-stream errors are not retried to avoid duplicate kernel blocks.
+        // Invalid requests cannot recover by retrying the same history.
+        // Other startup failures keep the bounded backoff; mid-stream errors
+        // are not retried to avoid duplicate kernel blocks.
         let mut stream = {
             let mut attempt = 0u32;
             loop {
@@ -1669,7 +1669,7 @@ async fn process_llm_stream(
                         }
                         break s;
                     }
-                    Err(e) if attempt <= MAX_LLM_RETRIES => {
+                    Err(e) if attempt <= MAX_LLM_RETRIES && !matches!(&e, LlmError::InvalidRequest(_)) => {
                         let delay_secs = attempt as u64;
                         log::warn!(
                             "LLM stream failed (attempt {}/{}): {}, retrying in {}s",
@@ -2734,6 +2734,53 @@ mod publish_tests {
         .await;
 
         (documents, ctx, player)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_live_tool_pairing_fails_once_without_retry() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("pairing-refusal").await);
+                let mut failed = kernel.turn_flows().subscribe("turn.failed");
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+                // A duplicate call id makes the live loop's appended history
+                // ambiguous. The second completion must never reach the mock.
+                let call = || StreamEvent::ToolUse {
+                    id: "duplicate_call".into(),
+                    name: "nonexistent_tool".into(),
+                    input: serde_json::json!({}),
+                };
+                let provider = Provider::Mock(MockClient::new("").with_scripted_stream(vec![
+                    vec![call(), call(), StreamEvent::Done {
+                        stop_reason: Some("tool_use".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        extra: None,
+                    }],
+                ]));
+                let (documents, ctx, _) = drive_turn_with(
+                    TurnOrigin::Interactive, kernel, provider, |_| {},
+                ).await;
+
+                match failed.try_recv().expect("invalid pairing must fail the turn").payload {
+                    TurnFlow::Failed { context_id, error, .. } => {
+                        assert_eq!(context_id, ctx);
+                        assert!(error.contains("duplicate_call"), "{error}");
+                    }
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                assert!(failed.try_recv().is_none(), "exactly one failure event");
+                assert!(completed.try_recv().is_none(), "failed turn cannot complete");
+                let blocks = documents.block_snapshots(ctx).unwrap();
+                let errors: Vec<_> = blocks.iter().filter(|b| {
+                    b.kind == BlockKind::Error && b.content.contains("Conversation tool pairing is invalid")
+                }).collect();
+                assert_eq!(errors.len(), 1, "refusal must leave one visible error");
+                assert!(errors[0].content.contains("Failed after 1 attempts"), "{}", errors[0].content);
+                assert!(errors[0].content.contains("duplicate_call"), "{}", errors[0].content);
+            })
+            .await;
     }
 
     /// An announced turn publishes `Completed` only after the stream ends, and

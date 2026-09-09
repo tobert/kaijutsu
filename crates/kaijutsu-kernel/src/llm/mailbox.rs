@@ -2,7 +2,7 @@
 //!
 //! Holds a [`HydrationState`] and feeds blocks into it either as a
 //! bootstrap batch (fork / new / cold start / attach) or one at a
-//! time (incremental, from a `BlockFlow::Inserted` subscriber).
+//! time (incremental, through a cursor over the durable block log).
 //!
 //! [`snapshot`] returns the wire-history view by cloning the internal
 //! state, running final flush + tool_use/result repair on the clone,

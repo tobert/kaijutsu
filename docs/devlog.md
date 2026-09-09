@@ -62,6 +62,17 @@ the append-only live session hydrated from it at boundary events. `stage
 exclude` and `block edit` land at the next hydrate — remediate a poisoned
 conversation by excluding in context, then forking.
 
+The August 18 tool-pairing failure exposed two contributing factors: a
+repair pass indexed a filtered sequence using positions from its input,
+and the provider boundary trusted the result. Fixing the index stopped the
+observed cascade, but logging an invariant violation still allowed a bad
+request to leave. The September hydration work closes each call batch in
+one repair pass and validates pairing before every provider dispatch,
+including live-loop appends. Invalid history now stops locally with an
+error and a terminal turn event. Late results retain the existing
+interruption policy; preventing their interleaving in the durable context
+is a separate writer-side design (`docs/conversation-session.md`).
+
 **No first-class "agent."** An actor is always a principal; agent-ness
 emerges from fork and drift, not from a noun in the schema. Later, a
 principal with a sheet became a **character** (September).
