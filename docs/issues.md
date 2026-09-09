@@ -1109,6 +1109,11 @@ history must not be quoted. Open:
 - **A reformulated command does not carry its pending ask forward.** A
   `retry-after-ask` ledger row is the minimum (a measurement, not a
   control). Unbuilt.
+- **The hook's own `kj ledger` exemption is a second statement of
+  `is_gate_exempt_kj`** (`assets/defaults/rc/lib/hooks/lfm2d.kai`,
+  exemption 2) and reads the second word, so a root flag ahead of the verb
+  defeats it; the evaluator already skips PreCall for an exempt program.
+  Delete the jq copy next time the hook is edited.
 - **A kaish lexer rejection degrades the gate to the no-plan fallback**
   (~16x noisier). `contrib/kai-parse-check.sh` guards our own corpus; the
   lexer bug is kaish's (`gotcha_kaish` in memory has the shape).
