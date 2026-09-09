@@ -37,15 +37,22 @@ and safe to cut. Amy's own client sessions are attached; when she has said
 cargo build -p kaijutsu-server
 systemctl --user stop kaijutsu-server.service
 cd ~/.local/share/kaijutsu/kernel
-for f in kernel.db kernel.db-wal kernel.db-shm auth.db; do
-  cp -p "$f" "backups/$f.$(date +%Y%m%d-%H%M%S)"
+stamp="$(date +%Y%m%d-%H%M%S)"
+for f in kernel.db kernel.db-wal kernel.db-shm; do
+  cp -p "$f" "backups/$f.$stamp"
+done
+for f in auth.db auth.db-wal auth.db-shm; do
+  cp -p "../$f" "backups/$f.$stamp"
 done
 systemctl --user start kaijutsu-server.service
 ```
 
 Copy while stopped. Stopping does **not** checkpoint the WAL, so the
-`-wal` file is part of the backup, not an optional extra. `auth.db` is in
-the set since the keyring melt rewrites it. `backups/` is gitignored.
+`-wal` file is part of the backup, not an optional extra. `auth.db` lives
+one directory up, in `~/.local/share/kaijutsu/`, with its own `-wal` and
+`-shm`; it is in the set since the keyring melt rewrites it. Chain the
+copies so a missing file stops the script before the start, and start the
+service by hand if it does. `backups/` is gitignored.
 Snapshot retention is decided: the db grows, because `doc_snapshots.state`
 is the conversation and a sweep there deletes sessions.
 
