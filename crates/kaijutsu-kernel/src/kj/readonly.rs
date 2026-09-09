@@ -126,9 +126,12 @@ pub(crate) fn is_gate_exempt_kj(cmd: &PlannedCommand) -> bool {
     if is_read_only_kj(cmd) {
         return true;
     }
-    let Some(args) = resolved_kj_args(cmd) else {
+    let Some(mut args) = resolved_kj_args(cmd) else {
         return false;
     };
+    // The root flags may sit ahead of the verb; classify strips them the
+    // same way before it parses.
+    super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
     let Some(verb) = args.first() else {
         return false;
     };
@@ -478,6 +481,16 @@ mod tests {
         assert!(is_gate_exempt_kj(&plan_one("kj ledger deny 01a0-abc")));
         assert!(is_gate_exempt_kj(&plan_one("kj ledger list --status abandoned")));
         assert!(is_gate_exempt_kj(&plan_one("kj block list")));
+    }
+
+    /// A root flag ahead of the verb is stripped before the verb is read,
+    /// the same way `classify` strips it, so `kj --json ledger allow` is
+    /// still the gate's answer path and never meets a hook.
+    #[test]
+    fn a_root_flag_before_the_verb_does_not_hide_a_ledger_answer() {
+        assert!(is_gate_exempt_kj(&plan_one("kj --json ledger allow 01a0-abc")));
+        assert!(is_gate_exempt_kj(&plan_one("kj --confirm ledger deny 01a0-abc")));
+        assert!(!is_gate_exempt_kj(&plan_one("kj --json context remove 01a0-abc")));
     }
 
     /// `kj ledger list` is read-only on its own merits, and `kj ledger
