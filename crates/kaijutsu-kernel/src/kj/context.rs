@@ -2159,6 +2159,49 @@ where
     )
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for ContextArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for ContextConfigArgs {
+    fn effect(&self) -> Effect {
+        // Only ever flattened into `create`/`set`, both of which write.
+        Effect::Write
+    }
+}
+
+impl Classify for ContextCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::List { .. }
+            | Self::Info { .. }
+            | Self::Prompt { .. }
+            | Self::Current
+            | Self::Log { .. } => Effect::Read,
+            Self::Switch { .. }
+            | Self::Create { .. }
+            | Self::Scratch
+            | Self::Rebind { .. }
+            | Self::Set { .. }
+            | Self::Unset { .. }
+            | Self::Move { .. }
+            | Self::Rename { .. }
+            | Self::Conclude { .. }
+            | Self::Promote { .. }
+            | Self::Demote { .. }
+            | Self::Pause { .. }
+            | Self::Resume { .. }
+            | Self::Hydrate { .. } => Effect::Write,
+            Self::Archive { .. } | Self::Remove { .. } | Self::Retag { .. } => Effect::Destroy,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::kernel_db::ContextEdgeRow;

@@ -8,6 +8,7 @@
 
 use clap::{Parser, Subcommand};
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 use crate::editor::{EditorSessionId, EditorState};
 use crate::mcp::Capability;
@@ -233,6 +234,28 @@ fn mode_label_of(mode: Option<&str>) -> &str {
     mode.map(str::trim)
         .map(|s| s.trim_matches('-').trim())
         .unwrap_or("NORMAL")
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for EditorArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for EditorCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            EditorCommand::State { .. } | EditorCommand::List => Effect::Read,
+            // `open` allocates a new kernel-owned session (and signals it to
+            // attached app windows) even though nothing here writes a file —
+            // a side effect on kernel state, not a pure read.
+            EditorCommand::Open { .. }
+            | EditorCommand::Keys { .. }
+            | EditorCommand::Save { .. }
+            | EditorCommand::Quit { .. } => Effect::Write,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 
 use clap::{Parser, Subcommand};
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 use crate::mcp::{Capability, InstanceId};
 
@@ -172,6 +173,22 @@ impl KjDispatcher {
                 serde_json::json!({"path": path}),
             ),
             Err(e) => KjResult::Err(format!("kj swap discard: {e}")),
+        }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for SwapArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for SwapCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            SwapCommand::List => Effect::Read,
+            SwapCommand::Ack { .. } | SwapCommand::Discard { .. } => Effect::Write,
         }
     }
 }

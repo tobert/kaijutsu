@@ -12,6 +12,7 @@
 use clap::Parser;
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::refs::{parse_context_ref, resolve_context_ref};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -91,6 +92,15 @@ impl KjDispatcher {
                 .unwrap_or_else(|| target_id.short())
         };
         KjResult::Switch(target_id, format!("attached to {label}"))
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for AttachArgs {
+    fn effect(&self) -> Effect {
+        // No subcommand: attaches the session to the target context and
+        // fires its rc `attach` lifecycle — a context-state write.
+        Effect::Write
     }
 }
 

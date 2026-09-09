@@ -13,6 +13,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -160,6 +161,21 @@ impl KjDispatcher {
             )
         };
         KjResult::ok_with_data(msg, record)
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for DbArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for DbCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            DbCommand::Backup { .. } | DbCommand::Checkpoint => Effect::Write,
+        }
     }
 }
 

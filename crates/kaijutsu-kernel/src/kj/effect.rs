@@ -129,6 +129,78 @@ pub(crate) enum KjCommand {
     Diff(super::diff::DiffArgs),
 }
 
+impl Classify for KjCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            KjCommand::Context(a) => a.effect(),
+            KjCommand::Workspace(a) => a.effect(),
+            KjCommand::Preset(a) => a.effect(),
+            KjCommand::Backend(a) => a.effect(),
+            KjCommand::Cast(a) => a.effect(),
+            KjCommand::Character(a) => a.effect(),
+            KjCommand::Handoff(a) => a.effect(),
+            KjCommand::Alias(a) => a.effect(),
+            KjCommand::Cas(a) => a.effect(),
+            KjCommand::Cc(a) => a.effect(),
+            KjCommand::Ledger(a) => a.effect(),
+            KjCommand::Db(a) => a.effect(),
+            KjCommand::Audio(a) => a.effect(),
+            KjCommand::Midi(a) => a.effect(),
+            KjCommand::Roster(a) => a.effect(),
+            KjCommand::Cp(a) => a.effect(),
+            KjCommand::Play(a) => a.effect(),
+            KjCommand::Rc(a) => a.effect(),
+            KjCommand::Editor(a) => a.effect(),
+            KjCommand::Swap(a) => a.effect(),
+            KjCommand::System(a) => a.effect(),
+            KjCommand::Config(a) => a.effect(),
+            KjCommand::Block(a) => a.effect(),
+            KjCommand::Binding(a) => a.effect(),
+            KjCommand::Policy(a) => a.effect(),
+            KjCommand::Mcp(a) => a.effect(),
+            KjCommand::Hook(a) => a.effect(),
+            KjCommand::Search(a) => a.effect(),
+            KjCommand::Doc(a) => a.effect(),
+            KjCommand::Attach(a) => a.effect(),
+            KjCommand::Transport(a) => a.effect(),
+            KjCommand::Models(a) => a.effect(),
+            KjCommand::Model(a) => a.effect(),
+            KjCommand::Kaish(a) => a.effect(),
+            KjCommand::Fork(a) => a.effect(),
+            KjCommand::Drive(a) => a.effect(),
+            KjCommand::Wait(a) => a.effect(),
+            KjCommand::Stage(a) => a.effect(),
+            KjCommand::Drift(a) => a.effect(),
+            KjCommand::Cache(a) => a.effect(),
+            KjCommand::Vfs(a) => a.effect(),
+            KjCommand::Diff(a) => a.effect(),
+        }
+    }
+}
+
+/// Why an argv could not be classified. A parse failure is the only way:
+/// the argv names no live leaf, or an argument does not fit its slot
+/// (a `${VAR}` in a numeric flag at plan time, say). The caller decides
+/// what that means; the shell gate treats it as "not read-only".
+#[derive(Debug, thiserror::Error)]
+pub enum ClassifyError {
+    #[error("kj argv does not classify: {0}")]
+    Parse(#[from] clap::Error),
+}
+
+/// The effect of running `kj <argv>`, from the verb's own declaration.
+///
+/// `argv` is the kj argv without the leading `kj`, with or without the root
+/// `--confirm`/`--json` flags (both are stripped before the parse, the way
+/// the builtin strips them before dispatch). Runs no handler and touches no
+/// kernel state.
+pub fn classify(argv: &[String]) -> Result<Effect, ClassifyError> {
+    let mut argv = argv.to_vec();
+    super::parse::strip_flag(&mut argv, &["--confirm", "--json"]);
+    let parsed = KjArgs::try_parse_from(&argv)?;
+    Ok(parsed.command.effect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +226,61 @@ mod tests {
         let mut out = BTreeSet::new();
         walk(cmd, &[], &mut out);
         out
+    }
+
+    /// Split a clause the way a shell would for the quoting the corpus
+    /// uses (single quotes only), dropping the leading `kj`.
+    fn argv(clause: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        let mut pending = false;
+        for c in clause.chars() {
+            match c {
+                '\'' => { quoted = !quoted; pending = true; }
+                ' ' if !quoted => { if pending { out.push(std::mem::take(&mut cur)); pending = false; } }
+                _ => { cur.push(c); pending = true; }
+            }
+        }
+        if pending { out.push(cur); }
+        out.into_iter().skip(1).collect()
+    }
+
+    /// Every live leaf classifies through the clause the corpus synthesizes
+    /// for it. The exhaustive matches make a missing arm a compile error;
+    /// this test is the runtime half — a placeholder that does not fit its
+    /// slot, or a leaf the root enum somehow cannot reach, fails here by
+    /// name.
+    #[test]
+    fn every_live_leaf_classifies() {
+        let corpus = super::super::corpus::corpus().expect("corpus builds");
+        let failed: Vec<String> = corpus
+            .verbs
+            .iter()
+            .filter_map(|v| classify(&argv(&v.clause)).err().map(|e| format!("{}: {e}", v.clause)))
+            .collect();
+        assert!(failed.is_empty(), "{} leaf(ves) do not classify:\n{}", failed.len(), failed.join("\n"));
+        assert!(corpus.verbs.len() > 100);
+    }
+
+    #[test]
+    fn root_flags_are_stripped_before_the_parse() {
+        let with = classify(&argv("kj preset list --json")).unwrap();
+        let trailing = classify(&argv("kj preset rm x --confirm")).unwrap();
+        assert_eq!(with, Effect::Read);
+        assert_eq!(trailing, Effect::Destroy);
+    }
+
+    #[test]
+    fn an_unknown_verb_does_not_classify() {
+        assert!(classify(&argv("kj frobnicate now")).is_err());
+        assert!(classify(&argv("kj ${VERB} list")).is_err());
+    }
+
+    #[test]
+    fn an_argument_can_change_the_effect() {
+        assert_eq!(classify(&argv("kj block cat 019a2f3c")).unwrap(), Effect::Read);
+        assert_eq!(classify(&argv("kj block cat 019a2f3c --out /tmp/x")).unwrap(), Effect::Write);
     }
 
     #[test]

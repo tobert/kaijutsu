@@ -315,6 +315,25 @@ impl KjDispatcher {
     }
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for PresetArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for PresetCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::List | Self::Show { .. } => Effect::Read,
+            Self::Save { .. } | Self::Reseed => Effect::Write,
+            Self::Remove { .. } => Effect::Destroy,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::*;

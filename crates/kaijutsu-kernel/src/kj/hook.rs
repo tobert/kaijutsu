@@ -62,6 +62,7 @@ use crate::mcp::{
 };
 use kaijutsu_types::{ContextId, PrincipalId};
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -623,6 +624,25 @@ fn entry_json(phase: McpHookPhase, entry: &HookEntry, full: bool) -> serde_json:
         "kaish_script_id": entry.kaish_script_id,
         "action": action_json,
     })
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for HookArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for HookCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            HookCommand::List { .. } | HookCommand::Show { .. } => Effect::Read,
+            // `remove` mutates the broker's hook tables but does not test
+            // `caller.confirmed` — idempotent, no latch — so it classifies
+            // Write despite the TOML's "data-critical" severity rung.
+            HookCommand::Remove { .. } | HookCommand::Add { .. } => Effect::Write,
+        }
+    }
 }
 
 #[cfg(test)]

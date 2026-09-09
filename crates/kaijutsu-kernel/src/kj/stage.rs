@@ -13,6 +13,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, ContextState};
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -238,6 +239,24 @@ impl KjDispatcher {
             n => KjResult::Err(format!(
                 "kj stage: '{block_key}' matches {n} blocks — be more specific"
             )),
+        }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for StageArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for StageCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            StageCommand::Status => Effect::Read,
+            StageCommand::Commit | StageCommand::Include { .. } | StageCommand::Exclude { .. } => {
+                Effect::Write
+            }
         }
     }
 }

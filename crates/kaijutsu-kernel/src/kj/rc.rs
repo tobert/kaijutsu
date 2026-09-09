@@ -21,6 +21,7 @@ use kaijutsu_types::paths;
 use regex::Regex;
 use std::sync::OnceLock;
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -652,6 +653,22 @@ pub async fn check_context_type(vfs: &crate::vfs::MountTable, context_type: &str
         paths::RC_ROOT,
         known.join(", "),
     ))
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for RcArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for RcCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            RcCommand::List { .. } | RcCommand::Show { .. } => Effect::Read,
+            RcCommand::Add { .. } | RcCommand::Rm { .. } => Effect::Write,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -460,6 +460,33 @@ impl KjDispatcher {
     }
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for CastArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for CastCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::List | Self::Show { .. } => Effect::Read,
+            Self::Create { .. } | Self::Remove { .. } | Self::Set { .. } => Effect::Write,
+            Self::Slot(cmd) => cmd.effect(),
+        }
+    }
+}
+
+impl Classify for CastSlotCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::Set { .. } | Self::Remove { .. } => Effect::Write,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{test_caller, test_dispatcher};

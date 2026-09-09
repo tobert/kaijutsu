@@ -15,6 +15,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::roster::{Availability, RosterEntity};
 
@@ -295,6 +296,22 @@ fn row_to_json(row: &crate::roster::RosterRow) -> serde_json::Value {
         "status_observed_at": row.status_observed_at,
         "status_recorded_at": row.status_recorded_at,
     })
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for RosterArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for RosterCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            RosterCommand::Status { .. } => Effect::Write,
+            RosterCommand::List { .. } => Effect::Read,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -277,6 +277,25 @@ fn character_to_json(row: &CharacterRow) -> serde_json::Value {
     })
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for CharacterArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for CharacterCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::List { .. } | Self::Show { .. } => Effect::Read,
+            Self::Create { .. } => Effect::Write,
+            Self::Retire { .. } => Effect::Destroy,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{caller_with_context, register_context, test_caller};

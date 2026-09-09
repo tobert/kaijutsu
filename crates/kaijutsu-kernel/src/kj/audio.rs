@@ -19,6 +19,7 @@ use beat_this::{BeatThis, RtenRuntime};
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -256,6 +257,26 @@ impl KjDispatcher {
         });
 
         KjResult::ok_with_data(message, data)
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for AudioArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for AudioCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            AudioCommand::Devices { .. }
+            | AudioCommand::KeepStatus { .. }
+            | AudioCommand::Beats { .. } => Effect::Read,
+            AudioCommand::Keep { .. }
+            | AudioCommand::KeepRetry { .. }
+            | AudioCommand::KeepCancel { .. } => Effect::Write,
+        }
     }
 }
 

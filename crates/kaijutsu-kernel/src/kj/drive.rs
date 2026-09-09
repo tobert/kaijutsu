@@ -17,6 +17,7 @@
 use clap::Parser;
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult};
 
@@ -196,6 +197,14 @@ impl KjDispatcher {
                 "delivered": delivered,
             })),
         }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for DriveArgs {
+    fn effect(&self) -> Effect {
+        // May write a seed block and always publishes a turn request.
+        Effect::Write
     }
 }
 

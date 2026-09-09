@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 use kaijutsu_types::paths::{CLIENT_DEFAULT_DIR, CLIENT_ROOT, CONFIG_ROOT};
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 
 #[derive(Parser, Debug)]
@@ -314,6 +315,22 @@ impl KjDispatcher {
         KjResult::ok(format!(
             "reset config '{canonical}' to its embedded default"
         ))
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for ConfigArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for ConfigCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            ConfigCommand::List | ConfigCommand::Show { .. } => Effect::Read,
+            ConfigCommand::Reset { .. } => Effect::Write,
+        }
     }
 }
 

@@ -15,6 +15,7 @@ use clap::Parser;
 use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, Role};
 use regex::Regex;
 
+use super::effect::{Classify, Effect};
 use super::refs::resolve_context_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
 
@@ -235,6 +236,15 @@ fn short_block(key: &str) -> String {
     BlockId::from_key(key)
         .map(|b| format!("{}#{}", b.principal_id.short(), b.seq))
         .unwrap_or_else(|| key.to_string())
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for SearchArgs {
+    fn effect(&self) -> Effect {
+        // No subcommand: a regex scan over block content already in the
+        // kernel — no write anywhere (READ_ONLY_NO_SUBCOMMAND).
+        Effect::Read
+    }
 }
 
 #[cfg(test)]

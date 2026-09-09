@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 use crate::mcp::InstanceId;
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -147,6 +148,22 @@ impl KjDispatcher {
         {
             Ok(()) => KjResult::ok(format!("updated policy for {}", instance.as_str())),
             Err(e) => KjResult::Err(format!("kj policy set: {e}")),
+        }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for PolicyArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for PolicyCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            PolicyCommand::Show { .. } => Effect::Read,
+            PolicyCommand::Set { .. } => Effect::Write,
         }
     }
 }

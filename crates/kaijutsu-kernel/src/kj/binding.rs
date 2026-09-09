@@ -40,6 +40,7 @@ use kaijutsu_types::{ContentType, ContextId};
 
 use crate::mcp::{Capability, InstanceId};
 
+use super::effect::{Classify, Effect};
 use super::refs::resolve_context_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
 
@@ -404,6 +405,24 @@ pub(crate) fn cap_label(cap: &Capability) -> String {
             .authority_name()
             .expect("authority variant has a token")
             .to_string(),
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for BindingArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for BindingCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            BindingCommand::Show { .. } => Effect::Read,
+            BindingCommand::Allow { .. }
+            | BindingCommand::Revoke { .. }
+            | BindingCommand::Reset { .. } => Effect::Write,
+        }
     }
 }
 

@@ -13,6 +13,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{KjDispatcher, KjResult, clap_help_for};
 
 #[derive(Parser, Debug)]
@@ -118,6 +119,22 @@ impl KjDispatcher {
         };
         let text = kaish_help::compose(&selector, &NoBuiltins);
         KjResult::ok_typed(text, ContentType::Markdown)
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for KaishArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for KaishCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            // Composes onboarding text from kaish-help; no write anywhere.
+            KaishCommand::Primer => Effect::Read,
+        }
     }
 }
 

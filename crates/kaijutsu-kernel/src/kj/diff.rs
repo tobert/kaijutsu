@@ -46,6 +46,7 @@ use clap::Parser;
 use kaijutsu_diff::{DiffOptions, FileSpec};
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::block_store::BlockStoreError;
 use crate::vfs::VfsOps;
@@ -289,6 +290,15 @@ impl KjDispatcher {
                 None
             }
         }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for DiffArgs {
+    fn effect(&self) -> Effect {
+        // Reads disk and/or kernel-held document versions; never writes
+        // either side (see the module doc).
+        Effect::Read
     }
 }
 

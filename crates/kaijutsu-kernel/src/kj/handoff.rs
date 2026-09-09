@@ -361,6 +361,24 @@ impl KjDispatcher {
     }
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for HandoffArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for HandoffCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::Tail { .. } => Effect::Read,
+            Self::Note { .. } => Effect::Write,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::test_dispatcher;

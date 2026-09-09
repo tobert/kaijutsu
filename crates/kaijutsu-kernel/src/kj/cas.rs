@@ -283,6 +283,26 @@ pub fn mime_from_extension(path: &str) -> &'static str {
     }
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for CasArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for CasCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::Ls | Self::Info { .. } => Effect::Read,
+            Self::Get { out: None, .. } => Effect::Read,
+            Self::Get { out: Some(_), .. } => Effect::Write,
+            Self::Put { .. } | Self::Rm { .. } => Effect::Write,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::{test_caller, test_dispatcher};

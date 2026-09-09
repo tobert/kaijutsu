@@ -40,6 +40,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -328,6 +329,22 @@ impl KjDispatcher {
             ContentType::Plain,
             serde_json::Value::Array(rows),
         )
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for SystemArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for SystemCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            SystemCommand::Status | SystemCommand::Ps => Effect::Read,
+            SystemCommand::Quiesce { .. } | SystemCommand::Resume => Effect::Write,
+        }
     }
 }
 

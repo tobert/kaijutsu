@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use kaijutsu_types::DriftKind;
 use kaijutsu_types::{ContentType, ContextId, EdgeKind};
 
+use super::effect::{Classify, Effect};
 use super::format::format_drift_queue;
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
@@ -1220,6 +1221,37 @@ impl KjDispatcher {
             KjResult::ok(format!("cancelled drift #{}", id))
         } else {
             KjResult::Err(format!("kj drift cancel: drift #{} not found in queue", id))
+        }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for DriftArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for DriftCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            DriftCommand::Queue | DriftCommand::History { .. } => Effect::Read,
+            DriftCommand::Push { .. }
+            | DriftCommand::Pull { .. }
+            | DriftCommand::Merge { .. }
+            | DriftCommand::Flush
+            | DriftCommand::Cancel { .. } => Effect::Write,
+            DriftCommand::Edge { op } => op.effect(),
+        }
+    }
+}
+
+impl Classify for EdgeCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            // A hard delete of provenance metadata, not confirm-gated —
+            // Write, not Destroy.
+            EdgeCommand::Rm { .. } => Effect::Write,
         }
     }
 }

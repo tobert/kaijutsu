@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::vfs::{FileType, VfsOps, VfsSink, pump_stream};
 
@@ -127,6 +128,13 @@ impl KjDispatcher {
             }
             _ => Ok(dst.to_path_buf()),
         }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for CpArgs {
+    fn effect(&self) -> Effect {
+        Effect::Write
     }
 }
 

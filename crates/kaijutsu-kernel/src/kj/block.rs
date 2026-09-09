@@ -18,6 +18,7 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status, KIND_NAMES, ROLE_NAME
 use serde::Serialize;
 
 use crate::block_tools::translate::{line_range_to_char_range, line_to_char_offset};
+use super::effect::{Classify, Effect};
 use super::refs::resolve_context_arg;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -1855,6 +1856,48 @@ fn first_line_trunc(s: &str, max: usize) -> String {
     } else {
         let trunc: String = one_line.chars().take(max).collect();
         format!("{trunc}…")
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for BlockArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for BlockCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            BlockCommand::List { .. }
+            | BlockCommand::Inspect { .. }
+            | BlockCommand::Count { .. }
+            | BlockCommand::Read { .. }
+            | BlockCommand::Render { .. }
+            | BlockCommand::History { .. }
+            | BlockCommand::Diff { .. } => Effect::Read,
+            // `--out <path>` writes the payload to the host filesystem;
+            // with no `--out` this is a pure read of already-stored content.
+            BlockCommand::Cat { out: None, .. } => Effect::Read,
+            BlockCommand::Cat { out: Some(_), .. } => Effect::Write,
+            BlockCommand::Original { out: None, .. } => Effect::Read,
+            BlockCommand::Original { out: Some(_), .. } => Effect::Write,
+            BlockCommand::Reproject { .. }
+            | BlockCommand::Append { .. }
+            | BlockCommand::Status { .. }
+            | BlockCommand::Create { .. } => Effect::Write,
+            BlockCommand::Edit { op, .. } => op.effect(),
+        }
+    }
+}
+
+impl Classify for EditOp {
+    fn effect(&self) -> Effect {
+        match self {
+            EditOp::Insert { .. } | EditOp::Delete { .. } | EditOp::Replace { .. } => {
+                Effect::Write
+            }
+        }
     }
 }
 

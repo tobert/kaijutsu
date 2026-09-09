@@ -18,6 +18,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, TrackId};
 
+use super::effect::{Classify, Effect};
 use super::format::{format_track_table, TrackListRow, TrackListState};
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult};
@@ -828,6 +829,35 @@ impl KjDispatcher {
         }
 
         Ok((track, attachment, policy))
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for TransportArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for TransportCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            // `list` is the roster read (`readonly.rs`'s own doc excludes it
+            // from the module's table only because `kj transport` was kept
+            // out wholesale, not because it mutates — `docs/kj-verb-class.md`
+            // makes it Read on its own merits).
+            TransportCommand::List => Effect::Read,
+            TransportCommand::Attach { .. }
+            | TransportCommand::Detach { .. }
+            | TransportCommand::Play { .. }
+            | TransportCommand::Pause { .. }
+            | TransportCommand::Stop { .. }
+            | TransportCommand::Tempo { .. }
+            | TransportCommand::Ooda { .. }
+            | TransportCommand::Clock { .. }
+            | TransportCommand::Rotate { .. }
+            | TransportCommand::Delete { .. } => Effect::Write,
+        }
     }
 }
 

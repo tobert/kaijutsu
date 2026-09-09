@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 use crate::mcp::{Capability, Health, external_instance_id};
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 
 #[derive(Parser, Debug)]
@@ -333,6 +334,22 @@ fn health_json(h: &Health) -> serde_json::Value {
         Health::Ready => serde_json::json!({"state": "ready"}),
         Health::Degraded { reason } => serde_json::json!({"state": "degraded", "reason": reason}),
         Health::Down { reason } => serde_json::json!({"state": "down", "reason": reason}),
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for McpArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for McpCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            McpCommand::List { .. } => Effect::Read,
+            McpCommand::Reload {} | McpCommand::Restart { .. } => Effect::Write,
+        }
     }
 }
 

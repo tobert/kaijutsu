@@ -29,6 +29,7 @@ use kaijutsu_cas::{ContentHash, ContentStore};
 use kaijutsu_types::{ContentType, TrackId};
 
 use super::refs;
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 use crate::flows::BlockFlow;
 use crate::hyoushigi::schedule_clip_cell;
@@ -362,6 +363,13 @@ impl KjDispatcher {
                 "mime": mime,
             })),
         }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for PlayArgs {
+    fn effect(&self) -> Effect {
+        Effect::Write
     }
 }
 

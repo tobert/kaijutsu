@@ -19,6 +19,7 @@
 use clap::Parser;
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
@@ -294,6 +295,21 @@ impl KjDispatcher {
                 "context_window": context_window,
             }),
         )
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for ModelsArgs {
+    fn effect(&self) -> Effect {
+        // Pure LLM-registry discovery, no capability gate — see the module doc.
+        Effect::Read
+    }
+}
+
+impl Classify for ModelArgs {
+    fn effect(&self) -> Effect {
+        // Reports the effective model for a context; never writes.
+        Effect::Read
     }
 }
 

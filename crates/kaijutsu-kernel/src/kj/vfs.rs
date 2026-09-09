@@ -8,6 +8,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 use crate::vfs::{FileType, SnapshotNode};
 
@@ -146,6 +147,22 @@ impl KjDispatcher {
             "entries": data_entries,
         });
         KjResult::ok_with_data(text, data)
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for VfsArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for VfsCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            // Pure read discovery, no capability gate — see the module doc.
+            VfsCommand::Snapshot { .. } | VfsCommand::Activity { .. } => Effect::Read,
+        }
     }
 }
 

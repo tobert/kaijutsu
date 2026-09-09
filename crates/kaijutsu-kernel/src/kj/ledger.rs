@@ -41,6 +41,7 @@ use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, PrincipalId};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, refs, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -1425,6 +1426,41 @@ fn learn_every_statement(
     let learned = statements.len();
     tx.commit()?;
     Ok(learned)
+}
+
+// Verb class: docs/kj-verb-class.md
+//
+// `kj ledger` stays out of readonly.rs's tables entirely — the whole verb is
+// exempt there as the gate's own answer path (`is_gate_exempt_kj`), a
+// different rule from read-only. Classified here on each leaf's own merits:
+// `list`/`show`/`rules`/`runs` read the ledger, nothing else does.
+impl Classify for LedgerArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for LedgerCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            LedgerCommand::List { .. }
+            | LedgerCommand::Show { .. }
+            | LedgerCommand::Rules { .. }
+            | LedgerCommand::Runs { .. } => Effect::Read,
+            LedgerCommand::Allow { .. } | LedgerCommand::Deny { .. } | LedgerCommand::Forget { .. } => {
+                Effect::Write
+            }
+            LedgerCommand::Signal { command } => command.effect(),
+        }
+    }
+}
+
+impl Classify for SignalCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            SignalCommand::Add { .. } => Effect::Write,
+        }
+    }
 }
 
 #[cfg(test)]

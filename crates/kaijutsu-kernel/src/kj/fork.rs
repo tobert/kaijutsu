@@ -24,6 +24,7 @@ use kaijutsu_types::{
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 use crate::llm::splice::{SpliceItem, plan_splice};
 
+use super::effect::{Classify, Effect};
 use super::parse::resolve_model_choice;
 use super::{KjCaller, KjDispatcher, KjResult};
 
@@ -1649,6 +1650,15 @@ fn inherit_parent_context_type(
             parent_type,
             child_id.short()
         );
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for ForkArgs {
+    fn effect(&self) -> Effect {
+        // Every fork variant (full/compact/subtree) creates a new context,
+        // copies or distills its document, and writes the kernel DB.
+        Effect::Write
     }
 }
 

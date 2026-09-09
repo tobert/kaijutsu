@@ -79,6 +79,7 @@ use kaijutsu_types::paths::{MIDI_ROOT, midi_device_path};
 
 use crate::midi_exchange::DEFAULT_EXCHANGE_TIMEOUT_MS;
 
+use super::effect::{Classify, Effect};
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 use crate::flows::BlockFlow;
@@ -962,6 +963,34 @@ impl KjDispatcher {
             content.len(),
         );
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for MidiArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for MidiCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            MidiCommand::List | MidiCommand::Show { .. } => Effect::Read,
+            MidiCommand::Send { message, .. } => message.effect(),
+            MidiCommand::Identify { .. } | MidiCommand::Panic { .. } => Effect::Write,
+        }
+    }
+}
+
+impl Classify for SendMessage {
+    fn effect(&self) -> Effect {
+        match self {
+            SendMessage::Note { .. }
+            | SendMessage::Cc { .. }
+            | SendMessage::Pc { .. }
+            | SendMessage::Sysex { .. } => Effect::Write,
+        }
     }
 }
 

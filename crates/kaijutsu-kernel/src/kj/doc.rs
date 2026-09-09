@@ -20,6 +20,7 @@ use kaijutsu_types::{BlockId, BlockKind as BlockKind, ConversationDAG};
 use kaijutsu_types::{ContentType, ContextId, DocKind};
 use serde::Serialize;
 
+use super::effect::{Classify, Effect};
 use super::{KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -547,6 +548,25 @@ fn format_dag_node(
             expand_tools,
             out,
         );
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for DocArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for DocCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            DocCommand::List { .. } | DocCommand::Tree { .. } => Effect::Read,
+            DocCommand::Create { .. } => Effect::Write,
+            // Confirm-gated: doc_delete tests `caller.confirmed` and latches
+            // otherwise, CASCADEs the contexts row/oplog/snapshots, irreversible.
+            DocCommand::Delete { .. } => Effect::Destroy,
+        }
     }
 }
 

@@ -170,6 +170,24 @@ impl KjDispatcher {
     }
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for AliasArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for AliasCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::List => Effect::Read,
+            Self::Set { .. } | Self::Remove { .. } => Effect::Write,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{test_caller, test_dispatcher};

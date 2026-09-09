@@ -660,6 +660,43 @@ impl KjDispatcher {
     }
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for BackendArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for BackendCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::List | Self::Show { .. } => Effect::Read,
+            Self::Set { .. } | Self::Remove { .. } | Self::Reseed => Effect::Write,
+            Self::Model(cmd) => cmd.effect(),
+            Self::Default(cmd) => cmd.effect(),
+        }
+    }
+}
+
+impl Classify for BackendModelCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::Set { .. } | Self::Remove { .. } => Effect::Write,
+        }
+    }
+}
+
+impl Classify for BackendDefaultCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::Show => Effect::Read,
+            Self::Set { .. } => Effect::Write,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{test_caller, test_dispatcher};

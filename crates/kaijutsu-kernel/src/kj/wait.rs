@@ -29,6 +29,7 @@
 use clap::{Parser, ValueEnum};
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContentType, Role};
 
+use super::effect::{Classify, Effect};
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult};
 
@@ -394,6 +395,14 @@ impl KjDispatcher {
                 "elapsed_ms": elapsed_ms,
             })),
         }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for WaitArgs {
+    fn effect(&self) -> Effect {
+        // Parks on the flow bus and re-reads the durable log; writes nothing.
+        Effect::Read
     }
 }
 

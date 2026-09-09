@@ -23,6 +23,7 @@ use kaijutsu_types::ContentType;
 
 use crate::llm::stream::{CacheTarget, CacheTtl};
 
+use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -186,6 +187,22 @@ impl KjDispatcher {
         match db.clear_cache_breakpoints(context_id) {
             Ok(count) => KjResult::ok(format!("cleared {count} cache breakpoint(s)")),
             Err(e) => KjResult::Err(format!("kj cache clear: {e}")),
+        }
+    }
+}
+
+// Verb class: docs/kj-verb-class.md
+impl Classify for CacheArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for CacheCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            CacheCommand::List => Effect::Read,
+            CacheCommand::Add { .. } | CacheCommand::Clear => Effect::Write,
         }
     }
 }

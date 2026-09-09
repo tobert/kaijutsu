@@ -373,6 +373,29 @@ fn cc_send_inner(
     }
 }
 
+// Verb class: docs/kj-verb-class.md
+use super::effect::{Classify, Effect};
+
+impl Classify for CcArgs {
+    fn effect(&self) -> Effect {
+        self.command.effect()
+    }
+}
+
+impl Classify for CcCommand {
+    fn effect(&self) -> Effect {
+        match self {
+            Self::List => Effect::Read,
+            // `--dry-run` builds the frame shape and touches no filesystem
+            // or socket at all (module doc, "never opens a key file"); a
+            // real send at minimum leaves a durable ledger ask row, and on
+            // redemption delivers into the target session's inbox.
+            Self::Send { dry_run: true, .. } => Effect::Read,
+            Self::Send { dry_run: false, .. } => Effect::Write,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

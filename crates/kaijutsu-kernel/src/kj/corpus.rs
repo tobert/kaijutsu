@@ -130,9 +130,16 @@ struct ReflectedLeaf {
     path: String,
     aliases: Vec<String>,
     about: String,
-    /// Ids of every required positional, in declaration order — the input
-    /// to clause synthesis.
-    required_positionals: Vec<String>,
+    /// Every required argument, positionals first in declaration order,
+    /// then named options — the input to clause synthesis.
+    required: Vec<RequiredArg>,
+}
+
+/// One required argument and the sample value synthesis fills it with.
+struct RequiredArg {
+    /// `Some("--kind")` for a named option, `None` for a positional.
+    flag: Option<String>,
+    placeholder: String,
 }
 
 /// Walk every subcommand of `kj_command()` and collect its leaves — a
@@ -169,16 +176,22 @@ fn leaf_from(cmd: &clap::Command, path: String) -> ReflectedLeaf {
         .get_about()
         .map(|s| trim_about(&s.to_string()))
         .unwrap_or_default();
-    let required_positionals = cmd
+    let mut required: Vec<RequiredArg> = cmd
         .get_positionals()
         .filter(|a| a.is_required_set())
-        .map(|a| a.get_id().as_str().to_string())
+        .map(|a| RequiredArg { flag: None, placeholder: placeholder_for(a) })
         .collect();
+    required.extend(
+        cmd.get_opts()
+            .filter(|a| a.is_required_set())
+            .filter_map(|a| a.get_long().map(|l| (l, a)))
+            .map(|(long, a)| RequiredArg { flag: Some(format!("--{long}")), placeholder: placeholder_for(a) }),
+    );
     ReflectedLeaf {
         path,
         aliases,
         about,
-        required_positionals,
+        required,
     }
 }
 
@@ -199,11 +212,32 @@ fn trim_about(about: &str) -> String {
     }
 }
 
-/// One placeholder value per required positional, by arg id. Order follows
-/// declaration order; an id with no recognized shape falls back to the id
-/// itself, so a synthesized clause never invents data.
-fn placeholder_for(arg_id: &str) -> String {
-    let id = arg_id.to_ascii_lowercase();
+/// One sample value per required argument. A typed slot gets a value its
+/// parser accepts (a number, a UUID); a text slot gets one by arg id. An id
+/// with no recognized shape falls back to the id itself, so a synthesized
+/// clause never invents data.
+fn placeholder_for(arg: &clap::Arg) -> String {
+    use std::any::TypeId;
+    if let Some(first) = arg.get_value_parser().possible_values().and_then(|mut v| v.next()) {
+        return first.get_name().to_string();
+    }
+    let ty = arg.get_value_parser().type_id();
+    let numeric = [
+        TypeId::of::<u8>(),
+        TypeId::of::<u16>(),
+        TypeId::of::<u32>(),
+        TypeId::of::<u64>(),
+        TypeId::of::<usize>(),
+        TypeId::of::<i32>(),
+        TypeId::of::<i64>(),
+    ];
+    if numeric.iter().any(|t| ty == *t) {
+        return "1".to_string();
+    }
+    if ty == TypeId::of::<uuid::Uuid>() {
+        return "019a2f3c-0000-7000-8000-000000000000".to_string();
+    }
+    let id = arg.get_id().as_str().to_ascii_lowercase();
     if id.contains("context") || id.contains("id") || id.contains("block") {
         "019a2f3c".to_string()
     } else if id.contains("path") || id.contains("file") {
@@ -211,15 +245,19 @@ fn placeholder_for(arg_id: &str) -> String {
     } else if id.contains("hash") {
         "sha256-abc123def".to_string()
     } else {
-        arg_id.to_string()
+        arg.get_id().as_str().to_string()
     }
 }
 
 fn synthesize_clause(leaf: &ReflectedLeaf, confirm_gated: bool) -> String {
     let mut clause = format!("kj {}", leaf.path);
-    for arg_id in &leaf.required_positionals {
+    for arg in &leaf.required {
+        if let Some(flag) = &arg.flag {
+            clause.push(' ');
+            clause.push_str(flag);
+        }
         clause.push(' ');
-        clause.push_str(&placeholder_for(arg_id));
+        clause.push_str(&arg.placeholder);
     }
     if confirm_gated {
         clause.push_str(" --confirm");
