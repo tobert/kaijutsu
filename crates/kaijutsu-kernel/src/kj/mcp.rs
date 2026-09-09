@@ -337,7 +337,7 @@ fn health_json(h: &Health) -> serde_json::Value {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for McpArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

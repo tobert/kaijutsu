@@ -283,7 +283,7 @@ pub fn mime_from_extension(path: &str) -> &'static str {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 use super::effect::{Classify, Effect};
 
 impl Classify for CasArgs {

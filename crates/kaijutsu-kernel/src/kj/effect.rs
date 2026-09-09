@@ -1,6 +1,7 @@
 //! The `kj` verb class: every verb declares its effect where it is
 //! declared, and that declaration is the only place the question is
-//! answered. `docs/kj-verb-class.md` carries the build plan.
+//! answered. The devlog chapter "The file that answered a question the
+//! code already knew" carries the reasoning.
 //!
 //! Each domain module implements [`Classify`] for its `*Args` struct with an
 //! exhaustive match over the parsed value, so a new variant with no arm is

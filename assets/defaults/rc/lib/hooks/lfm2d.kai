@@ -167,7 +167,7 @@ fi
 #    `KJ_TOOL_PLAN`'s `commands[].kj_readonly` field
 #    (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN") -- itself computed by
 #    `kj::readonly::is_read_only_kj` against each verb's own declared
-#    effect (`kj/effect.rs`, `docs/kj-verb-class.md`), never derived here.
+#    effect (`kj/effect.rs`), never derived here.
 #    That function already refuses a redirect, a background
 #    call, a heredoc, a redacted argument, and any command whose name isn't
 #    exactly `kj`, so none of those need re-checking in this filter --

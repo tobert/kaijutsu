@@ -200,7 +200,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for DriveArgs {
     fn effect(&self) -> Effect {
         // May write a seed block and always publishes a turn request.

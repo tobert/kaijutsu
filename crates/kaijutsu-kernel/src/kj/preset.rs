@@ -281,7 +281,7 @@ impl KjDispatcher {
     }
 
     /// `kj preset remove <label>` — delete a preset. `Destroy`-classed
-    /// (`docs/kj-verb-class.md`); the dispatcher latches an unconfirmed call
+    /// (`kj/effect.rs`); the dispatcher latches an unconfirmed call
     /// before this handler runs.
     fn preset_remove(&self, label: &str) -> KjResult {
         if crate::seed_presets::is_reserved_preset_label(label) {
@@ -306,7 +306,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 use super::effect::{Classify, Effect};
 
 impl Classify for PresetArgs {
@@ -399,7 +399,7 @@ mod tests {
     async fn preset_remove_rejects_reserved_label() {
         // Confirmed: an unconfirmed call latches before the handler (and its
         // reserved-label check) ever runs — `Destroy` always latches
-        // (`docs/kj-verb-class.md`, slice 3).
+        // (`kj/effect.rs`, slice 3).
         let d = test_dispatcher().await;
         let ctx = register_context(&d, Some("ctx"), None, PrincipalId::new());
         let c = confirmed_caller(ctx);

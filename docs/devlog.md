@@ -918,3 +918,52 @@ became optional. The same morning explained a ghost peer registration — the
 bridge task's self-detach lived on a LocalSet that was dropped before it
 could run — and moved that cleanup onto the connection's own Drop, the only
 teardown that runs.
+
+## The file that answered a question the code already knew (September 9)
+
+Amy read `contrib/kj-expectations.toml` and said something felt off without
+being able to say what. The file was the authored half of a probe corpus:
+clap reflection listed every `kj` leaf, and the TOML said for each whether
+it mutated, whether its handler asked for confirmation, and which severity
+the lfm2d scorer was expected to assign. Two of those three were facts about
+the handler, written down beside it in a sidecar that a coverage test could
+check for presence and never for truth. "Does this verb write?" had three
+answers that never checked each other: the TOML, a two-token pass list in
+`kj/readonly.rs` that could not see past the second word and so gave up
+`backend default show` and `block cat` wholesale, and the handler body. The
+gate-policy plan was about to add a fourth column to the same file and say
+in the same breath that it must not agree with the third. And the one
+column that was genuinely an expectation was the scorer's vocabulary, not
+ours.
+
+Amy: "the declaration whether something mutates should be required on every
+kj verb, and can be accessed there directly as source of truth. I think at
+one point I asked for a file export and it got over-generalized." And: "I
+don't expect the classifier to ever learn kj vocabulary and we control the
+code here." So the declaration moved onto the verb. Every subcommand enum
+carries an exhaustive match to `Effect::Read | Write | Destroy`; a new
+variant with no arm does not compile, which is the entire coverage
+mechanism. Because the match is over the parsed value and not the leaf name,
+an argument that changes the effect is visible to it: `block cat` is a read
+and `block cat --out` is a write, in one arm, where the old table had to
+refuse both. A root clap enum wraps the forty-two domains so the reflected
+surface and the classified surface are one parse, and `classify(argv)` runs
+no handler.
+
+Three mechanisms fell out. The read-only module kept its five structural
+conditions and lost its tables. The eight handler-local confirmation checks
+became one gate in dispatch, and the decision to always latch a Destroy cost
+two handlers their state-dependent messages, accepted. `kj transport list`
+became a read on its own merits, undoing an earlier instruction to keep the
+whole verb out of the pass list, and a `${VAR}` in a typed slot fails
+closed rather than earning a second, lenient parser. And the lfm2d fixture
+left the kernel: severity derives from effect, the probe keeps only the
+calibration deltas beside itself, and the word "expectation" is not
+kaijutsu vocabulary any more.
+
+Two lessons. Reflecting the keys of a hand audit mechanizes half of it and
+leaves the values to rot at the old rate; the fix is to put the judgment
+where the compiler can demand it. And the corpus, built to remove clauses
+that do not parse, had been scoring eighteen of them: synthesis had filled
+positionals and never required options. Classifying every leaf through its
+own synthesized clause found that on the first run.

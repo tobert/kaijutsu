@@ -9,7 +9,7 @@
 //! a declared class beats tuning: `kj block list` (`informative` 0.897) and
 //! `kj context list` (0.960) sail through, so neighbouring reads on the same
 //! noun disagree. This module is Amy's fix: every `kj` verb declares its own
-//! effect (`kj/effect.rs`, `docs/kj-verb-class.md`), and a call whose effect
+//! effect (`kj/effect.rs`), and a call whose effect
 //! is [`Effect::Read`] skips the classifier entirely (`KJ_TOOL_PLAN`'s
 //! `kj_readonly` field, wired in `mcp/broker.rs`).
 //!
@@ -396,9 +396,7 @@ mod tests {
 
     #[test]
     fn a_transport_list_is_read_only() {
-        // No longer kept out of this module wholesale — the class puts it
-        // on its own merits (`docs/kj-verb-class.md`, "Decisions carried
-        // here").
+        // The class puts it on its own merits: the handler only reads.
         let cmd = plan_one("kj transport list");
         assert!(is_read_only_kj(&cmd));
     }

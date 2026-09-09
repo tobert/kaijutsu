@@ -332,7 +332,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for SystemArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

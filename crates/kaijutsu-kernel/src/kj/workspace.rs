@@ -304,7 +304,7 @@ impl KjDispatcher {
     }
 
     /// `kj workspace remove <label>` — archive a workspace. `Destroy`-classed
-    /// (`docs/kj-verb-class.md`); the dispatcher latches an unconfirmed call
+    /// (`kj/effect.rs`); the dispatcher latches an unconfirmed call
     /// before this handler runs.
     fn workspace_remove(&self, label: &str) -> KjResult {
         let db = self.kernel_db().lock();
@@ -327,7 +327,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 use super::effect::{Classify, Effect};
 
 impl Classify for WorkspaceArgs {

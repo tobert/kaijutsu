@@ -1313,7 +1313,7 @@ can also call it directly. Tests: `kj_tool_plan_projects_the_shell_command`
 when `kj::readonly::is_read_only_kj`
 (`crates/kaijutsu-kernel/src/kj/readonly.rs`) accepts that exact
 `PlannedCommand`: five structural conditions, then the verb's own declared
-`Effect::Read` (`docs/kj-verb-class.md`). The classification itself is
+`Effect::Read` (`kj/effect.rs`). The classification itself is
 pure Rust against the typed command — never re-derived from the JSON — and
 this field is the mechanical mirror of that decision onto the same-position
 command object. Additive: every field the surface already

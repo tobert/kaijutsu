@@ -98,7 +98,7 @@ Uncovered otherwise — today's behavior, stated rather than discovered.
 
 | Layer | Store | Materialized by | Who authors it |
 |---|---|---|---|
-| 1. Builtin/generated | const tables (`kj/readonly.rs`) and the corpus `gate` field (§Generated tier) | compile | shipped in-repo, reviewed like code |
+| 1. Builtin | each verb's declared `Effect` (`kj/effect.rs`, §Builtin tier) | compile | shipped in-repo, reviewed like code |
 | 2. Global config | `/config/kernel/gate.toml`, `[global]` | host file, seeded from `assets/defaults/gate.toml` via `config_seed.rs` | Amy, at the keyboard, no rebuild |
 | 3. context_type config | same file, `[context_type.<type>]` sections | same | Amy, per role |
 | 4. User explicit | `approval_rules` (digest) + family rules (§Learned family rules) | `kj ledger allow --remember` at answer time | a human decision, attributed and revocable |
@@ -290,8 +290,7 @@ minted from an answer, and answers still come from a peer seat.
 
 Every `kj` verb declares its effect in code, on the verb itself:
 `Effect::Read | Write | Destroy`, an exhaustive match per subcommand enum
-(`docs/kj-verb-class.md` carries the build plan; after it ships,
-`kj/effect.rs` is the reference). The builtin tier is that declaration:
+(`kj/effect.rs` is the reference). The builtin tier is that declaration:
 
 - `Read` is allowed by construction. The verb never meets the classifier
   or the gate. `kj/readonly.rs` keeps the five structural conditions (name
@@ -336,7 +335,6 @@ verb's effect:
   construction.
 - The duplicated `kj ledger` exemption prose in `kj/readonly.rs`'s module
   doc shrinks to a pointer.
-- `READ_ONLY_TABLE`/`READ_ONLY_NO_SUBCOMMAND` after the corpus fold.
 
 ## Rollout
 
@@ -351,7 +349,7 @@ unreleased one:
    row), and `auto_reason` text grows layer names. Parity tests pin
    everything else.
 2. **Config layer.** `assets/defaults/gate.toml` + seed + `[global]` /
-   `[context_type.<type>]` + corpus key validation + the PreCall Deny branch
+   `[context_type.<type>]` + kj key validation through `classify` + the PreCall Deny branch
    (`subject = gate policy`) + the `KJ_TOOL_PLAN` tier field + **both** lfm2d
    hook rules (ask-tier exit 3, allow-tier clause drop) + the `--help`
    structural rule in the evaluator with its Rust bypass test. The non-kj
@@ -399,7 +397,7 @@ KEY                  VERDICT  LAYER
 kj handoff note      allow    learned family (always, rule 01a0…, from ask 01a0…)
 kj rc add            ask      global config
 dd                   deny     global config
-kj block read        allow    builtin (corpus gate)
+kj block read        allow    builtin (Effect::Read)
 ```
 
 The user-facing word is **gate rules**, never "policy": `kj policy` is the

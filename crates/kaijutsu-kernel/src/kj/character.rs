@@ -189,7 +189,7 @@ impl KjDispatcher {
     /// Retire: stamp `retired_at`, and conclude + archive every live
     /// context the character plays, in the same act
     /// (`docs/character.md`, "Retire takes its contexts with it").
-    /// `Destroy`-classed (`docs/kj-verb-class.md`); the dispatcher latches
+    /// `Destroy`-classed (`kj/effect.rs`); the dispatcher latches
     /// an unconfirmed call before this handler runs, whether or not the
     /// character has anything live to archive — the archival loop below is
     /// not separately confirmed, since that one latch already covers the
@@ -262,7 +262,7 @@ fn character_to_json(row: &CharacterRow) -> serde_json::Value {
     })
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 use super::effect::{Classify, Effect};
 
 impl Classify for CharacterArgs {
@@ -375,7 +375,7 @@ mod tests {
     }
 
     /// `retire` latches an unconfirmed call even with no live contexts to
-    /// archive — `Destroy` always latches (`docs/kj-verb-class.md`, slice
+    /// archive — `Destroy` always latches (`kj/effect.rs`, slice
     /// 3), regardless of what the handler would find. Confirmed, it
     /// completes on the next call.
     #[tokio::test]

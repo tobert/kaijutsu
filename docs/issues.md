@@ -1095,8 +1095,8 @@ tiers are `docs/gate-policy-tuning.md`. Old measurements in this entry's
 history must not be quoted. Open:
 
 - **Our `kj` verbs never reach the classifier as reads.** Every verb
-  declares `Effect::Read | Write | Destroy` in code (`docs/kj-verb-class.md`
-  until it ships, then `kj/effect.rs`); Read skips scoring by construction
+  declares `Effect::Read | Write | Destroy` in code (`kj/effect.rs`); Read
+  skips scoring by construction
   and the classifier is not expected to learn kj vocabulary. Writes still
   score until the gate-policy tiers land.
 - **Widen the probe with real traffic** (`LFM2D_MODE=log` for an interval)

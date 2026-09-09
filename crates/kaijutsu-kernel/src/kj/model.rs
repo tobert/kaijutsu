@@ -298,7 +298,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for ModelsArgs {
     fn effect(&self) -> Effect {
         // Pure LLM-registry discovery, no capability gate — see the module doc.

@@ -1653,7 +1653,7 @@ fn inherit_parent_context_type(
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for ForkArgs {
     fn effect(&self) -> Effect {
         // Every fork variant (full/compact/subtree) creates a new context,

@@ -408,7 +408,7 @@ impl KjDispatcher {
             return KjResult::ok_ephemeral(self.help(), ContentType::Markdown);
         }
 
-        // Verb class: docs/kj-verb-class.md. A Destroy verb latches here,
+        // Verb class: kj/effect.rs. A Destroy verb latches here,
         // the one place, instead of a handler-local `caller.confirmed`
         // check — no handler for a Destroy verb runs before this. A
         // classify failure (help flags, unknown verb, an argument that
@@ -1744,7 +1744,7 @@ mod published_prose {
 
 #[cfg(test)]
 mod destroy_latches_at_dispatch_tests {
-    //! `docs/kj-verb-class.md` slice 3: `dispatch()` latches every `Destroy`
+    //! `dispatch()` latches every `Destroy`
     //! verb itself, before routing to a handler. Proven on every reflected
     //! leaf rather than the seven verbs by name, so a future `Destroy` verb
     //! is covered without a new test: a handler that ran would return `Err`

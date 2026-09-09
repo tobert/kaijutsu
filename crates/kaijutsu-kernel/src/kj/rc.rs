@@ -655,7 +655,7 @@ pub async fn check_context_type(vfs: &crate::vfs::MountTable, context_type: &str
     ))
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for RcArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

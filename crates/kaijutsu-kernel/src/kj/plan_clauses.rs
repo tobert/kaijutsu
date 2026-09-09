@@ -55,7 +55,7 @@ pub struct PlanClause {
     /// the carrier a clause was cut out of.
     pub stmt_rendered: String,
     /// `true` only when this clause is one command whose own declared
-    /// effect (`kj/effect.rs`, `docs/kj-verb-class.md`) is `Read`, per
+    /// effect (`kj/effect.rs`, `kj/effect.rs`) is `Read`, per
     /// [`crate::kj::readonly::is_read_only_kj`]. Always `false` on the
     /// whole-statement path.
     pub kj_readonly: bool,

@@ -398,7 +398,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for WaitArgs {
     fn effect(&self) -> Effect {
         // Parks on the flow bus and re-reads the durable log; writes nothing.

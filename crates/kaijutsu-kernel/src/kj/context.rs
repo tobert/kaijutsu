@@ -1722,7 +1722,7 @@ impl KjDispatcher {
     }
 
     /// `kj context archive <ctx>` — soft-delete one context. `Destroy`-classed
-    /// (`docs/kj-verb-class.md`); the dispatcher latches an unconfirmed call
+    /// (`kj/effect.rs`); the dispatcher latches an unconfirmed call
     /// before this handler runs.
     ///
     /// Never recurses. Children keep their structural edge and their own
@@ -1927,7 +1927,7 @@ impl KjDispatcher {
     }
 
     /// `kj context remove <ctx>` — permanently delete a context.
-    /// `Destroy`-classed (`docs/kj-verb-class.md`); the dispatcher latches
+    /// `Destroy`-classed (`kj/effect.rs`); the dispatcher latches
     /// an unconfirmed call before this handler runs.
     async fn context_remove(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let (target_id, target_label) = {
@@ -2031,7 +2031,7 @@ impl KjDispatcher {
     }
 
     /// `kj context retag <label> <ctx>` — move a label to a different
-    /// context. `Destroy`-classed (`docs/kj-verb-class.md`); the dispatcher
+    /// context. `Destroy`-classed (`kj/effect.rs`); the dispatcher
     /// latches an unconfirmed call before this handler runs.
     async fn context_retag(&self, label: &str, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         // Resolve the new holder and find old holder (single lock scope)
@@ -2093,7 +2093,7 @@ where
     )
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 use super::effect::{Classify, Effect};
 
 impl Classify for ContextArgs {

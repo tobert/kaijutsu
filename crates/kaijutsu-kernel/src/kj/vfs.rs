@@ -150,7 +150,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for VfsArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

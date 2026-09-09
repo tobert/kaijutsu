@@ -626,7 +626,7 @@ fn entry_json(phase: McpHookPhase, entry: &HookEntry, full: bool) -> serde_json:
     })
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for HookArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

@@ -95,7 +95,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for AttachArgs {
     fn effect(&self) -> Effect {
         // No subcommand: attaches the session to the target context and

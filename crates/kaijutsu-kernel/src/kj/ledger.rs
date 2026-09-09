@@ -1428,7 +1428,7 @@ fn learn_every_statement(
     Ok(learned)
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 //
 // `kj ledger` stays out of readonly.rs's tables entirely — the whole verb is
 // exempt there as the gate's own answer path (`is_gate_exempt_kj`), a

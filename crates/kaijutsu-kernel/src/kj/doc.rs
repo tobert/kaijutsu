@@ -383,7 +383,7 @@ impl KjDispatcher {
     }
 
     /// Delete a document and CASCADE-drop its contexts row, oplog,
-    /// snapshots. `Destroy`-classed (`docs/kj-verb-class.md`); the
+    /// snapshots. `Destroy`-classed (`kj/effect.rs`); the
     /// dispatcher latches an unconfirmed call before this handler runs.
     fn doc_delete(&self, id_str: &str) -> KjResult {
         let ctx_id = match ContextId::parse(id_str) {
@@ -524,7 +524,7 @@ fn format_dag_node(
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for DocArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

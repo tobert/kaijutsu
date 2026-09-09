@@ -298,7 +298,7 @@ fn row_to_json(row: &crate::roster::RosterRow) -> serde_json::Value {
     })
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for RosterArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

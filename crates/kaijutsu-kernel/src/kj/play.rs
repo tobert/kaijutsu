@@ -366,7 +366,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for PlayArgs {
     fn effect(&self) -> Effect {
         Effect::Write

@@ -238,7 +238,7 @@ fn short_block(key: &str) -> String {
         .unwrap_or_else(|| key.to_string())
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for SearchArgs {
     fn effect(&self) -> Effect {
         // No subcommand: a regex scan over block content already in the

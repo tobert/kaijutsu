@@ -832,7 +832,7 @@ impl KjDispatcher {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for TransportArgs {
     fn effect(&self) -> Effect {
         self.command.effect()
@@ -844,7 +844,7 @@ impl Classify for TransportCommand {
         match self {
             // `list` is the roster read (`readonly.rs`'s own doc excludes it
             // from the module's table only because `kj transport` was kept
-            // out wholesale, not because it mutates — `docs/kj-verb-class.md`
+            // out wholesale, not because it mutates — `kj/effect.rs`
             // makes it Read on its own merits).
             TransportCommand::List => Effect::Read,
             TransportCommand::Attach { .. }

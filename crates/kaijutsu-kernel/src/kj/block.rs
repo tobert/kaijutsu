@@ -1859,7 +1859,7 @@ fn first_line_trunc(s: &str, max: usize) -> String {
     }
 }
 
-// Verb class: docs/kj-verb-class.md
+// Verb class: kj/effect.rs
 impl Classify for BlockArgs {
     fn effect(&self) -> Effect {
         self.command.effect()

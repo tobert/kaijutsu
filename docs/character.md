@@ -868,7 +868,7 @@ Each slice is independently shippable and leaves the tree green.
    is this log read by someone else" true before slice 7's addressing
    exists; `tail` never mints, because a read-only verb's whole flag
    surface must be incapable of a write (the verb declares `Effect::Read`
-   and the class match is exhaustive, `docs/kj-verb-class.md`); `note` is not
+   and the class match is exhaustive, `kj/effect.rs`); `note` is not
    `ConfigWrite`-gated, since leaving a note is ordinary authoring and the
    gate would route every handoff through the lfm2d escalation; no
    character fails loudly and names `kj character create`; `played_by`
