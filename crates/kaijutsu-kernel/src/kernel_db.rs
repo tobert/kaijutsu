@@ -1998,7 +1998,9 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Additive column backfills for DBs created before a column existed.
+    /// Column backfills and guarded configuration migrations for existing DBs.
+    /// The embedding table rebuild is transactional and preserves enablement
+    /// and the projection budget while replacing obsolete model settings.
     /// The project's stance is "schema is truth, bump = wipe", but a single
     /// `ADD COLUMN ... DEFAULT 0` is cheap and spares a live kernel a wipe.
     /// Each ALTER is guarded: a "duplicate column" error on a fresh DB (the

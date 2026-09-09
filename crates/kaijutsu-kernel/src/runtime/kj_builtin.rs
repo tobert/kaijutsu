@@ -955,6 +955,35 @@ mod tests {
         }
     }
 
+    struct PartlyFailingSynthSource { failing_context: ContextId }
+    impl kaijutsu_index::BlockSource for PartlyFailingSynthSource {
+        fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+            if ctx == self.failing_context { return Err("injected block read failure".into()); }
+            SynthSource.block_snapshots(ctx)
+        }
+    }
+
+    #[tokio::test]
+    async fn synth_all_reports_partial_failure_and_keeps_successful_results() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let good = register_context(&dispatcher, Some("synth-good"), None, PrincipalId::system());
+        let bad = register_context(&dispatcher, Some("synth-bad"), None, PrincipalId::system());
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(kaijutsu_index::SemanticIndex::new(
+            kaijutsu_index::IndexConfig::new(3, 2048, dir.path()),
+            Box::new(SynthEmbedder(Arc::new(std::sync::atomic::AtomicUsize::new(0)))),
+        ).unwrap());
+        let kaish = embedded_with_index(dispatcher, good, Some(index.clone()),
+            Arc::new(PartlyFailingSynthSource { failing_context: bad })).await;
+        let result = kaish.execute_with_options("kj synth all", ExecuteOptions::default()).await.unwrap();
+        assert_eq!(result.code, 1, "{result:?}");
+        assert!(result.err.contains("injected block read failure"), "{result:?}");
+        assert!(result.err.contains(&bad.short()), "failure must identify its context: {result:?}");
+        assert!(index.synthesis_cache().get_any(good).is_some());
+        assert!(index.synthesis_cache().get_any(bad).is_none());
+    }
+
     #[tokio::test]
     async fn synth_force_reaches_single_and_all_context_refreshes() {
         use std::sync::atomic::{AtomicUsize, Ordering};

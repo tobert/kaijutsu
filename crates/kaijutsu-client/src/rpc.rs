@@ -765,8 +765,8 @@ impl KernelHandle {
 
     /// Semantic search: find contexts similar to a free-text query.
     ///
-    /// Returns up to `k` results ranked by cosine similarity. Empty when the
-    /// kernel has no semantic index.
+    /// Returns up to `k` results ranked by cosine similarity. Returns an error
+    /// when the kernel's semantic index is unavailable.
     #[tracing::instrument(skip(self, query), name = "rpc_client.search_similar")]
     pub async fn search_similar(
         &self,

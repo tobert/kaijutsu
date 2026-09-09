@@ -23,11 +23,14 @@ purpose for searches. Batches contain at most 32 inputs. lfm2d embeds each
 input independently; changing that numerical contract requires a profile
 change. Every response must carry matching model id and weight hash headers,
 correct cardinality and dimensions, finite components, and a nonzero norm.
-The adapter L2-normalizes accepted vectors before returning them.
+The adapter L2-normalizes accepted vectors before returning them. HTTP endpoints
+must name the service root; path prefixes are rejected rather than discarded.
 
 Service failures return errors and preserve prior synthesis. Failure to
 connect at startup logs the problem and leaves the semantic index unavailable;
-restart after repairing the endpoint. `kj synth` reports unavailability.
+restart after repairing the endpoint. Discovery can delay startup by up to
+`timeout_ms` (30 seconds by default) when the service is unreachable. `kj synth` and semantic search report unavailability; search does not return
+an empty success when the index is absent.
 There is no automatic reconnection or alternate model selection.
 
 Opening an old builtin-model configuration migrates it to the default service,

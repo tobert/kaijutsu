@@ -42,8 +42,9 @@ impl Lfm2dEmbedder {
             reqwest::Url::parse("http://localhost/").map_err(failure)?
         } else {
             let url = reqwest::Url::parse(endpoint).map_err(failure)?;
-            if !matches!(url.scheme(), "http" | "https") || url.query().is_some() || url.fragment().is_some() {
-                return Err(failure("endpoint must be an HTTP(S) URL without query or fragment, or unix:///absolute/path"));
+            if !matches!(url.scheme(), "http" | "https") || url.path() != "/"
+                || url.query().is_some() || url.fragment().is_some() {
+                return Err(failure("endpoint must be an HTTP(S) root URL without query or fragment, or unix:///absolute/path"));
             }
             url
         };

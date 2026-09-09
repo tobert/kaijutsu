@@ -153,3 +153,12 @@ async fn service_request_deadline_includes_waiting_for_capacity() {
     assert!(b.is_err());
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn service_refuses_endpoint_prefix_instead_of_silently_discarding_it() {
+    let error = match Lfm2dEmbedder::connect("http://127.0.0.1:9/prefix", Duration::from_millis(100), 1).await {
+        Ok(_) => panic!("a prefixed endpoint must be rejected"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("root URL"), "reject the path before making a request: {error}");
+}

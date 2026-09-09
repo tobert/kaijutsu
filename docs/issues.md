@@ -204,6 +204,36 @@ leaves its prior search vector intact; synthesis now clears its own preview,
 but search needs an explicit removal policy. Audio still uses rten; its stale
 `kj/audio.rs` embedding-reference comment belongs to the active kj lane.
 
+Bulk synthesis also undercounts completed indexing when a context's index
+write succeeds but its later synthesis fails: `refresh_synthesis` returns one
+error and loses the intermediate `was_indexed` counter. Preserve partial
+progress in that result when refining the bulk status output.
+
+## Synthesis publication can race index eviction
+
+With optional `IndexConfig::max_contexts`, an in-flight synthesis refresh can
+finish after its context was evicted and repopulate that context's synthesis
+rows. `runtime/synthesis.rs::run_synthesis_and_cache` serializes refreshes,
+but indexing/eviction does not share its guard. There is also a narrower
+window in `SemanticIndex::store_synthesis`: the metadata guard drops before
+the memory-cache insert, so eviction can remove the DB row before that insert
+reintroduces the memory entry. These storage paths predate the service move.
+
+Make publication conditional on an eviction generation and keep DB/cache
+publication ordered with eviction. Preserve intentional synthesis-only caches;
+requiring an index entry unconditionally would break them. Add deterministic
+race tests covering eviction during inference and between DB/cache publication.
+Found in kaibo's synthesis review (GLM-5.3 via Crusoe).
+
+## Embedding and classifier service configuration should share backend rows
+
+The existing `embedding_config` singleton is the kernel's sole embedding
+configuration source (`llm/db_config.rs::load_embedding_config`); the
+classifier hook uses its own lfm2d URL. Move both into backend rows with an
+embedding/classifier kind and shared endpoint ownership. This depends on
+the active kj verb-class lane because it changes the registry and backend
+administration. It does not block the synthesis service branch.
+
 ## The WAL grows without bound and never shrinks (2026-09-01)
 
 `kernel.db-wal` measured at 719 MB holding zero live frames — SQLite behaving
@@ -1342,10 +1372,9 @@ track before an explicit `--track` can move it (no `--track` passthrough on
 - **Synthesis and embedding tables lack `ON DELETE CASCADE`** in
   `kernel_db.rs` (other tables have it); deletes are manual across three
   tables. Do it at the next schema change.
-- **`OnnxEmbedder` is BERT-only** (`kaijutsu-index/src/embedder.rs:43-45`
-  hardcodes `input_ids`/`attention_mask`/`token_type_ids`); E5/jina models
-  will not load. The `kaijutsu-abc` MidiWriter leaves pitch/velocity
-  unmasked (`midi.rs:970-995`), safe while the one caller uses velocity 80.
+- **ABC MIDI pitch/velocity are unmasked.** The `kaijutsu-abc` MidiWriter
+  leaves pitch/velocity unmasked (`midi.rs:970-995`), safe while the one
+  caller uses velocity 80.
 
 ## `docs/abc-reference.md`'s support matrix is four months stale
 
