@@ -9,6 +9,8 @@
 //! existing ones first). We test the positive path here; the negative is the
 //! guard itself, exercised by every non-empty cold start in the other e2e tests.
 
+mod support;
+
 use kaijutsu_types::PrincipalId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -17,6 +19,7 @@ async fn empty_kernel_seeds_one_root_director_context() {
 
     // config_dir = None → embedded rc/config defaults; data_dir = fresh tempdir
     // → an empty KernelDb, so the ROOT bootstrap must fire.
+    support::disable_embeddings(tmp.path());
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         None,
         &kaijutsu_server::config_mounts::ConfigMounts::new(tmp.path().join("config")),

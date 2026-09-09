@@ -134,30 +134,7 @@ const FACTORY_MAX_TOKENS: i64 = 16384;
 /// than through this default.
 const FACTORY_EFFORT: &str = "max";
 
-/// The local ONNX embedding model for semantic indexing (constellation
-/// clustering, drift discovery, semantic search). Inference is pure-Rust
-/// (rten) — no ONNX Runtime library involved.
-///
-/// Install recipe (rescued from the demolished models.toml's comments —
-/// this is its durable home now):
-///
-/// - Directory must hold `model.onnx` + `tokenizer.json`.
-/// - fp32 export (works as-is, 133 MB): `onnx/model.onnx` + `tokenizer.json`
-///   from <https://huggingface.co/Xenova/bge-small-en-v1.5>
-/// - int8 (34 MB, faster load, what we ship): quantize the fp32 export with
-///   rten's own tool (needs a Python venv with onnxruntime, onnx, onnx_ir):
-///   `python ort-quantize.py dynamic fp32.onnx model.onnx` —
-///   <https://github.com/robertknight/rten/blob/main/tools/ort-quantize.py>
-/// - Verify a candidate: `cargo run -p kaijutsu-index --example embed_check`
-/// - Quantized exports from OTHER pipelines may not load — rten rejects e.g.
-///   fp16 initializers (the old Qdrant bge-small-en-v1.5-onnx-Q fails so).
-///
-/// The model's identity is its directory basename: renaming the dir — or
-/// changing `dimensions` — invalidates the on-disk semantic index (wiped at
-/// next kernel start, re-populated lazily from the watcher / `kj synth all`).
-const FACTORY_EMBEDDING_DIR: &str = "~/.local/share/kaijutsu/models/bge-small-en-v1.5";
-const FACTORY_EMBEDDING_DIMS: i64 = 384;
-const FACTORY_EMBEDDING_MAX_TOKENS: i64 = 512;
+pub(crate) const FACTORY_EMBEDDING_ENDPOINT: &str = "http://lfm2d-1.taila4abc.ts.net:8088";
 
 /// True when `name` is a factory backend name. Not a hard reservation — an
 /// operator may absolutely re-point `anthropic` at a gateway — but
@@ -264,9 +241,8 @@ fn factory_defaults() -> LlmDefaultsRow {
 fn factory_embedding() -> EmbeddingConfigRow {
     EmbeddingConfigRow {
         enabled: true,
-        model_dir: FACTORY_EMBEDDING_DIR.to_string(),
-        dimensions: FACTORY_EMBEDDING_DIMS,
-        max_tokens: FACTORY_EMBEDDING_MAX_TOKENS,
+        endpoint: FACTORY_EMBEDDING_ENDPOINT.to_string(),
+        timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
     }
 }
 

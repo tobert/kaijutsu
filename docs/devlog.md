@@ -322,6 +322,16 @@ dead slots the real index had been carrying. Sonnet lanes wrote the code;
 the lead's review, the outside models and the running kernel each found bugs
 the other two missed. That triangle is the lesson.
 
+The September synthesis pass exposed a second distinction: the search
+projection and the synthesis input are different documents for hashing
+purposes. A prefix hash cannot validate a gist drawn from the whole context.
+Amy's direction to use lfm2d moved embedding inference out of the kernel,
+and made purpose, normalization, and checkpoint identity explicit parts of
+the interface. Caching unchanged work and bounding service calls came first;
+changed contexts still need per-block reuse before automatic synthesis can
+return. Keeping that switch off made it possible to replace the inference
+mechanism without repeating the September startup load spike.
+
 ## The filesystem becomes a world, then ambient (July 12–13)
 
 The fsn landscape went from vocabulary to a rendering world in one evening of

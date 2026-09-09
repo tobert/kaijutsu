@@ -1,7 +1,7 @@
 //! Semantic vector indexing for kaijutsu contexts.
 //!
-//! Provides local ONNX embeddings, HNSW nearest-neighbor search, and
-//! density-based clustering. No external API calls — fully offline.
+//! Provides asynchronous service embeddings, HNSW nearest-neighbor search,
+//! density-based clustering, and persistent synthesis caches.
 //!
 //! # Architecture
 //!
@@ -24,7 +24,9 @@ pub mod watcher;
 
 pub use config::IndexConfig;
 pub use content::extract_context_content;
-pub use embedder::{Embedder, RtenEmbedder};
+pub use embedder::{Embedder, EmbeddingPurpose};
+pub mod lfm2d;
+pub use lfm2d::Lfm2dEmbedder;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -163,46 +165,27 @@ fn pick_cluster_label<'a>(
 ///
 /// # Lock order
 ///
-/// Writers (`index_context`) take `metadata` then `hnsw` — the metadata lock
-/// is deliberately held across embed + insert so concurrent callers can't
-/// embed the same context twice. Everyone else must **never hold `hnsw` while
-/// acquiring `metadata`**: collect what you need from the graph, drop the
-/// guard, then touch metadata (`neighbors`/`clusters` show the pattern).
-/// Holding both in the opposite order inverts the writer order and deadlocks.
-///
-/// Lock poisoning is deliberately fatal: a panic while holding either lock
-/// (OOM mid-embed, hnsw_rs panic) poisons it, and every later `.unwrap()`
-/// propagates the panic instead of serving state of unknown integrity —
-/// crash over corruption. The kernel treats a failed SemanticIndex as
-/// "no index" and degrades gracefully; a restart rebuilds from disk.
+/// Writers take `metadata` then `hnsw` during storage. Inference awaits
+/// happen outside both locks. Readers must drop `hnsw` before taking
+/// `metadata` to avoid inverting the writer order. Blocking graph and SQLite
+/// work runs on blocking tasks. Poisoned locks are fatal: serving state of
+/// unknown integrity is worse than refusing the operation.
 pub struct SemanticIndex {
     embedder: Arc<dyn Embedder>,
-    hnsw: RwLock<index::HnswIndex>,
-    metadata: Mutex<metadata::MetadataStore>,
+    hnsw: Arc<RwLock<index::HnswIndex>>,
+    metadata: Arc<Mutex<metadata::MetadataStore>>,
     config: IndexConfig,
-    synthesis_cache: synthesis::SynthesisCache,
+    synthesis_cache: Arc<synthesis::SynthesisCache>,
+    synthesis_refresh: tokio::sync::Mutex<()>,
 }
 
 impl SemanticIndex {
     /// Create or load a semantic index.
     ///
-    /// Before any other on-disk state is touched, this compares the
-    /// embedder's `(model_name(), dimensions)` against every distinct pair
-    /// recorded in `index_meta.db` (if one exists — a fresh data_dir is
-    /// never mismatched). Vectors from two different embedding models live
-    /// in incomparable spaces; mixing them into one HNSW graph produces
-    /// meaningless similarity scores with no error. On any mismatch, the
-    /// on-disk index (HNSW graph, SQLite metadata, and any in-flight
-    /// atomic-dump files — a completed old-model dump must not be
-    /// resurrected by `HnswIndex::new`'s crash recovery) is wiped and
-    /// construction proceeds as a fresh, empty index. The index is a
-    /// derived cache: contexts re-index lazily via the watcher / `kj synth
-    /// all`, so this is never data loss.
-    ///
-    /// `model_name` derives from the model directory's basename (see
-    /// `RtenEmbedder::new`), so renaming the model directory — even with
-    /// identical files inside — also triggers a wipe. That's correct: the
-    /// config changed, and the cache follows.
+    /// The persisted embedding profile covers model name, revision,
+    /// dimensions, and the query/document normalization contract. A changed
+    /// or missing profile clears the derived graph and synthesis caches,
+    /// including synthesis-only databases. Context blocks remain intact.
     ///
     /// If the loaded graph carries more points than metadata has live rows —
     /// dead slots survived from eviction before the process last stopped —
@@ -214,17 +197,22 @@ impl SemanticIndex {
         // Must run before HnswIndex::new/MetadataStore::open construct
         // anything real, so a mismatch leaves a genuinely empty data_dir for
         // the normal fresh-index path below to build on.
-        Self::wipe_on_model_mismatch(&config, embedder.model_name())?;
+        if config.dimensions != embedder.dimensions() || config.dimensions == 0 {
+            return Err(IndexError::Embedding("index dimensions do not match the embedding profile".into()));
+        }
+        Self::wipe_on_model_mismatch(&config, &embedder.cache_identity())?;
 
         let hnsw = index::HnswIndex::new(&config)?;
         let metadata = metadata::MetadataStore::open(&config.data_dir)?;
+        metadata.set_embedding_profile(&embedder.cache_identity())?;
 
         let this = Self {
             embedder: Arc::from(embedder),
-            hnsw: RwLock::new(hnsw),
-            metadata: Mutex::new(metadata),
+            hnsw: Arc::new(RwLock::new(hnsw)),
+            metadata: Arc::new(Mutex::new(metadata)),
             config,
-            synthesis_cache: synthesis::SynthesisCache::new(),
+            synthesis_cache: Arc::new(synthesis::SynthesisCache::new()),
+            synthesis_refresh: tokio::sync::Mutex::new(()),
         };
 
         // Lock order: each guard here is a standalone temporary, dropped at
@@ -268,43 +256,18 @@ impl SemanticIndex {
         Ok(this)
     }
 
-    /// Wipe the on-disk index if it was built by a different embedding model
-    /// (name or dimensions) than the one about to open it.
-    ///
-    /// No-op when `index_meta.db` doesn't exist yet — a fresh data_dir can't
-    /// be mismatched. Opens a throwaway `MetadataStore` to read the recorded
-    /// `(model_name, dimensions)` pairs and drops it *before* deleting any
-    /// files: the SQLite connection must close first, or the delete of
-    /// `index_meta.db` (and the WAL/SHM opened alongside it) would fight an
-    /// open handle.
+    /// Compare the global profile before loading the graph. Close SQLite
+    /// before deleting mismatched derived files, including atomic dump remnants.
     fn wipe_on_model_mismatch(config: &IndexConfig, model_name: &str) -> Result<(), IndexError> {
         let meta_path = config.data_dir.join("index_meta.db");
         if !meta_path.exists() {
             return Ok(());
         }
 
-        let mismatch = {
-            let store = metadata::MetadataStore::open(&config.data_dir)?;
-            store
-                .distinct_models()?
-                .into_iter()
-                .find(|(name, dims)| name != model_name || *dims != config.dimensions)
-            // `store` (and its SQLite connection) drops here, at the end of
-            // this block — before any file deletion below.
-        };
-
-        let Some((old_name, old_dims)) = mismatch else {
-            return Ok(());
-        };
-
-        tracing::warn!(
-            old_model = %old_name,
-            old_dimensions = old_dims,
-            new_model = %model_name,
-            new_dimensions = config.dimensions,
-            "semantic index model mismatch — wiping on-disk index; \
-             it will re-populate lazily from the watcher / `kj synth all`"
-        );
+        let old_profile = metadata::MetadataStore::open(&config.data_dir)?.embedding_profile()?;
+        if old_profile.as_deref() == Some(model_name) { return Ok(()); }
+        tracing::warn!(old_profile = ?old_profile, new_profile = %model_name,
+            "embedding profile changed or unrecorded; clearing derived index and synthesis caches");
 
         // Real index files plus any in-flight atomic-dump leftovers
         // (index.new.*) — a completed old-model dump must be deleted
@@ -331,90 +294,93 @@ impl SemanticIndex {
 
     /// Index a context's blocks. Returns true if content was (re-)embedded.
     ///
-    /// This is a blocking operation — call from `spawn_blocking`.
-    /// ONNX inference, HNSW graph operations, and SQLite writes all happen synchronously.
-    pub fn index_context(
+    /// Service inference holds no storage locks. An optimistic hash check
+    /// refuses to overwrite a concurrent refresh with superseded work.
+    pub async fn index_context(
         &self,
         ctx_id: ContextId,
         blocks: &[BlockSnapshot],
     ) -> Result<bool, IndexError> {
-        let (text, hash) = extract_context_content(blocks, self.config.max_tokens * 4);
+        let (text, hash) = extract_context_content(blocks, self.config.max_context_bytes);
+        if text.is_empty() { return Ok(false); }
+        let metadata = self.metadata.clone();
+        let before = tokio::task::spawn_blocking(move || metadata.lock().unwrap().get_content_hash(ctx_id))
+            .await.map_err(|e| IndexError::Index(format!("read index metadata: {e}")))??;
+        if before.as_deref() == Some(hash.as_str()) { return Ok(false); }
 
-        if text.is_empty() {
-            return Ok(false);
-        }
-
-        // Hold the metadata lock across hash-check + embed + assign_slot to prevent
-        // another thread from embedding the same context concurrently.
-        // Embedding is CPU-bound on a blocking thread, so holding std::sync::Mutex is fine.
-        let mut meta = self.metadata.lock().unwrap();
-
-        // Check if already indexed with same content
-        if meta.get_content_hash(ctx_id)?.is_some_and(|h| h == hash) {
-            return Ok(false);
-        }
-
-        // Embed — ONNX inference is CPU-bound, fine on a blocking thread
-        let embedding = self.embedder.embed(&text)?;
-
-        // Assign or get slot
-        let slot = meta.assign_slot(
-            ctx_id,
-            &hash,
-            self.embedder.model_name(),
-            self.config.dimensions,
-        )?;
-
-        // Insert into HNSW
-        {
-            let mut hnsw = self.hnsw.write().unwrap();
-            hnsw.insert(slot, &embedding)?;
-            hnsw.save()?;
-        }
-
-        tracing::debug!(
-            context = %ctx_id.short(),
-            slot = slot,
-            "indexed context"
-        );
-
-        // LRU eviction: if max_contexts is set and we've exceeded it, evict oldest
-        if let Some(max) = self.config.max_contexts {
-            let count = meta.count()?;
-            if count > max {
-                let to_evict = count - max;
-                let evicted = meta.evict_oldest(to_evict)?;
-
-                // The graph points for evicted slots remain in HNSW — it has
-                // no delete — but clear_slot at least stops the embeddings
-                // cache from continuing to serve them. meta is still held
-                // here, so lock order (metadata -> hnsw) matches every other
-                // writer. The graph points themselves are only reclaimed by
-                // the next rebuild() (startup auto-rebuild or `kj synth
-                // rebuild`). The in-memory synthesis cache must be cleared
-                // too — evict_oldest already deleted the SQLite rows, and a
-                // leftover memory entry would serve the evicted context's
-                // gist until the next restart.
-                if !evicted.is_empty() {
-                    let mut hnsw = self.hnsw.write().unwrap();
-                    for (slot, _) in &evicted {
-                        hnsw.clear_slot(*slot);
-                    }
-                    drop(hnsw);
-                    for (_, ctx) in &evicted {
-                        self.synthesis_cache.remove(*ctx);
-                    }
-                }
-
-                tracing::info!(
-                    evicted = evicted.len(),
-                    max_contexts = max,
-                    "evicted oldest contexts from index"
-                );
+        let embedding = self.embedder.embed(&text, EmbeddingPurpose::Document).await?;
+        let metadata = self.metadata.clone();
+        let hnsw_store = self.hnsw.clone();
+        let synthesis_cache = self.synthesis_cache.clone();
+        let model_name = self.embedder.model_name().to_owned();
+        let dimensions = self.config.dimensions;
+        let max_contexts = self.config.max_contexts;
+        tokio::task::spawn_blocking(move || {
+            let mut meta = metadata.lock().unwrap();
+            let current = meta.get_content_hash(ctx_id)?;
+            if current.as_deref() == Some(hash.as_str()) { return Ok(false); }
+            if current != before {
+                return Err(IndexError::Index("context was indexed by another refresh; retry with current blocks".into()));
             }
-        }
+            // Assign or get slot
+            let slot = meta.assign_slot(
+                ctx_id,
+                &hash,
+                &model_name,
+                dimensions,
+            )?;
 
-        Ok(true)
+            // Insert into HNSW
+            {
+                let mut hnsw = hnsw_store.write().unwrap();
+                hnsw.insert(slot, &embedding)?;
+                hnsw.save()?;
+            }
+
+            tracing::debug!(
+                context = %ctx_id.short(),
+                slot = slot,
+                "indexed context"
+            );
+
+            // LRU eviction: if max_contexts is set and we've exceeded it, evict oldest
+            if let Some(max) = max_contexts {
+                let count = meta.count()?;
+                if count > max {
+                    let to_evict = count - max;
+                    let evicted = meta.evict_oldest(to_evict)?;
+
+                    // The graph points for evicted slots remain in HNSW — it has
+                    // no delete — but clear_slot at least stops the embeddings
+                    // cache from continuing to serve them. meta is still held
+                    // here, so lock order (metadata -> hnsw) matches every other
+                    // writer. The graph points themselves are only reclaimed by
+                    // the next rebuild() (startup auto-rebuild or `kj synth
+                    // rebuild`). The in-memory synthesis cache must be cleared
+                    // too — evict_oldest already deleted the SQLite rows, and a
+                    // leftover memory entry would serve the evicted context's
+                    // gist until the next restart.
+                    if !evicted.is_empty() {
+                        let mut hnsw = hnsw_store.write().unwrap();
+                        for (slot, _) in &evicted {
+                            hnsw.clear_slot(*slot);
+                        }
+                        drop(hnsw);
+                        for (_, ctx) in &evicted {
+                            synthesis_cache.remove(*ctx);
+                        }
+                    }
+
+                    tracing::info!(
+                        evicted = evicted.len(),
+                        max_contexts = max,
+                        "evicted oldest contexts from index"
+                    );
+                }
+            }
+
+            Ok(true)
+        }).await.map_err(|e| IndexError::Index(format!("store index: {e}")))?
     }
 
     /// Rebuild the HNSW index from scratch, reclaiming dead slots from eviction.
@@ -490,29 +456,32 @@ impl SemanticIndex {
 
     /// Search for contexts similar to a text query.
     ///
-    /// Blocking — call from `spawn_blocking`.
-    pub fn search(&self, query: &str, k: usize) -> Result<Vec<SearchResult>, IndexError> {
-        let embedding = self.embedder.embed(query)?;
+    /// Embeds with query purpose, then searches on a blocking task.
+    pub async fn search(&self, query: &str, k: usize) -> Result<Vec<SearchResult>, IndexError> {
+        let embedding = self.embedder.embed(query, EmbeddingPurpose::Query).await?;
+        let hnsw_store = self.hnsw.clone();
+        let metadata = self.metadata.clone();
+        tokio::task::spawn_blocking(move || {
+            // Lock order: drop the hnsw guard before taking metadata (see struct docs).
+            let neighbors = {
+                let hnsw = hnsw_store.read().unwrap();
+                hnsw.search(&embedding, k)?
+            };
 
-        // Lock order: drop the hnsw guard before taking metadata (see struct docs).
-        let neighbors = {
-            let hnsw = self.hnsw.read().unwrap();
-            hnsw.search(&embedding, k)?
-        };
-
-        let meta = self.metadata.lock().unwrap();
-        let mut results = Vec::with_capacity(neighbors.len());
-        for (slot, distance) in neighbors {
-            if let Some(ctx_id) = meta.get_context_id(slot)? {
-                results.push(SearchResult {
-                    context_id: ctx_id,
-                    score: (1.0 - distance).clamp(0.0, 1.0),
-                    label: None,
-                });
+            let meta = metadata.lock().unwrap();
+            let mut results = Vec::with_capacity(neighbors.len());
+            for (slot, distance) in neighbors {
+                if let Some(ctx_id) = meta.get_context_id(slot)? {
+                    results.push(SearchResult {
+                        context_id: ctx_id,
+                        score: (1.0 - distance).clamp(0.0, 1.0),
+                        label: None,
+                    });
+                }
             }
-        }
 
-        Ok(results)
+            Ok(results)
+        }).await.map_err(|e| IndexError::Index(format!("search index: {e}")))?
     }
 
     /// Find contexts similar to a given context.
@@ -624,6 +593,12 @@ impl SemanticIndex {
         &self.synthesis_cache
     }
 
+    /// Serialize synthesis refreshes so concurrent requests can reuse the
+    /// first result. This guard is independent of all storage locks.
+    pub async fn synthesis_refresh(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.synthesis_refresh.lock().await
+    }
+
     /// Persist a synthesis result and update the in-memory cache.
     ///
     /// DB-first: writes to `index_meta.db` before touching the memory cache,
@@ -663,8 +638,68 @@ mod tests {
         pairs.iter().map(|(t, s)| (t.to_string(), *s)).collect()
     }
 
-    #[test]
-    fn cluster_label_picks_highest_summed_keyword() {
+    struct PausingEmbedder {
+        started: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+        purposes: Arc<Mutex<Vec<EmbeddingPurpose>>>,
+    }
+    #[async_trait::async_trait]
+    impl Embedder for PausingEmbedder {
+        fn model_name(&self) -> &str { "mock" }
+        fn revision(&self) -> &str { "mock-v1" }
+        fn dimensions(&self) -> usize { 32 }
+        async fn embed_batch(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
+            self.purposes.lock().unwrap().push(purpose);
+            if texts.iter().any(|text| text.contains("old snapshot")) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            MockEmbedder { dims: 32 }.embed_batch(texts, purpose).await
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_releases_storage_and_superseded_index_write_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let purposes = Arc::new(Mutex::new(Vec::new()));
+        let idx = Arc::new(SemanticIndex::new(test_config(dir.path()), Box::new(PausingEmbedder {
+            started: started.clone(), release: release.clone(), purposes: purposes.clone(),
+        })).unwrap());
+        let ctx = ContextId::new();
+        let old = { let idx = idx.clone(); tokio::spawn(async move {
+            idx.index_context(ctx, &make_blocks(ctx, "old snapshot waiting on the service")).await
+        }) };
+        started.notified().await;
+        let new = make_blocks(ctx, "new snapshot with the latest text");
+        tokio::time::timeout(std::time::Duration::from_secs(2), idx.index_context(ctx, &new))
+            .await.expect("inference must not hold the storage lock").unwrap();
+        release.notify_one();
+        assert!(old.await.unwrap().is_err(), "old refresh must not overwrite the newer commit");
+        assert!(!idx.index_context(ctx, &new).await.unwrap());
+        idx.search("query about the latest text", 1).await.unwrap();
+        assert_eq!(*purposes.lock().unwrap(), vec![EmbeddingPurpose::Document, EmbeddingPurpose::Document, EmbeddingPurpose::Query]);
+    }
+
+    #[tokio::test]
+    async fn profile_change_discards_synthesis_without_index_entries() {
+        let dir = TempDir::new().unwrap();
+        let ctx = ContextId::new();
+        {
+            let idx = SemanticIndex::new(test_config(dir.path()), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            idx.store_synthesis(ctx, synthesis::SynthesisResult {
+                content_hash: "old-profile".into(), gist: Some("old gist".into()),
+                keywords: vec![], top_blocks: vec![],
+            }).unwrap();
+        }
+        let idx = SemanticIndex::new(test_config(dir.path()), Box::new(NamedMockEmbedder {
+            inner: MockEmbedder { dims: 32 }, name: "changed-model".into(),
+        })).unwrap();
+        assert!(idx.synthesis_cache().get_any(ctx).is_none());
+    }
+
+    #[tokio::test]
+    async fn cluster_label_picks_highest_summed_keyword() {
         // "rust" totals 0.6+0.5=1.1 across two members; "async" only 0.9; "gpu" 0.4.
         let m1 = kw(&[("rust", 0.6), ("gpu", 0.4)]);
         let m2 = kw(&[("rust", 0.5), ("async", 0.9)]);
@@ -672,8 +707,8 @@ mod tests {
         assert_eq!(label.as_deref(), Some("rust"));
     }
 
-    #[test]
-    fn cluster_label_breaks_score_ties_alphabetically() {
+    #[tokio::test]
+    async fn cluster_label_breaks_score_ties_alphabetically() {
         // Both terms total 1.0; the alphabetically smaller ("alpha") wins,
         // regardless of member order.
         let m1 = kw(&[("zeta", 1.0)]);
@@ -688,8 +723,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cluster_label_none_when_no_keywords() {
+    #[tokio::test]
+    async fn cluster_label_none_when_no_keywords() {
         let empty: Vec<Vec<(String, f32)>> = vec![vec![], vec![]];
         assert_eq!(
             pick_cluster_label(empty.iter().map(|v| v.as_slice())),
@@ -704,20 +739,25 @@ mod tests {
         dims: usize,
     }
 
+    #[async_trait::async_trait]
     impl Embedder for MockEmbedder {
         fn model_name(&self) -> &str {
             "mock"
         }
 
+        fn revision(&self) -> &str { "mock-v1" }
+
         fn dimensions(&self) -> usize {
             self.dims
         }
 
-        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, IndexError> {
-            texts.iter().map(|t| self.embed(t)).collect()
+        async fn embed_batch(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
+            let mut vectors = Vec::new();
+            for text in texts { vectors.push(self.embed(text, purpose).await?); }
+            Ok(vectors)
         }
 
-        fn embed(&self, text: &str) -> Result<Vec<f32>, IndexError> {
+        async fn embed(&self, text: &str, _purpose: EmbeddingPurpose) -> Result<Vec<f32>, IndexError> {
             let mut v = vec![0.0f32; self.dims];
             // Hash text bytes into vector components
             for (i, byte) in text.bytes().enumerate() {
@@ -753,18 +793,21 @@ mod tests {
         name: String,
     }
 
+    #[async_trait::async_trait]
     impl Embedder for NamedMockEmbedder {
         fn model_name(&self) -> &str {
             &self.name
         }
+        fn revision(&self) -> &str { "mock-v1" }
+
         fn dimensions(&self) -> usize {
             self.inner.dimensions()
         }
-        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, IndexError> {
-            self.inner.embed_batch(texts)
+        async fn embed_batch(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
+            self.inner.embed_batch(texts, purpose).await
         }
-        fn embed(&self, text: &str) -> Result<Vec<f32>, IndexError> {
-            self.inner.embed(text)
+        async fn embed(&self, text: &str, _purpose: EmbeddingPurpose) -> Result<Vec<f32>, IndexError> {
+            self.inner.embed(text, _purpose).await
         }
     }
 
@@ -777,17 +820,22 @@ mod tests {
         dims: usize,
     }
 
+    #[async_trait::async_trait]
     impl Embedder for KeyedEmbedder {
         fn model_name(&self) -> &str {
             "keyed"
         }
+        fn revision(&self) -> &str { "mock-v1" }
+
         fn dimensions(&self) -> usize {
             self.dims
         }
-        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, IndexError> {
-            texts.iter().map(|t| self.embed(t)).collect()
+        async fn embed_batch(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
+            let mut vectors = Vec::new();
+            for text in texts { vectors.push(self.embed(text, purpose).await?); }
+            Ok(vectors)
         }
-        fn embed(&self, text: &str) -> Result<Vec<f32>, IndexError> {
+        async fn embed(&self, text: &str, _purpose: EmbeddingPurpose) -> Result<Vec<f32>, IndexError> {
             let mut v = vec![0.0f32; self.dims];
             if text.contains("PAIR") {
                 // Both pair points live near axis 0; slight perturbation on
@@ -813,12 +861,11 @@ mod tests {
 
     fn test_config(dir: &std::path::Path) -> IndexConfig {
         IndexConfig {
-            model_dir: dir.to_path_buf(),
             dimensions: 32,
             data_dir: dir.to_path_buf(),
             hnsw_max_nb_connection: 8,
             hnsw_ef_construction: 50,
-            max_tokens: 512,
+            max_context_bytes: 512,
             max_contexts: None,
         }
     }
@@ -845,16 +892,16 @@ mod tests {
     /// traverse. Populating enough unrelated points guarantees layer-0
     /// connectivity so tests that assert on search/neighbor results are stable.
     /// The `FILLER` keyword keeps `KeyedEmbedder` fillers off the PAIR axis.
-    fn seed_filler(idx: &SemanticIndex, n: usize) {
+    async fn seed_filler(idx: &SemanticIndex, n: usize) {
         for i in 0..n {
             let ctx = ContextId::new();
             let filler = format!("FILLER context number {i}");
-            idx.index_context(ctx, &make_blocks(ctx, &filler)).unwrap();
+            idx.index_context(ctx, &make_blocks(ctx, &filler)).await.unwrap();
         }
     }
 
-    #[test]
-    fn test_index_and_search_round_trip() {
+    #[tokio::test]
+    async fn test_index_and_search_round_trip() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
@@ -862,10 +909,10 @@ mod tests {
         let ctx = ContextId::new();
         let blocks = make_blocks(ctx, "the quick brown fox jumps over the lazy dog");
 
-        let indexed = idx.index_context(ctx, &blocks).unwrap();
+        let indexed = idx.index_context(ctx, &blocks).await.unwrap();
         assert!(indexed, "first indexing should embed");
 
-        let results = idx.search("quick brown fox", 5).unwrap();
+        let results = idx.search("quick brown fox", 5).await.unwrap();
         assert!(!results.is_empty(), "search should return results");
         assert_eq!(results[0].context_id, ctx);
 
@@ -879,8 +926,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_dedup_same_content() {
+    #[tokio::test]
+    async fn test_dedup_same_content() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
@@ -888,32 +935,32 @@ mod tests {
         let ctx = ContextId::new();
         let blocks = make_blocks(ctx, "identical content for dedup test");
 
-        let first = idx.index_context(ctx, &blocks).unwrap();
+        let first = idx.index_context(ctx, &blocks).await.unwrap();
         assert!(first, "first call should index");
 
-        let second = idx.index_context(ctx, &blocks).unwrap();
+        let second = idx.index_context(ctx, &blocks).await.unwrap();
         assert!(!second, "second call with same content should skip");
     }
 
-    #[test]
-    fn test_neighbors() {
+    #[tokio::test]
+    async fn test_neighbors() {
         // This test covers the `neighbors()` API — metadata lookup, self-
         // exclusion, score clamping. It does NOT assert on HNSW approximate-
         // nearest-neighbor ordering: hnsw_rs's reverse_update writes reverse
         // edges at the neighbour's own level (not the current search layer),
         // so points inserted after a random-higher-layer point may not appear
         // in its layer-0 neighbour list. Semantic ordering quality belongs in
-        // integration tests with the real ONNX embedder + a realistic corpus.
+        // integration tests with a real embedding service + a realistic corpus.
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(KeyedEmbedder { dims: 32 })).unwrap();
-        seed_filler(&idx, 30);
+        seed_filler(&idx, 30).await;
 
         let ctx1 = ContextId::new();
         let ctx2 = ContextId::new();
-        idx.index_context(ctx1, &make_blocks(ctx1, "PAIR alpha content"))
+        idx.index_context(ctx1, &make_blocks(ctx1, "PAIR alpha content")).await
             .unwrap();
-        idx.index_context(ctx2, &make_blocks(ctx2, "PAIR beta content"))
+        idx.index_context(ctx2, &make_blocks(ctx2, "PAIR beta content")).await
             .unwrap();
 
         let neighbors = idx.neighbors(ctx1, 5).unwrap();
@@ -928,8 +975,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_persistence_round_trip() {
+    #[tokio::test]
+    async fn test_persistence_round_trip() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
 
@@ -942,10 +989,10 @@ mod tests {
                 SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
             // See note in test_neighbors: tiny HNSW graphs are probabilistically
             // disconnected, so seed enough points to guarantee reachability.
-            seed_filler(&idx, 30);
-            idx.index_context(ctx1, &make_blocks(ctx1, "persistence test alpha"))
+            seed_filler(&idx, 30).await;
+            idx.index_context(ctx1, &make_blocks(ctx1, "persistence test alpha")).await
                 .unwrap();
-            idx.index_context(ctx2, &make_blocks(ctx2, "persistence test beta"))
+            idx.index_context(ctx2, &make_blocks(ctx2, "persistence test beta")).await
                 .unwrap();
             idx.save().unwrap();
         }
@@ -954,7 +1001,7 @@ mod tests {
         {
             let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
 
-            let results = idx.search("persistence test", 5).unwrap();
+            let results = idx.search("persistence test", 5).await.unwrap();
             assert!(results.len() >= 2, "should find both contexts after reload");
 
             let neighbors = idx.neighbors(ctx1, 5).unwrap();
@@ -967,15 +1014,15 @@ mod tests {
     /// hnsw write lock — an ABBA deadlock under concurrency. One indexer plus
     /// two searchers hammering the same index trips the inversion within a few
     /// iterations; the channel timeout converts a hang into a test failure.
-    #[test]
-    fn test_concurrent_search_and_index_no_deadlock() {
+    #[tokio::test]
+    async fn test_concurrent_search_and_index_no_deadlock() {
         use std::time::Duration;
 
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx =
             Arc::new(SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap());
-        seed_filler(&idx, 10);
+        seed_filler(&idx, 10).await;
 
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let mut handles = Vec::new();
@@ -984,26 +1031,26 @@ mod tests {
         {
             let idx = idx.clone();
             let done = done_tx.clone();
-            handles.push(std::thread::spawn(move || {
+            handles.push(std::thread::spawn(move || tokio::runtime::Runtime::new().unwrap().block_on(async move {
                 for i in 0..200 {
                     let ctx = ContextId::new();
                     let blocks = make_blocks(ctx, &format!("stress indexer content {i}"));
-                    idx.index_context(ctx, &blocks).unwrap();
+                    idx.index_context(ctx, &blocks).await.unwrap();
                 }
                 let _ = done.send(());
-            }));
+            })));
         }
 
         // Searcher threads: hnsw.read → metadata (the inverted order pre-fix)
         for t in 0..2 {
             let idx = idx.clone();
             let done = done_tx.clone();
-            handles.push(std::thread::spawn(move || {
+            handles.push(std::thread::spawn(move || tokio::runtime::Runtime::new().unwrap().block_on(async move {
                 for i in 0..200 {
-                    idx.search(&format!("stress query {t} {i}"), 3).unwrap();
+                    idx.search(&format!("stress query {t} {i}"), 3).await.unwrap();
                 }
                 let _ = done.send(());
-            }));
+            })));
         }
         drop(done_tx);
 
@@ -1017,21 +1064,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_empty_index_search() {
+    #[tokio::test]
+    async fn test_empty_index_search() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
 
-        let results = idx.search("anything", 5).unwrap();
+        let results = idx.search("anything", 5).await.unwrap();
         assert!(
             results.is_empty(),
             "empty index should return empty results"
         );
     }
 
-    #[test]
-    fn test_max_contexts_eviction() {
+    #[tokio::test]
+    async fn test_max_contexts_eviction() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config(dir.path());
         config.max_contexts = Some(2);
@@ -1041,16 +1088,16 @@ mod tests {
         let ctx2 = ContextId::new();
         let ctx3 = ContextId::new();
 
-        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first")).await
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second")).await
             .unwrap();
         assert_eq!(idx.len(), 2);
 
         // Indexing a third should evict the oldest (ctx1)
         std::thread::sleep(std::time::Duration::from_millis(10));
-        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third")).await
             .unwrap();
         assert_eq!(idx.len(), 2, "should have evicted down to max_contexts");
 
@@ -1064,20 +1111,20 @@ mod tests {
         assert!(meta.get_slot(ctx3).unwrap().is_some(), "ctx3 should remain");
     }
 
-    #[test]
-    fn test_empty_content_not_indexed() {
+    #[tokio::test]
+    async fn test_empty_content_not_indexed() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
 
         let ctx = ContextId::new();
-        let indexed = idx.index_context(ctx, &[]).unwrap();
+        let indexed = idx.index_context(ctx, &[]).await.unwrap();
         assert!(!indexed, "empty blocks should not be indexed");
         assert!(idx.is_empty());
     }
 
-    #[test]
-    fn test_eviction_clears_embeddings_cache() {
+    #[tokio::test]
+    async fn test_eviction_clears_embeddings_cache() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config(dir.path());
         config.max_contexts = Some(2);
@@ -1087,15 +1134,15 @@ mod tests {
         let ctx2 = ContextId::new();
         let ctx3 = ContextId::new();
 
-        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first")).await
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second")).await
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         // Evicts ctx1; no rebuild has run yet, so the graph point for ctx1
         // is still physically present — only the cache entry should be gone.
-        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third")).await
             .unwrap();
         assert_eq!(idx.len(), 2);
 
@@ -1108,8 +1155,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_rebuild_reclaims_evicted_slots() {
+    #[tokio::test]
+    async fn test_rebuild_reclaims_evicted_slots() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config(dir.path());
         config.max_contexts = Some(2);
@@ -1119,14 +1166,14 @@ mod tests {
         let ctx2 = ContextId::new();
         let ctx3 = ContextId::new();
 
-        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first")).await
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second")).await
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         // Indexing a third evicts ctx1 (oldest) down to max_contexts = 2.
-        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third")).await
             .unwrap();
         assert_eq!(idx.len(), 2);
 
@@ -1149,7 +1196,7 @@ mod tests {
             "graph must match metadata after rebuild"
         );
 
-        let results = idx.search("context", 10).unwrap();
+        let results = idx.search("context", 10).await.unwrap();
         let ids: Vec<ContextId> = results.iter().map(|r| r.context_id).collect();
         assert!(
             !ids.contains(&ctx1),
@@ -1161,8 +1208,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_rebuild_repairs_orphan_metadata_row() {
+    #[tokio::test]
+    async fn test_rebuild_repairs_orphan_metadata_row() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
@@ -1184,8 +1231,8 @@ mod tests {
         assert_eq!(idx.len(), 0, "orphan row should be removed from metadata");
     }
 
-    #[test]
-    fn test_startup_auto_rebuild_reclaims_dead_slots() {
+    #[tokio::test]
+    async fn test_startup_auto_rebuild_reclaims_dead_slots() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config(dir.path());
         // Generous enough that seeding fillers doesn't evict any of them, but
@@ -1199,8 +1246,8 @@ mod tests {
         {
             let idx =
                 SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
-            seed_filler(&idx, 30);
-            idx.index_context(ctx_live, &make_blocks(ctx_live, "persistent live context"))
+            seed_filler(&idx, 30).await;
+            idx.index_context(ctx_live, &make_blocks(ctx_live, "persistent live context")).await
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
             // Pushes count to 32 > 31, evicting the oldest filler — leaves a
@@ -1209,7 +1256,7 @@ mod tests {
             idx.index_context(
                 extra_ctx,
                 &make_blocks(extra_ctx, "one more filler to force eviction"),
-            )
+            ).await
             .unwrap();
 
             let meta_count = idx.len();
@@ -1233,15 +1280,15 @@ mod tests {
             "auto-rebuild on startup should have reclaimed the dead slot"
         );
 
-        let results = idx.search("persistent live context", 5).unwrap();
+        let results = idx.search("persistent live context", 5).await.unwrap();
         assert!(
             !results.is_empty(),
             "search should still work after auto-rebuild"
         );
     }
 
-    #[test]
-    fn test_model_mismatch_wipes_index() {
+    #[tokio::test]
+    async fn test_model_mismatch_wipes_index() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
 
@@ -1250,9 +1297,9 @@ mod tests {
                 SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
             // See seed_filler's doc comment: enough points to guarantee
             // layer-0 connectivity so post-wipe search/index checks are stable.
-            seed_filler(&idx, 30);
+            seed_filler(&idx, 30).await;
             let ctx = ContextId::new();
-            idx.index_context(ctx, &make_blocks(ctx, "model mismatch test alpha"))
+            idx.index_context(ctx, &make_blocks(ctx, "model mismatch test alpha")).await
                 .unwrap();
             idx.save().unwrap();
             assert_eq!(idx.len(), 31);
@@ -1269,27 +1316,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(idx.len(), 0, "model name mismatch must wipe the index");
-        let results = idx.search("model mismatch test alpha", 5).unwrap();
+        let results = idx.search("model mismatch test alpha", 5).await.unwrap();
         assert!(results.is_empty(), "wiped index should return no results");
 
         // The index must still be usable after the wipe.
         let ctx2 = ContextId::new();
-        idx.index_context(ctx2, &make_blocks(ctx2, "fresh content after wipe"))
+        idx.index_context(ctx2, &make_blocks(ctx2, "fresh content after wipe")).await
             .unwrap();
         assert_eq!(idx.len(), 1);
-        let results2 = idx.search("fresh content after wipe", 5).unwrap();
+        let results2 = idx.search("fresh content after wipe", 5).await.unwrap();
         assert!(!results2.is_empty(), "index should work after the wipe");
     }
 
-    #[test]
-    fn test_dimensions_mismatch_wipes_index() {
+    #[tokio::test]
+    async fn test_dimensions_mismatch_wipes_index() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
 
         {
             let idx =
                 SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
-            seed_filler(&idx, 30);
+            seed_filler(&idx, 30).await;
             idx.save().unwrap();
             assert_eq!(idx.len(), 30);
         }
@@ -1301,17 +1348,17 @@ mod tests {
         let idx = SemanticIndex::new(mismatched, Box::new(MockEmbedder { dims: 16 })).unwrap();
 
         assert_eq!(idx.len(), 0, "dimension mismatch must wipe the index");
-        let results = idx.search("anything", 5).unwrap();
+        let results = idx.search("anything", 5).await.unwrap();
         assert!(results.is_empty(), "wiped index should return no results");
 
         let ctx = ContextId::new();
-        idx.index_context(ctx, &make_blocks(ctx, "content in new dims"))
+        idx.index_context(ctx, &make_blocks(ctx, "content in new dims")).await
             .unwrap();
         assert_eq!(idx.len(), 1, "index should work after the wipe");
     }
 
-    #[test]
-    fn test_matching_model_preserves_index() {
+    #[tokio::test]
+    async fn test_matching_model_preserves_index() {
         // Mirrors test_persistence_round_trip: identical model name + dims
         // on reopen must NOT trigger the mismatch guard.
         let dir = TempDir::new().unwrap();
@@ -1321,8 +1368,8 @@ mod tests {
         {
             let idx =
                 SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
-            seed_filler(&idx, 30);
-            idx.index_context(ctx1, &make_blocks(ctx1, "matching model preserved"))
+            seed_filler(&idx, 30).await;
+            idx.index_context(ctx1, &make_blocks(ctx1, "matching model preserved")).await
                 .unwrap();
             idx.save().unwrap();
             assert_eq!(idx.len(), 31);
@@ -1335,22 +1382,22 @@ mod tests {
             "identical model name + dimensions must preserve the index"
         );
 
-        let results = idx.search("matching model preserved", 5).unwrap();
+        let results = idx.search("matching model preserved", 5).await.unwrap();
         assert!(
             !results.is_empty(),
             "search should still find indexed content after reopen"
         );
     }
 
-    #[test]
-    fn test_mismatch_wipe_removes_pending_dump() {
+    #[tokio::test]
+    async fn test_mismatch_wipe_removes_pending_dump() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
 
         {
             let idx =
                 SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
-            seed_filler(&idx, 30);
+            seed_filler(&idx, 30).await;
             idx.save().unwrap();
         }
 
@@ -1403,7 +1450,7 @@ mod tests {
 
         assert_eq!(idx.len(), 0, "old-model metadata rows must be gone");
         let ctx = ContextId::new();
-        idx.index_context(ctx, &make_blocks(ctx, "works after dump cleanup"))
+        idx.index_context(ctx, &make_blocks(ctx, "works after dump cleanup")).await
             .unwrap();
         assert_eq!(idx.len(), 1, "index should work after the wipe");
     }
@@ -1411,8 +1458,8 @@ mod tests {
     /// Eviction must clear the in-memory synthesis cache alongside the SQLite
     /// rows — otherwise get_any() serves an evicted context's gist/keywords
     /// until the next restart (deepseek review finding, 2026-07-12).
-    #[test]
-    fn test_eviction_clears_synthesis_cache_in_memory() {
+    #[tokio::test]
+    async fn test_eviction_clears_synthesis_cache_in_memory() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config(dir.path());
         config.max_contexts = Some(2);
@@ -1422,7 +1469,7 @@ mod tests {
         let ctx2 = ContextId::new();
         let ctx3 = ContextId::new();
 
-        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first")).await
             .unwrap();
         idx.store_synthesis(
             ctx1,
@@ -1435,11 +1482,11 @@ mod tests {
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second")).await
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         // Evicts ctx1 (oldest).
-        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third")).await
             .unwrap();
         assert_eq!(idx.len(), 2);
 
@@ -1449,8 +1496,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_synthesis_survives_reopen() {
+    #[tokio::test]
+    async fn test_synthesis_survives_reopen() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let ctx = ContextId::new();
@@ -1487,8 +1534,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_synthesis_hash_invalidation_still_works() {
+    #[tokio::test]
+    async fn test_synthesis_hash_invalidation_still_works() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
         let ctx = ContextId::new();
@@ -1515,8 +1562,8 @@ mod tests {
         assert!(idx.synthesis_cache().get_any(ctx).is_some());
     }
 
-    #[test]
-    fn test_eviction_removes_persisted_synthesis() {
+    #[tokio::test]
+    async fn test_eviction_removes_persisted_synthesis() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config(dir.path());
         config.max_contexts = Some(2);
@@ -1536,19 +1583,19 @@ mod tests {
             let idx =
                 SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
 
-            idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+            idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first")).await
                 .unwrap();
             idx.store_synthesis(ctx1, synth_for("alpha")).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
 
-            idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+            idx.index_context(ctx2, &make_blocks(ctx2, "beta context second")).await
                 .unwrap();
             idx.store_synthesis(ctx2, synth_for("beta")).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
 
             // Indexing a third context evicts ctx1 (oldest) down to
             // max_contexts = 2 — evict_oldest must also drop ctx1's synthesis.
-            idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+            idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third")).await
                 .unwrap();
             idx.store_synthesis(ctx3, synth_for("gamma")).unwrap();
 

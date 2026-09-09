@@ -181,30 +181,28 @@ From a sibling session's bridge work, not yet folded into
 
 ## Synthesis re-embeds the whole context on every block write (2026-09-01)
 
-**Automatic synthesis is disabled** (`kaijutsu-server/src/rpc.rs:3007`,
-`spawn_index_watcher` gets `None` for `on_indexed`, and the call site cites
-this entry by title as the re-enable condition — keep the title stable).
-`run_synthesis` (`runtime/synthesis.rs:60-68`) still embeds every text block
-in the context on each call, then again at sentence granularity, then a third
-time over 50 n-gram candidates — appending one block to a context with N
-blocks costs an embed of all N. Measured 2026-09-01 on zorak: 16 `rten-*`
-threads at 72-99% for ~17 minutes from kernel start, load average 25+ on a
-16-core box, for four contexts indexed in that window.
+**Automatic synthesis remains disabled** (`spawn_index_watcher` receives
+`None` for `on_indexed`; keep this title stable for its re-enable condition).
+Unchanged manual synthesis now reuses a hash of its exact input and embedding
+profile, survives restart, and accepts `--force`. lfm2d replaces builtin
+embedding inference; see `docs/synthesis.md` for its configuration and contract.
 
-**Fix 1 — incremental.** `SynthesisCache::get(ctx, hash)` still cannot hit:
-`run_synthesis` still stamps every result `content_hash: String::new()`
-(`synthesis.rs:113,126,152`, re-verified), so the key is always empty.
-`extract_context_content` already computes a usable hash for `index_context`
-— reuse it. Also unconditional: `synth_all`/`synth_context`
-(`kj_builtin.rs:253,353`) call `run_synthesis` regardless of `was_indexed`,
-which they compute and use only for a counter — wants an explicit
-force-resynthesis flag.
+Changed contexts still embed every selected block plus gist/keyword candidates.
+Next: per-block vector reuse and coalescing changed refreshes before enabling
+automatic synthesis. Manual refreshes currently serialize across the index.
+A final snapshot check refuses changes during inference, but publication is
+not atomic with later context mutations. Index refresh checks competing
+commits, but its supplied snapshot has no authoritative revision; a stale
+snapshot submitted after a newer commit can still overwrite it. Both paths
+want revision-aware publication through the kernel sequencer.
 
-**Fix 2 (longer term) — get the models out of the kernel process.** Amy,
-2026-09-01: swap bge-small/`rten` for the lfm2d service (already run, already
-carries the gate classifier). `RTEN_NUM_THREADS` is unset, so rten's pool
-defaults to every physical core and competes with tokio/kaish/everything
-else. Subsumes Fix 1 rather than replacing it.
+Selection also needs a separate decision: synthesis preserves its old
+non-File/length filter, whereas indexing requires terminal Text/Thinking
+blocks. Neither filter explicitly accounts for excluded blocks. Review that
+policy before automatic synthesis returns. An empty index projection also
+leaves its prior search vector intact; synthesis now clears its own preview,
+but search needs an explicit removal policy. Audio still uses rten; its stale
+`kj/audio.rs` embedding-reference comment belongs to the active kj lane.
 
 ## The WAL grows without bound and never shrinks (2026-09-01)
 

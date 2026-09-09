@@ -10,10 +10,9 @@ workspace = true
 [dependencies]
 kaijutsu-types.workspace = true
 
-# ONNX inference (pure Rust) + tokenizer
-rten = "0.24"
-rten-tensor = "0.24"
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# Embedding service client
+async-trait.workspace = true
+reqwest = { version = "0.13", features = ["json"] }
 
 # Vector index
 hnsw_rs = "0.3"
@@ -43,5 +42,5 @@ thiserror = { workspace = true }
 sha2 = "0.10"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "test-util"] }
 tempfile = { workspace = true }

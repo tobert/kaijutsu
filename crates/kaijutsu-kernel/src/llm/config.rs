@@ -406,18 +406,16 @@ pub struct ResolvedSlot {
     pub extra: Option<String>,
 }
 
-/// Configuration for a local ONNX embedding model (the former `[embedding]`
-/// section of models.toml, now the `embedding_config` singleton row).
+/// Configuration for the lfm2d embedding service (`embedding_config` singleton).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddingModelConfig {
-    /// Whether embedding is enabled.
     pub enabled: bool,
-    /// Directory containing model.onnx + tokenizer.json.
-    pub model_dir: std::path::PathBuf,
-    /// Output embedding dimensions (e.g. 384 for bge-small).
-    pub dimensions: usize,
-    /// Maximum input tokens (truncated beyond this).
-    pub max_tokens: usize,
+    /// HTTP(S) endpoint or unix:///absolute/socket/path.
+    pub endpoint: String,
+    pub timeout_ms: u64,
+    pub max_in_flight: usize,
+    /// UTF-8 byte budget of the context projection used by semantic search.
+    pub max_context_bytes: usize,
 }
 
 #[cfg(test)]

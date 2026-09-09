@@ -238,15 +238,10 @@ pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelCo
     if !row.enabled {
         return Ok(None);
     }
-    // `~` expansion happens here, not at write time: the stored value is what
-    // the operator typed, so a config moved between machines keeps meaning
-    // "my home directory" rather than someone else's absolute path.
-    let expanded = shellexpand::tilde(&row.model_dir).into_owned();
     Ok(Some(EmbeddingModelConfig {
-        enabled: true,
-        model_dir: std::path::PathBuf::from(expanded),
-        dimensions: row.dimensions as usize,
-        max_tokens: row.max_tokens as usize,
+        enabled: true, endpoint: row.endpoint,
+        timeout_ms: row.timeout_ms as u64, max_in_flight: row.max_in_flight as usize,
+        max_context_bytes: row.max_context_bytes as usize,
     }))
 }
 
@@ -490,17 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn embedding_config_reads_from_the_db_and_expands_tilde() {
+    fn embedding_config_reads_service_defaults() {
         let db = seeded_db();
         let emb = load_embedding_config(&db).unwrap().expect("floor seeds embedding");
-        assert_eq!(emb.dimensions, 384);
-        assert_eq!(emb.max_tokens, 512);
-        assert!(
-            !emb.model_dir.to_string_lossy().starts_with('~'),
-            "~ must be expanded at read time: {:?}",
-            emb.model_dir
-        );
-        assert!(emb.model_dir.ends_with("bge-small-en-v1.5"));
+        assert_eq!(emb.endpoint, "http://lfm2d-1.taila4abc.ts.net:8088");
+        assert_eq!(emb.timeout_ms, 30_000);
+        assert_eq!(emb.max_in_flight, 2);
+        assert_eq!(emb.max_context_bytes, 2048);
     }
 
     #[test]
@@ -580,13 +571,12 @@ mod tests {
         let mut db = seeded_db();
         db.set_embedding_config(&EmbeddingConfigRow {
             enabled: false,
-            model_dir: "/tmp/nope".into(),
-            dimensions: 7,
-            max_tokens: 9,
+            endpoint: "http://localhost:9".into(),
+            timeout_ms: 7, max_in_flight: 1, max_context_bytes: 9,
         })
         .unwrap();
         reseed_factory_backends(&mut db, PrincipalId::system()).unwrap();
         let emb = load_embedding_config(&db).unwrap().expect("reseed re-enables");
-        assert_eq!(emb.dimensions, 384);
+        assert_eq!(emb.endpoint, "http://lfm2d-1.taila4abc.ts.net:8088");
     }
 }

@@ -22,6 +22,8 @@
 //! file exercises the "doesn't abort boot" / "visibly failed" guarantees
 //! with a deliberately-broken mcp.toml instead.
 
+mod support;
+
 use kaijutsu_kernel::mcp::InstanceId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -44,6 +46,7 @@ transport = "carrier_pigeon"
     )
     .unwrap();
 
+    support::disable_embeddings(data_dir.path());
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         Some(config_dir.path()),
         &kaijutsu_server::config_mounts::ConfigMounts::new(config_dir.path().join("config")),

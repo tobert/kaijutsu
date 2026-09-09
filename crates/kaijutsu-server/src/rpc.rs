@@ -2973,19 +2973,20 @@ pub async fn create_shared_kernel(
 
     // Initialize semantic index if embedding model is configured
     let semantic_index = if let Some(emb_config) = embedding_config {
-        let index_config = kaijutsu_index::IndexConfig::new(
-            emb_config.model_dir.clone(),
-            emb_config.dimensions,
-            emb_config.max_tokens,
-            &resolved_data_dir,
-        );
-        match kaijutsu_index::RtenEmbedder::new(
-            &emb_config.model_dir,
-            emb_config.dimensions,
-            emb_config.max_tokens,
-        ) {
+        match kaijutsu_index::Lfm2dEmbedder::connect(
+            &emb_config.endpoint,
+            std::time::Duration::from_millis(emb_config.timeout_ms),
+            emb_config.max_in_flight,
+        ).await {
             Ok(embedder) => {
-                match kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder)) {
+                use kaijutsu_index::Embedder;
+                let index_config = kaijutsu_index::IndexConfig::new(
+                    embedder.dimensions(), emb_config.max_context_bytes, &resolved_data_dir,
+                );
+                let loaded = tokio::task::spawn_blocking(move ||
+                    kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder))
+                ).await.map_err(|e| capnp::Error::failed(format!("load semantic index: {e}")))?;
+                match loaded {
                     Ok(idx) => {
                         let idx = Arc::new(idx);
                         // Spawn background watcher for re-indexing on block completion
@@ -3013,7 +3014,7 @@ pub async fn create_shared_kernel(
                         );
                         log::info!(
                             "Semantic index initialized with {}",
-                            emb_config.model_dir.display()
+                            emb_config.endpoint
                         );
                         Some(idx)
                     }
@@ -7334,11 +7335,7 @@ impl kernel::Server for KernelImpl {
             async move {
                 let search_results = match &kernel.semantic_index {
                     Some(idx) => {
-                        let idx = idx.clone();
-                        let q = query.clone();
-                        tokio::task::spawn_blocking(move || idx.search(&q, k))
-                            .await
-                            .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                        idx.search(&query, k).await
                             .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?
                     }
                     None => vec![],
