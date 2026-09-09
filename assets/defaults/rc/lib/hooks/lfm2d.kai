@@ -106,8 +106,8 @@ fi
 
 # -- a call whose every clause is exempt proceeds without being scored.
 # Three exemptions. The first two are narrow and both require `kj` as the
-# first word AND no redirect; the third is a static classification kept
-# entirely in Rust (`kj::readonly::is_read_only_kj`,
+# first word AND no redirect; the third is a classification kept entirely
+# in Rust (`kj::readonly::is_read_only_kj`,
 # crates/kaijutsu-kernel/src/kj/readonly.rs).
 #
 # `has_redirect` gates exemptions 1 and 2. A redirect turns any command
@@ -166,8 +166,9 @@ fi
 #    per-command branch of `items_filter` above, straight from
 #    `KJ_TOOL_PLAN`'s `commands[].kj_readonly` field
 #    (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN") -- itself computed by
-#    `kj::readonly::is_read_only_kj` against a static per-verb table, never
-#    derived here. That function already refuses a redirect, a background
+#    `kj::readonly::is_read_only_kj` against each verb's own declared
+#    effect (`kj/effect.rs`, `docs/kj-verb-class.md`), never derived here.
+#    That function already refuses a redirect, a background
 #    call, a heredoc, a redacted argument, and any command whose name isn't
 #    exactly `kj`, so none of those need re-checking in this filter --
 #    trusting the field is the point of keeping the classification in Rust.

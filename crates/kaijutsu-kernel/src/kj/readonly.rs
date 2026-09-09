@@ -1,4 +1,4 @@
-//! Static read-only classification for a `kj` invocation reaching the shell.
+//! Read-only classification for a `kj` invocation reaching the shell.
 //!
 //! `lfm2d-advisory` (`assets/defaults/rc/lib/hooks/lfm2d.kai`) scores every
 //! `shell_write` clause through a classifier that over-escalates on ordinary
@@ -6,11 +6,11 @@
 //! <id>` lands `situation-normal` 0.791 and `kj rc show <path>` 0.675, and
 //! anything but `informative` escalates — so a verb named `read` asked a
 //! human for permission to read. The escalation is not uniform, which is why
-//! a pass list beats tuning: `kj block list` (`informative` 0.897) and
+//! a declared class beats tuning: `kj block list` (`informative` 0.897) and
 //! `kj context list` (0.960) sail through, so neighbouring reads on the same
-//! noun disagree. This module is Amy's fix: a static pass list for
-//! read-only `kj` verbs, consulted before the classifier ever runs, so a
-//! call this module accepts skips scoring entirely (`KJ_TOOL_PLAN`'s
+//! noun disagree. This module is Amy's fix: every `kj` verb declares its own
+//! effect (`kj/effect.rs`, `docs/kj-verb-class.md`), and a call whose effect
+//! is [`Effect::Read`] skips the classifier entirely (`KJ_TOOL_PLAN`'s
 //! `kj_readonly` field, wired in `mcp/broker.rs`).
 //!
 //! [`is_read_only_kj`] takes one [`PlannedCommand`] — kaish's own plan
@@ -19,7 +19,14 @@
 //! one wrong turns this into a bypass, so read every doc comment on
 //! [`is_read_only_kj`] before touching it.
 //!
-//! ## `${VAR}` is safe in a fixed subcommand's flags, and only there
+//! Conditions 1–5 are structural: the command is exactly `kj`, carries no
+//! redirect, background flag, or heredoc, and every argument is plain text.
+//! Condition 6 asks the verb itself: the plain arguments, with the leading
+//! `kj` dropped, are handed to [`classify`], and the answer is `true` only
+//! when it returns [`Effect::Read`]. There is no table here any more — the
+//! verb's own [`Classify`] impl is the only place the question is answered.
+//!
+//! ## `${VAR}` is safe in a value position, and only there
 //!
 //! kaish renders an unexpanded `${VAR}` reference as the literal text
 //! `${VAR}` inside a [`PlannedValue::Plain`] — the plan is parse
@@ -29,16 +36,15 @@
 //! *one* argument, never a flag plus a value plus a trailing clause.
 //!
 //! That makes `${VAR}` harmless in a value position on an already-resolved
-//! read-only subcommand — `kj block read ${ID}` still runs `block read`,
-//! whatever `${ID}` turns out to be, and `block read` takes no flag that
-//! writes. It is NOT safe in the verb or subcommand position: `kj ${VERB}
-//! list` cannot be looked up in [`READ_ONLY_TABLE`] (the literal text
-//! `${VERB}` matches no known command name), so [`is_read_only_kj`] simply
-//! fails to resolve it and returns `false` — condition 6 refuses it before
-//! any question of expansion-time danger even arises. No special case is
-//! needed for either direction: the table lookup itself is what makes the
-//! verb/subcommand position safe, and the argument semantics above are what
-//! make the flag position safe.
+//! read-only verb — `kj block read ${ID}` still runs `block read`, whatever
+//! `${ID}` turns out to be, and a `String` positional accepts it as-is. It
+//! is NOT safe in the verb or subcommand position: clap has no subcommand
+//! named `${VERB}` to resolve, so `kj ${VERB} list` fails to parse and
+//! condition 6 refuses before any question of expansion-time danger even
+//! arises. The same failure mode catches a `${VAR}` sitting in a typed
+//! flag — `kj wait ${CTX} --timeout ${T}` fails to parse `${T}` as the
+//! `u64` `--timeout` takes, so it refuses too, even though `${CTX}`'s own
+//! `String` slot would have been fine alone.
 //!
 //! ## The redirect hole this closes
 //!
@@ -56,318 +62,23 @@
 //! exempting the gate's own answer path. See that filter's comment in
 //! `assets/defaults/rc/lib/hooks/lfm2d.kai` for the trade.
 //!
-//! ## Two-level tables only — a nested subcommand is excluded wholesale
-//!
-//! [`READ_ONLY_TABLE`] pairs a command with exactly one subcommand token,
-//! because that is as deep as [`is_read_only_kj`] ever looks. Several `kj`
-//! verbs nest a third level under one subcommand — `kj backend default
-//! show` (read) vs. `kj backend default set` (write), `kj cast slot set`,
-//! `kj drift edge rm` — and this module cannot tell those apart: `backend`
-//! `default` is one table entry regardless of what follows it. So a
-//! subcommand with a mixed-safety third level is never entered in
-//! [`READ_ONLY_TABLE`] at all, not even for its read half. Nothing is lost
-//! when every branch beneath it already mutates (`cast slot`, `drift
-//! edge`); `backend default show` is the one case that gives up a real
-//! read-only path for safety — recorded in the per-entry table below.
-//!
 //! ## `kj ledger` is exempt as a verb, not as a set of reads
 //!
-//! `kj ledger list`/`show`/`rules`/`runs` are genuinely read-only by this
-//! module's own rules, but none of `kj ledger`'s subcommands appear in
-//! [`READ_ONLY_TABLE`] — the whole verb stays classified mutating in
-//! [`MUTATING_TABLE`] (for [`every_kj_subcommand_is_classified`]'s
-//! exhaustiveness only). The verb is exempt whole, reads and answers
-//! alike, by [`is_gate_exempt_kj`]: it is the gate's answer path, and a
-//! gated answer path is not one. The evaluator in `mcp/broker.rs` skips
-//! PreCall for a program made only of exempt commands
-//! ([`program_is_gate_exempt`]), so no hook — asking, denying, or
-//! scoring — sees `kj ledger allow <id>`. The advisory hook's own
-//! `kj ledger` exemption in jq is now a second statement of the same rule
-//! and can go when that hook is next edited.
+//! `kj ledger list`/`show`/`rules`/`runs` classify as [`Effect::Read`] by
+//! their own declaration, but the whole verb is exempt whether or not a
+//! given call reads: [`is_gate_exempt_kj`] accepts any `kj ledger` call that
+//! meets conditions 1–5, regardless of what [`classify`] says about it. A
+//! hook that could ask about `kj ledger allow <id>` makes answering an ask
+//! require answering another ask, so the exemption is structural rather than
+//! a hook's policy: the evaluator skips PreCall for a program made only of
+//! exempt commands ([`program_is_gate_exempt`]). It is safe only because a
+//! seat cannot answer its own ask (a context check in the ledger,
+//! `docs/gate-and-shell-split.md`, "No self-approval"); remove that
+//! invariant and this exemption goes with it.
 
 use kaish_types::plan::{PlannedCommand, PlannedValue};
 
-/// `(command, subcommand)` pairs whose ENTIRE flag surface is incapable of
-/// a write — to the kernel database, the filesystem, a context, or a
-/// remote. Verified by reading each subcommand's clap definition (not
-/// inferred from its name): see the module doc for the two-level and
-/// ledger exclusions, and [`NO_SUBCOMMAND_READ_ONLY`] for verbs with no
-/// subcommand at all.
-///
-/// Every entry below carries a one-line justification in its own comment.
-/// The full accounting — every mutating pair, and the two verbs excluded
-/// only out of caution — lives in the task report, not here (this file
-/// follows the project's own rule against historical prose in comments).
-pub(crate) const READ_ONLY_TABLE: &[(&str, &str)] = &[
-    // -- block: metadata/content reads. `cat`/`original` are excluded
-    // despite reading a block, because both accept `--out <path>`, which
-    // writes to the filesystem; `status`/`edit`/`create`/`append`/
-    // `reproject` mutate the block itself.
-    ("block", "list"),
-    ("block", "inspect"),
-    ("block", "count"),
-    ("block", "read"),
-    ("block", "history"),
-    ("block", "diff"),
-    // `render` engraves an ABC block to SVG on stdout and stores nothing.
-    // Unlike `cat` it has no `--out`, which is the only reason `cat` is
-    // classified mutating.
-    ("block", "render"),
-    // -- context: metadata reads. `switch` moves the session's active
-    // context (a session-row write) and every other variant mutates a
-    // context, so neither is here.
-    ("context", "list"),
-    ("context", "info"),
-    ("context", "prompt"),
-    ("context", "current"),
-    ("context", "log"),
-    // -- workspace / preset / backend / cast / alias: `list`/`show` read a
-    // row; every other verb inserts, updates, or deletes one. `backend
-    // model`/`backend default`/`cast slot` nest a third level (see module
-    // doc) and are excluded wholesale.
-    ("workspace", "list"),
-    ("workspace", "show"),
-    ("preset", "list"),
-    ("preset", "show"),
-    ("backend", "list"),
-    ("backend", "show"),
-    ("cast", "list"),
-    ("cast", "show"),
-    ("alias", "list"),
-    // -- character: `list`/`show` read the sheet table; `create` mints a
-    // principal and `retire` archives contexts, both writes.
-    ("character", "list"),
-    ("character", "show"),
-    // -- handoff: `tail` reads a character's handoff log; `note` appends
-    // to it (a write, and may mint the context lazily on first use).
-    ("handoff", "tail"),
-    // -- cas: `ls`/`info` read the store's metadata. `get` is excluded
-    // despite reading an object, because it accepts `--out <path>`.
-    ("cas", "ls"),
-    ("cas", "info"),
-    // -- cc: the session roster. `send` delivers a message unless
-    // `--dry-run` is also given, and this module classifies on the
-    // subcommand alone, never a flag's presence — see the module doc.
-    ("cc", "list"),
-    // -- audio: `beats` is pure offline analysis of a caller-given file —
-    // no kernel/db/context/filesystem write. `devices` and `keep-status`
-    // read a node's inventory and a keep job's state.
-    ("audio", "beats"),
-    ("audio", "devices"),
-    ("audio", "keep-status"),
-    // -- midi: `list`/`show` read the device-profile tree; `send`/
-    // `identify`/`panic` emit real MIDI (a write to attached hardware).
-    ("midi", "list"),
-    ("midi", "show"),
-    // -- roster: `list` reads the live roster; `status` posts to it.
-    ("roster", "list"),
-    // -- rc: `list`/`show` read script files and the seed comparison
-    // ("Indicator only — it never writes anything", rc.rs's own doc);
-    // `add`/`rm` write the tree.
-    ("rc", "list"),
-    ("rc", "show"),
-    // -- editor: `list` and `state` read session metadata/buffer; `open`
-    // allocates a new session, `keys`/`save`/`quit` mutate one.
-    ("editor", "list"),
-    ("editor", "state"),
-    // -- swap: `list` reads the unflushed-buffer table; `ack`/`discard`
-    // resolve one.
-    ("swap", "list"),
-    // -- system: `status`/`ps` report kernel state; `quiesce`/`resume`
-    // flip the durable quiesce flag.
-    ("system", "status"),
-    ("system", "ps"),
-    // -- config: `list`/`show` read a config file; `reset` overwrites one
-    // with its embedded default.
-    ("config", "list"),
-    ("config", "show"),
-    // -- binding: `show` reads a context's capability allow-set;
-    // `allow`/`revoke`/`reset` all write it.
-    ("binding", "show"),
-    // -- policy: `show` reads an instance's QoS policy; `set` writes it.
-    ("policy", "show"),
-    // -- mcp: `list` compares configured-vs-running servers; `reload`
-    // reconciles the broker's live registrations.
-    ("mcp", "list"),
-    // -- hook: `list`/`show` read the broker's hook tables; `add`/`remove`
-    // write them.
-    ("hook", "list"),
-    ("hook", "show"),
-    // -- doc: `list`/`tree` read document metadata/structure; `create`/
-    // `delete` mutate.
-    ("doc", "list"),
-    ("doc", "tree"),
-    // -- kaish: `primer` composes onboarding text from `kaish-help` with no
-    // kernel/db/filesystem write.
-    ("kaish", "primer"),
-    // -- stage: `status` reads staging state; `commit`/`include`/`exclude`
-    // all mutate it.
-    ("stage", "status"),
-    // -- drift: `queue`/`history` read staged/flushed drift state; every
-    // other verb (`push`/`pull`/`merge`/`flush`/`cancel`/`edge`) mutates.
-    ("drift", "queue"),
-    ("drift", "history"),
-    // -- cache: `list` reads breakpoints; `add`/`clear` mutate them.
-    ("cache", "list"),
-    // -- vfs: both verbs are documented pure-read discovery ("Pure read
-    // discovery, no capability gate" — vfs.rs's own module doc); neither
-    // mutates.
-    ("vfs", "snapshot"),
-    ("vfs", "activity"),
-];
-
-/// Top-level `kj` verbs with no `#[command(subcommand)]` at all — every
-/// argument is a flag or positional on the verb itself — whose entire flag
-/// surface is read-only. Paired with [`MUTATING_NO_SUBCOMMAND`] so
-/// [`every_kj_subcommand_is_classified`] can hold every no-subcommand verb
-/// to the same exhaustiveness this module holds two-level ones to.
-pub(crate) const READ_ONLY_NO_SUBCOMMAND: &[&str] = &[
-    // `kj models` / `kj model`: pure LLM-registry discovery, no capability
-    // gate ("discovery is not escalation" — model.rs's own module doc).
-    "models",
-    "model",
-    // `kj search`: a regex scan over block content already in the kernel.
-    "search",
-    // `kj diff`: reads two kernel-held versions of a file and renders a
-    // unified diff; never writes either side.
-    "diff",
-    // `kj wait`: subscribes to the turn-completion bus and re-reads the
-    // block log in a loop; no write in the dispatch path.
-    "wait",
-];
-
-/// Every OTHER `(command, subcommand)` pair `kj_command()` declares,
-/// classified mutating. Exists only so
-/// [`every_kj_subcommand_is_classified`] can assert every pair lands in
-/// exactly one of this table or [`READ_ONLY_TABLE`] — a new `kj` verb with
-/// no entry in either fails that test until someone classifies it.
-///
-/// `kj ledger`'s subcommands are listed here even though `list`/`show`/
-/// `rules`/`runs` are themselves reads — see the module doc, "`kj ledger`
-/// is exempt as a verb, not as a set of reads". `kj transport`'s subcommands are
-/// listed here in full, `list` included, even though its own doc comment
-/// calls `list` read-only — excluded on Amy's explicit instruction to keep
-/// the whole verb out of this module for now, not out of a per-verb
-/// mutation finding; revisit if `kj transport list` needs the bypass later.
-#[cfg(test)]
-const MUTATING_TABLE: &[(&str, &str)] = &[
-    ("context", "switch"),
-    ("context", "create"),
-    ("context", "scratch"),
-    ("context", "rebind"),
-    ("context", "set"),
-    ("context", "unset"),
-    ("context", "move"),
-    ("context", "rename"),
-    ("context", "archive"),
-    ("context", "conclude"),
-    ("context", "promote"),
-    ("context", "demote"),
-    ("context", "pause"),
-    ("context", "resume"),
-    ("context", "remove"),
-    ("context", "retag"),
-    ("context", "hydrate"),
-    ("workspace", "create"),
-    ("workspace", "add"),
-    ("workspace", "bind"),
-    ("workspace", "remove"),
-    ("preset", "save"),
-    ("preset", "remove"),
-    ("preset", "reseed"),
-    ("backend", "set"),
-    ("backend", "remove"),
-    ("backend", "model"),
-    ("backend", "default"),
-    ("backend", "reseed"),
-    ("cast", "create"),
-    ("cast", "remove"),
-    ("cast", "set"),
-    ("cast", "slot"),
-    ("character", "create"),
-    ("character", "retire"),
-    ("handoff", "note"),
-    ("alias", "set"),
-    ("alias", "remove"),
-    ("cas", "put"),
-    ("cas", "get"),
-    ("cas", "rm"),
-    ("cc", "send"),
-    ("ledger", "list"),
-    ("ledger", "show"),
-    ("ledger", "allow"),
-    ("ledger", "deny"),
-    ("ledger", "rules"),
-    ("ledger", "forget"),
-    ("ledger", "runs"),
-    ("ledger", "signal"),
-    ("db", "backup"),
-    ("db", "checkpoint"),
-    ("midi", "send"),
-    ("midi", "identify"),
-    ("midi", "panic"),
-    ("roster", "status"),
-    ("rc", "add"),
-    ("rc", "rm"),
-    ("editor", "open"),
-    ("editor", "keys"),
-    ("editor", "save"),
-    ("editor", "quit"),
-    ("swap", "ack"),
-    ("swap", "discard"),
-    ("system", "quiesce"),
-    ("system", "resume"),
-    ("config", "reset"),
-    ("block", "cat"),
-    ("block", "original"),
-    ("block", "reproject"),
-    ("block", "append"),
-    ("block", "status"),
-    ("block", "edit"),
-    ("block", "create"),
-    ("binding", "allow"),
-    ("binding", "revoke"),
-    ("binding", "reset"),
-    ("policy", "set"),
-    ("mcp", "reload"),
-    ("mcp", "restart"),
-    // -- audio: `keep` protects material in daemon RAM and uploads it to
-    // CAS; `keep-retry`/`keep-cancel` drive that job.
-    ("audio", "keep"),
-    ("audio", "keep-retry"),
-    ("audio", "keep-cancel"),
-    ("hook", "remove"),
-    ("hook", "add"),
-    ("doc", "create"),
-    ("doc", "delete"),
-    ("transport", "attach"),
-    ("transport", "detach"),
-    ("transport", "play"),
-    ("transport", "pause"),
-    ("transport", "stop"),
-    ("transport", "tempo"),
-    ("transport", "ooda"),
-    ("transport", "clock"),
-    ("transport", "rotate"),
-    ("transport", "delete"),
-    ("transport", "list"),
-    ("stage", "commit"),
-    ("stage", "include"),
-    ("stage", "exclude"),
-    ("drift", "push"),
-    ("drift", "pull"),
-    ("drift", "merge"),
-    ("drift", "flush"),
-    ("drift", "cancel"),
-    ("drift", "edge"),
-    ("cache", "add"),
-    ("cache", "clear"),
-];
-
-/// Top-level `kj` verbs with no subcommand at all, classified mutating —
-/// the [`MUTATING_TABLE`] counterpart of [`READ_ONLY_NO_SUBCOMMAND`].
-#[cfg(test)]
-const MUTATING_NO_SUBCOMMAND: &[&str] = &["cp", "play", "attach", "fork", "drive"];
+use super::effect::{classify, Effect};
 
 /// Whether `cmd` is a `kj` invocation this hook may skip scoring for.
 ///
@@ -388,48 +99,42 @@ const MUTATING_NO_SUBCOMMAND: &[&str] = &["cp", "play", "attach", "fork", "drive
 ///    which kaish names as where an embedder-side redaction pass would add
 ///    its variant. A value this module cannot read as plain text is never
 ///    something to wave through unscored.
-/// 6. The plain arguments resolve, verb then subcommand, to a pair this
-///    module's tables cover: either a no-subcommand verb in
-///    [`READ_ONLY_NO_SUBCOMMAND`], or a `(command, subcommand)` pair in
-///    [`READ_ONLY_TABLE`] with no argument before the subcommand starting
-///    with `-`. An unresolvable pair — an unknown verb, an unknown
-///    subcommand, or a flag sitting where the subcommand belongs — fails
-///    closed: this function returns `false`, not an error, on anything it
-///    cannot positively place in the tables.
+/// 6. The plain arguments, as an argv with the leading `kj` dropped, parse
+///    through [`classify`] to [`Effect::Read`]. A parse failure — an
+///    unknown verb, an unresolvable subcommand, a flag sitting where the
+///    subcommand belongs, a `${VAR}` in a typed slot — refuses closed: this
+///    function returns `false`, not an error, on anything [`classify`]
+///    cannot place.
 pub(crate) fn is_read_only_kj(cmd: &PlannedCommand) -> bool {
-    let Some((verb, subcommand)) = resolved_kj_verb(cmd) else {
+    let Some(args) = resolved_kj_args(cmd) else {
         return false;
     };
-    if READ_ONLY_NO_SUBCOMMAND.contains(&verb) {
-        return true;
-    }
-    let Some(subcommand) = subcommand else {
-        return false;
-    };
-    READ_ONLY_TABLE.contains(&(verb, subcommand))
+    matches!(classify(&args), Ok(Effect::Read))
 }
 
 /// Whether one command may reach the shell without any PreCall hook
 /// seeing it: a read-only `kj` call, or any `kj ledger` call.
 ///
-/// `kj ledger` is the gate's own answer path. A hook that could ask about
-/// `kj ledger allow <id>` makes answering an ask require answering another
-/// ask, so the exemption is structural rather than a hook's policy: the
-/// evaluator skips PreCall for a program made only of exempt commands
-/// (`program_is_gate_exempt`). The whole verb is covered — `list`, `show`,
-/// `rules` and `runs` are reads, `signal add` is what the advisory hook
-/// itself calls, and `forget` only makes the gate more conservative. It is
-/// safe only because a seat cannot answer its own ask (a context check in
-/// the ledger, `docs/gate-and-shell-split.md`, "No self-approval"); remove
-/// that invariant and this exemption goes with it.
+/// The ledger half resolves the first plain argument through
+/// [`super::kj_command`]'s own subcommand table (aliases included, via
+/// clap's [`clap::Command::find_subcommand`]) and checks whether it names
+/// `ledger` — no hand-written alias list to keep in step.
 ///
-/// The same six structural conditions as [`is_read_only_kj`] apply, so a
+/// The same five structural conditions as [`is_read_only_kj`] apply, so a
 /// redirect, a background call, a heredoc or a substituted argument refuse.
 pub(crate) fn is_gate_exempt_kj(cmd: &PlannedCommand) -> bool {
     if is_read_only_kj(cmd) {
         return true;
     }
-    matches!(resolved_kj_verb(cmd), Some(("ledger", _)))
+    let Some(args) = resolved_kj_args(cmd) else {
+        return false;
+    };
+    let Some(verb) = args.first() else {
+        return false;
+    };
+    super::kj_command()
+        .find_subcommand(verb)
+        .is_some_and(|sub| sub.get_name() == "ledger")
 }
 
 /// Whether a whole planned program is exempt from PreCall hooks: every
@@ -446,9 +151,10 @@ pub(crate) fn program_is_gate_exempt(statements: &[kaish_kernel::PlannedStatemen
 
 /// Conditions 1–5 of [`is_read_only_kj`], shared with [`is_gate_exempt_kj`]:
 /// the command is exactly `kj`, carries no redirect, background flag or
-/// heredoc, and every argument is plain text. Returns the verb and the
-/// subcommand when neither is a flag; `None` refuses.
-fn resolved_kj_verb(cmd: &PlannedCommand) -> Option<(&str, Option<&str>)> {
+/// heredoc, and every argument is plain text. Returns the plain arguments
+/// with the leading `kj` dropped — the argv [`classify`] parses; `None`
+/// refuses.
+fn resolved_kj_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
     if cmd.name != "kj" {
         return None;
     }
@@ -462,21 +168,15 @@ fn resolved_kj_verb(cmd: &PlannedCommand) -> Option<(&str, Option<&str>)> {
         return None;
     }
 
-    let mut plain_args: Vec<&str> = Vec::with_capacity(cmd.args.len());
+    let mut args = Vec::with_capacity(cmd.args.len());
     for arg in &cmd.args {
         match arg {
-            PlannedValue::Plain(s) => plain_args.push(s.as_str()),
+            PlannedValue::Plain(s) => args.push(s.clone()),
             // Any variant kaish adds to its redaction seam: never exempt.
             _ => return None,
         }
     }
-
-    let &verb = plain_args.first()?;
-    if verb.starts_with('-') {
-        return None;
-    }
-    let subcommand = plain_args.get(1).copied().filter(|s| !s.starts_with('-'));
-    Some((verb, subcommand))
+    Some(args)
 }
 
 #[cfg(test)]
@@ -609,17 +309,13 @@ mod tests {
 
     // -- condition 5: the plain-value seam ---------------------------------
 
-    /// `--confirm=<token>` used to refuse a read here, because kaish planned
-    /// it as a redacted value. kaish removed the confirmation latch the flag
-    /// guarded, and with it the plan-side redaction, so the flag is now an
-    /// ordinary argument and `PlannedValue` carries only `Plain`.
-    ///
-    /// Nothing is waved through that was not already a read: the flag sits
-    /// after the subcommand, resolution reads only the verb and subcommand
-    /// positions, and `kj block list` is in the table on its own merits.
+    /// `--role=user` is an ordinary flag value with an `=` in it, sitting
+    /// after the leaf has already resolved. Nothing about condition 5's
+    /// plain-value check should treat that specially — it stays `Plain`,
+    /// and [`classify`] parses it as `--role`'s value like any other.
     #[test]
-    fn a_confirm_flag_is_an_ordinary_argument_and_does_not_refuse_a_read() {
-        let cmd = plan_one("kj block list --confirm=deadbeef");
+    fn an_equals_flag_value_is_an_ordinary_argument_and_does_not_refuse_a_read() {
+        let cmd = plan_one("kj block list --kind=text");
         assert!(
             cmd.args.iter().all(|a| matches!(a, PlannedValue::Plain(_))),
             "kaish plans every value as Plain; a new variant means condition 5 \
@@ -634,8 +330,7 @@ mod tests {
     // fail-closed guard for a variant kaish has not added yet, and the
     // assertion in the test above fires when it does.
 
-    // -- condition 6: table resolution, and the dash-before-subcommand
-    // guard specifically -------------------------------------------------
+    // -- condition 6: classify resolution ----------------------------------
 
     #[test]
     fn an_unknown_verb_refuses() {
@@ -651,9 +346,9 @@ mod tests {
 
     #[test]
     fn a_flag_where_the_subcommand_belongs_refuses() {
-        // `--json` sits where `list` would; the table lookup can't see past
-        // it, so this must fail closed rather than skip to the next word.
-        let cmd = plan_one("kj block --json list");
+        // `--role` is `block create`'s flag, not `block`'s own — with no
+        // subcommand resolved at all, clap has nothing to classify.
+        let cmd = plan_one("kj block --role user");
         assert!(!is_read_only_kj(&cmd));
     }
 
@@ -661,53 +356,6 @@ mod tests {
     fn a_known_read_only_pair_passes() {
         let cmd = plan_one("kj block list");
         assert!(is_read_only_kj(&cmd));
-    }
-
-    // -- gate exemption: the ledger's own verb, under the same six conditions
-
-    /// The gate's answer path is exempt by construction: `kj ledger` never
-    /// reaches a hook that can ask. Read-only verbs are exempt too.
-    #[test]
-    fn a_ledger_answer_is_gate_exempt() {
-        assert!(is_gate_exempt_kj(&plan_one("kj ledger allow 01a0-abc")));
-        assert!(is_gate_exempt_kj(&plan_one("kj ledger deny 01a0-abc")));
-        assert!(is_gate_exempt_kj(&plan_one("kj ledger list --status abandoned")));
-        assert!(is_gate_exempt_kj(&plan_one("kj block list")));
-    }
-
-    /// `kj ledger` is exempt only under the structural conditions
-    /// `is_read_only_kj` applies: a redirect, a background call, a
-    /// substituted argument, or a mutating verb that is not `ledger` all
-    /// refuse.
-    #[test]
-    fn a_ledger_answer_with_a_redirect_or_substitution_is_not_exempt() {
-        assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 > /tmp/out")));
-        assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 &")));
-        assert!(!is_gate_exempt_kj(&plan_one("kj block create --role user --kind text")));
-        // A substitution is planned as its own command beside the kj call,
-        // so the kj half is exempt in isolation and the program rule is what
-        // refuses the whole: the substituted command is not exempt.
-        let program =
-            kaish_kernel::ast::plan::plan_program("kj ledger allow $(cat /tmp/id)").unwrap();
-        assert!(!program_is_gate_exempt(&program));
-    }
-
-    /// A whole program is exempt only when every command of every
-    /// statement is: `kj ledger allow x; dd ...` must still be scored.
-    #[test]
-    fn a_program_is_exempt_only_when_every_command_is() {
-        let only_answers = kaish_kernel::ast::plan::plan_program(
-            "kj ledger show 01a0-abc; kj ledger allow 01a0-abc",
-        )
-        .unwrap();
-        assert!(program_is_gate_exempt(&only_answers));
-        let mixed = kaish_kernel::ast::plan::plan_program(
-            "kj ledger allow 01a0-abc; dd if=/dev/zero of=/dev/sda",
-        )
-        .unwrap();
-        assert!(!program_is_gate_exempt(&mixed));
-        let empty = kaish_kernel::ast::plan::plan_program("").unwrap();
-        assert!(!program_is_gate_exempt(&empty), "an empty program is not an exemption");
     }
 
     #[test]
@@ -723,15 +371,39 @@ mod tests {
     }
 
     #[test]
-    fn cas_get_is_excluded_despite_reading_because_of_its_out_flag() {
-        // `kj cas get <hash> --out <path>` writes to the filesystem, and
-        // this module has no per-flag logic — so `cas get` is never in
-        // READ_ONLY_TABLE at all, even for a call with no --out.
-        let cmd = plan_one("kj cas get deadbeef");
-        assert!(!is_read_only_kj(&cmd));
+    fn a_backend_default_show_is_read_only() {
+        // The nested-subcommand case a two-level table couldn't tell apart
+        // from `backend default set` — the class doesn't have that problem.
+        let cmd = plan_one("kj backend default show");
+        assert!(is_read_only_kj(&cmd));
     }
 
-    // -- ${VAR} in verb position fails closed; in a flag value it doesn't --
+    #[test]
+    fn a_block_cat_is_read_only_only_without_out() {
+        let read = plan_one("kj block cat 019a2f3c");
+        assert!(is_read_only_kj(&read));
+        let write = plan_one("kj block cat 019a2f3c --out /tmp/x");
+        assert!(!is_read_only_kj(&write));
+    }
+
+    #[test]
+    fn a_cas_get_is_read_only_only_without_out() {
+        let read = plan_one("kj cas get sha256-abc");
+        assert!(is_read_only_kj(&read));
+        let write = plan_one("kj cas get sha256-abc --out /tmp/x");
+        assert!(!is_read_only_kj(&write));
+    }
+
+    #[test]
+    fn a_transport_list_is_read_only() {
+        // No longer kept out of this module wholesale — the class puts it
+        // on its own merits (`docs/kj-verb-class.md`, "Decisions carried
+        // here").
+        let cmd = plan_one("kj transport list");
+        assert!(is_read_only_kj(&cmd));
+    }
+
+    // -- ${VAR} in verb position, and in a typed slot, fail closed ---------
 
     #[test]
     fn a_variable_reference_in_verb_position_fails_closed() {
@@ -746,12 +418,22 @@ mod tests {
     }
 
     #[test]
-    fn a_variable_reference_in_a_flag_value_on_a_resolved_read_only_pair_passes() {
+    fn a_variable_reference_in_a_string_positional_on_a_read_only_verb_passes() {
         // `${ID}` can only ever stand for one argument (kaish does no word
-        // splitting), and it sits in a value position on an
-        // already-resolved read-only pair — it cannot smuggle in a flag.
+        // splitting), and it sits in a `String` positional — the same
+        // position `block read`'s handler would read whatever it resolves
+        // to from.
         let cmd = plan_one("kj block read ${ID}");
         assert!(is_read_only_kj(&cmd));
+    }
+
+    #[test]
+    fn a_variable_reference_in_a_typed_flag_fails_closed() {
+        // `${T}` is not a `u64`, so `classify` cannot parse `--timeout`'s
+        // value — even though `${CTX}`'s own `String` positional would have
+        // been fine alone.
+        let cmd = plan_one("kj wait ${CTX} --timeout ${T}");
+        assert!(!is_read_only_kj(&cmd));
     }
 
     // -- command substitution: structural, not special-cased ---------------
@@ -788,51 +470,65 @@ mod tests {
         assert!(is_read_only_kj(kj_cmd));
     }
 
-    // -- exhaustiveness: every kj_command() leaf is classified -------------
+    // -- gate exemption: the ledger's own verb, under the same five conditions
 
+    /// The gate's answer path is exempt by construction: `kj ledger` never
+    /// reaches a hook that can ask. Read-only verbs are exempt too.
     #[test]
-    fn every_kj_subcommand_is_classified() {
-        let root = super::super::kj_command();
-        let mut unclassified = Vec::new();
+    fn a_ledger_answer_is_gate_exempt() {
+        assert!(is_gate_exempt_kj(&plan_one("kj ledger allow 01a0-abc")));
+        assert!(is_gate_exempt_kj(&plan_one("kj ledger deny 01a0-abc")));
+        assert!(is_gate_exempt_kj(&plan_one("kj ledger list --status abandoned")));
+        assert!(is_gate_exempt_kj(&plan_one("kj block list")));
+    }
 
-        for verb in root.get_subcommands() {
-            let verb_name = verb.get_name();
-            if verb_name == "help" {
-                // clap's own auto-generated help pseudo-subcommand — not a
-                // kj verb, nothing to classify.
-                continue;
-            }
-            let subs: Vec<&str> = verb
-                .get_subcommands()
-                .map(|s| s.get_name())
-                .filter(|&n| n != "help")
-                .collect();
+    /// `kj ledger list` is read-only on its own merits, and `kj ledger
+    /// allow` is not — but both are gate-exempt, because the exemption
+    /// covers the whole verb regardless of what `classify` says about a
+    /// given call.
+    #[test]
+    fn ledger_list_is_read_only_and_ledger_allow_is_not_but_both_are_exempt() {
+        let list = plan_one("kj ledger list");
+        assert!(is_read_only_kj(&list));
+        assert!(is_gate_exempt_kj(&list));
 
-            if subs.is_empty() {
-                let in_ro = READ_ONLY_NO_SUBCOMMAND.contains(&verb_name);
-                let in_mut = MUTATING_NO_SUBCOMMAND.contains(&verb_name);
-                if in_ro == in_mut {
-                    unclassified.push(format!("kj {verb_name} (no subcommand)"));
-                }
-                continue;
-            }
+        let allow = plan_one("kj ledger allow 019a2f3c");
+        assert!(!is_read_only_kj(&allow));
+        assert!(is_gate_exempt_kj(&allow));
+    }
 
-            for sub_name in subs {
-                let pair = (verb_name, sub_name);
-                let in_ro = READ_ONLY_TABLE.contains(&pair);
-                let in_mut = MUTATING_TABLE.contains(&pair);
-                if in_ro == in_mut {
-                    unclassified.push(format!("kj {verb_name} {sub_name}"));
-                }
-            }
-        }
+    /// `kj ledger` is exempt only under the structural conditions
+    /// `is_read_only_kj` applies: a redirect, a background call, a
+    /// substituted argument, or a mutating verb that is not `ledger` all
+    /// refuse.
+    #[test]
+    fn a_ledger_answer_with_a_redirect_or_substitution_is_not_exempt() {
+        assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 > /tmp/out")));
+        assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 &")));
+        assert!(!is_gate_exempt_kj(&plan_one("kj block create --role user --kind text")));
+        // A substitution is planned as its own command beside the kj call,
+        // so the kj half is exempt in isolation and the program rule is what
+        // refuses the whole: the substituted command is not exempt.
+        let program =
+            kaish_kernel::ast::plan::plan_program("kj ledger allow $(cat /tmp/id)").unwrap();
+        assert!(!program_is_gate_exempt(&program));
+    }
 
-        assert!(
-            unclassified.is_empty(),
-            "every kj subcommand must be classified in exactly one of \
-             READ_ONLY_TABLE/READ_ONLY_NO_SUBCOMMAND or \
-             MUTATING_TABLE/MUTATING_NO_SUBCOMMAND — unclassified (or \
-             double-classified): {unclassified:#?}"
-        );
+    /// A whole program is exempt only when every command of every
+    /// statement is: `kj ledger allow x; dd ...` must still be scored.
+    #[test]
+    fn a_program_is_exempt_only_when_every_command_is() {
+        let only_answers = kaish_kernel::ast::plan::plan_program(
+            "kj ledger show 01a0-abc; kj ledger allow 01a0-abc",
+        )
+        .unwrap();
+        assert!(program_is_gate_exempt(&only_answers));
+        let mixed = kaish_kernel::ast::plan::plan_program(
+            "kj ledger allow 01a0-abc; dd if=/dev/zero of=/dev/sda",
+        )
+        .unwrap();
+        assert!(!program_is_gate_exempt(&mixed));
+        let empty = kaish_kernel::ast::plan::plan_program("").unwrap();
+        assert!(!program_is_gate_exempt(&empty), "an empty program is not an exemption");
     }
 }

@@ -54,9 +54,10 @@ pub struct PlanClause {
     /// The whole statement's unexpanded rendering, for a reader that needs
     /// the carrier a clause was cut out of.
     pub stmt_rendered: String,
-    /// `true` only when this clause is one command that
-    /// [`crate::kj::readonly::is_read_only_kj`] places in its static
-    /// read-only table. Always `false` on the whole-statement path.
+    /// `true` only when this clause is one command whose own declared
+    /// effect (`kj/effect.rs`, `docs/kj-verb-class.md`) is `Read`, per
+    /// [`crate::kj::readonly::is_read_only_kj`]. Always `false` on the
+    /// whole-statement path.
     pub kj_readonly: bool,
     /// Whether the command declares a redirect. Always `false` on the
     /// whole-statement path.
@@ -222,8 +223,9 @@ mod tests {
         assert_eq!(clauses[0].clause, "kj ledger list");
     }
 
-    /// A read-only `kj` verb carries the exemption the static table grants
-    /// it, so a caller can skip scoring without re-deriving verb structure.
+    /// A read-only `kj` verb carries the exemption its own declared effect
+    /// grants it, so a caller can skip scoring without re-deriving verb
+    /// structure.
     #[test]
     fn a_read_only_kj_command_is_marked() {
         let clauses = render_clauses(&planned("kj block list"));

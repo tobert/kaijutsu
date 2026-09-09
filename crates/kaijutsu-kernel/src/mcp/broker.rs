@@ -2570,10 +2570,11 @@ impl Broker {
         //
         // `kj_readonly` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): a
         // bool on every command object, `true` only when
-        // `kj::readonly::is_read_only_kj` places that exact command in its
-        // static read-only table. A hook body can check this once instead
-        // of re-deriving verb/subcommand structure itself. Additive — every
-        // field above already existed and is unchanged.
+        // `kj::readonly::is_read_only_kj` resolves that exact command to a
+        // verb whose own declared effect (`kj/effect.rs`) is `Read`. A hook
+        // body can check this once instead of re-deriving verb/subcommand
+        // structure itself. Additive — every field above already existed
+        // and is unchanged.
         //
         // `clause` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): the text
         // a classifier scores for that command, from
