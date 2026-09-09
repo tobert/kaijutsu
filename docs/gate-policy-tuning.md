@@ -117,10 +117,9 @@ positional token)**.
 - `kj` keys resolve through the same six structural conditions
   `is_read_only_kj` enforces today (`kj/readonly.rs:390`): name exactly
   `kj`, no redirect, no background, no heredoc, every argument
-  `PlannedValue::Plain`, verb and subcommand table-resolvable. The corpus
-  (`contrib/kj-expectations.toml` joined against clap reflection in
-  `kj/corpus.rs`) is the key validator: a kj key that names no live leaf
-  fails a test, not silently.
+  `PlannedValue::Plain`, and the argv classifies (`kj::classify`, which
+  parses the whole argv through the verb enums). A kj key that names no
+  live leaf fails a test, not silently.
 - Non-kj keys are free-form command names (`rg`) or name-plus-first-token
   (`git push`). Nothing reflects over host PATH, so a typo is a no-op —
   which fails safe, toward the default ask.
@@ -287,54 +286,39 @@ keep their digest shape; nothing in approval-ledger learns about config.
 revokes either by rule_id. No-self-approval is untouched: a family rule is
 minted from an answer, and answers still come from a peer seat.
 
-## Generated tier (corpus `gate` field)
+## Builtin tier: the verb class
 
-`contrib/kj-expectations.toml` already carries an authored classification
-for all 173 kj leaves (`expect`, `mutates`, `confirm_gated`), joined against
-clap reflection and coverage-tested in both directions. It grows one more
-authored field:
+Every `kj` verb declares its effect in code, on the verb itself:
+`Effect::Read | Write | Destroy`, an exhaustive match per subcommand enum
+(`docs/kj-verb-class.md` carries the build plan; after it ships,
+`kj/effect.rs` is the reference). The builtin tier is that declaration:
 
-```toml
-["handoff note"]
-expect = "situation-normal"
-mutates = true
-gate = "allow"        # builtin tier: allow | ask | deny | (absent = default)
-```
+- `Read` is allowed by construction. The verb never meets the classifier
+  or the gate. `kj/readonly.rs` keeps the five structural conditions (name
+  exactly `kj`, no redirect, no background, no heredoc, plain arguments)
+  and asks `classify()` for the sixth.
+- `Write` and `Destroy` meet the gate like any other statement, and the
+  layers above decide.
+- `Destroy` is additionally latched by the dispatcher: no `--confirm`, no
+  run, from one place.
 
-`gate` is authored for the builtin layer deliberately *not* derived from
-`expect`: the severity column measures classifier behavior and must stay
-honest for the probe family (`cargo run --example lfm2d-probe`), while
-`gate` is a permission claim. `gate` is optional per entry (absent = the
-default ask), so the exhaustiveness claim needs its own teeth: a **new**
-test, beside `every_live_leaf_has_an_entry` (`kj/corpus.rs:344`), asserting
-that the set of `gate = "allow"` leaves equals exactly
-`READ_ONLY_TABLE ∪ READ_ONLY_NO_SUBCOMMAND` until the fold lands, and after
-it, that every `mutates = false` leaf carries an authored `gate` value. A
-reviewer chooses each one; nothing inherits by silence.
+There is no authored `gate` field and no TOML. A Write verb that policy
+should allow by default (`kj handoff note`) is a rule in the global allow
+tier, not a claim on the class, so the class stays honest about what the
+verb does. That is a choice: an authored allow on the class would also
+work, and reversing it is a decision to record here, not a drift.
 
-Three leaves the fold must handle explicitly, because they are structural
-rather than per-leaf today:
+Two structural rules stay outside the class because they are not about a
+verb's effect:
 
-- **`kj ledger`** — exempt as a whole verb via `is_gate_exempt_kj`
-  (`kj/readonly.rs:419`), not via `READ_ONLY_TABLE`. The corpus leaves
-  (`ledger allow` etc.) carry `mutates = true`, so they cannot take
-  `gate = "allow"` without breaking the equality assertion. The whole-verb
-  exemption survives the fold as a structural arm of the evaluator, with its
-  no-self-approval dependency intact.
-- **The `--help` rule** — a flag *pattern* (last word `--help`/`-h`, no
-  intervening flag), not a verb key; it fits no layer and moves into the
-  evaluator as a structural rule in slice 2, with a Rust test for the
-  `--content --help` bypass that `contrib/lfm2d-ladder-check.kai:146`
-  asserts today.
-- **`kj transport list`** — excluded from the read-only tables on Amy's
-  explicit instruction (`kj/readonly.rs:244`), present in the corpus. The
-  fold test forces an authored `gate` choice for it rather than letting it
-  ride the exclusion forever.
-
-Once the assertion holds, `READ_ONLY_TABLE` and `READ_ONLY_NO_SUBCOMMAND`
-fold into the corpus — one authored builtin tier instead of two tables that
-must agree. That fold is its own slice and changes no behavior on the day it
-lands.
+- **`kj ledger`** is exempt as a whole verb via `is_gate_exempt_kj`. It is
+  the gate's answer path, and a gated answer path is not one. `ledger
+  list` is a Read verb and `ledger allow` a Write verb by class, and the
+  exemption applies over both.
+- **The `--help` rule** is a flag pattern (last word `--help`/`-h`, no
+  intervening flag), not a verb. It moves into the evaluator as a
+  structural rule in slice 2, with a Rust test for the `--content --help`
+  bypass that `contrib/lfm2d-ladder-check.kai:146` asserts today.
 
 ## What gets deleted
 

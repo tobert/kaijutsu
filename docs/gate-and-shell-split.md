@@ -1311,11 +1311,12 @@ can also call it directly. Tests: `kj_tool_plan_projects_the_shell_command`
 **`kj_readonly`** (added on top of the surface above, `broker.rs`'s
 `KJ_TOOL_PLAN` construction): a bool on every command object, `true` only
 when `kj::readonly::is_read_only_kj`
-(`crates/kaijutsu-kernel/src/kj/readonly.rs`) places that exact
-`PlannedCommand` in its static per-verb read-only table. The classification
-itself is pure Rust against the typed command — never re-derived from the
-JSON — and this field is the mechanical mirror of that decision onto the
-same-position command object. Additive: every field the surface already
+(`crates/kaijutsu-kernel/src/kj/readonly.rs`) accepts that exact
+`PlannedCommand`: five structural conditions, then the verb's own declared
+`Effect::Read` (`docs/kj-verb-class.md`). The classification itself is
+pure Rust against the typed command — never re-derived from the JSON — and
+this field is the mechanical mirror of that decision onto the same-position
+command object. Additive: every field the surface already
 carried is unchanged. `assets/defaults/rc/lib/hooks/lfm2d.kai`'s exemption
 filter treats `kj_readonly == true` as a third exemption alongside
 `--help`/`kj ledger`, so a call built entirely of read-only `kj` commands

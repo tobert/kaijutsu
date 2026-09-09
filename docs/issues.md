@@ -1094,9 +1094,11 @@ self-approval and approval-executes are canonical in
 tiers are `docs/gate-policy-tuning.md`. Old measurements in this entry's
 history must not be quoted. Open:
 
-- **Our `kj` verbs are out of distribution** for the classifier
-  (`docs/kj-verbs.md`); the lfm2d lane needs them in its truth set before an
-  auto-allow band can cover our seats. Cross-project.
+- **Our `kj` verbs never reach the classifier as reads.** Every verb
+  declares `Effect::Read | Write | Destroy` in code (`docs/kj-verb-class.md`
+  until it ships, then `kj/effect.rs`); Read skips scoring by construction
+  and the classifier is not expected to learn kj vocabulary. Writes still
+  score until the gate-policy tiers land.
 - **Widen the probe with real traffic** (`LFM2D_MODE=log` for an interval)
   and **whether to enable an auto-allow band at all** — both Amy's call.
 - **A reformulated command does not carry its pending ask forward.** A
