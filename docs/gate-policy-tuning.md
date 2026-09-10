@@ -192,7 +192,10 @@ rules, and both are load-bearing for slice 5:
 `/config/kernel/gate.toml`, seeded from `assets/defaults/gate.toml` through
 `config_seed.rs` like `mcp.toml` and `theme.toml` — the running kernel reads
 the host file, so an edit lands with no rebuild and no reseed
-(`docs/config-namespace.md`). The example is the rule:
+(`docs/config-namespace.md`). The seed writes only into an empty tree, so
+an install that predates the file gets it by `kj config reset gate.toml`
+or by copying the asset into the config directory; until then the config
+layer is empty and `kj ledger rules` says so. The example is the rule:
 
 ```toml
 # Gate policy — the tuned allow/ask/deny tiers beneath the ledger's
