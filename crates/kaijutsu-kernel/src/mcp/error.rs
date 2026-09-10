@@ -18,6 +18,11 @@ use kaijutsu_types::{AskRef, ContextId, Refusal, RefusalKind, Status};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HookId(pub String);
 
+/// The `subject` a refusal carries when the gate policy
+/// (`kj/gate_policy.rs`), not a hook, decided: there is no hook id, and
+/// the reason names the layer and key.
+pub(crate) const GATE_POLICY_SUBJECT: &str = "gate policy";
+
 impl std::fmt::Display for HookId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -278,6 +283,8 @@ impl McpError {
     ) -> Self {
         let who = if subject.is_empty() {
             "the approval gate".to_string()
+        } else if subject == GATE_POLICY_SUBJECT {
+            "the gate policy".to_string()
         } else {
             format!("gate for {subject}")
         };
@@ -285,6 +292,7 @@ impl McpError {
             RefusalKind::Pending => format!("{who} is waiting on a human"),
             RefusalKind::GateUnavailable => format!("{who} had nothing to answer it"),
             _ if subject.is_empty() => "the approval gate refused this".to_string(),
+            _ if subject == GATE_POLICY_SUBJECT => "denied by the gate policy".to_string(),
             _ => format!("denied by hook {subject}"),
         };
         // A refusal with nothing more to say is the headline alone. A hook

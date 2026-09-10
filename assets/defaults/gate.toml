@@ -1,0 +1,43 @@
+# Gate policy — the tuned allow/ask/deny tiers beneath the ledger's
+# per-decision rules (docs/gate-policy-tuning.md). Read from disk at every
+# shell submission; an edit lands with no rebuild and no reseed.
+#
+# Keys: "kj <verb> [<subcommand>]" (canonical names; an unknown verb fails
+# the load) or "<command> [<first argument>]". Verdicts: allow, ask, deny.
+# A more specific key wins; at equal specificity deny beats ask beats allow.
+# Layers compose: [global], then [context_type.<type>] over it. A learned
+# ledger rule outranks everything here; a verb's declared Read effect and
+# the whole `kj ledger` verb are allowed beneath it.
+#
+# allow covers a key, never arguments: a redirect, a background flag, a
+# heredoc or a substituted argument drops the statement back to the
+# classifier and the gate. ask is firm — no lower layer can allow it.
+# deny refuses at broker PreCall and inside the shell gate.
+#
+# A file that does not parse refuses every gated shell submission until it
+# is fixed; `kj config reset gate.toml` restores this default.
+
+[global]
+allow = [
+  "kj handoff note",     # recoverable by construction; the friction that started this
+  "kj block create",
+  "kj block append",
+  "kj stage include",
+  "kj stage exclude",
+  "rg",                  # non-kj entries exercising the key space: one-level key
+  "wc",
+]
+ask = [
+  "kj rc add",           # rc reaches every future context — a human sees each change
+  "kj rc rm",
+  "kj config reset",
+  "git push",            # non-kj entry: two-level key
+]
+deny = [
+  "dd",                  # no kaijutsu seat has a reason; uniform loud refusal
+]
+
+[context_type.explorer]
+deny = [
+  "kj context create",   # an explorer explores; lifecycle belongs to its parent
+]

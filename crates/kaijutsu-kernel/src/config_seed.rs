@@ -1,6 +1,6 @@
 //! Embedded default config-file bodies + the config seed manifest.
 //!
-//! The config TOMLs (`theme.toml`, `mcp.toml`) and the system prompt
+//! The config TOMLs (`theme.toml`, `mcp.toml`, `gate.toml`) and the system prompt
 //! (`system.md`) seed [`CONFIG_VFS_ROOT`], an ordinary host directory reached
 //! through `LocalBackend` (`docs/config-namespace.md`), exactly like
 //! `/config/rc`: [`seed_entries_into_dir`] writes each compiled-in default
@@ -26,6 +26,10 @@ pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.
 
 /// Embedded default system prompt.
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/system.md");
+
+/// Embedded default gate policy (TOML): the allow/ask/deny tiers
+/// `kj::gate_policy` reads beneath the ledger's rules.
+pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gate.toml");
 
 /// Embedded default metronome click config (TOML). The shared *client* default;
 /// see [`CLIENT_VFS_ROOT`] and `docs/config-namespace.md`.
@@ -64,6 +68,7 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("theme.toml"), DEFAULT_THEME),
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
         (config_path("system.md"), DEFAULT_SYSTEM_PROMPT),
+        (config_path("gate.toml"), DEFAULT_GATE_CONFIG),
     ]
 }
 
@@ -177,13 +182,14 @@ mod tests {
     use kaijutsu_types::paths::{client_config_path, config_path};
 
     #[test]
-    fn seed_manifest_covers_the_three_config_files() {
+    fn seed_manifest_covers_the_four_config_files() {
         let files = config_seed_files();
         let names: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
         assert!(names.contains(&config_path("theme.toml").as_str()));
         assert!(names.contains(&config_path("mcp.toml").as_str()));
         assert!(names.contains(&config_path("system.md").as_str()));
-        assert_eq!(files.len(), 3, "exactly the three known config files");
+        assert!(names.contains(&config_path("gate.toml").as_str()));
+        assert_eq!(files.len(), 4, "exactly the four known config files");
     }
 
     #[test]

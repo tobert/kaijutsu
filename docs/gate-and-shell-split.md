@@ -1328,6 +1328,17 @@ qualify. `kj ledger` is not in that table; it is exempt as a whole verb by
 `kj::readonly::is_gate_exempt_kj`, and the kernel enforces both exemptions
 before any hook runs — see "The exemption is the whole `kj ledger` verb".
 
+**`tier`** (added on top of the surface above, `broker.rs`'s `KJ_TOOL_PLAN`
+construction): a string on every command object — `allow`, `ask`, `deny` or
+`score` — the gate policy's verdict for that command
+(`kj::gate_policy::command_verdict`, `docs/gate-policy-tuning.md`), the
+same evaluator PreCall consulted for the call. `deny` never reaches a hook
+(PreCall refused the call). `assets/defaults/rc/lib/hooks/lfm2d.kai` reads
+it twice: an `ask`-tier clause exits 3 before the classifier runs, and
+`allow`-tier clauses are dropped from the scored set, so a mixed program's
+read clause is not re-scored by a classifier that escalates on reads. Test:
+`kj_tool_plan_carries_the_tier_per_command`.
+
 **`clause`** (added on top of the surface above, `broker.rs`'s
 `KJ_TOOL_PLAN` construction): a string on every command object — the text a
 classifier scores for that command, from

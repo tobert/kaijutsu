@@ -1543,7 +1543,7 @@ mod tests {
     /// (`docs/gate-resume.md`). Most tests below call this twice: once to
     /// raise the ask, once after a human answers to redeem it.
     async fn gate_once(d: &crate::kj::KjDispatcher, c: &KjCaller, spec: GateSpec) -> crate::kj::gate::GateOutcome {
-        run_gate(&d.kernel_db.clone(), c, spec, d.kernel.ledger_flows()).await
+        run_gate(&d.kernel_db.clone(), c, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await
     }
 
     #[tokio::test]
@@ -1722,7 +1722,7 @@ mod tests {
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), &flows).await
+            run_gate(&db, &caller, spec(), &flows, &crate::kj::gate_policy::no_config()).await
         });
 
         let mut request_id = String::new();
@@ -2298,7 +2298,7 @@ mod tests {
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
         let gate = tokio::spawn(async move {
-            run_gate(&db, &caller, spec(), &flows).await
+            run_gate(&db, &caller, spec(), &flows, &crate::kj::gate_policy::no_config()).await
         });
         let request_id = wait_for_pending(&d).await;
 
@@ -3083,7 +3083,7 @@ mod tests {
         let db = d.kernel_db.clone();
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), &flows).await });
+        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), &flows, &crate::kj::gate_policy::no_config()).await });
         let request_id = wait_for_pending(&d).await;
         let allow = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &answering_seat()).await;
         assert!(allow.is_ok(), "{allow:?}");
@@ -3114,7 +3114,7 @@ mod tests {
         let db = d.kernel_db.clone();
         let caller = c.clone();
         let flows = d.kernel.ledger_flows().clone();
-        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), &flows).await });
+        let gate = tokio::spawn(async move { run_gate(&db, &caller, spec(), &flows, &crate::kj::gate_policy::no_config()).await });
         let request_id = wait_for_pending(&d).await;
         {
             let db = d.kernel_db.lock();

@@ -47,6 +47,7 @@ fi
 # says why).
 plain_key="plain"
 sp=" "
+score_word="score"
 items_filter="$(cat <<'ITEMS_FILTER_EOF'
 [ .statements[] as $s
   | ($s.plan.commands // []) as $cmds
@@ -59,13 +60,15 @@ items_filter="$(cat <<'ITEMS_FILTER_EOF'
                 cmd_seq: $i,
                 clause: (([.name] + ((.args // [])|map(.plain))) | join($sp)),
                 kj_readonly: (.kj_readonly // false),
-                has_redirect: (((.redirects // []) | length) > 0)} ]
+                has_redirect: (((.redirects // []) | length) > 0),
+                tier: (.tier // $score)} ]
       else [{stmt: $s.plan.rendered,
              stmt_seq: $s.index,
              cmd_seq: null,
              clause: $s.plan.rendered,
              kj_readonly: false,
-             has_redirect: false}]
+             has_redirect: false,
+             tier: $score}]
       end )
 ] | add // []
 ITEMS_FILTER_EOF
@@ -81,7 +84,7 @@ ITEMS_FILTER_EOF
 # refactor these two calls back into one with an interpolated flag string.
 items_rc=1
 if test -n "${KJ_TOOL_PLAN:-}"; then
-  items="$(echo $KJ_TOOL_PLAN | jq -c --arg pk $plain_key --arg sp $sp $items_filter)"
+  items="$(echo $KJ_TOOL_PLAN | jq -c --arg pk $plain_key --arg sp $sp --arg score $score_word $items_filter)"
   items_rc=$?
 fi
 
@@ -95,8 +98,39 @@ if [[ "$items_rc" -ne 0 ]]; then
   # checks `== true`, so an absent field already fails closed, but a
   # reader of this fallback item shouldn't have to know that to trust it.
   cmd_text="$(echo $KJ_TOOL_ARGS | jq -r '.command // empty')"
-  items="$(jq -cn --arg c $cmd_text '[{stmt: $c, clause: $c, kj_readonly: false}]')"
+  items="$(jq -cn --arg c $cmd_text --arg score $score_word '[{stmt: $c, clause: $c, kj_readonly: false, tier: $score}]')"
 fi
+
+# -- gate policy tiers (docs/gate-policy-tuning.md, "Verdicts"). The
+# kernel's evaluator already decided allow/ask/deny for each command and
+# stamped the verdict onto KJ_TOOL_PLAN as `tier`; a command it left
+# undecided carries `score`, the only tier this hook's own classifier gets
+# to judge. Two rules, both load-bearing, checked in this order:
+#
+# 1. Ask tier is firm. A tier the classifier could vote down is not a
+#    tier -- an ask-tier clause exits (escalate mode) or logs (log mode)
+#    here, before lfm2d is even contacted, and nothing below can turn it
+#    back into an allow.
+# 2. Allow tier is dropped from the scored set. The broker's own skip only
+#    fires when EVERY command in the call is allow-tier; a mixed call (`kj
+#    block list; rm -rf /tmp/x`) still reaches this hook, and without this
+#    drop the classifier re-scores the allow clause on its own -- and this
+#    classifier reads a plain read as escalate (`kj block read` measured
+#    situation-normal 0.791), asking a human about a call the evaluator
+#    already allowed.
+ask_clause="$(echo $items | jq -r --arg t ask 'map(select(.tier == $t)) | if length > 0 then .[0].clause else empty end')"
+if test -n "$ask_clause"; then
+  case "$LFM2D_MODE" in
+    escalate)
+      echo "gate policy: ask tier on: $ask_clause" >&2
+      exit 3
+      ;;
+    *)
+      kj block create --kind trace --content "lfm2d-advisory: ask-tier clause, log mode does not ask: $ask_clause"
+      ;;
+  esac
+fi
+items="$(echo $items | jq -c --arg t allow '[.[] | select(.tier != $t)]')"
 
 clauses_json="$(echo $items | jq -c '[.[].clause]')"
 n_clauses="$(echo $clauses_json | jq 'length')"
@@ -104,6 +138,15 @@ if [[ "$n_clauses" -eq 0 ]]; then
   exit 0
 fi
 
+# -- the tier rules above already ran: an ask-tier clause never reaches
+# this point (it exited or logged first) and an allow-tier clause was
+# already dropped from `items`, so nothing below scores either kind. What
+# follows judges only what the evaluator left as `score` -- a clause it did
+# not decide. These three jq exemptions are scheduled for deletion once the
+# tiers cover every case they cover today (docs/gate-policy-tuning.md,
+# "What gets deleted"); until that lands they stay, unchanged, as a second
+# and independent check on the same ground.
+#
 # -- a call whose every clause is exempt proceeds without being scored.
 # Three exemptions. The first two are narrow and both require `kj` as the
 # first word AND no redirect; the third is a classification kept entirely

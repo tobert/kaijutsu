@@ -494,11 +494,14 @@ impl McpServerLike for ShellServer {
             // still exists (`kaijutsu_types::timeout::gate`) and is now
             // load-bearing for nothing here — it comes out with slice 4,
             // after the kernel can resume an approved action on its own.
+            let gate_config =
+                crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
             let outcome = crate::kj::gate::run_gate(
                 dispatcher.kernel_db(),
                 &caller,
                 spec,
                 dispatcher.kernel().ledger_flows(),
+                &gate_config,
             )
             .await;
             if !outcome.allowed() {

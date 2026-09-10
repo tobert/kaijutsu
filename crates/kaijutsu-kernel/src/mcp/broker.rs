@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::binding::{ContextToolBinding, ResolvedName};
 use super::coalescer::{NotificationCoalescer, ObserveOutcome};
 use super::context::CallContext;
-use super::error::{HookId, McpError, McpResult, PolicyError};
+use super::error::{GATE_POLICY_SUBJECT, HookId, McpError, McpResult, PolicyError};
 use super::hook_table::{AskSpec, HookAction, HookBody, HookEntry, McpHookPhase, HookTables};
 use super::hooks_builtin::BuiltinHookRegistry;
 use super::policy::InstancePolicy;
@@ -1898,21 +1898,58 @@ impl Broker {
         ctx: &CallContext,
         payload: PhasePayload<'_>,
     ) -> McpResult<PhaseEval> {
-        // The gate's answer path is ungated by construction: a shell
-        // program the gate policy allows outright — every statement a
-        // `kj ledger` call or read-only `kj` — reaches no PreCall hook at
-        // all, not the asking hook it would deadlock and not the scorer
-        // either. The decision is `kj::gate_policy::evaluate_planned`, on
-        // kaish's plan; a program that does not parse is not allowed and
-        // the hooks see it as before.
+        // The gate policy runs before any hook (`kj/gate_policy.rs`,
+        // `docs/gate-policy-tuning.md`): a shell program it allows outright
+        // — every statement a `kj ledger` call, read-only `kj`, or an
+        // allow-tier key — reaches no PreCall hook at all, not the asking
+        // hook it would deadlock and not the scorer either; a program with
+        // a deny-tier statement is refused here, with the layer and key
+        // named; anything else meets the hooks as before. A program that
+        // does not parse is not allowed and the hooks see it as before.
         if phase == McpHookPhase::PreCall
             && matches!(params.tool.as_str(), "shell" | "shell_write")
             && let Some(command) = params.arguments.get("command").and_then(|v| v.as_str())
             && let Ok(statements) = kaish_kernel::ast::plan::plan_program(command)
-            && crate::kj::gate_policy::evaluate_planned(&statements).verdict()
-                == approval_ledger::types::AskVerdict::Allow
         {
-            return Ok(no_hook_matched(mode));
+            let load = self.gate_config_load().await;
+            let config = match &load {
+                Ok(config) => config,
+                Err(e) => {
+                    // A fault, not a verdict: the file is the remedy, and
+                    // the message names it.
+                    return Ok(PhaseEval::Enforced(PhaseOutcome::GateUnavailable {
+                        hook_id: HookId(GATE_POLICY_SUBJECT.into()),
+                        reason: e.to_string(),
+                        ask: None,
+                    }));
+                }
+            };
+            let context_type = self.context_type_for(ctx).await;
+            let layers = crate::kj::gate_policy::Layers {
+                config,
+                context_type: context_type.as_deref(),
+            };
+            let policy = crate::kj::gate_policy::evaluate_planned(&statements, layers);
+            match policy.verdict() {
+                approval_ledger::types::AskVerdict::Allow => {
+                    return Ok(no_hook_matched(mode));
+                }
+                approval_ledger::types::AskVerdict::Deny => {
+                    let reason = policy.describe_planned(&statements, false);
+                    let hook_id = HookId(GATE_POLICY_SUBJECT.into());
+                    if mode == PhaseMode::DryRun {
+                        return Ok(PhaseEval::DryRun(
+                            self.dry_run_deny(&hook_id, reason, params, ctx).await,
+                        ));
+                    }
+                    return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
+                        hook_id,
+                        reason,
+                        ask: None,
+                    }));
+                }
+                approval_ledger::types::AskVerdict::Escalate => {}
+            }
         }
 
         // Snapshot matching entries + their indices so the sort is stable
@@ -2172,6 +2209,27 @@ impl Broker {
     /// the enforcing path either, so the row here exists for one reason: a
     /// blocked command is exactly the observation the dry run is for, and a
     /// finding that only reaches a log cannot be counted later.
+    /// `gate.toml` as the kernel's `/config/kernel` mount holds it right
+    /// now. A broker with no kernel wired has no config tree to read and
+    /// gets the empty config: the builtin layer alone, which is the state
+    /// every hook-pipeline test runs in.
+    async fn gate_config_load(&self) -> crate::kj::gate_policy::GateConfigLoad {
+        match self.kj_dispatcher().await {
+            Some(dispatcher) => {
+                crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await
+            }
+            None => crate::kj::gate_policy::no_config(),
+        }
+    }
+
+    /// The calling context's `context_type`, for the config layer keyed on
+    /// it. `None` with no dispatcher wired or no row for the context.
+    async fn context_type_for(&self, ctx: &CallContext) -> Option<String> {
+        let dispatcher = self.kj_dispatcher().await?;
+        let db = dispatcher.kernel_db().lock();
+        crate::kj::gate_policy::context_type_of(&db, Some(ctx.context_id))
+    }
+
     async fn dry_run_deny(
         &self,
         hook_id: &HookId,
@@ -2342,11 +2400,13 @@ impl Broker {
             privileged: false,
         };
         let gate_spec = crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params);
+        let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
         let outcome = crate::kj::gate::run_gate(
             dispatcher.kernel_db(),
             &caller,
             gate_spec,
             dispatcher.kernel().ledger_flows(),
+            &gate_config,
         )
         .await;
 
@@ -2598,6 +2658,38 @@ impl Broker {
             if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
                 match kaish_kernel::ast::plan::plan_program(command) {
                     Ok(statements) => {
+                        // `tier` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"):
+                        // the gate policy's per-command verdict word —
+                        // `allow`, `ask`, `deny` or `score` — from
+                        // `kj::gate_policy::command_verdict`, the same
+                        // evaluator PreCall consulted for this call. A file
+                        // PreCall already refused on never reaches a hook;
+                        // one that fails between the two stamps `score`
+                        // everywhere and says so.
+                        let gate_config = crate::kj::gate_policy::load_config(
+                            dispatcher.kernel().vfs(),
+                        )
+                        .await;
+                        let gate_config = match gate_config {
+                            Ok(config) => config,
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "kaijutsu::hooks",
+                                    error = %e,
+                                    "gate.toml unusable while building KJ_TOOL_PLAN; every \
+                                     command is stamped tier=score",
+                                );
+                                crate::kj::gate_policy::GateConfig::default()
+                            }
+                        };
+                        let context_type = {
+                            let db = dispatcher.kernel_db().lock();
+                            crate::kj::gate_policy::context_type_of(&db, Some(ctx.context_id))
+                        };
+                        let layers = crate::kj::gate_policy::Layers {
+                            config: &gate_config,
+                            context_type: context_type.as_deref(),
+                        };
                         let mut plan_value = serde_json::json!({
                             "statements": statements,
                         });
@@ -2636,6 +2728,14 @@ impl Broker {
                                         obj.insert(
                                             "clause".to_string(),
                                             serde_json::Value::String(clause),
+                                        );
+                                        obj.insert(
+                                            "tier".to_string(),
+                                            serde_json::Value::String(
+                                                crate::kj::gate_policy::command_verdict(cmd, layers)
+                                                    .tier()
+                                                    .to_string(),
+                                            ),
                                         );
                                     }
                                 }
@@ -9419,6 +9519,150 @@ mod tests {
         // not about the capability gate, so relax the kernel's deny-by-default.
         broker.relax_unbound_deny_for_test();
         (broker, kernel, kj_dispatcher)
+    }
+
+    /// `wired_kaish_broker` plus a `/config/kernel` mount holding `toml`
+    /// as `gate.toml`. The tempdir rides back so the mount outlives the
+    /// test body.
+    async fn wired_kaish_broker_with_gate_toml(
+        name: &str,
+        toml: &str,
+    ) -> (
+        Arc<Broker>,
+        Arc<crate::Kernel>,
+        Arc<crate::kj::KjDispatcher>,
+        tempfile::TempDir,
+    ) {
+        let (broker, kernel, kj) = wired_kaish_broker(name).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::kj::gate_policy::GATE_CONFIG_FILE), toml).unwrap();
+        assert!(
+            kernel
+                .mount(
+                    kaijutsu_types::paths::CONFIG_ROOT,
+                    crate::vfs::LocalBackend::new(dir.path()),
+                )
+                .await,
+            "the ephemeral kernel must accept a /config/kernel mount"
+        );
+        (broker, kernel, kj, dir)
+    }
+
+    fn shell_write_call(command: &str) -> KernelCallParams {
+        let mut call = params("svc", "shell_write");
+        call.arguments = serde_json::json!({ "command": command });
+        call
+    }
+
+    /// A deny-tier statement is refused at PreCall before any hook runs,
+    /// and the refusal names the layer and key rather than a hook.
+    ///
+    /// Falsified by removing the Deny arm at PreCall: the Ask hook fires
+    /// and the call comes back pending instead of denied.
+    #[tokio::test]
+    async fn a_deny_tier_statement_is_refused_at_pre_call_naming_the_layer_and_key() {
+        let (broker, _kernel, _kj, _dir) =
+            wired_kaish_broker_with_gate_toml("gate-toml-deny", "[global]\ndeny = [\"dd\"]\n").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_shell_write_hook(&broker, "asker", HookAction::Ask(AskSpec { description: None })).await;
+
+        let err = broker
+            .call_tool(shell_write_call("dd if=/dev/zero of=/dev/sda"), &CallContext::test(), CancellationToken::new())
+            .await
+            .expect_err("a deny-tier statement must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("denied by the gate policy") && text.contains("global config denies dd"),
+            "{text}"
+        );
+        assert!(text.contains("dd if=/dev/zero"), "the refusal names the statement: {text}");
+        assert!(
+            !text.contains("asker"),
+            "PreCall decided before the hook, so no hook is named: {text}"
+        );
+    }
+
+    /// An allow-tier program skips the hooks: an Ask hook on `shell_write`
+    /// never fires for `rg`, which no builtin layer knows.
+    ///
+    /// Falsified by dropping the config layer from PreCall: the hook fires
+    /// and the call comes back pending.
+    #[tokio::test]
+    async fn an_allow_tier_program_skips_the_hooks() {
+        let (broker, _kernel, _kj, _dir) =
+            wired_kaish_broker_with_gate_toml("gate-toml-allow", "[global]\nallow = [\"rg\"]\n").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_shell_write_hook(&broker, "asker", HookAction::Ask(AskSpec { description: None })).await;
+
+        let result = broker
+            .call_tool(shell_write_call("rg -n todo src"), &CallContext::test(), CancellationToken::new())
+            .await
+            .expect("an allow-tier program reaches no hook");
+        assert!(!result.is_error);
+        // The same hook still fires once anything else rides along.
+        let err = broker
+            .call_tool(shell_write_call("rg -n todo src; cat notes"), &CallContext::test(), CancellationToken::new())
+            .await
+            .expect_err("a mixed program still meets the hook");
+        assert!(err.to_string().contains("asker") || err.to_string().contains("pending"), "{err}");
+    }
+
+    /// `KJ_TOOL_PLAN` carries the gate policy's per-command tier: the word a
+    /// hook body reads to drop allow-tier clauses from scoring and to make
+    /// an ask-tier clause firm.
+    #[tokio::test]
+    async fn kj_tool_plan_carries_the_tier_per_command() {
+        let (broker, _kernel, _kj, _dir) = wired_kaish_broker_with_gate_toml(
+            "gate-toml-tier",
+            "[global]\nallow = [\"rg\"]\nask = [\"git push\"]\n",
+        )
+        .await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("tier-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(
+                "tiers=$(echo $KJ_TOOL_PLAN | jq -r '[.statements[].plan.commands[].tier]|join(\",\")')\n\
+                 case $tiers in allow,ask,score,allow) exit 0 ;; *) echo $tiers >&2; exit 1 ;; esac"
+                    .into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let result = broker
+            .call_tool(
+                shell_write_call("rg x; git push origin; cat y; kj block list"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the tiers must read allow,ask,score,allow");
+        assert!(!result.is_error);
+    }
+
+    /// A file that does not parse is a fault: the call is refused as gate
+    /// unavailable, not denied, and the message names the file and remedy.
+    #[tokio::test]
+    async fn an_unusable_gate_toml_refuses_every_shell_call_as_unavailable() {
+        let (broker, _kernel, _kj, _dir) =
+            wired_kaish_broker_with_gate_toml("gate-toml-broken", "[global]\nallow = [\"kj nope\"]\n").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+
+        let err = broker
+            .call_tool(shell_write_call("kj block list"), &CallContext::test(), CancellationToken::new())
+            .await
+            .expect_err("a broken gate.toml refuses even a read");
+        let text = err.to_string();
+        assert!(text.contains("gate.toml") && text.contains("kj config reset gate.toml"), "{text}");
+        assert!(text.contains("nope"), "the message names the bad key: {text}");
     }
 
     /// PostCall sees `KJ_TOOL_RESULT` populated with the JSON encoding of

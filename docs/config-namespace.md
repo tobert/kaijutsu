@@ -16,7 +16,7 @@ declaration, not a compiled-in constant.**
 ```
 /config/            # no backend of its own — listed from its mount points
     rc/             # lifecycle scripts
-    kernel/         # theme.toml, mcp.toml, system.md
+    kernel/         # theme.toml, mcp.toml, gate.toml, system.md
     client/         # default/<name>, <client-id>/<name>
     midi/           # devices/<name>
 ```

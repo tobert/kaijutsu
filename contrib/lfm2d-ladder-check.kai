@@ -149,6 +149,63 @@ check_exempt '[{"clause":"kj ledger list","has_redirect":false}]' true "ledger l
 check_exempt '[{"clause":"kj rc add --help","has_redirect":true}]' false "help with a redirect is a write" || fails=1
 check_exempt '[{"clause":"kj ledger allow a"},{"clause":"kj ledger deny b","has_redirect":true}]' false "one redirected clause scores the call" || fails=1
 
+# --- the tier rules -----------------------------------------------------
+#
+# The kernel's gate policy evaluator stamps each KJ_TOOL_PLAN command with a
+# tier -- allow, ask, deny, or score (docs/gate-policy-tuning.md,
+# "Verdicts"). `deny` never reaches a hook. Two rules, both load-bearing:
+#
+#   1. Ask tier is firm. An ask-tier clause is never re-scored by the
+#      classifier -- it exits (escalate mode) or logs (log mode) before
+#      lfm2d is even contacted, naming the FIRST ask-tier clause found.
+#   2. Allow tier is dropped from the scored set, so a mixed call (`kj
+#      block list; rm -rf /tmp/x`) does not send its already-allowed read
+#      clause back through the classifier. A clause with no `tier` field at
+#      all -- the KJ_TOOL_PLAN-unavailable fallback -- is NOT dropped: only
+#      an explicit `allow` is.
+#
+# THESE FILTERS ARE COPIES of the ones in
+# assets/defaults/rc/lib/hooks/lfm2d.kai and must change together, exactly
+# like the exemption filter comment above says.
+
+check_ask() {
+  # $1 items JSON, $2 expected clause ("" for none), $3 description
+  items="$1"
+  expected="$2"
+  what="$3"
+  got="$(echo $items | jq -r --arg t ask 'map(select(.tier == $t)) | if length > 0 then .[0].clause else empty end')"
+  if [[ "$got" = "$expected" ]]; then
+    echo "ok   ask: $what -> '$got'"
+  else
+    echo "FAIL ask: $what -> '$got', expected '$expected'"
+    return 1
+  fi
+}
+
+check_ask '[{"clause":"kj rc add x","tier":"ask"}]' "kj rc add x" "one ask-tier item detects it" || fails=1
+check_ask '[{"clause":"kj block list","tier":"allow"},{"clause":"rm -rf /tmp/x","tier":"score"}]' "" "no ask-tier item yields empty" || fails=1
+check_ask '[{"clause":"a","tier":"score"},{"clause":"b","tier":"ask"},{"clause":"c","tier":"ask"}]' "b" "the FIRST ask-tier clause wins" || fails=1
+
+check_allow_drop() {
+  # $1 items JSON, $2 expected filtered items JSON, $3 description
+  items="$1"
+  expected="$2"
+  what="$3"
+  got="$(echo $items | jq -c --arg t allow '[.[] | select(.tier != $t)]')"
+  if [[ "$got" = "$expected" ]]; then
+    echo "ok   allow-drop: $what -> $got"
+  else
+    echo "FAIL allow-drop: $what -> $got, expected $expected"
+    return 1
+  fi
+}
+
+check_allow_drop '[{"clause":"kj block list","tier":"allow"}]' '[]' "allow item dropped" || fails=1
+check_allow_drop '[{"clause":"a","tier":"score"}]' '[{"clause":"a","tier":"score"}]' "score item kept" || fails=1
+check_allow_drop '[{"clause":"a","tier":"ask"}]' '[{"clause":"a","tier":"ask"}]' "ask item kept" || fails=1
+check_allow_drop '[{"clause":"a"}]' '[{"clause":"a"}]' "item with no tier field is NOT dropped -- the fallback path" || fails=1
+check_allow_drop '[{"clause":"a","tier":"allow"},{"clause":"b","tier":"score"}]' '[{"clause":"b","tier":"score"}]' "mixed allow+score keeps exactly the score item" || fails=1
+
 if [[ "$fails" -ne 0 ]]; then
   echo "ladder check FAILED"
   exit 1

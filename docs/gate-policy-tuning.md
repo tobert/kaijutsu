@@ -1,7 +1,8 @@
 # Gate policy tuning — one layered list, one runtime path
 
-Status: designed 2026-09-08; slice 1 (the evaluator seam, `kj/gate_policy.rs`)
-shipped 2026-09-10, slices 2–5 unbuilt. Amy's rulings of the same day are quoted
+Status: designed 2026-09-08; slices 1 and 2 (the evaluator seam and the
+config layer, `kj/gate_policy.rs` + `assets/defaults/gate.toml`) shipped
+2026-09-10, slices 3 and 5 unbuilt, slice 4 retired by the verb class. Amy's rulings of the same day are quoted
 where they decide a shape. Reviewed against the live tree by kaibo (cast
 `crusoe`) the same day; the revision absorbs its findings. This doc is
 canonical for the gate-policy evaluator; `docs/gate-and-shell-split.md`
@@ -351,13 +352,13 @@ unreleased one:
    row), and `auto_reason` reads `gate policy: builtin allows kj block
    list` / `gate policy: user rule denies the exact statement (rule …) —
    statement #2 (…)`. Parity tests pin everything else.
-2. **Config layer.** `assets/defaults/gate.toml` + seed + `[global]` /
-   `[context_type.<type>]` + kj key validation through `classify` + the PreCall Deny branch
-   (`subject = gate policy`) + the `KJ_TOOL_PLAN` tier field + **both** lfm2d
-   hook rules (ask-tier exit 3, allow-tier clause drop) + the `--help`
-   structural rule in the evaluator with its Rust bypass test. The non-kj
-   test entries (`rg`, `wc`, `git push`, `dd`) ride in this slice — ruling
-   3's "a few other things just to test it out".
+2. **Config layer — shipped.** `assets/defaults/gate.toml` + seed + `[global]` /
+   `[context_type.<type>]` + kj key validation through the verb tables + the
+   PreCall Deny branch (`subject = gate policy`) + the `KJ_TOOL_PLAN` `tier`
+   field + **both** lfm2d hook rules (ask-tier exit 3, allow-tier clause
+   drop) + the `--help` structural rule in the evaluator with its Rust
+   bypass test. The non-kj test entries (`rg`, `wc`, `git push`, `dd`) ride
+   in this slice — ruling 3's "a few other things just to test it out".
 3. **Learned family rules.** Schema, `learn_family_from_approval` with the
    structural refusal, `--family` at answer time, `family_coverage()`
    beside `redeem()`, `kj ledger rules`/`forget` extension, both
@@ -419,7 +420,28 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   decision is their most deliberate act; both kinds stay revocable and both
   show in `kj ledger rules`.
 
+- **A file that does not load refuses, it does not degrade.** An
+  unreadable or unparseable `gate.toml` refuses every shell submission that
+  consults it — `GateUnavailable` at broker PreCall, `Unavailable` inside
+  `run_gate` — naming the file and `kj config reset gate.toml`. A policy
+  file that silently half-applies is the failure shape this repo does not
+  ship, and the host file is one edit from fixed. An absent file is the
+  empty config: deleting it is a deliberate act the seed respects.
+- **The `ask` tier on the RPC shell paths rides the hook stack.** Those
+  paths evaluate PreCall and never open the shell gate, so an ask-tier
+  statement there is asked only when the lfm2d hook is installed and in
+  `escalate` mode (in `log` mode it records a trace and proceeds). The MCP
+  `shell_write` path asks through `run_gate` regardless. Whether PreCall
+  should open its own ask for an ask-tier statement when no hook does is
+  the open question below.
+
 ## Open questions
+- **Should broker PreCall open an ask for an ask-tier statement itself?**
+  Today the ask tier is firm through `run_gate` (MCP `shell_write`) and
+  through the lfm2d hook's exit 3 (every path, escalate mode only). A
+  PreCall-owned ask would make the tier firm on the RPC paths with no hook
+  installed, at the cost of a second ask on the MCP path, which already
+  double-asks when a hook escalates ahead of the shell gate.
 - **shell-guard's interpreter lists.** They are opacity rules, not risk
   tiers, and stay a structural hook in v1. Whether `deny = ["sh", "bash",
   …]` in `gate.toml` eventually replaces the jq is a later call — one

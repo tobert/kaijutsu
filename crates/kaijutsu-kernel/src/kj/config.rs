@@ -35,7 +35,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "Read config: kernel-global at /config/kernel (system.md, theme.toml, mcp.toml) + per-client at /config/client (metronome.toml). To CHANGE a config file, just write it with the file tools or open it with `kj editor` — there is no set/edit verb. Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
+    about = "Read config: kernel-global at /config/kernel (system.md, theme.toml, mcp.toml, gate.toml) + per-client at /config/client (metronome.toml). To CHANGE a config file, just write it with the file tools or open it with `kj editor` — there is no set/edit verb. Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
