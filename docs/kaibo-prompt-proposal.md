@@ -99,7 +99,8 @@ Crusoe roles; neither envelope reports warnings. Their checkout records are
 `~/exomemory/kaijutsu/prompt-review-2026-09-10/`. These are useful cases,
 not a controlled comparison of model quality or proof that a prompt caused
 an error. This section checks selected claims, not every finding in either
-review.
+review. The [review synthesis](prompt-review-results.md) records the broader
+implementation recommendations and corrections checked against the raw answers.
 
 **The object under review must stay explicit.** DeepSeek finding 4 says the
 continuation draft needs the intent-versus-steering rule repeated. The
