@@ -3358,9 +3358,23 @@ async fn ensure_context_joinable(
             row.created_at,
             row.last_activity_at,
         );
+        // The row's own state travels with the heal: an archived row keeps
+        // its label as history without holding it, so it cannot collide
+        // with the live context that took the name after it was archived.
+        let state = if row.is_archived() {
+            kaijutsu_types::ContextState::Archived
+        } else {
+            row.context_state
+        };
         let mut drift = kernel.kernel.drift().write();
         drift
-            .register(context_id, row.label.as_deref(), row.forked_from, row.created_by)
+            .register_with_state(
+                context_id,
+                row.label.as_deref(),
+                row.forked_from,
+                row.created_by,
+                state,
+            )
             .map_err(|e| {
                 capnp::Error::failed(format!(
                     "join_context: failed to heal registry for {context_id}: {e}"

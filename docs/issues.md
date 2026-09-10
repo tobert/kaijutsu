@@ -43,33 +43,19 @@ mechanism**, not a one-off exemption. `docs/gate-policy-tuning.md` (designed
 the global allow tier and names this issue by title to close when slice 5
 ships. Delete this entry then.
 
-## `join_context` heals an archived row and collides with the live label (2026-09-09)
+## A client can resume into an archived context (2026-09-09)
 
-Sequence from the journal: 07:25 this session's MCP created `01a085ea`
-and renamed it `cc-kaijutsu-c75f64fe`; 07:43:59 another process archived
-it; 07:44 a second MCP instance created `e6a4375f` and renamed it to the
-same label; 07:55 the first process re-joined the archived `01a085ea` and
-kept working, because archiving does not evict a context from the
-in-memory registry; the bounce did, and the heal then collided.
-
-After the 09:14 bounce, the lead session's MCP mirror failed permanently:
-`join_context: failed to heal registry for 01a085ea…: label
-'cc-kaijutsu-c75f64fe' already in use by context e6a4375f`. `kj context
-info 01a085ea` says not found (archived); `e6a4375f` is the live context
-under that label. The heal path (`kaijutsu-server/src/rpc.rs`, "healing
-from its KernelDb row") registers any row `get_context` returns, and
-`DriftRouter::register` enforces label uniqueness across everything
-registered, while the DB scopes uniqueness to live rows
-(`idx_contexts_label … WHERE archived_at IS NULL`). Two fixes, both
-small: the heal refuses an archived row with an error that names the live
-context under the label, and the client re-registers instead of retrying
-a context id it cached before the bounce: `connect_handshake` in
-`kaijutsu-client/src/actor.rs` classifies the `join_context` failure as
-`ConnectOutcome::Permanent`, and the MCP surfaces it as "permanently
-failed" on every later call (`register_session` from a fresh process
-reports `already_registered` with a *different* id each time, which is a
-cache, not a kernel fact). Recovery today is `/mcp` in the affected
-session.
+Sequence from the journal: an MCP session's context was archived by another
+process while the session was attached; a second MCP instance created a new
+context under the same label; the first session kept working in the archived
+one, because archiving does not evict a context from the in-memory registry,
+and it re-joined the same archived id after the next bounce. The heal now
+registers an archived row as archived, so the re-join no longer collides
+with the live holder of the label (`register_with_state`, `drift.rs`). What
+remains open is whether `joinContext` on an archived context should redirect
+the client to the live holder of its label, or refuse so the MCP re-registers
+a fresh context; today it succeeds and the session works inside an archived
+context, which `ContextRow::is_archived` documents as inert.
 
 ## An ask's `exec_source` shows `none` for a positional the executor ran correctly (2026-09-09)
 

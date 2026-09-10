@@ -337,7 +337,7 @@ impl DriftRouter {
         }
     }
 
-    /// Register a context with a pre-assigned ContextId.
+    /// Register a live context with a pre-assigned ContextId.
     ///
     /// The caller (server RPC) creates the ContextId and passes it in.
     /// Provider and model default to None; use `configure_llm()` to set them.
@@ -350,7 +350,28 @@ impl DriftRouter {
         forked_from: Option<ContextId>,
         created_by: PrincipalId,
     ) -> Result<(), DriftError> {
-        if let Some(l) = label {
+        self.register_with_state(id, label, forked_from, created_by, ContextState::Live)
+    }
+
+    /// Register a context in a given lifecycle state, as when re-registering
+    /// a durable row after a restart.
+    ///
+    /// An archived context keeps its label as history but does not hold it,
+    /// matching `set_state`: the label stays on the handle, is not claimed in
+    /// the live map, and never collides with a live holder of the same name.
+    /// Every other state claims the label and fails if it is already in use.
+    #[tracing::instrument(skip(self), name = "drift.register_with_state")]
+    pub fn register_with_state(
+        &mut self,
+        id: ContextId,
+        label: Option<&str>,
+        forked_from: Option<ContextId>,
+        created_by: PrincipalId,
+        state: ContextState,
+    ) -> Result<(), DriftError> {
+        if let Some(l) = label
+            && state != ContextState::Archived
+        {
             self.check_label_available(l, id)?;
             self.label_to_id.insert(l.to_string(), id);
         }
@@ -365,7 +386,7 @@ impl DriftRouter {
             created_by,
             created_at: kaijutsu_types::now_millis(),
             trace_id: uuid::Uuid::new_v4().into_bytes(),
-            state: ContextState::Live,
+            state,
         };
 
         self.contexts.insert(id, handle);
@@ -1728,6 +1749,30 @@ mod tests {
         assert_eq!(router.get(old).unwrap().label.as_deref(), Some("ROOT"), "the archived handle lost its name");
         assert_eq!(router.resolve_context("ROOT").unwrap(), new);
         assert_eq!(router.resolve_context("RO").unwrap(), new, "an archived label must not make a prefix ambiguous");
+    }
+
+    /// Re-registering an archived row (the post-restart heal) must not
+    /// claim a label a live context now holds.
+    #[test]
+    fn archived_registration_does_not_collide_with_a_live_label() {
+        let mut router = DriftRouter::new();
+        let live = ContextId::new();
+        router.register(live, Some("ROOT"), None, PrincipalId::system()).unwrap();
+
+        let archived = ContextId::new();
+        router
+            .register_with_state(archived, Some("ROOT"), None, PrincipalId::system(), ContextState::Archived)
+            .expect("an archived registration must not contend for a live label");
+        assert_eq!(router.get(archived).unwrap().label.as_deref(), Some("ROOT"), "the archived handle lost its name");
+        assert_eq!(router.context_state(archived), Some(ContextState::Archived));
+        assert_eq!(router.resolve_context("ROOT").unwrap(), live, "the live holder must keep the label");
+
+        // The other direction still refuses: a live registration over a held label.
+        let other = ContextId::new();
+        assert!(matches!(
+            router.register_with_state(other, Some("ROOT"), None, PrincipalId::system(), ContextState::Live),
+            Err(DriftError::LabelInUse { .. })
+        ));
     }
 
     #[test]

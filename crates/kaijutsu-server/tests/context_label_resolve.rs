@@ -200,3 +200,65 @@ fn join_context_heals_registry_for_an_archived_context_after_restart() {
         assert_eq!(found.label, label);
     });
 }
+
+/// The heal above must respect the row's state. An archived context's label
+/// is free for reuse, so by the time a client re-joins an archived context
+/// after a restart, a live context may hold the same label. Registering the
+/// archived row as live collided on that label and failed the join
+/// permanently for every client that had cached the archived id.
+#[test]
+fn join_context_heals_an_archived_context_whose_label_a_live_context_holds() {
+    run_local(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        let label = "restart-heal-reused-label-test".to_string();
+
+        let (archived_id, live_id) = {
+            let addr = start_server_with_state_dir(state_dir.clone()).await;
+            let client = connect_client(addr).await;
+            let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+            let archived_id = kernel.create_context(&label).await.unwrap();
+            kernel.archive_context(archived_id).await.unwrap();
+            // The label is free again; a second context takes it while the
+            // first is still archived.
+            let live_id = kernel.create_context(&label).await.unwrap();
+            assert_ne!(archived_id, live_id);
+            (archived_id, live_id)
+        };
+
+        let addr2 = simulate_kernel_restart(state_dir).await;
+        let client2 = connect_client(addr2).await;
+        let (kernel2, _kernel_id2) = client2.bind_kernel().await.unwrap();
+
+        // Boot recovery registered the live holder; the label resolves to it.
+        let hit = kernel2
+            .resolve_context_label(&label)
+            .await
+            .unwrap()
+            .expect("the live holder must resolve after the restart");
+        assert_eq!(hit.id, live_id);
+
+        // Re-joining the archived id must heal it beside the live holder,
+        // not fail on the label the live holder legitimately owns.
+        let joined = kernel2
+            .join_context(archived_id, "post-restart-instance")
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "join_context must heal an archived row without contending for a \
+                     label a live context holds, got: {e}"
+                )
+            });
+        assert_eq!(joined, archived_id);
+
+        // The live holder keeps the label; the archived one is listed as archived.
+        let hit = kernel2.resolve_context_label(&label).await.unwrap().unwrap();
+        assert_eq!(hit.id, live_id, "the heal must not steal the label from the live holder");
+        let listed = kernel2.list_contexts().await.unwrap();
+        assert!(
+            listed.iter().any(|c| c.id == archived_id),
+            "the healed archived context must be visible to listContexts"
+        );
+        assert!(listed.iter().any(|c| c.id == live_id), "the live holder must stay listed");
+    });
+}
