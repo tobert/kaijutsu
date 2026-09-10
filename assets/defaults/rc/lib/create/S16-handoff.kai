@@ -1,0 +1,79 @@
+# S16-handoff.kai — inject a character's recent handoff notes at context
+# create (docs/character.md, "The handoff is an ordinary context"). One body
+# in lib/, linked into every create bundle that wants it.
+#
+# Whose log: the context env `KJ_CHARACTER` names the character when
+# the seat is played for someone other than the caller (a director seat a
+# person drives from the tui is created by them, but the seat's memory is
+# the seat's character's). Unset, the caller's own character is read.
+#
+# S15-recall injects what the fleet knows; this injects what the last
+# session left. Together they are the morning window: who I am, what I was
+# doing, what is waiting.
+#
+# Constraints this script exists to satisfy, same family as S15-recall:
+#
+#  - NEVER exit nonzero. A nonzero exit inserts a non-ephemeral
+#    BlockKind::Error the model sees on EVERY context create
+#    (kj/lifecycle.rs "Failure semantics"). `kj handoff tail` legitimately
+#    fails when the principal has no character sheet — a pre-character
+#    principal is not an error condition — so its exit is guarded INSIDE
+#    the substitution (`|| true`), and `exit 0` is the literal last line.
+#    Under `set -e` a failing `$(...)` assignment aborts the whole script,
+#    and no later line runs. Verified live.
+#  - NOTIFICATION, never (Role::System, BlockKind::Text). This content
+#    differs on every create, and the System+Text slot folds into the
+#    CACHED system prompt (llm/system_prompt.rs), so writing there would
+#    invalidate the --target=system cache breakpoint on every context
+#    creation. Notification hydrates as an ordinary appended turn
+#    (llm/hydrate.rs) and is never swept into the system prompt.
+#  - Bounded. A single builtin's stdout is capped at 8192 bytes
+#    (OutputLimitConfig::agent(), runtime/embedded_kaish.rs); crossing it
+#    silently splices head+tail rather than erroring. Twelve notes sit far
+#    under that, and --window keeps it that way.
+#  - kj-and-VFS only. No network, no external process.
+#
+# `$(...)` assignment cannot be guarded with a trailing `||` — kaish never
+# fires it. The `|| true` therefore sits inside the substitution, where it
+# does fire, and the fallback text is a separate `test -z` statement.
+set -e
+
+window=12
+
+who="$(kj context info --json | jq -r '.env.KJ_CHARACTER | tostring')"
+
+# `kj handoff tail` prints "[when] author: text" per note, or a bare
+# "<name> has no handoff notes yet" line. It errors only when the named
+# (or calling) principal has no character sheet at all.
+case "$who" in
+  null|"")
+    who="your character"
+    notes="$(kj handoff tail --window $window || true)"
+    note_cmd="kj handoff note 'what you did, what is next'"
+    ;;
+  *)
+    notes="$(kj handoff tail --window $window $who || true)"
+    note_cmd="kj handoff note --for $who 'what you did, what is next'"
+    ;;
+esac
+
+if test -z "$notes"; then
+  notes="(no handoff log reachable — this seat's character may have no sheet yet; 'kj character create <name>' mints one)"
+fi
+
+stamp="$(date -u --iso-8601=seconds)"
+
+content="=== Handoff — the last $window notes on the log of $who (auto-injected at create) ===
+Read $stamp. Notes are append-only and carry their own author, so a note
+signed by someone else was left FOR this seat by another character.
+
+$notes
+
+Leave one before this seat goes cold or rotates:
+    $note_cmd
+A note you write for someone else still lands under your own name."
+
+kj block create --role system --kind notification --content "$content" || true
+
+echo "handoff: injected window=$window who=$who stamp=$stamp"
+exit 0

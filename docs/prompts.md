@@ -8,11 +8,19 @@
 /config/rc/coder/create/S00-stance.kai
 /config/rc/default/create/S00-base.md -> ../../lib/create/S00-base.md
 /config/rc/default/create/S00-stance.md
+/config/rc/director/create/S00-base.md -> ../../lib/create/S00-base.md
+/config/rc/director/create/S00-stance.kai
+/config/rc/director/create/S06-kj-help.kai
 ```
 
-The shared base is optional. Coder and default include it through ordinary
-relative symlinks. Musician, bassist, assistant, director, mcp, and toolie keep
-their own role contracts. Kaijutsu never prepends a universal behavioral prompt.
+The shared base is optional. Coder, default and director include it through
+ordinary relative symlinks. Musician, bassist, assistant, mcp, and toolie keep
+their own role contracts. Director is the operator's seat: its stance names
+the character in the seat (`KJ_CHARACTER`, below) and `S06-kj-help.kai`
+composes `kj help` plus every top-level `kj <verb> --help` into one durable
+instruction block, so the seat runs kj from its own reference rather than
+reading help mid-task (about 28 KB; the cache breakpoint on the system
+prompt absorbs it). Kaijutsu never prepends a universal behavioral prompt.
 The kernel adds runtime facts; rc supplies the chosen instruction sections.
 
 The link filename controls order: `S00-base.md` precedes `S00-stance.*`.
@@ -38,6 +46,28 @@ It includes eligible rc instruction sections and runtime facts, omitting
 excluded, ephemeral, draft, and empty instruction blocks. A failed block read
 stops both preview and live turn preparation. An existing context with no
 instruction sections remains valid.
+
+## Rotating a seat
+
+```sh
+kj handoff note --for banto 'what happened, what is next'
+kj context create ROOT-next --type director --cast ops \
+  --env 'KJ_CHARACTER=banto' --env 'ROTATED_FROM=ROOT'
+kj context archive ROOT --confirm
+kj context rename ROOT-next ROOT
+```
+
+Two context env values drive the create lifecycle. `KJ_CHARACTER` names the
+character playing the seat: `S00-stance.kai` addresses it by name and
+`S16-handoff.kai` reads that character's handoff log instead of the caller's
+(the caller is whoever ran `create`, a person at the tui as often as not).
+`ROTATED_FROM` names the predecessor: `S17-predecessor.kai` injects its last
+twelve prose blocks, each cut at 400 bytes, as a notification, read with
+`kj wait` so an idle predecessor resolves from its log without parking. Both
+are bridges until `kj context create --as <character>` and the rc union land
+(`docs/character.md`, slices 3 and 5); the env names are the ones slice 5
+plans to seed. `kj fork --compact` is the alternative once a handoff worth
+distilling exists; it keeps the type and runs the fork lifecycle instead.
 
 ## Briefing and continuation
 

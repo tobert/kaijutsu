@@ -1,0 +1,46 @@
+# S17-predecessor.kai — when this context replaces another (a seat
+# rotation), inject the predecessor's recent prose so the new seat starts
+# where the old one stopped (docs/prompts.md, "Rotating a seat").
+#
+#   kj context create ROOT-next --type director --cast ops --env ROTATED_FROM=ROOT
+#
+# `ROTATED_FROM` is a context env value naming the predecessor by label or
+# id. Unset, this script does nothing. The tail is read with `kj wait`,
+# which resolves an idle context from its log without parking: 12 prose
+# blocks, each cut at 400 bytes, so the capture stays under the 8192-byte
+# builtin stdout cap (runtime/embedded_kaish.rs). A stale or archived
+# predecessor degrades to a fallback line; this script NEVER exits nonzero
+# (see S16-handoff.kai for the contract and the `|| true` placement).
+#
+# NOTIFICATION, never (Role::System, BlockKind::Text): the content differs
+# per create and must not fold into the cached system prompt.
+set -e
+
+prev="$(kj context info --json | jq -r '.env.ROTATED_FROM | tostring')"
+
+case "$prev" in
+  null|"")
+    echo "predecessor: none (set ROTATED_FROM=<label> at create to carry a tail)"
+    exit 0
+    ;;
+esac
+
+tail="$(kj wait $prev --timeout 1 --max-blocks 12 --max-bytes 400 --include text || true)"
+
+if test -z "$tail"; then
+  tail="(no tail readable from '$prev' — it may be archived or mislabeled)"
+fi
+
+stamp="$(date -u --iso-8601=seconds)"
+
+content="=== Rotated from context '$prev' (auto-injected at create) ===
+Read $stamp. The predecessor's last 12 prose blocks, each cut at 400 bytes.
+Read more with: kj block list -c $prev   then   kj block read -c $prev '<id>'
+The predecessor's handoff note, if it left one, is in the handoff block above.
+
+$tail"
+
+kj block create --role system --kind notification --content "$content" || true
+
+echo "predecessor: injected tail of $prev"
+exit 0

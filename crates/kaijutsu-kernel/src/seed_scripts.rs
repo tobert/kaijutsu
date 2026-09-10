@@ -383,7 +383,7 @@ mod tests {
     /// in by linking their create entry; no registry or kernel-wide prompt
     /// layer supplies it behind their back.
     #[test]
-    fn rc_shared_base_is_opted_into_by_coder_and_default_only() {
+    fn rc_shared_base_is_opted_into_by_coder_default_and_director_only() {
         const BASE: &str = "/config/rc/lib/create/S00-base.md";
         let seeds = seed_files();
         let known: std::collections::HashSet<String> =
@@ -395,7 +395,7 @@ mod tests {
             "the shared base owns its accepted closing"
         );
 
-        for context_type in ["coder", "default"] {
+        for context_type in ["coder", "default", "director"] {
             let link_path = format!("/config/rc/{context_type}/create/S00-base.md");
             assert_eq!(
                 seed_link_target(&link_path, seed_body(&link_path).expect("base link"), &known),
@@ -412,8 +412,12 @@ mod tests {
             seed_body("/config/rc/default/create/S00-stance.md").is_some(),
             "the default role follows the shared S00-base by lexical order"
         );
+        assert!(
+            seed_body("/config/rc/director/create/S00-stance.kai").is_some(),
+            "the director role follows the shared S00-base by lexical order"
+        );
 
-        for context_type in ["assistant", "bassist", "director", "mcp", "musician", "toolie"] {
+        for context_type in ["assistant", "bassist", "mcp", "musician", "toolie"] {
             let path = format!("/config/rc/{context_type}/create/S00-base.md");
             assert!(
                 seed_body(&path).is_none(),

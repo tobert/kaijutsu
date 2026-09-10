@@ -1,0 +1,95 @@
+# The kj reference, composed at create into one durable instruction block
+# so the operator's seat can run nearly all of kj in a turn without reading
+# help mid-task. Nothing here is hand-copied: `kj help` is the embedded
+# kj.md and each `kj <verb> --help` is clap reflection, so a verb change
+# reaches every newly created seat with no rc edit.
+#
+# Explicit captures, not a loop: kaish loop-body assignments do not persist
+# across iterations, so an accumulator built in `for` would come out empty.
+# The rc shell runs with the internal output profile (4 MiB), so the
+# 11 KB overview is captured whole. Each verb help is guarded with
+# `|| true` inside the substitution so a verb that grows a refusal cannot
+# fail the create; the overview is the one capture that must be non-empty.
+set -e
+overview="$(kj help)"
+test -n "$overview" || exit 1
+
+h_context="$(kj context --help || true)"
+h_block="$(kj block --help || true)"
+h_stage="$(kj stage --help || true)"
+h_fork="$(kj fork --help || true)"
+h_drive="$(kj drive --help || true)"
+h_wait="$(kj wait --help || true)"
+h_drift="$(kj drift --help || true)"
+h_ledger="$(kj ledger --help || true)"
+h_cast="$(kj cast --help || true)"
+h_backend="$(kj backend --help || true)"
+h_character="$(kj character --help || true)"
+h_handoff="$(kj handoff --help || true)"
+h_config="$(kj config --help || true)"
+h_rc="$(kj rc --help || true)"
+h_hook="$(kj hook --help || true)"
+h_binding="$(kj binding --help || true)"
+h_cache="$(kj cache --help || true)"
+h_workspace="$(kj workspace --help || true)"
+
+ref="$overview
+
+# Verb reference (each is kj <verb> --help; run kj <verb> <sub> --help for a leaf)
+
+## kj context
+$h_context
+
+## kj block
+$h_block
+
+## kj stage
+$h_stage
+
+## kj fork
+$h_fork
+
+## kj drive
+$h_drive
+
+## kj wait
+$h_wait
+
+## kj drift
+$h_drift
+
+## kj ledger
+$h_ledger
+
+## kj cast
+$h_cast
+
+## kj backend
+$h_backend
+
+## kj character
+$h_character
+
+## kj handoff
+$h_handoff
+
+## kj config
+$h_config
+
+## kj rc
+$h_rc
+
+## kj hook
+$h_hook
+
+## kj binding
+$h_binding
+
+## kj cache
+$h_cache
+
+## kj workspace
+$h_workspace"
+
+kj block create --role system --kind text --content "$ref"
+echo "kj-help: injected reference"
