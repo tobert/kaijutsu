@@ -41,3 +41,9 @@ deny = [
 deny = [
   "kj context create",   # an explorer explores; lifecycle belongs to its parent
 ]
+
+[context_type.mcp]
+allow = [
+  "kj context create",   # an mcp seat spins up coders; recoverable: archive it
+  "kj drive",            # runs a turn on a context this seat can already reach
+]

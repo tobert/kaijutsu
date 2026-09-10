@@ -6,6 +6,51 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `kj rc list` does not report hook bodies, so a stale hook is invisible (2026-09-10)
+
+`/config/rc/lib/hooks/*.kai` are read by `HookBody::KaishPath` at every
+fire but never listed by `kj rc list`, so its in-sync/differs marks say
+nothing about them. Observed live: the lfm2d hook body on disk was the
+2026-09-01 version through the whole day of gate-policy bounces — slice 2's
+two hook rules (ask tier firm, allow tier dropped from scoring) were in the
+running binary's embedded seed and not on disk. Consequence: a compound
+program mixing an allowed clause with any non-exempt clause still scores
+every clause (`kj context create --help; echo ---; kj cast show house`
+escalated on a Read verb because `echo` broke the all-or-nothing jq
+exemption), and an ask-tier statement is not firm in the hook stack. Fix
+is a `kaijutsu-server rc reseed --force` on a build of HEAD; the gap to
+close is `kj rc list` covering `lib/hooks` with the same seed comparison.
+
+## `kj context info --json` reports `resolved_cast: null` for a cast-slot model (2026-09-10)
+
+A context created with `--cast budget` resolved `deepseek-v4-pro`, and the
+kernel log says `via CastSlot { cast: "budget" }`, but `.resolved_cast` in
+the info JSON is `null`. `.resolved_model` is right, so `S00-stance.kai`
+tiers correctly; the cast field is the one lying.
+
+## A delegated coder inherits the lead's morning window (2026-09-10)
+
+`coder/create/S15-recall.kai` and `S16-handoff.kai` inject the fleet memory
+index and the calling character's last twelve handoff notes into every
+coder. A coder driven on a two-file fixture read the lead's note "no ask
+expected" and reported the lfm2d escalations it met as a possible
+regression — a concern the note caused, not the task. The broad loadout
+also lists 96 tools in `<situation>`, 45 of them `bevy_brp`. Both are
+per-turn cost on a delegated lane that needs neither; whether a delegated
+coder should run the same create lifecycle as a character's own seat is a
+design question (`docs/delegated-coder.md`, `docs/character.md`), not a
+patch to the scripts.
+
+## A failed approval-executed `shell_write` leaves an empty tool result (2026-09-10)
+
+`gate-resume` ran an approved `python -m unittest -v .` (exit 1,
+`err_len=1174`) and the resulting block (`2d25fb02#37` in
+`rc-review-coder-ds`) reads as an empty `[error]` tool result under
+`kj block read`; the model still saw the stderr, so the text rides in the
+tool envelope and not the block body. Same family as "A tool result's
+shape still depends on whether its body is empty" below, and the tui item
+"a ToolResult block must show command OUTPUT" in `signoff.md`.
+
 ## Context `--system-prompt` settings are inert (2026-09-10)
 
 `ContextRow.system_prompt` is still stored by `kj context --system-prompt`,
