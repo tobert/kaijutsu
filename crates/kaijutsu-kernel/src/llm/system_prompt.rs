@@ -7,6 +7,15 @@
 
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, ContextState, Role, Status};
 
+/// Read the instruction sections currently stored in a context.
+pub fn read_system_prompt_sections(
+    documents: &crate::block_store::BlockStore,
+    context_id: ContextId,
+) -> crate::block_store::BlockStoreResult<Vec<String>> {
+    documents.block_snapshots(context_id)
+        .map(|blocks| extract_system_prompt_sections(&blocks))
+}
+
 /// Per-call facts the system prompt should surface.
 ///
 /// All fields are optional — emit only the addendum sections we have
@@ -185,6 +194,31 @@ mod tests {
     fn empty_situational_and_sections_yields_no_prompt() {
         let out = build_system_prompt(&SituationalContext::default(), &[]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn system_prompt_read_distinguishes_missing_from_empty_document() {
+        let documents = crate::block_store::BlockStore::new(PrincipalId::new());
+        let context_id = ContextId::new();
+        assert!(read_system_prompt_sections(&documents, context_id).is_err(),
+            "a failed read must not become an empty instruction set");
+        documents.create_document(context_id, crate::DocumentKind::Conversation, None).unwrap();
+        assert!(read_system_prompt_sections(&documents, context_id).unwrap().is_empty(),
+            "an existing context can deliberately have no instruction sections");
+    }
+
+    #[test]
+    fn system_prompt_read_observes_instruction_edits_and_exclusions() {
+        let documents = crate::block_store::BlockStore::new(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents.create_document(context_id, crate::DocumentKind::Conversation, None).unwrap();
+        let id = documents.insert_block(context_id, None, None, Role::System,
+            BlockKind::Text, "first", Status::Done, kaijutsu_types::ContentType::Plain).unwrap();
+        assert_eq!(read_system_prompt_sections(&documents, context_id).unwrap(), vec!["first"]);
+        documents.edit_text(context_id, &id, 0, "second", 5).unwrap();
+        assert_eq!(read_system_prompt_sections(&documents, context_id).unwrap(), vec!["second"]);
+        documents.set_excluded(context_id, &id, true).unwrap();
+        assert!(read_system_prompt_sections(&documents, context_id).unwrap().is_empty());
     }
 
     #[test]

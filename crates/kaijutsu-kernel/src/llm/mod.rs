@@ -52,7 +52,7 @@ pub use stream::{
     InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_slot_tunables,
     longest_cache_ttl_secs,
 };
-pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
+pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
 pub(crate) use system_prompt::is_system_prompt_section;
 
 use serde::{Deserialize, Serialize};

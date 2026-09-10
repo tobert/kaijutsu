@@ -1025,3 +1025,11 @@ comparisons remain in `docs/oss-comparisons.md`; checked review mistakes became
 evidence-status examples in the Kaibo proposal. Temporary drafts and review
 plans were melted into those documents, with their earlier versions recoverable
 from git and the private review archive.
+
+The Kaibo implementation review also corrected our own explanation of timing:
+stored instruction blocks are read again before each turn, even though ordinary
+history edits wait for hydration. The distinction supports quick prompt
+iteration. A failed instruction read now stops preparation instead of silently
+running a context without its chosen prose. The review confirmed the main
+contracts and left metadata snapshot and fork-initialization fault handling as
+named follow-up work, with their limits recorded rather than called solved.

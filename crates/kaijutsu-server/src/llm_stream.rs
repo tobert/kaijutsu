@@ -516,10 +516,17 @@ pub(crate) async fn spawn_llm_for_prompt(
         model: Some(model_name.clone()),
         tool_names: tools.iter().map(|t| t.name.clone()).collect(),
     };
-    let rc_sections = documents
-        .block_snapshots(context_id)
-        .map(|b| kaijutsu_kernel::extract_system_prompt_sections(&b))
-        .unwrap_or_default();
+    let rc_sections = match kaijutsu_kernel::read_system_prompt_sections(&documents, context_id) {
+        Ok(sections) => sections,
+        Err(e) => {
+            let detail = format!(
+                "Could not read this context's instruction blocks: {e}. The turn was stopped."
+            );
+            log::error!("System prompt read failed for context {context_id}: {e}");
+            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
+            return Err(capnp::Error::failed(detail));
+        }
+    };
     let system_prompt = kaijutsu_kernel::build_system_prompt(&situational, &rc_sections);
 
     log::info!(

@@ -609,6 +609,28 @@ That decision supersedes both the larger universal draft and the proposed
 smaller mandatory base. The optional shared body retains
 `頑張（がんば）って！` at Amy's request.
 
+The implementation review ran on Kaibo's `crusoe` cast, configured with
+DeepSeek V4 Flash as explorer and GLM 5.3 as synthesis, against `94da5410`
+and `08ffcbca`. It
+confirmed the main composition, budget, provenance, and continuation contracts.
+Two findings were fixed: the guide had incorrectly deferred stored instruction
+edits until hydration, and live/preview assembly silently used no instructions
+when a block read failed. The shared reader now preserves read errors; a
+missing-document regression reproduces the old failure, while an existing empty
+context remains valid. Instruction edits and exclusions are read before each
+turn. This is distinct from ordinary history hydration.
+
+The remaining review observations were checked and scoped: source metadata is
+outside the block-version guard; late fork initialization failures can leave
+partial state (not always an orphan document, as the original report claimed);
+orphan tool results remain durable but are omitted by conversation repair; and
+Pending status is not swept with Running/Waiting. Open fork consistency and
+queued-work questions are in `docs/issues.md`; current edge behavior is in
+`docs/prompts.md`. The 4096-token one-shot cap is documented only for the
+adapters that actually request it. Raw review output remains in the private
+review archive. These are source-level conclusions, not model-effectiveness
+measurements or a live deployment check.
+
 The [Kaibo proposal](kaibo-prompt-proposal.md) uses these checked review mistakes
 as examples for evidence status, grounding, and handoff tests. A cited claim
 still needs an explanation of how its source establishes the behavior.

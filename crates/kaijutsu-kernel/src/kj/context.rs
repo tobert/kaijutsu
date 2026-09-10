@@ -1013,11 +1013,12 @@ impl KjDispatcher {
         // create/fork lifecycle dropped into this context's block store —
         // the SAME extractor the turn path calls, so this can't drift from
         // what's really sent.
-        let rc_sections = self
-            .block_store()
-            .block_snapshots(target_id)
-            .map(|b| crate::llm::extract_system_prompt_sections(&b))
-            .unwrap_or_default();
+        let rc_sections = match crate::llm::read_system_prompt_sections(self.block_store(), target_id) {
+            Ok(sections) => sections,
+            Err(e) => return KjResult::Err(format!(
+                "kj context prompt: could not read this context's instruction blocks: {e}"
+            )),
+        };
 
         // tool_names: the current tool inventory via the same broker call
         // the turn path uses, gated on the CALLING principal's own
@@ -4488,6 +4489,15 @@ mod tests {
     }
 
     // ── kj context prompt ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn system_prompt_read_failure_reaches_preview() {
+        let d = test_dispatcher().await;
+        let context_id = register_context(&d, Some("missing-document"), None, PrincipalId::new());
+        let result = d.dispatch(&[s("context"), s("prompt")], &caller_with_context(context_id)).await;
+        assert!(!result.is_ok(), "{}", result.message());
+        assert!(result.message().contains("instruction blocks"), "{}", result.message());
+    }
 
     /// Context types choose their prompt sections through rc. The opted-in
     /// coder gets the shared base before its role section; musician, which has

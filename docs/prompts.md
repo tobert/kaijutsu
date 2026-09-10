@@ -26,14 +26,18 @@ Edit shipped defaults under `assets/defaults/rc/`, then use
 `kaijutsu-server rc reseed` to materialize them when deploying. Every rc lifecycle
 reads the current host files. Markdown creates durable `(System, Text)` blocks;
 editing a source file does not rewrite existing contexts. Create a fresh context
-to exercise new create instructions. Updating stored instruction blocks takes
-effect at the next conversation hydrate boundary. Do not rerun all create
-scripts merely to refresh prose: creation also binds tools, arms contexts, and
-loads memory. See `docs/rc-on-disk.md` and `docs/conversation-session.md`.
+to exercise new create instructions. Stored instruction blocks are read again
+before each turn: edits and exclusions affect the next turn without a fork.
+Conversation-history edits take effect at the next hydrate boundary. Do not
+rerun all create scripts merely to refresh prose: creation also binds tools,
+arms contexts, and loads memory. See `docs/rc-on-disk.md` and
+`docs/conversation-session.md`.
 
 `kj context prompt` previews the same system-text builder used for live turns.
 It includes eligible rc instruction sections and runtime facts, omitting
-excluded, ephemeral, draft, and empty instruction blocks.
+excluded, ephemeral, draft, and empty instruction blocks. A failed block read
+stops both preview and live turn preparation. An existing context with no
+instruction sections remains valid.
 
 ## Briefing and continuation
 
@@ -74,8 +78,9 @@ values. Remove an override with `kj context unset . --env KJ_DRIFT_WORD_TARGET`.
 | `KJ_DISTILL_INPUT_BYTES` | 131072 | Maximum bytes in the complete summary user prompt, including framing, references, length guidance, and directed focus |
 
 All values must be positive integers. Invalid values fail before a provider
-call. Word guidance is advisory; the existing one-shot provider output cap is
-4096 tokens and is separate from these values.
+call. Word guidance is advisory. The Claude, DeepSeek, and OpenAI-compatible
+one-shot adapters request a 4096-token output cap separately from these values;
+the CodexApp one-shot path does not apply that cap.
 
 The summary transcript uses the conversation hydration admission rule. Excluded,
 draft, ephemeral, file, trace, and ordinary system instruction blocks are absent.
@@ -84,6 +89,9 @@ identifiers, error status, exit codes, and stderr when present. It keeps complet
 recent turn groups instead of cutting the first 2000 bytes from every block.
 Tool call/result pairs spanning an interleaved user block keep their intervening
 turns together. Exclusion still wins; an excluded partner is never restored.
+A retained tool result whose call is absent stays in the durable child, but
+hydration repair omits that orphan result from the conversation. Distillation
+can still summarize its eligible, labeled source text.
 
 When older material does not fit, the input names its omitted eligible block
 count and the first and last recovery identifiers. If the newest required group
@@ -99,10 +107,13 @@ group as native blocks, preserving tool linkage. The generated handoff precedes
 that recent working state. The child keeps its context type and runs the fork
 lifecycle; it does not rerun creation or acquire an unselected shared base.
 
-The source version must still match when retained blocks are copied after the
+The source block version must still match when retained blocks are copied after the
 model call. If it changed, compaction fails with a retry message instead of
-combining a stale summary with a different selection. Existing open blocks in
-the copied child are closed as they are in other fork paths.
+combining a stale summary with a different selection. This guard does not
+cover concurrent context metadata or environment changes; see `docs/issues.md`,
+"Fork consistency across metadata and document commits". Copied blocks in
+Running or Waiting become Error, as in other fork paths. Pending blocks remain
+Pending; queued execution is not transferred to the child.
 
 Compact mode has its own retention policy. It rejects `--include`, `--exclude`,
 `--preset`, and `--as`; use a filtered or subtree fork for those selections.

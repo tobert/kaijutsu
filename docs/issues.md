@@ -14,6 +14,28 @@ use only accepted `Role::System`/`BlockKind::Text` sections plus runtime facts,
 so the stored value never reaches a model. Decide and implement removal or an
 explicit migration; do not leave a second apparent prompt owner.
 
+## Fork consistency across metadata and document commits (2026-09-10)
+
+Kaibo's `crusoe` review of the prompt changes identified two adjacent fork
+issues. Code inspection confirmed the ordering; no DB fault was injected.
+
+- Compact forks capture context type, cast, workspace, and player before the
+  model call, while `insert_forked_context` copies environment and bindings
+  afterward. The source block-version guard cannot detect concurrent metadata
+  changes. Choose one configuration snapshot or reject a change before child
+  publication; test a source metadata update during a delayed mock response.
+- Fork initialization spans document copy, context/env transaction, cwd override,
+  edge insert, and router registration. Failure before the context transaction
+  can leave an orphan document; failure afterward can leave a partially
+  initialized context. The upfront label check does not cover a label claimed
+  concurrently during summarization. Define atomic initialization or cleanup,
+  with fault-injection coverage across full, filtered, and compact forks.
+
+`abandon_open_blocks` closes Running/Waiting, leaving Pending untouched. Normal
+tool calls start Running, but `kj block status` can set Pending explicitly.
+Define what a copied Pending tool call means before adding queued execution to
+forks; the model's repaired wire pair does not change that durable status.
+
 ## Found during the 2026-09-08 sweep (lead-verified)
 
 - **`background_exec.rs` and CLAUDE.md disagree.** The module header says

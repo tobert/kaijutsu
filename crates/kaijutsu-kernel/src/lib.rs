@@ -114,6 +114,7 @@ pub use llm::{
     SituationalContext,
     build_system_prompt,
     extract_system_prompt_sections,
+    read_system_prompt_sections,
     build_llm_registry,
     load_embedding_config,
 };
