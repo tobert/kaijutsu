@@ -198,7 +198,11 @@ impl StateMachine {
 
     fn accumulate_tool_call(&mut self, tc: ToolCallChunk) {
         let entry = self.tool_calls.entry(tc.index).or_default();
-        if let Some(id) = tc.id {
+        // An empty id is treated as absent: some OpenAI-compatible servers
+        // send `"id": ""` on every fragment, and taking it would either
+        // erase a real id from an earlier fragment or collide two parallel
+        // calls on "" at flush time.
+        if let Some(id) = tc.id.filter(|id| !id.is_empty()) {
             entry.id = Some(id);
         }
         if let Some(func) = tc.function {
@@ -224,7 +228,8 @@ impl StateMachine {
                 continue;
             };
             // DeepSeek always sends an id; fall back to an index-derived
-            // correlation key for OpenAI-compatible servers that omit it.
+            // correlation key for OpenAI-compatible servers that omit it
+            // (or send it empty — `accumulate_tool_call` drops those).
             let id = accum.id.unwrap_or_else(|| format!("call_{index}"));
             let input = if accum.arguments.trim().is_empty() {
                 serde_json::Value::Object(serde_json::Map::new())
@@ -482,6 +487,55 @@ data: [DONE]
             })
             .collect();
         assert_eq!(names, vec!["a", "b"], "flush in index order");
+    }
+
+    #[tokio::test]
+    async fn empty_tool_call_id_falls_back_to_index_key() {
+        // Some OpenAI-compatible servers send `"id": ""` instead of omitting
+        // the field. Two parallel calls with empty ids must not collide: an
+        // empty id is treated as absent and falls back to the index key.
+        let payload = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"a\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"\",\"function\":{\"name\":\"b\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}
+
+data: [DONE]
+
+";
+        let events = run(payload).await;
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["call_0", "call_1"], "empty ids fall back to the index key");
+    }
+
+    #[tokio::test]
+    async fn empty_id_on_a_later_fragment_does_not_erase_the_real_id() {
+        // A real id on the first fragment, then `"id": ""` on the argument
+        // continuation. The real id must survive.
+        let payload = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_real\",\"function\":{\"name\":\"a\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"arguments\":\"}\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}
+
+data: [DONE]
+
+";
+        let events = run(payload).await;
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["call_real"], "a later empty id must not overwrite the real one");
     }
 
     #[tokio::test]
