@@ -355,12 +355,6 @@ pub(crate) async fn spawn_llm_for_prompt(
     let (interrupt, interrupt_generation) = kernel.create_interrupt(context_id).await;
     let context_interrupts = kernel.context_interrupts.clone();
 
-    // Load the system prompt from the config tree, seeded from the embedded
-    // default while that tree is empty. One loader, shared with
-    // `kj context prompt` — two copies of it drifted once.
-    let system_prompt =
-        kaijutsu_kernel::config_seed::load_system_prompt(kernel_arc.vfs().as_ref()).await;
-
     // Read per-context model from DriftRouter (quick read, release lock).
     // Capture label/state alongside for the situational system-prompt addendum.
     let (ctx_model, ctx_provider_name, ctx_label, ctx_state) = {
@@ -507,15 +501,13 @@ pub(crate) async fn spawn_llm_for_prompt(
         }
     };
 
-    // Assemble situational system-prompt addendum (A4): static base + rc
-    // sections (the `.md` lifecycle scripts) + per-call facts so the model
-    // has context name, lifecycle state, and current tool inventory without
-    // losing the static stance set in assets/defaults/system.md.
+    // Assemble the system prompt from the sections this context's rc
+    // lifecycle selected, plus per-call facts about its current state and
+    // tool inventory. The kernel owns facts, never a mandatory base body.
     //
     // rc sections come from `(Role::System, BlockKind::Text)` blocks in the
     // conversation — typically dropped in by rc-on-create/-on-fork. They
-    // land between the static base and the `<situation>` addendum (matching
-    // the doc layout: base → rc → situation).
+    // land before the `<situation>` addendum.
     let situational = kaijutsu_kernel::SituationalContext {
         context_id: Some(context_id),
         context_label: ctx_label,
@@ -528,8 +520,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         .block_snapshots(context_id)
         .map(|b| kaijutsu_kernel::extract_system_prompt_sections(&b))
         .unwrap_or_default();
-    let system_prompt =
-        kaijutsu_kernel::build_system_prompt(&system_prompt, &situational, &rc_sections);
+    let system_prompt = kaijutsu_kernel::build_system_prompt(&situational, &rc_sections);
 
     log::info!(
         "Spawning LLM stream: context={}, model={}",

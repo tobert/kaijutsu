@@ -31,7 +31,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug, Default)]
 #[command(name = "fork", about = "Fork the current context into a child", disable_help_subcommand = true, no_binary_name = true)]
 pub(crate) struct ForkArgs {
-    /// Label for the child (--name/-n)
+    /// Label for the child
     #[arg(long, short = 'n')]
     name: Option<String>,
     /// Seed prompt; drives the child's turn
@@ -49,29 +49,28 @@ pub(crate) struct ForkArgs {
     /// Distillation model for compact forks
     #[arg(long = "distill-model")]
     distill_model: Option<String>,
-    /// Subtree template context ref; presence selects subtree mode
+    /// Clone a template context subtree
     #[arg(long = "as")]
     as_template: Option<String>,
-    /// Start the child in liminal staging state
+    /// Start the child in staging state
     #[arg(long, visible_alias = "staging")]
     stage: bool,
     /// Move the session to the child after forking
     #[arg(long)]
     switch: bool,
-    /// Compact (distill) fork
-    #[arg(long)]
+    /// Summarize earlier work; retain chosen instructions and the latest complete turn.
+    /// Word guidance and input limit come from the source context's environment.
+    #[arg(long, conflicts_with_all = ["preset", "include", "exclude", "as_template"])]
     compact: bool,
     /// Include only these ranges (repeatable). A range is `[lo]:[hi]`,
-    /// half-open `[lo, hi)`, endpoints `int | end | end-N` (e.g. `0:5`,
-    /// `end-10:`, `:`). Narrows the selection; every explicit `--include` must
-    /// survive the resolved keep-set or the fork refuses (no silent winner).
+    /// half-open `[lo, hi)`, with integer, `end`, or `end-N` endpoints
+    /// (e.g. `0:5`, `end-10:`, `:`). Fails if an explicit include is excluded
+    /// by another range or the preset.
     #[arg(long)]
     include: Vec<String>,
-    /// Exclude from the fork (repeatable). Either a range (`10:20`, `end-3:` —
-    /// same grammar as `--include`) or an exact block key in `context:agent:seq`
-    /// form (the orchestrator-repair path, "fork X without the block that blew
-    /// it up"). A value with the wrong colon count for a range is taken as a
-    /// block key and must exist in the source.
+    /// Exclude from the fork (repeatable): a range (`10:20`, `end-3:`) or
+    /// an exact block key (`context_principal_seq`). The block must exist
+    /// in the source. Ranges use the same grammar as --include.
     #[arg(long)]
     exclude: Vec<String>,
 }
@@ -844,22 +843,46 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
         };
 
-        // Summarize source context via LLM (use --distill-model when set).
+        let source_row = match self.kernel_db().lock().get_context(source_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return KjResult::Err("kj fork --compact: source context is missing".into()),
+            Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
+        };
+        let (source_version, source_blocks) = {
+            let Some(entry) = self.block_store().get(source_id) else {
+                return KjResult::Err("kj fork --compact: source document is missing".into());
+            };
+            (entry.doc.version(), entry.doc.blocks_ordered())
+        };
+        let recent = crate::drift::most_recent_eligible_turn_group(&source_blocks);
+        let retained: std::collections::HashSet<_> = recent.iter().map(|block| block.id)
+            .chain(source_blocks.iter().filter(|block| crate::llm::is_system_prompt_section(block))
+                .map(|block| block.id))
+            .collect();
+        let filter = crate::blocks::ForkBlockFilter {
+            exclude_block_ids: source_blocks.iter().filter(|block| !retained.contains(&block.id))
+                .map(|block| block.id.to_key()).collect(),
+            ..Default::default()
+        };
+
+        // Keep the native working state and the summary tied to one source version.
         let summary = match self
-            .summarize_with_model(source_id, None, distill_model.as_deref())
+            .summarize_for_continuation(source_id, distill_model.as_deref())
             .await
         {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
         };
 
-        // Create empty document for the new context
-        if let Err(e) =
-            self.block_store()
-                .create_document(new_id, crate::DocumentKind::Conversation, None)
-        {
-            return KjResult::Err(format!("kj fork --compact: failed to create document: {e}"));
+        if let Err(e) = self.block_store().fork_document_filtered_checked(
+            source_id, new_id, kaijutsu_types::now_millis(), &filter, Some(source_version),
+        ) {
+            return KjResult::Err(format!("kj fork --compact: failed to retain working state: {e}"));
         }
+        self.block_store().abandon_open_blocks(
+            new_id,
+            "left open in the parent when this context was forked; nothing is being retried here",
+        );
 
         // Seed with distilled summary as a Drift block
         {
@@ -872,7 +895,7 @@ impl KjDispatcher {
             // below. At this point in `fork_compact` the child's ContextRow
             // doesn't exist yet, but its `created_by` (inserted further down)
             // is always `caller.principal_id`, so that is the right value here.
-            if let Err(e) = self.block_store().insert_drift_block_as(
+            let summary_id = match self.block_store().insert_drift_block_as(
                 new_id,
                 None,
                 None,
@@ -882,7 +905,12 @@ impl KjDispatcher {
                 kaijutsu_types::DriftKind::Distill,
                 Some(caller.principal_id),
             ) {
-                return KjResult::Err(format!("kj fork --compact: failed to insert summary: {e}"));
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj fork --compact: failed to insert summary: {e}")),
+            };
+            // The handoff is earlier evidence; retained native turns follow it.
+            if let Err(e) = self.block_store().move_block(new_id, &summary_id, None) {
+                return KjResult::Err(format!("kj fork --compact: failed to order handoff: {e}"));
             }
         }
 
@@ -897,12 +925,11 @@ impl KjDispatcher {
         {
             let mut db = self.kernel_db().lock();
 
-            let source_row = db.get_context(source_id).ok().flatten();
-            let source_ws = source_row.as_ref().and_then(|r| r.workspace_id);
-            let source_cast = source_row.as_ref().and_then(|r| r.cast_id);
+            let source_ws = source_row.workspace_id;
+            let source_cast = source_row.cast_id;
             // A fork is the same performance's continuation by default —
             // whoever plays the source plays the child too.
-            let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
+            let source_played_by = source_row.played_by;
 
             let row = ContextRow {
                 context_id: new_id,
@@ -912,7 +939,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
-                context_type: "default".to_string(),
+                context_type: source_row.context_type.clone(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -1026,7 +1053,6 @@ impl KjDispatcher {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
 
-        inherit_parent_context_type(self, new_id, source_id);
         if let Err(e) = self
             .run_rc_lifecycle(
                 "fork",
@@ -3449,6 +3475,109 @@ mod tests {
                 Some(principal),
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_compact_retains_chosen_instructions_and_recent_tool_turn() {
+        use kaijutsu_types::{BlockKind, ContentType, Role, Status};
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        setup_compact_source(&d, source, principal).await;
+        d.kernel_db().lock().update_context_type(source, "musician").unwrap();
+        d.kernel_db().lock().set_context_env(source, "KJ_CONTINUATION_WORD_TARGET", "1800").unwrap();
+        d.kernel_db().lock().set_context_env(source, "KJ_DRIFT_WORD_TARGET", "not-a-briefing").unwrap();
+        let mut after = d.block_store().last_block_id(source);
+        for (role, content, excluded) in [
+            (Role::System, "CUSTOM-MUSICIAN-INSTRUCTIONS", false),
+            (Role::System, "EXCLUDED-INSTRUCTIONS", true),
+            (Role::User, "Check the revised score", false),
+        ] {
+            let id = d.block_store().insert_block_as(source, None, after.as_ref(), role,
+                BlockKind::Text, content.to_string(), Status::Done, ContentType::Plain,
+                Some(principal)).unwrap();
+            if excluded {
+                d.block_store().set_excluded(source, &id, true).unwrap();
+            }
+            after = Some(id);
+        }
+        let call = d.block_store().insert_tool_call_as(source, None, after.as_ref(),
+            "score_check", serde_json::json!({"file": "song.abc"}), None,
+            Some(principal), Some("call-score".to_string()), None).unwrap();
+        d.block_store().set_status(source, &call, Status::Done).unwrap();
+        d.block_store().insert_tool_result_as(source, &call, Some(&call),
+            "bar 7 still fails", true, Some(1), None, Some(principal),
+            Some("call-score".to_string())).unwrap();
+        let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")],
+            &caller_with_context(source)).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let child = d.kernel_db().lock().find_context_by_label("child").unwrap().unwrap();
+        assert_eq!(child.context_type, "musician");
+        let blocks = d.block_store().get(child.context_id).unwrap().doc.blocks_ordered();
+        assert!(blocks.iter().any(|b| b.role == Role::System && b.content == "CUSTOM-MUSICIAN-INSTRUCTIONS"));
+        assert!(!blocks.iter().any(|b| b.content == "EXCLUDED-INSTRUCTIONS" || b.content == "hello world"));
+        assert!(blocks.iter().any(|b| b.content == "Check the revised score"));
+        let call = blocks.iter().find(|b| b.kind == BlockKind::ToolCall).expect("native call retained");
+        let result = blocks.iter().find(|b| b.kind == BlockKind::ToolResult).expect("native result retained");
+        assert_eq!(call.tool_name.as_deref(), Some("score_check"));
+        assert_eq!(result.tool_call_id, Some(call.id));
+        assert_eq!(result.tool_use_id.as_deref(), Some("call-score"));
+        assert_eq!(result.content, "bar 7 still fails");
+        let summary_position = blocks.iter().position(|b| b.kind == BlockKind::Drift).unwrap();
+        let request_position = blocks.iter().position(|b| b.content == "Check the revised score").unwrap();
+        assert!(summary_position < request_position, "native recent evidence follows the handoff");
+
+        let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("grandchild")],
+            &caller_with_context(child.context_id)).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let child = d.kernel_db().lock().find_context_by_label("grandchild").unwrap().unwrap();
+        let blocks = d.block_store().get(child.context_id).unwrap().doc.blocks_ordered();
+        assert_eq!(child.context_type, "musician");
+        assert_eq!(blocks.iter().filter(|b| b.content == "CUSTOM-MUSICIAN-INSTRUCTIONS").count(), 1);
+        assert!(blocks.iter().any(|b| b.content == "Check the revised score"));
+        assert!(blocks.iter().any(|b| b.kind == BlockKind::ToolResult && b.is_error && b.content == "bar 7 still fails"));
+        assert!(!blocks.iter().any(|b| b.content.contains("We work as peers")), "an opted-out type gains no shared base");
+        let env = d.kernel_db().lock().get_context_env(child.context_id).unwrap();
+        assert!(env.iter().any(|row| row.key == "KJ_CONTINUATION_WORD_TARGET" && row.value == "1800"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fork_compact_refuses_source_changed_during_summary() {
+        use crate::llm::{MockClient, Provider};
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        setup_compact_source(&d, source, principal).await;
+        d.kernel().llm().write().await.register("mock", std::sync::Arc::new(
+            Provider::Mock(MockClient::new("stale summary").with_delay(std::time::Duration::from_secs(1)))));
+        let c = caller_with_context(source);
+        let args = [s("fork"), s("--compact"), s("--name"), s("stale-child")];
+        let (result, ()) = tokio::join!(d.dispatch(&args, &c), async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let block = d.block_store().last_block_id(source).unwrap();
+            d.block_store().set_excluded(source, &block, true).unwrap();
+        });
+        assert!(!result.is_ok(), "source mutation must invalidate the summary");
+        assert!(result.message().contains("Source changed"), "{}", result.message());
+        assert!(d.kernel_db().lock().find_context_by_label("stale-child").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fork_compact_help_and_selection_conflicts() {
+        let d = test_dispatcher().await;
+        let c = caller_with_context(kaijutsu_types::ContextId::new());
+        let help = d.dispatch(&[s("fork"), s("--help")], &c).await;
+        assert!(help.is_ok());
+        println!("{}", help.message());
+        assert!(help.message().contains("retain chosen instructions"));
+        for (flag, value) in [("--include", "end-1:"), ("--exclude", "0:1"),
+            ("--preset", "spawn"), ("--as", "template")] {
+            let result = d.dispatch(&[s("fork"), s("--compact"), s(flag), s(value)], &c).await;
+            assert!(!result.is_ok());
+            assert!(result.message().contains("cannot be used with"), "{}", result.message());
+        }
     }
 
     #[tokio::test]

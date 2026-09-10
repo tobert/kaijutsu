@@ -46,7 +46,7 @@ pub const CONFIG_NAMESPACE_ROOT: &str = "/config";
 pub const RC_ROOT: &str = "/config/rc";
 
 /// Root of the kernel-global config tree. A flat namespace:
-/// `/config/kernel/<name>` (e.g. `theme.toml`, `mcp.toml`, `system.md`) —
+/// `/config/kernel/<name>` (e.g. `theme.toml`, `mcp.toml`, `gate.toml`) —
 /// the kernel's own settings, as opposed to a client's or a device's.
 pub const CONFIG_ROOT: &str = "/config/kernel";
 

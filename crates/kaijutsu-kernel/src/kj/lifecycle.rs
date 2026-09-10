@@ -240,8 +240,34 @@ impl KjDispatcher {
         let scripts = match self.load_rc_scripts(&context_type, verb).await {
             Ok(s) => s,
             Err(e) => {
-                run_guard.finish(RcOutcome::Failed);
-                return Err(e);
+                // A loader error happens before the ordinary script path below
+                // ensures the in-memory document. Create it now so the
+                // diagnostic survives context creation and makes `rebind`
+                // actionable instead of disappearing into tracing.
+                match self
+                    .block_store()
+                    .create_document(new_id, kaijutsu_types::DocKind::Conversation, None)
+                {
+                    Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
+                        insert_rc_failure_block(
+                            self,
+                            new_id,
+                            &paths::rc_dir(&context_type, verb),
+                            "load",
+                            None,
+                            e.clone(),
+                            owner,
+                        );
+                        run_guard.finish(RcOutcome::Failed);
+                        return Err(e);
+                    }
+                    Err(document_error) => {
+                        run_guard.finish(RcOutcome::Failed);
+                        return Err(format!(
+                            "{e}; could not create the document for its diagnostic: {document_error}"
+                        ));
+                    }
+                }
             }
         };
 
@@ -1107,6 +1133,59 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("composed from a shared stance fragment")),
             "expected symlinked .md target content as block, got: {contents:?}"
+        );
+    }
+
+    /// A composed instruction link that cannot be read is corruption, not an
+    /// empty prompt section. Creation leaves the context inert, reports the
+    /// repair path, and records the unreadable link in a durable Error block.
+    #[tokio::test]
+    async fn rc_create_reports_and_records_a_broken_symlinked_md() {
+        use crate::vfs::VfsOps;
+
+        let d = test_dispatcher_rc().await;
+        d.kernel()
+            .vfs()
+            .symlink(
+                std::path::Path::new("/config/rc/test/create/S00-broken.md"),
+                std::path::Path::new("../../lib/create/no-such-shared.md"),
+            )
+            .await
+            .expect("create broken rc symlink");
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-broken-link", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "create preserves its diagnostic context: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("WARNING") && result.message().contains("no loadout"),
+            "creation must report the inert result and repair: {}",
+            result.message()
+        );
+        let new_id = lookup_context_id(&d, "ctx-broken-link");
+        assert_eq!(
+            d.has_usable_loadout(new_id),
+            Ok(false),
+            "a failed rc create must not leave a usable loadout"
+        );
+        let errors: Vec<_> = d
+            .block_store()
+            .block_snapshots(new_id)
+            .expect("read diagnostic blocks")
+            .into_iter()
+            .filter(|block| block.kind == kaijutsu_types::BlockKind::Error)
+            .collect();
+        assert!(
+            errors.iter().any(|block| block.content.contains("S00-broken.md")),
+            "the durable Error must name the unreadable link: {errors:?}"
         );
     }
 
@@ -1995,10 +2074,12 @@ mod tests {
 
         let new_id = lookup_context_id(&d, "ctx-stray");
         let kinds = block_kinds_in(&d, new_id);
-        assert!(
-            kinds.is_empty(),
-            "the verb must fail before running anything, got blocks: {kinds:?}"
+        assert_eq!(
+            kinds,
+            vec![kaijutsu_types::BlockKind::Error],
+            "the verb records its failure without running any script"
         );
+        assert!(block_contents_in(&d, new_id).iter().any(|body| body.contains("guard.hook.kai")));
 
         let run = find_run_for_context(&d, new_id, "create").expect("run row");
         assert_eq!(

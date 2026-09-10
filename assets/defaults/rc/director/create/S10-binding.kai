@@ -15,7 +15,7 @@ kj binding allow "admin"
 kj binding allow "builtin.file:write"
 kj binding allow "builtin.file:edit"
 # config-write opens `kj config reset` (restore a shipped default) over the
-# /config/kernel files (system.md, theme.toml, mcp.toml) AND the SQL-native
+# /config/kernel files (theme.toml, mcp.toml, gate.toml) AND the SQL-native
 # model config surfaces (`kj backend`, `kj cast`, `kj alias`) — i.e. which
 # model runs. Dedicated, not implied by the grants above.
 kj binding allow "config-write"

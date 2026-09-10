@@ -84,11 +84,9 @@ character       create, list, show, retire — the sheet a name resolves to
                 (principal id + given name); create mints a fresh principal
                 and is idempotent on the name; retire concludes and archives
                 every live context the character plays
-config          list, show, reset — config files at /config/kernel (system.md,
-                theme.toml, mcp.toml) + per-client at /config/client, ordinary
-                host files reached through the file tools, `kj editor`, or vim;
-                there is no `set`/`edit` verb — write the file directly. `reset`
-                restores a file to its embedded default.
+config          Read or reset files under /config/kernel and /config/client.
+                Edit them with the file tools or `kj editor`. For model
+                configuration, see `kj backend`, `kj cast`, and `kj alias`.
 context (ctx)   list, info, prompt, current, switch, create, scratch, rebind,
                 set, unset, log, move, rename, archive, conclude, promote,
                 demote, pause, resume, remove, retag, hydrate — prompt renders

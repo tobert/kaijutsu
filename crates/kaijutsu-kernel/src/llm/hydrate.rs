@@ -96,6 +96,40 @@ pub(crate) struct HydrationState {
     user_shell_pending: HashMap<BlockId, String>,
 }
 
+/// Whether a block belongs in model-visible history.
+///
+/// Distillation summarizes the same durable conversation a later turn would
+/// hydrate, so it uses this predicate too. Keep the predicate independent of
+/// provider message assembly: callers that need a transcript retain their own
+/// formatting while sharing the admission rule.
+pub(crate) fn is_history_eligible(block: &BlockSnapshot) -> bool {
+    if block.ephemeral || block.status == kaijutsu_types::Status::Draft || block.excluded {
+        return false;
+    }
+    if matches!(block.kind, BlockKind::File | BlockKind::Trace) {
+        return false;
+    }
+    if block.role == BlockRole::System
+        && block.kind != BlockKind::Drift
+        && block.kind != BlockKind::Error
+        && block.kind != BlockKind::Notification
+        && block.kind != BlockKind::Resource
+        && block.kind != BlockKind::Task
+    {
+        return false;
+    }
+    !block.content.is_empty()
+        || matches!(
+            block.kind,
+            BlockKind::ToolCall
+                | BlockKind::ToolResult
+                | BlockKind::Error
+                | BlockKind::Notification
+                | BlockKind::Resource
+                | BlockKind::Task
+        )
+}
+
 impl HydrationState {
     pub(crate) fn new() -> Self {
         Self {
@@ -120,49 +154,7 @@ impl HydrationState {
         block: &BlockSnapshot,
         parent: Option<&BlockSnapshot>,
     ) {
-        // Skip blocks that shouldn't appear in LLM history
-        if block.ephemeral {
-            return;
-        }
-        // A compose draft is someone mid-sentence — it is not part of the
-        // conversation until they submit it, at which point the SAME block
-        // leaves this status. Checked independently of `ephemeral` (which a
-        // draft also carries) so that a draft can never hydrate on the
-        // strength of one flag being wrong: submit clears them one at a time,
-        // and a crash between the two must fail toward silence.
-        if block.status == kaijutsu_types::Status::Draft {
-            return;
-        }
-        if block.excluded {
-            return;
-        }
-        if matches!(block.kind, BlockKind::File | BlockKind::Trace) {
-            return;
-        }
-        // Skip System blocks unless they're Drift, Error, Notification,
-        // Resource, or Task (D-34; Task added for household-agent grooming —
-        // docs/tasks.md). Task's builder/constructor don't force `role =
-        // System` the way Notification/Resource/Error do (a task follows
-        // ordinary content-authorship), but this stays in the allow-list
-        // defensively in case a future producer (e.g. an rc-seeded default
-        // task list) creates one as System.
-        if block.role == BlockRole::System
-            && block.kind != BlockKind::Drift
-            && block.kind != BlockKind::Error
-            && block.kind != BlockKind::Notification
-            && block.kind != BlockKind::Resource
-            && block.kind != BlockKind::Task
-        {
-            return;
-        }
-        if block.content.is_empty()
-            && block.kind != BlockKind::ToolCall
-            && block.kind != BlockKind::ToolResult
-            && block.kind != BlockKind::Error
-            && block.kind != BlockKind::Notification
-            && block.kind != BlockKind::Resource
-            && block.kind != BlockKind::Task
-        {
+        if !is_history_eligible(block) {
             return;
         }
 

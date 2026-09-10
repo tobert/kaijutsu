@@ -379,6 +379,49 @@ mod tests {
         );
     }
 
+    /// The shared working contract is an ordinary rc body. Context types opt
+    /// in by linking their create entry; no registry or kernel-wide prompt
+    /// layer supplies it behind their back.
+    #[test]
+    fn rc_shared_base_is_opted_into_by_coder_and_default_only() {
+        const BASE: &str = "/config/rc/lib/create/S00-base.md";
+        let seeds = seed_files();
+        let known: std::collections::HashSet<String> =
+            seeds.iter().map(|(path, _)| path.clone()).collect();
+
+        let base = seed_body(BASE).expect("shared base seed");
+        assert!(
+            base.ends_with("頑張（がんば）って！\n"),
+            "the shared base owns its accepted closing"
+        );
+
+        for context_type in ["coder", "default"] {
+            let link_path = format!("/config/rc/{context_type}/create/S00-base.md");
+            assert_eq!(
+                seed_link_target(&link_path, seed_body(&link_path).expect("base link"), &known),
+                Some(BASE.to_string()),
+                "{context_type} must choose the shared base through a real seed link"
+            );
+        }
+
+        assert!(
+            seed_body("/config/rc/coder/create/S00-stance.kai").is_some(),
+            "the coder role follows the shared S00-base by lexical order"
+        );
+        assert!(
+            seed_body("/config/rc/default/create/S00-stance.md").is_some(),
+            "the default role follows the shared S00-base by lexical order"
+        );
+
+        for context_type in ["assistant", "bassist", "director", "mcp", "musician", "toolie"] {
+            let path = format!("/config/rc/{context_type}/create/S00-base.md");
+            assert!(
+                seed_body(&path).is_none(),
+                "{context_type} has not opted into the shared base"
+            );
+        }
+    }
+
     #[test]
     fn reseed_force_restores_a_diverged_file_and_a_clobbered_link() {
         let dir = tempfile::tempdir().expect("tmpdir");

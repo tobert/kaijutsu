@@ -1,6 +1,6 @@
 //! `kj config` — read config files, and restore one to its shipped default.
 //!
-//! Config files (`system.md`, `theme.toml`, `mcp.toml`) live at `/config/kernel`
+//! Config files (`theme.toml`, `mcp.toml`, `gate.toml`) live at `/config/kernel`
 //! (`docs/config-namespace.md`), with per-client overrides at
 //! `/config/client`.
 //!
@@ -35,7 +35,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "Read config: kernel-global at /config/kernel (system.md, theme.toml, mcp.toml, gate.toml) + per-client at /config/client (metronome.toml). To CHANGE a config file, just write it with the file tools or open it with `kj editor` — there is no set/edit verb. Model config is SQL-native — see `kj backend`/`kj cast`/`kj alias`.",
+    about = "Read or reset files under /config/kernel and /config/client. Edit them with the file tools or `kj editor`. For model configuration, see `kj backend`, `kj cast`, and `kj alias`.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -52,10 +52,10 @@ enum ConfigCommand {
     /// Print one config file's content.
     #[command(alias = "cat")]
     Show {
-        /// Config file name (e.g. theme.toml) or full /config/kernel path
+        /// Config file name (e.g. theme.toml) or full /config/kernel or /config/client path
         path: String,
         /// Emit exactly the stored content — no path/length header, no code
-        /// fence. Round-trips byte-identical through `builtin.file:write`.
+        /// fence. Round-trips byte-identical through the file tools.
         #[arg(long)]
         raw: bool,
     },
@@ -69,7 +69,7 @@ enum ConfigCommand {
     /// Restore a config file to its embedded default. Errors if the path ships
     /// no built-in seed — there is nothing to reset it to.
     Reset {
-        /// Config file name (e.g. theme.toml) or full /config/kernel path
+        /// Config file name (e.g. theme.toml) or full /config/kernel or /config/client path
         path: String,
     },
 }
@@ -276,9 +276,8 @@ impl KjDispatcher {
         };
 
         if raw {
-            // Exactly the stored content — no header, no fence — so piping it
-            // into a file and `kj config set`-ing it back round-trips
-            // byte-identical instead of storing the decoration as content.
+            // Exactly the stored content — no header, no fence, no trimming,
+            // and no trailing-newline invention.
             return KjResult::ok(content);
         }
 
@@ -351,8 +350,8 @@ mod tests {
             "/config/kernel/theme.toml"
         );
         assert_eq!(
-            config_canonical("/config/kernel/system.md").unwrap(),
-            "/config/kernel/system.md"
+            config_canonical("/config/kernel/mcp.toml").unwrap(),
+            "/config/kernel/mcp.toml"
         );
         assert!(config_canonical("sub/dir.toml").is_err());
         assert!(config_canonical("/config/kernel/a/b.toml").is_err());
@@ -418,8 +417,9 @@ mod tests {
                     .filter_map(|x| x.as_str())
                     .collect();
                 assert!(names.contains(&"theme.toml"), "names: {names:?}");
-                assert!(names.contains(&"theme.toml"), "names: {names:?}");
-                assert!(names.contains(&"system.md"), "names: {names:?}");
+                assert!(names.contains(&"mcp.toml"), "names: {names:?}");
+                assert!(names.contains(&"gate.toml"), "names: {names:?}");
+                assert!(!names.contains(&"system.md"), "names: {names:?}");
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }

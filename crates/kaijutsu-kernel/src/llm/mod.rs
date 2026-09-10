@@ -32,7 +32,7 @@ pub mod codex;
 pub mod config;
 pub mod db_config;
 pub mod deepseek;
-mod hydrate;
+pub(crate) mod hydrate;
 pub mod image_cache;
 pub mod mailbox;
 pub mod openai;
@@ -53,6 +53,7 @@ pub use stream::{
     longest_cache_ttl_secs,
 };
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
+pub(crate) use system_prompt::is_system_prompt_section;
 
 use serde::{Deserialize, Serialize};
 use futures::{SinkExt, StreamExt};

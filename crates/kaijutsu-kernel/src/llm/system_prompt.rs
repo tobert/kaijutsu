@@ -1,16 +1,11 @@
 //! Per-call system-prompt assembly (A4).
 //!
-//! The kernel ships a static system prompt at `assets/defaults/system.md`.
-//! That base sets the cybernetic / 改善 stance but says nothing about where
-//! the model is, what tools it has, or what's happening in the conversation.
-//! `build_system_prompt` appends a structured situational addendum so the
-//! model gets per-call awareness without losing the static base.
-//!
-//! Additional context-specific sections (the rc `.md` mechanism — task or
-//! mode instructions installed at `/config/rc/<context_type>/create/`) layer
-//! between the static base and the situation block: `base → rc → situation`.
+//! Context types choose their system instructions through rc `.md` scripts.
+//! `build_system_prompt` joins their persisted sections and appends a
+//! structured per-call situational addendum. The kernel supplies facts; it
+//! does not prepend a mandatory instruction body.
 
-use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, ContextState, Role};
+use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, ContextState, Role, Status};
 
 /// Per-call facts the system prompt should surface.
 ///
@@ -40,13 +35,10 @@ impl SituationalContext {
     }
 }
 
-/// Append rc-derived sections and a structured situational addendum to a
-/// static system-prompt base.
+/// Join rc-derived sections and append a structured situational addendum.
 ///
 /// Layout (only sections with data appear):
 /// ```text
-/// {base}
-///
 /// {rc_section_1}
 ///
 /// {rc_section_2}
@@ -60,39 +52,37 @@ impl SituationalContext {
 ///
 /// `rc_sections` carries the content of `(Role::System, BlockKind::Text)`
 /// blocks the rc create/fork lifecycle has dropped into the conversation
-/// — task/mode instructions that come between the static stance and the
-/// per-call situation. Extract them with `extract_system_prompt_sections`.
+/// — the complete instruction body the context chose. Extract them with
+/// `extract_system_prompt_sections`.
 ///
 /// XML-ish situation block so parsers in the model's prompt-engineering
 /// can latch on; flat enough to read at a glance. Newlines are deliberate
 /// — providers split long single-line preambles awkwardly.
-pub fn build_system_prompt(
-    base: &str,
-    situational: &SituationalContext,
-    rc_sections: &[String],
-) -> String {
+pub fn build_system_prompt(situational: &SituationalContext, rc_sections: &[String]) -> String {
     if situational.is_empty() && rc_sections.is_empty() {
-        return base.to_string();
+        return String::new();
     }
 
-    let mut out = String::with_capacity(base.len() + 256);
-    out.push_str(base.trim_end());
-
+    let mut out = String::with_capacity(256);
     for section in rc_sections {
         let trimmed = section.trim();
         if trimmed.is_empty() {
             continue;
         }
-        out.push_str("\n\n");
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
         out.push_str(trimmed);
     }
 
     if situational.is_empty() {
-        out.push('\n');
         return out;
     }
 
-    out.push_str("\n\n<situation>\n");
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str("<situation>\n");
 
     if situational.context_id.is_some()
         || situational.context_label.is_some()
@@ -136,7 +126,7 @@ pub fn build_system_prompt(
 
 /// Pull the content of `(Role::System, BlockKind::Text)` blocks that should
 /// contribute to the system prompt. Filters mirror `hydrate_from_blocks`:
-/// skip ephemeral / excluded / empty blocks.
+/// skip ephemeral / draft / excluded / empty blocks.
 ///
 /// The result feeds `build_system_prompt`'s `rc_sections` parameter. rc
 /// `.md` lifecycle scripts produce blocks in exactly this shape (see
@@ -145,15 +135,22 @@ pub fn build_system_prompt(
 pub fn extract_system_prompt_sections(blocks: &[BlockSnapshot]) -> Vec<String> {
     blocks
         .iter()
-        .filter(|b| {
-            b.role == Role::System
-                && b.kind == BlockKind::Text
-                && !b.ephemeral
-                && !b.excluded
-                && !b.content.is_empty()
-        })
+        .filter(|block| is_system_prompt_section(block))
         .map(|b| b.content.clone())
         .collect()
+}
+
+/// Whether a persisted block contributes an rc instruction section.
+///
+/// This predicate is shared with compacting so live assembly, preview, and
+/// retained context admit the same instruction blocks.
+pub(crate) fn is_system_prompt_section(block: &BlockSnapshot) -> bool {
+    block.role == Role::System
+        && block.kind == BlockKind::Text
+        && !block.ephemeral
+        && !block.excluded
+        && block.status != Status::Draft
+        && !block.content.is_empty()
 }
 
 fn state_to_str(state: ContextState) -> &'static str {
@@ -185,10 +182,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_situational_no_rc_returns_base_unchanged() {
-        let base = "static base prompt";
-        let out = build_system_prompt(base, &SituationalContext::default(), &[]);
-        assert_eq!(out, base);
+    fn empty_situational_and_sections_yields_no_prompt() {
+        let out = build_system_prompt(&SituationalContext::default(), &[]);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -201,7 +197,7 @@ mod tests {
             model: Some("claude-haiku-4-5".to_string()),
             tool_names: vec!["block_create".to_string(), "shell".to_string()],
         };
-        let out = build_system_prompt("base", &situational, &[]);
+        let out = build_system_prompt(&situational, &[]);
         assert!(out.contains("<situation>"));
         assert!(out.contains("label=\"planning\""));
         assert!(out.contains("state=\"live\""));
@@ -218,7 +214,7 @@ mod tests {
             context_label: Some("a < b & \"q\"".to_string()),
             ..Default::default()
         };
-        let out = build_system_prompt("base", &situational, &[]);
+        let out = build_system_prompt(&situational, &[]);
         assert!(out.contains("&lt;"));
         assert!(out.contains("&amp;"));
         assert!(out.contains("&quot;"));
@@ -233,22 +229,20 @@ mod tests {
             model: Some("claude-haiku-4-5".to_string()),
             ..Default::default()
         };
-        let out = build_system_prompt("base", &situational, &[]);
+        let out = build_system_prompt(&situational, &[]);
         assert!(out.contains("<model"));
         assert!(!out.contains("<context"), "no context fields → no <context> section");
         assert!(!out.contains("<tools"), "no tool names → no <tools> section");
     }
 
     #[test]
-    fn base_prompt_is_preserved_verbatim() {
-        let base = "first line\nsecond line\n";
+    fn situation_without_sections_has_no_leading_blank_lines() {
         let situational = SituationalContext {
             model: Some("test-model".to_string()),
             ..Default::default()
         };
-        let out = build_system_prompt(base, &situational, &[]);
-        assert!(out.starts_with("first line\nsecond line"));
-        assert!(out.contains("<situation>"));
+        let out = build_system_prompt(&situational, &[]);
+        assert!(out.starts_with("<situation>\n"));
     }
 
     // ── rc-derived sections (the .md system-prompt path) ─────────────────
@@ -256,8 +250,8 @@ mod tests {
     /// The bug the rc rework is fixing: an installed `.md` rc script
     /// produces `(Role::System, BlockKind::Text)` blocks that were
     /// invisible to the model before this change. With the extract +
-    /// build pipeline wired, that content lands in the system prompt
-    /// between the static base and the `<situation>` addendum.
+    /// build pipeline wired, that content becomes the system prompt before
+    /// the `<situation>` addendum.
     #[test]
     fn rc_md_content_reaches_system_prompt() {
         let blocks = vec![
@@ -277,7 +271,7 @@ mod tests {
             model: Some("test-model".to_string()),
             ..Default::default()
         };
-        let prompt = build_system_prompt("base stance", &situational, &sections);
+        let prompt = build_system_prompt(&situational, &sections);
 
         assert!(
             prompt.contains("You are a focused planner."),
@@ -292,13 +286,11 @@ mod tests {
             "Model text must not appear in system prompt; got:\n{prompt}"
         );
 
-        // Ordering: base → rc → situation.
-        let base_pos = prompt.find("base stance").expect("base present");
         let rc_pos = prompt.find("You are a focused planner.").expect("rc present");
         let situation_pos = prompt.find("<situation>").expect("situation present");
         assert!(
-            base_pos < rc_pos && rc_pos < situation_pos,
-            "expected base → rc → situation order; got base={base_pos}, rc={rc_pos}, situation={situation_pos}\nfull:\n{prompt}"
+            rc_pos < situation_pos,
+            "expected rc → situation order; got rc={rc_pos}, situation={situation_pos}\nfull:\n{prompt}"
         );
     }
 
@@ -322,6 +314,18 @@ mod tests {
     }
 
     #[test]
+    fn extractor_skips_draft_system_text() {
+        let mut draft = snap(Role::System, BlockKind::Text, "unfinished instruction");
+        draft.status = Status::Draft;
+
+        let sections = extract_system_prompt_sections(&[
+            draft,
+            snap(Role::System, BlockKind::Text, "accepted instruction"),
+        ]);
+        assert_eq!(sections, vec!["accepted instruction".to_string()]);
+    }
+
+    #[test]
     fn extractor_skips_non_text_system_blocks() {
         // System+Notification, System+Resource, System+Drift, etc. have
         // dedicated hydrate arms; they're not system-prompt material.
@@ -338,11 +342,10 @@ mod tests {
 
     #[test]
     fn rc_sections_alone_without_situational_still_render() {
-        // A context with rc sections but no situational data should
-        // still get the rc material — no early return back to bare base.
+        // A context with rc sections but no situational data should still get
+        // its selected material.
         let sections = vec!["mode: planner".to_string()];
-        let out = build_system_prompt("base", &SituationalContext::default(), &sections);
-        assert!(out.contains("base"));
+        let out = build_system_prompt(&SituationalContext::default(), &sections);
         assert!(out.contains("mode: planner"));
         assert!(!out.contains("<situation>"));
     }
@@ -355,7 +358,7 @@ mod tests {
             "   ".to_string(),
             "second section".to_string(),
         ];
-        let out = build_system_prompt("base", &SituationalContext::default(), &sections);
+        let out = build_system_prompt(&SituationalContext::default(), &sections);
         // Blank sections shouldn't leave double-blank gaps.
         assert!(out.contains("leading and trailing whitespace"));
         assert!(out.contains("second section"));

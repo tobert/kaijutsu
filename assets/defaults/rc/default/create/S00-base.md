@@ -1,0 +1,1 @@
+/config/rc/lib/create/S00-base.md

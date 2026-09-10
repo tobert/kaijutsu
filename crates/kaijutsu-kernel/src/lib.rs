@@ -71,7 +71,6 @@ pub use block_store::{
     BlockStore, BlockStoreError, BlockStoreResult, DbHandle, SharedBlockStore, shared_block_store,
 };
 
-pub use config_seed::DEFAULT_SYSTEM_PROMPT;
 pub use control::ConsentMode;
 // Re-exported because `KernelDb::undelivered_answers` hands these out and a
 // caller outside this crate has to be able to read the answer.
@@ -130,8 +129,6 @@ pub use vfs::{
 
 pub use drift::{
     ContextHandle,
-    // Distillation helpers
-    DISTILLATION_SYSTEM_PROMPT,
     DriftError,
     DriftRouter,
     SharedDriftRouter,

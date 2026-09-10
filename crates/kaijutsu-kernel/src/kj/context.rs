@@ -84,7 +84,7 @@ enum ContextCommand {
         context: Option<String>,
     },
     /// Render the system prompt this context actually gets: the exact
-    /// `base → rc sections → <situation>` assembly the LLM turn path
+    /// `rc sections → <situation>` assembly the LLM turn path
     /// builds, so prompt/stance tuning can be verified against live kernel
     /// state instead of inferred from rc scripts (default: current).
     // Mirrors `crate::llm::build_system_prompt` (llm_stream.rs's
@@ -913,7 +913,7 @@ impl KjDispatcher {
     }
 
     /// Render the system prompt this context actually gets: the exact
-    /// `base → rc sections → <situation>` assembly `spawn_llm_for_prompt`
+    /// `rc sections → <situation>` assembly `spawn_llm_for_prompt`
     /// builds for a real turn (`crates/kaijutsu-server/src/llm_stream.rs`),
     /// reusing the same pure pieces (`build_system_prompt`,
     /// `extract_system_prompt_sections`, `resolve_context_model`) so this
@@ -1009,10 +1009,6 @@ impl KjDispatcher {
             None => (None, None),
         };
 
-        // base: the same loader the turn path uses, so what `kj context
-        // prompt` reports cannot drift from what is really sent.
-        let base = crate::config_seed::load_system_prompt(self.kernel().vfs().as_ref()).await;
-
         // rc sections: the (Role::System, BlockKind::Text) blocks the rc
         // create/fork lifecycle dropped into this context's block store —
         // the SAME extractor the turn path calls, so this can't drift from
@@ -1044,7 +1040,7 @@ impl KjDispatcher {
             model: resolved_model.clone(),
             tool_names,
         };
-        let prompt = crate::llm::build_system_prompt(&base, &situational, &rc_sections);
+        let prompt = crate::llm::build_system_prompt(&situational, &rc_sections);
 
         // The <situation> tail, sliced out of the already-assembled prompt
         // rather than re-derived from `situational` — guarantees
@@ -1064,8 +1060,8 @@ impl KjDispatcher {
             format!("Context: {label_display} ({})\nChars:   {char_count}\n\n{prompt}", target_id.short());
 
         // Structured record: the assembled string plus the individual
-        // layers, so a caller can diff which layer changed (e.g. did the rc
-        // stance change, or just the live tool list) without re-running the
+        // layers, so a caller can diff which selected section changed (or just
+        // the live tool list) without re-running the
         // assembly itself.
         let record = serde_json::json!({
             "context_id": target_id.to_hex(),
@@ -1074,7 +1070,6 @@ impl KjDispatcher {
             "resolved_backend": resolved_backend,
             "resolved_model": resolved_model,
             "prompt": prompt,
-            "base": base,
             "rc_sections": rc_sections,
             "situation": situation,
         });
@@ -4494,19 +4489,23 @@ mod tests {
 
     // ── kj context prompt ─────────────────────────────────────────────
 
-    /// The full A4 assembly, exercised through the REAL rc pipeline (not a
-    /// hand-seeded block): `context create --type coder` runs the actual
-    /// `assets/defaults/rc/coder/create/S00-stance.kai`, which drops a
-    /// `(Role::System, BlockKind::Text)` stance block via `kj block
-    /// create`. `kj context prompt` must show that block, the real
-    /// kernel-owned base (`/config/kernel/system.md` — `test_dispatcher_rc`
-    /// seeds it for real, unlike the plain `test_dispatcher`), and the
-    /// `<situation>` addendum, in that order — the order `build_system_prompt`
-    /// documents and the turn path relies on.
+    /// Context types choose their prompt sections through rc. The opted-in
+    /// coder gets the shared base before its role section; musician, which has
+    /// no link, gets none. A legacy kernel config file must affect neither.
     #[tokio::test]
-    async fn context_prompt_layers_base_rc_and_situation() {
+    async fn context_prompt_uses_rc_owned_sections() {
+        use crate::vfs::VfsOps;
+
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
+        d.kernel()
+            .vfs()
+            .write_all(
+                std::path::Path::new("/config/kernel/system.md"),
+                b"LEGACY-KERNEL-PROMPT-MUST-NOT-APPEAR",
+            )
+            .await
+            .expect("write legacy kernel prompt sentinel");
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
         let create_caller = caller_with_context(parent);
@@ -4528,9 +4527,17 @@ mod tests {
         assert!(result.is_ok(), "prompt failed: {}", result.message());
         let msg = result.message();
 
-        // Base: the real kernel-owned /config/kernel/system.md content.
-        assert!(msg.contains("改善"), "base content missing from prompt: {msg}");
-        // rc: S00-stance.kai's real output — both branches (crisp/synth)
+        let shared = "Kaijutsu (会術・かいじゅつ) — the art of meeting.";
+        assert_eq!(
+            msg.match_indices(shared).count(),
+            1,
+            "the opted-in coder receives the shared section exactly once: {msg}"
+        );
+        assert!(
+            !msg.contains("LEGACY-KERNEL-PROMPT-MUST-NOT-APPEAR"),
+            "the old /config/kernel/system.md input must be ignored: {msg}"
+        );
+        // rc: S00-stance.kai's real output — both branches (crisp/guided)
         // share this opening line, so this holds regardless of which the
         // `case` picked for the (unconfigured) resolved model.
         assert!(
@@ -4538,23 +4545,126 @@ mod tests {
             "rc-produced coder stance missing from prompt: {msg}"
         );
 
-        // Order: base → rc → situation (byte offsets, same technique as
-        // system_prompt.rs's own `rc_md_content_reaches_system_prompt`).
-        let base_pos = msg.find("改善").expect("base present");
+        // Order is the rc sort order: shared S00-base → coder S00-stance → situation.
+        let base_pos = msg.find(shared).expect("shared section present");
         let rc_pos = msg.find("You are coding here").expect("rc present");
         let situation_pos = msg.find("<situation>").expect("situation present");
         assert!(
             base_pos < rc_pos && rc_pos < situation_pos,
-            "expected base → rc → situation order; got base={base_pos}, rc={rc_pos}, \
+            "expected shared → role → situation order; got shared={base_pos}, rc={rc_pos}, \
              situation={situation_pos}\nfull:\n{msg}"
+        );
+
+        let create = d
+            .dispatch(
+                &[s("context"), s("create"), s("m1"), s("--type"), s("musician")],
+                &create_caller,
+            )
+            .await;
+        assert!(create.is_ok(), "musician create failed: {}", create.message());
+        let musician = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("m1").expect("m1 should exist")
+        };
+        let result = d
+            .dispatch(&[s("context"), s("prompt")], &caller_with_context(musician))
+            .await;
+        assert!(result.is_ok(), "musician prompt failed: {}", result.message());
+        let musician_prompt = result.message();
+        assert!(
+            !musician_prompt.contains(shared),
+            "an unlinked type must receive no shared base: {musician_prompt}"
+        );
+        assert!(
+            musician_prompt.contains("You're a musician here"),
+            "musician's own role section is still present: {musician_prompt}"
+        );
+    }
+
+    /// Rc source files are read when a lifecycle runs. Editing a shared body
+    /// changes a later create, never the already-authored instruction blocks
+    /// in an existing context.
+    #[tokio::test]
+    async fn rc_source_edit_applies_only_to_later_lifecycle_runs() {
+        use crate::vfs::VfsOps;
+
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let caller = caller_with_context(parent);
+
+        let create = d
+            .dispatch(
+                &[s("context"), s("create"), s("before"), s("--type"), s("coder")],
+                &caller,
+            )
+            .await;
+        assert!(create.is_ok(), "first create failed: {}", create.message());
+        let before = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("before").expect("before context")
+        };
+        let before_sections = d
+            .block_store()
+            .block_snapshots(before)
+            .map(|blocks| crate::llm::extract_system_prompt_sections(&blocks))
+            .expect("before snapshots");
+        assert!(
+            before_sections
+                .iter()
+                .any(|section| section.contains("Kaijutsu (会術・かいじゅつ)")),
+            "first context must receive the seeded shared body: {before_sections:?}"
+        );
+
+        d.kernel()
+            .vfs()
+            .write_all(
+                std::path::Path::new("/config/rc/lib/create/S00-base.md"),
+                b"CHANGED-SHARED-BASE-FOR-LATER-CREATE",
+            )
+            .await
+            .expect("edit shared rc source");
+
+        let unchanged_sections = d
+            .block_store()
+            .block_snapshots(before)
+            .map(|blocks| crate::llm::extract_system_prompt_sections(&blocks))
+            .expect("before snapshots after source edit");
+        assert_eq!(
+            unchanged_sections, before_sections,
+            "editing an rc source must not mutate an existing context's stored sections"
+        );
+
+        let create = d
+            .dispatch(
+                &[s("context"), s("create"), s("after"), s("--type"), s("coder")],
+                &caller,
+            )
+            .await;
+        assert!(create.is_ok(), "second create failed: {}", create.message());
+        let after = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("after").expect("after context")
+        };
+        let after_sections = d
+            .block_store()
+            .block_snapshots(after)
+            .map(|blocks| crate::llm::extract_system_prompt_sections(&blocks))
+            .expect("after snapshots");
+        assert!(
+            after_sections
+                .iter()
+                .any(|section| section.contains("CHANGED-SHARED-BASE-FOR-LATER-CREATE")),
+            "a later lifecycle run must read the edited shared source: {after_sections:?}"
         );
     }
 
     /// `--json`'s `data.prompt` must be exactly the string rendered in the
     /// human message (the header line precedes it) — no second assembly
     /// path that could quietly drift from what the human sees. Also checks
-    /// the individual `base`/`rc_sections` pieces the spec asks for, so a
-    /// caller can diff which layer changed without re-running the assembly.
+    /// the selected `rc_sections` piece the caller can inspect without
+    /// re-running the assembly.
     #[tokio::test]
     async fn context_prompt_json_matches_human_render() {
         let d = test_dispatcher().await;
@@ -4599,10 +4709,13 @@ mod tests {
                     "char_count must match the assembled prompt, not the wrapped message"
                 );
 
-                let base = v["base"].as_str().expect("data.base is a string");
                 assert!(
-                    prompt.starts_with(base.trim_end()),
-                    "prompt must start with base; base={base}\nprompt={prompt}"
+                    v.get("base").is_none(),
+                    "the preview must not imply a kernel-wide base: {v}"
+                );
+                assert!(
+                    prompt.starts_with("You are a terse test stance."),
+                    "prompt must start with the context's selected section: {prompt}"
                 );
 
                 let rc_sections = v["rc_sections"].as_array().expect("data.rc_sections is an array");

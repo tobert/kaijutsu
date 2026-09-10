@@ -80,6 +80,29 @@ fn is_turn_start(b: &BlockSnapshot) -> bool {
     b.role == BlockRole::User
 }
 
+/// Return the complete turn groups in source order.
+///
+/// The range rule is the same one [`plan_splice`] snaps to: a group starts at
+/// a user block and ends before the next user block. An older or damaged log
+/// can begin with an assistant continuation; that initial prefix remains one
+/// group so callers preserve evidence rather than guessing a boundary.
+pub(crate) fn turn_group_ranges(blocks: &[BlockSnapshot]) -> Vec<Range<usize>> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups = Vec::new();
+    let mut start = 0;
+    for (index, block) in blocks.iter().enumerate().skip(1) {
+        if is_turn_start(block) {
+            groups.push(start..index);
+            start = index;
+        }
+    }
+    groups.push(start..blocks.len());
+    groups
+}
+
 /// Snap a run start back to the nearest turn boundary at or before `lo`.
 /// Index 0 is always a valid start (there is nothing earlier to snap to).
 fn snap_start(blocks: &[BlockSnapshot], lo: usize) -> usize {

@@ -1551,13 +1551,17 @@ impl BlockDocument {
             passing.push((*block, snap));
         }
 
+        let passing_ids: HashSet<BlockId> = passing.iter().map(|(_, snap)| snap.id).collect();
+
         for (block, snap) in passing {
             let new_id = BlockId::new(new_context_id, snap.id.principal_id, snap.id.seq);
             let new_parent_id = snap
                 .parent_id
+                .filter(|parent_id| passing_ids.contains(parent_id))
                 .map(|pid| BlockId::new(new_context_id, pid.principal_id, pid.seq));
             let new_tool_call_id = snap
                 .tool_call_id
+                .filter(|tool_call_id| passing_ids.contains(tool_call_id))
                 .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
             // Seed the forked store's seq lane for EVERY copied block's principal
@@ -3879,6 +3883,134 @@ mod tests {
         let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
 
         assert_eq!(forked.block_count(), 2, "Specific block should be excluded");
+    }
+
+    #[test]
+    fn fork_filtered_clears_omitted_links_and_remaps_surviving_links() {
+        let mut store = test_store();
+        let root = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "root",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let dropped_parent = store
+            .insert_block(
+                Some(&root),
+                Some(&root),
+                Role::Model,
+                BlockKind::Text,
+                "dropped parent",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let retained_child = store
+            .insert_block(
+                Some(&dropped_parent),
+                Some(&dropped_parent),
+                Role::User,
+                BlockKind::Text,
+                "retained child",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let retained_child_of_root = store
+            .insert_block(
+                Some(&root),
+                Some(&retained_child),
+                Role::Model,
+                BlockKind::Text,
+                "retained child of root",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let dropped_call = store
+            .insert_tool_call(
+                Some(&root),
+                Some(&retained_child_of_root),
+                "dropped_tool",
+                serde_json::json!({"input": "dropped"}),
+                None,
+                None,
+            )
+            .unwrap();
+        let retained_result_of_dropped_call = store
+            .insert_tool_result_block(
+                &dropped_call,
+                Some(&dropped_call),
+                "retained result",
+                false,
+                Some(0),
+                None,
+            )
+            .unwrap();
+        let retained_call = store
+            .insert_tool_call(
+                Some(&root),
+                Some(&retained_result_of_dropped_call),
+                "retained_tool",
+                serde_json::json!({"input": "retained"}),
+                None,
+                None,
+            )
+            .unwrap();
+        let retained_result = store
+            .insert_tool_result_block(
+                &retained_call,
+                Some(&retained_call),
+                "retained result",
+                false,
+                Some(0),
+                None,
+            )
+            .unwrap();
+
+        let mut filter = ForkBlockFilter::default();
+        filter.exclude_block_ids.insert(dropped_parent.to_key());
+        filter.exclude_block_ids.insert(dropped_call.to_key());
+
+        let new_ctx = ContextId::new();
+        let forked = store.fork_filtered(new_ctx, PrincipalId::new(), u64::MAX, &filter);
+        let remapped = |id: BlockId| BlockId::new(new_ctx, id.principal_id, id.seq);
+
+        assert_eq!(
+            forked.get_block_snapshot(&remapped(retained_child)).unwrap().parent_id,
+            None,
+            "a retained block must not point at an omitted parent"
+        );
+        assert_eq!(
+            forked
+                .get_block_snapshot(&remapped(retained_child_of_root))
+                .unwrap()
+                .parent_id,
+            Some(remapped(root)),
+            "a retained parent must remap into the child document"
+        );
+
+        let dropped_result = forked
+            .get_block_snapshot(&remapped(retained_result_of_dropped_call))
+            .unwrap();
+        assert_eq!(
+            dropped_result.parent_id, None,
+            "a retained result must not point at an omitted call"
+        );
+        assert_eq!(
+            dropped_result.tool_call_id, None,
+            "a retained result must not retain an omitted tool-call id"
+        );
+
+        let live_result = forked.get_block_snapshot(&remapped(retained_result)).unwrap();
+        assert_eq!(live_result.parent_id, Some(remapped(retained_call)));
+        assert_eq!(live_result.tool_call_id, Some(remapped(retained_call)));
     }
 
     #[test]

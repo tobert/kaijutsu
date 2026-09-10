@@ -546,7 +546,7 @@ mod tests {
     async fn zq_on_a_config_path_keeps_the_rollback_recoverable() {
         let d = test_dispatcher_with_config().await;
         let c = test_caller();
-        let path = &kaijutsu_types::paths::config_path("system.md");
+        let path = &kaijutsu_types::paths::config_path("theme.toml");
 
         // Same setup as the /tmp test: make disk diverge from the
         // checkpoint, so "we deleted the rollback and reloaded from disk"

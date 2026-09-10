@@ -832,6 +832,18 @@ impl BlockStore {
         before_timestamp: u64,
         filter: &ForkBlockFilter,
     ) -> BlockStoreResult<()> {
+        self.fork_document_filtered_checked(source_id, new_id, before_timestamp, filter, None)
+    }
+
+    /// Copy a selection only if its source still has the version used to select it.
+    pub(crate) fn fork_document_filtered_checked(
+        &self,
+        source_id: ContextId,
+        new_id: ContextId,
+        before_timestamp: u64,
+        filter: &ForkBlockFilter,
+        expected_version: Option<u64>,
+    ) -> BlockStoreResult<()> {
         if self.documents.contains_key(&new_id) {
             return Err(BlockStoreError::DocumentAlreadyExists(new_id));
         }
@@ -839,6 +851,12 @@ impl BlockStore {
         let source_entry = self
             .get(source_id)
             .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
+
+        if expected_version.is_some_and(|version| source_entry.doc.version() != version) {
+            return Err(BlockStoreError::Validation(
+                "Source changed during compaction; retry the compact fork".to_string(),
+            ));
+        }
 
         // Validate timestamp is not in the future
         let now = kaijutsu_types::now_millis();

@@ -29,6 +29,7 @@
 //! to the staging queue (loudly, as an error) so content is never lost.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -41,6 +42,8 @@ use kaijutsu_types::{
 use kaijutsu_types::{ContextState, PrincipalId};
 
 use crate::block_store::SharedBlockStore;
+use crate::llm::hydrate::is_history_eligible;
+use crate::llm::splice::turn_group_ranges;
 use crate::kernel_db::{ContextRow, KernelDb, WellKnownRole};
 
 /// Shared, thread-safe DriftRouter reference.
@@ -1374,76 +1377,300 @@ pub enum DriftError {
 // Distillation helpers
 // ============================================================================
 
-/// System prompt for distillation — used when summarizing context for transfer.
-pub const DISTILLATION_SYSTEM_PROMPT: &str =
-    include_str!("../../../assets/defaults/prompts/distillation.md");
+/// Default maximum size of the complete user prompt sent to a distillation
+/// provider. This is source-evidence capacity, independent of a provider's
+/// response-token cap and of the operation's requested word target.
+pub const DEFAULT_DISTILL_INPUT_BYTES: usize = 131_072;
 
-/// Build a distillation prompt from a document's blocks.
+/// Select the latest complete, history-eligible turn group.
 ///
-/// Formats the conversation history as a transcript suitable for LLM summarization.
-// TODO: Use query_blocks with a kind filter once drift goes through RPC.
-// Current in-process DashMap reads are fast; optimize when drift becomes remote-capable.
+/// Compact fork retention uses this alongside copied instruction blocks. The
+/// group boundary comes from `splice`, so a user turn's model continuations,
+/// tool calls, and tool results stay together even when the tail begins on a
+/// tool block.
+pub(crate) fn most_recent_eligible_turn_group(blocks: &[BlockSnapshot]) -> Vec<BlockSnapshot> {
+    closed_eligible_turn_ranges(blocks)
+        .into_iter()
+        .rev()
+        .map(|range| {
+            blocks[range]
+                .iter()
+                .filter(|block| is_history_eligible(block))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .find(|group| !group.is_empty())
+        .unwrap_or_default()
+}
+
+/// Extend user-delimited turn groups across eligible tool pairs.
+///
+/// The durable log permits another user block to arrive between a tool call
+/// and its result. A raw user-to-user range would then split that evidence.
+/// Pair closure joins every range between the call and result; this may retain
+/// an unrelated intervening turn, but never presents a partial tool exchange.
+/// An excluded or otherwise ineligible partner is deliberately not restored.
+fn closed_eligible_turn_ranges(blocks: &[BlockSnapshot]) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for range in turn_group_ranges(blocks) {
+        let begins_eligible_turn = range.start == 0 || is_history_eligible(&blocks[range.start]);
+        if begins_eligible_turn {
+            ranges.push(range);
+        } else if let Some(previous) = ranges.last_mut() {
+            previous.end = range.end;
+        } else {
+            ranges.push(range);
+        }
+    }
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    let eligible_positions: HashMap<_, _> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| is_history_eligible(block))
+        .map(|(index, block)| (block.id, index))
+        .collect();
+
+    for (result_index, block) in blocks.iter().enumerate() {
+        if !is_history_eligible(block) || block.kind != BlockKind::ToolResult {
+            continue;
+        }
+        let Some(call_id) = block.tool_call_id else {
+            continue;
+        };
+        let Some(&call_index) = eligible_positions.get(&call_id) else {
+            continue;
+        };
+        merge_turn_ranges(&mut ranges, call_index, result_index);
+    }
+    ranges
+}
+
+fn merge_turn_ranges(ranges: &mut Vec<Range<usize>>, first: usize, second: usize) {
+    let Some(first_group) = ranges
+        .iter()
+        .position(|range| range.contains(&first))
+    else {
+        return;
+    };
+    let Some(second_group) = ranges
+        .iter()
+        .position(|range| range.contains(&second))
+    else {
+        return;
+    };
+    let start_group = first_group.min(second_group);
+    let end_group = first_group.max(second_group);
+    if start_group == end_group {
+        return;
+    }
+    let start = ranges[start_group].start;
+    let end = ranges[end_group].end;
+    ranges.splice(start_group..=end_group, [start..end]);
+}
+
+fn eligible_turn_groups(blocks: &[BlockSnapshot]) -> Vec<Vec<&BlockSnapshot>> {
+    closed_eligible_turn_ranges(blocks)
+        .into_iter()
+        .map(|range| {
+            blocks[range]
+                .iter()
+                .filter(|block| is_history_eligible(block))
+                .collect()
+        })
+        .filter(|group: &Vec<&BlockSnapshot>| !group.is_empty())
+        .collect()
+}
+
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::User => "User",
+        Role::Model => "Assistant",
+        Role::System => "System",
+        Role::Tool => "Tool",
+        Role::Asset => "Asset",
+    }
+}
+
+fn kind_suffix(block: &BlockSnapshot) -> String {
+    let kind = match block.kind {
+        BlockKind::Thinking => "thinking",
+        BlockKind::ToolCall => "tool call",
+        BlockKind::ToolResult => "tool result",
+        BlockKind::Drift => "drift",
+        BlockKind::File => "file",
+        BlockKind::Error => "error",
+        BlockKind::Notification => "notification",
+        BlockKind::Resource => "resource",
+        BlockKind::Trace => "trace",
+        BlockKind::Task => "task",
+        BlockKind::Text => return String::new(),
+    };
+    format!(" ({kind})")
+}
+
+fn format_block(block: &BlockSnapshot) -> String {
+    let mut metadata = vec![format!("block={}", block.id.to_key())];
+    if let Some(parent) = block.parent_id {
+        metadata.push(format!("parent={}", parent.to_key()));
+    }
+    if let Some(name) = &block.tool_name {
+        metadata.push(format!("tool={name}"));
+    }
+    if let Some(tool_use_id) = &block.tool_use_id {
+        metadata.push(format!("tool_use_id={tool_use_id}"));
+    }
+    if let Some(tool_call_id) = block.tool_call_id {
+        metadata.push(format!("tool_call={}", tool_call_id.to_key()));
+    }
+    if let Some(exit_code) = block.exit_code {
+        metadata.push(format!("exit_code={exit_code}"));
+    }
+    if block.is_error {
+        metadata.push("is_error=true".into());
+    }
+
+    let mut content = if block.content.is_empty() {
+        block.tool_input.clone().unwrap_or_default()
+    } else {
+        block.content.clone()
+    };
+    if let Some(stderr) = &block.stderr
+        && !stderr.is_empty()
+    {
+        content.push_str("\n\n[stderr]\n");
+        content.push_str(stderr);
+    }
+
+    format!(
+        "**{}{}** [{}]: {}\n\n",
+        role_label(block.role),
+        kind_suffix(block),
+        metadata.join(" "),
+        content
+    )
+}
+
+fn omitted_metadata(groups: &[Vec<&BlockSnapshot>]) -> String {
+    let Some(first) = groups.first().and_then(|group| group.first()) else {
+        return String::new();
+    };
+    let last = groups
+        .last()
+        .and_then(|group| group.last())
+        .expect("a nonempty omitted group has a last block");
+    let count: usize = groups.iter().map(Vec::len).sum();
+    format!(
+        "## Omitted source material\n\n{count} earlier eligible blocks were omitted to fit the input bound. \
+         Recover them from the source block log, ordered from `{}` through `{}`.\n\n",
+        first.id.to_key(),
+        last.id.to_key()
+    )
+}
+
+fn assemble_distillation_prompt(
+    selected: &[Vec<&BlockSnapshot>],
+    omitted: &[Vec<&BlockSnapshot>],
+    directed_prompt: Option<&str>,
+    length_guidance: Option<&str>,
+) -> String {
+    let mut transcript = String::from("# Conversation to summarize\n\n");
+    transcript.push_str(&omitted_metadata(omitted));
+    for group in selected {
+        for block in group {
+            transcript.push_str(&format_block(block));
+        }
+    }
+    if let Some(guidance) = length_guidance {
+        transcript.push_str(&format!("Length target: {guidance}.\n\n"));
+    }
+    if let Some(prompt) = directed_prompt {
+        transcript.push_str(&format!("---\n\nFocus your briefing on: {prompt}\n"));
+    }
+    transcript
+}
+
+/// Build a bounded, source-cited distillation transcript.
+///
+/// The newest complete eligible turn groups win. A turn group is indivisible:
+/// when the latest group cannot fit, this returns an error before a provider
+/// call instead of severing tool evidence or truncating text at an arbitrary
+/// byte boundary.
+pub(crate) fn build_bounded_distillation_prompt_with_guidance(
+    blocks: &[BlockSnapshot],
+    directed_prompt: Option<&str>,
+    input_bytes: usize,
+    length_guidance: Option<&str>,
+) -> Result<String, String> {
+    if input_bytes == 0 {
+        return Err("KJ_DISTILL_INPUT_BYTES must be greater than zero".into());
+    }
+    let groups = eligible_turn_groups(blocks);
+    if groups.is_empty() {
+        return Err("context has no eligible blocks to summarize".into());
+    }
+
+    let mut selected_start = groups.len();
+    for start in (0..groups.len()).rev() {
+        let prompt = assemble_distillation_prompt(
+            &groups[start..],
+            &groups[..start],
+            directed_prompt,
+            length_guidance,
+        );
+        if prompt.len() <= input_bytes {
+            selected_start = start;
+            continue;
+        }
+        if start == groups.len() - 1 {
+            let first = groups[start]
+                .first()
+                .expect("eligible turn group is nonempty");
+            let last = groups[start]
+                .last()
+                .expect("eligible turn group is nonempty");
+            return Err(format!(
+                "KJ_DISTILL_INPUT_BYTES={input_bytes} cannot fit the latest required turn group \
+                 ({} eligible blocks, `{}` through `{}`); raise KJ_DISTILL_INPUT_BYTES",
+                groups[start].len(),
+                first.id.to_key(),
+                last.id.to_key()
+            ));
+        }
+        break;
+    }
+
+    let prompt = assemble_distillation_prompt(
+        &groups[selected_start..],
+        &groups[..selected_start],
+        directed_prompt,
+        length_guidance,
+    );
+    if prompt.len() > input_bytes {
+        return Err(format!(
+            "KJ_DISTILL_INPUT_BYTES={input_bytes} cannot fit distillation framing and focus"
+        ));
+    }
+    Ok(prompt)
+}
+
+/// Build a bounded, source-cited distillation transcript.
+pub fn build_bounded_distillation_prompt(
+    blocks: &[BlockSnapshot],
+    directed_prompt: Option<&str>,
+    input_bytes: usize,
+) -> Result<String, String> {
+    build_bounded_distillation_prompt_with_guidance(blocks, directed_prompt, input_bytes, None)
+}
+
+/// Build a distillation prompt using the shipped input bound.
 pub fn build_distillation_prompt(
     blocks: &[BlockSnapshot],
     directed_prompt: Option<&str>,
-) -> String {
-    let mut transcript = String::new();
-    transcript.push_str("# Conversation to summarize\n\n");
-
-    for block in blocks {
-        let role_label = match block.role {
-            Role::User => "User",
-            Role::Model => "Assistant",
-            Role::System => "System",
-            Role::Tool => "Tool",
-            Role::Asset => "Asset",
-        };
-
-        let kind_suffix = match block.kind {
-            BlockKind::Thinking => " (thinking)",
-            BlockKind::ToolCall => " (tool call)",
-            BlockKind::ToolResult => " (tool result)",
-            BlockKind::Drift => " (drift)",
-            BlockKind::File => " (file)",
-            BlockKind::Error => " (error)",
-            BlockKind::Notification => " (notification)",
-            BlockKind::Resource => " (resource)",
-            BlockKind::Trace => " (trace)",
-            BlockKind::Task => " (task)",
-            BlockKind::Text => "",
-        };
-
-        // Skip empty blocks
-        if block.content.is_empty() {
-            continue;
-        }
-
-        // Truncate very long blocks — find a valid UTF-8 boundary near 2000 bytes
-        let content = if block.content.len() > 2000 {
-            let mut end = 2000;
-            while end > 0 && !block.content.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!(
-                "{}... [truncated, {} bytes total]",
-                &block.content[..end],
-                block.content.len()
-            )
-        } else {
-            block.content.clone()
-        };
-
-        transcript.push_str(&format!(
-            "**{}{}**: {}\n\n",
-            role_label, kind_suffix, content
-        ));
-    }
-
-    if let Some(prompt) = directed_prompt {
-        transcript.push_str(&format!("\n---\n\nFocus your summary on: {}\n", prompt));
-    }
-
-    transcript
+) -> Result<String, String> {
+    build_bounded_distillation_prompt(blocks, directed_prompt, DEFAULT_DISTILL_INPUT_BYTES)
 }
 
 // Drift engines removed — all drift operations go through `kj` commands via KjDispatcher.
@@ -1864,11 +2091,13 @@ mod tests {
             ),
         ];
 
-        let prompt = build_distillation_prompt(&blocks, None);
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
         assert!(prompt.contains("# Conversation to summarize"));
-        assert!(prompt.contains("**User**: How do I fix the auth bug?"));
-        assert!(prompt.contains("**Assistant**: The auth bug is caused by"));
-        assert!(!prompt.contains("Focus your summary on"));
+        assert!(prompt.contains("**User** [block="));
+        assert!(prompt.contains("How do I fix the auth bug?"));
+        assert!(prompt.contains("**Assistant** [block="));
+        assert!(prompt.contains("The auth bug is caused by"));
+        assert!(!prompt.contains("Focus your briefing on"));
     }
 
     #[test]
@@ -1885,12 +2114,12 @@ mod tests {
             "Let's discuss auth and caching.",
         )];
 
-        let prompt = build_distillation_prompt(&blocks, Some("what was decided about caching?"));
-        assert!(prompt.contains("Focus your summary on: what was decided about caching?"));
+        let prompt = build_distillation_prompt(&blocks, Some("what was decided about caching?")).unwrap();
+        assert!(prompt.contains("Focus your briefing on: what was decided about caching?"));
     }
 
     #[test]
-    fn test_build_distillation_prompt_truncates_long_blocks() {
+    fn test_build_distillation_prompt_keeps_complete_long_blocks() {
         use kaijutsu_types::BlockId;
         use kaijutsu_types::{PrincipalId, ToolKind};
         let ctx = ContextId::new();
@@ -1907,9 +2136,8 @@ mod tests {
             None,
         )];
 
-        let prompt = build_distillation_prompt(&blocks, None);
-        assert!(prompt.contains("[truncated, 3000 bytes total]"));
-        assert!(!prompt.contains(&long_content));
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
+        assert!(prompt.contains(&long_content));
     }
 
     #[test]
@@ -1929,9 +2157,292 @@ mod tests {
             ),
         ];
 
-        let prompt = build_distillation_prompt(&blocks, None);
-        assert!(!prompt.contains("**User**:"));
-        assert!(prompt.contains("**Assistant**: Only this should appear."));
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
+        assert!(!prompt.contains("**User** ["));
+        assert!(prompt.contains("Only this should appear."));
+    }
+
+    #[test]
+    fn distillation_matches_hydration_eligibility() {
+        use kaijutsu_types::{BlockSnapshotBuilder, Status};
+
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let id = |seq| BlockId::new(ctx, author, seq);
+        let blocks = vec![
+            BlockSnapshot::text(id(0), None, Role::User, "keep this"),
+            BlockSnapshotBuilder::new(id(1), BlockKind::Text)
+                .role(Role::User)
+                .content("excluded evidence")
+                .excluded(true)
+                .build(),
+            BlockSnapshotBuilder::new(id(2), BlockKind::Text)
+                .role(Role::User)
+                .content("compose draft")
+                .status(Status::Draft)
+                .build(),
+            BlockSnapshotBuilder::new(id(3), BlockKind::Text)
+                .role(Role::User)
+                .content("ephemeral status")
+                .ephemeral(true)
+                .build(),
+            BlockSnapshotBuilder::new(id(4), BlockKind::Text)
+                .role(Role::System)
+                .content("private system instructions")
+                .build(),
+            BlockSnapshotBuilder::new(id(5), BlockKind::File)
+                .role(Role::User)
+                .content("file contents")
+                .build(),
+            BlockSnapshotBuilder::new(id(6), BlockKind::Trace)
+                .role(Role::Model)
+                .content("trace payload")
+                .build(),
+        ];
+
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
+        assert!(prompt.contains("keep this"));
+        for absent in [
+            "excluded evidence",
+            "compose draft",
+            "ephemeral status",
+            "private system instructions",
+            "file contents",
+            "trace payload",
+        ] {
+            assert!(!prompt.contains(absent), "ineligible block leaked: {absent}");
+        }
+    }
+
+    #[test]
+    fn distillation_keeps_late_unicode_corrections() {
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let correction = "🦀 corrected decision: use the durable block id";
+        let content = format!("{}{}", "前".repeat(2_000), correction);
+        let blocks = vec![BlockSnapshot::text(
+            BlockId::new(ctx, author, 0),
+            None,
+            Role::Model,
+            content,
+        )];
+
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
+        assert!(
+            prompt.contains(correction),
+            "a later correction must not vanish at an arbitrary byte cut"
+        );
+    }
+
+    #[test]
+    fn distillation_keeps_block_and_tool_provenance() {
+        use kaijutsu_types::ToolKind;
+
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let call_id = BlockId::new(ctx, author, 3);
+        let result_id = BlockId::new(ctx, PrincipalId::system(), 4);
+        let blocks = vec![
+            BlockSnapshot::tool_call(
+                call_id,
+                None,
+                ToolKind::Builtin,
+                "kaish.exec",
+                serde_json::json!({"command": "kj block read"}),
+                Role::Model,
+                Some("toolu_read_42".into()),
+            ),
+            BlockSnapshot::tool_result(
+                result_id,
+                call_id,
+                ToolKind::Builtin,
+                "read result",
+                false,
+                Some(0),
+                Some("toolu_read_42".into()),
+            ),
+        ];
+
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
+        for provenance in [
+            call_id.to_key(),
+            result_id.to_key(),
+            "kaish.exec".into(),
+            "toolu_read_42".into(),
+        ] {
+            assert!(prompt.contains(&provenance), "missing provenance: {provenance}");
+        }
+    }
+
+    #[test]
+    fn distillation_uses_tool_input_when_tool_call_content_is_empty() {
+        use kaijutsu_types::BlockSnapshotBuilder;
+
+        let ctx = ContextId::new();
+        let call = BlockSnapshotBuilder::new(
+            BlockId::new(ctx, PrincipalId::new(), 0),
+            BlockKind::ToolCall,
+        )
+        .role(Role::Model)
+        .tool_name("kaish.exec")
+        .tool_input(r#"{"code":"kj block read source"}"#)
+        .tool_use_id("toolu_empty_content")
+        .build();
+
+        let prompt = build_distillation_prompt(&[call], None).unwrap();
+        assert!(prompt.contains("kj block read source"));
+        assert!(prompt.contains("kaish.exec"));
+    }
+
+    #[test]
+    fn distillation_input_has_a_total_bound() {
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let blocks: Vec<_> = (0..70)
+            .map(|seq| {
+                BlockSnapshot::text(
+                    BlockId::new(ctx, author, seq),
+                    None,
+                    Role::User,
+                    "evidence ".repeat(2_000),
+                )
+            })
+            .collect();
+
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
+        assert!(
+            prompt.len() <= 131_072,
+            "distillation input must have one total byte bound, got {} bytes",
+            prompt.len()
+        );
+        assert!(prompt.contains("evidence "));
+        assert!(prompt.contains("## Omitted source material"));
+        assert!(prompt.contains(&blocks[0].id.to_key()));
+    }
+
+    #[test]
+    fn distillation_refuses_an_oversized_required_turn_group() {
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let block = BlockSnapshot::text(
+            BlockId::new(ctx, author, 0),
+            None,
+            Role::User,
+            "evidence ".repeat(20_000),
+        );
+
+        let err = build_distillation_prompt(&[block], None).unwrap_err();
+        assert!(err.contains("KJ_DISTILL_INPUT_BYTES=131072"));
+        assert!(err.contains("latest required turn group"));
+    }
+
+    #[test]
+    fn distillation_closes_tool_pairs_across_interleaved_user_blocks() {
+        use kaijutsu_types::ToolKind;
+
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let call_id = BlockId::new(ctx, author, 1);
+        let result_id = BlockId::new(ctx, PrincipalId::system(), 3);
+        let blocks = vec![
+            BlockSnapshot::text(BlockId::new(ctx, author, 0), None, Role::User, "inspect it"),
+            BlockSnapshot::tool_call(
+                call_id,
+                None,
+                ToolKind::Builtin,
+                "kaish.exec",
+                serde_json::json!({"command": "rg evidence"}),
+                Role::Model,
+                Some("toolu_interleaved".into()),
+            ),
+            BlockSnapshot::text(
+                BlockId::new(ctx, PrincipalId::new(), 2),
+                None,
+                Role::User,
+                "also keep the command output",
+            ),
+            BlockSnapshot::tool_result(
+                result_id,
+                call_id,
+                ToolKind::Builtin,
+                "evidence found",
+                false,
+                Some(0),
+                Some("toolu_interleaved".into()),
+            ),
+        ];
+
+        let recent = most_recent_eligible_turn_group(&blocks);
+        let ids: Vec<_> = recent.iter().map(|block| block.id).collect();
+        assert!(ids.contains(&call_id), "the result must pull in its call");
+        assert!(ids.contains(&result_id), "the recent group keeps the result");
+
+        let prompt = build_distillation_prompt(&blocks, None).unwrap();
+        assert!(prompt.contains(&call_id.to_key()));
+        assert!(prompt.contains(&result_id.to_key()));
+    }
+
+    #[test]
+    fn distillation_does_not_restore_an_excluded_tool_partner() {
+        use kaijutsu_types::{BlockSnapshotBuilder, ToolKind};
+
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let call_id = BlockId::new(ctx, author, 1);
+        let result_id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let excluded_call = BlockSnapshotBuilder::new(call_id, BlockKind::ToolCall)
+            .role(Role::Model)
+            .content("excluded command")
+            .tool_name("kaish.exec")
+            .tool_use_id("toolu_excluded")
+            .excluded(true)
+            .build();
+        let result = BlockSnapshot::tool_result(
+            result_id,
+            call_id,
+            ToolKind::Builtin,
+            "kept result",
+            false,
+            Some(0),
+            Some("toolu_excluded".into()),
+        );
+
+        let prompt = build_distillation_prompt(&[excluded_call, result], None).unwrap();
+        assert!(prompt.contains("kept result"));
+        assert!(!prompt.contains("excluded command"));
+        assert!(!prompt.contains("tool=kaish.exec"));
+    }
+
+    #[test]
+    fn ineligible_user_block_does_not_split_the_active_turn() {
+        use kaijutsu_types::BlockSnapshotBuilder;
+
+        let ctx = ContextId::new();
+        let author = PrincipalId::new();
+        let request = BlockSnapshot::text(
+            BlockId::new(ctx, author, 0),
+            None,
+            Role::User,
+            "keep the active request",
+        );
+        let excluded = BlockSnapshotBuilder::new(
+            BlockId::new(ctx, author, 1),
+            BlockKind::Text,
+        )
+        .role(Role::User)
+        .content("excluded draft-like boundary")
+        .excluded(true)
+        .build();
+        let answer = BlockSnapshot::text(
+            BlockId::new(ctx, author, 2),
+            None,
+            Role::Model,
+            "the active answer",
+        );
+
+        let recent = most_recent_eligible_turn_group(&[request.clone(), excluded, answer.clone()]);
+        assert!(recent.iter().any(|block| block.id == request.id));
+        assert!(recent.iter().any(|block| block.id == answer.id));
     }
 
     #[test]

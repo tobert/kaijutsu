@@ -70,9 +70,69 @@ use std::sync::Arc;
 use kaijutsu_types::{ContentType, ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::block_store::SharedBlockStore;
-use crate::drift::{DISTILLATION_SYSTEM_PROMPT, SharedDriftRouter, build_distillation_prompt};
+use crate::drift::{
+    DEFAULT_DISTILL_INPUT_BYTES, SharedDriftRouter,
+    build_bounded_distillation_prompt_with_guidance,
+};
 use crate::kernel::Kernel;
-use crate::kernel_db::KernelDb;
+use crate::kernel_db::{ContextEnvRow, KernelDb};
+
+const DRIFT_WORD_TARGET_ENV: &str = "KJ_DRIFT_WORD_TARGET";
+const CONTINUATION_WORD_TARGET_ENV: &str = "KJ_CONTINUATION_WORD_TARGET";
+const DISTILL_INPUT_BYTES_ENV: &str = "KJ_DISTILL_INPUT_BYTES";
+const DEFAULT_DRIFT_WORD_TARGET: usize = 750;
+const DEFAULT_CONTINUATION_WORD_TARGET: usize = 1_500;
+
+#[derive(Clone, Copy)]
+enum DistillationPurpose {
+    DriftBrief,
+    Continuation,
+}
+
+impl DistillationPurpose {
+    fn word_target_key(self) -> &'static str {
+        match self {
+            Self::DriftBrief => DRIFT_WORD_TARGET_ENV,
+            Self::Continuation => CONTINUATION_WORD_TARGET_ENV,
+        }
+    }
+
+    fn default_word_target(self) -> usize {
+        match self {
+            Self::DriftBrief => DEFAULT_DRIFT_WORD_TARGET,
+            Self::Continuation => DEFAULT_CONTINUATION_WORD_TARGET,
+        }
+    }
+
+    async fn load_system_prompt(self, kernel: &Kernel) -> Result<String, String> {
+        match self {
+            Self::DriftBrief => crate::config_seed::load_distillation_prompt(kernel.vfs().as_ref())
+                .await
+                .map_err(|e| format!("drift briefing prompt: {e}")),
+            Self::Continuation => crate::config_seed::load_continuation_prompt(kernel.vfs().as_ref())
+                .await
+                .map_err(|e| format!("continuation prompt: {e}")),
+        }
+    }
+}
+
+fn parse_positive_context_env(
+    env: &[ContextEnvRow],
+    key: &str,
+    default: usize,
+    context_id: ContextId,
+) -> Result<usize, String> {
+    let Some(value) = env.iter().find(|row| row.key == key).map(|row| &row.value) else {
+        return Ok(default);
+    };
+    let parsed = value.parse::<usize>().ok().filter(|value| *value > 0);
+    parsed.ok_or_else(|| {
+        format!(
+            "{key}={value:?} in source context {} must be a positive integer",
+            context_id.short()
+        )
+    })
+}
 
 // ============================================================================
 // KjCaller — per-invocation identity
@@ -775,8 +835,33 @@ impl KjDispatcher {
         directed_prompt: Option<&str>,
         distill_model: Option<&str>,
     ) -> Result<String, String> {
-        self.summarize_with_model_for_caller(context_id, directed_prompt, distill_model, Some(context_id))
-            .await
+        self.summarize_with_model_for_caller_purpose(
+            context_id,
+            directed_prompt,
+            distill_model,
+            Some(context_id),
+            DistillationPurpose::DriftBrief,
+        )
+        .await
+    }
+
+    /// Summarize a context for compact-fork continuation.
+    ///
+    /// This is deliberately separate from drift briefing: continuation has a
+    /// structured handoff instruction and its own source-context word target.
+    pub(crate) async fn summarize_for_continuation(
+        &self,
+        context_id: ContextId,
+        distill_model: Option<&str>,
+    ) -> Result<String, String> {
+        self.summarize_with_model_for_caller_purpose(
+            context_id,
+            None,
+            distill_model,
+            Some(context_id),
+            DistillationPurpose::Continuation,
+        )
+        .await
     }
 
     /// Same as [`summarize_with_model`], but names the CALLER's context
@@ -798,6 +883,24 @@ impl KjDispatcher {
         distill_model: Option<&str>,
         caller_context_id: Option<ContextId>,
     ) -> Result<String, String> {
+        self.summarize_with_model_for_caller_purpose(
+            context_id,
+            directed_prompt,
+            distill_model,
+            caller_context_id,
+            DistillationPurpose::DriftBrief,
+        )
+        .await
+    }
+
+    async fn summarize_with_model_for_caller_purpose(
+        &self,
+        context_id: ContextId,
+        directed_prompt: Option<&str>,
+        distill_model: Option<&str>,
+        caller_context_id: Option<ContextId>,
+        purpose: DistillationPurpose,
+    ) -> Result<String, String> {
         let blocks = self
             .blocks
             .block_snapshots(context_id)
@@ -806,7 +909,15 @@ impl KjDispatcher {
             return Err("context has no blocks to summarize".into());
         }
 
-        let user_prompt = build_distillation_prompt(&blocks, directed_prompt);
+        let (word_target, input_bytes) = self.distillation_limits(context_id, purpose)?;
+        let length_guidance = format!("about {word_target} words");
+        let user_prompt = build_bounded_distillation_prompt_with_guidance(
+            &blocks,
+            directed_prompt,
+            input_bytes,
+            Some(&length_guidance),
+        )?;
+        let system_prompt = purpose.load_system_prompt(self.kernel()).await?;
 
         let registry = self.kernel.llm().read().await;
 
@@ -904,7 +1015,7 @@ impl KjDispatcher {
         };
 
         provider
-            .prompt_with_system(&model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
+            .prompt_with_system(&model, Some(&system_prompt), &user_prompt)
             .await
             .map_err(|e| {
                 format!(
@@ -913,6 +1024,31 @@ impl KjDispatcher {
                      `--distill-model provider/model`"
                 )
             })
+    }
+
+    fn distillation_limits(
+        &self,
+        context_id: ContextId,
+        purpose: DistillationPurpose,
+    ) -> Result<(usize, usize), String> {
+        let env = self
+            .kernel_db()
+            .lock()
+            .get_context_env(context_id)
+            .map_err(|e| format!("read distillation context_env for {}: {e}", context_id.short()))?;
+        let word_target = parse_positive_context_env(
+            &env,
+            purpose.word_target_key(),
+            purpose.default_word_target(),
+            context_id,
+        )?;
+        let input_bytes = parse_positive_context_env(
+            &env,
+            DISTILL_INPUT_BYTES_ENV,
+            DEFAULT_DISTILL_INPUT_BYTES,
+            context_id,
+        )?;
+        Ok((word_target, input_bytes))
     }
 
     /// Resolve a context's effective (backend, model) pair through the same
@@ -1003,6 +1139,54 @@ pub fn kj_command() -> clap::Command {
 }
 
 #[cfg(test)]
+mod distillation_tests {
+    use super::*;
+    use crate::kj::test_helpers::{register_context, test_dispatcher};
+
+    #[tokio::test]
+    async fn invalid_distillation_budget_fails_before_provider_selection() {
+        let d = test_dispatcher().await;
+        let context_id = register_context(&d, Some("budget-source"), None, PrincipalId::new());
+        d.kernel_db()
+            .lock()
+            .set_context_env(context_id, DRIFT_WORD_TARGET_ENV, "not-a-number")
+            .unwrap();
+
+        let err = d
+            .distillation_limits(context_id, DistillationPurpose::DriftBrief)
+            .unwrap_err();
+        assert!(err.contains(DRIFT_WORD_TARGET_ENV));
+        assert!(err.contains("not-a-number"));
+        assert!(err.contains(&context_id.short()));
+    }
+
+    #[test]
+    fn absent_distillation_settings_use_the_operation_defaults() {
+        let context_id = ContextId::new();
+        assert_eq!(
+            parse_positive_context_env(
+                &[],
+                DRIFT_WORD_TARGET_ENV,
+                DEFAULT_DRIFT_WORD_TARGET,
+                context_id,
+            )
+            .unwrap(),
+            750
+        );
+        assert_eq!(
+            parse_positive_context_env(
+                &[],
+                CONTINUATION_WORD_TARGET_ENV,
+                DEFAULT_CONTINUATION_WORD_TARGET,
+                context_id,
+            )
+            .unwrap(),
+            1_500
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
     use crate::block_store::{shared_block_store, shared_block_store_with_db};
@@ -1049,7 +1233,7 @@ pub(crate) mod test_helpers {
             Kernel::new("test", &kernel_data, blocks.clone(), kernel_db.clone())
                 .await
                 .with_timeouts(policy)
-                .with_temp_cleanup(root),
+                .with_temp_cleanup(root.clone()),
         );
         // Mount a host-backed /config/rc tree (LocalBackend). `kj rc` is now
         // VFS-direct, so it works over either backend; this keeps the broadly-
@@ -1058,6 +1242,17 @@ pub(crate) mod test_helpers {
         // covered by its own unit tests + test_dispatcher_rc.
         kernel
             .mount(RC_ROOT, crate::vfs::LocalBackend::new(&rc_tmp))
+            .await;
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("create config test dir");
+        crate::config_seed::seed_entries_into_dir(
+            CONFIG_ROOT,
+            crate::config_seed::config_seed_files(),
+            &config_dir,
+        )
+        .expect("seed config test files");
+        kernel
+            .mount(CONFIG_ROOT, crate::vfs::LocalBackend::new(&config_dir))
             .await;
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }

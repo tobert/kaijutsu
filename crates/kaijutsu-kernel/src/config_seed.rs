@@ -1,7 +1,7 @@
 //! Embedded default config-file bodies + the config seed manifest.
 //!
-//! The config TOMLs (`theme.toml`, `mcp.toml`, `gate.toml`) and the system prompt
-//! (`system.md`) seed [`CONFIG_VFS_ROOT`], an ordinary host directory reached
+//! The config TOMLs (`theme.toml`, `mcp.toml`, `gate.toml`) seed
+//! [`CONFIG_VFS_ROOT`], an ordinary host directory reached
 //! through `LocalBackend` (`docs/config-namespace.md`), exactly like
 //! `/config/rc`: [`seed_entries_into_dir`] writes each compiled-in default
 //! only while the tree is empty, and after that the directory is the
@@ -24,12 +24,18 @@ pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.tom
 /// Embedded default MCP server configuration (TOML).
 pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.toml");
 
-/// Embedded default system prompt.
-pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/system.md");
-
 /// Embedded default gate policy (TOML): the allow/ask/deny tiers
 /// `kj::gate_policy` reads beneath the ledger's rules.
 pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gate.toml");
+
+/// Embedded drift-briefing instruction. The host file is the live body.
+pub const DEFAULT_DISTILLATION_PROMPT: &str =
+    include_str!("../../../assets/defaults/prompts/distillation.md");
+
+/// Embedded compact-fork continuation instruction. The host file is the live
+/// body.
+pub const DEFAULT_CONTINUATION_PROMPT: &str =
+    include_str!("../../../assets/defaults/prompts/continuation.md");
 
 /// Embedded default metronome click config (TOML). The shared *client* default;
 /// see [`CLIENT_VFS_ROOT`] and `docs/config-namespace.md`.
@@ -67,8 +73,9 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
     vec![
         (config_path("theme.toml"), DEFAULT_THEME),
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
-        (config_path("system.md"), DEFAULT_SYSTEM_PROMPT),
         (config_path("gate.toml"), DEFAULT_GATE_CONFIG),
+        (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
+        (config_path("continuation.md"), DEFAULT_CONTINUATION_PROMPT),
     ]
 }
 
@@ -152,28 +159,31 @@ pub fn config_seed_body(canonical_path: &str) -> Option<&'static str> {
         })
 }
 
-/// Read the kernel-wide system prompt from `/config/kernel/system.md`.
-///
-/// The path is built from [`kaijutsu_types::paths::config_path`], never
-/// spelled at the call site: a literal survives a namespace move and then
-/// reads nothing, and the fallback below hides that behind one `warn!` per
-/// call. A read or UTF-8 failure falls back to [`DEFAULT_SYSTEM_PROMPT`],
-/// loudly — never a silent empty prompt.
-///
-/// Every caller that needs the base system prompt calls this. Two copies of
-/// this logic drifted once; one is the fix.
-pub async fn load_system_prompt(vfs: &dyn crate::vfs::VfsOps) -> String {
-    let system_md = kaijutsu_types::paths::config_path("system.md");
-    match vfs.read_all(std::path::Path::new(&system_md)).await {
-        Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
-            tracing::warn!("{system_md} is not UTF-8: {e}; using embedded default");
-            DEFAULT_SYSTEM_PROMPT.to_string()
-        }),
-        Err(e) => {
-            tracing::warn!("read {system_md} failed: {e}; using embedded default");
-            DEFAULT_SYSTEM_PROMPT.to_string()
-        }
+async fn load_auxiliary_prompt(
+    vfs: &dyn crate::vfs::VfsOps,
+    name: &str,
+) -> Result<String, String> {
+    let path = kaijutsu_types::paths::config_path(name);
+    let bytes = vfs
+        .read_all(std::path::Path::new(&path))
+        .await
+        .map_err(|e| format!("read {path}: {e}"))?;
+    let body = String::from_utf8(bytes).map_err(|e| format!("{path} is not UTF-8: {e}"))?;
+    if body.trim().is_empty() {
+        return Err(format!("{path} is empty"));
     }
+    Ok(body)
+}
+
+/// Read the live drift-briefing instruction from the ordinary config tree.
+pub async fn load_distillation_prompt(vfs: &dyn crate::vfs::VfsOps) -> Result<String, String> {
+    load_auxiliary_prompt(vfs, "distillation.md").await
+}
+
+/// Read the live compact-fork continuation instruction from the ordinary
+/// config tree.
+pub async fn load_continuation_prompt(vfs: &dyn crate::vfs::VfsOps) -> Result<String, String> {
+    load_auxiliary_prompt(vfs, "continuation.md").await
 }
 
 #[cfg(test)]
@@ -182,14 +192,18 @@ mod tests {
     use kaijutsu_types::paths::{client_config_path, config_path};
 
     #[test]
-    fn seed_manifest_covers_the_four_config_files() {
+    fn config_seed_manifest_excludes_system_prompt() {
         let files = config_seed_files();
         let names: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
         assert!(names.contains(&config_path("theme.toml").as_str()));
         assert!(names.contains(&config_path("mcp.toml").as_str()));
-        assert!(names.contains(&config_path("system.md").as_str()));
         assert!(names.contains(&config_path("gate.toml").as_str()));
-        assert_eq!(files.len(), 4, "exactly the four known config files");
+        assert!(names.contains(&config_path("distillation.md").as_str()));
+        assert!(names.contains(&config_path("continuation.md").as_str()));
+        assert!(
+            !names.contains(&config_path("system.md").as_str()),
+            "system prompts are selected by rc, never seeded as kernel config"
+        );
     }
 
     #[test]
@@ -209,6 +223,18 @@ mod tests {
         for (path, body) in config_seed_files() {
             assert!(!body.is_empty(), "seed body for {path} must be non-empty");
         }
+    }
+
+    #[test]
+    fn auxiliary_prompt_seeds_are_available_for_reset() {
+        assert_eq!(
+            config_seed_body(&config_path("distillation.md")),
+            Some(DEFAULT_DISTILLATION_PROMPT)
+        );
+        assert_eq!(
+            config_seed_body(&config_path("continuation.md")),
+            Some(DEFAULT_CONTINUATION_PROMPT)
+        );
     }
 
     #[test]
@@ -288,16 +314,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod system_prompt_loader_tests {
+mod auxiliary_prompt_loader_tests {
     use super::*;
     use crate::vfs::{LocalBackend, MountTable};
-    use kaijutsu_types::paths::{config_path, CONFIG_ROOT};
+    use kaijutsu_types::paths::CONFIG_ROOT;
     use std::sync::Arc;
 
-    /// Mount a real host directory at [`CONFIG_ROOT`] and return the dir so
-    /// the caller can write into it. Mirrors production's mount shape, so a
-    /// loader that spells its own path instead of deriving one reads the
-    /// wrong file here the moment `CONFIG_ROOT` moves.
     async fn config_vfs() -> (Arc<MountTable>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let vfs = Arc::new(MountTable::new());
@@ -305,38 +327,21 @@ mod system_prompt_loader_tests {
         (vfs, dir)
     }
 
-    /// The body on disk wins. A sentinel that shares no line with the
-    /// embedded default, so "fell back silently" and "read the file" cannot
-    /// be confused for one another.
     #[tokio::test]
-    async fn reads_the_body_on_disk() {
+    async fn auxiliary_prompt_loader_reads_the_live_host_body() {
         let (vfs, dir) = config_vfs().await;
-        std::fs::write(dir.path().join("system.md"), "SENTINEL-ON-DISK").unwrap();
+        std::fs::write(dir.path().join("distillation.md"), "LIVE-DRIFT-BRIEF").unwrap();
+        std::fs::write(dir.path().join("continuation.md"), "LIVE-CONTINUATION").unwrap();
 
-        let got = load_system_prompt(vfs.as_ref()).await;
-        assert_eq!(got, "SENTINEL-ON-DISK", "loader must serve the file at {}", config_path("system.md"));
-        assert_ne!(got, DEFAULT_SYSTEM_PROMPT, "must not fall back when the file reads fine");
+        assert_eq!(load_distillation_prompt(vfs.as_ref()).await.unwrap(), "LIVE-DRIFT-BRIEF");
+        assert_eq!(load_continuation_prompt(vfs.as_ref()).await.unwrap(), "LIVE-CONTINUATION");
     }
 
-    /// No file: the embedded default, never an empty prompt. The failure
-    /// mode this guards is a silently blank system prompt, which is worse
-    /// than a stale one.
     #[tokio::test]
-    async fn falls_back_to_the_embedded_default_when_absent() {
+    async fn missing_auxiliary_prompt_fails_instead_of_reviving_an_embedded_body() {
         let (vfs, _dir) = config_vfs().await;
 
-        let got = load_system_prompt(vfs.as_ref()).await;
-        assert_eq!(got, DEFAULT_SYSTEM_PROMPT);
-        assert!(!got.is_empty(), "the fallback must never be an empty prompt");
-    }
-
-    /// Non-UTF-8 takes the same fallback rather than panicking or serving
-    /// replacement characters into every context's system prompt.
-    #[tokio::test]
-    async fn falls_back_when_the_file_is_not_utf8() {
-        let (vfs, dir) = config_vfs().await;
-        std::fs::write(dir.path().join("system.md"), [0xff, 0xfe, 0x00]).unwrap();
-
-        assert_eq!(load_system_prompt(vfs.as_ref()).await, DEFAULT_SYSTEM_PROMPT);
+        let err = load_distillation_prompt(vfs.as_ref()).await.unwrap_err();
+        assert!(err.contains("/config/kernel/distillation.md"));
     }
 }
