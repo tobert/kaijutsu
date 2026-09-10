@@ -123,8 +123,12 @@ ledger          list, show, allow, deny, rules, forget, runs — answer pending
                 approval-ledger asks left by gated verbs (e.g. `kj cc send`);
                 allow/deny take `--remember <session|always>` to generalize
                 the decision into a standing rule (refused for `allow` when
-                a statement has a free variable), `rules` lists standing
-                rules, `forget <rule-id>` revokes one; `runs` lists the rc
+                a statement has a free variable), `--remember … --family`
+                to remember the command family (`kj handoff note`, `git
+                push`) whatever the arguments; `rules` lists the rules in
+                force for this context with the layer deciding each
+                (learned rules, then gate.toml tiers), `forget <rule-id>`
+                revokes one; `runs` lists the rc
                 lifecycle run log (create/fork/attach/drift/tick/rotate —
                 the durable "did the rc lifecycle actually fire" checklist),
                 `runs <run-id>` shows one run's per-script detail

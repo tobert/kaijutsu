@@ -1,8 +1,9 @@
 # Gate policy tuning — one layered list, one runtime path
 
-Status: designed 2026-09-08; slices 1 and 2 (the evaluator seam and the
-config layer, `kj/gate_policy.rs` + `assets/defaults/gate.toml`) shipped
-2026-09-10, slices 3 and 5 unbuilt, slice 4 retired by the verb class. Amy's rulings of the same day are quoted
+Status: designed 2026-09-08; slices 1–3 (the evaluator seam, the config
+layer, learned family rules — `kj/gate_policy.rs`,
+`assets/defaults/gate.toml`, `approval_rule_families`) shipped 2026-09-10,
+slice 5 unbuilt, slice 4 retired by the verb class. Amy's rulings of the same day are quoted
 where they decide a shape. Reviewed against the live tree by kaibo (cast
 `crusoe`) the same day; the revision absorbs its findings. This doc is
 canonical for the gate-policy evaluator; `docs/gate-and-shell-split.md`
@@ -24,7 +25,7 @@ each reading a different store, and they do not agree:
 
 | Checker | Reads | Where consulted |
 |---|---|---|
-| PreCall exemption | const tables, `kj/readonly.rs` | broker PreCall only (`mcp/broker.rs:1887`) |
+| PreCall exemption | const tables, `kj/readonly.rs` | broker PreCall only (`mcp/broker.rs`, `evaluate_phase_with_mode`) |
 | Hook exemptions | jq filters over `KJ_TOOL_PLAN` | `assets/defaults/rc/lib/hooks/lfm2d.kai` |
 | Rules redeem | `approval_rules` (SQLite, digest-keyed) | `run_gate` (`kj/gate.rs`), which both ask origins already flow through: the shell gate (`mcp/servers/shell.rs:497`) and hook escalation (`mcp/broker.rs:2323`) |
 
@@ -117,7 +118,7 @@ One shape for every program, kj or not: **(command name, optional first
 positional token)**.
 
 - `kj` keys resolve through the same six structural conditions
-  `is_read_only_kj` enforces today (`kj/readonly.rs:390`): name exactly
+  `is_read_only_kj` enforces today (`kj/readonly.rs`, `is_read_only_kj`): name exactly
   `kj`, no redirect, no background, no heredoc, every argument
   `PlannedValue::Plain`, and the argv classifies (`kj::classify`, which
   parses the whole argv through the verb enums). A kj key that names no
@@ -170,7 +171,7 @@ the hook's audit call. That path keeps its own controls (`require_cap`).
 
 To make Ask firm in the hook stack, `KJ_TOOL_PLAN` grows a per-command tier
 field beside `kj_readonly` — `allow` / `ask` / `score`, computed by the same
-evaluator when the broker builds the plan (`mcp/broker.rs:2540` ff.), so
+evaluator when the broker builds the plan (`mcp/broker.rs`, `run_kaish_hook`), so
 there is one classification with two consumers. The lfm2d hook gains **two**
 rules, and both are load-bearing for slice 5:
 
@@ -226,7 +227,8 @@ deny = [
 ]
 ```
 
-Unknown sections or verdict words fail the load loudly, naming the line —
+Unknown sections or verdict words fail the load loudly, naming the section
+and key (a TOML syntax error names the line) —
 a policy file that silently half-parses is the failure shape this repo does
 not ship.
 
@@ -251,14 +253,21 @@ CREATE TABLE approval_rule_families (
 ```
 
 Learned at answer time: `kj ledger allow <id> --remember always --family`
-mints a family rule from the answered ask's statement. The single write site
-is a new `learn_family_from_approval` beside `learn_from_approval` (the
-single write site for digest rules today, `approval-ledger/src/rules.rs:8`),
-and the structural check lives there: it refuses — loudly, naming the
-condition — when the statement carries a redirect, a background flag, a
-heredoc, or a non-plain argument, because the family key would then
-authorize text the human never saw. Without `--family`, `--remember` keeps
-today's digest-rule behavior unchanged.
+mints one family rule per command in the answered ask's program. The
+single write site is `learn_family_from_approval` beside
+`learn_from_approval` (`approval-ledger/src/rules.rs`). **As built**, the
+row carries one `family_key` column — the same key space as `gate.toml`
+(`kj <verb> [<subcommand>]`, `<command> [<first argument>]`) — instead of
+the `program`/`subcommand` pair sketched above, so one key space serves
+both layers; and the structural check lives in the kernel
+(`kj::gate_policy::family_keys_for_program`), not the ledger: the ledger
+stores no heredocs and cannot canonicalize a `kj` verb, so the kernel
+re-plans the ask's `exec_source` and refuses — loudly, naming the
+condition — when a command carries a redirect, a background flag, a
+heredoc, or a non-plain argument, or is a `kj` argv that does not
+classify, because the family key would then authorize text the human
+never saw. A `kj`-verb ask has no program and cannot teach a family.
+Without `--family`, `--remember` keeps the digest-rule behavior unchanged.
 
 **Guarantee 3 does not apply to family rules, and the reason is the key.**
 The free-variable refusal exists because a digest rule generalizes statement
@@ -319,7 +328,7 @@ verb's effect:
 - **The `--help` rule** is a flag pattern (last word `--help`/`-h`, no
   intervening flag), not a verb. It moves into the evaluator as a
   structural rule in slice 2, with a Rust test for the `--content --help`
-  bypass that `contrib/lfm2d-ladder-check.kai:146` asserts today.
+  bypass that `contrib/lfm2d-ladder-check.kai` asserts today.
 
 ## What gets deleted
 
@@ -359,15 +368,24 @@ unreleased one:
    drop) + the `--help` structural rule in the evaluator with its Rust
    bypass test. The non-kj test entries (`rg`, `wc`, `git push`, `dd`) ride
    in this slice — ruling 3's "a few other things just to test it out".
-3. **Learned family rules.** Schema, `learn_family_from_approval` with the
-   structural refusal, `--family` at answer time, `family_coverage()`
-   beside `redeem()`, `kj ledger rules`/`forget` extension, both
-   guarantee carve-outs documented and pinned.
+3. **Learned family rules — shipped.** Schema, `learn_family_from_approval`,
+   `--family` at answer time, `family_coverage()` beside `redeem()`,
+   `kj ledger rules` (the composed view) and `forget` over both kinds,
+   both guarantee carve-outs pinned. Two deviations from the section above,
+   both recorded there: the row carries one `family_key` column in the
+   config key space rather than `program`/`subcommand`, and the structural
+   refusal lives in the kernel (`gate_policy::family_keys_for_program`),
+   which re-plans the ask's `exec_source`.
 4. **Retired by the verb class (2026-09-09).** This slice authored a corpus
    `gate` field and retired the readonly tables; both went with
    `kj-expectations.toml`, and the builtin tier is each verb's declared
    `Effect` (§Builtin tier). Nothing remains to build here.
-5. **First tuning pass.** `kj handoff note` in the global allow tier closes
+5. **First tuning pass.** Before it: one test that runs the real
+   `lfm2d.kai` pipeline (or a fixture of its tier section) against a mixed
+   `KJ_TOOL_PLAN`, pinning that the allow-tier drop precedes `clauses_json`
+   and the ask check precedes the jq exemptions — the ladder check pins the
+   filters' logic, not their placement, and the deletion below rests on the
+   placement. Then `kj handoff note` in the global allow tier closes
    `docs/issues.md`, "The lfm2d gate escalates `kj handoff note` from the
    MCP shell" — its option 1, arrived at through the general mechanism
    instead of a scorer special case. Delete the jq exemptions (safe now:
@@ -382,7 +400,7 @@ The repo's own standard — a test that cannot fail is not a test:
 2. Mixed-program hook behavior (slice 2): a program with one allow-tier and
    one score-tier clause reaches the hook, the allow clause is dropped from
    the scored set, and the score clause still escalates — the parity tests
-   at `broker.rs:8105` only cover all-exempt programs today.
+   at `mcp/broker.rs`, `a_ledger_answer_never_reaches_an_asking_hook` only cover all-exempt programs today.
 3. Structural veto on family allows (slice 3): a family allow on
    `kj handoff note` does not cover `kj handoff note 'x' > ~/.bashrc` — the
    redirect drops it to Uncovered.
@@ -426,7 +444,11 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   `run_gate` — naming the file and `kj config reset gate.toml`. A policy
   file that silently half-applies is the failure shape this repo does not
   ship, and the host file is one edit from fixed. An absent file is the
-  empty config: deleting it is a deliberate act the seed respects.
+  empty config: deleting it is a deliberate act the seed respects. The one
+  consult that degrades is the `KJ_TOOL_PLAN` `tier` stamp: a file that
+  breaks between PreCall (which refused on it) and the hook run stamps
+  `score` everywhere and logs an error — the enforcing pinch points reload
+  and fail closed either side of it.
 - **The `ask` tier on the RPC shell paths rides the hook stack.** Those
   paths evaluate PreCall and never open the shell gate, so an ask-tier
   statement there is asked only when the lfm2d hook is installed and in

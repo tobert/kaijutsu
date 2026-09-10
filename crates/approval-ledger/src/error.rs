@@ -109,6 +109,11 @@ pub enum LedgerError {
     /// No approval_rules row exists with this `rule_id`.
     #[error("rule {0} not found")]
     RuleNotFound(String),
+    /// A family rule was asked for with no key to learn: the ask carries
+    /// no planned command (a `kj_verb`-origin ask), or the kernel found
+    /// nothing keyable in it.
+    #[error("ask {0} has no command family to learn: a family rule needs a planned shell command")]
+    NoFamilyKey(String),
 
     /// No `rc_runs` row exists with this `run_id`.
     #[error("rc run {0} not found")]

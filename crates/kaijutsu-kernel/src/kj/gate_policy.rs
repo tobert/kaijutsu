@@ -7,6 +7,10 @@
 //!
 //! 1. **User rules** — `approval_rules`, digest-keyed, learned from a human
 //!    answer. A human decision outranks everything shipped or configured.
+//!    Beneath them in the same layer, **family rules** —
+//!    `approval_rule_families`, keyed on a command family (`kj handoff
+//!    note`, `git push`), learned with `kj ledger allow --remember
+//!    <scope> --family`. The exact statement beats the family.
 //! 2. **context_type config** — `[context_type.<type>]` in
 //!    `/config/kernel/gate.toml`, for the calling context's type.
 //! 3. **Global config** — `[global]` in the same file.
@@ -16,8 +20,9 @@
 //!    conditions `kj/readonly.rs` states (a redirect, a background flag, a
 //!    heredoc or a substituted argument refuses).
 //!
-//! **Keys** (layers 2 and 3) are `kj <verb> [<subcommand>]` in canonical
-//! names, or `<command> [<first argument>]` for anything else. A more
+//! **Keys** (layers 1's families, 2 and 3) are `kj <verb> [<subcommand>]`
+//! in canonical names, or `<command> [<first argument>]` for anything else,
+//! where the first argument counts only when it is not a flag. A more
 //! specific key wins inside a layer; at equal specificity deny beats ask
 //! beats allow. A `kj` key that names no live verb fails the load.
 //!
@@ -25,8 +30,8 @@
 //! PreCall and inside `run_gate`. `ask` is firm: no lower layer can allow
 //! the statement, and each stack's own ask machinery does the asking.
 //!
-//! **Structural refusals veto allows.** An allow from a config layer or the
-//! builtin layer covers a *key*, never arguments, so a redirect, a
+//! **Structural refusals veto allows.** An allow from a family rule, a
+//! config layer or the builtin layer covers a *key*, never arguments, so a redirect, a
 //! background flag, a heredoc or a non-plain argument drops the statement
 //! to `Uncovered` and it meets the classifier and the gate as usual. A deny
 //! or an ask fires regardless of structure. A command whose arguments the
@@ -52,7 +57,7 @@
 
 use std::collections::BTreeMap;
 
-use approval_ledger::types::{AskVerdict, Origin, RuleRow, StatementVerdict};
+use approval_ledger::types::{AskVerdict, FamilyRuleRow, Origin, RuleRow, StatementVerdict};
 use kaish_kernel::PlannedStatement;
 use kaish_types::plan::PlannedCommand;
 use rusqlite::Connection;
@@ -71,6 +76,8 @@ pub(crate) const GATE_CONFIG_FILE: &str = "gate.toml";
 pub(crate) enum Layer {
     /// A digest-keyed rule a human taught the ledger.
     UserRule,
+    /// A family-keyed rule a human taught the ledger.
+    UserFamily,
     /// `[context_type.<type>]` in `gate.toml`.
     ContextTypeConfig(String),
     /// `[global]` in `gate.toml`.
@@ -84,6 +91,7 @@ impl std::fmt::Display for Layer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UserRule => f.write_str("user rule"),
+            Self::UserFamily => f.write_str("user family rule"),
             Self::ContextTypeConfig(t) => write!(f, "context_type config ({t})"),
             Self::GlobalConfig => f.write_str("global config"),
             Self::Builtin => f.write_str("builtin"),
@@ -367,6 +375,25 @@ impl GateConfig {
         Ok(TierTable { entries })
     }
 
+    /// The config entries in force for a caller of `context_type`, for
+    /// `kj ledger rules`: `(layer, key, verdict)`, the context_type section
+    /// first.
+    pub(crate) fn entries_for(&self, context_type: Option<&str>) -> Vec<(Layer, String, &'static str)> {
+        let mut out = Vec::new();
+        if let Some(t) = context_type
+            && let Some(table) = self.context_types.get(t)
+        {
+            out.extend(
+                table
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (Layer::ContextTypeConfig(t.to_string()), k.clone(), v.word())),
+            );
+        }
+        out.extend(self.global.entries.iter().map(|(k, v)| (Layer::GlobalConfig, k.clone(), v.word())));
+        out
+    }
+
     /// Every key with a verdict, for inspection: `(section, key, verdict)`.
     #[cfg(test)]
     pub(crate) fn entries(&self) -> Vec<(String, String, &'static str)> {
@@ -498,12 +525,14 @@ pub(crate) fn evaluate(
         principal_id,
     )?;
 
+    let family = family_layer_per_gated_statement(conn, spec, context_id, principal_id)?;
     let lower = lower_layers_per_gated_statement(spec, layers);
     let per_statement = coverage
         .per_statement
         .iter()
+        .zip(family)
         .zip(lower)
-        .map(|(rule, lower)| match rule {
+        .map(|((rule, family), lower)| match rule {
             StatementVerdict::Allow(row) => PolicyVerdict::Allow(vec![Decision {
                 layer: Layer::UserRule,
                 key: rule_key(row),
@@ -512,7 +541,10 @@ pub(crate) fn evaluate(
                 layer: Layer::UserRule,
                 key: rule_key(row),
             }),
-            StatementVerdict::Uncovered => lower,
+            StatementVerdict::Uncovered => match family {
+                PolicyVerdict::Uncovered => lower,
+                decided => decided,
+            },
         })
         .collect();
     Ok(PolicyEvaluation { per_statement })
@@ -520,6 +552,132 @@ pub(crate) fn evaluate(
 
 fn rule_key(row: &RuleRow) -> String {
     format!("the exact statement (rule {})", row.rule_id)
+}
+
+fn family_rule_key(row: &FamilyRuleRow) -> String {
+    format!("{} (rule {})", row.family_key, row.rule_id)
+}
+
+/// The family-rule verdict for each of `spec.statements`, aligned by
+/// index and shaped per origin like [`lower_layers_per_gated_statement`].
+/// A family deny on any command denies the statement regardless of
+/// structure; a family allow needs every command allowed and structurally
+/// plain; anything else is `Uncovered` for the lower layers to decide.
+fn family_layer_per_gated_statement(
+    conn: &Connection,
+    spec: &GateSpec,
+    context_id: Option<&[u8]>,
+    principal_id: Option<&[u8]>,
+) -> approval_ledger::Result<Vec<PolicyVerdict>> {
+    let n = spec.statements.len();
+    // The planned statements each gated statement stands for.
+    let groups: Vec<&[PlannedStatement]> = match spec.origin {
+        Origin::ShellGate if spec.planned.len() == n && n > 0 => {
+            spec.planned.iter().map(std::slice::from_ref).collect()
+        }
+        Origin::Hook if n == 1 && !spec.planned.is_empty() => vec![spec.planned.as_slice()],
+        Origin::ShellGate | Origin::Hook | Origin::KjVerb => return Ok(vec![PolicyVerdict::Uncovered; n]),
+    };
+    let mut out = Vec::with_capacity(n);
+    for group in groups {
+        let commands: Vec<Option<CommandKeys>> = group
+            .iter()
+            .flat_map(|s| s.plan.commands.iter())
+            .map(command_keys)
+            .collect();
+        let mut wanted: Vec<&str> = Vec::new();
+        for keys in commands.iter().flatten() {
+            for k in &keys.candidates {
+                if !wanted.contains(&k.as_str()) {
+                    wanted.push(k);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            out.push(PolicyVerdict::Uncovered);
+            continue;
+        }
+        let rows = approval_ledger::rules::family_coverage(conn, &wanted, context_id, principal_id)?;
+        let rule_for = |key: &str| -> Option<&FamilyRuleRow> {
+            wanted.iter().position(|w| *w == key).and_then(|i| rows[i].as_ref())
+        };
+        let mut decisions: Vec<Decision> = Vec::new();
+        let mut all_allowed = !commands.is_empty();
+        let mut deny: Option<Decision> = None;
+        for keys in &commands {
+            let Some(keys) = keys else {
+                all_allowed = false;
+                continue;
+            };
+            let hit = keys.candidates.iter().find_map(|k| rule_for(k));
+            match hit {
+                Some(row) if !row.allow => {
+                    deny.get_or_insert(Decision { layer: Layer::UserFamily, key: family_rule_key(row) });
+                }
+                Some(row) if keys.structural_ok => {
+                    let d = Decision { layer: Layer::UserFamily, key: family_rule_key(row) };
+                    if !decisions.contains(&d) {
+                        decisions.push(d);
+                    }
+                }
+                _ => all_allowed = false,
+            }
+        }
+        out.push(match deny {
+            Some(d) => PolicyVerdict::Deny(d),
+            None if all_allowed => PolicyVerdict::Allow(decisions),
+            None => PolicyVerdict::Uncovered,
+        });
+    }
+    Ok(out)
+}
+
+/// Why a statement cannot teach a family rule: the condition, named for
+/// the human who asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FamilyRefusal(pub String);
+
+impl std::fmt::Display for FamilyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The family keys a planned program teaches — one per command, most
+/// specific form — or the refusal: a family allow covers a key and never
+/// arguments, so a command with a redirect, a background flag, a heredoc
+/// or a non-plain argument, or a `kj` argv that does not classify, would
+/// authorize text the human never saw.
+pub(crate) fn family_keys_for_program(statements: &[PlannedStatement]) -> Result<Vec<String>, FamilyRefusal> {
+    let mut keys: Vec<String> = Vec::new();
+    for cmd in statements.iter().flat_map(|s| s.plan.commands.iter()) {
+        let refuse = |why: &str| FamilyRefusal(format!("`{}` {why}", cmd.name));
+        if !cmd.redirects.is_empty() {
+            return Err(refuse("has a redirect"));
+        }
+        if cmd.background {
+            return Err(refuse("runs in the background"));
+        }
+        if !cmd.heredocs.is_empty() {
+            return Err(refuse("carries a heredoc"));
+        }
+        let Some(k) = command_keys(cmd) else {
+            return Err(refuse(
+                "has an argument that is not plain text, or names no kj verb",
+            ));
+        };
+        if !k.structural_ok {
+            return Err(refuse("does not parse as a kj command"));
+        }
+        let key = k.candidates.into_iter().next().expect("candidates are never empty");
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Err(FamilyRefusal("the program has no command".to_string()));
+    }
+    Ok(keys)
 }
 
 /// Layers 2–4 for each of `spec.statements`, aligned by index.
@@ -659,8 +817,10 @@ fn command_keys(cmd: &PlannedCommand) -> Option<CommandKeys> {
             structural_ok: plain_shape && super::effect::classify(&args).is_ok(),
         });
     }
+    // The two-token key needs a first argument that is not a flag: `git
+    // push` is a family, `rg -n` is not.
     let mut candidates = Vec::with_capacity(2);
-    if let Some(first) = args.first() {
+    if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         candidates.push(format!("{} {first}", cmd.name));
     }
     candidates.push(cmd.name.clone());
@@ -823,6 +983,12 @@ mod tests {
             unconfigured("cargo test --help").per_statement[0],
             PolicyVerdict::Uncovered,
             "only kj's own help is known to be inert"
+        );
+        assert_eq!(
+            unconfigured("kj --json rc add --help").per_statement[0],
+            PolicyVerdict::Uncovered,
+            "a root flag ahead of the verb starts with '-', so this over-asks rather than \
+             widening the rule; the hook's jq copy draws the same line"
         );
     }
 
@@ -1025,7 +1191,7 @@ deny = ["kj context create"]
         assert_eq!(
             first_verdict("git -C x push", &cfg, None),
             PolicyVerdict::Uncovered,
-            "the key is the first argument verbatim"
+            "a flag is not a family token, and nothing looks past it"
         );
     }
 
@@ -1137,6 +1303,40 @@ deny = ["kj context create"]
         assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "deny");
         let stmt = &plan("cat x")[0];
         assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "score");
+    }
+
+    // ── family keys ─────────────────────────────────────────────────
+
+    #[test]
+    fn family_keys_are_the_most_specific_key_per_command() {
+        let keys = family_keys_for_program(&plan("kj handoff note 'a note'; git push origin main | wc -l")).unwrap();
+        assert_eq!(keys, vec!["kj handoff note", "git push", "wc"], "a flag is not a family token");
+    }
+
+    /// Guarantee 3 does not apply to a family: the note text is a free
+    /// variable, which a digest rule refuses and a family key never reads.
+    #[test]
+    fn a_free_variable_in_a_value_slot_still_teaches_a_family() {
+        let keys = family_keys_for_program(&plan("kj handoff note ${NOTE}")).unwrap();
+        assert_eq!(keys, vec!["kj handoff note"]);
+    }
+
+    #[test]
+    fn a_family_is_refused_on_structure_naming_the_condition() {
+        let err = |src: &str| family_keys_for_program(&plan(src)).unwrap_err().to_string();
+        assert!(err("kj handoff note 'x' > ~/.bashrc").contains("has a redirect"));
+        assert!(err("kj handoff note 'x' &").contains("runs in the background"));
+        // kaish plans every value `Plain` today; the non-plain arm guards
+        // its `#[non_exhaustive]` redaction seam and cannot be reached
+        // through `plan_program`.
+        assert!(err("kj wait ${CTX} --timeout ${T}").contains("does not parse"));
+        // A substitution plans as its own command beside the kj call, so
+        // the program teaches two families, and the kj half is the verb.
+        assert_eq!(
+            family_keys_for_program(&plan("kj ledger allow $(cat /tmp/id)")).unwrap(),
+            vec!["kj ledger allow", "cat /tmp/id"]
+        );
+        assert!(err("kj blok list").contains("names no kj verb"));
     }
 
     #[tokio::test]

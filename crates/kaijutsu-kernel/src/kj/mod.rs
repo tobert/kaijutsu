@@ -503,7 +503,7 @@ impl KjDispatcher {
         // DB, not a context, and a human must be able to reach it from a
         // shell with no context joined (that is the point of the gate).
         if cmd == "ledger" {
-            return self.dispatch_ledger(&argv[1..], caller);
+            return self.dispatch_ledger(&argv[1..], caller).await;
         }
         // `kj cp` addresses both ends by VFS path, not by context — same
         // exemption rationale as `kj cas`/`kj vfs`.

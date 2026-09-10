@@ -509,7 +509,7 @@ pub(crate) async fn run_gate(
         };
         if archived {
             return GateOutcome::unavailable_without_row(format!(
-                "context {} is archived — archived contexts are retained work and run                  nothing; nothing was run and no ask was recorded",
+                "context {} is archived — archived contexts are retained work and run nothing; nothing was run and no ask was recorded",
                 context_id.short()
             ));
         }

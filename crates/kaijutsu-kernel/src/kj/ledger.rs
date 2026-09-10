@@ -325,6 +325,14 @@ enum LedgerCommand {
         /// stands either way. Off by default. Undo with `kj ledger forget`.
         #[arg(long)]
         remember: Option<RememberScopeArg>,
+        /// With --remember: remember the command family instead of the
+        /// exact text — `kj handoff note`, `git push` — so any future
+        /// call of that family decides the same way, whatever its
+        /// arguments. Refused when a command has a redirect, a background
+        /// flag, a heredoc or a non-plain argument; the decision on THIS
+        /// ask still stands.
+        #[arg(long, requires = "remember")]
+        family: bool,
     },
     /// Deny one ask (claims it first; exactly one answerer wins).
     Deny {
@@ -336,9 +344,15 @@ enum LedgerCommand {
         /// Undo with `kj ledger forget`.
         #[arg(long)]
         remember: Option<RememberScopeArg>,
+        /// With --remember: deny the command family instead of the exact
+        /// text, whatever the arguments. Undo with `kj ledger forget`.
+        #[arg(long, requires = "remember")]
+        family: bool,
     },
-    /// List active (not-yet-forgotten) standing rules, most recently
-    /// created first, capped at `--limit` (default 20).
+    /// List the gate rules in force for this context: standing rules a
+    /// human taught (exact-text and family, newest first, capped at
+    /// `--limit`, default 20), then the gate.toml tiers that apply to this
+    /// context's type. Each names the layer that decides it.
     Rules {
         /// Newest N rules. Default 20.
         #[arg(long, default_value_t = 20)]
@@ -456,7 +470,7 @@ enum SignalCommand {
 }
 
 impl KjDispatcher {
-    pub(crate) fn dispatch_ledger(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_ledger(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return clap_help_for::<LedgerArgs>();
         }
@@ -478,13 +492,15 @@ impl KjDispatcher {
                 self.ledger_list(history, limit, since.as_deref(), origin, status, signals)
             }
             LedgerCommand::Show { request_id, signals } => self.ledger_show(&request_id, signals),
-            LedgerCommand::Allow { request_id, remember } => {
-                self.ledger_decide(&request_id, true, caller, remember)
+            LedgerCommand::Allow { request_id, remember, family } => {
+                self.ledger_decide(&request_id, true, caller, remember, family)
             }
-            LedgerCommand::Deny { request_id, remember } => {
-                self.ledger_decide(&request_id, false, caller, remember)
+            LedgerCommand::Deny { request_id, remember, family } => {
+                self.ledger_decide(&request_id, false, caller, remember, family)
             }
-            LedgerCommand::Rules { limit, since } => self.ledger_rules(limit, since.as_deref()),
+            LedgerCommand::Rules { limit, since } => {
+                self.ledger_rules(limit, since.as_deref(), caller).await
+            }
             LedgerCommand::Forget { rule_id } => self.ledger_forget(&rule_id),
             LedgerCommand::Runs { run_id, limit, since, context, verb } => match run_id {
                 Some(id) => self.ledger_run_show(&id),
@@ -843,6 +859,7 @@ impl KjDispatcher {
         allow: bool,
         caller: &KjCaller,
         remember: Option<RememberScopeArg>,
+        family: bool,
     ) -> KjResult {
         let verb = if allow { "allow" } else { "deny" };
 
@@ -968,7 +985,36 @@ impl KjDispatcher {
                     // already committed above, so nothing below can undo it —
                     // a refusal here only changes whether a RULE exists, never
                     // whether this ask was allowed or denied.
-                    if let Some(remember) = remember {
+                    if let Some(remember) = remember
+                        && family
+                    {
+                        match learn_family_for_ask(
+                            conn,
+                            request_id,
+                            remember.to_rule_scope(),
+                            allow,
+                            principal,
+                        ) {
+                            Ok(keys) => {
+                                message.push_str(&format!(
+                                    "; remembered as a standing {} family rule for {}",
+                                    remember.as_str(),
+                                    keys.join(", "),
+                                ));
+                                data["remembered"] = serde_json::json!({
+                                    "scope": remember.as_str(),
+                                    "family": keys,
+                                });
+                            }
+                            Err(e) => {
+                                message.push_str(&format!(
+                                    "; NOT remembered: {e} — the {verb} on THIS ask still stands"
+                                ));
+                                data["remembered"] = serde_json::json!(false);
+                                data["remember_error"] = serde_json::json!({ "message": e });
+                            }
+                        }
+                    } else if let Some(remember) = remember {
                         match learn_every_statement(
                             conn,
                             request_id,
@@ -1024,7 +1070,13 @@ impl KjDispatcher {
     }
 
     /// `kj ledger rules --limit/--since`, most recently created first.
-    fn ledger_rules(&self, limit: u32, since: Option<&str>) -> KjResult {
+    /// `kj ledger rules`: every rule with a verdict for the calling
+    /// context, each naming the layer that decides it — the human-taught
+    /// rules (exact text and family) first, newest first and capped by
+    /// `--limit`, then the `gate.toml` tiers in force for the caller's
+    /// context type. `.data` is the learned rule ids, the ones `forget`
+    /// takes.
+    async fn ledger_rules(&self, limit: u32, since: Option<&str>, caller: &KjCaller) -> KjResult {
         let since_ms = match since {
             Some(s) => match parse_since_duration_ms(s) {
                 Ok(ms) => Some(since_cutoff_ms(ms)),
@@ -1033,37 +1085,87 @@ impl KjDispatcher {
             None => None,
         };
         let filter = approval_ledger::rules::RuleListFilter { since_ms, limit: limit as i64 };
-        let (rows, total) = {
+        let gate_config = crate::kj::gate_policy::load_config(self.kernel.vfs()).await;
+        let (context_type, digest_rules, family_rules, total) = {
             let db = self.kernel_db.lock();
-            match approval_ledger::rules::list_rules_filtered(db.conn_for_ledger(), &filter) {
+            let context_type = crate::kj::gate_policy::context_type_of(&db, caller.context_id);
+            let conn = db.conn_for_ledger();
+            let (digest, t1) = match approval_ledger::rules::list_rules_filtered(conn, &filter) {
                 Ok(r) => r,
                 Err(e) => return KjResult::Err(format!("kj ledger rules: {e}")),
-            }
+            };
+            let (family, t2) = match approval_ledger::rules::list_family_rules_filtered(conn, &filter) {
+                Ok(r) => r,
+                Err(e) => return KjResult::Err(format!("kj ledger rules: {e}")),
+            };
+            (context_type, digest, family, t1 + t2)
         };
+
+        // One list, newest first, cut to `--limit` across both kinds.
+        // (key, verdict, layer, created_at, rule_id)
+        let mut learned: Vec<(String, &'static str, String, i64, String)> = digest_rules
+            .iter()
+            .map(|r| {
+                (
+                    r.authorized_label.clone(),
+                    if r.allow { "allow" } else { "deny" },
+                    format!("user rule ({}, rule {})", r.scope.as_str(), r.rule_id),
+                    r.created_at,
+                    r.rule_id.clone(),
+                )
+            })
+            .chain(family_rules.iter().map(|r| {
+                (
+                    r.family_key.clone(),
+                    if r.allow { "allow" } else { "deny" },
+                    format!("user family rule ({}, rule {})", r.scope.as_str(), r.rule_id),
+                    r.created_at,
+                    r.rule_id.clone(),
+                )
+            }))
+            .collect();
+        learned.sort_by(|a, b| b.3.cmp(&a.3));
+        learned.truncate(limit as usize);
         let data = serde_json::Value::Array(
-            rows.iter().map(|r| serde_json::json!(r.rule_id.clone())).collect(),
+            learned.iter().map(|r| serde_json::json!(r.4.clone())).collect(),
         );
-        if rows.is_empty() {
-            return KjResult::ok_with_data("(no active rules)".to_string(), data);
-        }
-        let mut lines = vec![format!(
-            "  {:<36}  {:<7}  {:<5}  {}",
-            "RULE", "SCOPE", "ALLOW", "LABEL"
-        )];
-        for r in &rows {
-            lines.push(format!(
-                "  {:<36}  {:<7}  {:<5}  {}",
-                r.rule_id,
-                r.scope.as_str(),
-                if r.allow { "yes" } else { "no" },
-                r.authorized_label,
-            ));
+
+        let mut lines: Vec<String> = Vec::new();
+        if learned.is_empty() {
+            lines.push("(no active rules)".to_string());
+        } else {
+            lines.push(format!("  {:<40}  {:<7}  {}", "KEY", "VERDICT", "LAYER"));
+            for (key, verdict, layer, _, _) in &learned {
+                lines.push(format!("  {:<40}  {:<7}  {layer}", truncate_key(key), verdict));
+            }
         }
         lines.push(String::new());
-        if let Some(notice) = truncation_notice(rows.len(), total, "") {
+        if let Some(notice) = truncation_notice(learned.len(), total, "") {
             lines.push(notice);
             lines.push(String::new());
         }
+        match &gate_config {
+            Ok(config) => {
+                let entries = config.entries_for(context_type.as_deref());
+                if entries.is_empty() {
+                    lines.push(format!(
+                        "gate.toml: no tiers apply to this context (type {})",
+                        context_type.as_deref().unwrap_or("unknown")
+                    ));
+                } else {
+                    lines.push(format!("  {:<40}  {:<7}  {}", "GATE.TOML KEY", "VERDICT", "LAYER"));
+                    for (layer, key, verdict) in entries {
+                        lines.push(format!("  {:<40}  {:<7}  {layer}", truncate_key(&key), verdict));
+                    }
+                }
+            }
+            Err(e) => lines.push(format!("gate.toml: {e}")),
+        }
+        lines.push(String::new());
+        lines.push(
+            "builtin: every kj verb declaring Read, kj ledger, and kj … --help are allowed beneath these"
+                .to_string(),
+        );
         lines.push("forget with: kj ledger forget <rule-id>".into());
         KjResult::ok_with_data(lines.join("\n"), data)
     }
@@ -1427,6 +1529,52 @@ fn learn_every_statement(
     let learned = statements.len();
     tx.commit()?;
     Ok(learned)
+}
+
+/// Generalize an ask into family rules — one per command in the program it
+/// carries — returning the keys learned. A family covers a key and never
+/// arguments, so the program is re-planned from the ask's `exec_source`
+/// and every command must be structurally plain
+/// (`gate_policy::family_keys_for_program` names the condition otherwise).
+/// An ask with no shell program (a `kj`-verb ask) has nothing to learn a
+/// family from.
+fn learn_family_for_ask(
+    conn: &Connection,
+    request_id: &str,
+    scope: RuleScope,
+    allow: bool,
+    created_by: &[u8],
+) -> Result<Vec<String>, String> {
+    let row = approval_ledger::ask::get_approval(conn, request_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no such ask {request_id}"))?;
+    let Some(source) = row.exec_source.as_deref() else {
+        return Err(
+            "this ask carries no shell program to learn a family from; --remember without \
+             --family remembers its exact statement"
+                .to_string(),
+        );
+    };
+    let planned = kaish_kernel::plan_program(source).map_err(|errors| {
+        let msg = errors.iter().map(|e| e.format(source)).collect::<Vec<_>>().join("\n");
+        format!("the ask's program does not plan: {msg}")
+    })?;
+    let keys = crate::kj::gate_policy::family_keys_for_program(&planned)
+        .map_err(|e| format!("a family rule covers a key, never arguments: {e}"))?;
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    approval_ledger::rules::learn_family_from_approval(conn, request_id, &refs, scope, allow, Some(created_by))
+        .map_err(|e| e.to_string())?;
+    Ok(keys)
+}
+
+/// A key or label on one listing line.
+fn truncate_key(s: &str) -> String {
+    const LIMIT: usize = 40;
+    if s.chars().count() <= LIMIT {
+        return s.replace('\n', "⏎");
+    }
+    let head: String = s.chars().take(LIMIT - 1).collect();
+    format!("{}…", head.replace('\n', "⏎"))
 }
 
 // Verb class: kj/effect.rs
@@ -2449,6 +2597,154 @@ mod tests {
         );
         let ask3 = third.ask.expect("an auto-decided ask still gets a durable row");
         assert_eq!(ask3.status, kaijutsu_types::AskStatus::Allowed);
+    }
+
+    fn planned_shell_spec(source: &str) -> GateSpec {
+        crate::kj::shell_gate::build_shell_gate_spec(source).expect("test source plans")
+    }
+
+    /// `--family`: the next ask of the same family auto-allows whatever
+    /// its arguments — the note text differs, so the label differs, and no
+    /// `LabelMismatch` fires (guarantee 4 does not apply to a family). The
+    /// same family with a redirect stays uncovered (the structural veto).
+    ///
+    /// Falsified by dropping the family layer from `gate_policy::evaluate`
+    /// (the second note comes back `Pending`).
+    #[tokio::test]
+    async fn remembering_a_family_allows_the_next_ask_of_that_family_whatever_its_arguments() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let first = gate_once(&d, &c, planned_shell_spec("kj handoff note 'first'")).await;
+        assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+
+        let result = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(result.is_ok(), "allow --remember --family must succeed: {result:?}");
+        assert!(
+            result.message().contains("family rule for kj handoff note"),
+            "{}",
+            result.message()
+        );
+
+        let second = gate_once(&d, &c, planned_shell_spec("kj handoff note 'a completely different note'")).await;
+        assert_eq!(second.verdict, crate::kj::gate::GateVerdict::Allowed, "{}", second.reason);
+        assert!(
+            second.reason.contains("user family rule allows kj handoff note"),
+            "{}",
+            second.reason
+        );
+
+        // Guarantee 3 does not apply either: a free variable in the value slot.
+        let free = gate_once(&d, &c, planned_shell_spec("kj handoff note ${NOTE}")).await;
+        assert_eq!(free.verdict, crate::kj::gate::GateVerdict::Allowed, "{}", free.reason);
+
+        // The structural veto: a redirect is not `handoff note`.
+        let redirected = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > ~/.bashrc")).await;
+        assert_eq!(redirected.verdict, crate::kj::gate::GateVerdict::Pending, "{}", redirected.reason);
+
+        // Listed with its layer, and forgettable like any rule.
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        assert!(rules.is_ok(), "{rules:?}");
+        assert!(
+            rules.message().contains("user family rule") && rules.message().contains("kj handoff note"),
+            "{}",
+            rules.message()
+        );
+        let rule_id = match &rules {
+            KjResult::Ok { data: Some(v), .. } => {
+                let ids = v.as_array().unwrap();
+                assert_eq!(ids.len(), 1, "{ids:?}");
+                ids[0].as_str().unwrap().to_string()
+            }
+            other => panic!("rules must carry the rule ids: {other:?}"),
+        };
+        let forgotten = d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &c).await;
+        assert!(forgotten.is_ok(), "{forgotten:?}");
+        let after = gate_once(&d, &c, planned_shell_spec("kj handoff note 'third'")).await;
+        assert_eq!(after.verdict, crate::kj::gate::GateVerdict::Pending, "a forgotten family must not keep allowing");
+    }
+
+    /// A family DENY outranks a config allow on the same key and fires
+    /// regardless of structure.
+    #[tokio::test]
+    async fn a_remembered_family_deny_refuses_the_next_ask_of_that_family() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let first = gate_once(&d, &c, planned_shell_spec("git push origin main")).await;
+        let request_id = first.ask.expect("row").request_id;
+        let result = d
+            .dispatch(
+                &[s("ledger"), s("deny"), s(&request_id), s("--remember"), s("always"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let config = Ok(crate::kj::gate_policy::GateConfig::parse("[global]\nallow = [\"git push\"]\n").unwrap());
+        let next = run_gate(
+            &d.kernel_db.clone(),
+            &c,
+            planned_shell_spec("git push other branch > /tmp/log"),
+            d.kernel.ledger_flows(),
+            &config,
+        )
+        .await;
+        assert_eq!(next.verdict, crate::kj::gate::GateVerdict::Denied, "{}", next.reason);
+        assert!(next.reason.contains("user family rule denies git push"), "{}", next.reason);
+    }
+
+    /// A family is refused on structure, naming the condition, while the
+    /// decision on the ask itself stands.
+    #[tokio::test]
+    async fn a_family_is_refused_when_the_ask_s_program_has_a_redirect_and_the_decision_stands() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let first = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
+        let request_id = first.ask.expect("row").request_id;
+        let result = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(result.is_ok(), "the decision itself succeeds: {result:?}");
+        assert!(
+            result.message().contains("NOT remembered") && result.message().contains("has a redirect"),
+            "{}",
+            result.message()
+        );
+        let redeemed = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
+        assert!(redeemed.allowed(), "the answered ask is still redeemed once: {}", redeemed.reason);
+        let again = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
+        assert_eq!(again.verdict, crate::kj::gate::GateVerdict::Pending, "no rule was learned");
+    }
+
+    #[tokio::test]
+    async fn family_needs_remember() {
+        let d = test_dispatcher().await;
+        let result = d.dispatch(&[s("ledger"), s("allow"), s("01a0-x"), s("--family")], &test_caller()).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("--remember"), "{}", result.message());
+    }
+
+    /// The composed view names the gate.toml tiers in force for the caller
+    /// beneath the learned rules.
+    #[tokio::test]
+    async fn ledger_rules_lists_the_config_tiers_for_the_calling_context() {
+        // The rc-shaped dispatcher mounts /config/kernel with the seeded
+        // gate.toml; the plain one has no config tree at all.
+        let d = crate::kj::test_helpers::test_dispatcher_rc().await;
+        let result = d.dispatch(&[s("ledger"), s("rules")], &test_caller()).await;
+        assert!(result.is_ok(), "{result:?}");
+        let text = result.message();
+        assert!(text.contains("no active rules"), "{text}");
+        assert!(text.contains("kj handoff note") && text.contains("global config"), "{text}");
     }
 
     /// A `kj cc send`-shaped ask has a free `MESSAGE` variable, so

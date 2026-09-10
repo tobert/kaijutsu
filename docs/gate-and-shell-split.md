@@ -1660,18 +1660,22 @@ mixed call is scored in full.
 **The kernel enforces it, by construction.** A gated answer path is not an
 answer path: if the asking hook could see `kj ledger allow <id>`, answering
 an ask would require answering another. So the exemption is no longer only
-S50's policy. `Broker::evaluate_phase_with_mode` skips PreCall entirely —
-every hook, asking, denying or scoring — for a `shell`/`shell_write`
-program in which every command of every statement passes
-`kj::readonly::is_gate_exempt_kj`: read-only `kj` by the static table, or
-`kj ledger` with any subcommand, under the same six structural conditions
-(exactly `kj`, no redirect, no background, no heredoc, plain arguments, a
-resolvable verb). A substitution is planned as its own command and fails
-the program rule; an empty or unparseable program is not exempt. The dry
-run reports `WouldProceed` with no hook id for the same programs. S50's jq
-predicate is now a second statement of the same rule and can go when that
-hook is next edited; `contrib/lfm2d-ladder-check.kai`'s copy stays for the
-reason below. Safe only while a seat cannot answer its own ask.
+S50's policy. `Broker::evaluate_phase_with_mode` consults the gate policy
+evaluator (`kj/gate_policy.rs`, `docs/gate-policy-tuning.md`) before any
+hook and skips PreCall entirely — every hook, asking, denying or scoring —
+for a `shell`/`shell_write` program the evaluator allows outright: every
+command of every statement a `kj` verb declaring `Effect::Read`, any
+`kj ledger` subcommand, a `kj … --help` invocation, or an allow-tier key in
+`gate.toml`, under the six structural conditions (exactly `kj` for the kj
+rules, no redirect, no background, no heredoc, plain arguments, a
+resolvable verb). A deny-tier statement is refused there instead. A
+substitution is planned as its own command and fails the program rule; an
+empty or unparseable program is not exempt. The dry run reports
+`WouldProceed` with no hook id for the same programs. S50's jq predicate is
+a second statement of the same rule; it goes in the tuning doc's slice 5,
+only after the hook's tier rules cover mixed programs, and
+`contrib/lfm2d-ladder-check.kai`'s copy stays for the reason below. Safe
+only while a seat cannot answer its own ask.
 
 `contrib/lfm2d-ladder-check.kai` holds a **copy** of that predicate, on
 purpose: staying free of kernel, config and network is what lets the lfm2d

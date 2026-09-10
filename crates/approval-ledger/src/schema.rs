@@ -672,6 +672,59 @@ BEGIN
     UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
 END;
 
+-- ── Family rules ──────────────────────────────────────────────────────
+-- A human's "always allow kj handoff note": a rule keyed on a command
+-- family, never on a statement's text. `family_key` is the gate policy's
+-- key space — "kj <verb> [<subcommand>]" in canonical names, or
+-- "<command> [<first argument>]" — normalized by the kernel, which owns
+-- the verb tables; this crate stores and matches the string.
+--
+-- Guarantees 3 and 4 do not apply here, and the reason is the key: a
+-- family key never reads arguments, so there is no variable value the
+-- answerer did not see (guarantee 3) and no authorized text to mismatch
+-- (guarantee 4) — generalizing past the arguments is what the answerer
+-- asked for. What keeps that safe is structural and lives in the kernel:
+-- a family allow is learned only from, and matches only, a command with
+-- no redirect, no background flag, no heredoc and plain arguments
+-- (`docs/gate-policy-tuning.md`, "Learned family rules").
+--
+-- No CHECK on `scope`: an enum column's CHECK has to be dropped by a
+-- table rebuild when the enum grows (`drop_legacy_value_enum_checks`
+-- below), so new enum-shaped columns leave it to Rust.
+CREATE TABLE IF NOT EXISTS approval_rule_families (
+    rule_id      TEXT    NOT NULL PRIMARY KEY,
+    family_key   TEXT    NOT NULL,
+    allow        INTEGER NOT NULL CHECK (allow IN (0, 1)),
+    scope        TEXT    NOT NULL,
+    context_id   BLOB,
+    principal_id BLOB,
+    created_at   INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by   BLOB,
+    learned_from TEXT    REFERENCES approvals(request_id),
+    revoked_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_approval_rule_families_active
+    ON approval_rule_families(family_key) WHERE revoked_at IS NULL;
+
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_family_insert
+AFTER INSERT ON approval_rule_families
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_family_update
+AFTER UPDATE ON approval_rule_families
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_family_delete
+AFTER DELETE ON approval_rule_families
+BEGIN
+    UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+END;
+
 -- An advisory signal attached to an ALREADY-EXISTING ask (`ask::add_signal`
 -- — a hook body logging a second scored clause onto the ask its first
 -- `--auto-allow` call created) is a durable change on its own: a live

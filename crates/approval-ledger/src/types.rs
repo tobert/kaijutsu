@@ -627,6 +627,22 @@ pub struct RuleRow {
     pub revoked_at: Option<i64>,
 }
 
+/// One `approval_rule_families` row: a rule keyed on a command family
+/// (`family_key`, the gate policy's key space), never on statement text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilyRuleRow {
+    pub rule_id: String,
+    pub family_key: String,
+    pub allow: bool,
+    pub scope: RuleScope,
+    pub context_id: Option<Vec<u8>>,
+    pub principal_id: Option<Vec<u8>>,
+    pub created_at: i64,
+    pub created_by: Option<Vec<u8>>,
+    pub learned_from: Option<String>,
+    pub revoked_at: Option<i64>,
+}
+
 /// One statement's coverage result within `rules::redeem` — guarantee 4
 /// preserved at per-statement granularity: `Uncovered` (no rule at all —
 /// clean cache miss) is never conflated with a rule that exists but

@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::ask::get_approval;
 use crate::error::{LedgerError, Result};
 use crate::time::now_millis;
-use crate::types::{AskCoverage, RuleRow, RuleScope, StatementVerdict, parse_enum};
+use crate::types::{AskCoverage, FamilyRuleRow, RuleRow, RuleScope, StatementVerdict, parse_enum};
 
 /// Generalize one statement of a decided approval (`request_id`,
 /// `stmt_seq` into `approval_ask_statements`) into a standing rule.
@@ -200,8 +200,9 @@ fn redeem_one(
     }
 }
 
-/// Revoke a rule. Idempotent: revoking an already-revoked rule is a no-op
-/// success, not an error — only a nonexistent `rule_id` is
+/// Revoke a rule of either kind (digest or family) by `rule_id`.
+/// Idempotent: revoking an already-revoked rule is a no-op success, not
+/// an error — only a `rule_id` neither table knows is
 /// [`LedgerError::RuleNotFound`].
 pub fn revoke(conn: &Connection, rule_id: &str) -> Result<()> {
     let now = now_millis();
@@ -212,10 +213,172 @@ pub fn revoke(conn: &Connection, rule_id: &str) -> Result<()> {
     if rows > 0 {
         return Ok(());
     }
-    match get_rule(conn, rule_id)? {
-        Some(_) => Ok(()), // already revoked
-        None => Err(LedgerError::RuleNotFound(rule_id.to_string())),
+    let rows = conn.execute(
+        "UPDATE approval_rule_families SET revoked_at = ?1 WHERE rule_id = ?2 AND revoked_at IS NULL",
+        params![now, rule_id],
+    )?;
+    if rows > 0 {
+        return Ok(());
     }
+    if get_rule(conn, rule_id)?.is_some() || get_family_rule(conn, rule_id)?.is_some() {
+        return Ok(()); // already revoked
+    }
+    Err(LedgerError::RuleNotFound(rule_id.to_string()))
+}
+
+// ── Family rules ────────────────────────────────────────────────────────
+
+/// Mint one family rule per key from a decided approval. The single write
+/// site for `approval_rule_families`. Fails with
+/// [`LedgerError::NotFound`] for an unknown `request_id` and
+/// [`LedgerError::NoFamilyKey`] when `family_keys` is empty; guarantees 3
+/// and 4 do not apply (schema comment on the table). The structural
+/// conditions a family allow rests on are the kernel's to check before
+/// calling, since only it can plan the ask's source.
+///
+/// Learning spends the answer it was learned from, exactly as
+/// [`learn_from_approval`] does and for the same reason: a forgotten rule
+/// must not leave a stale answer for the next identical call to find.
+pub fn learn_family_from_approval(
+    conn: &Connection,
+    request_id: &str,
+    family_keys: &[&str],
+    scope: RuleScope,
+    allow: bool,
+    created_by: Option<&[u8]>,
+) -> Result<Vec<FamilyRuleRow>> {
+    let approval = get_approval(conn, request_id)?.ok_or_else(|| LedgerError::NotFound(request_id.to_string()))?;
+    let mut keys: Vec<&str> = Vec::with_capacity(family_keys.len());
+    for key in family_keys {
+        if !key.trim().is_empty() && !keys.contains(key) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Err(LedgerError::NoFamilyKey(request_id.to_string()));
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO approval_redemptions (request_id) VALUES (?1)",
+        params![request_id],
+    )?;
+
+    let now = now_millis();
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let rule_id = uuid::Uuid::now_v7().to_string();
+        conn.execute(
+            "INSERT INTO approval_rule_families (
+                rule_id, family_key, allow, scope, context_id, principal_id,
+                created_at, created_by, learned_from
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                rule_id,
+                key,
+                allow as i64,
+                scope.as_str(),
+                approval.context_id,
+                approval.principal_id,
+                now,
+                created_by,
+                request_id,
+            ],
+        )?;
+        out.push(get_family_rule(conn, &rule_id)?.ok_or_else(|| LedgerError::RuleNotFound(rule_id.clone()))?);
+    }
+    Ok(out)
+}
+
+/// The active family rule in scope for each key, same order as
+/// `family_keys`: a deny outranks an allow on the same key, the newest
+/// wins otherwise, and `None` is an uncovered key. A family match reads
+/// no label, so there is no [`LedgerError::LabelMismatch`] here.
+pub fn family_coverage(
+    conn: &Connection,
+    family_keys: &[&str],
+    context_id: Option<&[u8]>,
+    principal_id: Option<&[u8]>,
+) -> Result<Vec<Option<FamilyRuleRow>>> {
+    let mut stmt = conn.prepare(
+        "SELECT rule_id, family_key, allow, scope, context_id, principal_id,
+                created_at, created_by, learned_from, revoked_at
+         FROM approval_rule_families
+         WHERE family_key = ?1 AND revoked_at IS NULL
+           AND (scope = 'always' OR (scope = 'session' AND context_id = ?2 AND principal_id = ?3))
+         ORDER BY allow ASC, created_at DESC",
+    )?;
+    let mut out = Vec::with_capacity(family_keys.len());
+    for key in family_keys {
+        let first: Option<FamilyRuleRow> = stmt
+            .query_map(params![key, context_id, principal_id], row_to_family_rule)?
+            .next()
+            .transpose()?;
+        out.push(first);
+    }
+    Ok(out)
+}
+
+pub fn get_family_rule(conn: &Connection, rule_id: &str) -> Result<Option<FamilyRuleRow>> {
+    conn.query_row(
+        "SELECT rule_id, family_key, allow, scope, context_id, principal_id,
+                created_at, created_by, learned_from, revoked_at
+         FROM approval_rule_families WHERE rule_id = ?1",
+        params![rule_id],
+        row_to_family_rule,
+    )
+    .optional()
+    .map_err(LedgerError::from)
+}
+
+/// Every active family rule matching `filter`, newest first, plus the
+/// count before `LIMIT` — the family half of `kj ledger rules`.
+pub fn list_family_rules_filtered(conn: &Connection, filter: &RuleListFilter) -> Result<(Vec<FamilyRuleRow>, i64)> {
+    use rusqlite::types::Value;
+
+    let mut where_sql = vec!["revoked_at IS NULL".to_string()];
+    let mut params: Vec<Value> = Vec::new();
+    if let Some(since_ms) = filter.since_ms {
+        where_sql.push("created_at >= ?".to_string());
+        params.push(Value::Integer(since_ms));
+    }
+    let where_clause = format!("WHERE {}", where_sql.join(" AND "));
+
+    let count_sql = format!("SELECT COUNT(*) FROM approval_rule_families {where_clause}");
+    let total: i64 =
+        conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
+
+    let select_sql = format!(
+        "SELECT rule_id, family_key, allow, scope, context_id, principal_id,
+                created_at, created_by, learned_from, revoked_at
+         FROM approval_rule_families {where_clause} ORDER BY created_at DESC LIMIT ?"
+    );
+    let mut select_params = params;
+    select_params.push(Value::Integer(filter.limit));
+    let mut stmt = conn.prepare(&select_sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(select_params.into_iter()), row_to_family_rule)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, total))
+}
+
+fn row_to_family_rule(row: &rusqlite::Row) -> rusqlite::Result<FamilyRuleRow> {
+    let allow: i64 = row.get(2)?;
+    let scope_raw: String = row.get(3)?;
+    Ok(FamilyRuleRow {
+        rule_id: row.get(0)?,
+        family_key: row.get(1)?,
+        allow: allow != 0,
+        scope: parse_enum::<RuleScope>("scope", &scope_raw).map_err(|e| match e {
+            LedgerError::Db(inner) => inner,
+            other => rusqlite::Error::InvalidColumnType(3, other.to_string(), rusqlite::types::Type::Text),
+        })?,
+        context_id: row.get(4)?,
+        principal_id: row.get(5)?,
+        created_at: row.get(6)?,
+        created_by: row.get(7)?,
+        learned_from: row.get(8)?,
+        revoked_at: row.get(9)?,
+    })
 }
 
 pub fn get_rule(conn: &Connection, rule_id: &str) -> Result<Option<RuleRow>> {
