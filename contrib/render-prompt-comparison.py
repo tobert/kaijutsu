@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the prompt review from seed literals and Markdown drafts; never run rc."""
+"""Compare a pinned prompt baseline with shipped seed literals; never run rc."""
 
 from pathlib import Path
 import argparse
@@ -39,51 +39,62 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Fail if the saved HTML differs from a fresh render; write nothing")
     args = parser.parse_args()
-    base_path = "assets/defaults/system.md"
+    baseline_path = "contrib/prompt-comparison-before.json"
+    baseline = json.loads(read(baseline_path))
+    base_path = "assets/defaults/rc/lib/create/S00-base.md"
     coder_path = "assets/defaults/rc/coder/create/S00-stance.kai"
+    general_path = "assets/defaults/rc/default/create/S00-stance.md"
     distill_path = "assets/defaults/prompts/distillation.md"
-    base = read(base_path).strip()
+    continuation_path = "assets/defaults/prompts/continuation.md"
+    shared_links = ["assets/defaults/rc/coder/create/S00-base.md",
+                    "assets/defaults/rc/default/create/S00-base.md"]
+    for link in shared_links:
+        if read(link).strip() != "/config/rc/lib/create/S00-base.md":
+            raise ValueError(f"Shared prompt selection changed in {link}; update the comparison")
     script = read(coder_path)
-    core = one(r'^core="(.*?)"$', script)
-    suffixes = re.findall(r'^    stance="\$core(.*?)"$', script, re.S | re.M)
-    if len(suffixes) != 2 or any("$" in s or "\\" in s for s in [core, *suffixes]):
-        raise ValueError("Coder string shape changed; update extraction before rendering")
-    focused, guided = [core + suffix for suffix in suffixes]
-    distill = read(distill_path).strip()
-    drafts = dict(re.findall(r'^## ([^\n]+)\n.*?^```text\n(.*?)\n```',
-                             read("docs/prompt-proposals.md"), re.S | re.M))
+    core_matches = re.findall(r'^core="(.*?)"$', script, re.S | re.M)
+    if core_matches:
+        core = one(r'^core="(.*?)"$', script)
+        suffixes = re.findall(r'^    stance="\$core(.*?)"$', script, re.S | re.M)
+        if len(suffixes) != 2 or any("$" in part or "\\" in part for part in [core, *suffixes]):
+            raise ValueError("Coder string shape changed; update extraction before rendering")
+        focused, guided = [core + suffix for suffix in suffixes]
+    else:
+        stances = re.findall(r'^    stance="(.*?)"$', script, re.S | re.M)
+        if len(stances) != 2 or any("$" in part or "\\" in part for part in stances):
+            raise ValueError("Coder string shape changed; update extraction before rendering")
+        focused, guided = stances
+    shipped = dict(base=read(base_path).strip(), focused=focused, guided=guided,
+                   general=read(general_path).strip(), drift=read(distill_path).strip(),
+                   handoff=read(continuation_path).strip())
     titles = ["Base", "Coder focused", "Coder guided", "General purpose", "Drift briefing", "Compact fork handoff"]
-    if set(drafts) != set(titles):
-        raise ValueError(f"Draft sections changed: {list(drafts)}")
-    default_dir = ROOT / "assets/defaults/rc/default/create"
-    if any("stance" in p.name for p in default_dir.iterdir()):
-        raise ValueError("Default now has a stance; review its current body")
     specs = [
-        ("base", base, base_path, "Shared by all context types.",
-         "Adds intent continuity and grounded reports to our shared stance. Review the cost to every type, including musician and MCP.", "direction-for-base-coder-and-general-purpose-contexts"),
-        ("focused", focused, coder_path, "Current focused branch: shared core + focused suffix.",
-         "Moves common behavior into the base, makes TDD explicit, and removes the promise that a context fork makes file edits risk-free.", "what-its-behavioral-prompt-has-learnedand-where-it-conflicts"),
-        ("guided", guided, coder_path, "Current guided branch: shared core + guided suffix.",
-         "Retains a numbered coding procedure. Both variants are drafts to compare; model-name branching has not been validated by this review.", "direction-for-base-coder-and-general-purpose-contexts"),
-        ("general", "", "assets/defaults/rc/default/create", "No dedicated stance in default today; the shared base still applies.",
-         "Tries general work under default. The existing assistant is fleet coordination. Compare against base alone before deciding this role earns its text.", "goose"),
-        ("drift", distill, distill_path, "Current shared distillation instruction; also used by compact forks.",
-         "Keeps a brief for a recipient, with evidence and uncertainty. Missing block references must be supplied by the formatter, not invented by the model.", "deepseek-harness-prompt-contribution-and-cache-aware-summaries"),
-        ("handoff", distill, distill_path, "Compact fork currently reuses this drift briefing instruction.",
-         "Proposes a separate continuation prompt: active objective, corrections, evidence, pending questions, and recovery references. Requires later runtime wiring and retention tests.", "compaction-retained-history-and-recoverable-content"),
+        ("base", base_path, "Before: automatic for every type. After: an optional shared rc file.",
+         "Coder and default choose the shared body through rc symlinks. Other types use their own instructions without a kernel-wide behavioral prepend.", "direction-for-base-coder-and-general-purpose-contexts"),
+        ("focused", coder_path, "The focused branch of the shipped coder script.",
+         "Makes TDD explicit and removes the promise that a context fork makes file edits risk-free. Existing model-tier selection is retained; it is not a measured capability ranking.", "what-its-behavioral-prompt-has-learnedand-where-it-conflicts"),
+        ("guided", coder_path, "The guided branch of the shipped coder script.",
+         "Keeps a numbered coding procedure with evidence and verification. It shares the same optional working contract as the focused branch.", "direction-for-base-coder-and-general-purpose-contexts"),
+        ("general", general_path, "Before: default had no dedicated role text. After: general-purpose guidance.",
+         "Default handles research, explanation, writing, planning, and practical tasks. Assistant remains fleet coordination.", "goose"),
+        ("drift", distill_path, "Briefing for another context, with rc-configurable word guidance.",
+         "The formatter now supplies source and tool references, honors exclusions, and bounds complete turn groups instead of cutting block tails.", "deepseek-harness-prompt-contribution-and-cache-aware-summaries"),
+        ("handoff", continuation_path, "A separate continuation instruction for compact forks.",
+         "Compact forks retain chosen instruction blocks and the latest complete turn. This handoff preserves active work, corrections, evidence status, and recovery references.", "compaction-retained-history-and-recoverable-content"),
     ]
     records = []
-    for title, (key, current, source, note, why, anchor) in zip(titles, specs):
-        proposed = drafts[title]
+    for title, (key, source, note, why, anchor) in zip(titles, specs):
+        current, proposed = baseline["texts"][key], shipped[key]
         combinable = key in {"focused", "guided", "general"}
-        combined_old = "\n\n".join(x for x in [base, current] if x) if combinable else current
-        combined_new = "\n\n".join([drafts["Base"], proposed]) if combinable else proposed
+        combined_old = "\n\n".join(x for x in [baseline["texts"]["base"], current] if x) if combinable else current
+        combined_new = "\n\n".join([shipped["base"], proposed]) if combinable else proposed
+        old_source = f'https://github.com/tobert/kaijutsu/blob/{baseline["revision"]}/{baseline["paths"][key]}'
         records.append(dict(id=key, title=title, current=current, proposed=proposed,
-                            source="../" + source, note=note, why=why, anchor=anchor,
+                            source=old_source, newSource="../" + source, note=note, why=why, anchor=anchor,
                             combinable=combinable, combinedOld=combined_old, combinedNew=combined_new,
                             diff=diff(current, proposed), combinedDiff=diff(combined_old, combined_new)))
-    inputs = [base_path, coder_path, distill_path, "docs/prompt-proposals.md",
-              "contrib/prompt-comparison.html", "contrib/render-prompt-comparison.py"]
+    inputs = [baseline_path, base_path, coder_path, general_path, distill_path, continuation_path,
+              *shared_links, "contrib/prompt-comparison.html", "contrib/render-prompt-comparison.py"]
     sources = {p: hashlib.sha256(read(p).encode()).hexdigest() for p in inputs}
     payload = json.dumps(dict(records=records, sources=sources), ensure_ascii=False).replace("<", "\\u003c")
     template = (ROOT / "contrib/prompt-comparison.html").read_text()

@@ -6,37 +6,13 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Distillation loses uncited block tails before summarization (2026-09-10)
+## Context `--system-prompt` settings are inert (2026-09-10)
 
-`build_distillation_prompt` (`crates/kaijutsu-kernel/src/drift.rs`) keeps only
-the first 2,000 bytes of each nonempty block. It reports the original size
-but includes no block identifier for retrieval. `kj fork --compact` uses
-that transcript and a briefing prompt under 500 words, then seeds a child
-without a selected verbatim recent-message tail. A decision or error beyond
-the cut cannot be recovered by better summary instructions alone.
-
-Separate drift briefing from task continuation requirements. Start with a
-fixture whose latest correction occurs after byte 2,000, then test pending
-questions, recent tool results, and repeated compact forks. Assess bounded
-selection with source references and retained recent material; audit exclusion
-handling along the selection path too. Source comparison and proposed
-experiments: `docs/oss-comparisons.md`. No runtime change in the dossier pass.
-
-## Compact forks do not restore the shipped coder stance (2026-09-10)
-
-`fork_compact` seeds a new document and invokes only the `fork` rc verb.
-`run_rc_lifecycle_inner` loads precisely that verb's directory; it does not
-also run `create`. The shipped coder fork entries resolve to cache and date
-scripts, neither of which emits the coder stance from `create/S00-stance.kai`.
-Running the fork hook therefore does not establish stance restoration.
-This is a source-level finding for the shipped seed, not a live-host check;
-custom rc may differ.
-
-Add a failing compact-fork test that inspects the child's assembled system
-prompt, then restore the appropriate stance and tool guidance without copying
-stale dynamic context. Coordinate with the distillation work above. Evidence
-and the reviewer disagreement that led here: `docs/kaibo-prompt-proposal.md`,
-"Examples from the arriving reviews".
+`ContextRow.system_prompt` is still stored by `kj context --system-prompt`,
+`kj preset`, and one fork copy path. LLM assembly and `kj context prompt` now
+use only accepted `Role::System`/`BlockKind::Text` sections plus runtime facts,
+so the stored value never reaches a model. Decide and implement removal or an
+explicit migration; do not leave a second apparent prompt owner.
 
 ## Found during the 2026-09-08 sweep (lead-verified)
 

@@ -35,6 +35,10 @@ can point `/config/rc` anywhere), mounted at `/config/rc` through
 every lifecycle run and records what it ran in the approval ledger's
 content-addressed store. Git is optional and unmanaged by us.
 
+Shared prompt text is an ordinary rc file chosen through relative symlinks.
+Coder and default opt in; other context types keep their own instructions.
+See `docs/prompts.md` for composition and when edited text reaches a context.
+
 ## The four decisions
 
 1. **Location: `~/.config/kaijutsu/config/rc/`** (`~/.config/kaijutsu/etc/rc/`

@@ -31,35 +31,37 @@ footer{margin-top:30px;color:var(--muted);font-size:13px}[hidden]{display:none!i
 </head>
 <body>
 <main>
-<div class="topline"><div class="eyebrow">会術 · Working draft · 2026-09-10</div><button id="theme" type="button" aria-pressed="true">Dark mode</button></div>
+<div class="topline"><div class="eyebrow">会術 · Prompt changes · 2026-09-10</div><button id="theme" type="button" aria-pressed="true">Dark mode</button></div>
 <h1>What we tell the next model.</h1>
-<p class="intro">Existing Kaijutsu prompt bodies beside proposed revisions. Read a single layer or combine base + role to see the full wording cost. These drafts are for discussion; the shipped prompts have not been changed.</p>
-<p class="small"><a href="prompt-proposals.md">Edit the drafts</a> · <a href="oss-comparisons.md">Read the source dossier</a> · All text and comparison data are included in this file.</p>
-<p class="small"><a href="prompt-review-results.md">Review findings</a> · <a href="kaibo-prompt-proposal.md">Kaibo prompt proposal</a>. Review recommendations are recorded separately; these prompt bodies remain drafts.</p>
+<p class="intro">The previous Kaijutsu prompts beside the new shipped defaults. Read one section or combine shared base + role to compare the complete wording. These are repository seeds; the live kernel changes only after deployment and the appropriate rc lifecycle.</p>
+<p class="small"><a href="prompts.md">Prompt configuration</a> · <a href="oss-comparisons.md">Read the source dossier</a> · All text and comparison data are included in this file.</p>
+<p class="small"><a href="oss-comparisons.md#prompt-review-lessons">Review findings</a> · <a href="kaibo-prompt-proposal.md">Kaibo prompt proposal</a>. Prompt text comes from the shipped seed files.</p>
+<p class="small">Each context type opts into shared prose with rc symlinks. Coder and default include the shared base; other types keep their own contracts. <a href="prompts.md">Configuration and migration</a>.</p>
 <nav id="choices" aria-label="Prompt to compare"></nav>
 <div class="controls">
 <label id="combine-label"><input type="checkbox" id="combine">Include shared base</label>
 <label><input type="checkbox" id="highlight">Highlight wording changes</label>
-<span class="legend" id="legend" hidden><mark class="removed">Existing wording</mark> / <mark class="added">Proposed wording</mark></span>
+<span class="legend" id="legend" hidden><mark class="removed">Before wording</mark> / <mark class="added">After wording</mark></span>
 </div>
 <section class="reason" aria-live="polite"><h2 id="title"></h2><p id="note" class="small"></p><p id="why"></p><a id="evidence">Evidence and tradeoffs in the dossier</a></section>
 <div class="grid">
-<section class="panel"><header><h2>Existing <span class="badge">Seed snapshot</span></h2><div class="count" id="old-count"></div></header><div class="body"><pre id="old"></pre></div><div class="actions"><button id="download-old">Download this text</button> <a id="source" class="small">Seed source</a></div></section>
-<section class="panel proposed"><header><h2>Proposed <span class="badge">Not deployed</span></h2><div class="count" id="new-count"></div></header><div class="body"><pre id="new"></pre></div><div class="actions"><button id="download-new">Download this text</button></div></section>
+<section class="panel"><header><h2>Before <span class="badge">14589559</span></h2><div class="count" id="old-count"></div></header><div class="body"><pre id="old"></pre></div><div class="actions"><button id="download-old">Download this text</button> <a id="source" class="small">Seed source</a></div></section>
+<section class="panel proposed"><header><h2>After <span class="badge">Repository seeds</span></h2><div class="count" id="new-count"></div></header><div class="body"><pre id="new"></pre></div><div class="actions"><button id="download-new">Download this text</button> <a id="new-source" class="small">Seed source</a></div></section>
 </div>
 <details><summary>What this comparison includes</summary>
 <p>Complete text for each compared layer. Coder text expands the shared core and the selected focused or guided suffix from the seed script. The “include shared base” view joins base + role text; it is not a provider-request capture.</p>
-<p>Other rc sections, the generated kaish primer, runtime situation, tool schemas, memory/handoff notifications and conversation messages are outside this view. The existing assistant type is fleet coordination; the general-purpose proposal targets default.</p>
-<p>Drift briefing and compact-fork handoff are separate proposed instructions. Today both paths share the same distillation prompt. Better wording cannot recover content cut off by the formatter or restore omitted tool guidance.</p>
+<p>Before, the base was automatic. After, “include shared base” models a type choosing that rc file. A type without the link receives only its selected instruction sections and runtime facts.</p>
+<p>Other rc sections, the generated kaish primer, runtime situation, tool schemas, memory/handoff notifications and conversation messages are outside this view. The existing assistant type is fleet coordination; the general-purpose role targets default.</p>
+<p>Drift briefing and compact-fork handoff now have separate instructions. Both have rc-configurable word guidance and a bounded source transcript. Provider output token limits are separate from this guidance.</p>
 <p>Word and UTF-8 byte counts describe the displayed bodies. They are not model-token measurements. Wording highlights compare literal tokens and may mark moved guidance as both removed and added.</p>
-<p class="small">Input SHA-256 hashes: <code id="hashes"></code>. These identify the seeds, drafts, template, and generator used for this file. Check freshness with <code>python3 'contrib/render-prompt-comparison.py' --check</code>.</p>
+<p class="small">Input SHA-256 hashes: <code id="hashes"></code>. These identify the pinned baseline, current seeds, template, and generator used for this file. Check freshness with <code>python3 'contrib/render-prompt-comparison.py' --check</code>.</p>
 </details>
 <details><summary>Complete upstream prompt text</summary>
 <p>The dossier provides pinned links and analysis rather than copies of every prompt. Each source link opens the complete source file; templated files still require the harness's assembly inputs to produce a final prompt.</p>
 <p>Start with <a href="oss-comparisons.md#omp-prompting-and-setup">omp's template and assembly map</a>. Polytoken is a documentation-only comparison: <a href="https://docs.polytoken.dev/harness-engineering/facets/">facets</a> and <a href="https://docs.polytoken.dev/harness-engineering/templating/">templating</a>. Its published examples are not a capture of its complete shipped prompts.</p>
 </details>
 <footer>Regenerate with <code>python3 'contrib/render-prompt-comparison.py'</code>. No model calls, rc execution, or live configuration writes are involved.</footer>
-<noscript><p>Enable JavaScript to compare prompts, or read <a href="prompt-proposals.md">the Markdown drafts</a>.</p></noscript>
+<noscript><p>Enable JavaScript to compare prompts, or read <a href="prompts.md">the configuration guide and source links</a>.</p></noscript>
 </main>
 <script id="data" type="application/json">__PROMPT_DATA__</script>
 <script>
@@ -84,6 +86,7 @@ function render(){
   byId('note').textContent=active.note;
   byId('why').textContent=active.why;
   byId('source').href=active.source;
+  byId('new-source').href=active.newSource;
   byId('evidence').href='oss-comparisons.md#'+active.anchor;
   const diff=combined?active.combinedDiff:active.diff;
   for(const [index,id,value] of [[0,'old',left],[1,'new',right]]){
@@ -105,7 +108,7 @@ for(const record of data.records){
 for(const id of ['combine','highlight'])byId(id).addEventListener('change',render);
 function download(index){
   const text=texts()[index],url=URL.createObjectURL(new Blob([text+'\n'],{type:'text/plain;charset=utf-8'}));
-  const a=document.createElement('a');a.href=url;a.download=`${active.id}-${index?'proposed':'existing'}${byId('combine').checked&&active.combinable?'-with-base':''}.txt`;
+  const a=document.createElement('a');a.href=url;a.download=`${active.id}-${index?'after':'before'}${byId('combine').checked&&active.combinable?'-with-base':''}.txt`;
   a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 byId('download-old').addEventListener('click',()=>download(0));

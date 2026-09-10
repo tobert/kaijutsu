@@ -988,3 +988,40 @@ where the compiler can demand it. And the corpus, built to remove clauses
 that do not parse, had been scoring eighteen of them: synthesis had filled
 positionals and never required options. Classifying every leaf through its
 own synthesized clause found that on the first run.
+
+
+## Context types choose their prompts (September 10)
+
+We started with a source dossier: omp's assembled prompts and setup, then
+DeepSeek Harness, Codex, Crush, Goose, Hermes, Aider, Kaibo, and Polytoken's
+published documentation. The aim was to learn from their accumulated failures
+without importing their whole execution model. Complete Kaijutsu prompt bodies
+went into an offline comparison so Amy could read the old and proposed wording
+together. That comparison now reads current seeds against a pinned baseline;
+its source hashes keep regeneration stable after a commit, and its dark mode
+makes it usable alongside the rest of the working environment.
+
+The reviews made the input mechanism matter more than the word choice.
+Distillation ignored exclusions, lost every block's tail after 2000 bytes, and
+asked models to preserve identifiers the formatter had never supplied. Compact
+forks also lost the coder's stance: their fork hooks did not run its create
+script. The fixes share hydration admission, carry source and tool evidence,
+bound complete turn groups, and retain chosen instruction blocks and a recent
+native turn. Briefing and continuation now have separate host-file instructions
+and source-context length controls. A stale source version fails compaction
+explicitly; a filtered copy cannot point at a child block it omitted.
+
+Claude's review exposed a conflicting contract in the proposed universal base:
+working guidance about investigation and handoffs could interfere with a
+musician's ABC-only performance. Amy removed the universal premise: “I don't
+think kaijutsu should force any one prompt into every context type.” Shared
+prose is an ordinary rc file, selected by symlinks in coder and default. Other
+types keep their own instructions. There is no new prompt registry and no
+hidden global fallback. The shared file still ends with the encouragement Amy
+wanted to keep: 頑張（がんば）って！
+
+`docs/prompts.md` owns the implemented contract and migration. The source
+comparisons remain in `docs/oss-comparisons.md`; checked review mistakes became
+evidence-status examples in the Kaibo proposal. Temporary drafts and review
+plans were melted into those documents, with their earlier versions recoverable
+from git and the private review archive.

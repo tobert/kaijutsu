@@ -37,6 +37,12 @@ rc-rebuilds-vs-prefix-preserve tension dissolves: those are different
 feature: that's the producer's horizon-latch edit channel) vs `window`
 (byte-stable prefix for KV reuse on API chairs), chosen per fork.
 
+`kj fork --compact` chooses its own retained instruction blocks and latest
+complete turn, then adds a continuation summary. It uses the filtered copy
+mechanism but rejects `--include`, `--exclude`, `--preset`, and `--as`; see
+`docs/prompts.md`, "Compact forks". A filtered copy preserves a block parent
+or tool-call link only when its referenced block survives the selection.
+
 ## The primitive
 
 A fork-time **interval selection** over the order-key-sorted, non-deleted

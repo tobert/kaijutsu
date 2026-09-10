@@ -30,7 +30,7 @@ tool schemas, and actual messages also matter.
 | Installed CLI | `kaibo 0.4.0` | Available commands; not a claim about the running MCP build |
 | Running MCP prompt resource | Captured 2026-09-10; built-in framing reported | Exact rendered role text; server build revision not established |
 | [Explorer PR #183][pr183] | Head `078f9410ddda793213cbb730f419634f5176302b`, open when inspected | Proposed reader distinction and its wiring/tests |
-| Kaijutsu drafts | `3deb6601`; [editable text](prompt-proposals.md) | Proposed base, coder, general purpose, briefing, and continuation contracts |
+| Kaijutsu drafts | `3deb6601`; [original text](https://github.com/tobert/kaijutsu/blob/3deb6601/docs/prompt-proposals.md) | Proposed base, coder, general purpose, briefing, and continuation contracts |
 | Kaijutsu source for review examples | `04538700b801dc3471cd5c2dec07ff8b5087e4fe` | Local source checks described below; no runtime test |
 
 Kaibo already has one composition owner, `resolve_phase_preamble`: built-in
@@ -99,14 +99,15 @@ Crusoe roles; neither envelope reports warnings. Their checkout records are
 `~/exomemory/kaijutsu/prompt-review-2026-09-10/`. These are useful cases,
 not a controlled comparison of model quality or proof that a prompt caused
 an error. This section checks selected claims, not every finding in either
-review. The [review synthesis](prompt-review-results.md) records the broader
+review. The [review lessons](oss-comparisons.md#prompt-review-lessons) records the broader
 implementation recommendations and corrections checked against the raw answers.
 
 **The object under review must stay explicit.** DeepSeek finding 4 says the
 continuation draft needs the intent-versus-steering rule repeated. The
-[existing draft](prompt-proposals.md#compact-fork-handoff) already says to
+[existing draft](https://github.com/tobert/kaijutsu/blob/3deb6601/docs/prompt-proposals.md#compact-fork-handoff) already says to
 distinguish a status question from a task change and preserve explicit stops.
-Runtime wiring is missing; the proposed prose is not missing that guidance.
+At that revision, runtime wiring was missing; the proposed prose already carried
+that guidance. The implemented Kaijutsu contract is now in `docs/prompts.md`.
 Its finding 6 also compares proposed base text against the old coder seed
 when alleging duplication. The intended composition is proposed base plus
 proposed coder. Train the review to name which pair it is comparing.

@@ -10,9 +10,12 @@ embodied — never preached — in the model-facing rc stances.)
 
 ## Stance
 
-The kernel restates the cybernetic / 改善 / TDD posture in its own rc lifecycle:
-`/config/rc/coder/create/S00-stance.kai` reaches the model via the
-system-prompt slot for every context with `context_type=coder`.
+Each context type chooses its behavioral instructions through rc. Coder and
+default opt into `/config/rc/lib/create/S00-base.md` with ordinary symlinks;
+coder adds its TDD procedure in `create/S00-stance.kai`. No prompt is forced
+into every type. Rc emits durable system instruction blocks, and the kernel
+adds runtime facts. `docs/prompts.md` owns composition, summary controls, and
+the migration from the removed global `system.md`.
 
 **Config is host files. Just write the file.** All four trees — `/config/rc`,
 `/config/kernel`, `/config/client`, `/config/midi` — are ordinary host
