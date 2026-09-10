@@ -41,9 +41,9 @@ pub(crate) struct ContextConfigArgs {
     /// Working directory for the context's shell
     #[arg(long)]
     cwd: Option<String>,
-    /// Set an env var as KEY=VALUE
+    /// Set an env var as KEY=VALUE. Repeat the flag for more than one
     #[arg(long)]
-    env: Option<String>,
+    env: Vec<String>,
     /// rc-dispatch context_type (selects which /config/rc scripts run)
     #[arg(long = "type")]
     type_: Option<String>,
@@ -269,7 +269,7 @@ struct ContextConfig {
     system_prompt: Option<String>,
     consent_spec: Option<String>,
     cwd_spec: Option<String>,
-    env_spec: Option<String>,
+    env_spec: Vec<String>,
     type_spec: Option<String>,
     /// `--cast <label>` — resolved + validated against `list_casts` in
     /// [`KjDispatcher::resolve_context_config`] before any mutation.
@@ -317,10 +317,8 @@ impl KjDispatcher {
                 "invalid consent mode '{spec}' — use 'collaborative' or 'autonomous'"
             ));
         }
-        if let Some(ref env) = cfg.env_spec
-            && !env.contains('=')
-        {
-            return Err("--env requires KEY=VALUE format".to_string());
+        if let Some(env) = cfg.env_spec.iter().find(|e| !e.contains('=')) {
+            return Err(format!("--env requires KEY=VALUE format, got '{env}'"));
         }
 
         let resolved_cast = match cfg.cast_spec {
@@ -432,8 +430,8 @@ impl KjDispatcher {
                     changes.push(format!("cwd={cwd}"));
                 }
 
-                if let Some(ref env) = cfg.env_spec {
-                    // KEY=VALUE shape validated upstream.
+                for env in &cfg.env_spec {
+                    // KEY=VALUE shape validated upstream; every pair lands.
                     if let Some((key, value)) = env.split_once('=') {
                         db.set_context_env(target_id, key, value)?;
                         changes.push(format!("env {key}={value}"));
@@ -3442,6 +3440,38 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].key, "RUST_LOG");
         assert_eq!(env[0].value, "debug");
+    }
+
+    /// `--env` repeats: every KEY=VALUE given lands as a row. A single
+    /// `Option<String>` field kept only the last one and dropped the rest
+    /// without a word, which is how a seat created with
+    /// `--env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT` came up nameless.
+    #[tokio::test]
+    async fn context_set_env_repeated_keeps_every_pair() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal);
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--env"), s("FIRST=1"), s("--env"), s("SECOND=2")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "set --env twice failed: {}", result.message());
+        let db = d.kernel_db().lock();
+        let mut env: Vec<(String, String)> = db
+            .get_context_env(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|v| (v.key, v.value))
+            .collect();
+        env.sort();
+        assert_eq!(
+            env,
+            vec![("FIRST".to_string(), "1".to_string()), ("SECOND".to_string(), "2".to_string())],
+            "both --env pairs must be stored"
+        );
     }
 
     #[tokio::test]
