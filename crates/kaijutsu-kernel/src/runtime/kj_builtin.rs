@@ -4,12 +4,10 @@
 //! Each connection gets its own `KjBuiltin` instance with the shared dispatcher
 //! plus per-connection identity.
 //!
-//! ## Server-side command interception
+//! ## Synthesis command interception
 //!
 //! `kj synth` is intercepted here before forwarding to `KjDispatcher` because
-//! synthesis requires `kaijutsu-index` (ONNX embedder, HNSW index), which is
-//! only available in the server crate — not in `kaijutsu-kernel` where
-//! `KjDispatcher` lives.
+//! this builtin receives the shared semantic index and its block source.
 
 use std::sync::Arc;
 
@@ -172,33 +170,46 @@ impl KjBuiltin {
     }
 
     // ========================================================================
-    // Synthesis commands (server-side, needs kaijutsu-index)
+    // Synthesis commands
     // ========================================================================
 
     /// Dispatch `kj synth <subcommand>`.
     async fn dispatch_synth(&self, argv: &[String], caller: &KjCaller) -> ExecResult {
-        let sub = argv.first().map(|s| s.as_str()).unwrap_or("help");
-
+        let force = argv.iter().any(|arg| arg == "--force");
+        let args: Vec<&str> = argv.iter().map(String::as_str).filter(|arg| *arg != "--force").collect();
+        let sub = args.first().copied().unwrap_or("help");
+        if args.len() > 1 || (force && matches!(sub, "status" | "rebuild" | "help" | "--help" | "-h")) {
+            return ExecResult::failure(2, "usage: kj synth <context|all> [--force], or kj synth <status|rebuild|help>");
+        }
         match sub {
-            "all" => self.synth_all().await,
+            "all" => self.synth_all(force).await,
             "status" => self.synth_status(),
             "rebuild" => self.synth_rebuild().await,
             "help" | "--help" | "-h" => ExecResult::success(Self::synth_help()),
-            // Anything else: treat as a context ref
-            _ => self.synth_context(sub, caller).await,
+            _ if sub.starts_with('-') => ExecResult::failure(2, format!("unknown synth option: {sub}")),
+            _ => self.synth_context(sub, caller, force).await,
         }
     }
 
-    /// `kj synth all` — index + synthesize all active contexts.
-    async fn synth_all(&self) -> ExecResult {
-        let Some(ref idx) = self.semantic_index else {
-            return ExecResult::failure(
-                1,
-                "semantic index not configured (no embedding model — see the `embedding_config` row)".to_string(),
-            );
-        };
+    async fn refresh_synthesis(
+        &self, ctx: ContextId, index: Arc<kaijutsu_index::SemanticIndex>, force: bool,
+    ) -> Result<(bool, kaijutsu_index::synthesis::SynthesisResult), String> {
+        let source = self.block_source.clone();
+        let blocks = tokio::task::spawn_blocking(move || source.block_snapshots(ctx))
+            .await.map_err(|e| format!("block fetch task: {e}"))?
+            .map_err(|e| format!("block fetch: {e}"))?;
+        let indexed = index.index_context(ctx, &blocks).await.map_err(|e| format!("index: {e}"))?;
+        let synthesis = super::synthesis::run_synthesis_and_cache(
+            ctx, index, self.block_source.clone(), force,
+        ).await.map_err(|e| format!("synthesis: {e}"))?;
+        Ok((indexed, synthesis))
+    }
 
-        let _kernel_id = self.dispatcher.kernel_id();
+    /// Index and prepare synthesis for all active contexts, reusing unchanged results.
+    async fn synth_all(&self, force: bool) -> ExecResult {
+        let Some(ref idx) = self.semantic_index else {
+            return ExecResult::failure(1, "semantic index unavailable; check embedding_config and service startup logs");
+        };
         let contexts = {
             let db = self.dispatcher.kernel_db().lock();
             match db.list_active_contexts() {
@@ -206,92 +217,21 @@ impl KjBuiltin {
                 Err(e) => return ExecResult::failure(1, format!("failed to list contexts: {e}")),
             }
         };
-
-        if contexts.is_empty() {
-            return ExecResult::success("no active contexts".to_string());
-        }
-
-        let total = contexts.len();
-        let mut indexed = 0usize;
-        let mut synthesized = 0usize;
-        let mut skipped = 0usize;
+        if contexts.is_empty() { return ExecResult::success("no active contexts"); }
+        let mut indexed = 0;
+        let mut ready = 0;
         let mut errors = Vec::new();
-
         for row in &contexts {
-            let ctx_id = row.context_id;
-            let idx = idx.clone();
-            let block_source = self.block_source.clone();
-
-            // Index + synthesize + persist on the blocking thread — the whole
-            // pipeline stays off the async runtime (store_synthesis takes the
-            // metadata mutex, which index_context holds across ONNX embeds
-            // from sibling blocking threads).
-            // BlockStoreSource auto-hydrates from DB if the document isn't in memory.
-            // Contexts with no document at all (metadata-only) are skipped.
-            let result = tokio::task::spawn_blocking(move || {
-                let blocks = match block_source.block_snapshots(ctx_id) {
-                    Ok(b) if b.is_empty() => return Ok(None), // empty doc, nothing to synthesize
-                    Ok(b) => b,
-                    Err(e) => {
-                        // No document in DB either — usually metadata-only,
-                        // but a transient fetch failure lands here too, so
-                        // leave a trace instead of a fully silent skip.
-                        tracing::debug!(
-                            context = %ctx_id.short(),
-                            error = %e,
-                            "synth all: no block snapshots, skipping"
-                        );
-                        return Ok(None);
-                    }
-                };
-
-                let was_indexed = idx
-                    .index_context(ctx_id, &blocks)
-                    .map_err(|e| format!("index: {e}"))?;
-
-                let synth =
-                    super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
-
-                let synthesized = if let Some(synth) = synth {
-                    idx.store_synthesis(ctx_id, synth)
-                        .map_err(|e| format!("store synthesis: {e}"))?;
-                    true
-                } else {
-                    false
-                };
-
-                Ok::<Option<(bool, bool)>, String>(Some((was_indexed, synthesized)))
-            })
-            .await;
-
-            match result {
-                Ok(Ok(Some((was_indexed, did_synthesize)))) => {
-                    if was_indexed {
-                        indexed += 1;
-                    }
-                    if did_synthesize {
-                        synthesized += 1;
-                    }
-                }
-                Ok(Ok(None)) => {
-                    skipped += 1;
-                } // no document or empty
-                Ok(Err(e)) => errors.push(format!("{}: {e}", ctx_id.short())),
-                Err(e) => errors.push(format!("{}: join error: {e}", ctx_id.short())),
+            match self.refresh_synthesis(row.context_id, idx.clone(), force).await {
+                Ok((was_indexed, _)) => { indexed += usize::from(was_indexed); ready += 1; }
+                Err(e) => errors.push(format!("{}: {e}", row.context_id.short())),
             }
         }
-
-        let mut out = format!(
-            "{total} contexts: {indexed} indexed, {synthesized} synthesized, {skipped} skipped"
-        );
-        if !errors.is_empty() {
-            out.push_str(&format!(
-                "\nerrors ({}):\n  {}",
-                errors.len(),
-                errors.join("\n  ")
-            ));
+        let mut out = format!("{} contexts: {indexed} indexed, {ready} synthesis results ready", contexts.len());
+        if errors.is_empty() { ExecResult::success(out) } else {
+            out.push_str(&format!("\nerrors ({}):\n  {}", errors.len(), errors.join("\n  ")));
+            ExecResult::failure(1, out)
         }
-        ExecResult::success(out)
     }
 
     /// `kj synth rebuild` — compact the HNSW index, reclaiming slots left
@@ -301,7 +241,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (no embedding model — see the `embedding_config` row)".to_string(),
+                "semantic index not configured (check embedding_config and service startup logs)".to_string(),
             );
         };
 
@@ -319,11 +259,11 @@ impl KjBuiltin {
     }
 
     /// `kj synth <ctx_ref>` — index + synthesize a single context.
-    async fn synth_context(&self, ctx_ref: &str, caller: &KjCaller) -> ExecResult {
+    async fn synth_context(&self, ctx_ref: &str, caller: &KjCaller, force: bool) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (no embedding model — see the `embedding_config` row)".to_string(),
+                "semantic index not configured (check embedding_config and service startup logs)".to_string(),
             );
         };
 
@@ -338,58 +278,18 @@ impl KjBuiltin {
             }
         };
 
-        let idx = idx.clone();
-        let block_source = self.block_source.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            let blocks = block_source
-                .block_snapshots(ctx_id)
-                .map_err(|e| format!("block fetch: {e}"))?;
-
-            let was_indexed = idx
-                .index_context(ctx_id, &blocks)
-                .map_err(|e| format!("index: {e}"))?;
-
-            let synth = super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
-
-            if let Some(ref s) = synth {
-                idx.store_synthesis(ctx_id, s.clone())
-                    .map_err(|e| format!("store synthesis: {e}"))?;
-            }
-
-            Ok::<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>), String>((
-                was_indexed,
-                synth,
-            ))
-        })
-        .await;
-
-        match result {
-            Ok(Ok((was_indexed, synth_result))) => {
+        match self.refresh_synthesis(ctx_id, idx.clone(), force).await {
+            Ok((was_indexed, synth)) => {
                 let mut out = ctx_id.short().to_string();
-                if was_indexed {
-                    out.push_str(" (newly indexed)");
-                }
-                if let Some(synth) = synth_result {
-                    let kw: Vec<&str> = synth.keywords.iter().map(|(k, _)| k.as_str()).collect();
-                    let kw_str = if kw.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        kw.join(", ")
-                    };
-                    out.push_str(&format!("\nkeywords: {kw_str}"));
-                    if !synth.top_blocks.is_empty() {
-                        let preview = &synth.top_blocks[0].2;
-                        let end = preview.len().min(60);
-                        out.push_str(&format!("\npreview: {}...", &preview[..end]));
-                    }
-                } else {
-                    out.push_str("\nno synthesis result (empty context?)");
+                if was_indexed { out.push_str(" (newly indexed)"); }
+                let keywords: Vec<&str> = synth.keywords.iter().map(|(word, _)| word.as_str()).collect();
+                out.push_str(&format!("\nkeywords: {}", if keywords.is_empty() { "(none)".into() } else { keywords.join(", ") }));
+                if let Some((_, _, preview)) = synth.top_blocks.first() {
+                    out.push_str(&format!("\npreview: {}...", preview.chars().take(60).collect::<String>()));
                 }
                 ExecResult::success(out)
             }
-            Ok(Err(e)) => ExecResult::failure(1, format!("synthesis failed: {e}")),
-            Err(e) => ExecResult::failure(1, format!("synthesis task failed: {e}")),
+            Err(e) => ExecResult::failure(1, format!("synthesis failed: {e}")),
         }
     }
 
@@ -397,7 +297,7 @@ impl KjBuiltin {
     fn synth_status(&self) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::success(
-                "semantic index: not configured\n(no embedding model configured)".to_string(),
+                "semantic index: not configured\n(check embedding_config and service startup logs)".to_string(),
             );
         };
 
@@ -415,13 +315,13 @@ impl KjBuiltin {
 kj synth — semantic indexing + keyword synthesis
 
 Commands:
-  kj synth all          Index and synthesize all active contexts
-  kj synth <ctx>        Index and synthesize a specific context
+  kj synth all [--force] Index and synthesize all active contexts
+  kj synth <ctx> [--force] Index and synthesize a specific context
   kj synth status       Show index statistics
   kj synth rebuild      Compact the HNSW index (reclaim evicted slots)
   kj synth help         Show this help
 
-Context references: . (current), .parent, label, hex prefix
+Unchanged synthesis is reused. --force recomputes synthesis.\n\nContext references: . (current), .parent, label, hex prefix
 
 Examples:
   kj synth .            Synthesize current context
@@ -990,6 +890,13 @@ mod tests {
     /// dispatcher. Mirrors the rc-lifecycle wiring in `kj/lifecycle.rs`
     /// but without the script-execution scaffolding.
     async fn embedded_with_kj(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
+        embedded_with_index(dispatcher, ctx, None, Arc::new(crate::kj::lifecycle::NoopBlockSource)).await
+    }
+
+    async fn embedded_with_index(
+        dispatcher: Arc<KjDispatcher>, ctx: ContextId,
+        index: Option<Arc<kaijutsu_index::SemanticIndex>>, source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> EmbeddedKaish {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = dispatcher.kernel().clone();
         let _kernel_id = dispatcher.kernel_id();
@@ -1006,8 +913,8 @@ mod tests {
                     scm,
                     PrincipalId::system(),
                     sid,
-                    None,
-                    Arc::new(crate::kj::lifecycle::NoopBlockSource),
+                    index,
+                    source,
                     false,
                 ));
             };
@@ -1026,6 +933,97 @@ mod tests {
             configure_tools,
         )
         .expect("EmbeddedKaish init")
+    }
+
+    struct SynthEmbedder(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl kaijutsu_index::Embedder for SynthEmbedder {
+        fn model_name(&self) -> &str { "test" }
+        fn revision(&self) -> &str { "test-v1" }
+        fn dimensions(&self) -> usize { 3 }
+        async fn embed_batch(&self, texts: &[&str], _purpose: kaijutsu_index::EmbeddingPurpose) -> Result<Vec<Vec<f32>>, kaijutsu_index::IndexError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![vec![1.0, 0.0, 0.0]; texts.len()])
+        }
+    }
+    struct SynthSource;
+    impl kaijutsu_index::BlockSource for SynthSource {
+        fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+            let id = kaijutsu_types::BlockId::new(ctx, PrincipalId::system(), 1);
+            Ok(vec![kaijutsu_types::BlockSnapshot::text(id, None, kaijutsu_types::Role::Model,
+                "A sentence with enough content to exercise synthesis through kaish.")])
+        }
+    }
+
+    struct PartlyFailingSynthSource { failing_context: ContextId }
+    impl kaijutsu_index::BlockSource for PartlyFailingSynthSource {
+        fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+            if ctx == self.failing_context { return Err("injected block read failure".into()); }
+            SynthSource.block_snapshots(ctx)
+        }
+    }
+
+    #[tokio::test]
+    async fn synth_all_reports_partial_failure_and_keeps_successful_results() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let good = register_context(&dispatcher, Some("synth-good"), None, PrincipalId::system());
+        let bad = register_context(&dispatcher, Some("synth-bad"), None, PrincipalId::system());
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(kaijutsu_index::SemanticIndex::new(
+            kaijutsu_index::IndexConfig::new(3, 2048, dir.path()),
+            Box::new(SynthEmbedder(Arc::new(std::sync::atomic::AtomicUsize::new(0)))),
+        ).unwrap());
+        let kaish = embedded_with_index(dispatcher, good, Some(index.clone()),
+            Arc::new(PartlyFailingSynthSource { failing_context: bad })).await;
+        let result = kaish.execute_with_options("kj synth all", ExecuteOptions::default()).await.unwrap();
+        assert_eq!(result.code, 1, "{result:?}");
+        assert!(result.err.contains("injected block read failure"), "{result:?}");
+        assert!(result.err.contains(&bad.short()), "failure must identify its context: {result:?}");
+        assert!(index.synthesis_cache().get_any(good).is_some());
+        assert!(index.synthesis_cache().get_any(bad).is_none());
+    }
+
+    #[tokio::test]
+    async fn synth_force_reaches_single_and_all_context_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let ctx = register_context(&dispatcher, Some("synth-force"), None, PrincipalId::system());
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(kaijutsu_index::SemanticIndex::new(
+            kaijutsu_index::IndexConfig::new(3, 2048, dir.path()), Box::new(SynthEmbedder(calls.clone())),
+        ).unwrap());
+        let kaish = embedded_with_index(dispatcher, ctx, Some(index), Arc::new(SynthSource)).await;
+        for target in [".", "all"] {
+            let command = format!("kj synth {target}");
+            let first = kaish.execute_with_options(&command, ExecuteOptions::default()).await.unwrap();
+            assert!(first.ok(), "{first:?}");
+            let n = calls.load(Ordering::SeqCst);
+            let cached = kaish.execute_with_options(&command, ExecuteOptions::default()).await.unwrap();
+            assert!(cached.ok(), "{cached:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), n);
+            let forced = kaish.execute_with_options(&format!("{command} --force"), ExecuteOptions::default()).await.unwrap();
+            assert!(forced.ok(), "{forced:?}");
+            assert!(calls.load(Ordering::SeqCst) > n);
+        }
+    }
+
+    #[tokio::test]
+    async fn synth_help_and_argument_errors_reach_kaish() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let ctx = register_context(&dispatcher, Some("synth-help"), None, PrincipalId::system());
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+        let help = kaish.execute_with_options("kj synth --help", ExecuteOptions::default()).await.unwrap();
+        assert!(help.ok(), "{help:?}");
+        assert!(help.text_out().contains("--force recomputes synthesis"));
+        println!("{}", help.text_out());
+        for command in ["kj synth all extra", "kj synth status --force", "kj synth --unknown"] {
+            let result = kaish.execute_with_options(command, ExecuteOptions::default()).await.unwrap();
+            assert_eq!(result.code, 2, "{command}: {result:?}");
+        }
     }
 
     /// Contents of every block in `ctx`, read from the dispatcher's store —

@@ -2973,19 +2973,20 @@ pub async fn create_shared_kernel(
 
     // Initialize semantic index if embedding model is configured
     let semantic_index = if let Some(emb_config) = embedding_config {
-        let index_config = kaijutsu_index::IndexConfig::new(
-            emb_config.model_dir.clone(),
-            emb_config.dimensions,
-            emb_config.max_tokens,
-            &resolved_data_dir,
-        );
-        match kaijutsu_index::RtenEmbedder::new(
-            &emb_config.model_dir,
-            emb_config.dimensions,
-            emb_config.max_tokens,
-        ) {
+        match kaijutsu_index::Lfm2dEmbedder::connect(
+            &emb_config.endpoint,
+            std::time::Duration::from_millis(emb_config.timeout_ms),
+            emb_config.max_in_flight,
+        ).await {
             Ok(embedder) => {
-                match kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder)) {
+                use kaijutsu_index::Embedder;
+                let index_config = kaijutsu_index::IndexConfig::new(
+                    embedder.dimensions(), emb_config.max_context_bytes, &resolved_data_dir,
+                );
+                let loaded = tokio::task::spawn_blocking(move ||
+                    kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder))
+                ).await.map_err(|e| capnp::Error::failed(format!("load semantic index: {e}")))?;
+                match loaded {
                     Ok(idx) => {
                         let idx = Arc::new(idx);
                         // Spawn background watcher for re-indexing on block completion
@@ -3013,7 +3014,7 @@ pub async fn create_shared_kernel(
                         );
                         log::info!(
                             "Semantic index initialized with {}",
-                            emb_config.model_dir.display()
+                            emb_config.endpoint
                         );
                         Some(idx)
                     }
@@ -3024,7 +3025,7 @@ pub async fn create_shared_kernel(
                 }
             }
             Err(e) => {
-                log::warn!("Embedding model unavailable: {}", e);
+                log::warn!("Embedding service unavailable at {}: {}", emb_config.endpoint, e);
                 None
             }
         }
@@ -7334,14 +7335,12 @@ impl kernel::Server for KernelImpl {
             async move {
                 let search_results = match &kernel.semantic_index {
                     Some(idx) => {
-                        let idx = idx.clone();
-                        let q = query.clone();
-                        tokio::task::spawn_blocking(move || idx.search(&q, k))
-                            .await
-                            .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                        idx.search(&query, k).await
                             .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?
                     }
-                    None => vec![],
+                    None => return Err(capnp::Error::failed(
+                        "semantic index unavailable; check embedding_config and service startup logs".into(),
+                    )),
                 };
 
                 // Populate labels from drift router
@@ -13052,5 +13051,38 @@ mod rc_thread_stack_tests {
                  `kj context create` aborts the whole server (stack overflow)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod semantic_search_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_index_is_an_rpc_error_not_empty_search_results() {
+        tokio::task::LocalSet::new().run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+            db.set_embedding_config(&kaijutsu_kernel::kernel_db::EmbeddingConfigRow {
+                enabled: false, endpoint: "http://127.0.0.1:9".into(),
+                timeout_ms: 100, max_in_flight: 1, max_context_bytes: 2048,
+            }).unwrap();
+            drop(db);
+            let shared = create_shared_kernel(None,
+                &crate::config_mounts::ConfigMounts::new(dir.path().join("config")),
+                Some(dir.path()),
+            ).await.unwrap();
+            let connection = Rc::new(RefCell::new(ConnectionState::new(
+                PrincipalId::system(), shared.session_contexts.clone(),
+            )));
+            let client: kernel::Client = capnp_rpc::new_client(KernelImpl::new(shared, connection));
+            let mut request = client.search_similar_request();
+            request.get().set_query("find relevant contexts");
+            request.get().set_k(5);
+            match request.send().promise.await {
+                Ok(_) => panic!("unavailable index must not look like a successful empty search"),
+                Err(error) => assert!(error.to_string().contains("semantic index unavailable"), "{error}"),
+            }
+        }).await;
     }
 }

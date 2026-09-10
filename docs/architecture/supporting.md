@@ -44,16 +44,13 @@ silently yields `application/octet-stream`.
 
 ## `kaijutsu-index` — semantic index
 
-Fully local: embeds block text via pure-Rust ONNX inference (`rten`/`rten-tensor`
-— there is no `ort` dependency, so no `download-binaries` air-gapped-build
-hazard), stores vectors in an HNSW graph (`hnsw_rs`), maps slot↔context in
-SQLite, supports density clustering. No external API calls. `SemanticIndex`
-(`lib.rs:178`) is the entry point; `BlockSource` / `StatusReceiver` traits
-(`:73`/`:86`) are seams the server implements to avoid a dep cycle. Depends only
-on `-types`; used by `-kernel` and `-server`. Smells: the metadata lock is held
-across ONNX inference (`lib.rs:347`, serializes index calls); `SearchResult.label`
-is always `None` (`lib.rs:510`, `:544`). `rebuild()` (`:436`) is a real
-slot-stable, never-reuse rebuild now, not a stub.
+Embeds through an asynchronous `Embedder` trait, with lfm2d as the default
+adapter. Query/document purpose, normalization, and model revision are
+explicit. HNSW stores vectors; SQLite stores slot mappings, the embedding
+profile, and synthesis results. Service requests hold no storage locks.
+`BlockSource` and `StatusReceiver` let the kernel/server provide snapshots
+and completion events without a dependency cycle. See `docs/synthesis.md`
+for configuration, cache identity, failure behavior, and remaining work.
 
 ## `kaijutsu-agent-tools` — agent session detection
 

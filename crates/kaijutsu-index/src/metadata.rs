@@ -88,7 +88,23 @@ impl MetadataStore {
         )
         .map_err(|e| IndexError::Database(format!("create synthesis tables: {}", e)))?;
 
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS embedding_profile (
+            id INTEGER PRIMARY KEY CHECK (id = 1), identity TEXT NOT NULL
+        );").map_err(|e| IndexError::Database(format!("create embedding profile: {e}")))?;
         Ok(Self { conn })
+    }
+
+    pub fn embedding_profile(&self) -> Result<Option<String>, IndexError> {
+        use rusqlite::OptionalExtension;
+        self.conn.query_row("SELECT identity FROM embedding_profile WHERE id = 1", [], |row| row.get(0))
+            .optional().map_err(|e| IndexError::Database(format!("read embedding profile: {e}")))
+    }
+
+    pub fn set_embedding_profile(&self, identity: &str) -> Result<(), IndexError> {
+        self.conn.execute("INSERT INTO embedding_profile (id, identity) VALUES (1, ?1)
+            ON CONFLICT(id) DO UPDATE SET identity = excluded.identity", [identity])
+            .map_err(|e| IndexError::Database(format!("write embedding profile: {e}")))?;
+        Ok(())
     }
 
     /// Get the HNSW slot for a context.

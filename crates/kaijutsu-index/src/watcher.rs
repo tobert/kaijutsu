@@ -1,8 +1,8 @@
 //! Background task that re-indexes contexts on block status changes.
 //!
 //! Uses trait objects so kaijutsu-index has no dependency on kaijutsu-kernel.
-//! Debounces rapid events (1s window) and runs indexing on `spawn_blocking`
-//! to keep the tokio runtime free.
+//! Debounces rapid events (1s window). Storage uses blocking tasks;
+//! embedding service requests await without holding storage locks.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ pub type OnIndexed = Arc<dyn Fn(kaijutsu_types::ContextId) + Send + Sync>;
 /// Spawn a background task that re-indexes contexts when blocks complete.
 ///
 /// Receives `StatusEvent`s via the trait. On terminal status, collects a batch
-/// (1s debounce window), then indexes each context on a blocking thread.
+/// (1s debounce window), then indexes each context asynchronously.
 /// Content hash comparison naturally deduplicates across batches.
 ///
 /// If `on_indexed` is provided, it is called for each context that was
@@ -70,7 +70,7 @@ pub fn spawn_index_watcher(
                 }
             }
 
-            // Index each pending context on a blocking thread
+            // Fetch snapshots off the runtime, then await each refresh.
             for ctx_id in pending {
                 let idx = index.clone();
                 let src = blocks.clone();
@@ -78,27 +78,28 @@ pub fn spawn_index_watcher(
                     let snaps = src
                         .block_snapshots(ctx_id)
                         .map_err(crate::IndexError::Index)?;
-                    idx.index_context(ctx_id, &snaps)
+                    Ok::<_, crate::IndexError>(snaps)
                 })
                 .await
                 {
-                    Ok(Ok(true)) => {
-                        tracing::debug!(context = %ctx_id.short(), "indexed context");
-                        if let Some(ref cb) = on_indexed {
-                            cb(ctx_id);
+                    Ok(Ok(snaps)) => match idx.index_context(ctx_id, &snaps).await {
+                        Ok(true) => {
+                            tracing::debug!(context = %ctx_id.short(), "indexed context");
+                            if let Some(ref cb) = on_indexed {
+                                cb(ctx_id);
+                            }
                         }
-                    }
-                    Ok(Ok(false)) => {} // content unchanged
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            context = %ctx_id.short(),
-                            error = %e,
-                            "failed to index context"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "index watcher spawn_blocking failed");
-                    }
+                        Ok(false) => {} // content unchanged
+                        Err(e) => {
+                            tracing::warn!(
+                                context = %ctx_id.short(),
+                                error = %e,
+                                "failed to index context"
+                            );
+                        }
+                    },
+                    Ok(Err(e)) => tracing::warn!(error = %e, "index watcher block read failed"),
+                    Err(e) => tracing::warn!(error = %e, "index watcher spawn_blocking failed"),
                 }
             }
         }

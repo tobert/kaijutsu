@@ -41,7 +41,9 @@ pub fn extract_context_content(blocks: &[BlockSnapshot], max_chars: usize) -> (S
         buf.push_str(&block.content);
 
         if buf.len() >= max_chars {
-            buf.truncate(max_chars);
+            let mut end = max_chars;
+            while !buf.is_char_boundary(end) { end -= 1; }
+            buf.truncate(end);
             break;
         }
     }
@@ -59,6 +61,14 @@ pub fn extract_context_content(blocks: &[BlockSnapshot], max_chars: usize) -> (S
 mod tests {
     use super::*;
     use kaijutsu_types::{BlockId, ContentType, ContextId, PrincipalId, Status};
+
+    #[test]
+    fn extraction_budget_is_utf8_safe() {
+        let block = test_block(Role::Model, BlockKind::Text, &"日本語".repeat(30));
+        let (text, _) = extract_context_content(&[block], 17);
+        assert!(text.len() <= 17);
+        assert!(text.starts_with("[Assistant]: "));
+    }
 
     fn test_block(role: Role, kind: BlockKind, content: &str) -> BlockSnapshot {
         let ctx = ContextId::new();

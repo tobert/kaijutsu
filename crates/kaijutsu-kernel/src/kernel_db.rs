@@ -1164,17 +1164,14 @@ CREATE TABLE IF NOT EXISTS model_aliases (
 );
 CREATE INDEX IF NOT EXISTS idx_model_aliases_backend ON model_aliases(backend_id);
 
--- ── Embedding model (semantic indexing) ────────────────────────
--- The former `[embedding]` section of models.toml. Singleton, same id=1 pin.
--- Changing `model_dir` (the model's identity is its directory basename) or
--- `dimensions` invalidates the on-disk semantic index — it is wiped at the
--- next kernel start and re-populates lazily.
+-- ── Embedding service (semantic indexing) ──────────────────────
 CREATE TABLE IF NOT EXISTS embedding_config (
-    id         INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    enabled    INTEGER NOT NULL DEFAULT 1,
-    model_dir  TEXT    NOT NULL,
-    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
-    max_tokens INTEGER NOT NULL CHECK (max_tokens > 0)
+    id                INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    endpoint          TEXT NOT NULL CHECK (endpoint != ''),
+    timeout_ms        INTEGER NOT NULL CHECK (timeout_ms > 0),
+    max_in_flight     INTEGER NOT NULL CHECK (max_in_flight > 0),
+    max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
 );
 
 -- ── Roster (`crates/kaijutsu-kernel/src/roster.rs`) ─────────────────────
@@ -2001,7 +1998,9 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Additive column backfills for DBs created before a column existed.
+    /// Column backfills and guarded configuration migrations for existing DBs.
+    /// The embedding table rebuild is transactional and preserves enablement
+    /// and the projection budget while replacing obsolete model settings.
     /// The project's stance is "schema is truth, bump = wipe", but a single
     /// `ADD COLUMN ... DEFAULT 0` is cheap and spares a live kernel a wipe.
     /// Each ALTER is guarded: a "duplicate column" error on a fresh DB (the
@@ -2009,6 +2008,28 @@ impl KernelDb {
     /// — a locked file, a genuinely malformed ALTER — fails loud instead of
     /// leaving the DB silently short a column that later code assumes exists.
     fn apply_additive_migrations(conn: &Connection) -> KernelDbResult<()> {
+        let legacy_embedding: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('embedding_config') WHERE name = 'model_dir')",
+            [], |row| row.get(0),
+        )?;
+        if legacy_embedding {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("ALTER TABLE embedding_config RENAME TO embedding_config_legacy;
+                CREATE TABLE embedding_config (
+                    id INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    endpoint TEXT NOT NULL CHECK (endpoint != ''),
+                    timeout_ms INTEGER NOT NULL CHECK (timeout_ms > 0),
+                    max_in_flight INTEGER NOT NULL CHECK (max_in_flight > 0),
+                    max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
+                );")?;
+            tx.execute("INSERT INTO embedding_config
+                SELECT id, enabled, ?1, 30000, 2, max_tokens * 4 FROM embedding_config_legacy",
+                [crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT])?;
+            tx.execute_batch("DROP TABLE embedding_config_legacy;")?;
+            tx.commit()?;
+            tracing::info!("migrated builtin embedding configuration to the default lfm2d service");
+        }
         let alters = [
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
@@ -6519,9 +6540,10 @@ pub struct ModelAliasRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingConfigRow {
     pub enabled: bool,
-    pub model_dir: String,
-    pub dimensions: i64,
-    pub max_tokens: i64,
+    pub endpoint: String,
+    pub timeout_ms: i64,
+    pub max_in_flight: i64,
+    pub max_context_bytes: i64,
 }
 
 fn read_backend_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<BackendId> {
@@ -7229,49 +7251,27 @@ impl KernelDb {
 
     /// The singleton embedding row, or `None` when never seeded.
     pub fn get_embedding_config(&self) -> KernelDbResult<Option<EmbeddingConfigRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT enabled, model_dir, dimensions, max_tokens FROM embedding_config WHERE id = 1",
-        )?;
-        Ok(stmt
-            .query_row([], |row| {
-                Ok(EmbeddingConfigRow {
-                    enabled: row.get::<_, i64>(0)? != 0,
-                    model_dir: row.get(1)?,
-                    dimensions: row.get(2)?,
-                    max_tokens: row.get(3)?,
-                })
-            })
-            .optional()?)
+        Ok(self.conn.query_row(
+            "SELECT enabled, endpoint, timeout_ms, max_in_flight, max_context_bytes FROM embedding_config WHERE id = 1",
+            [], |row| Ok(EmbeddingConfigRow {
+                enabled: row.get::<_, i64>(0)? != 0, endpoint: row.get(1)?,
+                timeout_ms: row.get(2)?, max_in_flight: row.get(3)?, max_context_bytes: row.get(4)?,
+            }),
+        ).optional()?)
     }
 
-    /// Replace the singleton embedding row.
+    /// Replace the singleton embedding service configuration.
     pub fn set_embedding_config(&self, row: &EmbeddingConfigRow) -> KernelDbResult<()> {
-        if row.dimensions <= 0 || row.max_tokens <= 0 {
-            return Err(KernelDbError::Validation(format!(
-                "embedding dimensions/max_tokens must be positive \
-                 (got dimensions={}, max_tokens={})",
-                row.dimensions, row.max_tokens
-            )));
-        }
-        if row.model_dir.trim().is_empty() {
-            return Err(KernelDbError::Validation(
-                "embedding model_dir must not be empty".into(),
-            ));
+        if row.timeout_ms <= 0 || row.max_in_flight <= 0 || row.max_context_bytes <= 0 || row.endpoint.trim().is_empty() {
+            return Err(KernelDbError::Validation("embedding endpoint must be nonempty and timeout_ms/max_in_flight/max_context_bytes must be positive".into()));
         }
         self.conn.execute(
-            "INSERT INTO embedding_config (id, enabled, model_dir, dimensions, max_tokens)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                 enabled = excluded.enabled,
-                 model_dir = excluded.model_dir,
-                 dimensions = excluded.dimensions,
-                 max_tokens = excluded.max_tokens",
-            params![
-                row.enabled as i64,
-                row.model_dir,
-                row.dimensions,
-                row.max_tokens
-            ],
+            "INSERT INTO embedding_config (id, enabled, endpoint, timeout_ms, max_in_flight, max_context_bytes)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, endpoint = excluded.endpoint,
+                 timeout_ms = excluded.timeout_ms, max_in_flight = excluded.max_in_flight,
+                 max_context_bytes = excluded.max_context_bytes",
+            params![row.enabled as i64, row.endpoint, row.timeout_ms, row.max_in_flight, row.max_context_bytes],
         )?;
         Ok(())
     }
@@ -7801,6 +7801,30 @@ fn make_edge(source: ContextId, target: ContextId, kind: EdgeKind) -> ContextEdg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_embedding_config_migrates_to_service_and_preserves_disable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.conn.execute_batch("DROP TABLE embedding_config;
+                CREATE TABLE embedding_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL,
+                    model_dir TEXT NOT NULL, dimensions INTEGER NOT NULL, max_tokens INTEGER NOT NULL);
+                INSERT INTO embedding_config VALUES (1, 0, '/old/model', 384, 123);").unwrap();
+        }
+        let db = KernelDb::open(&path).unwrap();
+        let row = db.get_embedding_config().unwrap().unwrap();
+        assert!(!row.enabled);
+        assert_eq!(row.endpoint, crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT);
+        assert_eq!(row.max_context_bytes, 492);
+        assert_eq!(row.timeout_ms, 30_000);
+        let mut edited = row;
+        edited.endpoint = "unix:///tmp/lfm2d.sock".into();
+        db.set_embedding_config(&edited).unwrap();
+        drop(db);
+        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(edited));
+    }
 
     #[test]
     fn quiesce_flag_defaults_clear_and_roundtrips() {

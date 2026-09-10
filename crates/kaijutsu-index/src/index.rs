@@ -388,12 +388,11 @@ mod tests {
 
     fn test_config(dir: &std::path::Path) -> IndexConfig {
         IndexConfig {
-            model_dir: dir.to_path_buf(),
             dimensions: 4,
             data_dir: dir.to_path_buf(),
             hnsw_max_nb_connection: 8,
             hnsw_ef_construction: 50,
-            max_tokens: 512,
+            max_context_bytes: 512,
             max_contexts: None,
         }
     }

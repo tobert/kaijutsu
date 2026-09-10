@@ -85,7 +85,7 @@ the navigation aid.
 KernelDb → Kernel → mounts (RO `/`, an opaque `/dev`, RW `~/src`/`/tmp`, the
 `/config` trees, the ephemeral `/run/midi`+`/run/audio`+`/run/roster` views,
 `/v/cas`, `/r`, then freeze) → block store → config backend → LLM registry →
-optional ONNX semantic index → `KjDispatcher` → context recovery from
+optional lfm2d semantic index → `KjDispatcher` → context recovery from
 KernelDb.
 
 ---

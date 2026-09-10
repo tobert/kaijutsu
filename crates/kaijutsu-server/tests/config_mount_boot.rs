@@ -6,6 +6,8 @@
 //! fresh tree is seeded onto the host filesystem, and that `/config` lists its
 //! children with nothing serving `/config` itself.
 
+mod support;
+
 use kaijutsu_kernel::vfs::VfsOps;
 use kaijutsu_server::config_mounts::ConfigMounts;
 use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_NAMESPACE_ROOT, CONFIG_ROOT, CONFIG_TREES, MIDI_ROOT, RC_ROOT};
@@ -23,6 +25,7 @@ async fn every_config_tree_mounts_and_seeds_onto_the_host_filesystem() {
     let data = tempfile::tempdir().expect("data dir");
     let mounts = ConfigMounts::new(root.path());
 
+    support::disable_embeddings(data.path());
     let shared = kaijutsu_server::rpc::create_shared_kernel(None, &mounts, Some(data.path()))
         .await
         .expect("kernel boots against a fresh config root");
@@ -68,6 +71,7 @@ async fn the_hosts_etc_is_refused_by_the_read_only_root_like_any_host_path() {
     let data = tempfile::tempdir().expect("data dir");
     let mounts = ConfigMounts::new(root.path());
 
+    support::disable_embeddings(data.path());
     let shared = kaijutsu_server::rpc::create_shared_kernel(None, &mounts, Some(data.path()))
         .await
         .expect("kernel boots");
@@ -98,6 +102,7 @@ async fn the_config_namespace_lists_its_trees_with_no_backend_of_its_own() {
     let data = tempfile::tempdir().expect("data dir");
     let mounts = ConfigMounts::new(root.path());
 
+    support::disable_embeddings(data.path());
     let shared = kaijutsu_server::rpc::create_shared_kernel(None, &mounts, Some(data.path()))
         .await
         .expect("kernel boots");
@@ -131,6 +136,7 @@ async fn a_declared_tree_is_mounted_where_it_was_declared() {
     let mut mounts = ConfigMounts::new(root.path());
     mounts.set(RC_ROOT, elsewhere.path()).unwrap();
 
+    support::disable_embeddings(data.path());
     let shared = kaijutsu_server::rpc::create_shared_kernel(None, &mounts, Some(data.path()))
         .await
         .expect("kernel boots with a declared tree");

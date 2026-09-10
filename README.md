@@ -190,27 +190,16 @@ Pure layout/geometry helpers for the time well context browser.
 
 ### kaijutsu-index
 
-Semantic vector indexing — local ONNX embeddings, HNSW nearest-neighbor
-search, and density-based clustering. No external API calls; runs fully
-offline.
+Semantic vector indexing through the lfm2d embedding service, with local
+HNSW nearest-neighbor search, density-based clustering, and persistent
+keyword/gist synthesis. Kaijutsu owns content selection and caching; the
+service owns model loading and inference. Query/document purpose, model
+identity, and normalization are explicit in the embedding interface.
 
-**What ort does for us:** [ort](https://ort.pyke.io/) embeds ONNX Runtime
-so the kernel runs the embedding model (bge-small-en-v1.5, configured in
-the `embedding_config` table) in-process. It powers semantic search across
-contexts, constellation clustering, and the keyword/gist synthesis shown
-on well cards — all without a network call. The `download-binaries`
-feature fetches the ONNX Runtime shared library at build time.
-
-**Memory expectations:** ONNX Runtime uses an arena allocator that grows
-but **never shrinks** — whatever peak inference hits stays resident in
-the kernel until restart. Batch size is the dangerous dimension: inputs
-are padded to the batch's longest sequence, so `embed_batch` chunks to 32
-texts per session run, which caps the arena around ~1 GB during heavy
-synthesis (`kj synth all`); an unbounded batch once took it past 9 GB.
-Expect kernel RSS of roughly 1–2 GB with the index active. Inference is
-deliberately single-threaded (one session, `intra_threads(1)`) — bulk
-synthesis is CPU-bound wall-clock, not memory-bound; scaling plans live
-in `docs/issues.md`.
+See [Synthesis](docs/synthesis.md) for service configuration, startup failure
+behavior, cache identity, and the remaining incremental work. Automatic
+synthesis is disabled; `kj synth <context>` runs it on demand and reuses
+unchanged results. Add `--force` to recompute synthesis.
 
 ### kaijutsu-mcp
 
