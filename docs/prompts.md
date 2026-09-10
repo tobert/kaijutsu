@@ -54,7 +54,7 @@ kj handoff note --for banto 'what happened, what is next'
 kj context create ROOT-next --type director --cast ops \
   --env 'KJ_CHARACTER=banto' --env 'ROTATED_FROM=ROOT'
 kj context archive ROOT --confirm
-kj context rename ROOT-next ROOT
+kj context rename -c ROOT-next ROOT
 ```
 
 Two context env values drive the create lifecycle. `KJ_CHARACTER` names the
