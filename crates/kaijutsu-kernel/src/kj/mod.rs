@@ -49,6 +49,7 @@ pub mod preset;
 pub mod editor;
 pub mod effect;
 pub(crate) mod readonly;
+pub(crate) mod gate_policy;
 pub mod rc;
 pub mod lifecycle;
 pub mod roster;

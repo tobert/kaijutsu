@@ -70,8 +70,8 @@
 //! meets conditions 1–5, regardless of what [`classify`] says about it. A
 //! hook that could ask about `kj ledger allow <id>` makes answering an ask
 //! require answering another ask, so the exemption is structural rather than
-//! a hook's policy: the evaluator skips PreCall for a program made only of
-//! exempt commands ([`program_is_gate_exempt`]). It is safe only because a
+//! a hook's policy: the gate policy evaluator (`kj/gate_policy.rs`) skips
+//! PreCall for a program made only of exempt commands. It is safe only because a
 //! seat cannot answer its own ask (a context check in the ledger,
 //! `docs/gate-and-shell-split.md`, "No self-approval"); remove that
 //! invariant and this exemption goes with it.
@@ -140,24 +140,12 @@ pub(crate) fn is_gate_exempt_kj(cmd: &PlannedCommand) -> bool {
         .is_some_and(|sub| sub.get_name() == "ledger")
 }
 
-/// Whether a whole planned program is exempt from PreCall hooks: every
-/// command of every statement passes [`is_gate_exempt_kj`]. An empty
-/// program is not exempt — there is nothing to exempt, and the hooks decide
-/// what an empty submission means.
-pub(crate) fn program_is_gate_exempt(statements: &[kaish_kernel::PlannedStatement]) -> bool {
-    let mut commands = statements.iter().flat_map(|s| s.plan.commands.iter()).peekable();
-    if commands.peek().is_none() {
-        return false;
-    }
-    commands.all(is_gate_exempt_kj)
-}
-
-/// Conditions 1–5 of [`is_read_only_kj`], shared with [`is_gate_exempt_kj`]:
-/// the command is exactly `kj`, carries no redirect, background flag or
-/// heredoc, and every argument is plain text. Returns the plain arguments
-/// with the leading `kj` dropped — the argv [`classify`] parses; `None`
-/// refuses.
-fn resolved_kj_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
+/// Conditions 1–5 of [`is_read_only_kj`], shared with [`is_gate_exempt_kj`]
+/// and the gate policy evaluator's key naming: the command is exactly `kj`,
+/// carries no redirect, background flag or heredoc, and every argument is
+/// plain text. Returns the plain arguments with the leading `kj` dropped —
+/// the argv [`classify`] parses; `None` refuses.
+pub(crate) fn resolved_kj_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
     if cmd.name != "kj" {
         return None;
     }
@@ -517,29 +505,5 @@ mod tests {
         assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 > /tmp/out")));
         assert!(!is_gate_exempt_kj(&plan_one("kj ledger allow 01a0 &")));
         assert!(!is_gate_exempt_kj(&plan_one("kj block create --role user --kind text")));
-        // A substitution is planned as its own command beside the kj call,
-        // so the kj half is exempt in isolation and the program rule is what
-        // refuses the whole: the substituted command is not exempt.
-        let program =
-            kaish_kernel::ast::plan::plan_program("kj ledger allow $(cat /tmp/id)").unwrap();
-        assert!(!program_is_gate_exempt(&program));
-    }
-
-    /// A whole program is exempt only when every command of every
-    /// statement is: `kj ledger allow x; dd ...` must still be scored.
-    #[test]
-    fn a_program_is_exempt_only_when_every_command_is() {
-        let only_answers = kaish_kernel::ast::plan::plan_program(
-            "kj ledger show 01a0-abc; kj ledger allow 01a0-abc",
-        )
-        .unwrap();
-        assert!(program_is_gate_exempt(&only_answers));
-        let mixed = kaish_kernel::ast::plan::plan_program(
-            "kj ledger allow 01a0-abc; dd if=/dev/zero of=/dev/sda",
-        )
-        .unwrap();
-        assert!(!program_is_gate_exempt(&mixed));
-        let empty = kaish_kernel::ast::plan::plan_program("").unwrap();
-        assert!(!program_is_gate_exempt(&empty), "an empty program is not an exemption");
     }
 }

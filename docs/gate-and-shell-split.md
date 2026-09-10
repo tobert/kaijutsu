@@ -780,7 +780,7 @@ exists to prevent. See `shell_gate.rs`'s module docs for the full reasoning.
 **The `plan_program`/`Stmt::Empty` index-gap landmine** (`docs/issues.md`) is
 guarded structurally, not just tested: `GatedStatement::source_index` carries
 `PlannedStatement::index` (the PUBLISHED, pre-filter position) through
-untouched, and `describe_rule_coverage` (`gate.rs`) reads it off the
+untouched, and `PolicyEvaluation::describe` (`kj/gate_policy.rs`) reads it off the
 statement it belongs to rather than re-deriving a position by enumerating
 `GateSpec::statements`. Regression tests:
 `kj::shell_gate::tests::a_leading_comment_does_not_shift_which_statement_is_reported`

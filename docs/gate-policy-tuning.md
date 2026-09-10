@@ -1,6 +1,7 @@
 # Gate policy tuning — one layered list, one runtime path
 
-Status: designed 2026-09-08, unbuilt. Amy's rulings of the same day are quoted
+Status: designed 2026-09-08; slice 1 (the evaluator seam, `kj/gate_policy.rs`)
+shipped 2026-09-10, slices 2–5 unbuilt. Amy's rulings of the same day are quoted
 where they decide a shape. Reviewed against the live tree by kaibo (cast
 `crusoe`) the same day; the revision absorbs its findings. This doc is
 canonical for the gate-policy evaluator; `docs/gate-and-shell-split.md`
@@ -331,8 +332,8 @@ verb's effect:
   before the allow-tier drop exists would hand mixed programs' read clauses
   back to the classifier, which escalates them.
 - `program_is_gate_exempt`'s broker-only consult — folded into the
-  evaluator both pinch points share. The stack mismatch dies by
-  construction.
+  evaluator both pinch points share (slice 1, done). The stack mismatch
+  died by construction.
 - The duplicated `kj ledger` exemption prose in `kj/readonly.rs`'s module
   doc shrinks to a pointer.
 
@@ -341,13 +342,15 @@ verb's effect:
 Slices, each landing with tests and nothing downstream depending on an
 unreleased one:
 
-1. **Evaluator seam.** `kj/gate_policy.rs` composing today's two sources
-   (code tables, digest rules) behind one function; broker PreCall and
-   `run_gate` both consult it, with the `KjVerb`-origin boundary stated
+1. **Evaluator seam — shipped.** `kj/gate_policy.rs` composes today's two
+   sources (the verb class, digest rules) behind `evaluate`; broker PreCall
+   consults `evaluate_planned` (builtin layer only, no store) and
+   `run_gate` consults `evaluate`, with the `KjVerb`-origin boundary stated
    above. Behavior changes, both deliberate: an exempt program now
    auto-allows inside `run_gate` too (the mismatch fix, with the durable
-   row), and `auto_reason` text grows layer names. Parity tests pin
-   everything else.
+   row), and `auto_reason` reads `gate policy: builtin allows kj block
+   list` / `gate policy: user rule denies the exact statement (rule …) —
+   statement #2 (…)`. Parity tests pin everything else.
 2. **Config layer.** `assets/defaults/gate.toml` + seed + `[global]` /
    `[context_type.<type>]` + kj key validation through `classify` + the PreCall Deny branch
    (`subject = gate policy`) + the `KJ_TOOL_PLAN` tier field + **both** lfm2d
@@ -359,9 +362,10 @@ unreleased one:
    structural refusal, `--family` at answer time, `family_coverage()`
    beside `redeem()`, `kj ledger rules`/`forget` extension, both
    guarantee carve-outs documented and pinned.
-4. **Corpus `gate` field + the fold.** Authored builtin tier, the two
-   exhaustiveness assertions, the three structural leaves handled by name,
-   then `READ_ONLY_TABLE`/`READ_ONLY_NO_SUBCOMMAND` retire.
+4. **Retired by the verb class (2026-09-09).** This slice authored a corpus
+   `gate` field and retired the readonly tables; both went with
+   `kj-expectations.toml`, and the builtin tier is each verb's declared
+   `Effect` (§Builtin tier). Nothing remains to build here.
 5. **First tuning pass.** `kj handoff note` in the global allow tier closes
    `docs/issues.md`, "The lfm2d gate escalates `kj handoff note` from the
    MCP shell" — its option 1, arrived at through the general mechanism

@@ -1899,16 +1899,18 @@ impl Broker {
         payload: PhasePayload<'_>,
     ) -> McpResult<PhaseEval> {
         // The gate's answer path is ungated by construction: a shell
-        // program made only of `kj ledger` calls, or of read-only `kj`,
-        // reaches no PreCall hook at all — not the asking hook it would
-        // deadlock, and not the scorer either. The decision is
-        // `kj::readonly::program_is_gate_exempt`, on kaish's plan; a program
-        // that does not parse is not exempt and the hooks see it as before.
+        // program the gate policy allows outright — every statement a
+        // `kj ledger` call or read-only `kj` — reaches no PreCall hook at
+        // all, not the asking hook it would deadlock and not the scorer
+        // either. The decision is `kj::gate_policy::evaluate_planned`, on
+        // kaish's plan; a program that does not parse is not allowed and
+        // the hooks see it as before.
         if phase == McpHookPhase::PreCall
             && matches!(params.tool.as_str(), "shell" | "shell_write")
             && let Some(command) = params.arguments.get("command").and_then(|v| v.as_str())
             && let Ok(statements) = kaish_kernel::ast::plan::plan_program(command)
-            && crate::kj::readonly::program_is_gate_exempt(&statements)
+            && crate::kj::gate_policy::evaluate_planned(&statements).verdict()
+                == approval_ledger::types::AskVerdict::Allow
         {
             return Ok(no_hook_matched(mode));
         }

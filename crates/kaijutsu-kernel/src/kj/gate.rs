@@ -55,8 +55,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use approval_ledger::types::{
-    ApprovalStatus, AskCoverage, AskVerdict, NewAsk, NewAskEnv, NewOption, NewPlanCommand,
-    NewPlanStatement, NewPlanVar, NewPlannedValue, Origin, StatementVerdict, VarBinding,
+    ApprovalStatus, AskVerdict, NewAsk, NewAskEnv, NewOption, NewPlanCommand,
+    NewPlanStatement, NewPlanVar, NewPlannedValue, Origin, VarBinding,
 };
 
 use kaijutsu_types::{AskRef, AskStatus};
@@ -284,7 +284,7 @@ pub(crate) struct GateSpec {
 /// redeem an ask from the other. `KjVerb`'s prefix (`"kj-verb"`, hyphenated)
 /// is unchanged from before this gate went multi-origin, so any rule
 /// already taught for `kj cc send` keeps matching.
-fn statement_digest(origin: Origin, rendered: &str) -> String {
+pub(crate) fn statement_digest(origin: Origin, rendered: &str) -> String {
     match origin {
         Origin::KjVerb => format!("kj-verb:v1:{rendered}"),
         Origin::ShellGate => format!("shell-stmt:v1:{rendered}"),
@@ -430,43 +430,6 @@ fn build_ask(
     }
 }
 
-/// Truncate a statement's rendered text for a one-line reason string — the
-/// full text is always available via `kj ledger show <id>`.
-fn truncate_for_reason(s: &str) -> String {
-    const LIMIT: usize = 120;
-    if s.chars().count() <= LIMIT {
-        return s.replace('\n', "⏎");
-    }
-    let head: String = s.chars().take(LIMIT).collect();
-    format!("{}…", head.replace('\n', "⏎"))
-}
-
-/// Describe a rule-composed verdict for the human/model-facing reason
-/// string, naming exactly which statement(s) an active DENY rule matched —
-/// using the SOURCE index the caller published for each statement
-/// (`GatedStatement::source_index`), never a position re-derived by
-/// enumerating `statements` (see that field's doc for why the two can
-/// disagree).
-fn describe_rule_coverage(statements: &[GatedStatement], coverage: &AskCoverage, allow: bool) -> String {
-    if allow {
-        return "rule coverage: every statement matched an active allow rule".to_string();
-    }
-    let offenders: Vec<String> = coverage
-        .per_statement
-        .iter()
-        .zip(statements.iter())
-        .filter(|(v, _)| matches!(v, StatementVerdict::Deny(_)))
-        .map(|(_, s)| match s.source_index {
-            Some(idx) => format!("statement #{idx} (`{}`)", truncate_for_reason(&s.rendered)),
-            None => format!("`{}`", truncate_for_reason(&s.rendered)),
-        })
-        .collect();
-    format!(
-        "rule coverage: a statement matched an active deny rule — {}",
-        offenders.join(", ")
-    )
-}
-
 /// Announce that the approval ledger moved, to anyone subscribed.
 ///
 /// **Call this only AFTER the mutation has committed** — commands express
@@ -554,24 +517,23 @@ pub(crate) async fn run_gate(
         .collect();
     let digest_refs: Vec<&str> = digests.iter().map(String::as_str).collect();
 
-    // 1. Rules first — an explicit DENY rule on ANY statement short-circuits
-    //    the WHOLE submission without asking anyone (deny wins); every
-    //    statement covered by an ALLOW rule auto-allows the whole
-    //    submission; anything else (including partial coverage) escalates —
-    //    `AskCoverage::verdict()` composes this, never applying a submission
+    // 1. Gate policy first — every layer composed per statement
+    //    (`kj/gate_policy.rs`): a DENY on ANY statement short-circuits the
+    //    WHOLE submission without asking anyone (deny wins); every statement
+    //    allowed auto-allows the whole submission; anything else (including
+    //    partial coverage) escalates. A submission is never applied
     //    partially (module docs: there is no way to run "just the allowed
     //    half" of one submitted blob). Both terminal outcomes leave a
     //    durable row.
-    let coverage = {
+    let policy = {
         let db = db.lock();
-        match approval_ledger::rules::redeem(
+        match super::gate_policy::evaluate(
             db.conn_for_ledger(),
-            &digest_refs,
-            &spec.authorized_label,
+            &spec,
             Some(context.as_slice()),
             Some(principal.as_slice()),
         ) {
-            Ok(coverage) => coverage,
+            Ok(policy) => policy,
             Err(e) => {
                 return GateOutcome::unavailable_without_row(format!(
                     "approval gate could not read its rules: {e} (fail-closed — this is a \
@@ -580,7 +542,7 @@ pub(crate) async fn run_gate(
             }
         }
     };
-    let verdict = coverage.verdict();
+    let verdict = policy.verdict();
 
     // 2. An answer already given. Nothing waits any more, so a caller told
     //    `Pending` comes back and asks again — and the human's answer is
@@ -682,7 +644,7 @@ pub(crate) async fn run_gate(
     // no human in the loop (`decided_by` None + `auto_reason` mark it).
     if matches!(verdict, AskVerdict::Allow | AskVerdict::Deny) {
         let allow = matches!(verdict, AskVerdict::Allow);
-        let auto_reason = describe_rule_coverage(&spec.statements, &coverage, allow);
+        let auto_reason = policy.describe(&spec.statements, allow);
         let auto_reason = auto_reason.as_str();
         let row = {
             let db = db.lock();
@@ -1300,7 +1262,7 @@ mod tests {
     /// Multi-statement composition, deny branch: one denied statement among
     /// several refuses the WHOLE submission (never a partial apply), and
     /// the reason names the ACTUAL denied statement — proving
-    /// `describe_rule_coverage` reads `source_index` off the statement it
+    /// `PolicyEvaluation::describe` reads `source_index` off the statement it
     /// belongs to rather than any freshly re-derived position.
     #[tokio::test]
     async fn a_denied_statement_among_several_refuses_the_whole_submission_and_names_it() {
@@ -1811,5 +1773,116 @@ mod tests {
 
         let env = d.kernel_db.lock().ask_env(&request_id).unwrap();
         assert!(env.is_empty(), "no context_id means no context_env to snapshot: {env:?}");
+    }
+
+    // ── The gate policy evaluator (`kj/gate_policy.rs`) ─────────────────
+
+    fn auto_reason(db: &Arc<parking_lot::Mutex<KernelDb>>, request_id: &str) -> Option<String> {
+        let db = db.lock();
+        approval_ledger::ask::get_approval(db.conn_for_ledger(), request_id)
+            .unwrap()
+            .expect("the ask row exists")
+            .auto_reason
+    }
+
+    /// The mismatch the evaluator closes: a program broker PreCall waved
+    /// through without a hook still escalated inside `run_gate`, so a read
+    /// through the MCP `shell_write` tool asked a human. The builtin layer
+    /// now auto-allows it here too, with the durable row every
+    /// auto-decision leaves, and the row names the layer and key.
+    ///
+    /// Falsified by dropping the builtin layer from `gate_policy::evaluate`
+    /// (the verdict comes back `Pending`).
+    #[tokio::test]
+    async fn a_read_only_shell_program_auto_allows_with_a_row_naming_the_builtin_layer() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+
+        assert!(outcome.allowed(), "{}", outcome.reason);
+        assert_eq!(outcome.verdict, GateVerdict::Allowed);
+        assert!(
+            outcome.reason.contains("builtin allows kj block list"),
+            "the reason must name the layer and key: {}",
+            outcome.reason
+        );
+        let ask = outcome.ask.as_ref().expect("an auto-allow leaves a durable row");
+        assert_eq!(
+            auto_reason(&d.kernel_db, &ask.request_id).as_deref(),
+            Some(outcome.reason.as_str()),
+            "the row carries the same reason the caller saw"
+        );
+        assert!(
+            d.kernel_db.lock().list_pending_asks().unwrap().is_empty(),
+            "nothing was left for a human"
+        );
+    }
+
+    /// Top wins: a deny rule a human taught on the exact statement outranks
+    /// the builtin allow on the same statement.
+    ///
+    /// Falsified by composing builtin over rules (the verdict comes back
+    /// `Allowed`).
+    #[tokio::test]
+    async fn a_user_deny_rule_outranks_the_builtin_allow() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
+        let digest = statement_digest(Origin::ShellGate, &spec.statements[0].rendered);
+        seed_deny_rule(&d.kernel_db, &digest, &spec.authorized_label);
+
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+
+        assert_eq!(outcome.verdict, GateVerdict::Denied, "{}", outcome.reason);
+        assert!(
+            outcome.reason.contains("user rule denies"),
+            "the reason must name the winning layer: {}",
+            outcome.reason
+        );
+    }
+
+    /// The origin boundary: a `KjVerb` ask carries no plan, so the builtin
+    /// layer has nothing to classify even when the rendered text would read
+    /// as a read-only kj call. It meets the user-rule layer only.
+    #[tokio::test]
+    async fn a_kj_verb_ask_never_meets_the_builtin_layer() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let mut spec = cc_spec("kaijutsu-chan");
+        spec.statements[0].rendered = "kj block list".into();
+        spec.statements[0].vars.clear();
+
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+
+        assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
+    }
+
+    /// Both stacks consult one evaluator: a hook `Ask` on a shell call whose
+    /// program is read-only throughout auto-allows the same way the shell
+    /// gate does, keyed on the whole program.
+    #[tokio::test]
+    async fn a_hook_ask_on_a_read_only_shell_call_auto_allows() {
+        let d = gate_dispatcher().await;
+        let caller = test_caller();
+        let params = crate::mcp::types::KernelCallParams {
+            instance: crate::mcp::types::InstanceId::new("builtin.shell_write"),
+            tool: "shell_write".into(),
+            arguments: serde_json::json!({ "command": "kj block list; kj ledger list" }),
+        };
+        let spec = crate::kj::hook_gate::build_hook_gate_spec("lfm2d-advisory", "d".into(), &params);
+
+        let outcome =
+            run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows()).await;
+
+        assert!(outcome.allowed(), "{}", outcome.reason);
+        assert!(
+            outcome.reason.contains("builtin allows kj block list, kj ledger"),
+            "{}",
+            outcome.reason
+        );
     }
 }
