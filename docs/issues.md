@@ -22,6 +22,22 @@ selection with source references and retained recent material; audit exclusion
 handling along the selection path too. Source comparison and proposed
 experiments: `docs/oss-comparisons.md`. No runtime change in the dossier pass.
 
+## Compact forks do not restore the shipped coder stance (2026-09-10)
+
+`fork_compact` seeds a new document and invokes only the `fork` rc verb.
+`run_rc_lifecycle_inner` loads precisely that verb's directory; it does not
+also run `create`. The shipped coder fork entries resolve to cache and date
+scripts, neither of which emits the coder stance from `create/S00-stance.kai`.
+Running the fork hook therefore does not establish stance restoration.
+This is a source-level finding for the shipped seed, not a live-host check;
+custom rc may differ.
+
+Add a failing compact-fork test that inspects the child's assembled system
+prompt, then restore the appropriate stance and tool guidance without copying
+stale dynamic context. Coordinate with the distillation work above. Evidence
+and the reviewer disagreement that led here: `docs/kaibo-prompt-proposal.md`,
+"Examples from the arriving reviews".
+
 ## Found during the 2026-09-08 sweep (lead-verified)
 
 - **`background_exec.rs` and CLAUDE.md disagree.** The module header says

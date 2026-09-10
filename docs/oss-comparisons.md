@@ -41,6 +41,7 @@ be established by a later review rather than inferred from this one.
 | [Aider][aider-root] | `5dc9490bb35f9729ef2c95d00a19ccd30c26339c` | 2026-05-22 | Edit examples, architect/editor split, message assembly, summary retention |
 | Polytoken | Published documentation retrieved 2026-09-10 | Unpinned | Facets, templates, VFS inspection, skills and compaction; no source checkout |
 | Kaijutsu | `208cd9db91c0dfa3fbdb4623a77ffe2a447ddaf5` | Review baseline | Seed prompts, rc composition, system assembly, compact fork and distillation |
+| Kaibo | `1063d74f83a47d22eb1d27791c85f427c8f8d11b` | Follow-up inspected 2026-09-10 | Rendered prompts, composition, evidence handoff, recovery; open explorer PR #183 inspected separately |
 
 **Polytoken is a documentation-only comparison.** Amy clarified that it is
 not OSS and asked us to use its published docs. No `polytoken` checkout was
@@ -432,6 +433,36 @@ retains a recent tail when possible and recursively summarizes older messages
 under a token budget; its class default is 1,024 tokens, not a universal
 runtime setting. Its alternating text-chat and user-managed file selection
 assumptions do not directly match Kaijutsu's multi-writer context or kaish tools.
+
+## Kaibo: evidence gathering and review
+
+Kaibo supplies a useful neighboring design: grounded, read-only consultation
+with an explorer and synthesis agent. Its prompt composition has one owner,
+`resolve_phase_preamble`, with complete role overrides and separate project
+orientation/house-rule layers. Tool-bearing phases share generated kaish
+guidance; oneshot and offline synthesis explicitly lack project tools.
+
+The [complete rendered prompt resource](kaibo-prompts-current.md) preserves
+the current text. The [Kaibo implementation report](kaibo-prompt-proposal.md)
+maps our new drafts back into its roles, with proposed evidence and review
+passages, auxiliary-prompt changes, and tests. That report pins the source
+and [explorer PR #183](https://github.com/tobert/kaibo/pull/183), which names
+whether an explorer reports to the caller or a synthesis agent. These are
+distinct reader needs even when the reading procedure is shared.
+
+Lessons for Kaijutsu: prompt previews should disclose the layers they omit;
+evidence status should survive a handoff; a source citation needs an explanation
+of how it supports the claim; and forced completion should report incomplete
+evidence honestly. Kaibo already keeps tool definitions but disables new calls
+for a final recovery turn. That is a runtime mechanism alongside its prompt.
+Its question/answer session replay and recovery transcript are not semantic
+compaction in the inspected paths.
+
+The arriving DeepSeek and GLM reviews also supplied cases where a finding
+confused draft behavior with shipped behavior or inferred a hook's effect
+without following its implementation. Selected claims were checked locally
+and recorded in the implementation report. Those cases motivate an experiment;
+they do not establish that any model or prompt is generally better.
 
 ## Polytoken: documented composition
 
