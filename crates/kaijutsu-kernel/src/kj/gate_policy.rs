@@ -342,6 +342,54 @@ mod tests {
         assert_eq!(evaluate_planned(&[]).verdict(), AskVerdict::Escalate);
     }
 
+    /// `verdict()` re-states the ledger's composition rather than
+    /// delegating to it (the ledger composes rule rows, this composes
+    /// layers). Pinned against `AskCoverage::verdict` over every mix of
+    /// verdicts so the two cannot drift apart unnoticed.
+    #[test]
+    fn program_verdict_agrees_with_the_ledger_s_own_composition() {
+        use approval_ledger::types::{AskCoverage, RuleRow, RuleScope};
+        let row = || RuleRow {
+            rule_id: "r".into(),
+            statement_digest: "d".into(),
+            authorized_label: "l".into(),
+            context_id: None,
+            principal_id: None,
+            scope: RuleScope::Always,
+            allow: true,
+            created_at: 0,
+            created_by: None,
+            learned_from: None,
+            revoked_at: None,
+        };
+        let allow = || PolicyVerdict::Allow { layer: Layer::Builtin, key: "k".into() };
+        let deny = || PolicyVerdict::Deny { layer: Layer::UserRule, key: "k".into() };
+        let cases: Vec<Vec<PolicyVerdict>> = vec![
+            vec![],
+            vec![allow()],
+            vec![PolicyVerdict::Uncovered],
+            vec![deny()],
+            vec![allow(), allow()],
+            vec![allow(), PolicyVerdict::Uncovered],
+            vec![allow(), deny()],
+            vec![PolicyVerdict::Uncovered, deny()],
+        ];
+        for per_statement in cases {
+            let ledger = AskCoverage {
+                per_statement: per_statement
+                    .iter()
+                    .map(|v| match v {
+                        PolicyVerdict::Allow { .. } => StatementVerdict::Allow(row()),
+                        PolicyVerdict::Deny { .. } => StatementVerdict::Deny(row()),
+                        PolicyVerdict::Uncovered => StatementVerdict::Uncovered,
+                    })
+                    .collect(),
+            };
+            let ours = PolicyEvaluation { per_statement: per_statement.clone() };
+            assert_eq!(ours.verdict(), ledger.verdict(), "{per_statement:?}");
+        }
+    }
+
     #[test]
     fn a_program_that_does_not_parse_is_not_evaluated_here() {
         // `plan_program` refuses; the caller sees no statements and the

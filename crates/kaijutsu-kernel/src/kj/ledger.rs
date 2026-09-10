@@ -31,8 +31,9 @@
 //! create an `allow` rule for a statement with any free variable
 //! (`docs/gate-and-shell-split.md`, "Rulings"); this module never
 //! re-implements that check, only reports what the ledger said. Once
-//! a rule exists, [`crate::kj::gate::run_gate`]'s `rules::redeem` step
-//! auto-decides the next identical ask without asking anyone —
+//! a rule exists, [`crate::kj::gate::run_gate`]'s gate policy step
+//! (`kj/gate_policy.rs`, user-rule layer) auto-decides the next identical
+//! ask without asking anyone —
 //! `kj ledger forget` is how that stops.
 
 use approval_ledger::error::LedgerError;
@@ -2442,8 +2443,8 @@ mod tests {
         );
         assert_eq!(third.verdict, crate::kj::gate::GateVerdict::Allowed);
         assert!(
-            third.reason.contains("rule"),
-            "the reason must show this was a RULE decision, not a human one: {}",
+            third.reason.contains("gate policy: user rule allows"),
+            "the reason must name the user-rule layer, not a human: {}",
             third.reason
         );
         let ask3 = third.ask.expect("an auto-decided ask still gets a durable row");

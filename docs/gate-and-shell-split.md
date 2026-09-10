@@ -777,14 +777,16 @@ the statement actually runs (the gate cannot pause mid-execution — see "The
 crux" above), so showing one would recreate exactly the mismatch a gate
 exists to prevent. See `shell_gate.rs`'s module docs for the full reasoning.
 
-**The `plan_program`/`Stmt::Empty` index-gap landmine** (`docs/issues.md`) is
-guarded structurally, not just tested: `GatedStatement::source_index` carries
-`PlannedStatement::index` (the PUBLISHED, pre-filter position) through
-untouched, and `PolicyEvaluation::describe` (`kj/gate_policy.rs`) reads it off the
-statement it belongs to rather than re-deriving a position by enumerating
-`GateSpec::statements`. Regression tests:
-`kj::shell_gate::tests::a_leading_comment_does_not_shift_which_statement_is_reported`
-and `…multiple_leading_gaps_still_report_a_nonzero_source_index`.
+**The `plan_program` statement-index contract** is consumed, never
+re-derived: `GatedStatement::source_index` carries `PlannedStatement::index`
+(the index kaish publishes; since kaish 0.16 that is the position in the
+returned list, with empty statements already dropped) through untouched,
+and `PolicyEvaluation::describe` (`kj/gate_policy.rs`) reads it off the
+statement it belongs to rather than enumerating `GateSpec::statements`.
+Regression tests:
+`kj::shell_gate::tests::source_index_follows_kaish_published_index_across_a_leading_comment`
+and `…multiple_leading_gaps_do_not_shift_the_published_index`; their
+comments carry the 0.16 reversal.
 
 **Scope, stated plainly (also in `shell_gate.rs`'s module docs, where a
 reader of the code is most likely to assume more than this gate delivers):**
