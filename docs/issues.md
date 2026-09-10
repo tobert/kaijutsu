@@ -6,6 +6,22 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Distillation loses uncited block tails before summarization (2026-09-10)
+
+`build_distillation_prompt` (`crates/kaijutsu-kernel/src/drift.rs`) keeps only
+the first 2,000 bytes of each nonempty block. It reports the original size
+but includes no block identifier for retrieval. `kj fork --compact` uses
+that transcript and a briefing prompt under 500 words, then seeds a child
+without a selected verbatim recent-message tail. A decision or error beyond
+the cut cannot be recovered by better summary instructions alone.
+
+Separate drift briefing from task continuation requirements. Start with a
+fixture whose latest correction occurs after byte 2,000, then test pending
+questions, recent tool results, and repeated compact forks. Assess bounded
+selection with source references and retained recent material; audit exclusion
+handling along the selection path too. Source comparison and proposed
+experiments: `docs/oss-comparisons.md`. No runtime change in the dossier pass.
+
 ## Found during the 2026-09-08 sweep (lead-verified)
 
 - **`background_exec.rs` and CLAUDE.md disagree.** The module header says

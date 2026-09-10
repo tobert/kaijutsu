@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kaijutsu — prompt review</title>
+<style>
+:root{color-scheme:light;--ink:#182b30;--muted:#53696d;--paper:#f5f4ee;--line:#cbd4cf;--green:#146958}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 system-ui,sans-serif}
+main{max-width:1500px;margin:auto;padding:38px 38px 60px}a{color:var(--green);text-underline-offset:3px}
+.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.16em;font-weight:750;color:var(--green)}
+h1{font-size:clamp(30px,4vw,46px);line-height:1.15;margin:10px 0 16px;letter-spacing:-.03em}h2{font-size:22px;margin:0}
+.intro{max-width:900px;color:var(--muted)}nav{display:flex;gap:7px;flex-wrap:wrap;margin:26px 0 16px}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);border-radius:7px;padding:9px 14px;background:#fff;color:var(--ink)}
+button:hover{border-color:var(--green)}button[aria-pressed=true]{background:var(--ink);color:white;border-color:var(--ink)}
+button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #cb7917;outline-offset:4px}
+.controls{display:flex;flex-wrap:wrap;gap:24px;align-items:center;padding:12px 0}.controls label{cursor:pointer}input{accent-color:var(--green);width:17px;height:17px;vertical-align:middle;margin-right:7px}
+.legend{font-size:13px;color:var(--muted)}.reason{border-left:3px solid var(--green);padding:3px 0 3px 16px;margin:12px 0 24px;max-width:1050px}
+.reason p{margin:5px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}.panel{background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.panel header{background:#edf0eb;border-bottom:1px solid var(--line);padding:18px 23px}.panel.proposed header{background:#e6f0e9}
+.panel header h2{display:flex;justify-content:space-between;gap:16px;align-items:center}.badge{font-size:11px;letter-spacing:.08em;text-transform:uppercase;border:1px solid currentColor;border-radius:4px;padding:2px 6px;color:var(--muted)}
+.count{font-size:13px;color:var(--muted);margin-top:8px}.body{padding:23px}pre{font:14px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
+mark{color:inherit;border-radius:2px}.removed{background:#ffe2d9}.added{background:#d2efdf}.empty{font:italic 16px/1.7 system-ui;color:var(--muted)}
+.actions{padding:0 23px 20px}.actions button{font-size:13px;padding:6px 10px}details{margin-top:30px;border-top:1px solid var(--line);padding-top:16px}summary{cursor:pointer;font-weight:650}.small{font-size:14px;color:var(--muted)}code{overflow-wrap:anywhere}
+footer{margin-top:30px;color:var(--muted);font-size:13px}[hidden]{display:none!important}
+@media(max-width:850px){main{padding:24px 18px}.grid{grid-template-columns:1fr}.panel header,.body{padding:18px}}
+@media print{nav,.controls,.actions{display:none}main{padding:0;max-width:none}.grid{gap:12px}pre{font-size:10px}.panel{break-inside:auto}body{background:white}}
+</style>
+</head>
+<body>
+<main>
+<div class="eyebrow">会術 · Working draft · 2026-09-10</div>
+<h1>What we tell the next model.</h1>
+<p class="intro">Existing Kaijutsu prompt bodies beside proposed revisions. Read a single layer or combine base + role to see the full wording cost. These drafts are for discussion; the shipped prompts have not been changed.</p>
+<p class="small"><a href="prompt-proposals.md">Edit the drafts</a> · <a href="oss-comparisons.md">Read the source dossier</a> · All text and comparison data are included in this file.</p>
+<nav id="choices" aria-label="Prompt to compare"></nav>
+<div class="controls">
+<label id="combine-label"><input type="checkbox" id="combine">Include shared base</label>
+<label><input type="checkbox" id="highlight">Highlight wording changes</label>
+<span class="legend" id="legend" hidden><mark class="removed">Existing wording</mark> / <mark class="added">Proposed wording</mark></span>
+</div>
+<section class="reason" aria-live="polite"><h2 id="title"></h2><p id="note" class="small"></p><p id="why"></p><a id="evidence">Evidence and tradeoffs in the dossier</a></section>
+<div class="grid">
+<section class="panel"><header><h2>Existing <span class="badge">Seed snapshot</span></h2><div class="count" id="old-count"></div></header><div class="body"><pre id="old"></pre></div><div class="actions"><button id="download-old">Download this text</button> <a id="source" class="small">Seed source</a></div></section>
+<section class="panel proposed"><header><h2>Proposed <span class="badge">Not deployed</span></h2><div class="count" id="new-count"></div></header><div class="body"><pre id="new"></pre></div><div class="actions"><button id="download-new">Download this text</button></div></section>
+</div>
+<details><summary>What this comparison includes</summary>
+<p>Complete text for each compared layer. Coder text expands the shared core and the selected focused or guided suffix from the seed script. The “include shared base” view joins base + role text; it is not a provider-request capture.</p>
+<p>Other rc sections, the generated kaish primer, runtime situation, tool schemas, memory/handoff notifications and conversation messages are outside this view. The existing assistant type is fleet coordination; the general-purpose proposal targets default.</p>
+<p>Drift briefing and compact-fork handoff are separate proposed instructions. Today both paths share the same distillation prompt. Better wording cannot recover content cut off by the formatter or restore omitted tool guidance.</p>
+<p>Word and UTF-8 byte counts describe the displayed bodies. They are not model-token measurements. Wording highlights compare literal tokens and may mark moved guidance as both removed and added.</p>
+<p class="small">Source snapshot: <code id="revision"></code>. Seed body hashes: <code id="hashes"></code>.</p>
+</details>
+<details><summary>Complete upstream prompt text</summary>
+<p>The dossier provides pinned links and analysis rather than copies of every prompt. Each source link opens the complete source file; templated files still require the harness's assembly inputs to produce a final prompt.</p>
+<p>Start with <a href="oss-comparisons.md#omp-prompting-and-setup">omp's template and assembly map</a>. Polytoken is a documentation-only comparison: <a href="https://docs.polytoken.dev/harness-engineering/facets/">facets</a> and <a href="https://docs.polytoken.dev/harness-engineering/templating/">templating</a>. Its published examples are not a capture of its complete shipped prompts.</p>
+</details>
+<footer>Regenerate with <code>python3 'contrib/render-prompt-comparison.py'</code>. No model calls, rc execution, or live configuration writes are involved.</footer>
+<noscript><p>Enable JavaScript to compare prompts, or read <a href="prompt-proposals.md">the Markdown drafts</a>.</p></noscript>
+</main>
+<script id="data" type="application/json">__PROMPT_DATA__</script>
+<script>
+"use strict";
+const data=JSON.parse(document.getElementById('data').textContent);
+const byId=id=>document.getElementById(id);
+let active=data.records.find(r=>r.id===location.hash.slice(1))||data.records[0];
+const words=text=>text.trim()?text.trim().split(/\s+/u).length:0;
+const bytes=text=>new TextEncoder().encode(text).length;
+const texts=()=>byId('combine').checked&&active.combinable?[active.combinedOld,active.combinedNew]:[active.current,active.proposed];
+function render(){
+  const combined=byId('combine').checked&&active.combinable;
+  const [left,right]=texts(), highlighted=byId('highlight').checked;
+  byId('combine-label').hidden=!active.combinable;
+  byId('legend').hidden=!highlighted;
+  byId('title').textContent=active.title+(combined?' · base + role':'');
+  byId('note').textContent=active.note;
+  byId('why').textContent=active.why;
+  byId('source').href=active.source;
+  byId('evidence').href='oss-comparisons.md#'+active.anchor;
+  const diff=combined?active.combinedDiff:active.diff;
+  for(const [index,id,value] of [[0,'old',left],[1,'new',right]]){
+    byId(id).classList.toggle('empty',!value);
+    if(!value)byId(id).textContent='No dedicated role text. Select “Include shared base” to see the current base.';
+    else if(highlighted)byId(id).innerHTML=diff[index];
+    else byId(id).textContent=value;
+  }
+  byId('old-count').textContent=`${words(left)} words · ${bytes(left).toLocaleString()} bytes`;
+  const delta=words(right)-words(left);
+  byId('new-count').textContent=`${words(right)} words · ${bytes(right).toLocaleString()} bytes · ${delta>=0?'+':''}${delta} words`;
+  for(const button of byId('choices').children)button.setAttribute('aria-pressed',String(button.dataset.id===active.id));
+}
+for(const record of data.records){
+  const button=document.createElement('button');button.textContent=record.title;button.dataset.id=record.id;
+  button.addEventListener('click',()=>{active=record;history.replaceState(null,'','#'+record.id);render();});
+  byId('choices').append(button);
+}
+for(const id of ['combine','highlight'])byId(id).addEventListener('change',render);
+function download(index){
+  const text=texts()[index],url=URL.createObjectURL(new Blob([text+'\n'],{type:'text/plain;charset=utf-8'}));
+  const a=document.createElement('a');a.href=url;a.download=`${active.id}-${index?'proposed':'existing'}${byId('combine').checked&&active.combinable?'-with-base':''}.txt`;
+  a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+byId('download-old').addEventListener('click',()=>download(0));
+byId('download-new').addEventListener('click',()=>download(1));
+byId('revision').textContent=data.revision;
+byId('hashes').textContent=Object.entries(data.sources).map(([path,hash])=>`${path}: ${hash.slice(0,12)}`).join('; ');
+render();
+</script>
+</body>
+</html>
