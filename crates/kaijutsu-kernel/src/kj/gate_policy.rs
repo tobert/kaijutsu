@@ -920,6 +920,23 @@ mod tests {
         evaluate_planned(&plan(source), layers).per_statement.remove(0)
     }
 
+    /// A context env argument (`--env KEY=VALUE`) is plain text and must
+    /// not drop a tier-allowed `kj context create` to Uncovered.
+    #[test]
+    fn env_argument_keeps_the_context_type_allow() {
+        let cfg = config("[context_type.mcp]\nallow = [\"kj context create\"]\n");
+        let v = first_verdict(
+            "kj context create banto-probe --type director --env KJ_CHARACTER=banto --env ROTATED_FROM=ROOT",
+            &cfg,
+            Some("mcp"),
+        );
+        assert_eq!(
+            allow_keys(&v),
+            vec![(Layer::ContextTypeConfig("mcp".to_string()), "kj context create".to_string())],
+            "got {v:?}"
+        );
+    }
+
     fn allow_keys(v: &PolicyVerdict) -> Vec<(Layer, String)> {
         match v {
             PolicyVerdict::Allow(ds) => ds.iter().map(|d| (d.layer.clone(), d.key.clone())).collect(),
