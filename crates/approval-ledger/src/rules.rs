@@ -393,19 +393,6 @@ pub fn get_rule(conn: &Connection, rule_id: &str) -> Result<Option<RuleRow>> {
     .map_err(LedgerError::from)
 }
 
-/// List every active (not revoked) rule, most recently created first. The
-/// `kj ledger rules` answering-side view — a remember with no way to see
-/// what got remembered is half a feature.
-pub fn list_rules(conn: &Connection) -> Result<Vec<RuleRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT rule_id, statement_digest, authorized_label, context_id, principal_id,
-                scope, allow, created_at, created_by, learned_from, revoked_at
-         FROM approval_rules WHERE revoked_at IS NULL ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map([], row_to_rule)?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
 /// Filter + page for [`list_rules_filtered`] — `kj ledger rules`'s
 /// `--limit`/`--since`. [`list_rules`] above stays unfiltered/unbounded
 /// (no other caller needs it capped); this struct is the CLI's own query.
@@ -526,6 +513,92 @@ mod tests {
 
     fn decided_allowed(conn: &Connection, request_id: &str) {
         decide(conn, request_id, DecideInput { allow: true, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
+    }
+
+    // ── family rules ────────────────────────────────────────────────
+
+    /// One row per distinct key, the answer spent (as a digest rule
+    /// spends it), and the two refusals named.
+    #[test]
+    fn learn_family_mints_one_rule_per_key_and_spends_the_answer() {
+        let conn = open_memory();
+        let ask = ask_with_statement("digest-fam", VarBinding::Bound, "kj handoff note x");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        decided_allowed(&conn, &request_id);
+
+        let rules = learn_family_from_approval(
+            &conn,
+            &request_id,
+            &["kj handoff note", "wc", "wc"],
+            RuleScope::Always,
+            true,
+            Some(b"alice"),
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 2, "duplicate keys collapse: {rules:?}");
+        assert_eq!(rules[0].family_key, "kj handoff note");
+        assert_eq!(rules[1].family_key, "wc");
+        assert_eq!(rules[0].learned_from.as_deref(), Some(request_id.as_str()));
+        assert!(
+            crate::ask::redeemed_at(&conn, &request_id).unwrap().is_some(),
+            "learning a family spends the answer it was learned from"
+        );
+        assert!(matches!(
+            learn_family_from_approval(&conn, &request_id, &[], RuleScope::Always, true, None),
+            Err(LedgerError::NoFamilyKey(_))
+        ));
+        assert!(matches!(
+            learn_family_from_approval(&conn, "no-such-ask", &["x"], RuleScope::Always, true, None),
+            Err(LedgerError::NotFound(_))
+        ));
+    }
+
+    /// On one key a deny outranks an allow whatever their order; a
+    /// revoked deny uncovers the allow again; revoke reaches a family
+    /// rule by id and is idempotent.
+    #[test]
+    fn family_coverage_prefers_a_deny_on_the_same_key_and_revoke_reaches_it() {
+        let conn = open_memory();
+        let ask = ask_with_statement("digest-fam2", VarBinding::Bound, "git push");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        decided_allowed(&conn, &request_id);
+        learn_family_from_approval(&conn, &request_id, &["git push"], RuleScope::Always, true, None).unwrap();
+
+        let hit = family_coverage(&conn, &["git push", "rg"], None, None).unwrap();
+        assert!(hit[0].as_ref().is_some_and(|r| r.allow), "{hit:?}");
+        assert!(hit[1].is_none(), "an unlearned key is uncovered: {hit:?}");
+
+        let deny = learn_family_from_approval(&conn, &request_id, &["git push"], RuleScope::Always, false, None).unwrap();
+        let hit = family_coverage(&conn, &["git push"], None, None).unwrap();
+        assert!(hit[0].as_ref().is_some_and(|r| !r.allow), "deny outranks allow on one key: {hit:?}");
+
+        revoke(&conn, &deny[0].rule_id).unwrap();
+        revoke(&conn, &deny[0].rule_id).unwrap();
+        let hit = family_coverage(&conn, &["git push"], None, None).unwrap();
+        assert!(hit[0].as_ref().is_some_and(|r| r.allow), "the allow is live again: {hit:?}");
+        assert!(matches!(revoke(&conn, "no-such-rule"), Err(LedgerError::RuleNotFound(_))));
+    }
+
+    /// A session-scoped family matches only the context and principal that
+    /// raised the ask it was learned from.
+    #[test]
+    fn a_session_scoped_family_matches_its_own_context_and_principal_only() {
+        let conn = open_memory();
+        let ask = ask_with_statement("digest-fam3", VarBinding::Bound, "kj handoff note x");
+        let request_id = create_ask(&conn, &ask).unwrap();
+        decided_allowed(&conn, &request_id);
+        learn_family_from_approval(&conn, &request_id, &["kj handoff note"], RuleScope::Session, true, None).unwrap();
+
+        let mine = family_coverage(
+            &conn,
+            &["kj handoff note"],
+            Some(ask.context_id.as_slice()),
+            Some(ask.principal_id.as_slice()),
+        )
+        .unwrap();
+        assert!(mine[0].is_some(), "{mine:?}");
+        let theirs = family_coverage(&conn, &["kj handoff note"], Some(b"other-context"), Some(ask.principal_id.as_slice())).unwrap();
+        assert!(theirs[0].is_none(), "{theirs:?}");
     }
 
     #[test]
@@ -766,7 +839,7 @@ mod tests {
         let revoked = make_rule(&conn, "digest-list-3", VarBinding::Bound, "rm c", true);
         revoke(&conn, &revoked.rule_id).unwrap();
 
-        let rules = list_rules(&conn).unwrap();
+        let rules = list_rules_filtered(&conn, &RuleListFilter { since_ms: None, limit: 100 }).map(|(rows, _)| rows).unwrap();
         let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
         assert_eq!(ids, vec![second.rule_id.as_str(), first.rule_id.as_str()], "newest first, revoked excluded");
     }
@@ -774,7 +847,7 @@ mod tests {
     #[test]
     fn list_rules_on_an_empty_table_is_empty() {
         let conn = open_memory();
-        assert!(list_rules(&conn).unwrap().is_empty());
+        assert!(list_rules_filtered(&conn, &RuleListFilter { since_ms: None, limit: 100 }).map(|(rows, _)| rows).unwrap().is_empty());
     }
 
     // ── `list_rules_filtered` (kj ledger rules --limit/--since) ─────────

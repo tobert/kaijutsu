@@ -263,11 +263,15 @@ pub(crate) struct GateSpec {
     /// caller must retry instead. That is not a silent fallback: the
     /// refusal's remedy says which of the two the caller is getting.
     pub exec_source: Option<String>,
-    /// The `plan_program()` output `statements` was built from —
-    /// `Origin::ShellGate` only; empty for every other origin, which has no
-    /// source program to plan. Carried here so `build_ask` can compute the
-    /// free-variable env snapshot ([`crate::kj::env_snapshot`]) without
-    /// re-parsing the submission a second time.
+    /// The `plan_program()` output of the program this ask runs: for
+    /// `Origin::ShellGate` the submitted source `statements` was rendered
+    /// from, for a shell-shaped `Origin::Hook` ask the `command` argument
+    /// the one gated statement stands for; empty for `Origin::KjVerb` and
+    /// a hook on any other tool, which have no source program to plan.
+    /// Carried here so `build_ask` can compute the free-variable env
+    /// snapshot ([`crate::kj::env_snapshot`]) without re-parsing, and so
+    /// the gate policy's family and config layers have a command tree to
+    /// key on.
     pub planned: Vec<kaish_kernel::PlannedStatement>,
 }
 

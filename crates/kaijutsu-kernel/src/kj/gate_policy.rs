@@ -445,6 +445,10 @@ fn normalize_config_key(raw: &str) -> Result<String, String> {
     }
     match tokens.len() {
         1 => Ok(first.to_string()),
+        2 if tokens[1].starts_with('-') => Err(format!(
+            "a flag is not a key token, so `{first} {}` would never match; use `{first}`",
+            tokens[1]
+        )),
         2 => Ok(format!("{first} {}", tokens[1])),
         _ => Err("a key is `<command>` or `<command> <first argument>`".to_string()),
     }
@@ -501,9 +505,10 @@ pub(crate) fn evaluate_planned(
     }
 }
 
-/// Every layer, for one gate ask: user rules over the ask's statement
-/// digests, then layers 2–4 over the planned program the spec carries.
-/// Fails only when the ledger cannot be read.
+/// Every layer, for one gate ask: exact-statement rules over the ask's
+/// statement digests, then family rules over the planned program's
+/// command keys, then layers 2–4 over the same program. Fails only when
+/// the ledger cannot be read.
 pub(crate) fn evaluate(
     conn: &Connection,
     spec: &GateSpec,
@@ -651,7 +656,7 @@ impl std::fmt::Display for FamilyRefusal {
 pub(crate) fn family_keys_for_program(statements: &[PlannedStatement]) -> Result<Vec<String>, FamilyRefusal> {
     let mut keys: Vec<String> = Vec::new();
     for cmd in statements.iter().flat_map(|s| s.plan.commands.iter()) {
-        let refuse = |why: &str| FamilyRefusal(format!("`{}` {why}", cmd.name));
+        let refuse = |why: &str| FamilyRefusal(format!("`{}` {why}", command_clause(cmd)));
         if !cmd.redirects.is_empty() {
             return Err(refuse("has a redirect"));
         }
@@ -860,6 +865,20 @@ fn builtin_key(cmd: &PlannedCommand) -> Option<String> {
         key.push_str(sub.get_name());
     }
     Some(key)
+}
+
+/// One command as a human would read it in a refusal: the name and its
+/// plain arguments, cut short.
+fn command_clause(cmd: &PlannedCommand) -> String {
+    use kaish_types::plan::PlannedValue;
+    let mut words = vec![cmd.name.clone()];
+    for arg in &cmd.args {
+        match arg {
+            PlannedValue::Plain(s) => words.push(s.clone()),
+            _ => words.push("<redacted>".to_string()),
+        }
+    }
+    truncate_for_reason(&words.join(" "))
 }
 
 /// `kj … --help` / `kj … -h`: clap resolves help before dispatch, so
@@ -1151,6 +1170,11 @@ deny = ["kj context create"]
         assert!(m.contains("[context_type.coder] deny") && m.contains("lisst"), "{m}");
         let err = GateConfig::parse("[global]\nask = [\"git push origin\"]\n").unwrap_err();
         assert!(matches!(err, GateConfigError::Parse(_)), "three tokens is not a key: {err:?}");
+        // A flag as the second token could never match a command (the key
+        // derivation skips flags), so the entry would be silently dead.
+        let err = GateConfig::parse("[global]\nallow = [\"rg -n\"]\n").unwrap_err();
+        let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
+        assert!(m.contains("rg -n") && m.contains("flag"), "{m}");
     }
 
     #[test]
@@ -1325,6 +1349,11 @@ deny = ["kj context create"]
     fn a_family_is_refused_on_structure_naming_the_condition() {
         let err = |src: &str| family_keys_for_program(&plan(src)).unwrap_err().to_string();
         assert!(err("kj handoff note 'x' > ~/.bashrc").contains("has a redirect"));
+        assert!(
+            err("ls; kj handoff note 'x' > ~/.bashrc").contains("`kj handoff note x` has a redirect"),
+            "the refusal names the offending command, not just its name: {}",
+            err("ls; kj handoff note 'x' > ~/.bashrc")
+        );
         assert!(err("kj handoff note 'x' &").contains("runs in the background"));
         // kaish plans every value `Plain` today; the non-plain arm guards
         // its `#[non_exhaustive]` redaction seam and cannot be reached

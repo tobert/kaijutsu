@@ -345,7 +345,10 @@ enum LedgerCommand {
         #[arg(long)]
         remember: Option<RememberScopeArg>,
         /// With --remember: deny the command family instead of the exact
-        /// text, whatever the arguments. Undo with `kj ledger forget`.
+        /// text, whatever the arguments. Refused, like a family allow, when
+        /// a command has a redirect, a background flag, a heredoc or a
+        /// non-plain argument; the decision on THIS ask still stands. Undo
+        /// with `kj ledger forget`.
         #[arg(long, requires = "remember")]
         family: bool,
     },
@@ -1562,8 +1565,13 @@ fn learn_family_for_ask(
     let keys = crate::kj::gate_policy::family_keys_for_program(&planned)
         .map_err(|e| format!("a family rule covers a key, never arguments: {e}"))?;
     let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    approval_ledger::rules::learn_family_from_approval(conn, request_id, &refs, scope, allow, Some(created_by))
+    // One transaction for the whole family set, as `learn_every_statement`
+    // does: a fault mid-way leaves no half-learned family behind a message
+    // that says nothing was remembered.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+    approval_ledger::rules::learn_family_from_approval(&tx, request_id, &refs, scope, allow, Some(created_by))
         .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(keys)
 }
 
@@ -2745,6 +2753,113 @@ mod tests {
         let text = result.message();
         assert!(text.contains("no active rules"), "{text}");
         assert!(text.contains("kj handoff note") && text.contains("global config"), "{text}");
+    }
+
+    /// Learning a family spends the answer it was learned from, exactly as
+    /// a digest rule does: after `forget`, the next IDENTICAL ask must
+    /// escalate rather than redeem the human's original answer.
+    ///
+    /// Falsified by dropping the `approval_redemptions` insert from
+    /// `learn_family_from_approval`: the identical ask comes back allowed.
+    #[tokio::test]
+    async fn forgetting_a_family_makes_the_identical_ask_escalate_again() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let source = "kj handoff note 'the same note'";
+        let first = gate_once(&d, &c, planned_shell_spec(source)).await;
+        let request_id = first.ask.expect("row").request_id;
+        let result = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        let rule_id = match &rules {
+            KjResult::Ok { data: Some(v), .. } => v.as_array().unwrap()[0].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert!(d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &c).await.is_ok());
+        let again = gate_once(&d, &c, planned_shell_spec(source)).await;
+        assert_eq!(
+            again.verdict,
+            crate::kj::gate::GateVerdict::Pending,
+            "the original answer was spent by learning the family: {}",
+            again.reason
+        );
+    }
+
+    /// Ruling 1: a human's family allow outranks a config deny on its key.
+    #[tokio::test]
+    async fn a_remembered_family_allow_outranks_a_config_deny() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let first = gate_once(&d, &c, planned_shell_spec("rg -n todo src")).await;
+        let request_id = first.ask.expect("row").request_id;
+        let result = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        let config = Ok(crate::kj::gate_policy::GateConfig::parse("[global]\ndeny = [\"rg\"]\n").unwrap());
+        let next = run_gate(
+            &d.kernel_db.clone(),
+            &c,
+            planned_shell_spec("rg -n fixme src"),
+            d.kernel.ledger_flows(),
+            &config,
+        )
+        .await;
+        assert_eq!(next.verdict, crate::kj::gate::GateVerdict::Allowed, "{}", next.reason);
+        assert!(next.reason.contains("user family rule allows rg"), "{}", next.reason);
+    }
+
+    /// A session-scoped family applies to the context that raised the ask
+    /// and to no other.
+    #[tokio::test]
+    async fn a_session_scoped_family_covers_its_own_context_only() {
+        let d = test_dispatcher().await;
+        let mine = crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new());
+        let theirs = crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new());
+        let first = gate_once(&d, &mine, planned_shell_spec("kj handoff note 'mine'")).await;
+        let request_id = first.ask.expect("row").request_id;
+        let result = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("session"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        let same = gate_once(&d, &mine, planned_shell_spec("kj handoff note 'mine again'")).await;
+        assert_eq!(same.verdict, crate::kj::gate::GateVerdict::Allowed, "{}", same.reason);
+        let other = gate_once(&d, &theirs, planned_shell_spec("kj handoff note 'theirs'")).await;
+        assert_eq!(other.verdict, crate::kj::gate::GateVerdict::Pending, "{}", other.reason);
+    }
+
+    /// A kj-verb ask carries no shell program, so `--family` is refused
+    /// with the digest fallback named, and the decision still stands.
+    #[tokio::test]
+    async fn a_kj_verb_ask_cannot_teach_a_family() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let first = gate_once(&d, &c, spec()).await;
+        let request_id = first.ask.expect("row").request_id;
+        let result = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(result.is_ok(), "the decision itself succeeds: {result:?}");
+        assert!(
+            result.message().contains("NOT remembered")
+                && result.message().contains("no shell program"),
+            "{}",
+            result.message()
+        );
     }
 
     /// A `kj cc send`-shaped ask has a free `MESSAGE` variable, so

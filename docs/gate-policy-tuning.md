@@ -269,8 +269,14 @@ re-plans the ask's `exec_source` and refuses — loudly, naming the
 condition — when a command carries a redirect, a background flag, a
 heredoc, or a non-plain argument, or is a `kj` argv that does not
 classify, because the family key would then authorize text the human
-never saw. A `kj`-verb ask has no program and cannot teach a family.
-Without `--family`, `--remember` keeps the digest-rule behavior unchanged.
+never saw. A `kj`-verb ask has no program and cannot teach a family. Two
+consequences worth knowing: a family *deny* is refused on structure too,
+though a standing deny is safety-increasing — the refusal is the same
+function and stays fail-safe until a case asks otherwise; and a non-kj
+command whose first argument is a flag teaches the bare command as its
+family (`git -C x push` teaches `git`), which the answer-time message
+names, so the human sees the width they consented to. Without
+`--family`, `--remember` keeps the digest-rule behavior unchanged.
 
 **Guarantee 3 does not apply to family rules, and the reason is the key.**
 The free-variable refusal exists because a digest rule generalizes statement
@@ -419,12 +425,24 @@ The repo's own standard — a test that cannot fail is not a test:
 verdict for the calling context, each naming its winning layer:
 
 ```text
-KEY                  VERDICT  LAYER
-kj handoff note      allow    learned family (always, rule 01a0…, from ask 01a0…)
-kj rc add            ask      global config
-dd                   deny     global config
-kj block read        allow    builtin (Effect::Read)
+  KEY                  VERDICT  LAYER
+  ls -la /srv/builds   allow    user rule (session, rule 01a0…)
+  kj handoff note      allow    user family rule (always, rule 01a0…)
+
+  GATE.TOML KEY        VERDICT  LAYER
+  kj rc add            ask      global config
+  dd                   deny     global config
+
+builtin: every kj verb declaring Read, kj ledger, and kj … --help are allowed beneath these
+forget with: kj ledger forget <rule-id>
 ```
+
+As built: the learned rules of both kinds come first, newest first and
+cut by `--limit`; the `gate.toml` tiers in force for the caller's
+context type follow, uncounted; the builtin layer is one line rather than
+a row per Read verb. The listing is not context-scoped — another
+context's session rules appear too — which is how the digest listing
+already behaved.
 
 The user-facing word is **gate rules**, never "policy": `kj policy` is the
 per-instance QoS surface and one term keeps one meaning. The internal module
@@ -472,8 +490,9 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   …]` in `gate.toml` eventually replaces the jq is a later call — one
   authoring surface is attractive, the guard's fail-closed-on-no-plan
   behavior must survive the move unchanged.
-- **Session-scoped family rules** (`scope = 'session'`) are in the schema
-  for symmetry with digest rules; nothing learns one until a UX wants it.
+- **Session-scoped family rules** (`scope = 'session'`) are learnable
+  (`--remember session --family`) and cover the raising context only;
+  pinned, but no surface has asked for one yet.
 - **Composed-view caching.** v1 composes at check time (one SQLite read
   that `redeem` already pays, plus an mtime-cached file read). A per-context
   materialized cache is a follow-up if measurement ever asks for it.
