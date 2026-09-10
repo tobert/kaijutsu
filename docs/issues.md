@@ -6,6 +6,81 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The kernel writes ~15 MB/s while a turn streams (2026-09-10, P1 perf)
+
+Measured on zorak by an Opus lane while the tui felt slow: `/proc/170725/io`
+write_bytes 73–77 MB per 5 s with a turn streaming (about 136 KB per
+stream delta) against 1 MB per 5 s idle, a 70x swing; `/proc/pressure/io`
+`full avg60=12.7` with cpu and memory pressure at zero; a `turn-driver`
+thread in D state. `kernel.db-wal` was 2.3 MB against a 907 MB db, so the
+WAL checkpoints constantly — that checkpointing is the cost, not a
+runaway log. The suspect is per-append durable persistence of the block or
+document snapshot (`project_kernel_db_shape`: the db is mostly
+`doc_snapshots`). Reproduce with two 5 s `/proc/<pid>/io` samples during
+a streaming turn, then find the write per delta before proposing batching.
+Related: the DEBUG `llm` span logging ran at ~92 lines/s (4,744 lines/min
+peak); `RUST_LOG=info` on the unit is the cheap half.
+
+## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
+
+`crates/kaijutsu-tui/src/bridge.rs:78` spawns the actor with
+`scope_blocks_to_context: false` on purpose (the tui is a mux), so with
+500+ live contexts it receives every block event, including
+`report_audio_inventory` bumping a revision every 10 s. `run.rs:782`
+(`mirror_ops`) awaits one `edit_input` per vi op with no per-RPC timeout —
+the only timeout is `connect_timeout` (`main.rs:60`) — so under IO stall
+typing blocks rather than timing out, and the tui logs only WARN to
+stderr with no file. Fix is the same as the app's entry above:
+`watch_contexts` for the set the mux shows, and one `edit_input` per
+keystroke batch. Until then, start it with `2>/tmp/tui.log` to keep the
+"kernel events lost" notices.
+
+## kaish children inherit the kernel's priority (2026-09-10)
+
+A host command run from a context (`cargo test` in a coder, `git` from
+the operator's seat) is spawned by kaish inside `kaijutsu-server.service`
+at the kernel's own nice (kaish-kernel 0.17.2 `spawn.rs:205` builds the
+`Command` with no priority), so a coder's build competes with the kernel's
+own threads head-on, and raising the service's `CPUWeight` raises the
+build with it. `docs/operating.md`, "Builds beside a live kernel" carries
+what can be done from outside today.
+
+The policy is ours; the seam is kaish's. Kaijutsu never sees the
+`Command`, a pre-exec point, or the child pid — the embedder sets only
+`allow_external_commands` and `PATH` — so the request for a `nice` field
+or a `before_exec` hook on the spawn request is filed in
+`~/exomemory/issues/kaish.md`, "A pre-exec seam on the spawn request".
+Once it lands, `ExternalExec` in `runtime/embedded_kaish.rs` (the one
+exec authority, `kj/context_shell.rs`) grows the policy, and it should be
+pluggable by host rather than a table in kaish: nice is the portable
+floor; Linux can add cgroup placement (write the pid into a prepared
+cgroup, or `systemd-run --scope` with `CPUWeight`/`IOWeight`) for IO and
+memory control nice cannot give; macOS has no cgroup and marks a process
+background with `setpriority(PRIO_DARWIN_PROCESS, …)` / `PRIO_DARWIN_BG`,
+what `taskpolicy -b` does. Start with nice 10 for exec-granting seats and
+measure before adding a second mechanism.
+
+## `kj context create --as <character>` is designed, not built (2026-09-10)
+
+`played_by` is set only by MCP `register_session`; `kj context create`
+writes `None` (`kj/context.rs:1215`), so a seat created for a character
+from a kj shell is played by nobody. The director bundle bridges this with
+the context env `KJ_CHARACTER` (read by `S00-stance.kai` and
+`S16-handoff.kai`), the name slice 5 of `docs/character.md` plans to seed.
+Delete this entry when `--as` lands and the env bridge goes.
+
+## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
+
+From an `mcp` seat with `[context_type.mcp] allow = ["kj context create"]`
+live, `kj context create x --type director` auto-allowed and
+`kj context create x --type director --env KJ_CHARACTER=banto` escalated
+(ask `01a08d9a-6514`). A `gate_policy` unit test of the same
+statement against the same config returns Allow from the context_type
+layer, so the evaluator is not where it drops: look between the broker's
+PreCall (`mcp/broker.rs`, `evaluate_planned` over its own plan of the
+command) and the hook path that raised the ask, on the running binary
+(`04538700`).
+
 ## `kj rc list` does not report hook bodies, so a stale hook is invisible (2026-09-10)
 
 `/config/rc/lib/hooks/*.kai` are read by `HookBody::KaishPath` at every

@@ -99,6 +99,32 @@ second seat to approve it.
 from the **binary**, so build first. Ephemeral test kernels blank every
 S50 scorer.
 
+## Builds beside a live kernel
+
+Run a build in its own low-weight scope under the user manager, where it
+is a sibling of `kaijutsu-server.service` and the weights compare:
+
+```sh
+systemd-run --user --scope -q -p CPUWeight=20 --nice=19 cargo test -p kaijutsu-kernel --lib
+```
+
+The kernel service carries `CPUWeight=1000` (drop-in
+`~/.config/systemd/user/kaijutsu-server.service.d/priority.conf`), so a
+build scope at 20 yields to it under CPU pressure. A plain `cargo` from a
+Claude Code terminal lands in `session-N.scope` instead, a sibling of the
+whole `user@1000.service` tree at equal weight, and its nice value (Claude
+Code runs at -15, inherited by every child) never compares against the
+kernel at all.
+
+Two limits, both measured 2026-09-10 on zorak: the IO controller is not
+delegated to the user slice and both NVMe queues run the `none` scheduler,
+so `IOWeight` is accepted and ignored — `/proc/pressure/io` was the only
+pressure that registered while the kernel felt slow, and fixing that is a
+root decision (`bfq` on the queues plus io delegation). And a command a
+context runs through kaish is spawned inside the kernel's own cgroup at the
+kernel's nice; see `docs/issues.md`, "kaish children inherit the kernel's
+priority".
+
 ## Parallel lanes in one working tree
 
 Subagents make no git mutations. Each lane gets a disjoint file territory,
