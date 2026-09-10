@@ -23,7 +23,8 @@ snapshots.
 Local verification actually performed: read all seven attachments; read
 `build_distillation_prompt`, `summarize_with_model_for_caller`,
 `block_ids_ordered`/`blocks_ordered`, the hydrate filter, and `fork_compact`;
-checked `kj drift push --focus` against the fork args; listed
+inspected drift and fork arguments (the executor's claimed `push --focus`
+precedent was corrected in the Claude follow-up below); listed
 `assets/defaults/rc/coder/fork/`; regenerated the comparison artifact and
 restored it. No Rust build, no kernel operation, no reseed.
 
@@ -62,10 +63,11 @@ per-operation length value. The executor's preferred remedy, consistent
 with GLM's proposal and the plan's "no new registry or RPC": resolve per-operation
 config from the existing context-scoped mechanisms, keep the compiled
 instruction stable, and have the formatter append one budget line. The
-existing `--focus` precedent supports the split: it is a per-call argument
-(`kj drift push --focus`), validated as non-empty, appended after the
-transcript (`drift.rs:1442-1444`); length guidance belongs to the operation
-the same way. DeepSeek instead proposed reading the prompt body from the
+existing directed-prompt precedent supports the split: `kj drift pull`
+accepts trailing positional prompt text, joins it, and supplies it to the
+formatter, which appends it after the transcript. There is no `kj drift push
+--focus` flag. Length guidance could belong to the operation the same way.
+DeepSeek instead proposed reading the prompt body from the
 config tree with an embedded fallback. The reviewers agree on the missing
 configuration mechanism, not on its implementation.
 
@@ -217,3 +219,27 @@ successes.
 - Is the rc budget a word target only, or should the formatter also carry a
   hard input bound for the transcript itself (A2's total-bound gap is
   separate from any word target)?
+
+## Claude Code follow-up
+
+The separate Claude review pins its source citations to `14589559` and marks
+its working file ephemeral, not for commit. It confirms the filter,
+provenance, total-bound, and compact-fork initialization findings. Codex
+checked its correction to the directed-prompt interface against
+`kj/drift.rs`: the existing input is trailing text on `pull`, not a `--focus`
+flag on `push`. A3 above now reflects that source.
+
+Its strongest additional design concern is the global base's working
+contract. The shipped musician stance requires ABC-only output on a phrase
+deadline. Asking every type to investigate, ask questions, and write project
+handoffs can conflict with that output contract. Proposed remedy: keep the
+universal base small and compose the working contract through shared rc only
+for types that need it. Source establishes the conflicting instructions;
+their behavioral cost has not been measured.
+
+Other proposals to carry into implementation planning: unify the coder
+variants' fork wording; inspect reuse of `plan_splice` for a compact fork's
+recent complete turn groups; load the auxiliary prompt body through existing
+host-file configuration; and keep a default length policy in one owner.
+These are proposals, not newly shipped behavior. The private Site's first
+version predates this follow-up and is a snapshot of the earlier documents.
