@@ -1,38 +1,41 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kaijutsu — prompt review</title>
 <style>
-:root{color-scheme:light;--ink:#182b30;--muted:#53696d;--paper:#f5f4ee;--line:#cbd4cf;--green:#146958}
+:root{color-scheme:dark;--ink:#e0eae5;--muted:#a5b9b0;--paper:#101916;--line:#3d5348;--green:#88d8b5;--surface:#18241f;--header:#202f27;--proposed:#20392c;--removed:#62362e;--added:#244f3b;--selected:#a6e5c7;--selected-ink:#10291c}
+:root[data-theme=light]{color-scheme:light;--ink:#182b30;--muted:#53696d;--paper:#f5f4ee;--line:#cbd4cf;--green:#146958;--surface:#fff;--header:#edf0eb;--proposed:#e6f0e9;--removed:#ffe2d9;--added:#d2efdf;--selected:#182b30;--selected-ink:#fff}
 *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 system-ui,sans-serif}
 main{max-width:1500px;margin:auto;padding:38px 38px 60px}a{color:var(--green);text-underline-offset:3px}
 .eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.16em;font-weight:750;color:var(--green)}
 h1{font-size:clamp(30px,4vw,46px);line-height:1.15;margin:10px 0 16px;letter-spacing:-.03em}h2{font-size:22px;margin:0}
 .intro{max-width:900px;color:var(--muted)}nav{display:flex;gap:7px;flex-wrap:wrap;margin:26px 0 16px}
-button{font:inherit;cursor:pointer;border:1px solid var(--line);border-radius:7px;padding:9px 14px;background:#fff;color:var(--ink)}
-button:hover{border-color:var(--green)}button[aria-pressed=true]{background:var(--ink);color:white;border-color:var(--ink)}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);border-radius:7px;padding:9px 14px;background:var(--surface);color:var(--ink)}
+button:hover{border-color:var(--green)}button[aria-pressed=true]{background:var(--selected);color:var(--selected-ink);border-color:var(--selected)}
+.topline{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}#theme{font-size:13px;padding:6px 10px}
 button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #cb7917;outline-offset:4px}
 .controls{display:flex;flex-wrap:wrap;gap:24px;align-items:center;padding:12px 0}.controls label{cursor:pointer}input{accent-color:var(--green);width:17px;height:17px;vertical-align:middle;margin-right:7px}
 .legend{font-size:13px;color:var(--muted)}.reason{border-left:3px solid var(--green);padding:3px 0 3px 16px;margin:12px 0 24px;max-width:1050px}
-.reason p{margin:5px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}.panel{background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}
-.panel header{background:#edf0eb;border-bottom:1px solid var(--line);padding:18px 23px}.panel.proposed header{background:#e6f0e9}
+.reason p{margin:5px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start}.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.panel header{background:var(--header);border-bottom:1px solid var(--line);padding:18px 23px}.panel.proposed header{background:var(--proposed)}
 .panel header h2{display:flex;justify-content:space-between;gap:16px;align-items:center}.badge{font-size:11px;letter-spacing:.08em;text-transform:uppercase;border:1px solid currentColor;border-radius:4px;padding:2px 6px;color:var(--muted)}
 .count{font-size:13px;color:var(--muted);margin-top:8px}.body{padding:23px}pre{font:14px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
-mark{color:inherit;border-radius:2px}.removed{background:#ffe2d9}.added{background:#d2efdf}.empty{font:italic 16px/1.7 system-ui;color:var(--muted)}
+mark{color:inherit;border-radius:2px}.removed{background:var(--removed)}.added{background:var(--added)}.empty{font:italic 16px/1.7 system-ui;color:var(--muted)}
 .actions{padding:0 23px 20px}.actions button{font-size:13px;padding:6px 10px}details{margin-top:30px;border-top:1px solid var(--line);padding-top:16px}summary{cursor:pointer;font-weight:650}.small{font-size:14px;color:var(--muted)}code{overflow-wrap:anywhere}
 footer{margin-top:30px;color:var(--muted);font-size:13px}[hidden]{display:none!important}
 @media(max-width:850px){main{padding:24px 18px}.grid{grid-template-columns:1fr}.panel header,.body{padding:18px}}
-@media print{nav,.controls,.actions{display:none}main{padding:0;max-width:none}.grid{gap:12px}pre{font-size:10px}.panel{break-inside:auto}body{background:white}}
+@media print{:root,:root[data-theme=light]{color-scheme:light;--ink:#182b30;--muted:#53696d;--paper:#fff;--line:#cbd4cf;--green:#146958;--surface:#fff;--header:#edf0eb;--proposed:#e6f0e9;--removed:#ffe2d9;--added:#d2efdf}nav,.controls,.actions,#theme{display:none}main{padding:0;max-width:none}.grid{gap:12px}pre{font-size:10px}.panel{break-inside:auto}}
 </style>
 </head>
 <body>
 <main>
-<div class="eyebrow">会術 · Working draft · 2026-09-10</div>
+<div class="topline"><div class="eyebrow">会術 · Working draft · 2026-09-10</div><button id="theme" type="button" aria-pressed="true">Dark mode</button></div>
 <h1>What we tell the next model.</h1>
 <p class="intro">Existing Kaijutsu prompt bodies beside proposed revisions. Read a single layer or combine base + role to see the full wording cost. These drafts are for discussion; the shipped prompts have not been changed.</p>
 <p class="small"><a href="prompt-proposals.md">Edit the drafts</a> · <a href="oss-comparisons.md">Read the source dossier</a> · All text and comparison data are included in this file.</p>
+<p class="small"><a href="prompt-review-results.md">Review findings</a> · <a href="kaibo-prompt-proposal.md">Kaibo prompt proposal</a>. Review recommendations are recorded separately; these prompt bodies remain drafts.</p>
 <nav id="choices" aria-label="Prompt to compare"></nav>
 <div class="controls">
 <label id="combine-label"><input type="checkbox" id="combine">Include shared base</label>
@@ -49,7 +52,7 @@ footer{margin-top:30px;color:var(--muted);font-size:13px}[hidden]{display:none!i
 <p>Other rc sections, the generated kaish primer, runtime situation, tool schemas, memory/handoff notifications and conversation messages are outside this view. The existing assistant type is fleet coordination; the general-purpose proposal targets default.</p>
 <p>Drift briefing and compact-fork handoff are separate proposed instructions. Today both paths share the same distillation prompt. Better wording cannot recover content cut off by the formatter or restore omitted tool guidance.</p>
 <p>Word and UTF-8 byte counts describe the displayed bodies. They are not model-token measurements. Wording highlights compare literal tokens and may mark moved guidance as both removed and added.</p>
-<p class="small">Source snapshot: <code id="revision"></code>. Seed body hashes: <code id="hashes"></code>.</p>
+<p class="small">Input SHA-256 hashes: <code id="hashes"></code>. These identify the seeds, drafts, template, and generator used for this file. Check freshness with <code>python3 'contrib/render-prompt-comparison.py' --check</code>.</p>
 </details>
 <details><summary>Complete upstream prompt text</summary>
 <p>The dossier provides pinned links and analysis rather than copies of every prompt. Each source link opens the complete source file; templated files still require the harness's assembly inputs to produce a final prompt.</p>
@@ -63,6 +66,11 @@ footer{margin-top:30px;color:var(--muted);font-size:13px}[hidden]{display:none!i
 "use strict";
 const data=JSON.parse(document.getElementById('data').textContent);
 const byId=id=>document.getElementById(id);
+byId('theme').addEventListener('click',()=>{
+  const dark=document.documentElement.dataset.theme!=='dark';
+  document.documentElement.dataset.theme=dark?'dark':'light';
+  byId('theme').setAttribute('aria-pressed',String(dark));
+});
 let active=data.records.find(r=>r.id===location.hash.slice(1))||data.records[0];
 const words=text=>text.trim()?text.trim().split(/\s+/u).length:0;
 const bytes=text=>new TextEncoder().encode(text).length;
@@ -102,7 +110,6 @@ function download(index){
 }
 byId('download-old').addEventListener('click',()=>download(0));
 byId('download-new').addEventListener('click',()=>download(1));
-byId('revision').textContent=data.revision;
 byId('hashes').textContent=Object.entries(data.sources).map(([path,hash])=>`${path}: ${hash.slice(0,12)}`).join('; ');
 render();
 </script>

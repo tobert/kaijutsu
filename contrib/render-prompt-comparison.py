@@ -2,12 +2,12 @@
 """Render the prompt review from seed literals and Markdown drafts; never run rc."""
 
 from pathlib import Path
+import argparse
 import difflib
 import hashlib
 import html
 import json
 import re
-import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +36,9 @@ def diff(left, right):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Fail if the saved HTML differs from a fresh render; write nothing")
+    args = parser.parse_args()
     base_path = "assets/defaults/system.md"
     coder_path = "assets/defaults/rc/coder/create/S00-stance.kai"
     distill_path = "assets/defaults/prompts/distillation.md"
@@ -79,14 +82,21 @@ def main():
                             source="../" + source, note=note, why=why, anchor=anchor,
                             combinable=combinable, combinedOld=combined_old, combinedNew=combined_new,
                             diff=diff(current, proposed), combinedDiff=diff(combined_old, combined_new)))
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    sources = {p: hashlib.sha256(read(p).encode()).hexdigest() for p in [base_path, coder_path, distill_path]}
-    payload = json.dumps(dict(records=records, revision=revision, sources=sources), ensure_ascii=False).replace("<", "\\u003c")
+    inputs = [base_path, coder_path, distill_path, "docs/prompt-proposals.md",
+              "contrib/prompt-comparison.html", "contrib/render-prompt-comparison.py"]
+    sources = {p: hashlib.sha256(read(p).encode()).hexdigest() for p in inputs}
+    payload = json.dumps(dict(records=records, sources=sources), ensure_ascii=False).replace("<", "\\u003c")
     template = (ROOT / "contrib/prompt-comparison.html").read_text()
     if template.count("__PROMPT_DATA__") != 1:
         raise ValueError("Expected exactly one data slot in HTML template")
     output = DOCS / "prompt-comparison.html"
-    output.write_text(template.replace("__PROMPT_DATA__", payload))
+    rendered = template.replace("__PROMPT_DATA__", payload)
+    if args.check:
+        if not output.exists() or output.read_text() != rendered:
+            parser.exit(1, "Prompt comparison is stale or missing; run python3 contrib/render-prompt-comparison.py\n")
+        print(f"Current: {output}")
+        return
+    output.write_text(rendered)
     print(f"Rendered {len(records)} comparisons to {output}")
 
 

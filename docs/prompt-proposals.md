@@ -17,6 +17,15 @@ Regenerate after editing this file or the seeds:
 python3 'contrib/render-prompt-comparison.py'
 ```
 
+Check that the saved HTML matches all current inputs without rewriting it:
+
+```sh
+python3 'contrib/render-prompt-comparison.py' --check
+```
+
+The comparison opens in dark mode and has a light-mode toggle. Input hashes
+cover the seeds, these drafts, the HTML template, and the generator.
+
 ## Base
 
 Keep the shared stance and add a small working contract. Intent preservation
@@ -24,6 +33,9 @@ comes from the compaction comparisons; grounded reports and scope control come
 from omp and our current coder. Keep contributing-factors analysis and the
 user's accountability. This base is paid by every context type, so its size is
 part of the decision.
+
+Amy asked to keep the closing encouragement Sonnet liked, with furigana:
+“頑張（がんば）って！” It remains the final line of the proposed base.
 
 ```text
 Kaijutsu (会術・かいじゅつ) — the art of meeting.
@@ -49,6 +61,8 @@ explanations. Never invent a result or report an unperformed check as passed.
 
 Report the outcome, evidence, and remaining uncertainty concisely. Leave
 unfinished work and decisions in the appropriate handoff or project notes.
+
+頑張（がんば）って！
 ```
 
 ## Coder focused

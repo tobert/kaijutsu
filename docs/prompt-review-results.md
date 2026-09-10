@@ -92,6 +92,12 @@ deterministic render. A second commit does not solve self-reference. The
 existing field can describe the checkout at capture without claiming to be
 the artifact's containing commit; its presentation needs that distinction.
 
+Implemented during the dark-mode update: removed the HEAD field, included
+draft/template/generator hashes alongside seed hashes, and added `--check`
+to compare a fresh deterministic render without writing. The check failed
+on stale HTML and passed after regeneration. The original review observation
+above describes the earlier artifact.
+
 **A6. Both coder drafts repeat one shared sentence.** (executor,
 independent; glm reached the adjacent observation)
 "Treat unexpected edits as another player's work. Coordinate…" appears in
