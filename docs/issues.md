@@ -35,41 +35,16 @@ payload and logging, in the order to try:
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
 
-## A filled ask leaves its `gate.pending` error child in the log, sorted last (2026-09-11)
+## A failed ToolResult insert leaves the next anchor before its call (2026-09-11)
 
-Probe `ask-link-probe` (coder, deepseek-v4-pro) on `9be5ee08`, the kernel
-with the model-path ask link. A gated heredoc left the pair `#21/#22`
-Waiting; `kj ledger allow` from the lead seat ran the command and filled
-that pair (`#22` Done, content `probe ok`), authored no second pair, and
-the next turn hydrated with zero repair warnings. That is the fix
-working, and it means the 18-per-turn late-arrival drops seen earlier on
-`tui-ask-stuck` were most likely the pre-fix second pairs; a parallel-call
-probe is the remaining check if the warnings ever recur.
-
-What the probe found instead: asked on the next turn for the output, the
-model answered that "nothing was run" and dismissed `probe ok` as an echo.
-Two contributing factors, both in the durable log:
-
-- The fill (`rpc.rs`, `act_on_executable_answer`) knows only the linked
-  pair. The `system/error` child (`gate.pending: … nothing was run`) that
-  Step 6b authored beside the Waiting result stays in the log, status
-  `error`, after the pair is Done. A pending ask is not an error; either
-  do not author an error child for a Waiting dispatch, or retire it when
-  the pair fills.
-- Error children sort after every later block of the same turn.
-  `insert_error_block_as` anchors the child after the result block, and
-  the loop then sets `last_block_id` to the result block too
-  (`llm_stream.rs`, "Unzip and update last_block_id"), so the next
-  iteration's thinking and text slot in between. `kj block list` shows
-  `#18 #19 #17` and `#24 #25 #23` in the probe. The same shape put
-  `tui-ask-stuck`'s error blocks in the order 25, 290, 74, 90, …. Advance
-  the anchor past the child, or anchor the child at the result and the
-  next blocks after it.
-
-Smaller, seen on the way: `kj wait` after an approval executes reports
-`running` by timeout with no turn in flight, because the approval runs
-the command without resuming the coder (by design, `docs/gate-resume.md`)
-and nothing ends a turn. Belongs with the ledger ergonomics entry.
+In `process_llm_stream`'s tool dispatch, a tool whose ToolResult block
+fails to insert returns no anchor, so the "Unzip and update last_block_id"
+loop keeps the previous tool's anchor. When that tool was the last of the
+batch, the next iteration's blocks land before its ToolCall block in
+document order. Needs a block-insert failure, which is logged loudly, so it
+is rare; the fix is to fall back to the call block id as the anchor (the
+inline path already does). Found by Kaibo reviewing the error-child anchor
+fix.
 
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 
@@ -535,6 +510,12 @@ re-verified:
   same seat is the safe direction. The tui answers from another seat it
   holds, side-stepping this for a human; it stands for a model wanting to
   withdraw its own ask (the `cancel` verb above).
+
+`kj wait <ctx>` after `kj ledger allow` reports `running` by timeout with no
+turn in flight: the approval runs the command without resuming the coder
+(`docs/gate-resume.md`), so nothing ends a turn for `wait` to see. Either
+`wait` should notice a filled pair, or `allow` should say the coder needs a
+`kj drive` to continue (2026-09-11).
 
 ## The scorer and the snapshot (2026-09-02)
 

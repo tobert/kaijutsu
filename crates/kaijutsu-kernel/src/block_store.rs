@@ -7866,4 +7866,78 @@ mod tests {
             Status::Error
         );
     }
+
+    // ========================================================================
+    // insert_error_block_as — the returned id anchors what comes next
+    // ========================================================================
+
+    /// `insert_error_block_as` anchors its child `after_id: Some(parent_id)`
+    /// (the `ToolResult`), which makes the child — not the result — the tail
+    /// of that tool's output. A caller that keeps anchoring the next insert
+    /// at the result rather than at the id this function returns puts that
+    /// next block BEFORE the error child in document order: `call, result,
+    /// next, error` instead of `call, result, error, next`.
+    ///
+    /// Falsified by anchoring the next block at `result` instead of the
+    /// returned child id.
+    #[test]
+    fn insert_error_block_as_returns_the_id_to_anchor_the_next_block_after() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let call = store
+            .insert_tool_call(
+                ctx,
+                None,
+                None,
+                "shell_write",
+                serde_json::json!({"command": "rm -rf /"}),
+                Some(ToolKind::Shell),
+            )
+            .unwrap();
+        let result = store
+            .insert_tool_result(ctx, &call, Some(&call), "denied", true, None, Some(ToolKind::Shell))
+            .unwrap();
+        store.set_status(ctx, &result, Status::Error).unwrap();
+        store.set_status(ctx, &call, Status::Error).unwrap();
+
+        let payload = kaijutsu_types::ErrorPayload {
+            category: kaijutsu_types::ErrorCategory::Tool,
+            severity: kaijutsu_types::ErrorSeverity::Error,
+            code: Some("gate.denied".to_string()),
+            detail: Some("denied".to_string()),
+            span: None,
+            source_kind: Some(BlockKind::ToolResult),
+        };
+        let error_child = store
+            .insert_error_block_as(ctx, &result, &payload, "denied", None)
+            .unwrap();
+
+        // The next iteration's block belongs after the error child — the
+        // real tail of this tool's output — not after `result`.
+        let next = store
+            .insert_block(
+                ctx,
+                None,
+                Some(&error_child),
+                Role::Model,
+                BlockKind::Text,
+                "continuing",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let ordered: Vec<BlockId> = store.block_snapshots(ctx).unwrap().iter().map(|b| b.id).collect();
+        let pos = |id: &BlockId| ordered.iter().position(|x| x == id).expect("block present");
+        assert!(
+            pos(&call) < pos(&result) && pos(&result) < pos(&error_child) && pos(&error_child) < pos(&next),
+            "expected document order call, result, error child, next; got positions {:?} in {:?}",
+            [pos(&call), pos(&result), pos(&error_child), pos(&next)],
+            ordered,
+        );
+    }
 }

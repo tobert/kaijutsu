@@ -1114,3 +1114,17 @@ iteration's completion with stop reason and usage, interrupts,
 cancellations, and tool refusals; one line per connection and one summary
 per boot. The kernel's own disk writes did not move with the log level,
 which put the log cost on journald where it belonged.
+
+The ask link went live in the afternoon, written by a DeepSeek coder driven
+from the tui, and a probe coder confirmed it: an allow filled the Waiting
+pair with the real output, authored no second pair, and the next turn
+hydrated clean. Asked for that output, the model then insisted nothing had
+run. Two things in the durable log said so. The `gate.pending` error child
+authored beside a Waiting result outlived the ask, because the fill touches
+only the linked pair, and error children sorted after every later block of
+the turn, because the loop re-anchored on the result block rather than the
+child it had just hung off it. A pending ask is not an error, so the
+mapping now withholds the payload for a Waiting dispatch and no child is
+authored; and both dispatch paths anchor the next block past an error
+child when one is. Four tests pin it, two of them reproducing the exact
+`#18 #19 #17` order from the probe before the fix.

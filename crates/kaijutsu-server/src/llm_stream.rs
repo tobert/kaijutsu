@@ -1019,6 +1019,13 @@ struct ToolDispatch {
     content: String,
     is_error: bool,
     status: Status,
+    /// The error to author as a `system/error` child of the `ToolResult`
+    /// block, when there is one to author. `None` for a settled `Waiting`
+    /// dispatch even though `is_error` is true: a pending ask is not an
+    /// error, the `ToolResult` block already carries the refusal's text via
+    /// `content`, and nothing outside this file reads the `gate.pending`
+    /// child; the fill touches only the linked pair, so a child authored
+    /// here would outlive the ask it described.
     payload: Option<kaijutsu_types::ErrorPayload>,
     /// The ask this dispatch left holding its pair, when it left one
     /// `Waiting` — `None` for every settled outcome. The settle sites hand it
@@ -1098,11 +1105,18 @@ fn map_tool_dispatch_result(
             };
             // The refusal's own text names the state, the ask and the
             // remedy; a prefix here would restate one of them.
+            //
+            // `Waiting` withholds the payload rather than authoring it and
+            // relying on the two insert sites to skip it: `payload` here is
+            // the ONLY input either site reads to decide whether to author a
+            // `system/error` child, so deciding once, here, is the whole
+            // fix rather than a rule two call sites must both remember.
+            let payload = (status != Status::Waiting).then_some(payload);
             ToolDispatch {
                 content: refusal.to_string(),
                 is_error: true,
                 status,
-                payload: Some(payload),
+                payload,
                 ask_id: refusal.ask_id().map(str::to_owned),
             }
         }
@@ -1374,18 +1388,28 @@ async fn dispatch_inline_tool_result(
             );
         }
         let _ = documents.set_status(context_id, &result_block_id, settled_status);
-        if let Some(payload) = error_payload
-            && let Err(error) = documents.insert_error_block_as(
+        // An error child anchors after the result block
+        // (`insert_error_block_as`), so it is the new tail of this tool's
+        // output: advance `last_block_id` past it, or the next iteration's
+        // blocks land between the result and its own error child.
+        let mut anchor = result_block_id;
+        if let Some(payload) = error_payload {
+            match documents.insert_error_block_as(
                 context_id,
                 &result_block_id,
                 &payload,
                 payload.summary_line(),
                 Some(PrincipalId::system()),
-            )
-        {
-            log::warn!("Failed to insert inline tool error block for {}: {}", tool_name, error);
+            ) {
+                Ok(child_id) => anchor = child_id,
+                Err(error) => log::warn!(
+                    "Failed to insert inline tool error block for {}: {}",
+                    tool_name,
+                    error
+                ),
+            }
         }
-        *last_block_id = result_block_id;
+        *last_block_id = anchor;
     }
     let _ = documents.set_status(context_id, &tool_call_block_id, settled_status);
     link_waiting_pair_to_ask(
@@ -2648,17 +2672,29 @@ async fn process_llm_stream(
                         );
                     }
 
-                    // Step 6b: Emit structured Error child block if tool failed
-                    if let (Some(rb_id), Some(payload)) = (&result_block_id, &error_payload)
-                        && let Err(e) = documents.insert_error_block_as(
+                    // Step 6b: Emit structured Error child block if tool
+                    // failed, and anchor this dispatch's return past it. An
+                    // error child anchors after the result block
+                    // (`insert_error_block_as`), so it is the new tail of
+                    // this tool's output; returning the result id here would
+                    // put the next iteration's thinking and text between the
+                    // result and its own error child.
+                    let mut anchor_block_id = result_block_id;
+                    if let (Some(rb_id), Some(payload)) = (&result_block_id, &error_payload) {
+                        match documents.insert_error_block_as(
                             context_id,
                             rb_id,
                             payload,
                             payload.summary_line(),
                             Some(PrincipalId::system()),
-                        )
-                    {
-                        log::warn!("Failed to insert error block for tool {}: {}", tool_name, e);
+                        ) {
+                            Ok(child_id) => anchor_block_id = Some(child_id),
+                            Err(e) => log::warn!(
+                                "Failed to insert error block for tool {}: {}",
+                                tool_name,
+                                e
+                            ),
+                        }
                     }
 
                     // Step 7: Return for conversation history
@@ -2668,7 +2704,7 @@ async fn process_llm_stream(
                             content: result_content,
                             is_error,
                         },
-                        result_block_id,
+                        anchor_block_id,
                     )
                 }
             })
@@ -2677,7 +2713,8 @@ async fn process_llm_stream(
         let results_with_ids = futures::future::join_all(futures).await;
 
         // Unzip and update last_block_id so the next iteration's blocks
-        // appear after tool results, not after tool calls.
+        // appear after tool results (or their error child, when one was
+        // authored), not after tool calls.
         let mut tool_results = Vec::new();
         for (content_block, block_id_opt) in results_with_ids {
             tool_results.push(content_block);
@@ -3629,8 +3666,37 @@ mod tool_dispatch_timeout_tests {
             "the model must be handed the ask id: {}",
             out.content
         );
-        let payload = out.payload.expect("a refusal carries a payload");
-        assert_eq!(payload.code.as_deref(), Some("gate.pending"));
+    }
+
+    /// A pending ask is not an error: the `ToolResult` block already carries
+    /// the refusal's text via `content`, and nothing outside this file reads
+    /// a `gate.pending` error child. The fill touches only the linked pair,
+    /// never a sibling error child, so one authored here would stay in the
+    /// log saying nothing ran after the pair carries the real output.
+    ///
+    /// `is_error` still reports true (a refusal is loud, always); only the
+    /// block-store payload is withheld. Falsified by authoring a payload
+    /// for a `Waiting` dispatch again.
+    #[test]
+    fn a_pending_gate_carries_no_error_payload_to_author() {
+        let err = McpError::refused_gate(
+            kaijutsu_types::RefusalKind::Pending,
+            "shell_write",
+            Some(kaijutsu_types::AskRef {
+                request_id: "01a05d19-0000-7000-8000-000000000000".to_string(),
+                status: kaijutsu_types::AskStatus::Pending,
+            }),
+            "nothing was run",
+        );
+        let out = map_tool_dispatch_result("shell_write", Err(err));
+
+        assert_eq!(out.status, Status::Waiting);
+        assert!(out.is_error, "a refusal is still loud on the D-28 channel");
+        assert!(
+            out.payload.is_none(),
+            "a Waiting dispatch must not carry an error payload to author; got: {:?}",
+            out.payload
+        );
     }
 
     /// The neighbouring kinds settle `Error` — nothing is coming back for a
@@ -3841,6 +3907,195 @@ mod tool_dispatch_timeout_tests {
             !is_error,
             "`kj policy set` raising call_timeout above 120s must actually take effect once \
              the redundant loop-level timeout is gone — got: {content:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // dispatch_inline_tool_result — the error child's anchor
+    // ─────────────────────────────────────────────────────────────────
+
+    /// A single-tool `McpServerLike` that always refuses — stands in for a
+    /// denied gate without wiring up the hook machinery that normally
+    /// produces one.
+    struct RefusingServer {
+        id: InstanceId,
+        notif_tx: broadcast::Sender<ServerNotification>,
+    }
+
+    impl RefusingServer {
+        fn new(id: &str) -> Self {
+            let (notif_tx, _) = broadcast::channel(4);
+            Self { id: InstanceId::new(id), notif_tx }
+        }
+    }
+
+    #[async_trait]
+    impl McpServerLike for RefusingServer {
+        fn instance_id(&self) -> &InstanceId {
+            &self.id
+        }
+
+        async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
+            Ok(vec![KernelTool {
+                instance: self.id.clone(),
+                name: "denyme".to_string(),
+                description: None,
+                input_schema: serde_json::json!({ "type": "object" }),
+            }])
+        }
+
+        async fn call_tool(
+            &self,
+            _params: KernelCallParams,
+            _ctx: &CallContext,
+            _cancel: CancellationToken,
+        ) -> McpResult<KernelToolResult> {
+            Err(McpError::refused_gate(
+                kaijutsu_types::RefusalKind::Denied,
+                "denyme",
+                None,
+                "not this time",
+            ))
+        }
+
+        fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
+            self.notif_tx.subscribe()
+        }
+    }
+
+    /// Build an ephemeral kernel with `refuser`/`denyme` registered and bound
+    /// into a fresh context that already holds one anchor block. Returns
+    /// `(kernel, documents, context_id, tool_ctx, anchor)`.
+    async fn kernel_with_refusing_tool(
+        name: &str,
+    ) -> (
+        Arc<Kernel>,
+        SharedBlockStore,
+        ContextId,
+        kaijutsu_kernel::ExecContext,
+        kaijutsu_types::BlockId,
+    ) {
+        let kernel = Arc::new(Kernel::new_ephemeral(name).await);
+        let ctx = ContextId::new();
+        let documents = kernel.blocks().clone();
+        documents
+            .create_document(ctx, kaijutsu_kernel::DocumentKind::Conversation, None)
+            .expect("create document");
+        let anchor = documents
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "run it",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::new()),
+            )
+            .expect("insert anchor block");
+
+        let server = Arc::new(RefusingServer::new("refuser"));
+        kernel
+            .broker()
+            .register(
+                server,
+                InstancePolicy {
+                    call_timeout: Duration::from_secs(5),
+                    max_result_bytes: 1024,
+                    max_concurrency: 4,
+                },
+            )
+            .await
+            .unwrap();
+        kernel
+            .broker()
+            .set_binding(
+                ctx,
+                ContextToolBinding::with_instances(vec![InstanceId::new("refuser")]),
+            )
+            .await
+            .unwrap();
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            PrincipalId::new(),
+            ctx,
+            PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+        (kernel, documents, ctx, tool_ctx, anchor)
+    }
+
+    /// `insert_error_block_as` anchors the error child `after_id:
+    /// Some(result_block_id)` — the child, not the result, is the tail of a
+    /// denied tool's output. Before this, `dispatch_inline_tool_result` left
+    /// `last_block_id` at the result, so the next block inserted after this
+    /// call landed BETWEEN the result and its own error child. Document
+    /// order must be call, result, error child, next.
+    ///
+    /// Falsified by anchoring `last_block_id` at `result_block_id` again.
+    #[tokio::test]
+    async fn a_denied_inline_tool_anchors_the_next_block_past_its_error_child() {
+        let (kernel, documents, ctx, tool_ctx, anchor) =
+            kernel_with_refusing_tool("inline-anchor").await;
+        let mut last_block_id = anchor;
+
+        let _ = dispatch_inline_tool_result(
+            &documents,
+            ctx,
+            &mut last_block_id,
+            &kernel,
+            "denyme",
+            serde_json::json!({}),
+            &tool_ctx,
+            CancellationToken::new(),
+            "call-1",
+            PrincipalId::new(),
+        )
+        .await;
+
+        // Simulate the next iteration's block, anchored wherever this
+        // dispatch left `last_block_id`.
+        let next = documents
+            .insert_block_as(
+                ctx,
+                None,
+                Some(&last_block_id),
+                Role::Model,
+                BlockKind::Text,
+                "continuing",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::new()),
+            )
+            .expect("insert next block");
+
+        let blocks = documents.block_snapshots(ctx).expect("read blocks");
+        let call = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolCall)
+            .expect("tool call block must exist")
+            .id;
+        let result = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult)
+            .expect("tool result block must exist")
+            .id;
+        let error_child = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Error)
+            .expect("a denied refusal must author an error child")
+            .id;
+
+        let ordered: Vec<_> = blocks.iter().map(|b| b.id).collect();
+        let pos = |id: &kaijutsu_types::BlockId| ordered.iter().position(|x| x == id).unwrap();
+        assert!(
+            pos(&call) < pos(&result)
+                && pos(&result) < pos(&error_child)
+                && pos(&error_child) < pos(&next),
+            "expected document order call, result, error child, next; \
+             got positions {:?}",
+            [pos(&call), pos(&result), pos(&error_child), pos(&next)]
         );
     }
 }
@@ -4598,6 +4853,174 @@ mod usage_tests {
             "the span carries the final call's usage, not the first's"
         );
         assert_eq!(seen["llm.usage.output_tokens"].last, Some(30));
+    }
+}
+
+#[cfg(test)]
+mod error_child_anchor_tests {
+    //! `insert_error_block_as` anchors its child `after_id: Some(rb_id)` —
+    //! the child, not the `ToolResult` it hangs off, is the tail of a
+    //! failed tool's output. The agentic loop's "Step 6b" used to return
+    //! `rb_id` as the next iteration's anchor anyway, so the next model
+    //! turn's blocks landed BETWEEN the result and its own error child.
+    //! This drives a real two-iteration
+    //! agentic turn through `process_llm_stream` end to end and pins
+    //! document order across the whole loop, not just the anchor variable.
+    use super::*;
+    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
+    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
+    use kaijutsu_kernel::kernel_db::KernelDb;
+    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use kaijutsu_types::SessionId;
+
+    use crate::interrupt::ContextInterruptState;
+    use crate::rpc::ConversationCache;
+
+    /// Drive one `process_llm_stream` turn against a scripted Mock provider,
+    /// same shape as `publish_tests::drive_turn_with` and
+    /// `usage_tests::drive_turn_with`.
+    async fn drive_turn_with(provider: Provider, kernel: Arc<Kernel>) -> (SharedBlockStore, ContextId) {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let documents: SharedBlockStore = Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let ctx = ContextId::new();
+        documents
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let player = PrincipalId::new();
+        let after = documents
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "run the tool",
+                Status::Done,
+                ContentType::Plain,
+                Some(player),
+            )
+            .unwrap();
+
+        let provider = Arc::new(provider);
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let conversation_cache = Arc::new(ConversationCache::new(8));
+        let interrupt = ContextInterruptState::new(1);
+        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            player,
+            ctx,
+            std::path::PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+
+        process_llm_stream(
+            provider,
+            documents.clone(),
+            ctx,
+            "mock-model".to_string(),
+            kernel.clone(),
+            kernel_db,
+            vec![],
+            after,
+            "system".to_string(),
+            1024,
+            StreamTimeouts::from_policy(kernel.timeouts()),
+            None,
+            conversation_cache,
+            player,
+            tool_ctx,
+            interrupt,
+            1,
+            context_interrupts,
+            TurnOrigin::Autonomous,
+        )
+        .await;
+
+        (documents, ctx)
+    }
+
+    /// A failed tool call (`nonexistent_tool` against an unbound context,
+    /// same fixture `usage_tests::multi_iteration_turn_keeps_only_final_call_usage`
+    /// uses) authors an Error child off its `ToolResult`. The second
+    /// iteration's own text block must land AFTER that child, in document
+    /// order: call, result, error child, text.
+    ///
+    /// Falsified by anchoring Step 6b's return at the result block instead
+    /// of the error child it inserts.
+    #[tokio::test]
+    async fn a_failed_tool_calls_error_child_precedes_the_next_iterations_text() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("error-child-anchor").await);
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(vec![
+                    // Iteration 1: a tool call that fails (unknown tool name),
+                    // forcing a second round-trip.
+                    vec![
+                        StreamEvent::ToolUse {
+                            id: "call_1".into(),
+                            name: "nonexistent_tool".into(),
+                            input: serde_json::json!({}),
+                        },
+                        StreamEvent::Done {
+                            stop_reason: Some("tool_use".into()),
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            extra: None,
+                        },
+                    ],
+                    // Iteration 2: final text, no more tool calls.
+                    vec![
+                        StreamEvent::TextStart,
+                        StreamEvent::TextDelta("done".into()),
+                        StreamEvent::TextEnd,
+                        StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(20),
+                            output_tokens: Some(3),
+                            extra: None,
+                        },
+                    ],
+                ]));
+
+                let (documents, ctx) = drive_turn_with(provider, kernel.clone()).await;
+
+                let blocks = documents.block_snapshots(ctx).expect("read blocks");
+                let call = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::ToolCall)
+                    .expect("tool call block must exist")
+                    .id;
+                let result = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::ToolResult)
+                    .expect("tool result block must exist")
+                    .id;
+                let error_child = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::Error)
+                    .expect("the failed call must author an error child")
+                    .id;
+                let next_text = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::Text && b.content == "done")
+                    .expect("iteration 2's text block must exist")
+                    .id;
+
+                let ordered: Vec<_> = blocks.iter().map(|b| b.id).collect();
+                let pos = |id: &kaijutsu_types::BlockId| ordered.iter().position(|x| x == id).unwrap();
+                assert!(
+                    pos(&call) < pos(&result)
+                        && pos(&result) < pos(&error_child)
+                        && pos(&error_child) < pos(&next_text),
+                    "expected document order call, result, error child, text; \
+                     got positions {:?}",
+                    [pos(&call), pos(&result), pos(&error_child), pos(&next_text)]
+                );
+            })
+            .await;
     }
 }
 
