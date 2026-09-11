@@ -6,49 +6,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## The kernel writes ~15 MB/s while a turn streams (2026-09-10, P1 perf)
+## A streaming turn still writes ~2 MB/s and logs ~160 lines/s (2026-09-11, perf)
 
-Measured on zorak by an Opus lane while the tui felt slow: `/proc/170725/io`
-write_bytes 73–77 MB per 5 s with a turn streaming (about 136 KB per
-stream delta) against 1 MB per 5 s idle, a 70x swing; `/proc/pressure/io`
-`full avg60=12.7` with cpu and memory pressure at zero; a `turn-driver`
-thread in D state. `kernel.db-wal` was 2.3 MB against a 907 MB db, so the
-WAL checkpoints constantly — that checkpointing is the cost, not a
-runaway log. The suspect is per-append durable persistence of the block or
-document snapshot (`project_kernel_db_shape`: the db is mostly
-`doc_snapshots`). Reproduce with two 5 s `/proc/<pid>/io` samples during
-a streaming turn, then find the write per delta before proposing batching.
-Related: the DEBUG `llm` span logging ran at ~92 lines/s (4,744 lines/min
-peak); `RUST_LOG=info` on the unit is the cheap half. The per-iteration
-`llm.turn` span growth that multiplied those lines is fixed
-(`TurnUsageOnSpan` in `llm_stream.rs`).
+The fsync storm is fixed and measured (`docs/devlog.md`, "The kernel that
+fsynced every word"): `synchronous = NORMAL` and one transaction per
+journaled op took a streamed delta from about 200 KB of block-layer writes
+to 13 to 15 KB, with `wchar` equal to `write_bytes`. What remains is
+payload and logging, in the order to try:
 
-Diagnosed 2026-09-11 (Opus lane, probe context `write-storm-probe`,
-citations re-read by the lead). Measured on the live kernel: 91 MB per 5 s
-of `write_bytes` against 453 deltas, so about 200 KB at the block layer per
-delta for 16 KB through write syscalls and 18.5 write syscalls; a 1,949-delta
-turn wrote 428 MB for 10 KB of prose. The WAL high-water of 4,120,032 bytes
-is 1000 pages, the SQLite default `wal_autocheckpoint`. Per delta the path
-is `llm_stream.rs` TextDelta → `block_store.rs::append_text_as` →
-`journal_op`, which issues two autocommits on the same connection:
-`kernel_db.rs::write_op` (`INSERT INTO oplog`) and
-`touch_context_activity` (`UPDATE contexts SET last_activity_at`), each an
-fsync because `init_connection` (`kernel_db.rs`) sets only
-`journal_mode=WAL`, `foreign_keys`, and `busy_timeout`, leaving
-`synchronous` at FULL. Every 500 ops or 1 MiB, `compact_document` rewrites
-the whole `doc_snapshots` blob and runs a database-global
-`wal_checkpoint(TRUNCATE)`. A control on the same btrfs volume with the
-same two-commits-per-delta shape measured 175 KB per delta at FULL, 11 KB
-at NORMAL, 4 KB at OFF, with identical syscall bytes, so the amplification
-is btrfs fsync metadata (DUP), not payload. The 913 MB db has 16,147
-extents and no `chattr +C`.
-
-Smallest changes to test first, in order: `PRAGMA synchronous = NORMAL`
-in `init_connection` (crash-safe under WAL; only a power loss or kernel
-panic can drop the last commits, and zorak has no UPS, so this is Amy's
-call); then one transaction for the op row and the activity touch via the
-existing `in_transaction`. Later if still needed: `PASSIVE` instead of
-`TRUNCATE` for compaction's checkpoint, and `chattr +C` on a rebuilt db.
+- The DEBUG `llm` spans log every `TextDelta`/`ThinkingDelta` event, about
+  160 lines/s during a deepseek-v4-flash turn, and journald writes each.
+  `RUST_LOG=info` on the unit is the cheap half; Amy's call.
+- Each delta is still about 14 write syscalls and 13 KB: WAL pages for the
+  `oplog` row and the `contexts` activity touch. Batching the activity
+  touch (once per turn, or on a timer) halves the page writes; batching
+  deltas into fewer op rows is a design conversation, since the op row is
+  the durable unit the change feed replays.
+- Idle, the kernel writes about 100 KB/s. `report_audio_inventory` bumps a
+  revision every 10 s (see the tui entry below); check whether that bump
+  persists a document snapshot.
+- Untested from the diagnosis: `PASSIVE` instead of `TRUNCATE` for
+  compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
+  has 16,147 extents.
 
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 

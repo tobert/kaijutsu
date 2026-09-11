@@ -1088,6 +1088,10 @@ put the cost in the filesystem's fsync path rather than the payload. Amy
 took the durability trade with no UPS: "go with NORMAL, seems fine." Under
 WAL, NORMAL stays consistent through a process crash and only a power loss
 can drop the last commits. The two writes now share one transaction.
+Measured live after the bounce, a prose-only probe wrote 13 to 15 KB per
+delta with syscall bytes equal to block-layer bytes: the amplification is
+gone, and what is left is the payload of two WAL pages and a log line per
+token.
 
 A smaller storm rode along in the logs. The `llm.turn` span recorded its
 usage fields from every `Done` event, and tracing-subscriber's fmt layer
