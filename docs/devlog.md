@@ -1057,3 +1057,45 @@ its original inventory and rollout. This removes planned sheet fields from the
 working contract and corrects the claim that all block edits wait for hydration.
 The aim is fewer competing explanations, with correctness checked against code;
 source length alone is not evidence of better model behavior.
+
+## The kernel that fsynced every word (September 11)
+
+Banto's seat was rotated onto the character work the morning after it
+landed: build, force reseed, bounce, one `kj context create --as banto`,
+then archive and rename. The first job through the new seat was the context
+cleanup Amy had promised it: 421 no-model contexts, most of them mirrors of
+dead MCP sessions from mid-August. Banto reconnoitered on its own before
+acting, submitted the archive as one gated loop, and the shell gate held it.
+The lead denied that first ask: the filter excluded rows aged `now`, and a
+live seat reads `1m` after a minute idle. The deny resumed banto with the
+corrected filter already in its history, it re-verified the two live seats
+were absent, and the second ask ran 412 archives. Two facts about driving a
+seat came out of it. A user block written into a running turn's log does not
+reach that turn; it lands on the next drive, or on the resume a deny triggers.
+And `kj context list` reports "(no model)" for cast-resolved seats and handoff
+logs too, so a cleanup rule needs cast and handoff exclusions, not just the
+model column.
+
+The P1 that made the tui feel slow turned out to be an fsync per word. An
+Opus lane measured the live kernel while a probe context streamed: about
+200 KB of block-layer writes per delta, 428 MB for a 10 KB turn. Each delta
+was two autocommits on one connection, the oplog insert and the context's
+activity touch, and `init_connection` had never set `synchronous`, so SQLite
+ran at FULL and fsynced both. On btrfs with DUP metadata each fsync writes
+its metadata twice. A control on the same volume with the same shape fell
+from 175 KB to 11 KB per delta at NORMAL with identical syscall bytes, which
+put the cost in the filesystem's fsync path rather than the payload. Amy
+took the durability trade with no UPS: "go with NORMAL, seems fine." Under
+WAL, NORMAL stays consistent through a process crash and only a power loss
+can drop the last commits. The two writes now share one transaction.
+
+A smaller storm rode along in the logs. The `llm.turn` span recorded its
+usage fields from every `Done` event, and tracing-subscriber's fmt layer
+appends each record to a span's formatted fields instead of replacing it, so
+by iteration ten every log line under the span carried ten usage blocks. A
+drop guard now records the final call's numbers once at turn exit. Its test
+taught a lesson about tracing in a large test binary: a callsite caches its
+interest against the default subscriber of whichever thread hits it first,
+and under a full suite that is a sibling test with no subscriber, so a
+thread-local test subscriber saw no spans at all. The test installs a global
+default and tells spans apart by the thread that created them.
