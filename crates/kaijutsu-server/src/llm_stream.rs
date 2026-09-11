@@ -5257,3 +5257,259 @@ mod authorship_tests {
         );
     }
 }
+
+// This module is deliberately placed after `authorship_tests`:
+// `production_source` above scans everything before that module's text, and
+// this module's fixtures stamp `Some(PrincipalId::system())` on the tool
+// result the way the real gate-resume driver does, which would otherwise
+// throw off that count.
+#[cfg(test)]
+mod gate_resume_cache_eviction_tests {
+    //! Regression for `ConversationCache::evict`
+    //! (`docs/conversation-session.md`, "Tool pairing at send"): the
+    //! gate-resume driver (`crates/kaijutsu-server/src/rpc.rs`,
+    //! `act_on_executable_answer`) fills a `Waiting` ToolCall/ToolResult pair
+    //! in place, but `ConversationMailbox::catch_up` only folds blocks it has
+    //! not yet seen — an in-place edit to an already-seen block is invisible
+    //! to it. Without eviction, a cached mailbox keeps serving the
+    //! pre-approval text forever. This drives two real turns through
+    //! `process_llm_stream` against one shared `ConversationCache` and
+    //! inspects what the second turn actually hydrated.
+    use super::*;
+    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
+    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
+    use kaijutsu_kernel::kernel_db::KernelDb;
+    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use kaijutsu_types::{BlockId, SessionId};
+
+    use crate::interrupt::ContextInterruptState;
+    use crate::rpc::ConversationCache;
+
+    /// Drive one scripted turn against a caller-owned `documents` /
+    /// `conversation_cache`, so a test can inspect what a *later* turn
+    /// hydrates. Same shape as `usage_tests::drive_turn_with`, minus the
+    /// kernel_db context/document seeding neither this test nor
+    /// `error_child_anchor_tests::drive_turn_with` needs
+    /// (`get_hydration_policy` returns `Ok(None)` for an unknown context,
+    /// not an error).
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_turn(
+        provider: Provider,
+        documents: &SharedBlockStore,
+        ctx: ContextId,
+        player: PrincipalId,
+        kernel: &Arc<Kernel>,
+        kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
+        conversation_cache: Arc<ConversationCache>,
+        after: BlockId,
+    ) {
+        let provider = Arc::new(provider);
+        let interrupt = ContextInterruptState::new(1);
+        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            player,
+            ctx,
+            std::path::PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+        process_llm_stream(
+            provider,
+            documents.clone(),
+            ctx,
+            "mock-model".to_string(),
+            kernel.clone(),
+            kernel_db,
+            vec![],
+            after,
+            "system".to_string(),
+            1024,
+            StreamTimeouts::from_policy(kernel.timeouts()),
+            None,
+            conversation_cache,
+            player,
+            tool_ctx,
+            interrupt,
+            1,
+            context_interrupts,
+            TurnOrigin::Autonomous,
+        )
+        .await;
+    }
+
+    fn text_reply(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextStart,
+            StreamEvent::TextDelta(text.to_string()),
+            StreamEvent::TextEnd,
+            StreamEvent::Done {
+                stop_reason: Some("end_turn".into()),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                extra: None,
+            },
+        ]
+    }
+
+    /// Documents + a context carrying a ToolCall/ToolResult pair already
+    /// `Waiting` on "waiting on a human" — the shape a gated tool call
+    /// leaves behind for the gate-resume driver to fill in.
+    fn seed_waiting_pair() -> (SharedBlockStore, ContextId, PrincipalId, BlockId, BlockId) {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let documents: SharedBlockStore =
+            Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let ctx = ContextId::new();
+        documents
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let player = PrincipalId::new();
+
+        let user_block = documents
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "run the migration",
+                Status::Done,
+                ContentType::Plain,
+                Some(player),
+            )
+            .unwrap();
+        let command_block = documents
+            .insert_tool_call_as(
+                ctx,
+                None,
+                Some(&user_block),
+                "shell",
+                serde_json::json!({"code": "echo hi"}),
+                Some(TypesToolKind::Shell),
+                Some(player),
+                None,
+                None,
+            )
+            .unwrap();
+        let output_block = documents
+            .insert_tool_result_as(
+                ctx,
+                &command_block,
+                Some(&command_block),
+                "waiting on a human",
+                false,
+                None,
+                Some(TypesToolKind::Shell),
+                Some(PrincipalId::system()),
+                None,
+            )
+            .unwrap();
+        documents
+            .set_status(ctx, &output_block, Status::Waiting)
+            .unwrap();
+        documents
+            .set_status(ctx, &command_block, Status::Waiting)
+            .unwrap();
+
+        (documents, ctx, player, command_block, output_block)
+    }
+
+    /// The gate-resume driver's in-place fill: the exact calls
+    /// `run_into_blocks` (success) and `settle_pair_error` (failure) make on
+    /// the pair's blocks.
+    fn fill_pair_in_place(
+        documents: &SharedBlockStore,
+        ctx: ContextId,
+        command_block: &BlockId,
+        output_block: &BlockId,
+    ) {
+        documents
+            .edit_text_as(
+                ctx,
+                output_block,
+                0,
+                "real output",
+                "waiting on a human".len(),
+                Some(PrincipalId::system()),
+            )
+            .unwrap();
+        documents
+            .set_status(ctx, output_block, Status::Done)
+            .unwrap();
+        documents
+            .set_status(ctx, command_block, Status::Done)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn eviction_after_an_in_place_fill_makes_the_next_turn_hydrate_the_real_output() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("gate-resume-evict").await);
+                let (documents, ctx, player, command_block, output_block) = seed_waiting_pair();
+                let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+                let conversation_cache = Arc::new(ConversationCache::new(8));
+
+                // Turn 1: hydrates cold, folds the Waiting pair into the cache.
+                drive_turn(
+                    Provider::Mock(
+                        MockClient::new("unused").with_scripted_stream(vec![text_reply("ack")]),
+                    ),
+                    &documents,
+                    ctx,
+                    player,
+                    &kernel,
+                    kernel_db.clone(),
+                    conversation_cache.clone(),
+                    documents.last_block_id(ctx).unwrap(),
+                )
+                .await;
+
+                // The approval lands: the driver settles the pair in place —
+                // and, with the fix, evicts the cache.
+                fill_pair_in_place(&documents, ctx, &command_block, &output_block);
+                conversation_cache.evict(ctx);
+
+                let followup = documents
+                    .insert_block_as(
+                        ctx,
+                        None,
+                        Some(&documents.last_block_id(ctx).unwrap()),
+                        Role::User,
+                        BlockKind::Text,
+                        "did it work?",
+                        Status::Done,
+                        ContentType::Plain,
+                        Some(player),
+                    )
+                    .unwrap();
+
+                // Turn 2: must hydrate cold and see the real output.
+                drive_turn(
+                    Provider::Mock(
+                        MockClient::new("unused").with_scripted_stream(vec![text_reply("yes")]),
+                    ),
+                    &documents,
+                    ctx,
+                    player,
+                    &kernel,
+                    kernel_db.clone(),
+                    conversation_cache.clone(),
+                    followup,
+                )
+                .await;
+
+                let snapshot = conversation_cache.get_or_create(ctx).lock().await.snapshot();
+                let rendered = format!("{snapshot:?}");
+                assert!(
+                    rendered.contains("real output"),
+                    "the second turn must hydrate the settled output: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("waiting on a human"),
+                    "eviction must drop the stale cached text: {rendered}"
+                );
+            })
+            .await;
+    }
+}

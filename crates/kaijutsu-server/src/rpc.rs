@@ -239,6 +239,60 @@ impl ConversationCache {
         self.entries.insert(ctx, lock.clone());
         lock
     }
+
+    /// Drop this context's cached mailbox so the next turn hydrates it
+    /// cold from the durable block log.
+    ///
+    /// `ConversationMailbox::catch_up` folds blocks it has not seen; it
+    /// has no way to notice that a block it already folded was edited in
+    /// place. Call this whenever code outside a running turn fills a
+    /// block already in the cache — the gate-resume driver settling a
+    /// `Waiting` pair to its real output, for one — so the stale text
+    /// does not linger for the rest of the conversation.
+    ///
+    /// Safe to call while a turn holds this context's mailbox: that turn
+    /// keeps its own `Arc` clone and finishes on it unaffected. Only the
+    /// entry the cache itself would hand out next is removed.
+    pub fn evict(&self, ctx: ContextId) {
+        self.entries.remove(&ctx);
+        self.last_accessed.remove(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod conversation_cache_tests {
+    use super::*;
+
+    /// `evict` drops the cached mailbox; the next `get_or_create` must hand
+    /// back a fresh, un-materialized one rather than the same `Arc` —
+    /// otherwise a driver that fills a pair in place has no way to make the
+    /// next turn hydrate cold.
+    #[tokio::test]
+    async fn get_or_create_returns_a_fresh_mailbox_after_evict() {
+        let cache = ConversationCache::new(4);
+        let ctx = ContextId::new();
+
+        let first = cache.get_or_create(ctx);
+        {
+            let mut mb = first.lock().await;
+            // Any feed materializes the mailbox, even an empty one — see
+            // `ConversationMailbox::catch_up`.
+            mb.catch_up(&[]);
+        }
+        assert!(first.lock().await.is_materialized());
+
+        cache.evict(ctx);
+
+        let second = cache.get_or_create(ctx);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "evict must remove the entry so get_or_create allocates a new mailbox"
+        );
+        assert!(
+            !second.lock().await.is_materialized(),
+            "the mailbox handed back after evict must be fresh, not the evicted one"
+        );
+    }
 }
 
 /// One live FlowBus block-event subscription in the per-(principal, instance)
@@ -753,6 +807,10 @@ fn settle_pair_error(
     let _ = documents.set_stderr(context_id, output_block_id, Some(reason));
     let _ = documents.set_status(context_id, output_block_id, Status::Error);
     let _ = documents.set_status(context_id, command_block_id, Status::Error);
+    // The pair may already be cached from an earlier turn as `Waiting`;
+    // this settles it in place, so the next turn must hydrate cold to see
+    // it (see `ConversationCache::evict`).
+    kernel.conversation_cache.evict(context_id);
 }
 
 /// Run an answered ask that carries executable source, or settle the blocks
@@ -969,6 +1027,12 @@ async fn act_on_executable_answer(
         None,
     )
     .await;
+
+    // `run_into_blocks` just settled the pair in place. When it was
+    // already `Waiting` in a cached mailbox, that edit is invisible to
+    // `catch_up`; evict so the next turn hydrates cold and reads the real
+    // output instead of the stale "waiting" text.
+    kernel.conversation_cache.evict(context_id);
 
     if authored {
         // The output blocks reach the model as new blocks in its context;

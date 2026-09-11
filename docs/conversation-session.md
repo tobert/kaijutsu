@@ -27,6 +27,13 @@ block log. It is a pull-based cursor, not an insert-event subscriber.
 `snapshot()` repairs a clone of the accumulated history; it does not change
 the mailbox or the durable blocks.
 
+A pair the gate-resume driver fills in place (`crates/kaijutsu-server/src/rpc.rs`,
+`act_on_executable_answer`) evicts the context's cached mailbox
+(`ConversationCache::evict`), so the next turn hydrates cold from the block
+log. `catch_up` folds blocks it has not seen; it has no way to notice that a
+block it already folded was edited afterward, so a cached mailbox would keep
+serving the pre-edit text for the rest of the conversation.
+
 Hydration closes each assistant call batch in one pass over messages. Each
 `tool_use` gets a `tool_result` in the immediately following user message,
 before ordinary content. Adjacent real results survive; missing results get
