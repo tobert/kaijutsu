@@ -1020,6 +1020,11 @@ struct ToolDispatch {
     is_error: bool,
     status: Status,
     payload: Option<kaijutsu_types::ErrorPayload>,
+    /// The ask this dispatch left holding its pair, when it left one
+    /// `Waiting` — `None` for every settled outcome. The settle sites hand it
+    /// to [`link_waiting_pair_to_ask`], which is what lets a human's answer
+    /// fill *this* pair instead of authoring a second one beside it.
+    ask_id: Option<String>,
 }
 
 fn map_tool_dispatch_result(
@@ -1029,7 +1034,13 @@ fn map_tool_dispatch_result(
     match result {
         Ok(r) if r.success => {
             log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
-            ToolDispatch { content: r.stdout, is_error: false, status: Status::Done, payload: None }
+            ToolDispatch {
+                content: r.stdout,
+                is_error: false,
+                status: Status::Done,
+                payload: None,
+                ask_id: None,
+            }
         }
         Ok(r) => {
             // A tool that wrote a body already said what went wrong, and that
@@ -1056,6 +1067,7 @@ fn map_tool_dispatch_result(
                 is_error: true,
                 status: Status::Error,
                 payload: Some(payload),
+                ask_id: None,
             }
         }
         // A refusal is a verdict the machinery reached, not an execution
@@ -1091,6 +1103,7 @@ fn map_tool_dispatch_result(
                 is_error: true,
                 status,
                 payload: Some(payload),
+                ask_id: refusal.ask_id().map(str::to_owned),
             }
         }
         Err(McpError::Policy(PolicyError::Timeout { timeout_ms, .. })) => {
@@ -1113,6 +1126,7 @@ fn map_tool_dispatch_result(
                 is_error: true,
                 status: Status::Error,
                 payload: Some(payload),
+                ask_id: None,
             }
         }
         Err(e) => {
@@ -1130,6 +1144,7 @@ fn map_tool_dispatch_result(
                 is_error: true,
                 status: Status::Error,
                 payload: Some(payload),
+                ask_id: None,
             }
         }
     }
@@ -1163,6 +1178,67 @@ async fn dispatch_and_map_tool_result(
         .dispatch_tool_via_broker_with_cancel(tool_name, params, tool_ctx, cancel)
         .await;
     map_tool_dispatch_result(tool_name, result)
+}
+
+/// What to record on an ask for a dispatch that left a pair `Waiting`: the
+/// ask id, and the block the pair's output belongs in. `None` when nothing
+/// should be linked.
+///
+/// The pure half of [`link_waiting_pair_to_ask`], split out so the predicate
+/// has a test that needs no ledger and no broker.
+fn ask_link_for<'a>(
+    status: Status,
+    ask_id: Option<&'a str>,
+    result_block_id: Option<&'a kaijutsu_types::BlockId>,
+) -> Option<(&'a str, &'a kaijutsu_types::BlockId)> {
+    if status != Status::Waiting {
+        return None;
+    }
+    ask_id.zip(result_block_id)
+}
+
+/// Tell the ask which `ToolCall`/`ToolResult` pair is holding it.
+///
+/// **The one place the pair's ids and the refusal's ask id are in scope
+/// together.** The gate runs inside the broker's hook evaluation, which never
+/// sees a block id (`KernelDb::link_ask_blocks`'s own note), and the pair is
+/// authored only after the dispatch returns. The rpc shell path writes this
+/// same link for its own pair (`rpc.rs`'s `link_ask_blocks` site); this is
+/// that link for the path a model's tool call takes.
+///
+/// Without it the gate-resume driver finds no pair to fill
+/// (`act_on_executable_answer`'s `linked`), so an allow authors a *second*
+/// pair beside this one and a deny settles nothing at all — either way these
+/// blocks stay `Waiting` for the life of the kernel process. Nothing else
+/// reaps them: `Waiting` is deliberately not settled
+/// (`kaijutsu-tui/src/render.rs`'s `is_settled` counts `Done | Error`), so
+/// the block is never printed and the tui's in-flight strip goes on drawing
+/// the call as "waiting on ask" until the kernel restarts.
+///
+/// Only a `Waiting` dispatch links, via [`ask_link_for`]: every other refusal
+/// settles its blocks `Error`, so there is nothing left holding an ask, and
+/// linking one would have the driver write the reason onto a block that
+/// already carries it. An ask left with no `exec_source` still falls back to
+/// the driver's wake, whose retry authors its own pair — that residual gap is
+/// the old wake shape, not something this link introduces.
+///
+/// Best-effort on purpose, exactly like the rpc path's link: the refusal is
+/// already correct and already returned, and failing the call because a
+/// convenience link did not write would turn a working refusal into an error.
+/// Logged, never swallowed.
+fn link_waiting_pair_to_ask(
+    kernel_db: &parking_lot::Mutex<KernelDb>,
+    status: Status,
+    ask_id: Option<&str>,
+    tool_call_block_id: &kaijutsu_types::BlockId,
+    result_block_id: Option<&kaijutsu_types::BlockId>,
+) {
+    let Some((ask_id, output_block_id)) = ask_link_for(status, ask_id, result_block_id) else {
+        return;
+    };
+    if let Err(e) = kernel_db.lock().link_ask_blocks(ask_id, tool_call_block_id, output_block_id) {
+        log::error!("ask {ask_id}: could not record the blocks waiting on it: {e}");
+    }
 }
 
 /// Execute a provider-owned, in-flight tool callback through Kaijutsu's one
@@ -1255,7 +1331,7 @@ async fn dispatch_inline_tool_result(
     // Let the client observe the running ToolResult before it completes.
     tokio::task::yield_now().await;
 
-    let ToolDispatch { content, is_error, status: settled_status, payload: error_payload } =
+    let ToolDispatch { content, is_error, status: settled_status, payload: error_payload, ask_id } =
         dispatch_and_map_tool_result(
         kernel,
         tool_name,
@@ -1312,6 +1388,13 @@ async fn dispatch_inline_tool_result(
         *last_block_id = result_block_id;
     }
     let _ = documents.set_status(context_id, &tool_call_block_id, settled_status);
+    link_waiting_pair_to_ask(
+        &kernel.kernel_db(),
+        settled_status,
+        ask_id.as_deref(),
+        &tool_call_block_id,
+        result_block_id.as_ref(),
+    );
 
     InlineToolResult { content, is_error }
 }
@@ -2470,6 +2553,7 @@ async fn process_llm_stream(
                         is_error,
                         status: settled_status,
                         payload: error_payload,
+                        ask_id,
                     } = dispatch_and_map_tool_result(
                         &kernel,
                         &tool_name,
@@ -2548,6 +2632,20 @@ async fn process_llm_stream(
                     }
                     if let Some(ref tcb_id) = tool_call_block_id {
                         let _ = documents.set_status(context_id, tcb_id, settled_status);
+                    }
+                    // Tell the ask which pair is holding it, so a human's
+                    // answer fills this pair instead of authoring a second one
+                    // beside it (`link_waiting_pair_to_ask`).
+                    if let (Some(rb_id), Some(tcb_id)) =
+                        (result_block_id.as_ref(), tool_call_block_id.as_ref())
+                    {
+                        link_waiting_pair_to_ask(
+                            &kernel.kernel_db(),
+                            settled_status,
+                            ask_id.as_deref(),
+                            tcb_id,
+                            Some(rb_id),
+                        );
                     }
 
                     // Step 6b: Emit structured Error child block if tool failed
@@ -3744,6 +3842,77 @@ mod tool_dispatch_timeout_tests {
             "`kj policy set` raising call_timeout above 120s must actually take effect once \
              the redundant loop-level timeout is gone — got: {content:?}"
         );
+    }
+}
+
+/// The ask-to-pair link the model path was missing.
+///
+/// A gate that leaves a tool call holding an ask settles its pair `Waiting`
+/// (`settled_block_status`), not `Error`: nothing prints such a pair, and the
+/// tui keeps drawing it in the in-flight strip. The fix is the link the rpc
+/// shell path already writes; the two halves of it are tested here — the ask
+/// id must survive the mapping, and the predicate must fire only for the
+/// `Waiting` pair that needs filling.
+#[cfg(test)]
+mod ask_link_tests {
+    use super::*;
+
+    fn pending_refusal(ask: &str) -> McpError {
+        McpError::refused_gate(
+            kaijutsu_types::RefusalKind::Pending,
+            "shell_write",
+            Some(kaijutsu_types::AskRef {
+                request_id: ask.to_string(),
+                status: kaijutsu_types::AskStatus::Pending,
+            }),
+            "nothing was run",
+        )
+    }
+
+    /// The settle sites have nothing to hand the ledger if the mapping drops
+    /// the ask id — the link would silently never write.
+    #[test]
+    fn a_pending_refusal_carries_its_ask_id_out_of_the_mapping() {
+        let out = map_tool_dispatch_result("shell_write", Err(pending_refusal("01a05d19-ask")));
+        assert_eq!(out.status, Status::Waiting, "a pending ask is not a failure");
+        assert_eq!(
+            out.ask_id.as_deref(),
+            Some("01a05d19-ask"),
+            "the ask id must reach the settle site that links the pair"
+        );
+    }
+
+    /// A denial settles its blocks `Error`: there is nothing left holding the
+    /// ask, so there is nothing to link.
+    #[test]
+    fn a_denial_carries_no_ask_to_link() {
+        let denied = McpError::refused_gate(
+            kaijutsu_types::RefusalKind::Denied,
+            "shell_write",
+            None,
+            "not this time",
+        );
+        let out = map_tool_dispatch_result("shell_write", Err(denied));
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.ask_id, None);
+    }
+
+    /// Falsified by dropping the `Waiting` arm (a settled `Error` then links
+    /// too) or the `result_block_id` arm (the command block would be recorded
+    /// as the output block as well).
+    #[test]
+    fn only_a_waiting_pair_with_an_ask_and_an_output_links() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let result = kaijutsu_types::BlockId::new(ctx, principal, 2);
+
+        assert!(
+            ask_link_for(Status::Waiting, Some("01a05d19-ask"), Some(&result)).is_some(),
+            "a waiting pair with an ask and an output block must link"
+        );
+        assert!(ask_link_for(Status::Error, Some("01a05d19-ask"), Some(&result)).is_none());
+        assert!(ask_link_for(Status::Waiting, None, Some(&result)).is_none());
+        assert!(ask_link_for(Status::Waiting, Some("01a05d19-ask"), None).is_none());
     }
 }
 
