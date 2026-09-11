@@ -180,7 +180,7 @@ vt100 = "0.16"
 imara-diff = "0.2"
 
 # Persistence
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled", "hooks"] }
 
 # Configuration
 toml = "0.8"

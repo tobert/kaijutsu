@@ -1989,11 +1989,17 @@ impl KernelDb {
         &self.conn
     }
 
+    /// Under WAL, `synchronous = NORMAL` fsyncs at checkpoint instead of on
+    /// every commit, and stays consistent through a process crash; only a
+    /// power loss or kernel panic can drop the most recent commits. The
+    /// default `FULL` fsyncs every commit, and a streaming turn commits once
+    /// per delta.
     fn init_connection(conn: &Connection) -> SqliteResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA busy_timeout = 5000;
+             PRAGMA synchronous = NORMAL;",
         )?;
         Ok(())
     }
@@ -8702,6 +8708,21 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "re-open must be an idempotent no-op");
         }
+    }
+
+    // ── synchronous pragma ────────────────────────────────────────────
+
+    /// `init_connection` must set `synchronous = NORMAL` (1), not SQLite's
+    /// default `FULL` (2). Under WAL, NORMAL fsyncs at checkpoint instead of
+    /// on every commit, and a streaming turn commits once per delta.
+    #[test]
+    fn init_connection_sets_synchronous_normal() {
+        let db = KernelDb::temporary().unwrap();
+        let mode: i64 = db
+            .conn_for_ledger()
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, 1, "synchronous should be NORMAL (1), got {mode}");
     }
 
     // ── WAL checkpoint ──────────────────────────────────────────────────

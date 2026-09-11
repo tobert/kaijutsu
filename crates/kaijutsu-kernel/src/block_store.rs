@@ -1039,18 +1039,21 @@ impl BlockStore {
 
         {
             let db_guard = db.lock();
+            // One transaction, not two autocommit statements: the op row and
+            // the activity stamp land together, so a single streamed delta
+            // pays for one fsync instead of two.
             db_guard
-                .append_op(context_id, seq as i64, &payload_bytes)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-            // Stage 1 (time-well) kernel truth: stamp this context's
-            // last_activity_at on every mutating block op. `now_millis()` is
-            // the SAME Unix-millis clock `created_at` is stamped with
-            // (`kaijutsu_types::now_millis`, mirrored by kernel_db's private
-            // helper of the same name/formula) - the app computes
-            // `now - last_activity_at` directly against it, so the epoch must
-            // match exactly. One extra O(1) UPDATE under a lock already held.
-            db_guard
-                .touch_context_activity(context_id, kaijutsu_types::now_millis() as i64)
+                .in_transaction(|db| {
+                    db.append_op(context_id, seq as i64, &payload_bytes)?;
+                    // Stage 1 (time-well) kernel truth: stamp this context's
+                    // last_activity_at on every mutating block op.
+                    // `now_millis()` is the SAME Unix-millis clock
+                    // `created_at` is stamped with (`kaijutsu_types::now_millis`,
+                    // mirrored by kernel_db's private helper of the same
+                    // name/formula) - the app computes `now - last_activity_at`
+                    // directly against it, so the epoch must match exactly.
+                    db.touch_context_activity(context_id, kaijutsu_types::now_millis() as i64)
+                })
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
@@ -6237,6 +6240,50 @@ mod tests {
         };
         let store = BlockStore::with_db(db.clone(), ws_id, creator);
         (db, ws_id, store)
+    }
+
+    /// `journal_op` must commit `append_op` and `touch_context_activity`
+    /// together as one transaction, not as two separate autocommit
+    /// statements. Counts SQLite commits via `commit_hook` around a single
+    /// streamed text append, the hot path: a turn takes it once per delta.
+    #[test]
+    fn append_text_commits_once_not_twice() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (db, _ws_id, store) = store_with_db();
+        let ctx = ContextId::new();
+        let block_id = store
+            .create_document_with_block(
+                ctx,
+                DocumentKind::File,
+                None,
+                Role::System,
+                BlockKind::Text,
+                "start",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let commits = Arc::new(AtomicUsize::new(0));
+        {
+            let counter = commits.clone();
+            db.lock()
+                .conn_for_ledger()
+                .commit_hook(Some(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    false
+                }))
+                .unwrap();
+        }
+
+        store.append_text_as(ctx, &block_id, " more", None).unwrap();
+
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            1,
+            "one journaled append must be one SQLite commit"
+        );
     }
 
     /// Write a `documents` row with no snapshot and no oplog — the shape a
