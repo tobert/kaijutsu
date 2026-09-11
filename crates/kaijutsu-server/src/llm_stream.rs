@@ -1316,6 +1316,47 @@ async fn dispatch_inline_tool_result(
     InlineToolResult { content, is_error }
 }
 
+/// The `llm.turn` span's usage fields, recorded exactly once per turn.
+///
+/// Each `Done` event replaces `last`; the record happens when the guard drops
+/// at turn exit, on every path out of `process_llm_stream`. Recording per
+/// call is wrong twice: `tracing_subscriber`'s fmt layer appends every
+/// `Span::record` to a span's formatted fields instead of replacing it, so
+/// every log line under the span grew by one usage block per iteration; and
+/// the span is one turn, so its usage is one gauge. The final call's numbers
+/// are the gauge `ContextUsageRow` keeps: each call resends the whole
+/// history, so a sum would multiply-count it.
+#[must_use = "the record happens when the guard drops"]
+struct TurnUsageOnSpan {
+    span: tracing::Span,
+    last: Option<TurnUsage>,
+}
+
+struct TurnUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    stop_reason: Option<String>,
+}
+
+impl Drop for TurnUsageOnSpan {
+    fn drop(&mut self) {
+        let Some(usage) = self.last.take() else {
+            return;
+        };
+        self.span.record("llm.usage.input_tokens", usage.input_tokens);
+        self.span.record("llm.usage.output_tokens", usage.output_tokens);
+        self.span.record("llm.usage.cache_read_tokens", usage.cache_read_tokens);
+        self.span.record("llm.usage.cache_write_tokens", usage.cache_write_tokens);
+        self.span.record("llm.usage.reasoning_tokens", usage.reasoning_tokens);
+        if let Some(stop_reason) = usage.stop_reason {
+            self.span.record("llm.response.stop_reason", stop_reason.as_str());
+        }
+    }
+}
+
 /// Process LLM streaming in a background task with agentic loop.
 ///
 /// Handles all stream events, executes tools, and loops until the model signals
@@ -1327,8 +1368,9 @@ async fn dispatch_inline_tool_result(
 ///
 /// The span carries `llm.*` fields (matching the kernel's span namespace;
 /// metrics live under `gen_ai.*`). Usage fields are declared empty and
-/// recorded from the terminal `Done` event so token/cache/reasoning
-/// accounting lands on the trace, not just the metrics meter.
+/// recorded once at turn exit by [`TurnUsageOnSpan`], holding the final
+/// `Done` event's numbers, so token/cache/reasoning accounting lands on the
+/// trace, not just the metrics meter.
 ///
 /// `turn.*` is the outcome namespace, recorded at the publish site: how the turn
 /// ended (`turn.stop_reason`) and who asked for it (`turn.origin`) — the same two
@@ -1386,6 +1428,13 @@ async fn process_llm_stream(
     // id, not at spawn racing the model.
     origin: TurnOrigin,
 ) {
+    // Records the final call's usage on the `llm.turn` span when this
+    // function exits, whichever path it takes.
+    let mut usage_on_span = TurnUsageOnSpan {
+        span: tracing::Span::current(),
+        last: None,
+    };
+
     // The principal stamped on blocks this stream authors. Two provenance
     // categories share the turn: PROVIDER-OUTPUT is content the LLM itself
     // produced — the streamed Thinking and Text blocks and their appends,
@@ -2066,17 +2115,16 @@ async fn process_llm_stream(
                         None => (0, 0, 0),
                     };
 
-                    // Tack the usage onto the turn span (llm.* namespace) so
-                    // the numbers reach the trace, not just the metrics meter.
-                    let span = tracing::Span::current();
-                    span.record("llm.usage.input_tokens", input_tokens.unwrap_or(0));
-                    span.record("llm.usage.output_tokens", output_tokens.unwrap_or(0));
-                    span.record("llm.usage.cache_read_tokens", cache_read);
-                    span.record("llm.usage.cache_write_tokens", cache_write);
-                    span.record("llm.usage.reasoning_tokens", reasoning);
-                    if let Some(ref sr) = stop_reason {
-                        span.record("llm.response.stop_reason", sr.as_str());
-                    }
+                    // The turn span gets this call's usage at turn exit, once
+                    // (`TurnUsageOnSpan`); a later call replaces it.
+                    usage_on_span.last = Some(TurnUsage {
+                        input_tokens: input_tokens.unwrap_or(0),
+                        output_tokens: output_tokens.unwrap_or(0),
+                        cache_read_tokens: cache_read,
+                        cache_write_tokens: cache_write,
+                        reasoning_tokens: reasoning,
+                        stop_reason: stop_reason.clone(),
+                    });
 
                     // Record token usage to the global meter (no-op until OTel
                     // is enabled). Both the completed and cancelled paths spend
@@ -4235,6 +4283,152 @@ mod usage_tests {
                 assert_eq!(blocks.len(), 252);
             })
             .await;
+    }
+
+    /// The `llm.turn` span carries the turn's usage ONCE. Every `Done` used to
+    /// call `Span::record`, and `tracing_subscriber`'s fmt layer APPENDS each
+    /// record to a span's formatted fields instead of replacing it
+    /// (`fmt/fmt_layer.rs`, `on_record` → `add_fields`), so by iteration 10
+    /// every log line under the span carried ten copies of the usage block.
+    /// Pins one record per usage field per turn, holding the final call's
+    /// numbers — the same gauge `ContextUsageRow` keeps.
+    ///
+    /// The counting subscriber is the process-wide default, not a thread-local
+    /// one: a callsite caches its `Interest` the first time any thread hits
+    /// it, against that thread's default. Tests start together, so most of
+    /// the kernel's callsites are first hit by a sibling test's thread; with
+    /// a thread-local default they cache `never` and this thread's turn
+    /// creates no spans at all. A global default is what those registrations
+    /// consult. Spans are told apart by the thread that created them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn turn_span_records_usage_once_with_the_final_call() {
+        use std::sync::Mutex as StdMutex;
+        use std::thread::ThreadId;
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Default)]
+        struct Seen {
+            count: usize,
+            last: Option<u64>,
+        }
+        #[derive(Default)]
+        struct SpanSeen {
+            thread: Option<ThreadId>,
+            fields: HashMap<String, Seen>,
+        }
+        #[derive(Clone, Default)]
+        struct RecordCounter(Arc<StdMutex<HashMap<u64, SpanSeen>>>);
+        struct Count<'a>(&'a mut HashMap<String, Seen>);
+        impl Visit for Count<'_> {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                let seen = self.0.entry(field.name().to_string()).or_default();
+                seen.count += 1;
+                seen.last = Some(value);
+            }
+            fn record_debug(&mut self, field: &Field, _: &dyn std::fmt::Debug) {
+                self.0.entry(field.name().to_string()).or_default().count += 1;
+            }
+        }
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RecordCounter {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
+                if attrs.metadata().name() != "llm.turn" {
+                    return;
+                }
+                self.0.lock().unwrap().entry(id.into_u64()).or_default().thread =
+                    Some(std::thread::current().id());
+            }
+            fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+                let span = ctx.span(id).expect("a recorded span exists");
+                if span.name() != "llm.turn" {
+                    return;
+                }
+                let mut spans = self.0.lock().unwrap();
+                values.record(&mut Count(&mut spans.entry(id.into_u64()).or_default().fields));
+            }
+        }
+
+        let counter = RecordCounter::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(counter.clone()),
+        )
+        .expect("this is the only global subscriber the server test binary installs");
+        let here = std::thread::current().id();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("usage-span-once").await);
+                // A callsite whose registration straddled the install above
+                // may still hold the interest it computed against no
+                // subscriber; recompute now that they have all landed.
+                tracing::callsite::rebuild_interest_cache();
+                let provider = Provider::Mock(MockClient::new("unused").with_scripted_stream(
+                    vec![
+                        vec![
+                            StreamEvent::ToolUse {
+                                id: "call_1".into(),
+                                name: "nonexistent_tool".into(),
+                                input: serde_json::json!({}),
+                            },
+                            StreamEvent::Done {
+                                stop_reason: Some("tool_use".into()),
+                                input_tokens: Some(100),
+                                output_tokens: Some(20),
+                                extra: None,
+                            },
+                        ],
+                        vec![
+                            StreamEvent::TextStart,
+                            StreamEvent::TextDelta("done".into()),
+                            StreamEvent::TextEnd,
+                            StreamEvent::Done {
+                                stop_reason: Some("end_turn".into()),
+                                input_tokens: Some(150),
+                                output_tokens: Some(30),
+                                extra: None,
+                            },
+                        ],
+                    ],
+                ));
+                drive_turn_with(provider, 0, kernel.clone()).await;
+            })
+            .await;
+
+        let spans = counter.0.lock().unwrap();
+        let mine: Vec<&SpanSeen> = spans.values().filter(|s| s.thread == Some(here)).collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "this thread drove one turn, so one llm.turn span was created here"
+        );
+        let seen = &mine[0].fields;
+        for field in [
+            "llm.usage.input_tokens",
+            "llm.usage.output_tokens",
+            "llm.usage.cache_read_tokens",
+            "llm.usage.cache_write_tokens",
+            "llm.usage.reasoning_tokens",
+            "llm.response.stop_reason",
+        ] {
+            let s = seen
+                .get(field)
+                .unwrap_or_else(|| panic!("{field} was never recorded on llm.turn"));
+            assert_eq!(
+                s.count, 1,
+                "{field} recorded {} times on one llm.turn span — the fmt layer appends \
+                 every record, so a per-call record grows every log line",
+                s.count
+            );
+        }
+        assert_eq!(
+            seen["llm.usage.input_tokens"].last,
+            Some(150),
+            "the span carries the final call's usage, not the first's"
+        );
+        assert_eq!(seen["llm.usage.output_tokens"].last, Some(30));
     }
 }
 
