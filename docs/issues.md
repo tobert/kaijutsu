@@ -2,7 +2,7 @@
 
 Live work items distilled from prior design and TODO docs, plus architectural observations from code reviews. Code is truth; this exists to track what's *not* in the code yet.
 
-Organized by area. Keep entries terse — link to file:line when a pointer makes the work concrete. When an item ships, delete the entry — if the "how we got here" is worth keeping, move the narrative to [`devlog.md`](devlog.md) (the landed-work story). See the three-file working-notes pattern in `CLAUDE.md`.
+Organized by area. Keep entries terse — link to file:line when a pointer makes the work concrete. When an item ships, delete the entry — if the "how we got here" is worth keeping, move the narrative to [`devlog.md`](devlog.md) (the landed-work story). See `AGENTS.md`, "Writing, memory, and git".
 
 ---
 
@@ -60,15 +60,6 @@ background with `setpriority(PRIO_DARWIN_PROCESS, …)` / `PRIO_DARWIN_BG`,
 what `taskpolicy -b` does. Start with nice 10 for exec-granting seats and
 measure before adding a second mechanism.
 
-## `kj context create --as <character>` is designed, not built (2026-09-10)
-
-`played_by` is set only by MCP `register_session`; `kj context create`
-writes `None` (`kj/context.rs:1215`), so a seat created for a character
-from a kj shell is played by nobody. The director bundle bridges this with
-the context env `KJ_CHARACTER` (read by `S00-stance.kai` and
-`S16-handoff.kai`), the name slice 5 of `docs/character.md` plans to seed.
-Delete this entry when `--as` lands and the env bridge goes.
-
 ## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
 
 From an `mcp` seat with `[context_type.mcp] allow = ["kj context create"]`
@@ -102,6 +93,19 @@ A context created with `--cast budget` resolved `deepseek-v4-pro`, and the
 kernel log says `via CastSlot { cast: "budget" }`, but `.resolved_cast` in
 the info JSON is `null`. `.resolved_model` is right, so `S00-stance.kai`
 tiers correctly; the cast field is the one lying.
+
+## Optional rc reads collapse failures into missing-history text
+
+`assets/defaults/rc/lib/create/S16-handoff.kai` and `S17-predecessor.kai`
+guard reads with `|| true`. A missing sheet or predecessor is optional, but a
+storage/read failure takes the same path and may be reported as absent history.
+The scripts also swallow notification-write failures and then print "injected".
+Distinguish legitimate absence from failed reads/writes and report the actual
+outcome without making optional memory a prerequisite for context creation.
+`context info` also discards character lookup errors with `.ok().flatten()`,
+so rc can mistake an unreadable performer for an unassigned context.
+The performer-selection tests cover successful handoff injection; failure
+classification needs its own fixtures.
 
 ## A delegated coder inherits the lead's morning window (2026-09-10)
 
@@ -160,7 +164,7 @@ forks; the model's repaired wire pair does not change that durable status.
 
 - **`background_exec.rs` and CLAUDE.md disagree.** The module header says
   kaish's job system is not reusable here and treats the migration as
-  rejected; CLAUDE.md "Host exec has one owner" still names it as the
+  rejected; AGENTS.md "Config and execution" still names it as the
   ad-hoc exec site being retired. One of them is wrong; decide which.
 
 ## Living documents + project contexts (Amy, 2026-09-07)
@@ -643,9 +647,6 @@ Full reports: `docs/audits/`. Re-verified against the current tree:
   `kaijutsu-server rc reseed`. (`ensure_rc_seed_files` itself is install-if-
   absent per path and well tested — `rpc.rs` gaining `#[cfg(test)] mod
   context_bootstrap_tests` this pass is unrelated coverage, not this gap.)
-- **The `kj` builtin still flattens kaish's typed `ToolArgs` back to argv**
-  for clap to re-parse (`kj_builtin.rs`) — still waiting on kaish's
-  `ArgBinding::Verbatim` (not present at kaish 0.17, confirmed).
 - **`OutputProfile::Internal`** (`runtime/embedded_kaish.rs:127,1282`) is
   still present, still waiting on a kaish spill knob that doesn't remap the
   exit code.
@@ -1232,7 +1233,7 @@ list.
 migration is structurally wrong — a per-call `EmbeddedKaish` can't host a job
 that outlives the call, and kaish's job streams are ephemeral/in-process —
 and presents `spawn_background` as the deliberate, permanent design.
-CLAUDE.md's "Host exec has one owner" doctrine still names only the MCP
+AGENTS.md's "Config and execution" rule still names only the MCP
 stdio launch as the sanctioned exception; `background_exec.rs` isn't named
 there. The kaish-side worktree this entry was blocked on
 (`~/src/wt/kaish-jobs-embedder`) no longer exists.

@@ -2,10 +2,9 @@
 # create (docs/character.md, "The handoff is an ordinary context"). One body
 # in lib/, linked into every create bundle that wants it.
 #
-# Whose log: the context env `KJ_CHARACTER` names the character when
-# the seat is played for someone other than the caller (a director seat a
-# person drives from the tui is created by them, but the seat's memory is
-# the seat's character's). Unset, the caller's own character is read.
+# Read the performer's handoff log when `played_by` names a character.
+# Without a performer, read the caller's own log. Requester and performer
+# can differ when a person creates a model context with `--as`.
 #
 # S15-recall injects what the fleet knows; this injects what the last
 # session left. Together they are the morning window: who I am, what I was
@@ -40,20 +39,21 @@ set -e
 
 window=12
 
-who="$(kj context info --json | jq -r '.env.KJ_CHARACTER | tostring')"
+who="$(kj context info --json | jq -r '.played_by_name // empty')"
 
 # `kj handoff tail` prints "[when] author: text" per note, or a bare
 # "<name> has no handoff notes yet" line. It errors only when the named
 # (or calling) principal has no character sheet at all.
 case "$who" in
-  null|"")
+  "")
     who="your character"
     notes="$(kj handoff tail --window $window || true)"
     note_cmd="kj handoff note 'what you did, what is next'"
     ;;
   *)
-    notes="$(kj handoff tail --window $window $who || true)"
-    note_cmd="kj handoff note --for $who 'what you did, what is next'"
+    notes="$(kj handoff tail --window "$window" "$who" || true)"
+    # Resolve by context so a name is passed as a value, never shell source.
+    note_cmd="kj handoff note --for \"\$(kj context info $KJ_CONTEXT --json | jq -r .played_by_name)\" 'what you did, what is next'"
     ;;
 esac
 

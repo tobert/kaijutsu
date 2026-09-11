@@ -907,6 +907,22 @@ outranking everything shipped. `signoff.md` gave up its durable third to
 `docs/operating.md` the same day, on the way to being retired by the log it
 described.
 
+Banto made the next missing part concrete. Its director instructions knew its
+name through `KJ_CHARACTER`, but the context had no performer in `played_by`.
+Amy asked to align `AGENTS.md` with the character system, then added, "I'm open
+to completing some of that character work too." Explicit create-time `--as`
+now records the performer without changing the requester. Director and handoff
+scripts read that metadata, removing the environment bridge. Retirement can
+therefore find these contexts through the existing relationship. Provider block
+attribution remains a separate change because it changes block identity.
+
+A runnable handoff example exposed why dispatcher tests alone were insufficient:
+the kj adapter rebuilt split arguments with flags after positional text, turning
+`--for` into note content and writing into the caller's log. Kaish 0.17.2 already
+had the ordered-argument interface the backlog said was missing. Using it removed
+the reconstruction code. The regression executes the published advice and checks
+which log received the note, including names that require literal preservation.
+
 ## The hardware gets its own body (September 7–8)
 
 Amy wanted MIDI presence and music to survive closing the 3D app, then
@@ -1033,3 +1049,11 @@ iteration. A failed instruction read now stops preparation instead of silently
 running a context without its chosen prose. The review confirmed the main
 contracts and left metadata snapshot and fork-initialization fault handling as
 named follow-up work, with their limits recorded rather than called solved.
+
+The same separation now governs the repository instructions. `AGENTS.md` keeps
+work rules, essential invariants, and pointers; `docs/writing.md` owns the full
+writing guide and terms. The character document separates current behavior from
+its original inventory and rollout. This removes planned sheet fields from the
+working contract and corrects the claim that all block edits wait for hydration.
+The aim is fewer competing explanations, with correctness checked against code;
+source length alone is not evidence of better model behavior.

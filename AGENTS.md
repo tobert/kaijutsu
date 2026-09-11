@@ -1,509 +1,189 @@
 # 会術 Kaijutsu
 
-Kaijutsu is a cybernetic system for multi-user multi-model multi-context collaboration.
-It is an **instrument you play, not a harness that drives you** — you play it, a model
-plays it, anyone with a connected app plays it too; many hands on one keyboard. The
-kernel is the instrument's *body*: it holds context data, model interactions, workspaces,
-and tools, and supplies what a turn needs without playing the turn itself. It speaks SSH
-with Cap'n Proto over channels. (Named for humans in `docs/instrument-design.md`;
-embodied — never preached — in the model-facing rc stances.)
-
-## Stance
-
-Each context type chooses its behavioral instructions through rc. Coder and
-default opt into `/config/rc/lib/create/S00-base.md` with ordinary symlinks;
-coder adds its TDD procedure in `create/S00-stance.kai`. No prompt is forced
-into every type. Rc emits durable system instruction blocks, and the kernel
-adds runtime facts. `docs/prompts.md` owns composition, summary controls, and
-the migration from the removed global `system.md`.
-
-**Config is host files. Just write the file.** All four trees — `/config/rc`,
-`/config/kernel`, `/config/client`, `/config/midi` — are ordinary host
-directories reached through `LocalBackend`, and carry **no capability of their
-own**. The file tools, the editor, host `vim` and git all reach them, and
-`file:write` is what governs the ones that route through the kernel. Every
-lifecycle run reads the latest body from disk.
-
-**A `/config` path is a well-known name; where it comes from is a mount
-declaration** — `--config-root <dir>`, a `mounts.toml` inside it, or
-`--mount /config/rc=<dir>`. Declare nothing and every tree is an ordinary
-subdirectory of one root. `/config` itself has no backend: the mount table
-lists it from the mount points beneath it. `docs/config-namespace.md` is
-canonical.
-
-Change a shipped default by editing `assets/defaults/` (the in-repo seed),
-then `kaijutsu-server rc reseed [--force]` to materialize rc — Amy reseeds
-regularly, so treat the host rc tree as a materialization of the seed rather
-than a place to accumulate hand edits. A reseed **names** every file it
-leaves alone that differs from its default, so a tree pointed somewhere
-unexpected says so. `kj config` keeps only what has no file-tool equivalent:
-`list`, `show` and `reset` (restore the embedded default). Unlike rc,
-`/config/kernel` is local, snowflake, and points at secrets — never reseed
-over it.
-
-**Single kernel ownership is the invariant**, whatever the storage: config
-must never have two competing sources of truth.
-
-**kaijutsu does not squat `/etc`.** The host's `/etc` is a plain read-only
-host path, and the `deny_etc_write` guard that drew a line inside it is gone
-with the move.
-
-**Permission to get simpler** (Amy, 2026-08-15): *"If the agent can see the
-files and edit them, that's fine, we don't need to complicate it just because
-it's config."* Config is not a special category deserving its own machinery. If
-plain files plus the tools every player already has (kaish, the file tools, the
-editor) do the job, that is the answer — a reseed tool for the shipped defaults,
-and git as a skill reachable through rc or the help system rather than something
-the kernel performs. Prefer deleting a mechanism to generalizing it. This is
-explicit permission to reduce scope, not merely to avoid adding to it.
-
-**Kaijutsu is the learning space; delete and rewrite freely** (Amy,
-2026-08-19). There are no outside users to strand, so a mechanism that turned
-out wrong gets removed rather than deprecated, and a shape that fights us gets
-rewritten rather than wrapped. Deleting code you just wrote is a normal outcome
-here, not waste — a guard written to make a bad path fail loudly has done its
-job when the path itself goes away.
-
-**kaish and kaibo are not this.** They hope to have outside users, so they are
-conservative by comparison: a public surface there is a promise, breaking
-changes get declared and explained to an audience, and "we'll just change it"
-is not available. When work spans kaijutsu and one of them, the conservative
-rules govern the shared surface even though the kaijutsu side may be rewritten
-around it freely.
-
-**Shared trust, crosstalk-as-feature.** Every player — human, model, connected
-app, sibling context — is *inside* the trust boundary; the kernel runs as one
-unix user and the real boundaries live outside it. We design for resilience to
-boundary trespass, not enforcement between cooperating players: crosstalk is a
-feature (your neighbor's wrong note is one you cover). Capabilities/loadouts are
-**ergonomic nudges for focus and mistake-prevention, not security** — "less
-privileged" means *narrower focus* (footguns absent by construction), never less
-trusted, and mistake-prevention is routed through the loadout, not through auth
-denials between players. Full reasoning: `docs/instrument-design.md` ("Many hands,
-one trust boundary") + `docs/chameleon.md`.
-
-**Host exec has one owner.** All host process execution routes through
-kaish — `EmbeddedKaish`'s `ExternalExec::Allow{path}|Deny` policy (set in
-`kj/context_shell.rs`, enum in `runtime/embedded_kaish.rs`) is the one place
-exec authority, ignore config, output limits, and VFS cwd resolution live.
-The sole sanctioned exception is MCP stdio server launches
-(`mcp/servers/external.rs`) — config-driven, spawned by `rmcp`, never
-agent-supplied. A new ad-hoc exec site (another `/bin/sh -c`, another bare
-`Command::new`) is a design conversation, not a patch: it re-derives policy
-kaish already owns, and the copy drifts — see `docs/issues.md` for one that
-did and is being retired.
-
-## Durable state and the wire
-
-**The kernel is the sole sequencer.** Kaijutsu is not a partition-tolerant
-peer-to-peer system and does not try to be: there is one authoritative kernel,
-every accepted mutation gets a kernel-assigned sequence, and gap recovery is
-"ask the kernel again" — never a peer merge. Contexts are multi-writer because
-many players share one kernel, not because replicas reconcile.
-
-The shape every path should follow:
-
-```text
-rich RPC command  →  kernel validates and sequences  →  semantic operation +
-materialized state commit atomically  →  projected event stream  →  thin clients
-```
-
-Three rules that follow, and they are the ones to check a patch against:
-
-1. **Commands express intent; events express accepted facts.** Commit first,
-   publish second — never publish an event you have not durably accepted.
-2. **Clients never author or decode storage-engine operations.** A client that
-   decodes an oplog to learn what happened is reaching around the contract. Ask
-   for blocks and revisions as projected facts.
-3. **The durable and wire vocabulary is Kaijutsu's domain vocabulary** — blocks
-   authored, edited, completed, excluded; input edited, submitted, cleared — not
-   a text engine's encoding of them.
-
-**Clients read over the wire and write through kaish.** There is deliberately no
-client-facing RPC for editing block text — `pushOps` was the only one and it is
-deleted. A client *follows* a context through the change feed
-(`docs/change-feed.md`) and *mutates* by asking the kernel to run something:
-`kj block append`/`edit`, an MCP block tool, a kaish script. One mutation path,
-one set of capability checks, instead of a parallel RPC surface that would drift
-from it (Amy, 2026-08-15: *"clients should rely on stuff in kaish anyways most of
-the time"*). `authorBlock` stays — authoring a whole block is a submission, not
-an edit.
-
-**And the line that decides where a new surface goes** (Amy, 2026-08-15): *"kj is
-good enough for all admin-like stuff. normal ops over RPC is probably still
-advisable for chatty paths."* Administration — config, rc, reset, reload,
-anything an operator does occasionally and deliberately — is a `kj` verb, and
-does **not** earn a wire method. Chatty paths that run at interaction rate —
-compose keystrokes, the change feed, block queries — stay on RPC, because
-routing them through a shell dispatch per event is a cost with no benefit. Three
-config RPCs were deleted under this rule and had zero callers; `getConfig`
-survived it, because a client fetching its theme at bootstrap step 0 has no
-context to run `kj` in, and reading over the wire is what the rule above already
-sanctions.
-
-**Block text is a plain `String`.** There is no text CRDT in kaijutsu.
-`diamond-types-extended` is not a dependency of any crate and appears nowhere
-in `Cargo.lock`; the wire carries no storage-engine operations; the compose
-draft is an ordinary block. Two rules follow, and both are live:
-
-- **Concurrent merge into kernel documents is structurally impossible**, not
-  merely unobserved. There is no concurrent caller of `merge_ops`, and replay
-  is sequential self-application. Code that reasons about conflict resolution
-  here is reasoning about a state the system cannot reach — check before
-  building for it.
-- **Do not reintroduce a text CRDT** for block content. Streaming is 100%
-  append and `push_str` is amortized O(1), while per-block merge metadata cost
-  a measured ~4x the text it represented. If a surface genuinely needs
-  concurrent text merge, that is a design conversation.
-
-Amy's ruling and the reasoning behind it: `docs/crdt-position-2026-08.md`.
-
-## Crates
-
-`kaijutsu-types` first — the shared types every other crate depends on. Then
-`kaijutsu-kernel` (Kernel, the block store, VFS, MCP broker,
-LLM, drift, `kj` builtin), `kaijutsu-server` (SSH server, EmbeddedKaish),
-`kaijutsu-client` (RPC client, Send+Sync ActorHandle), `kaijutsu-app` (Bevy 0.19 GUI;
-inline SVG + ABC→staff rendering). Others: abc, audio, mcp, cas, agent-tools, editor,
-index, telemetry, hyoushigi, viz. Wire schema: `kaijutsu.capnp`. The stdio MCP server (`kaijutsu-mcp`)
-exposes most kernel capabilities and can be called as a hook from client applications.
-
-## Time
-
-Musical time is doctrine, not folklore — `docs/midi.md` "The one timebase":
-never chase a clock (model it); wire timing artifacts carry emission wallclock
-stamps and sinks back-date; stale timing data is rejected on a ladder; missed
-beats are missed (never replay); the kernel grid is scheduled-periodic; a
-dialed-in phasor free-runs on the local clock inside a deadband. Touch any
-beat/clock/cue code with that section open.
-
-## Conversation vs Context
-
-**Context** is the durable side: the kernel-sequenced block log, exclusions, edits, conversation metadata. Multi-writer — many players, one kernel. Holds more than the live conversation knows about.
-
-**Conversation** is the live session: an append-only message sequence shipped to the LLM. Hydrated from context once at boundary events (fork, new, cold start, attach) and append-only thereafter.
-
-`stage exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) reach the next turn through a per-context mailbox, which is a **pull-based cursor over the durable block log**, not a queue: a background writer inserts into the block store and the mailbox discovers the delta on the next turn's `catch_up`. **There is no insert-time atomicity gate**, so an unrelated writer can still land a block between a tool_use and its tool_result; what exists is repair at `snapshot()` time, which fixes the conversation shape and leaves the durable blocks interleaved. The gate is a named follow-up — `docs/conversation-session.md`, "Out of scope for Slice A".
-
-## Character
-
-A **character** is the persistent someone a name like `kaijutsu-lead`
-resolves to. Amy is one; so is every model seat. It is a principal with a
-sheet: accountable-to, default cast, and pointers to an rc directory, a
-memory root, a handoff track and a root context. A context is one
-performance of a character in a `context_type` by a cast. Slices 1, 2
-and 4 shipped 2026-09-06/07: the sheet, the keyring (`auth.db` binds a
-fingerprint to a principal id and nothing else), and the handoff log
-(`kj handoff note|tail`, injected at create by `S16-handoff.kai`).
-`docs/character.md` is canonical and carries the rollout. Not terms:
-party, chair, seat.
-
-## Machines
-
-Kaijutsu is hacked on across three machines — `hostname` tells you where you are:
-
-- **moltar** — Amy's office PC / gaming rig (Arch, real GPU). She is often at its
-  controls; the eurorack is connected here and VR is coming. Live GUI runs,
-  BRP-driven testing, and heavy builds belong here.
-- **zorak** — AMD Strix Halo; increasingly the kaijutsu *server and inference*
-  machine. Prefer not to burden it with builds.
-- **Amy's work MacBook Pro** — macOS client, already works via Bevy. Mac support
-  is expected: no Linux-only assumptions in the app without a mac story.
-
-Operating the live kernel on zorak (deploy, backup, bounce, rebuilding the
-MCP, driving it from an agent, parallel lanes): `docs/operating.md`.
-
-## Autonomous Development Loop
-
-Most testing happens on a Linux server with a real GPU that the user can connect to with remote desktop.
-
-```bash
-# user starts this in the Wayland session:
-./contrib/kaijutsu-runner.sh
-
-# agents use:
-./contrib/kj status|tail|pause|resume|rebuild|restart
-```
-
-The Bevy BRP tools work directly. Take screenshots frequently.
-
-## Working Notes
-
-Three markdown files carry work between sessions; keep them current **as you
-go**, not at the end. They compete for context tokens in every future session,
-so compression is part of maintaining them — the day-to-day detail is always
-recoverable from each file's own git history.
-
-- **`signoff.md`** (repo root, ephemeral, never committed) — the living handoff
-  a fresh process can't reconstruct: where we are, next moves, live-environment
-  facts, parallel-work warnings. Keep it to a couple screenfuls; melt durable
-  parts into the repo docs before they go stale, and delete sections once
-  melted. It is short-term memory, not an archive.
-- **`docs/issues.md`** (committed) — the open-work backlog and side-quest valve. Record
-  out-of-scope work here before moving on; **delete an entry when it ships** (melt the
-  story into the devlog if it's worth keeping). Code is truth; this tracks what's *not*
-  in the code yet.
-- **`docs/devlog.md`** (committed) — the evolving narrative of how kaijutsu and
-  its ideas took shape: arcs, decisions, and lessons, written oldest → newest.
-  It is a story, not a standup log. Fold new work into the chapter it belongs
-  to (or open one for a genuinely new arc) and compress chapters as they cool;
-  prefer rewriting a chapter over appending another status update to it. Commit
-  hashes, test counts, and daily blow-by-blow belong in `git log`, not here.
-
-## Git Conventions
-
-- Working on main (early development); parallel work on the same repo is common
-- Add files by name, avoid wildcards; ephemeral markdown is usually not committed
-- Set Co-Authored-By in commit messages, crediting the model that did the work.
-- **Never run `cargo fmt`.** `rustfmt.toml` disables it repo-wide so the command
-  is a no-op — don't work around that, and don't reformat by hand either. Match
-  the surrounding style. Rationale + the condition that would reverse it:
-  README.md "Code Style".
-
-Commit and pull request bodies should usually summarize the decisions behind the
-change, **drawn from the conversation with the user**. Commit messages briefly explain
-what happened as context for the more important task of explaining the decisions we
-made.
-
-## Writing style
-
-Kaijutsu keeps a small, predictable instrument so existing skill transfers. This
-guide keeps a small, predictable subset of English for the same reason. Read it
-before editing prose, comments, published help, or documentation.
-
-Absorbed from kaish's `AGENTS.md` (2026-08-18) and adapted — the rules are
-shared, the vocabulary is ours. Where a rule collided with kaijutsu's existing
-prose, the collision is named below rather than silently resolved.
-
-### Vocabulary choices
-
-Keep the vocabulary small. This limits the number of distinct words, not the
-length of the text — a familiar word may need a longer sentence.
-
-Use plain words instead of figures of speech. Make the intended meaning
-available from the words themselves, including in second-language or
-partial-context use.
-
-Use an established technical term when kaijutsu gives it one meaning. Those
-terms live in the Terms table below.
-
-Use the public word instead of a tool's private term. Write "18% fewer
-allocations," not "18% fewer blocks," because `block` already names a kaijutsu
-concept — a private term that collides with a public one is the worst case.
-
-Use American spelling to match the corpus: `modeled`, not `modelled`.
-
-### One term, one meaning
-
-Pick one word for each concept and keep it. Do not vary a word for style.
-
-Two words carry kaijutsu meanings that differ from kaish's guide. Ours win in
-this repo:
-
-- **`surface`** is a real kaijutsu noun, not a hedge: a place a player acts on
-  the instrument (the conversation surface, a write surface, the RPC surface,
-  the `kj` surface). It is legitimate when the thing named is a surface. It is
-  a hedge when it stands in for a specific artifact — then name the tool schema,
-  the error message, the help topic, or the RPC method instead.
-- **`seam`** is where two mechanisms are joined and one can be replaced. It is
-  ours and it stays. Use `boundary` for the line that separates available
-  actions from mechanism behind them. They are different words for different
-  things; do not treat them as synonyms.
-
-Cross-references take one form per target: `` see `kj help <topic>` `` for a
-help topic, and `docs/<file>.md`, "Section name" for a design document. Link
-instead of re-explaining.
-
-### Provide specific values
-
-Whenever it is practical, give the public exit code, size, flag, default, and
-condition. This saves a round trip and gives a model a clear observation to
-update against.
-
-> Before: Oversize output fails.
->
-> After: Oversize output spills to a file and exits 3.
-
-State the default and the condition too — "reads stdin when no files are given",
-"off by default; applies to `-r` only".
-
-### Fast and informative failures
-
-Make errors, warnings, and failures informative and, where possible,
-instructive. Lead with the consequence, name the condition, and suggest the next
-step when it is known.
-
-**Code comments are technical, not historical.** No dates, rulings, quotes,
-slice numbers, or commit hashes in a Rust comment or a schema comment — those
-live in `git log`, `docs/devlog.md`, and `docs/issues.md`. State the rule the
-code follows; a `docs/<file>.md` pointer is the exit to the why.
-
-Text that faces users, agents, and models must not leak internals. An internal
-module path is unresolvable to its reader and should appear only in an assertion
-or an error that indicates a real defect in kaijutsu.
-
-### Published text
-
-Some of what we write is shipped to models as part of their working context.
-Treat it as a product surface, not as a comment.
-
-Published in kaijutsu:
-
-- **`kj` help.** Every `///` on a clap struct field is reflected out of
-  `kj_command()` into help that agents read. Describe the argument's behavior
-  there. Put mechanism and rationale in `//` comments.
-- **MCP tool schemas.** Tool and parameter descriptions reach every connected
-  client.
-- **`docs/kj-help/`.** Help topics, read by models mid-task.
-- **rc scripts** under `/config/rc` — a `.md` block lands in the system-prompt
-  slot. This is the most expensive prose in the repo; every token competes.
-- **Error blocks.** `BlockKind::Error` text is read by the model that caused it.
-
-> Before: `/// List rc lifecycle runs (the durable "did the rc lifecycle`
-> `/// actually fire" checklist — approval_ledger::rc_runs), or, with a run`
-> `/// id, show one run's per-script detail. A bare positional (not a --run`
-> `/// flag) to match show <request_id>'s shape ...`
->
-> After: `/// List rc lifecycle runs, most recent first. With a run id, show`
-> `/// that run's per-script detail.`
-
-Do not infer the published text by grepping the source — read what the reflection
-actually emits, by running the command's `--help` or reading the tool schema.
-When you touch a `kj` verb, audit every `///` on its clap struct; the visit
-supplies the context needed to judge each line.
-
-### Write for model context
-
-Use the same prose in human and model contexts. Assume the context may be
-truncated: put the rule before its justification, so a cut keeps the rule.
-Teach syntax with examples. Repeat a rule in the error that enforces it.
-
-### The example is the rule
-
-Show the correct example before explaining it. Make the example carry the rule
-by itself, so the explanation is confirmation rather than the only source.
-
-> Before: **Exclude, then fork.** `stage exclude` operates on the context and
-> only takes effect at the next hydrate boundary.
->
-> After: `kj stage exclude <id> && kj fork` — exclusion lands at the next
-> hydrate boundary, and fork is the boundary you can reach on demand.
-
-Avoid incorrect examples. When one is necessary, put the correct form first and
-mark the error next to it:
-`kj block read 'abc12345#7'`; `kj block read abc12345#7 # error — kaish eats the #`.
-
-### Terms
-
-Terms that carry a guarantee. **This table is the source.** The list grows when
-a collision appears in real prose, not in advance.
-
-| Term | Part of speech | Meaning |
+Kaijutsu is a cybernetic system for people and models working together across
+contexts. It is an instrument you play: the kernel holds durable state, model
+interactions, workspaces, and tools; players choose the work. It speaks SSH
+with Cap'n Proto over channels. See `docs/instrument-design.md`.
+
+## Working together
+
+Work as peers. Amy is accountable for our work. Follow her objective and
+corrections; a progress question does not cancel unfinished work. Ask when a
+choice needs her judgment, and continue independent work while waiting.
+
+Read the relevant code and project notes before editing. Prefer changing or
+removing an existing mechanism to adding a second one. Kaijutsu is our learning
+space, with no outside users to strand: delete and rewrite when the design
+calls for it. Shared interfaces with kaish and kaibo carry their more
+conservative public compatibility promises.
+
+Use test-driven development for behavior changes: write or adapt a test,
+observe it fail for the intended reason, implement, then run the relevant
+checks. Verify user-facing behavior where it is used. Distinguish observations,
+inferences, and unknowns; report what ran and any verification left undone.
+Investigate contributing factors. Fail loudly rather than continue on a wrong
+assumption or corrupt data.
+
+Treat unexpected edits as another player's work. Coordinate overlapping
+changes. A context fork does not isolate files; use git worktrees under
+`~/src/wt/` for pull requests. Working on main is normal here.
+
+Prefer Kaibo when reviewing code. Use DeepSeek through its own API for bulk
+model work; choose cheap models for probes. OpenRouter is for comparisons,
+and hosted GPT sol-tier spend is deliberate. Ask Amy before posting publicly
+or to repositories we do not own.
+
+## Characters and prompts
+
+A **character** is the persistent someone a name resolves to, human or model.
+Its identity is a `PrincipalId`; its sheet lives in `kernel.db`. Today the sheet
+holds name, creation/retirement timestamps, and an optional handoff context.
+`auth.db` binds credentials to principals; it does not own character names.
+`kj character` manages sheets, and `kj handoff note|tail` accesses their logs.
+Retirement archives contexts whose `played_by` names the character.
+
+Keep requester, performer, context type, and cast distinct. `created_by` names
+the requester who created a context; `played_by` records its performer when
+set. A `context_type` selects the role's rc bundle; a cast selects models for
+roles. `kj context create --as <character>` sets the performer explicitly; omitting
+it leaves the performer unset on this path. Provider-output attribution and
+composition with character rc are still planned. Accountable-to, default cast,
+rc directory, memory root, and root context are also planned sheet fields.
+See `docs/character.md`, "Current implementation" and "Rollout, smallest first".
+
+Banto uses the existing `director` type. Create its context with `--as banto`;
+director instructions and handoff injection read the performer metadata. The
+old `KJ_CHARACTER` environment bridge did not set identity and is no longer
+read by the shipped scripts. `ROTATED_FROM` loads predecessor prose.
+Use `docs/prompts.md`, "Rotating a director context" for the current procedure.
+
+Each context type chooses its instructions through rc. Coder, default, and
+director link to `lib/create/S00-base.md`; other types choose their own
+contracts. There is no mandatory behavioral prepend. Rc creates durable
+`(System, Text)` instruction blocks; the kernel adds runtime facts.
+
+Read `docs/prompts.md` before changing prompt composition or rc instructions.
+It owns the implemented contract; `docs/oss-comparisons.md` owns the research.
+Keep collaboration guidance in the optional shared base, task procedure in the
+type, syntax in help/schema, and changing observations in notifications.
+Character-specific rc is a design direction, not an available loader feature.
+Model-name tiers are policy choices awaiting comparative evidence.
+
+## State and interfaces
+
+The kernel is the sole sequencer. Accepted mutations commit their semantic
+operation and materialized state atomically, then publish projected events.
+Commands express intent; events express accepted facts. Gap recovery asks the
+kernel again. Clients neither author nor decode storage-engine operations.
+
+Clients read over RPC and edit through kaish (`kj block append|edit`, block
+tools, scripts). Whole-block submission (`authorBlock`) and interaction-rate
+paths such as compose input, block queries, and the change feed remain RPC.
+Administration belongs in `kj`: config, rc, reset, and reload do not earn wire
+methods. Bootstrap config reads remain RPC. See `docs/change-feed.md`.
+
+Block text is a plain `String`; streaming appends with `push_str`. There is no
+text CRDT or concurrent merge into kernel documents. Do not reintroduce one
+without a design conversation. See `docs/crdt-position-2026-08.md`.
+
+A **context** is durable metadata and a kernel-sequenced block log, with edits
+and exclusions. A **conversation** is the live append-only message sequence
+hydrated from it at fork, new, cold start, or attach.
+
+`kj stage exclude <id> && kj fork` removes unwanted history from the child's
+conversation. History edits wait for hydration; stored system instruction edits
+and exclusions affect the next turn. Editing an rc source file affects future
+lifecycle runs, not already stored instructions. See `docs/prompts.md`.
+
+Async writers reach the next turn through a mailbox cursor over the durable
+log. There is no insert-time tool-pair gate; snapshot repair fixes the live
+conversation shape while durable blocks may remain interleaved. See
+`docs/conversation-session.md`.
+
+Every player is inside one trust boundary; the kernel runs as one Unix user.
+Capabilities and loadouts narrow focus and prevent mistakes. They are not
+security boundaries between players. See `docs/instrument-design.md`, "Many
+hands, one trust boundary" and `docs/chameleon.md`.
+
+## Config and execution
+
+Config is ordinary host files reached through `LocalBackend`. `/config/rc`,
+`/config/kernel`, `/config/client`, and `/config/midi` have no capabilities of
+their own; kernel file writes use `file:write`. `/config` is a mount-table name,
+with no backend of its own. Declare locations through `--config-root`,
+`mounts.toml`, or `--mount`; see `docs/config-namespace.md`.
+
+Edit shipped defaults in `assets/defaults/`, then materialize rc with
+`kaijutsu-server rc reseed [--force]` when deploying. Reseed reports differing
+files it leaves alone. Treat host rc as a materialization of the seed.
+`/config/kernel` is local configuration and points at secrets: never reseed
+over it. `kj config list|show|reset` supplies inspection and explicit restoration
+of embedded defaults. Keep one owner for each configuration value.
+The host's `/etc` remains a plain read-only host path.
+
+Host execution policy belongs to kaish's `EmbeddedKaish` and its
+`ExternalExec::Allow{path}|Deny` setting in `kj/context_shell.rs`. MCP stdio
+server launch through `rmcp` is the sanctioned config-driven exception.
+A new `Command::new` or `/bin/sh -c` execution path needs a design conversation;
+see the existing `background_exec.rs` discrepancy in `docs/issues.md`.
+
+## Finding and checking code
+
+Start with `kaijutsu-types` for shared domain types. `kaijutsu-kernel` owns
+state, VFS, model work, MCP brokerage, and `kj`; `kaijutsu-server` owns SSH and
+embedded kaish; `kaijutsu-client` owns the RPC client and `ActorHandle`.
+`kaijutsu-app` is the Bevy GUI; `kaijutsu-tui` is the terminal client;
+`kaijutsu-mcp` is the stdio MCP bridge. Wire schema: `kaijutsu.capnp`.
+
+Run `hostname` before planning builds or live checks. **moltar** has the real
+GPU and hosts heavy builds, GUI runs, and BRP checks. **zorak** serves the
+kernel and inference; avoid burdening it with builds. The MacBook is a supported
+client: app changes need a macOS story. Read `docs/operating.md` before working
+on the live kernel, including builds beside it.
+
+For GUI work, Amy starts `./contrib/kaijutsu-runner.sh` in her Wayland session.
+Use `./contrib/kj status|tail|pause|resume|rebuild|restart` to operate that runner,
+and BRP tools plus screenshots to check the app.
+
+Read the relevant contract before changing these areas:
+
+| Area | Rules to preserve | Read |
 |---|---|---|
-| kernel | noun | The kaijutsu kernel. Not the OS kernel, and not kaish's execution core — say "kaish kernel" when you mean that one. |
-| context | noun | The durable, kernel-sequenced, multi-writer side: block log, exclusions, edits, metadata. |
-| conversation | noun | The live append-only message sequence shipped to the LLM, hydrated from a context at a boundary event. |
-| document | noun | The storage primitive in the block store. A context is metadata on a `Conversation` document; the two words are not interchangeable. |
-| block | noun | One authored unit in a document. Never use it for an allocation, a disk block, or a UI rectangle. |
-| player | noun | Anyone acting on the instrument — human, model, connected app, sibling context. All players are inside one trust boundary. |
-| capability | noun | An ergonomic nudge that narrows focus and removes a footgun. Never a security control, and never a statement that a player is less trusted. |
-| loadout | noun | The set of capabilities a context is given. Where mistake-prevention is routed. |
-| gate | noun, verb | The check that stops a statement to ask a human. The one place that authority lives. |
-| ask | noun | A durable row a gate leaves behind, waiting for a decision. Answered through `kj ledger`. |
-| fork | noun, verb | Making a child context. The structural parent edge; the context graph is a forest. |
-| drift | noun, verb | An overlay edge between contexts, deliberately cyclic. Never unify it with fork. |
-| hydrate | verb | To build a conversation from a context. Happens only at a boundary event. |
-| sequence | verb, noun | What the kernel does to every accepted mutation. There is exactly one sequencer. |
-| fail loudly | verb phrase | An error is explicit and immediate. We never continue on a wrong assumption, and we prefer crashing to corrupting. |
-| character | noun | The persistent someone a name resolves to; human or model. A principal with a sheet (`docs/character.md`). For a text unit say code point, glyph, or `char`, never character. |
-| context_type | noun | The rc bundle a context runs, `/config/rc/<type>/<verb>/`. A role, not an individual; half of the rc union once characters land. Not "chair". |
+| Beat, clock, cue | Model the clock; stamp emissions and back-date sinks; reject stale data; never replay missed beats; scheduled-periodic kernel grid; local phasor free-runs inside its deadband | `docs/midi.md`, "The one timebase" |
+| App input | Central action table → `ActionFired` → handlers; add `InputContext` and bindings. Only the vi editor grabs raw keyboard input. Vi owns Esc where live; elsewhere one `PopLevel` | `docs/input.md` |
+| Tui | Transcript goes once into terminal scrollback; fixed-height live band changes text, not height. Thinking pane and picker/ledger dismissal have documented exceptions | `docs/tui.md`, "Surfaces" and "The in-flight strip" |
+| Navigation and editing | Preserve screen/tmux `Ctrl+A` and vi muscle memory; document differences | `docs/input.md` and `docs/tui.md` |
 
-## Proprioception
+For Bevy APIs, read `Cargo.lock` and the matching cargo cache source. A related
+crate's version does not identify its Bevy dependency. Check
+`git -C ~/src/bevy describe --tags` before using that checkout and report which
+tag you read; its examples may be stale.
 
-The tui and the app are where the hands Amy has trained on the tools she
-already plays become the written language of this shared space. The theme
-is combining tools that are already great at a deeper level, never
-reinventing them: **screen/tmux → context navigation** (the `Ctrl+A`
-prefix, `[` for copy mode, windows are contexts), **vi/vim → editing modes**
-(compose, the `:` line, the editor, copy mode's motions). Match the original
-where it lines up. Where it does not, name the difference in `docs/tui.md`
-or `docs/input.md`, and leave room to trip on a new combination — Amy's
-statements are guidance, not rulings.
+`ComputedNode` dimensions and UI `GlobalTransform` are physical pixels; font
+sizes, `Val::Px`, and `ScrollPosition` are logical. Convert with
+`view::ui_rtt::logical_size` or `logical_content_size` before layout math.
 
-**The tui's live band is a static-height box pinned at the bottom.** The
-transcript is printed once into the terminal's own scrollback and never
-redrawn; the inline viewport below it is the only thing that changes,
-and it changes its text, not its height. What is in flight is one fixed
-row (the in-flight strip), not a body that grows and shrinks, because a
-resize scrolls the transcript and a mutating row does not. Grow the band
-only for a surface that earns it once per turn (the thinking pane) or on
-dismissal (the picker, the ledger). `docs/tui.md`, "Surfaces" and "The
-in-flight strip".
+## Writing, memory, and git
 
-The standard is a power user's: roll with defaults plus a few earned
-preferences, and never overhaul a tool from the state its developers ship
-it in. A powerful subset of a few powertools, played really well. Amy
-(2026-09-03): *"Claude Code is pretty good but also I am an expert and it is
-increasingly a consumer tool, and it should be, that's its promise.
-Kaijutsu is a first generation mecha for us to make music and build with
-whatever and whoever we meet."* A kaijutsu surface is judged against the
-instrument a player already knows, not against what a consumer tool does.
-Proprioception is the pilot feeling the machine as her own body; the muscle
-memory she brings is what the machine must not fight.
+Read `docs/writing.md` before editing prose, comments, help, or schemas. It owns
+the Terms table. Use plain words, one term per concept, American spelling, and
+correct examples first. State the rule before the reason. Keep history out of
+code comments. For `kj` changes, audit the clap field docs and read emitted
+`--help`; for tools, inspect the emitted schema.
 
-## App Input
+Keep these notes current as work progresses:
 
-All keyboard/gamepad/mouse input in `kaijutsu-app` flows through the central
-action table (`crates/kaijutsu-app/src/input/`): raw input → Ctrl+A prefix →
-one dispatcher → `ActionFired` → domain handlers. **Never read
-`ButtonInput`/`KeyboardInput` directly in a view or scene** — add an
-`InputContext` + bindings to the table instead; gamepad, `bindings.toml`
-rebinding, and the `?` legend then come free. The vi editor is the one
-sanctioned raw reader (an explicit keyboard grab). `docs/input.md` is
-canonical: Esc doctrine (vi owns Esc where a vi surface is live; elsewhere
-it is exactly one `PopLevel`), the Ctrl+A prefix table, clipboard model.
+- `signoff.md` at the repo root (ephemeral, never committed), or
+  `~/exomemory/kaijutsu/signoff.md`: short handoff, user quotes, next moves,
+  live facts, and overlapping work. Keep it to a couple screenfuls.
+- `docs/issues.md`: open work and out-of-scope findings. Record them before
+  moving on; delete entries when the work ships.
+- `docs/devlog.md`: decisions and lessons, oldest to newest. Fold work into
+  its existing chapter and compress as it cools. Daily detail belongs in git.
 
-## Bevy Quick Reference
+Add files by name. Never run `cargo fmt`, work around its disabled config, or
+reformat by hand; match surrounding style. See README.md, "Code Style".
+Commit and PR bodies explain decisions from the conversation and relevant
+validation. Credit contributing models with `Co-Authored-By`.
 
-**We are on Bevy 0.19** (`Cargo.lock`, and `crates/kaijutsu-app/Cargo.toml`
-declares `"0.19"`). This heading said 0.18 until 2026-08-15, when a subagent
-reported the mismatch mid-task — the doc warning below about a stale checkout
-applies to this document too. **The lockfile is the answer to "what are we on";
-check it rather than this line.**
-
-Trust this table over training memory — these renames landed in 0.18, still
-hold in 0.19, and are newer than most model training.
-
-| Old (0.14-0.17) | New (0.18) |
-|-----------------|------------|
-| `#[derive(Event)]` | `#[derive(Message)]` |
-| `EventReader<T>` / `EventWriter<T>` | `MessageReader<T>` / `MessageWriter<T>` |
-| `events.send(x)` | `messages.write(x)` |
-| `app.add_event::<T>()` | `app.add_message::<T>()` |
-| `ChildBuilder` | `ChildSpawnerCommands` |
-| `BorderColor(color)` | `BorderColor::all(color)` |
-| `query.get_single()` | `query.single()` |
-
-**HiDPI units:** `ComputedNode` (size/content_box/border/padding) and UI
-`GlobalTransform` are **physical** pixels; font sizes, `Val::Px`, and
-`ScrollPosition` are **logical**. Never feed a raw `ComputedNode` dimension
-into layout math — convert via `view::ui_rtt::logical_size` /
-`logical_content_size` (invisible at 1x, breaks on HiDPI).
-
-Bevy source: `~/src/bevy`, examples at `~/src/bevy/examples/`
-
-**Check what `~/src/bevy` is on before trusting it.** It is a working
-checkout, not a pinned mirror — on 2026-08-12 it was five months stale
-(0.18.1) while 0.19.0 was out, so a sweep planned against it would have
-concluded 0.19 did not exist. Run `git -C ~/src/bevy describe --tags` first,
-`git fetch` and check out the tag you actually mean, and **say in your
-findings which tag you read**. While we are mid-migration, **prefer the cargo
-caches** (`~/.cargo/registry/`) as truth for "what does version X require" — a
-cached `.crate` tarball's `Cargo.toml` is the real manifest and cannot go
-stale the way a checkout can. This applies to subagents too: tell them the
-tag, don't let them assume.
-
-A related trap that already bit us: **a dependency's own version number says
-nothing about which Bevy it targets.** `bevy_brp_extras = "0.19"` required
-`bevy 0.18.1`; its first release wanting Bevy 0.19 was 0.21.0, and the
-workspace now pins `0.22`. Read the pin, never infer it from the number.
+The standard we walk by is the standard we accept — 改善（かいぜん）.

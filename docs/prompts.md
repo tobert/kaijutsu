@@ -16,11 +16,13 @@
 The shared base is optional. Coder, default and director include it through
 ordinary relative symlinks. Musician, bassist, assistant, mcp, and toolie keep
 their own role contracts. Director is the operator's seat: its stance names
-the character in the seat (`KJ_CHARACTER`, below) and `S06-kj-help.kai`
-composes `kj help` plus every top-level `kj <verb> --help` into one durable
-instruction block, so the seat runs kj from its own reference rather than
-reading help mid-task (about 28 KB; the cache breakpoint on the system
-prompt absorbs it). Kaijutsu never prepends a universal behavioral prompt.
+the character recorded in `played_by` (below) and `S06-kj-help.kai`
+composes `kj help` plus a selected set of eighteen top-level verb help pages
+into one durable instruction block. Leaf command help remains available on
+demand. This reference was about 28 KB when introduced; that is a source size,
+not a token measurement. The system cache breakpoint permits reuse where the
+provider supports it; the initial request still pays for the reference.
+Kaijutsu never prepends a universal behavioral prompt.
 The kernel adds runtime facts; rc supplies the chosen instruction sections.
 
 The link filename controls order: `S00-base.md` precedes `S00-stance.*`.
@@ -47,27 +49,81 @@ excluded, ephemeral, draft, and empty instruction blocks. A failed block read
 stops both preview and live turn preparation. An existing context with no
 instruction sections remains valid.
 
-## Rotating a seat
+## Characters and lifecycle observations
+
+`kj context create ROOT-next --type director --cast ops --as banto` records
+Banto's principal in `played_by`, while `created_by` remains the requester.
+The character must exist and be live; unknown or retired names fail before
+creating a context. Omitting `--as` leaves `played_by` unset on this `kj` path.
+This does not change provider-output attribution or load a character rc
+bundle. See `docs/character.md`, "Current implementation".
+
+Director's stance and the shared `S16-handoff.kai` read `played_by_name` from
+context metadata. The handoff script reads that character's log, or the caller's
+log when no performer is recorded. `KJ_CHARACTER` was an environment bridge;
+new create instructions no longer use it. Existing stored instructions are
+unchanged until edited or replaced with a new context.
+
+Handoff, memory recall, datetime, and predecessor text are changing observations.
+Their scripts emit `(System, Notification)` blocks, which hydrate into the
+conversation without joining the cached system instruction sections. Handoff
+reads the last twelve notes. A missing handoff log or predecessor is reported
+as fallback text; these optional scripts do not abort creation. This differs
+from the required instruction-file reads described below.
+
+## Rotating a director context
 
 ```sh
 kj handoff note --for banto 'what happened, what is next'
-kj context create ROOT-next --type director --cast ops \
-  --env 'KJ_CHARACTER=banto' --env 'ROTATED_FROM=ROOT'
+kj context create ROOT-next --type director --cast ops --as banto \
+  --env 'ROTATED_FROM=ROOT'
+kj context info ROOT-next --json
+kj context prompt ROOT-next
+kj block list -c ROOT-next
+```
+
+Check that `played_by_name` is `banto`, the expected instructions and handoff
+arrived, and the create lifecycle left a usable loadout. Read any Error blocks
+before replacing the previous context. Then:
+
+```sh
 kj context archive ROOT --confirm
 kj context rename -c ROOT-next ROOT
 ```
 
-Two context env values drive the create lifecycle. `KJ_CHARACTER` names the
-character playing the seat: `S00-stance.kai` addresses it by name and
-`S16-handoff.kai` reads that character's handoff log instead of the caller's
-(the caller is whoever ran `create`, a person at the tui as often as not).
-`ROTATED_FROM` names the predecessor: `S17-predecessor.kai` injects its last
-twelve prose blocks, each cut at 400 bytes, as a notification, read with
-`kj wait` so an idle predecessor resolves from its log without parking. Both
-are bridges until `kj context create --as <character>` and the rc union land
-(`docs/character.md`, slices 3 and 5); the env names are the ones slice 5
-plans to seed. `kj fork --compact` is the alternative once a handoff worth
-distilling exists; it keeps the type and runs the fork lifecycle instead.
+`ROTATED_FROM` names the predecessor. Director's `S17-predecessor.kai` reads
+up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes
+400 --include text`, then emits a notification. This is a bounded excerpt,
+not a complete continuation; it omits tool results and can cut prose. An idle
+predecessor resolves from its log without waiting for another turn.
+
+`kj fork --compact` is the alternative when retaining recent working state
+and a generated continuation is useful. It keeps the source's type and
+performer metadata and runs the fork lifecycle, not creation.
+
+## Maintaining instructions
+
+Keep `AGENTS.md` to repository work rules and essential invariants. Put task
+procedure in the context type, shared collaboration guidance in the optional
+base, and syntax in emitted help and tool schemas. A character's enduring
+commitments and memory sources belong with that character; the planned rc
+union is not yet implemented. Detailed writing rules and terms live in
+`docs/writing.md`.
+
+Write the rule before its reason and show correct examples. Preserve the user's
+objective, corrections, and unresolved work. Report observations, inferences,
+and unknowns separately. Verify the complete rendered instructions and available
+tools, including lifecycle selection and hydration, before attributing a result
+to prompt wording.
+
+The research in `docs/oss-comparisons.md`, "Direction for base, coder, and
+general-purpose contexts" motivates this division of responsibilities. It is
+source review and design evidence, not a measured model ranking or proof that
+fewer words improve performance. Coder and director choose a stance tier during
+creation; changing the model later updates runtime facts but does not rerun the
+stance. Compare behavior on the same tasks before expanding model-name rules.
+Measure system text and tool schemas separately with the target tokenizer or
+provider usage; bytes alone do not measure token cost or effectiveness.
 
 ## Briefing and continuation
 
@@ -150,6 +206,12 @@ Compact mode has its own retention policy. It rejects `--include`, `--exclude`,
 `--prompt` adds a new instruction and requests a child turn after initialization.
 
 ## Migration and comparison
+
+Deploy the `--as` implementation and metadata-reading director/handoff scripts
+together. A kernel that lacks the flag cannot create the intended performer
+relationship. Replace contexts using the old `KJ_CHARACTER` bridge with verified
+successors as described above; changing the seed does not rewrite their stored
+instructions or assign their performer retroactively.
 
 Deploy code and rc together. The old `/config/kernel/system.md` is no longer
 read or seeded. Existing contexts may have depended on that automatic base;

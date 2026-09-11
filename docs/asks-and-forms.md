@@ -28,7 +28,7 @@ The data is different. The blocking is the same. That split is the whole brief.
 The coder runs the command; the gate stops it; an ask row lands in the ledger;
 an orchestrator answers with `kj ledger allow <id>`. No new surface is needed,
 and `ask` already means exactly this in kaijutsu's vocabulary — *a durable row a
-gate leaves behind, waiting for a decision* (`CLAUDE.md`, Terms).
+gate leaves behind, waiting for a decision* (`docs/writing.md`, "Terms").
 
 What is broken is the **wait**, not the vocabulary: `gate_wait_timeout` is one
 process-wide 300 s (`kaijutsu-types/src/timeout.rs`), so an unattended coder
@@ -45,7 +45,7 @@ mechanisms named the same thing.
 Drift is an overlay that carries *findings* between contexts. A request for a
 decision is not a finding, and routing one through drift would make drift mean
 two things. `fork` and `drift` are already kept distinct on purpose
-(`CLAUDE.md`, Terms); this would blur a third thing into one of them.
+(`docs/writing.md`, "Terms"); this would blur a third thing into one of them.
 
 ## The ledger is three layers, and only the bottom is shell-shaped
 

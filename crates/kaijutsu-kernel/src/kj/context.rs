@@ -32,7 +32,7 @@ pub(crate) struct ContextConfigArgs {
     /// Model spec `provider/model` or a bare model name (resolved to default provider)
     #[arg(long, short = 'm')]
     model: Option<String>,
-    /// System prompt text
+    /// Stored legacy prompt value; not included in model instructions. Use rc instruction blocks
     #[arg(long = "system-prompt")]
     system_prompt: Option<String>,
     /// Consent mode: collaborative|autonomous
@@ -44,7 +44,7 @@ pub(crate) struct ContextConfigArgs {
     /// Set an env var as KEY=VALUE. Repeat the flag for more than one
     #[arg(long)]
     env: Vec<String>,
-    /// rc-dispatch context_type (selects which /config/rc scripts run)
+    /// Context type selecting the /config/rc lifecycle bundle
     #[arg(long = "type")]
     type_: Option<String>,
     /// Cast label — the named model ensemble this context plays under
@@ -83,10 +83,8 @@ enum ContextCommand {
         /// labels come from `kj context list`.
         context: Option<String>,
     },
-    /// Render the system prompt this context actually gets: the exact
-    /// `rc sections → <situation>` assembly the LLM turn path
-    /// builds, so prompt/stance tuning can be verified against live kernel
-    /// state instead of inferred from rc scripts (default: current).
+    /// Show the system instructions and runtime facts used for this context's
+    /// next model turn (default: current).
     // Mirrors `crate::llm::build_system_prompt` (llm_stream.rs's
     // `spawn_llm_for_prompt`) exactly, reading the live DriftRouter handle
     // rather than falling back to the KernelDb row — a resolved target with
@@ -111,12 +109,16 @@ enum ContextCommand {
     Create {
         /// Label (positional form; or use --name)
         label: Option<String>,
-        /// Label (flag form, fork-parity)
+        /// Label (flag form; takes precedence over the positional label)
         #[arg(long, short = 'n')]
         name: Option<String>,
         /// Parent context to fork the structural edge from
         #[arg(long, short = 'p')]
         parent: Option<String>,
+        /// Existing live character performing this context. Unset by default;
+        /// does not change the requester or block authorship
+        #[arg(long = "as", value_name = "CHARACTER")]
+        character: Option<String>,
         #[command(flatten)]
         config: ContextConfigArgs,
     },
@@ -519,11 +521,13 @@ impl KjDispatcher {
                 label,
                 name,
                 parent,
+                character,
                 config,
             } => {
                 self.context_create(
                     name.or(label).as_deref(),
                     parent.as_deref(),
+                    character.as_deref(),
                     config.into(),
                     caller,
                 )
@@ -679,12 +683,8 @@ impl KjDispatcher {
                 .and_then(|cid| db.get_cast(cid).ok().flatten())
                 .map(|c| c.label);
 
-            // The character playing this context, if any — the row carries
-            // only the principal id; resolve its name here the same way
-            // `cast_label` resolves `cast_id`. A dangling id (the character
-            // retired but the pointer was never cleared) shows as absent,
-            // not an error — `played_by` staying set through a retirement
-            // is metadata, not corruption, in this slice.
+            // Resolve the performer's name for live and archived contexts.
+            // Retirement preserves both the sheet and this relationship.
             let played_by_name = row
                 .played_by
                 .and_then(|pid| db.get_character(pid).ok().flatten())
@@ -1126,6 +1126,7 @@ impl KjDispatcher {
         &self,
         label: Option<&str>,
         parent: Option<&str>,
+        character: Option<&str>,
         mut cfg: ContextConfig,
         caller: &KjCaller,
     ) -> KjResult {
@@ -1179,9 +1180,24 @@ impl KjDispatcher {
         };
         let new_id = ContextId::new();
 
-        // Write-through: KernelDb first, then DriftRouter
+        // Resolve the performer under the same lock as insertion so retirement
+        // cannot happen between validation and the new context becoming visible.
+        // The requester remains the author of creation and rc output.
         {
             let db = self.kernel_db().lock();
+            let played_by = match character {
+                Some(name) => match db.get_character_by_name(name) {
+                    Ok(Some(row)) if row.retired_at.is_none() => Some(row.principal_id),
+                    Ok(Some(_)) => return KjResult::Err(format!(
+                        "kj context create: character '{name}' is retired; choose a live character with `kj character list`"
+                    )),
+                    Ok(None) => return KjResult::Err(format!(
+                        "kj context create: no character named '{name}'; use `kj character list` or `kj character create <name>`"
+                    )),
+                    Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+                },
+                None => None,
+            };
             let default_ws = match db.get_or_create_default_workspace(caller.principal_id) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
@@ -1210,7 +1226,7 @@ impl KjDispatcher {
                 paused_at: None,
                 cast_id: None,
                 origin_host: None,
-                played_by: None,
+                played_by,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
@@ -2307,6 +2323,178 @@ mod tests {
                 .iter()
                 .any(|r| r.label.as_deref() == Some("child-ctx"))
         );
+    }
+
+    #[tokio::test]
+    async fn context_create_help_describes_performer_selection() {
+        let d = test_dispatcher().await;
+        let result = d.dispatch(&[s("context"), s("create"), s("--help")], &test_caller()).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let help = result.message();
+        println!("{help}");
+        assert!(help.contains("--as <CHARACTER>"));
+        assert!(help.contains("Unset by default"));
+        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("banto")], &test_caller()).await;
+        assert!(!set.is_ok(), "performer selection is create-only");
+    }
+
+    // Creating through a shell re-enters kaish for rc; use the production rc stack.
+    #[test]
+    fn context_create_as_records_performer_and_loads_director_handoff() {
+        std::thread::Builder::new()
+            .stack_size(crate::KAISH_RC_THREAD_STACK)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(context_create_as_director_body());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn context_create_as_director_body() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let mut caller = test_caller();
+        caller.context_id = None;
+        let actor = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: actor,
+            name: s("banto"),
+            created_at: 1,
+            retired_at: None,
+            handoff_ctx: None,
+        }).unwrap();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: caller.principal_id, name: s("amy"), created_at: 1,
+            retired_at: None, handoff_ctx: None,
+        }).unwrap();
+        let parent = register_context(&d, Some("parent-operator"), None, caller.principal_id);
+        d.kernel_db().lock().update_played_by(parent, Some(caller.principal_id)).unwrap();
+        caller.context_id = Some(parent);
+        let note = d.dispatch(
+            &[s("handoff"), s("note"), s("--for"), s("banto"), s("remember-the-operator-task")],
+            &caller,
+        ).await;
+        assert!(note.is_ok(), "{}", note.message());
+        let shell = d.materialize_context_kaish_rc(
+            "create-operator", caller.principal_id, parent, caller.session_id, None,
+            std::sync::Arc::new(super::super::lifecycle::NoopBlockSource),
+        ).await.unwrap();
+        let result = shell.execute_with_options(
+            "kj context create operator --type director --as banto --env 'KJ_CHARACTER=obsolete-name'",
+            kaish_kernel::ExecuteOptions::default(),
+        ).await.unwrap();
+        assert!(result.ok(), "{result:?}");
+        let context = {
+            let db = d.kernel_db().lock();
+            let id = db.resolve_context("operator").unwrap();
+            let row = db.get_context(id).unwrap().unwrap();
+            assert_eq!(row.created_by, caller.principal_id);
+            assert_eq!(row.played_by, Some(actor));
+            assert_eq!(row.context_type, "director");
+            id
+        };
+        let info = d.dispatch(&[s("context"), s("info"), s("operator")], &caller).await;
+        let KjResult::Ok { data: Some(data), .. } = info else { panic!("context info data: {info:?}") };
+        assert_eq!(data["played_by_name"], "banto");
+        let blocks = d.block_store().block_snapshots(context).unwrap();
+        let instructions = crate::llm::extract_system_prompt_sections(&blocks).join("\n");
+        assert!(instructions.contains("You are banto"), "{instructions}");
+        assert!(!instructions.contains("obsolete-name"));
+        assert!(!instructions.contains("remember-the-operator-task"));
+        assert!(blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Notification
+            && b.content.contains("remember-the-operator-task")), "handoff must be a notification");
+        assert!(blocks.iter().filter(|b| b.role == kaijutsu_types::Role::System)
+            .all(|b| b.id.principal_id == caller.principal_id), "rc authorship stays with requester");
+
+        let mut confirmed = caller.clone();
+        confirmed.confirmed = true;
+        let retired = d.dispatch(&[s("character"), s("retire"), s("banto")], &confirmed).await;
+        assert!(retired.is_ok(), "{}", retired.message());
+        assert!(d.kernel_db().lock().get_context(context).unwrap().unwrap().archived_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn context_create_as_preserves_character_names_in_rc_and_handoff_advice() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let mut caller = test_caller();
+        caller.context_id = None;
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: caller.principal_id, name: s("amy"), created_at: 1,
+            retired_at: None, handoff_ctx: None,
+        }).unwrap();
+        for (index, name) in ["two words", "O'Brien", "null", "$literal", "1.0"].into_iter().enumerate() {
+            let actor = PrincipalId::new();
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: actor, name: s(name), created_at: 1,
+                retired_at: None, handoff_ctx: None,
+            }).unwrap();
+            let note = d.dispatch(&[s("handoff"), s("note"), s("--for"), s(name), s("name-specific-history")], &caller).await;
+            assert!(note.is_ok(), "{}", note.message());
+            let label = format!("named-{index}");
+            let create = d.dispatch(&[s("context"), s("create"), s(&label), s("--type"), s("director"), s("--as"), s(name)], &caller).await;
+            assert!(create.is_ok(), "{}", create.message());
+            let id = d.kernel_db().lock().resolve_context(&label).unwrap();
+            let blocks = d.block_store().block_snapshots(id).unwrap();
+            let instructions = crate::llm::extract_system_prompt_sections(&blocks).join("\n");
+            assert!(instructions.contains(&format!("You are {name},")), "name={name}: {instructions}");
+            let handoff = blocks.iter().find(|b| b.kind == kaijutsu_types::BlockKind::Notification
+                && b.content.contains("name-specific-history")).expect("performer's handoff");
+            let advice = handoff.content.lines().find(|line| line.trim_start().starts_with("kj handoff note"))
+                .expect("handoff command").trim();
+            let shell = d.materialize_context_kaish_rc(
+                "handoff-advice", caller.principal_id, id, caller.session_id, None,
+                std::sync::Arc::new(super::super::lifecycle::NoopBlockSource),
+            ).await.unwrap();
+            let result = shell.execute_with_options(advice, kaish_kernel::ExecuteOptions::default()).await.unwrap();
+            assert!(result.ok(), "name={name}, advice={advice}: {result:?}");
+            let tail = d.dispatch(&[s("handoff"), s("tail"), s(name)], &caller).await;
+            assert!(tail.is_ok(), "{}", tail.message());
+            assert!(tail.message().contains("what you did, what is next"), "name={name}, advice={advice}, result={result:?}, tail={}", tail.message());
+        }
+    }
+
+    #[tokio::test]
+    async fn context_create_as_refuses_unknown_or_retired_without_mutation() {
+        let d = test_dispatcher().await;
+        let mut caller = test_caller();
+        caller.context_id = None;
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: PrincipalId::new(), name: s("retired"), created_at: 1,
+            retired_at: Some(2), handoff_ctx: None,
+        }).unwrap();
+        let before = d.kernel_db().lock().list_documents().unwrap().len();
+        for (name, expected) in [("missing", "no character named"), ("retired", "is retired")] {
+            let result = d.dispatch(
+                &[s("context"), s("create"), s("refused"), s("--as"), s(name)], &caller,
+            ).await;
+            assert!(!result.is_ok());
+            assert!(result.message().contains(expected), "{}", result.message());
+            assert_eq!(d.kernel_db().lock().list_documents().unwrap().len(), before);
+            assert!(d.kernel_db().lock().resolve_context("refused").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn context_create_without_as_keeps_performer_unset() {
+        let d = test_dispatcher().await;
+        let mut caller = test_caller();
+        caller.context_id = None;
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: caller.principal_id, name: s("requester"), created_at: 1,
+            retired_at: None, handoff_ctx: None,
+        }).unwrap();
+        let result = d.dispatch(&[s("context"), s("create"), s("unassigned")], &caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let db = d.kernel_db().lock();
+        let row = db.get_context(db.resolve_context("unassigned").unwrap()).unwrap().unwrap();
+        assert_eq!(row.created_by, caller.principal_id);
+        assert_eq!(row.played_by, None);
     }
 
     /// `--type` with no matching rc bucket is refused before any row lands

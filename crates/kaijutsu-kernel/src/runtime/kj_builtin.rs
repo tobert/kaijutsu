@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use kaish_kernel::ast::Value;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::{ExecContext, Tool};
@@ -423,7 +422,7 @@ impl Tool for KjBuiltin {
         // binding. So a one-variable-at-a-time mutation on a subcommand that
         // sets no data shows green and proves nothing. Mutate against a
         // subcommand that does (`kj context list` attaches the id array).
-        let schema = schema.with_typed_substitution();
+        let schema = schema.with_typed_substitution().with_verbatim_argv();
 
         schema
     }
@@ -437,105 +436,11 @@ impl Tool for KjBuiltin {
             .downcast_mut::<ExecContext>()
             .expect("kj builtin always runs against the kernel ExecContext");
 
-        // Build argv from positional args + named args + flags.
-        // kaish splits `kj fork --name exploration` into:
-        //   positional: ["fork"], named: {"name": "exploration"}
-        // We reconstruct the flat argv that KjDispatcher.dispatch() expects.
-        let mut argv: Vec<String> = args
-            .positional
-            .iter()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                Value::Int(n) => n.to_string(),
-                Value::Float(f) => f.to_string(),
-                Value::Bool(b) => b.to_string(),
-                other => format!("{other:?}"),
-            })
-            .collect();
-
-        // Reconstruct --key value pairs from named args.
-        for (key, val) in &args.named {
-            let flag = if key.len() == 1 {
-                format!("-{key}")
-            } else {
-                format!("--{key}")
-            };
-            match val {
-                // Repeatable value flags (clap `ArgAction::Append`, i.e. a
-                // `Vec<String>` arg like fork's `--include` / `--exclude`) are
-                // accumulated by kaish under one `named` key as a
-                // `Value::Json(Array(...))` — one element per occurrence (see
-                // kaish `push_repeatable_value`). Emit the flag once per element
-                // so clap's `Vec<_>` re-parse sees each value as its own
-                // occurrence. Before this, the array fell through to the
-                // `{other:?}` arm below and reached clap as a single
-                // Debug-formatted token like `Json(Array [String("0:1")])`,
-                // which the range parser then rejected as a bad endpoint — the
-                // live `kj fork --include 0:1` failure. A `serde_json` string
-                // element must be pushed raw (its `to_string()` re-quotes it).
-                Value::Json(serde_json::Value::Array(items)) => {
-                    for item in items {
-                        argv.push(flag.clone());
-                        match item {
-                            serde_json::Value::String(s) => argv.push(s.clone()),
-                            other => argv.push(other.to_string()),
-                        }
-                    }
-                }
-                Value::String(s) => {
-                    argv.push(flag);
-                    argv.push(s.clone());
-                }
-                Value::Int(n) => {
-                    argv.push(flag);
-                    argv.push(n.to_string());
-                }
-                Value::Float(f) => {
-                    argv.push(flag);
-                    argv.push(f.to_string());
-                }
-                Value::Bool(b) => {
-                    argv.push(flag);
-                    argv.push(b.to_string());
-                }
-                other => {
-                    argv.push(flag);
-                    argv.push(format!("{other:?}"));
-                }
-            }
-        }
-
-        // Reconstruct boolean flags. `json` is skipped here so the global
-        // `--json` flag never reaches `KjDispatcher::dispatch()`'s per-subcommand
-        // clap re-parse: kaish 0.13 owns `--json` entirely now
-        // (`GlobalFlags::apply_from_args`, called by the kaish kernel before
-        // `execute()` runs, reads kaish's OWN structured `args.flags` — a
-        // `HashSet<String>` of flag *names*, no dashes — to set
-        // `ctx.output_format`; `finalize_output`/`apply_output_format` then
-        // render this call's `ExecResult` after `execute()` returns — see
-        // `schema()`'s `owns_output` note). Most kj leaves don't declare their
-        // own `json` field, so handing "--json" to the re-parse below would
-        // make those leaves reject it as an unrecognized argument. (A handful
-        // of leaves — `doc list`, `config show`/`list`, `rc list`/`show`,
-        // `search` — DO carry their own local `json: bool` field for a
-        // differently-shaped internal message; that field is unreachable via
-        // this live kaish bridge either way, since --json never survives to
-        // here regardless of this filter — only `KjDispatcher::dispatch()`
-        // called directly, as the dispatcher-level unit tests do, ever sets
-        // it.)
-        //
-        // Using kaish's structured `args.flags` (rather than string-matching
-        // "--json" tokens in already-flattened argv, the old approach) also
-        // keeps a literal `"--json"` *value* safe — e.g. `kj config set foo
-        // --content --json`, where "--json" is `--content`'s value, not a
-        // flag — since `args.flags` only ever contains flag *names*.
-        for flag in args.flags.iter().filter(|f| f.as_str() != "json") {
-            if flag.len() == 1 {
-                argv.push(format!("-{flag}"));
-            } else {
-                argv.push(format!("--{flag}"));
-            }
-        }
+        // kj parses its own arguments. Preserve source order so options before
+        // trailing prose remain options; rebuilding split arguments can turn
+        // `handoff note --for name text` into a note in the caller's log.
+        // kaish still owns global output flags such as --json.
+        let mut argv = args.words_argv();
 
         // Extract the bare --confirm flag before dispatch. kaish 0.14 deleted
         // the confirmation latch and with it the nonce store this used to
@@ -884,6 +789,7 @@ mod tests {
     use crate::runtime::context_engine::session_context_map;
     use crate::runtime::embedded_kaish::EmbeddedKaish;
     use kaijutsu_types::SessionId;
+    use kaish_kernel::ast::Value;
     use kaish_kernel::ExecuteOptions;
 
     /// Build an `EmbeddedKaish` wired to a `KjBuiltin` rooted at the given

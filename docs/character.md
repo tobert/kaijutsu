@@ -5,8 +5,47 @@
 > and what kaijutsu needs so the morning is smooth, then revised through two
 > model reviews the same afternoon ("Review", below) and a readiness pass
 > the next day. **Slices 0a, 1, 2 and 4 are built and verified (2026-09-06/07); slices 3 and 5–8 are not.**
-> Every code claim carries a `file:line`; re-read it before relying on it.
+> Read "Current implementation" first; historical line references need rechecking.
 > Amy's statements are guidance, not rulings.
+
+## Current implementation
+
+Read this section for current behavior; the design and original inventory below
+also describe work that has not shipped. `AGENTS.md` links here so the roadmap
+does not become an instruction to use nonexistent features.
+
+| Part | Implemented contract |
+|---|---|
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`; `kj character create\|list\|show\|retire` |
+| Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
+| Performer metadata | `kj context create --as <character>` records `played_by` before create rc, rejects unknown/retired names, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
+| Client creation | Server `create_context_inner` defaults `played_by` to the creating principal's character when present; MCP session registration uses this path |
+| Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged |
+| Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
+| Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
+
+Sources: `kernel_db.rs::CharacterRow`, `kj/context.rs::context_create`,
+`kj/character.rs`, `kj/handoff.rs`, `kj/lifecycle.rs::load_rc_scripts` in
+`crates/kaijutsu-kernel/src/`; `crates/kaijutsu-server/src/rpc.rs::create_context_inner`;
+`assets/defaults/rc/director/create/S00-stance.kai` and
+`assets/defaults/rc/lib/create/S16-handoff.kai`.
+
+Banto is a character using the `director` context type. It does not need a new
+type to have its own identity and handoff. `KJ_CHARACTER` was a temporary rc
+name/handoff selector; it never set `played_by`. New instructions read performer
+metadata instead. Existing contexts that used the bridge remain unassigned:
+create a successor with `--as banto` and verify it before archiving its
+predecessor. See `docs/prompts.md`, "Rotating a director context".
+
+Still planned: provider-output attribution (slice 3), character rc composition
+(slice 5), roster grouping and character drift addressing (slices 6–7), and
+scheduled janitor/proctor work (slice 8). The sheet has no `accountable_to`,
+`default_cast_id`, `rc_dir`, `memory_root`, or `root_ctx` fields yet. The handoff
+is a context, not a transport track. Requester and performer remain separate;
+setting `played_by` does not change credentials, asks, or provider block authors.
+
+The original inventory and gap analysis below describe the pre-implementation
+state. Use this section and the rollout to distinguish them from current code.
 
 ## The problem, in one paragraph
 
@@ -98,7 +137,7 @@ collision is real in code (about 300 uses of the word as a text unit across
 the crates), which is one reason the design below adds **no new Rust noun**
 for identity.
 
-## What already exists — the parts
+## Original inventory — the parts
 
 Read before designing; most of the character is already in the kernel under
 other names.
@@ -134,7 +173,7 @@ Two facts from that table drive the whole design:
    presence, and self-reported availability.** Inverting it onto characters
    is grouping, not a new store.
 
-## What is missing — the gaps
+## Original gap analysis
 
 - **The sheet.** Nothing hangs off a principal but credentials. No
   accountable-to, no default cast, no pointers to rc, memory, handoff, root.
@@ -494,9 +533,10 @@ all of which work with the service stopped.
 ALTER TABLE contexts ADD COLUMN played_by BLOB;  -- principal_id; NULL = nobody (score ctx, file doc)
 ```
 
-Set at create: `kj context create --as <character>`; default is the caller's
-own character when the caller is a model character's context, else none.
-Fork copies it. `register_session` sets it from the session's `--name`.
+Set explicitly with `kj context create --as <character>`; omitting it leaves
+`played_by` unset on the kj path. Fork copies it. Server client creation
+defaults to the creating principal's character, when present. Automatic
+inheritance from a calling model context remains a design question.
 
 **Two identities ride every turn, and neither replaces the other.** The
 **requester** is who caused the turn: the principal on the `KjCaller`, on the
@@ -844,8 +884,9 @@ Each slice is independently shippable and leaves the tree green.
    characters carrying their old usernames, against a fixture mimicking a
    real `auth.db`, never against anything real; anonymous auto-register
    binds to `hajime` and mints nothing.
-3. **Attribution.** Turn-start resolution of `played_by` to the effective
-   actor; provider-emitted blocks authored by it. This is the slice that
+3. **Attribution.** Create-time performer selection (`kj context create --as`)
+   is implemented separately; provider-output attribution remains open.
+   Turn-start resolution of `played_by` to the effective actor; provider-emitted blocks authored by it. This is the slice that
    changes `BlockId` lanes, so it ships alone.
    Tests: a model block's author is the character and differs from the
    requester; the prompt's author is still the requester; a tool call is

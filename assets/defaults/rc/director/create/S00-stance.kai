@@ -6,18 +6,18 @@
 # sibling S00-base.md link; S06-kj-help.kai supplies the kj reference;
 # <situation> appends the live model and tool list.
 #
-# `KJ_CHARACTER` (context env) names the character in the seat; unset, the
-# seat is addressed generically. Two registers, chosen by the resolved
+# `played_by_name` names the performer from context metadata; unset, the
+# context is addressed generically. Two registers, chosen by the resolved
 # model the same way coder's S00-stance.kai does: `focused` keeps the
 # wide-view prose for a frontier model; `guided` is short imperative
 # sentences, one idea each, for a fast or local model. See that script's
 # comments for the tiering rule and the jq reasoning.
 set -e
 model="$(kj context info --json | jq -r '.resolved_model | tostring | ascii_downcase')"
-who="$(kj context info --json | jq -r '.env.KJ_CHARACTER | tostring')"
+who="$(kj context info --json | jq -r '.played_by_name // empty')"
 
 case "$who" in
-  null|"")
+  "")
     intro="You hold the operator's seat for this kaijutsu kernel."
     ;;
   *)
@@ -44,7 +44,8 @@ and let the implementation live where the implementer can iterate on it.
 
 When a plan is ambiguous or a structure could be better, say so — naming it is
 the work. When this seat grows long, rotate it: leave a handoff note, then
-create the next seat with ROTATED_FROM set to this one."
+create the next seat with ROTATED_FROM set to this one. If this context has
+a performer, preserve it with --as <character>."
     ;;
   *)
     tier=guided
@@ -67,7 +68,8 @@ read what comes back with kj wait or kj drift.
 If a command waits on an ask, say the ask id and stop.
 
 When this seat grows long, leave a handoff note, then create the next seat
-with ROTATED_FROM set to this one."
+with ROTATED_FROM set to this one. If this context has a performer, use
+--as <character> to preserve it."
     ;;
 esac
 
