@@ -517,6 +517,15 @@ turn in flight: the approval runs the command without resuming the coder
 `wait` should notice a filled pair, or `allow` should say the coder needs a
 `kj drive` to continue (2026-09-11).
 
+An approval that fills a linked pair leaves no trace for the model: the
+result block carries the output and the model's own earlier text says an
+ask was pending, so on the next drive it reads the two as contradictory
+(a probe coder "corrected" itself that it had fabricated the ask id). The
+authored-pair branch already seeds "<who> approved the action you were
+waiting on … It has run." (`act_on_executable_answer`, `ExecAction::Tell`);
+the linked-pair branch returns `Settled` with no seed. Seed the same
+sentence for a linked pair, delivered on the next drive (2026-09-11).
+
 ## The scorer and the snapshot (2026-09-02)
 
 **Shipped:** the lfm2d hook now reads `$s.plan.rendered` for `clause`
