@@ -35,28 +35,41 @@ payload and logging, in the order to try:
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
 
-## Displaced error and result blocks make hydration drop real tool output (2026-09-11)
+## A filled ask leaves its `gate.pending` error child in the log, sorted last (2026-09-11)
 
-Seen on `tui-ask-stuck` (be3bd66a, coder, deepseek-v4-flash): every turn
-logs 18 `hydration repair: synthesizing tool_result for orphaned tool_use`
-WARNs and 18 matching `dropping orphaned tool_result (late arrival)` for
-the SAME `tool_use_id`s, so the model gets a synthesized interruption error
-in place of output that exists in the log. `kj block list -c be3bd66a`
-shows the cause: document order is not sequence order. Blocks #364, #392,
-#400, #418 and #421 (tool_results and `system/error` blocks anchored at
-calls #362–#419) sort after #428, and `--kind error --json` lists error
-blocks in the order 25, 290, 74, 90, 126, 127, 95, 65, 31, 19, 280, 294,
-302, 417, 421, 400, 364. Hydration walks document order, so a result that
-sorts past the next assistant message is a late arrival under the policy
-in `docs/conversation-session.md`, "Tool pairing at send". That policy
-assumed OTHER writers interleave; here the kernel's own
-`insert_error_block_as` (anchored `after_id: Some(parent_id)`) and
-`insert_tool_result_as` (`after: Option<&BlockId>`) produce the
-displacement. Two things to establish first: which insert path lands a
-block at the document tail when its anchor already has a successor, and
-why the repair runs on every turn when `process_llm_stream` hydrates once
-and then trusts the mailbox. The context is Amy's live seat; reproduce in
-a probe coder with a gated shell call before touching it.
+Probe `ask-link-probe` (coder, deepseek-v4-pro) on `9be5ee08`, the kernel
+with the model-path ask link. A gated heredoc left the pair `#21/#22`
+Waiting; `kj ledger allow` from the lead seat ran the command and filled
+that pair (`#22` Done, content `probe ok`), authored no second pair, and
+the next turn hydrated with zero repair warnings. That is the fix
+working, and it means the 18-per-turn late-arrival drops seen earlier on
+`tui-ask-stuck` were most likely the pre-fix second pairs; a parallel-call
+probe is the remaining check if the warnings ever recur.
+
+What the probe found instead: asked on the next turn for the output, the
+model answered that "nothing was run" and dismissed `probe ok` as an echo.
+Two contributing factors, both in the durable log:
+
+- The fill (`rpc.rs`, `act_on_executable_answer`) knows only the linked
+  pair. The `system/error` child (`gate.pending: … nothing was run`) that
+  Step 6b authored beside the Waiting result stays in the log, status
+  `error`, after the pair is Done. A pending ask is not an error; either
+  do not author an error child for a Waiting dispatch, or retire it when
+  the pair fills.
+- Error children sort after every later block of the same turn.
+  `insert_error_block_as` anchors the child after the result block, and
+  the loop then sets `last_block_id` to the result block too
+  (`llm_stream.rs`, "Unzip and update last_block_id"), so the next
+  iteration's thinking and text slot in between. `kj block list` shows
+  `#18 #19 #17` and `#24 #25 #23` in the probe. The same shape put
+  `tui-ask-stuck`'s error blocks in the order 25, 290, 74, 90, …. Advance
+  the anchor past the child, or anchor the child at the result and the
+  next blocks after it.
+
+Smaller, seen on the way: `kj wait` after an approval executes reports
+`running` by timeout with no turn in flight, because the approval runs
+the command without resuming the coder (by design, `docs/gate-resume.md`)
+and nothing ends a turn. Belongs with the ledger ergonomics entry.
 
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 
