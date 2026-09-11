@@ -22,12 +22,80 @@ payload and logging, in the order to try:
   touch (once per turn, or on a timer) halves the page writes; batching
   deltas into fewer op rows is a design conversation, since the op row is
   the durable unit the change feed replays.
-- Idle, the kernel writes about 100 KB/s. `report_audio_inventory` bumps a
-  revision every 10 s (see the tui entry below); check whether that bump
-  persists a document snapshot.
+- The "idle" 50–100 KB/s measured today is unverified: the audio
+  inventory store is in-memory (`audio_inventory.rs`, no db), and every
+  sample so far overlapped either Amy's turns or this session's own hook
+  mirror (each Claude Code tool call becomes blocks in the session
+  context). Measure again with no client active; the per-thread `io`
+  attribution (`/proc/<pid>/task/*/io`, threads named `kjutsu-rpc-<id>`)
+  says which connection writes.
 - Untested from the diagnosis: `PASSIVE` instead of `TRUNCATE` for
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
+
+## INFO is still a debug log (2026-09-11)
+
+Measured on zorak after `RUST_LOG=info` went live at 11:18 EDT. Amy: "info
+should be a bit quieter imo". What INFO emits, by source, with the change
+each wants:
+
+- **Boot**: one `Recovered context … from KernelDb` line per context
+  (`rpc.rs`), 29 today and 436 yesterday. One summary line at info, the
+  per-context line at debug.
+- **Client reconnect after a bounce**: 23 `ERROR … Session error: IO(…
+  BrokenPipe)` and a few `early eof` (`ssh.rs`) for clients whose
+  connection died with the old process. A peer hanging up is not an error;
+  debug, or info with the principal and no `IO(Os {…})` dump.
+- **Per connection**: `Auth accepted`, `Channel N opened`, `Binding channel
+  N to kaijutsu-rpc`, `RPC session started` — four lines, and each
+  Claude Code session opens two connections. Keep `Auth accepted` (who,
+  from where) and `RPC session started`; the channel plumbing is debug.
+- **Every 10 s**: `report_audio_inventory: audio/zorak revision N via
+  connection …` (`rpc.rs`), the single largest INFO source at rest. Debug,
+  or info only when the report's content changed (the store already
+  decides `Stored` vs `Ignored` by revision, not content).
+- **Per shell command**: `Shell execute: context_id=…, code=<full code>`
+  (`rpc.rs`), then `shell_execute: executing code via EmbeddedKaish:
+  "<full code>"` and `shell_execute: kaish returned …` (`shell_run.rs`).
+  Three lines carrying the command text twice. One line at info with the
+  context and exit code; the code text at debug.
+- **Per turn iteration** (`llm_stream.rs`): `Spawning LLM stream`,
+  `Mailbox caught up`, `Sending N messages`, `LLM stream started
+  successfully`, `Agentic loop iteration N`, `Executing N tool calls`,
+  `Executing tool: <name> with params: <json>`, `Agentic loop complete`,
+  `Conversation cache updated`, `LLM stream completed`, `LLM stream
+  processing complete` — eleven lines per iteration, the tool params
+  in full. Two at info: started (context, model) and completed (stop
+  reason, usage, iterations); the rest debug.
+- **Hydration repair** WARNs: 36 per turn on `tui-ask-stuck` today; see
+  the entry below, which is a correctness problem, not a log one.
+
+The kernel's own `write_bytes` did not move with the log level (1.7 MB/s
+streaming at info vs 2 MB/s at debug); journald paid for DEBUG, not the
+kernel.
+
+## Displaced error and result blocks make hydration drop real tool output (2026-09-11)
+
+Seen on `tui-ask-stuck` (be3bd66a, coder, deepseek-v4-flash): every turn
+logs 18 `hydration repair: synthesizing tool_result for orphaned tool_use`
+WARNs and 18 matching `dropping orphaned tool_result (late arrival)` for
+the SAME `tool_use_id`s, so the model gets a synthesized interruption error
+in place of output that exists in the log. `kj block list -c be3bd66a`
+shows the cause: document order is not sequence order. Blocks #364, #392,
+#400, #418 and #421 (tool_results and `system/error` blocks anchored at
+calls #362–#419) sort after #428, and `--kind error --json` lists error
+blocks in the order 25, 290, 74, 90, 126, 127, 95, 65, 31, 19, 280, 294,
+302, 417, 421, 400, 364. Hydration walks document order, so a result that
+sorts past the next assistant message is a late arrival under the policy
+in `docs/conversation-session.md`, "Tool pairing at send". That policy
+assumed OTHER writers interleave; here the kernel's own
+`insert_error_block_as` (anchored `after_id: Some(parent_id)`) and
+`insert_tool_result_as` (`after: Option<&BlockId>`) produce the
+displacement. Two things to establish first: which insert path lands a
+block at the document tail when its anchor already has a successor, and
+why the repair runs on every turn when `process_llm_stream` hydrates once
+and then trusts the mailbox. The context is Amy's live seat; reproduce in
+a probe coder with a gated shell call before touching it.
 
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 
