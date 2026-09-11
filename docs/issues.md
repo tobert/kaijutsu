@@ -46,6 +46,32 @@ is rare; the fix is to fall back to the call block id as the anchor (the
 inline path already does). Found by Kaibo reviewing the error-child anchor
 fix.
 
+## The cached mailbox never re-reads a block it has seen (2026-09-11)
+
+`ConversationMailbox::catch_up` (`llm/mailbox.rs`) folds unseen block ids
+and keeps a `seen` set; nothing invalidates an entry when a seen block
+changes. The gate-resume fill evicts the cache (`ConversationCache::evict`,
+rpc.rs), which covers approvals. Same class, not covered (Kaibo, deepseek
+cast, source reading only):
+
+- `kj block edit` / `kj block append` on a block a cached mailbox already
+  folded: the next turn reads the old text. The kj verbs live in the
+  kernel crate and cannot reach the server's cache.
+- `kj stage exclude` on a warm cache: `excluded` is read only at fold time
+  (`hydrate.rs`). Narrow, since the documented flow is exclude then fork.
+- Draft promotion: `submit_draft` turns a `Draft` block `Done` under the
+  same id; `catch_up` adds every block to `seen` even when the fold skips
+  it as ineligible, so a draft that was open during another principal's
+  turn stays invisible to that mailbox for good. Not reproduced.
+- Overlapping prompts on one context: a second turn that called
+  `get_or_create` before the fill holds the old `Arc`, waits on the mutex,
+  then folds against the stale `seen` set. Needs two prompts in flight on
+  one context; the interactive spawn sites do not check `turn_in_flight`.
+
+One mechanism would cover all four: a change feed the mailbox subscribes
+to, or a per-block version the fold compares. Both are design
+conversations under `docs/conversation-session.md`.
+
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 
 `crates/kaijutsu-tui/src/bridge.rs:78` spawns the actor with
