@@ -510,7 +510,21 @@ impl server::Server for Server {
     }
 
     fn handle_session_error(&mut self, error: <Self::Handler as server::Handler>::Error) {
-        log::error!("Session error: {:?}", error);
+        // A peer that hangs up (a client reconnecting after a bounce, a tui
+        // closed mid-channel) is ordinary; only unexpected failures are errors.
+        match &error {
+            russh::Error::IO(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                log::debug!("Session closed by peer: {e}");
+            }
+            _ => log::error!("Session error: {:?}", error),
+        }
     }
 }
 
@@ -524,7 +538,7 @@ struct ConnectionHandler {
     registry: Arc<ServerRegistry>,
     /// Channels opened but not yet bound to a subsystem. `channel_open_session`
     /// stashes each one here; `subsystem_request` drains it and dispatches by
-    /// name (`kaijutsu-rpc` today; SFTP and a debug shell later).
+    /// name (RPC, SFTP, and share subsystems).
     pending_channels: HashMap<ChannelId, Channel<Msg>>,
     /// Shared counter of active connections (decremented on drop).
     active_connections: Arc<AtomicUsize>,
@@ -914,10 +928,10 @@ impl server::Handler for ConnectionHandler {
         // Stash the channel inert. It carries no traffic until the client
         // names a subsystem via `subsystem_request`, which drains the map and
         // dispatches by name. This retention-and-dispatch scaffold is shared by
-        // every named tenant of the session-channel surface (RPC today; SFTP
-        // and a debug shell later).
+        // every named tenant of the session-channel surface (RPC, SFTP, and
+        // share).
         let channel_id = channel.id();
-        log::info!(
+        log::debug!(
             "Channel {} opened for {}, awaiting subsystem request",
             channel_id,
             principal.short(),
@@ -967,7 +981,7 @@ impl server::Handler for ConnectionHandler {
 
         match name {
             SSH_RPC_SUBSYSTEM => {
-                log::info!(
+                log::debug!(
                     "Binding channel {} to {} for {}",
                     channel,
                     SSH_RPC_SUBSYSTEM,
@@ -982,7 +996,7 @@ impl server::Handler for ConnectionHandler {
                 Ok(())
             }
             SSH_SFTP_SUBSYSTEM => {
-                log::info!(
+                log::debug!(
                     "Binding channel {} to {} for {}",
                     channel,
                     SSH_SFTP_SUBSYSTEM,
@@ -999,7 +1013,7 @@ impl server::Handler for ConnectionHandler {
                 Ok(())
             }
             SSH_SHARE_SUBSYSTEM => {
-                log::info!(
+                log::debug!(
                     "Binding channel {} to {} for {} — role swap: kernel plays SFTP client",
                     channel,
                     SSH_SHARE_SUBSYSTEM,

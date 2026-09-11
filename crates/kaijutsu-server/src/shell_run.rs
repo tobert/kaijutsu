@@ -87,7 +87,7 @@ pub(crate) async fn run_into_blocks(
     // persist whatever this command changes (`cd`, `export`) back to L1.
     let state_before = snapshot_shell_state(kaish).await;
 
-    log::info!(
+    log::debug!(
         "shell_execute: executing code via EmbeddedKaish: {:?}",
         code
     );

@@ -2773,6 +2773,7 @@ pub async fn create_shared_kernel(
     // Register recovered contexts into DriftRouter
     if !all_contexts.is_empty() {
         let mut drift = kernel_arc.drift().write();
+        let mut recovered = 0usize;
         for row in &all_contexts {
             if let Err(e) = drift.register(
                 row.context_id,
@@ -2790,13 +2791,18 @@ pub async fn create_shared_kernel(
             if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
                 let _ = drift.configure_llm(row.context_id, provider, model);
             }
-            log::info!(
+            log::debug!(
                 "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
                 row.context_id.short(),
                 row.label,
                 row.provider,
             );
+            recovered += 1;
         }
+        log::info!(
+            "Recovered {recovered}/{} context(s) from KernelDb",
+            all_contexts.len()
+        );
     }
 
     // Re-adopt the persisted lost+found sink (docs/drifting-dead-letters.md,
@@ -5400,10 +5406,6 @@ impl kernel::Server for KernelImpl {
         params: kernel::ShellExecuteParams,
         mut results: kernel::ShellExecuteResults,
     ) -> Promise<(), capnp::Error> {
-        log::debug!(
-            "shell_execute() called for kernel {}",
-            self.kernel.id.to_hex()
-        );
         let params = pry!(params.get());
         let trace_span = extract_rpc_trace(params.get_trace(), "shell_execute");
         let code = pry!(pry!(params.get_code()).to_str()).to_owned();
@@ -5413,7 +5415,7 @@ impl kernel::Server for KernelImpl {
                 .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
         );
         let user_initiated = params.get_user_initiated();
-        log::info!(
+        log::debug!(
             "Shell execute: context_id={}, code={}, user_initiated={}",
             context_id,
             code,
@@ -7170,7 +7172,7 @@ impl kernel::Server for KernelImpl {
         );
         let is_shell = pry!(p.get_mode()) == InputMode::Shell;
 
-        log::info!("submit_input: context={} shell={}", context_id, is_shell);
+        log::debug!("submit_input: context={} shell={}", context_id, is_shell);
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
@@ -8736,7 +8738,7 @@ impl kernel::Server for KernelImpl {
                 Promise::ok(())
             }
             Ok(Recorded::Stored) => {
-                log::info!(
+                log::debug!(
                     "report_audio_inventory: {node} revision {revision} via connection {}",
                     connection.short()
                 );

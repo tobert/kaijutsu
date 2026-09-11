@@ -16,7 +16,8 @@ payload and logging, in the order to try:
 
 - The DEBUG `llm` spans log every `TextDelta`/`ThinkingDelta` event, about
   160 lines/s during a deepseek-v4-flash turn, and journald writes each.
-  `RUST_LOG=info` on the unit is the cheap half; Amy's call.
+  The unit runs `RUST_LOG=info` since 2026-09-11 11:18 EDT (matches
+  `contrib/install-systemd.sh`); the INFO diet is the next entry.
 - Each delta is still about 14 write syscalls and 13 KB: WAL pages for the
   `oplog` row and the `contexts` activity touch. Batching the activity
   touch (once per turn, or on a timer) halves the page writes; batching
@@ -36,29 +37,13 @@ payload and logging, in the order to try:
 ## INFO is still a debug log (2026-09-11)
 
 Measured on zorak after `RUST_LOG=info` went live at 11:18 EDT. Amy: "info
-should be a bit quieter imo". What INFO emits, by source, with the change
-each wants:
+should be a bit quieter imo". Done in tree: the per-context boot recovery
+line, the SSH channel plumbing, the 10 s audio inventory line, the shell
+command text (rpc and shell_run) and `submit_input` are debug; boot logs one
+`Recovered N context(s)` line; a peer hang-up (`BrokenPipe`,
+`UnexpectedEof`, `ConnectionReset`) logs at debug instead of `ERROR
+Session error: IO(…)`. Still to do:
 
-- **Boot**: one `Recovered context … from KernelDb` line per context
-  (`rpc.rs`), 29 today and 436 yesterday. One summary line at info, the
-  per-context line at debug.
-- **Client reconnect after a bounce**: 23 `ERROR … Session error: IO(…
-  BrokenPipe)` and a few `early eof` (`ssh.rs`) for clients whose
-  connection died with the old process. A peer hanging up is not an error;
-  debug, or info with the principal and no `IO(Os {…})` dump.
-- **Per connection**: `Auth accepted`, `Channel N opened`, `Binding channel
-  N to kaijutsu-rpc`, `RPC session started` — four lines, and each
-  Claude Code session opens two connections. Keep `Auth accepted` (who,
-  from where) and `RPC session started`; the channel plumbing is debug.
-- **Every 10 s**: `report_audio_inventory: audio/zorak revision N via
-  connection …` (`rpc.rs`), the single largest INFO source at rest. Debug,
-  or info only when the report's content changed (the store already
-  decides `Stored` vs `Ignored` by revision, not content).
-- **Per shell command**: `Shell execute: context_id=…, code=<full code>`
-  (`rpc.rs`), then `shell_execute: executing code via EmbeddedKaish:
-  "<full code>"` and `shell_execute: kaish returned …` (`shell_run.rs`).
-  Three lines carrying the command text twice. One line at info with the
-  context and exit code; the code text at debug.
 - **Per turn iteration** (`llm_stream.rs`): `Spawning LLM stream`,
   `Mailbox caught up`, `Sending N messages`, `LLM stream started
   successfully`, `Agentic loop iteration N`, `Executing N tool calls`,
@@ -66,7 +51,8 @@ each wants:
   `Conversation cache updated`, `LLM stream completed`, `LLM stream
   processing complete` — eleven lines per iteration, the tool params
   in full. Two at info: started (context, model) and completed (stop
-  reason, usage, iterations); the rest debug.
+  reason, usage, iterations); the rest debug. Waiting on the coder edit
+  in flight in that file (2026-09-11 midday).
 - **Hydration repair** WARNs: 36 per turn on `tui-ask-stuck` today; see
   the entry below, which is a correctness problem, not a log one.
 
