@@ -1103,3 +1103,14 @@ interest against the default subscriber of whichever thread hits it first,
 and under a full suite that is a sibling test with no subscriber, so a
 thread-local test subscriber saw no spans at all. The test installs a global
 default and tells spans apart by the thread that created them.
+
+With the unit at `RUST_LOG=info`, INFO still read like a debug log: a line
+per recovered context at boot, four per SSH connection, a reconnecting
+client's hang-up as `ERROR Session error: IO(…)`, the shell command text
+twice per command, the audio inventory every ten seconds, and eleven lines
+per turn iteration with tool params in full. The diet keeps what an
+operator reads a turn by: the stream start with context and model, each
+iteration's completion with stop reason and usage, interrupts,
+cancellations, and tool refusals; one line per connection and one summary
+per boot. The kernel's own disk writes did not move with the log level,
+which put the log cost on journald where it belonged.

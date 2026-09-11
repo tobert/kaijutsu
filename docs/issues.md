@@ -17,7 +17,8 @@ payload and logging, in the order to try:
 - The DEBUG `llm` spans log every `TextDelta`/`ThinkingDelta` event, about
   160 lines/s during a deepseek-v4-flash turn, and journald writes each.
   The unit runs `RUST_LOG=info` since 2026-09-11 11:18 EDT (matches
-  `contrib/install-systemd.sh`); the INFO diet is the next entry.
+  `contrib/install-systemd.sh`), and INFO is a turn-level log now
+  (`docs/devlog.md`, "The kernel that fsynced every word").
 - Each delta is still about 14 write syscalls and 13 KB: WAL pages for the
   `oplog` row and the `contexts` activity touch. Batching the activity
   touch (once per turn, or on a timer) halves the page writes; batching
@@ -33,32 +34,6 @@ payload and logging, in the order to try:
 - Untested from the diagnosis: `PASSIVE` instead of `TRUNCATE` for
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
-
-## INFO is still a debug log (2026-09-11)
-
-Measured on zorak after `RUST_LOG=info` went live at 11:18 EDT. Amy: "info
-should be a bit quieter imo". Done in tree: the per-context boot recovery
-line, the SSH channel plumbing, the 10 s audio inventory line, the shell
-command text (rpc and shell_run) and `submit_input` are debug; boot logs one
-`Recovered N context(s)` line; a peer hang-up (`BrokenPipe`,
-`UnexpectedEof`, `ConnectionReset`) logs at debug instead of `ERROR
-Session error: IO(…)`. Still to do:
-
-- **Per turn iteration** (`llm_stream.rs`): `Spawning LLM stream`,
-  `Mailbox caught up`, `Sending N messages`, `LLM stream started
-  successfully`, `Agentic loop iteration N`, `Executing N tool calls`,
-  `Executing tool: <name> with params: <json>`, `Agentic loop complete`,
-  `Conversation cache updated`, `LLM stream completed`, `LLM stream
-  processing complete` — eleven lines per iteration, the tool params
-  in full. Two at info: started (context, model) and completed (stop
-  reason, usage, iterations); the rest debug. Waiting on the coder edit
-  in flight in that file (2026-09-11 midday).
-- **Hydration repair** WARNs: 36 per turn on `tui-ask-stuck` today; see
-  the entry below, which is a correctness problem, not a log one.
-
-The kernel's own `write_bytes` did not move with the log level (1.7 MB/s
-streaming at info vs 2 MB/s at debug); journald paid for DEBUG, not the
-kernel.
 
 ## Displaced error and result blocks make hydration drop real tool output (2026-09-11)
 

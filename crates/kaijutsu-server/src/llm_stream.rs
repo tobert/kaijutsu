@@ -208,7 +208,7 @@ fn handle_hydration_outcome(
                 Some((marker, window)) => {
                     mailbox.rehydrate_windowed(&blocks, marker, window as usize);
                     let snapshot = mailbox.snapshot();
-                    log::info!(
+                    log::debug!(
                         "Mailbox windowed-rehydrated (marker {marker}, window {window}): \
                          {} blocks in log → {} messages on the wire for context {context_id}",
                         blocks.len(),
@@ -219,7 +219,7 @@ fn handle_hydration_outcome(
                 None => {
                     let new_blocks = mailbox.catch_up(&blocks);
                     let snapshot = mailbox.snapshot();
-                    log::info!(
+                    log::debug!(
                         "Mailbox caught up: +{} new blocks, {} messages on the wire for context {}",
                         new_blocks,
                         snapshot.len(),
@@ -1644,7 +1644,7 @@ async fn process_llm_stream(
         );
     }
 
-    log::info!(
+    log::debug!(
         "Sending {} messages for context {}",
         messages.len(),
         context_id
@@ -1731,7 +1731,7 @@ async fn process_llm_stream(
             break;
         }
 
-        log::info!(
+        log::debug!(
             "Agentic loop iteration {} with {} messages, {} tools",
             iteration,
             messages.len(),
@@ -1793,9 +1793,9 @@ async fn process_llm_stream(
                 match provider.stream(build_opts.clone(), messages.clone()).await {
                     Ok(s) => {
                         if attempt > 1 {
-                            log::info!("LLM stream started on attempt {}", attempt);
+                            log::debug!("LLM stream started on attempt {}", attempt);
                         } else {
-                            log::info!("LLM stream started successfully");
+                            log::debug!("LLM stream started successfully");
                         }
                         break s;
                     }
@@ -2447,12 +2447,12 @@ async fn process_llm_stream(
             if !assistant_text.is_empty() {
                 messages.push(LlmMessage::assistant(&assistant_text));
             }
-            log::info!("Agentic loop complete - no tool calls this iteration");
+            log::debug!("Agentic loop complete - no tool calls this iteration");
             break;
         }
 
         // Execute tools concurrently — the kernel sequences concurrent block inserts
-        log::info!("Executing {} tool calls concurrently", tool_calls.len());
+        log::debug!("Executing {} tool calls concurrently", tool_calls.len());
 
         // Build assistant tool uses (for conversation history)
         let assistant_tool_uses: Vec<ContentBlock> = tool_calls
@@ -2479,7 +2479,7 @@ async fn process_llm_stream(
                 let tool_call_entry = tool_call_blocks.get(&tool_use_id).cloned();
                 async move {
                     let params = input.to_string();
-                    log::info!("Executing tool: {} with params: {}", tool_name, params);
+                    log::debug!("Executing tool: {} with params: {}", tool_name, params);
 
                     let tool_call_block_id = match tool_call_entry {
                         Some(Some(id)) => Some(id),
@@ -2711,7 +2711,7 @@ async fn process_llm_stream(
 
     // Conversation history is already persisted in the per-context lock.
     // The MutexGuard drops when this function returns.
-    log::info!(
+    log::debug!(
         "Conversation cache updated: {} messages for cell {}",
         messages.len(),
         context_id
@@ -2730,7 +2730,7 @@ async fn process_llm_stream(
         }
     }
 
-    log::info!("LLM stream processing complete for cell {}", context_id);
+    log::debug!("LLM stream processing complete for cell {}", context_id);
 
     // Announce the turn outcome at ACTUAL stream end (design §7) — the publish
     // sits here, not at the spawn site, so it carries the real `output_block_id`
