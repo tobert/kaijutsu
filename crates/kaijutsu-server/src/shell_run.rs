@@ -122,12 +122,13 @@ pub(crate) async fn run_into_blocks(
                 Some(ref p) => p.text.clone(),
                 None => result.text_out().into_owned(),
             };
-            if let Err(e) = documents.edit_text_as(
+            // Replace, never insert: an output block authored for this run
+            // is empty, but a `Waiting` tool result an approval fills already
+            // carries the gate's placeholder text.
+            if let Err(e) = documents.replace_text_as(
                 context_id,
                 output_block_id,
-                0,
                 &out_text,
-                0,
                 Some(PrincipalId::system()),
             ) {
                 log::error!("Failed to update shell output: {}", e);
@@ -378,5 +379,65 @@ pub(crate) async fn run_into_blocks(
                 let _ = documents.set_status(context_id, command_block_id, status);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    use kaijutsu_kernel::Kernel;
+    use kaijutsu_kernel::block_store::DocumentKind;
+
+    /// An approved ask fills the pair the gate left `Waiting`. That result
+    /// block already carries the gate's placeholder text, and the output
+    /// must replace it: a placeholder that survives beside the real output
+    /// tells the next turn nothing ran.
+    #[tokio::test]
+    async fn a_waiting_result_is_replaced_by_the_output_not_prefixed_to_it() {
+        let kernel = Arc::new(Kernel::new_ephemeral("fill-waiting").await);
+        let documents = kernel.blocks().clone();
+        let ctx = ContextId::new();
+        documents
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let call = documents
+            .insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None)
+            .unwrap();
+        let placeholder = "gate for shell_write is waiting on a human: nothing was run.";
+        let result = documents
+            .insert_tool_result(ctx, &call, Some(&call), placeholder, true, None, None)
+            .unwrap();
+        documents.set_status(ctx, &result, Status::Waiting).unwrap();
+
+        let kaish = EmbeddedKaish::new("fill-waiting", documents.clone(), kernel.clone(), None)
+            .expect("EmbeddedKaish::new failed");
+        kaish.set_context_id(ctx);
+        run_into_blocks(
+            &kaish,
+            "echo replaced",
+            ctx,
+            &call,
+            &result,
+            &documents,
+            kernel.block_flows(),
+            kernel.kernel_db(),
+            &kernel,
+            PrincipalId::system(),
+            SessionId::new(),
+            kernel.id(),
+            None,
+        )
+        .await;
+
+        let filled = documents
+            .get_block_snapshot(ctx, &result)
+            .unwrap()
+            .expect("the result block still exists");
+        assert_eq!(
+            filled.content.trim(),
+            "replaced",
+            "the output must replace the placeholder, not sit beside it"
+        );
+        assert_eq!(filled.status, Status::Done);
     }
 }

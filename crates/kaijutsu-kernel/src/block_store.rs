@@ -1512,6 +1512,31 @@ impl BlockStore {
         self.edit_text_as(context_id, block_id, pos, insert, delete, None)
     }
 
+    /// Replace a block's whole text with `text`, as `principal_id`.
+    ///
+    /// One edit that deletes the current content and inserts the new text,
+    /// journaled and published like any other edit. Use it to fill a block
+    /// that already carries text, such as a `Waiting` tool result whose
+    /// placeholder must not survive beside the real output; `edit_text_as`
+    /// at position 0 with no delete would keep the placeholder.
+    pub fn replace_text_as(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        text: &str,
+        principal_id: Option<PrincipalId>,
+    ) -> BlockStoreResult<()> {
+        // A missing block reads as empty here and then fails in
+        // `edit_text_as` with the document's own error.
+        let len = self
+            .get(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?
+            .doc
+            .block_content_len(block_id)
+            .unwrap_or(0);
+        self.edit_text_as(context_id, block_id, 0, text, len, principal_id)
+    }
+
     /// Edit text within a block with an explicit author identity.
     pub fn edit_text_as(
         &self,
@@ -7880,6 +7905,34 @@ mod tests {
     ///
     /// Falsified by anchoring the next block at `result` instead of the
     /// returned child id.
+    /// `replace_text_as` swaps the whole content; a block that already
+    /// carries text ends up with only the new text.
+    #[test]
+    fn replace_text_as_drops_the_existing_content() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let call = store
+            .insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None)
+            .unwrap();
+        let result = store
+            .insert_tool_result(ctx, &call, Some(&call), "waiting on a human", true, None, None)
+            .unwrap();
+
+        store
+            .replace_text_as(ctx, &result, "real output", Some(test_agent()))
+            .unwrap();
+
+        let text = store
+            .get_block_snapshot(ctx, &result)
+            .unwrap()
+            .expect("block exists")
+            .content;
+        assert_eq!(text, "real output");
+    }
+
     #[test]
     fn insert_error_block_as_returns_the_id_to_anchor_the_next_block_after() {
         let store = BlockStore::new(test_agent());
