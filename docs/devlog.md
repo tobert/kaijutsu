@@ -1208,3 +1208,10 @@ prompt timeout as the reviewer denying the ask. Timeouts and cancelled
 prompts now leave the durable ask pending; only a selected decision records
 a verdict. Review also separated the TUI's pending snapshot from its shown
 card set, preserving the next ask while another card is open.
+
+Fable's review had also found that settling a denied model tool pair did
+not tell its turn. Denials and cancellations now settle the pair, evict the
+cached conversation, and resume it with an explicit no-run receipt. A failed
+shell materialization tells the waiting model too; connected session pairs
+continue to receive their result through the block feed. Wire regressions
+cover both denial and cancellation without executing the command.
