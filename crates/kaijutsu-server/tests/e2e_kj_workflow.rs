@@ -840,17 +840,16 @@ fn test_coder_stance_guided_for_rpc_created_fast_model() {
             blocks
         );
 
-        // Stance text: "Do not guess." is the guided tier's defining
-        // instruction (plain imperative, no metaphor) and appears in no
-        // other tier.
+        // Stance text: "Work in this order:" opens the guided tier's
+        // numbered procedure and appears in no other tier.
         let has_guided_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("Do not guess.")
+                && b.content.contains("Work in this order:")
         });
         assert!(
             has_guided_stance,
-            "expected the guided coder stance (\"Do not guess.\") for a \
+            "expected the guided coder stance (\"Work in this order:\") for a \
              context inheriting a fast-executor model; got {} blocks: {:#?}",
             blocks.len(),
             blocks
@@ -897,18 +896,19 @@ fn test_coder_stance_focused_for_a_frontier_model() {
             blocks
         );
 
-        // "one hand in a cybernetic loop" is the focused tier's defining
-        // line and appears in no other arm — the register split is the
-        // whole point of the tiering, so pin the register, not the length.
+        // "Use test-driven development." is the focused tier's own line;
+        // the guided tier spells the same rule out as numbered steps — the
+        // register split is the whole point of the tiering, so pin the
+        // register, not the length.
         let has_focused_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("one hand in a cybernetic loop")
+                && b.content.contains("Use test-driven development.")
         });
         assert!(
             has_focused_stance,
-            "expected the focused coder stance (\"one hand in a cybernetic \
-             loop\") for a frontier model; got {} blocks: {:#?}",
+            "expected the focused coder stance (\"Use test-driven \
+             development.\") for a frontier model; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
@@ -918,7 +918,7 @@ fn test_coder_stance_focused_for_a_frontier_model() {
         let has_guided_marker = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("Do not guess.")
+                && b.content.contains("Work in this order:")
         });
         assert!(
             !has_guided_marker,
@@ -962,19 +962,17 @@ fn test_coder_stance_guided_for_rpc_created_non_matching_model() {
             blocks
         );
 
-        // Stance text: "Do not read the whole repository first." is a
-        // guided-tier-only instruction and appears in no other tier.
+        // Stance text: "Work in this order:" opens the guided tier's
+        // numbered procedure and appears in no other tier.
         let has_guided_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content
-                    .contains("Do not read the whole repository first.")
+                && b.content.contains("Work in this order:")
         });
         assert!(
             has_guided_stance,
-            "expected the guided coder stance (\"Do not read the whole \
-             repository first.\") for a context inheriting a non-matching \
-             model; got {} blocks: {:#?}",
+            "expected the guided coder stance (\"Work in this order:\") for a \
+             context inheriting a non-matching model; got {} blocks: {:#?}",
             blocks.len(),
             blocks
         );
@@ -1053,11 +1051,11 @@ fn test_coder_stance_guided_for_null_row_model_via_kj_dispatch() {
         let has_guided_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("Do not guess.")
+                && b.content.contains("Work in this order:")
         });
         assert!(
             has_guided_stance,
-            "expected the guided coder stance (\"Do not guess.\") for a \
+            "expected the guided coder stance (\"Work in this order:\") for a \
              kj-dispatch-created context with a null row model and a \
              fast-executor registry default; got {} blocks: {:#?}",
             blocks.len(),
