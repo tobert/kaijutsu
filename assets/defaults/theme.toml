@@ -8,8 +8,8 @@
 # Base UI
 bg = "#131020"
 panel_bg = "#131020f2"
-fg = "#d8d2ee"
-fg_dim = "#6f6592"
+fg = "#ece8f7"
+fg_dim = "#9a90bd"
 accent = "#a487ff"
 accent2 = "#ffcf7d"
 border = "#3d3260"
@@ -70,7 +70,7 @@ frame_edge_dim_focused = [1.0, 1.0, 1.0, 1.0]
 
 # Shader effects — glow
 effect_glow_radius = 4.0
-effect_glow_intensity = 0.3
+effect_glow_intensity = 0.15
 effect_glow_falloff = 2.0
 
 # Shader effects — sheen (subtle shine)
@@ -124,9 +124,9 @@ block_border_drift = "#c476e180"
 block_border_thickness = 1.5
 block_border_corner_radius = 4.0
 block_border_glow_radius = 6.0
-block_border_glow_intensity = 0.25
+block_border_glow_intensity = 0.12
 text_glow_radius = 2.5
-text_glow_color = "#cbb8ff59"
+text_glow_color = "#cbb8ff2e"
 block_border_padding = 0.6
 block_spacing = 12.0
 
@@ -230,3 +230,14 @@ bloom_low_frequency_boost = 0.25
 # one of: tony_mc_mapface | aces | agx | blender_filmic | reinhard |
 #         reinhard_luminance | somewhat_boring | none
 tonemapper = "aces"
+
+[scene.lighting]
+# OPTIONAL hybrid lit-chamber spike (off = today's all-unlit room, docs/color.md)
+lit_chamber = false
+chamber_roughness = 0.5      # wet-asphalt sheen on the lit shell surfaces
+chamber_reflectance = 0.3    # a small specular kick
+key_light_color = "#ffc58f"  # one warm key light at the well (~3200K)
+key_light_intensity = 5.0e8  # lumens; large — the room is ~1300 units, not metric
+key_light_range = 2000.0     # cutoff radius, covers the floor disc and walls
+ambient_color = "#ffe6cc"    # faint warm fill so far walls are not pure black
+ambient_brightness = 150.0

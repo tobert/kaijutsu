@@ -75,6 +75,22 @@ pub struct ScenePalette {
     pub bloom_intensity: f32,
     pub bloom_low_frequency_boost: f32,
     pub tonemapper: Tonemapping,
+
+    // ── Lit-chamber mode (OPTIONAL; off by default — docs/color.md) ──
+    /// Light the chamber shell instead of the all-unlit room. Read at spawn
+    /// time: off spawns no lights and builds every material as the unlit path.
+    pub lit_chamber: bool,
+    /// `perceptual_roughness`/`reflectance` for the lit shell surfaces.
+    pub chamber_roughness: f32,
+    pub chamber_reflectance: f32,
+    /// The one warm key light at the well (color linear; intensity in lumens,
+    /// range in world units — the room is not metric, so these are large).
+    pub key_light: LinearRgba,
+    pub key_light_intensity: f32,
+    pub key_light_range: f32,
+    /// Faint warm ambient fill so the far walls are not pure black.
+    pub ambient: LinearRgba,
+    pub ambient_brightness: f32,
 }
 
 impl ScenePalette {
@@ -102,6 +118,7 @@ impl ScenePalette {
         let t = &scene.tiers;
         let g = &scene.gains;
         let p = &scene.post;
+        let l = &scene.lighting;
         Self {
             bg: hue("bg", &h.bg, d.bg),
             gold: hue("gold", &h.gold, d.gold),
@@ -144,6 +161,15 @@ impl ScenePalette {
                 );
                 d.tonemapper
             }),
+
+            lit_chamber: l.lit_chamber,
+            chamber_roughness: l.chamber_roughness,
+            chamber_reflectance: l.chamber_reflectance,
+            key_light: hue("key_light_color", &l.key_light_color, d.key_light),
+            key_light_intensity: l.key_light_intensity,
+            key_light_range: l.key_light_range,
+            ambient: hue("ambient_color", &l.ambient_color, d.ambient),
+            ambient_brightness: l.ambient_brightness,
         }
     }
 }
@@ -195,6 +221,19 @@ impl Default for ScenePalette {
             bloom_intensity: 0.22,
             bloom_low_frequency_boost: 0.25,
             tonemapper: Tonemapping::AcesFitted,
+
+            // Lit-chamber mode OFF by default (mirrors SceneLightingData::
+            // default()); the light colors parse from the same hex as the
+            // theme so the mirror test holds. Intensity/range are first
+            // guesses against the room's large non-metric scale — tuned live.
+            lit_chamber: false,
+            chamber_roughness: 0.5,
+            chamber_reflectance: 0.3,
+            key_light: Srgba::hex("#ffc58f").unwrap().into(),
+            key_light_intensity: 5.0e8,
+            key_light_range: 2000.0,
+            ambient: Srgba::hex("#ffe6cc").unwrap().into(),
+            ambient_brightness: 150.0,
         }
     }
 }
@@ -283,10 +322,18 @@ mod tests {
         close(compiled.wall_base, parsed.wall_base, "wall_base");
         close(compiled.wall_mullion, parsed.wall_mullion, "wall_mullion");
         close(compiled.dark_surface, parsed.dark_surface, "dark_surface");
+        close(compiled.key_light, parsed.key_light, "key_light");
+        close(compiled.ambient, parsed.ambient, "ambient");
         assert_eq!(compiled.crest, parsed.crest);
         assert_eq!(compiled.gain_beat, parsed.gain_beat);
         assert_eq!(compiled.tonemapper, parsed.tonemapper);
         assert_eq!(compiled.bloom_intensity, parsed.bloom_intensity);
+        assert_eq!(compiled.lit_chamber, parsed.lit_chamber);
+        assert_eq!(compiled.chamber_roughness, parsed.chamber_roughness);
+        assert_eq!(compiled.chamber_reflectance, parsed.chamber_reflectance);
+        assert_eq!(compiled.key_light_intensity, parsed.key_light_intensity);
+        assert_eq!(compiled.key_light_range, parsed.key_light_range);
+        assert_eq!(compiled.ambient_brightness, parsed.ambient_brightness);
     }
 
     #[test]

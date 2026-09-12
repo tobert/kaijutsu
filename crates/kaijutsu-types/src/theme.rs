@@ -397,6 +397,7 @@ pub struct SceneData {
     pub tiers: SceneTiersData,
     pub gains: SceneGainsData,
     pub post: ScenePostData,
+    pub lighting: SceneLightingData,
 }
 
 /// `[scene.hues]` — identity hues, hex sRGB. Brightness lives in the tiers;
@@ -582,6 +583,54 @@ impl Default for ScenePostData {
             bloom_intensity: 0.22,
             bloom_low_frequency_boost: 0.25,
             tonemapper: "aces".into(),
+        }
+    }
+}
+
+/// `[scene.lighting]` — the OPTIONAL hybrid lit-chamber mode (`docs/color.md`,
+/// the two-lane contract; `docs/scenes/shell.md`, "all-unlit discipline").
+/// Off by default: the room renders exactly as the all-unlit shell. On, only
+/// the chamber SHELL (floor disc, wall panel bases, vault dome, console table)
+/// turns into low-albedo lit `StandardMaterial` catching one warm key light at
+/// the well; every content-bearing surface (traces, cards, lamps, threads,
+/// gold trim, glyphs) stays unlit and emissive so the tier ladder's
+/// bloom-at-1.0 rule holds. Colors are sRGB hex (linearized for the light);
+/// intensity/range are in Bevy's photometric units against the room's own
+/// large world scale, a first-guess tuned live over BRP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SceneLightingData {
+    /// Light only the chamber shell instead of the all-unlit room.
+    pub lit_chamber: bool,
+    /// `perceptual_roughness` of the lit shell surfaces (wet-asphalt sheen).
+    pub chamber_roughness: f32,
+    /// `reflectance` of the lit shell surfaces (a small specular kick).
+    pub chamber_reflectance: f32,
+    /// Warm key light at the well center (~3200K).
+    pub key_light_color: String,
+    /// Key light luminous power (lumens). Large: the room is ~1300 units, not
+    /// meters, so inverse-square falloff needs a big first guess.
+    pub key_light_intensity: f32,
+    /// Key light cutoff radius — covers the floor disc (`FLOOR_RADIUS` 1300)
+    /// and the walls.
+    pub key_light_range: f32,
+    /// Faint warm fill so the far walls are not pure black.
+    pub ambient_color: String,
+    /// Ambient fill brightness (cd/m^2).
+    pub ambient_brightness: f32,
+}
+
+impl Default for SceneLightingData {
+    fn default() -> Self {
+        Self {
+            lit_chamber: false,
+            chamber_roughness: 0.5,
+            chamber_reflectance: 0.3,
+            key_light_color: "#ffc58f".into(),
+            key_light_intensity: 5.0e8,
+            key_light_range: 2000.0,
+            ambient_color: "#ffe6cc".into(),
+            ambient_brightness: 150.0,
         }
     }
 }

@@ -202,6 +202,14 @@ const TABLE_PEDESTAL_RADIUS: f32 = 55.0;
 /// standing there*, not by an arbitrary rule.
 pub(crate) const TABLE_PLINTH_RADIUS: f32 = 145.0;
 const TABLE_PLINTH_HEIGHT: f32 = 16.0;
+
+/// Height (world-Y) of the OPTIONAL lit-chamber key light, a bit above the
+/// console rings so it washes down over the floor and up the near walls
+/// (`ScenePalette::lit_chamber`; only spawned when that flag is on). Above
+/// `TABLE_TOP_Y` (70), below the nameplates (`PLATE_HEIGHT`, 200). Brightness,
+/// range, and colour are tunable via `ScenePalette`; this placement is
+/// geometry.
+const WELL_LIGHT_HEIGHT: f32 = 180.0;
 // Table/pedestal/plinth colour (`ScenePalette::table`) and the rim torus's
 // gold trim brightness (`ScenePalette::gold` × `ScenePalette::trim`) moved
 // onto the palette resource.
@@ -571,6 +579,19 @@ fn enter_room(
         cam.clear_color = ClearColorConfig::Custom(Color::LinearRgba(palette.bg));
         let (pos, look) = shot::resolve(shot::RoomShot::focused(room.carousel.focused_station()));
         *tf = Transform::from_translation(pos).looking_at(look, Vec3::Y);
+        // OPTIONAL lit-chamber mode: a faint warm ambient fill so the far
+        // walls are not pure black. `AmbientLight` is a per-view override that
+        // `#[require(Camera)]`, so it rides the room camera (not a standalone
+        // entity, which would drag in a second camera); `teardown_room`
+        // removes it on the way out. Tunable live over BRP by mutating this
+        // component on the room camera. Off = no ambient, the all-unlit room.
+        if palette.lit_chamber {
+            commands.entity(cam_entity).insert(AmbientLight {
+                color: Color::LinearRgba(palette.ambient),
+                brightness: palette.ambient_brightness,
+                ..default()
+            });
+        }
     }
 
     let root = commands
@@ -585,11 +606,21 @@ fn enter_room(
     // Vault dome — an enclosing sphere with a subtle vertical vertex-colour
     // gradient (calm darkness overhead; `shell.md` open question 4 defers the
     // dome's content — no starfield). Viewed from inside → no back-face cull.
-    let dome_mat = mats.add(StandardMaterial {
-        base_color: Color::WHITE, // vertex colours carry the gradient
-        unlit: true,
-        cull_mode: None,
-        ..default()
+    // Vertex colours carry the gradient; viewed from inside → no back-face
+    // cull. In lit-chamber mode the dark gradient becomes low albedo so the
+    // dome stays a calm dark vault. Off = the unlit path, byte-for-byte.
+    let dome_mat = mats.add(if palette.lit_chamber {
+        StandardMaterial {
+            base_color: Color::WHITE,
+            unlit: false,
+            perceptual_roughness: palette.chamber_roughness,
+            metallic: 0.0,
+            reflectance: palette.chamber_reflectance,
+            cull_mode: None,
+            ..default()
+        }
+    } else {
+        StandardMaterial { base_color: Color::WHITE, unlit: true, cull_mode: None, ..default() }
     });
     commands.spawn((
         Mesh3d(meshes.add(dome_mesh(DOME_RADIUS))),
@@ -712,6 +743,27 @@ fn enter_room(
     // own doc above has the story).
     switchboard::spawn_switchboard(&mut commands, root, &mut meshes, &mut mats);
 
+    // OPTIONAL lit-chamber mode: one warm key light at the well/console center,
+    // the room's visual heart. A `RoomRoot` child so it despawns with the room;
+    // named so it can be tuned live over BRP (intensity/color/range). Shadows
+    // off for the spike. Off (the default) spawns no light and the shell stays
+    // all-unlit (`docs/scenes/shell.md`, "all-unlit discipline").
+    if palette.lit_chamber {
+        commands.spawn((
+            PointLight {
+                color: Color::LinearRgba(palette.key_light),
+                intensity: palette.key_light_intensity,
+                range: palette.key_light_range,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_xyz(0.0, WELL_LIGHT_HEIGHT, 0.0),
+            Visibility::Inherited,
+            Name::new("WellKeyLight"),
+            ChildOf(root),
+        ));
+    }
+
     info!("room: entered (Tardis chamber — the time well at center)");
 }
 
@@ -758,6 +810,9 @@ pub(crate) fn teardown_room(
     }
     if let Ok((cam_entity, mut cam)) = app_camera.single_mut() {
         commands.entity(cam_entity).remove::<RoomCamera>();
+        // Drop the lit-chamber ambient override (a no-op when the mode was off
+        // and none was inserted) so the shared camera leaves the room clean.
+        commands.entity(cam_entity).remove::<AmbientLight>();
         cam.clear_color = ClearColorConfig::Custom(theme.bg);
     }
 }
@@ -939,10 +994,21 @@ fn spawn_floor(
     // plane, +Z normal), so the same tip-to-XZ rotation applies.
     commands.spawn((
         Mesh3d(meshes.add(floor_mesh(FLOOR_RADIUS, FLOOR_RINGS, FLOOR_SEGMENTS))),
-        MeshMaterial3d(mats.add(StandardMaterial {
-            base_color: Color::WHITE, // vertex colours carry the gradient
-            unlit: true,
-            ..default()
+        // Vertex colours carry the dark radial gradient; in lit-chamber mode
+        // that gradient becomes low albedo (WHITE × dark vertex colour) so the
+        // floor stays dark and catches the well's light. Off = the unlit path,
+        // byte-for-byte.
+        MeshMaterial3d(mats.add(if palette.lit_chamber {
+            StandardMaterial {
+                base_color: Color::WHITE,
+                unlit: false,
+                perceptual_roughness: palette.chamber_roughness,
+                metallic: 0.0,
+                reflectance: palette.chamber_reflectance,
+                ..default()
+            }
+        } else {
+            StandardMaterial { base_color: Color::WHITE, unlit: true, ..default() }
         })),
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
         Visibility::Inherited,
@@ -1078,7 +1144,9 @@ fn spawn_table(
     meshes: &mut Assets<Mesh>,
     mats: &mut Assets<StandardMaterial>,
 ) {
-    let table_mat = mats.add(unlit(Color::LinearRgba(palette.table)));
+    // Table body is chamber shell (lit in lit-chamber mode); the gold rim is
+    // content-bearing trim and stays unlit + emissive.
+    let table_mat = mats.add(chamber_mat(palette, Color::LinearRgba(palette.table)));
     let gold_mat = mats.add(unlit(lin_scaled(palette.gold, palette.trim)));
 
     // Plinth — wide and low, grounding the table to the floor.
@@ -1143,7 +1211,9 @@ fn spawn_walls(
     let panel_width = bearing::octagon_panel_width(wall_apothem) - WALL_PANEL_GAP;
 
     let base_mesh = meshes.add(Rectangle::new(panel_width, WALL_HEIGHT));
-    let base_mat = mats.add(unlit(Color::LinearRgba(palette.wall_base)));
+    // The panel base quad is chamber shell (lit in lit-chamber mode); the neon
+    // edge trim, violet threads, and mullions below stay unlit + emissive.
+    let base_mat = mats.add(chamber_mat(palette, Color::LinearRgba(palette.wall_base)));
     // `glow_quad_mesh` (not a plain `Rectangle`) so `uv.x` tracks each trim
     // strip's own REAL length: the top/bottom strips are wide-and-short, the
     // left/right strips are narrow-and-tall, and `TraceGlowMaterial`'s
@@ -1656,6 +1726,32 @@ fn sync_room_glow(
 /// room's one emission channel (HDR blooms, LDR reads crisp).
 fn unlit(base_color: Color) -> StandardMaterial {
     StandardMaterial { base_color, unlit: true, ..default() }
+}
+
+/// A chamber-shell material: the all-unlit [`unlit`] path by default, or — when
+/// [`ScenePalette::lit_chamber`] is on — a low-albedo LIT `StandardMaterial`
+/// with real roughness that catches the well's key light as a highlight and a
+/// falloff while staying dark (wet-asphalt). `base_color` is the same linear
+/// value the unlit path carries, so the surface stays dark and below the
+/// bloom threshold; only the shape catches light. When the flag is off this is
+/// byte-for-byte the `unlit()` material — the spike is a true no-op then. Only
+/// the four structural shell groups (floor disc, wall panel bases, vault dome,
+/// console table) use this; every content-bearing emissive surface keeps
+/// carrying its brightness in `base_color` through `unlit()` (`docs/color.md`,
+/// the tier ladder; `docs/scenes/shell.md`, "all-unlit discipline").
+fn chamber_mat(palette: &ScenePalette, base_color: Color) -> StandardMaterial {
+    if palette.lit_chamber {
+        StandardMaterial {
+            base_color,
+            unlit: false,
+            perceptual_roughness: palette.chamber_roughness,
+            metallic: 0.0,
+            reflectance: palette.chamber_reflectance,
+            ..default()
+        }
+    } else {
+        unlit(base_color)
+    }
 }
 
 /// A linear-rgb [`Color`] from a [`Vec3`].
