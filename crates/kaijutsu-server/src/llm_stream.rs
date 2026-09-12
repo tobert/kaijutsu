@@ -285,6 +285,9 @@ pub(crate) async fn spawn_llm_for_prompt(
     // completion is precisely what a wire subscriber (`subscribeTurnEvents`,
     // the ACP adapter) is waiting for.
     origin: TurnOrigin,
+    // An answered gate preserves the epoch that started the turn which raised
+    // it. Every other request is an explicit drive and opens a fresh window.
+    continuation_epoch: Option<i64>,
 ) -> Result<(), capnp::Error> {
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();
@@ -588,6 +591,30 @@ pub(crate) async fn spawn_llm_for_prompt(
     // this function returns to its RPC caller, so a `kj wait` issued right
     // after the RPC response cannot race it. `process_llm_stream` always
     // publishes exactly one terminal `TurnFlow` (§7 above), which clears it.
+    let continuation_epoch = match continuation_epoch {
+        Some(epoch) => {
+            if kernel_arc.turn_in_flight(context_id) { return Ok(()); }
+            let window = kernel_arc.gate_resume_window().await.map_err(capnp::Error::failed)?;
+            let window_ms = i64::try_from(window.as_millis())
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            if !kernel_db.lock().claim_automatic_resume(
+                context_id, epoch, kaijutsu_types::now_millis() as i64, window_ms,
+            ).map_err(|error| capnp::Error::failed(error.to_string()))? {
+                return Ok(());
+            }
+            Some(epoch)
+        },
+        None => Some(
+            kernel_db
+                .lock()
+                .begin_continuation(context_id, kaijutsu_types::now_millis() as i64)
+                .map_err(|error| capnp::Error::failed(format!(
+                    "Could not open continuation window: {error}"
+                )))?
+                .epoch,
+        ),
+    };
+
     kernel_arc.mark_turn_begun(context_id);
 
     tokio::task::spawn_local(process_llm_stream(
@@ -611,6 +638,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         interrupt_generation,
         context_interrupts,
         origin,
+        continuation_epoch,
     ));
 
     Ok(())
@@ -1305,6 +1333,79 @@ fn link_waiting_pair_to_ask(
     }
 }
 
+fn pending_shell_operation_receipt(
+    kernel: &Arc<Kernel>,
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    tool_ctx: &kaijutsu_kernel::ExecContext,
+    source: &str,
+    ask_id: &str,
+) -> Result<String, String> {
+    if let Some(existing) = kernel.shell_operations().get_by_ask(ask_id, context_id)? {
+        return Ok(existing.receipt.operation_id);
+    }
+    let arguments: serde_json::Value = serde_json::from_str(source).map_err(|error| error.to_string())?;
+    let command_source = arguments.get("command").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "pending shell call has no command".to_string())?;
+    let tail = documents.last_block_id(context_id);
+    let command = documents.insert_tool_call_as(
+        context_id, None, tail.as_ref(), "shell",
+        serde_json::json!({"command": command_source}),
+        Some(kaijutsu_types::ToolKind::Shell), Some(tool_ctx.actor_id), None, None,
+    ).map_err(|error| error.to_string())?;
+    let output = documents.insert_tool_result_as(
+        context_id, &command, Some(&command), "", false, None,
+        Some(kaijutsu_types::ToolKind::Shell), Some(PrincipalId::system()), None,
+    ).map_err(|error| error.to_string())?;
+    for block in [&command, &output] {
+        documents.set_excluded(context_id, block, true).map_err(|error| error.to_string())?;
+        documents.set_status(context_id, block, Status::Waiting).map_err(|error| error.to_string())?;
+    }
+    let epoch = kernel.kernel_db().lock().continuation_epoch(context_id).map_err(|error| error.to_string())?;
+    let receipt = kernel.shell_operations().register(
+        context_id, tool_ctx.principal_id, tool_ctx.actor_id, command, output,
+        command_source, epoch,
+    )?;
+    kernel.shell_operations().mark_waiting(&receipt.operation_id, ask_id)?;
+    kernel.kernel_db().lock().link_ask_blocks(
+        ask_id, &receipt.command_block_id, &receipt.output_block_id,
+        kaijutsu_kernel::PairOwner::Turn,
+    ).map_err(|error| error.to_string())?;
+    Ok(receipt.operation_id)
+}
+
+fn make_pending_shell_receipt(
+    kernel: &Arc<Kernel>, documents: &SharedBlockStore, context_id: ContextId,
+    tool_ctx: &kaijutsu_kernel::ExecContext, tool_name: &str, params: &str,
+    ask_id: Option<&str>, content: &mut String, is_error: &mut bool, status: &mut Status,
+) {
+    if !matches!(tool_name, "shell" | "shell_write") || *status != Status::Waiting {
+        return;
+    }
+    let Some(ask_id) = ask_id else { return; };
+    if serde_json::from_str::<serde_json::Value>(params).ok()
+        .and_then(|value| value.get("foreground").and_then(serde_json::Value::as_bool)) == Some(true)
+    {
+        return;
+    }
+    match pending_shell_operation_receipt(kernel, documents, context_id, tool_ctx, params, ask_id) {
+        Ok(operation_id) => {
+            let mut receipt = ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Waiting);
+            receipt.stderr = format!("operation {operation_id} is waiting for ask {ask_id}; the command has not run");
+            receipt.operation_id = Some(operation_id);
+            receipt.ask_id = Some(ask_id.to_owned());
+            *content = receipt.to_value().to_string();
+            *is_error = false;
+            *status = Status::Done;
+        }
+        Err(error) => {
+            *content = format!("Could not create receipt for pending ask {ask_id}: {error}");
+            *is_error = true;
+            *status = Status::Error;
+        }
+    }
+}
+
 /// Execute a provider-owned, in-flight tool callback through Kaijutsu's one
 /// broker path, while materializing the same durable ToolCall/ToolResult pair
 /// an ordinary `StreamEvent::ToolUse` gets.
@@ -1395,7 +1496,7 @@ async fn dispatch_inline_tool_result(
     // Let the client observe the running ToolResult before it completes.
     tokio::task::yield_now().await;
 
-    let ToolDispatch { content, is_error, status: settled_status, payload: error_payload, ask_id } =
+    let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload: error_payload, ask_id } =
         dispatch_and_map_tool_result(
         kernel,
         tool_name,
@@ -1404,6 +1505,11 @@ async fn dispatch_inline_tool_result(
         cancel,
     )
     .await;
+
+    make_pending_shell_receipt(
+        kernel, documents, context_id, tool_ctx, tool_name, &input.to_string(),
+        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status,
+    );
 
     // ANSI ingest, same policy as the agentic path above: the projection is
     // what the block stores AND what the model reads back.
@@ -1542,6 +1648,27 @@ struct TurnSpanIdentity {
     review_source: kaijutsu_kernel::approval_identity::ReviewSource,
 }
 
+// The full turn context (provider, target block, interrupt/cache/kernel
+// handles) has to reach the stream loop somehow; a params struct would just
+// relocate these 17 fields without changing the shape of the problem.
+fn record_continuation_yield(
+    kernel_db: &parking_lot::Mutex<KernelDb>,
+    context_id: ContextId,
+    continuation_epoch: Option<i64>,
+) {
+    let Some(epoch) = continuation_epoch else {
+        return;
+    };
+    if let Err(error) = kernel_db
+        .lock()
+        .record_continuation_yield(context_id, epoch, kaijutsu_types::now_millis() as i64)
+    {
+        log::error!(
+            "Could not record continuation yield for {context_id} epoch {epoch}: {error}"
+        );
+    }
+}
+
 #[tracing::instrument(
     name = "llm.turn",
     skip_all,
@@ -1566,9 +1693,6 @@ struct TurnSpanIdentity {
         turn.origin = tracing::field::Empty,
     )
 )]
-// The full turn context (provider, target block, interrupt/cache/kernel
-// handles) has to reach the stream loop somehow; a params struct would just
-// relocate these 17 fields without changing the shape of the problem.
 #[allow(clippy::too_many_arguments)]
 async fn process_llm_stream(
     provider: Arc<Provider>,
@@ -1604,6 +1728,7 @@ async fn process_llm_stream(
     // unconditional. It fires at actual stream end with the real output block
     // id, not at spawn racing the model.
     origin: TurnOrigin,
+    continuation_epoch: Option<i64>,
 ) {
     if let Some(identity) = span_identity {
         let span = tracing::Span::current();
@@ -1676,6 +1801,7 @@ async fn process_llm_stream(
                 error: format!("hydration policy unreadable: {e}"),
                 origin,
             });
+            record_continuation_yield(&kernel_db, context_id, continuation_epoch);
             kernel.mark_turn_ended(context_id);
             return;
         }
@@ -1701,6 +1827,7 @@ async fn process_llm_stream(
                 error: "hydration failed: could not read conversation history".to_string(),
                 origin,
             });
+            record_continuation_yield(&kernel_db, context_id, continuation_epoch);
             kernel.mark_turn_ended(context_id);
             return;
         }
@@ -1900,7 +2027,16 @@ async fn process_llm_stream(
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                match provider.stream(build_opts.clone(), messages.clone()).await {
+                let stamp = continuation_epoch.map(|epoch| kernel_db.lock().record_continuation_request(
+                    context_id, epoch, kaijutsu_types::now_millis() as i64,
+                )).transpose();
+                let started = match stamp {
+                    Ok(_) => provider.stream(build_opts.clone(), messages.clone()).await,
+                    Err(error) => Err(LlmError::InvalidRequest(format!(
+                        "Could not record inference request: {error}"
+                    ))),
+                };
+                match started {
                     Ok(s) => {
                         if attempt > 1 {
                             log::debug!("LLM stream started on attempt {}", attempt);
@@ -1953,6 +2089,7 @@ async fn process_llm_stream(
                             error: format!("LLM stream failed to start: {e}"),
                             origin,
                         });
+                        record_continuation_yield(&kernel_db, context_id, continuation_epoch);
                         kernel.mark_turn_ended(context_id);
                         return;
                     }
@@ -2275,6 +2412,7 @@ async fn process_llm_stream(
                             error: detail,
                             origin,
                         });
+                        record_continuation_yield(&kernel_db, context_id, continuation_epoch);
                         kernel.mark_turn_ended(context_id);
                         return;
                     }
@@ -2530,6 +2668,7 @@ async fn process_llm_stream(
                         error: format!("LLM stream error: {err}"),
                         origin,
                     });
+                    record_continuation_yield(&kernel_db, context_id, continuation_epoch);
                     kernel.mark_turn_ended(context_id);
                     return;
                 }
@@ -2659,9 +2798,9 @@ async fn process_llm_stream(
                     // no outer timeout wrapper needed here; see
                     // `dispatch_and_map_tool_result`'s doc for why.
                     let ToolDispatch {
-                        content: result_content,
-                        is_error,
-                        status: settled_status,
+                        content: mut result_content,
+                        mut is_error,
+                        status: mut settled_status,
                         payload: error_payload,
                         ask_id,
                     } = dispatch_and_map_tool_result(
@@ -2672,6 +2811,11 @@ async fn process_llm_stream(
                         interrupt.cancel.clone(),
                     )
                     .await;
+
+                    make_pending_shell_receipt(
+                        &kernel, &documents, context_id, &tool_ctx, &tool_name, &params,
+                        ask_id.as_deref(), &mut result_content, &mut is_error, &mut settled_status,
+                    );
 
                     // Step 4a: split the two readers. A `shell` result is a
                     // JSON envelope (`docs/shell-envelope.md`) — that is what
@@ -2884,6 +3028,7 @@ async fn process_llm_stream(
         reason: stop_reason_out,
         origin,
     });
+    record_continuation_yield(&kernel_db, context_id, continuation_epoch);
     kernel.mark_turn_ended(context_id);
 }
 
@@ -3002,6 +3147,7 @@ mod publish_tests {
             1,
             context_interrupts,
             origin,
+            None,
         )
         .await;
 
@@ -3455,6 +3601,7 @@ mod publish_tests {
             1,
             context_interrupts,
             origin,
+            None,
         )
         .await;
         ctx
@@ -4471,6 +4618,7 @@ mod usage_tests {
             1,
             context_interrupts,
             TurnOrigin::Autonomous,
+            None,
         )
         .await;
 
@@ -5066,6 +5214,7 @@ mod error_child_anchor_tests {
             1,
             context_interrupts,
             TurnOrigin::Autonomous,
+            None,
         )
         .await;
 
@@ -5272,6 +5421,7 @@ mod authorship_tests {
             1,
             context_interrupts,
             TurnOrigin::Autonomous,
+            None,
         )
         .await;
 
@@ -5416,6 +5566,7 @@ mod gate_resume_cache_eviction_tests {
             1,
             context_interrupts,
             TurnOrigin::Autonomous,
+            None,
         )
         .await;
     }

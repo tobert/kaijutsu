@@ -119,16 +119,16 @@ crash-loss of provenance ever bites.
 **Reality checks from the build (2026-08-19).** Three findings from reading
 the actual ingest paths, now load-bearing:
 
-- **Foreground output arrives whole, not streaming.** kaish's
-  `ExecuteOptions` has no output sink; `ExecResult` returns one buffer. The
-  only streaming path is `background_exec.rs` (8 KiB chunks) — the one place
-  the incremental parser and its chunk-boundary state matter. Read
-  `result.out` (`OutputPayload`) directly; `text_out()` is already lossy on
-  the `Bytes` arm.
-- **kaish truncates upstream** (head+tail spill, Agent profile 8 KB), so
-  foreground provenance is *post-cap* bytes — "what kaish handed us" is the
-  honest original. `background_exec`'s cap is kaijutsu-side, so pre-cap
-  capture is possible there.
+- **Shell output arrives at a whole-program boundary.** kaish's
+  `ExecuteOptions` has no output sink; `ExecResult` returns one buffer. Both
+  `foreground: true` and asynchronous completion use that result. The latter
+  settles its separate output block after the complete kaish program ends;
+  neither path streams chunks into a block. Read `result.out`
+  (`OutputPayload`) directly; `text_out()` is already lossy on the `Bytes`
+  arm.
+- **kaish truncates upstream** (head+tail spill, Agent profile 8 KB), so shell
+  provenance is *post-cap* bytes — "what kaish handed us" is the honest
+  original.
 - **`journal_op` is not a transaction today** (two autocommit statements
   under a mutex). The provenance row is therefore its own statement at the
   hook site: a crash between leaves a detectable gap (tag without row —
@@ -147,23 +147,11 @@ the actual ingest paths, now load-bearing:
   the raw text went, record. `raw_stdout(&ExecResult)` is the matching
   accessor for kaish results — `text_out()` is lossy on the `Bytes` arm and is
   never the provenance source.
-- **`background_exec` needs ONE parser for the whole block, not one per
-  pipe.** Both drain tasks append into the same block, so block content is the
-  interleaving of stdout and stderr in arrival order. Span offsets address that
-  interleaving, and `strip(original) == (content, spans)` only holds if a
-  single parser saw a single byte order. The shared `AnsiDrain` (parser +
-  cursor into `parser.text()` + raw buffer + committed watermark) sits behind a
-  mutex the drains take across feed-and-append. Side effect worth having: the
-  old per-chunk `String::from_utf8_lossy` smeared any multi-byte codepoint that
-  straddled a read boundary; the parser doesn't.
-- **The background cap now counts clean bytes, and provenance stops where the
-  block does.** `DEFAULT_OUTPUT_CAP` bounds what the block actually holds (the
-  persistent, replicated thing), so escape sequences no longer eat a colorful
-  command's budget. The stored original is exactly the byte prefix whose
-  projection reached the block. Consequence to know when writing the CI sweep:
-  for a *capped* block, `content == strip(original) + the cap marker`, not
-  `== strip(original)` — kaijutsu's own marker is deliberately not in the
-  original. Spans are exact either way.
+- **One completed result has one projection.** An asynchronous operation does
+  not interleave stdout and stderr chunks into its output block. Project the
+  returned result once before settling that block, so span offsets describe the
+  output a model and player can read. If streaming output returns, it needs an
+  incremental parser and chunk-boundary tests before it writes blocks.
 
 One replay wrinkle to remember: oplog replay applies journaled semantic
 appends through `edit_text`, which clears spans (live end-appends via
@@ -206,14 +194,15 @@ to diverge that way.
 
 ## Test ladder
 
-Cheapest to heaviest; the chunk-boundary property is the one that will catch
-*our* bugs (kaish output streams, sequences straddle flushes):
+Cheapest to heaviest; completion-boundary coverage catches the current shell
+path. Chunk-boundary coverage becomes necessary if a streaming writer returns.
 
 1. **Totality fuzzing** — cargo-fuzz over arbitrary bytes: never panics,
    memory O(input), time linear. With vte underneath, this mostly exercises
    our span assembly.
-2. **Chunk-boundary property** — parse split at every position (and random
-   splits) ≡ one-shot parse, byte-identical output.
+2. **Completion-boundary property** — parse each returned result once and
+   preserve byte-identical output. Add the chunk-boundary property only if a
+   future streaming writer is introduced.
 3. **Projection properties** — stripped text = input minus recognized
    sequences (differential vs a naive stripper on well-formed input); span
    offsets land on UTF-8 char boundaries of the stripped text;

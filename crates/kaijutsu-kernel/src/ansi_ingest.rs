@@ -1,4 +1,4 @@
-//! The `ansi-strip` ingest policy — one decision, six call sites.
+//! The `ansi-strip` ingest policy — one decision for all callers.
 //!
 //! Terminal output reaches kaijutsu through a handful of narrow doors
 //! (interactive shell stdout, `kj` capture, model tool results, rc/hook script
@@ -12,12 +12,6 @@
 //!                                     then record() lands spans + provenance
 //! ```
 //!
-//! Keeping the policy in one function is the point. The rules below are subtle
-//! enough that six independent copies would drift within a month. One site —
-//! `background_exec::AnsiDrain` — genuinely can't call [`project`] (it needs
-//! the incremental parser for chunk-boundary state), so it shares the no-op
-//! predicate ([`is_noop_projection`]) instead: one policy, two shapes.
-//!
 //! - **The fast path must stay free.** The overwhelming majority of shell
 //!   output has no `ESC` in it at all. [`project`] answers that case with a
 //!   single `memchr` (`<[u8]>::contains` specializes to `memchr` for `u8`) and
@@ -26,7 +20,7 @@
 //! - **A tag whose original equals its content teaches nobody anything.**
 //!   Escape bytes present but the projection byte-identical (a lone `ESC`
 //!   that survived to `finish` with no other effect) gets the no-op
-//!   treatment too — [`is_noop_projection`], shared by both shapes.
+//!   treatment too — [`is_noop_projection`], used by the projection.
 //! - **A tagged block always has a row.** Hook sites call [`record`], which
 //!   writes the provenance row *before* the tag, so a crash in between leaves
 //!   an orphan row (invisible, harmless) rather than a tag pointing at bytes
@@ -89,14 +83,7 @@ pub fn project(raw: &[u8]) -> Option<AnsiProjection> {
     Some(AnsiProjection { text, spans })
 }
 
-/// The second guard [`project`] applies, exported so the one streaming
-/// site (`background_exec::AnsiDrain::finish`) can apply the same rule
-/// instead of re-deriving it. True when a projection is a no-op worth
-/// suppressing: no styling, and the projected text is byte-identical to what
-/// was fed in — a tag whose original equals its content teaches nobody
-/// anything. This is what keeps a stray lone `ESC` (with no other escape
-/// bytes around it) from earning a tag, a `block_provenance` row, and a
-/// `SpansChanged` event for a block nothing actually happened to.
+/// A projection is a no-op when it changes neither styling nor text.
 pub(crate) fn is_noop_projection(text: &str, spans: &[StyleSpan], raw: &[u8]) -> bool {
     spans.is_empty() && text.as_bytes() == raw
 }
@@ -160,8 +147,7 @@ pub fn record(
 /// Note what this *cannot* recover: kaish applies its own output limiter
 /// upstream (head+tail spill, 8 KB on the Agent profile), so foreground
 /// provenance is post-cap bytes. "What kaish handed us" is the honest original
-/// for these sites; `background_exec` streams from the pipe itself and can
-/// capture pre-cap.
+/// for these sites.
 pub fn raw_stdout(result: &kaish_kernel::interpreter::ExecResult) -> Cow<'_, [u8]> {
     match result.out_bytes() {
         Some(bytes) => Cow::Borrowed(bytes),

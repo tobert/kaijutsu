@@ -21,6 +21,14 @@ use crate::kaijutsu_capnp::world;
 /// cadence its own streaming path would drive.
 const VFS_READ_CHUNK: u32 = 256 * 1024;
 
+/// A submitted shell operation. A pending ask keeps its operation handle.
+#[derive(Debug, Clone)]
+pub struct ShellSubmission {
+    pub command_block_id: BlockId,
+    pub operation_id: String,
+    pub refusal: Option<kaijutsu_types::Refusal>,
+}
+
 /// Aborts the Cap'n Proto RPC system task when the last reference is dropped.
 ///
 /// Without this, `spawn_local(rpc_system)` runs forever — the task owns the
@@ -441,10 +449,10 @@ pub struct ContextInfo {
     /// (wire sentinel -1.0) — decoded here so no code above this boundary
     /// has to remember what -1.0 means.
     pub context_used_pct: Option<f32>,
-    /// Background processes (`kaijutsu_kernel::background_exec`) currently
+    /// Shell operations currently
     /// `Running` in this context. `0` when none — the honest "nothing
     /// running" state, not a sentinel (kernel:
-    /// `BackgroundRegistry::summary_by_context`).
+    /// `ShellOperationRegistry::summary_by_context`).
     pub background_running_count: u32,
     /// Unix-millis `started_at` of the longest-running currently-`Running`
     /// background process, or `None` when nothing is running (0 on the
@@ -958,6 +966,21 @@ impl KernelHandle {
         context_id: ContextId,
         user_initiated: bool,
     ) -> Result<BlockId, RpcError> {
+        let submission = self.shell_submit(code, context_id, user_initiated).await?;
+        match submission.refusal {
+            Some(refusal) => Err(RpcError::Refused(refusal)),
+            None => Ok(submission.command_block_id),
+        }
+    }
+
+    /// Submit a shell operation and return its durable handle without waiting.
+    #[tracing::instrument(skip(self, code), name = "rpc_client.shell_submit")]
+    pub async fn shell_submit(
+        &self,
+        code: &str,
+        context_id: ContextId,
+        user_initiated: bool,
+    ) -> Result<ShellSubmission, RpcError> {
         let mut request = self.kernel.shell_execute_request();
         request.get().set_code(code);
         request.get().set_context_id(context_id.as_bytes());
@@ -969,12 +992,26 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        match response.get()?.get_outcome()?.which()? {
+        let outcome = response.get()?.get_outcome()?;
+        let operation_id = outcome.get_operation_id()?.to_str()?.to_owned();
+        match outcome.which()? {
             crate::kaijutsu_capnp::shell_execute_outcome::Ok(block_id) => {
-                parse_block_id(&block_id?)
+                Ok(ShellSubmission {
+                    command_block_id: parse_block_id(&block_id?)?,
+                    operation_id,
+                    refusal: None,
+                })
             }
             crate::kaijutsu_capnp::shell_execute_outcome::Refused(r) => {
-                Err(RpcError::Refused(refusal_from_capnp(r?)?))
+                let refusal = refusal_from_capnp(r?)?;
+                if operation_id.is_empty() || refusal.ask_id().is_none() {
+                    return Err(RpcError::Refused(refusal));
+                }
+                Ok(ShellSubmission {
+                    command_block_id: parse_block_id(&outcome.get_command_block_id()?)?,
+                    operation_id,
+                    refusal: Some(refusal),
+                })
             }
         }
     }
@@ -3693,7 +3730,7 @@ fn parse_context_info(
     };
     // -1 is the dedicated "no exit code" sentinel (a killed process, or
     // nothing finished yet) — real exit codes (including the `128 + signal`
-    // convention `background_exec.rs` uses) are never negative, so there is
+    // shell exit convention) are never negative, so there is
     // no collision the way there would be with a plain 0-means-none scheme.
     let background_last_exit_code = match reader.get_background_last_exit_code() {
         -1 => None,
@@ -5951,7 +5988,7 @@ mod tests {
     }
 
     /// Background-process ambient-state wire spine (`ContextHandleInfo`
-    /// `background*` fields @23-@27, `kaijutsu_kernel::background_exec`).
+    /// `background*` fields @23-@27, `kaijutsu_kernel::shell_operations`).
     /// Two sentinels to pin down here, mirroring the `contextUsedPct`
     /// coverage above: (1) an unset/no-history context decodes every field
     /// as `None`/`0`, never a fabricated "0 running"-that-looks-intentional;

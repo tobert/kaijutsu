@@ -281,41 +281,24 @@ impl KjDispatcher {
             }));
         }
 
-        // Child processes kaijutsu spawned. `summary_by_context` is the one
-        // kernel-wide read the registry offers, so it names the contexts and
-        // `list_for_context` supplies each one's per-process detail.
-        let summaries = self.kernel().background_processes().summary_by_context();
+        let summaries = match self.kernel().shell_operations().summary_by_context() {
+            Ok(summaries) => summaries,
+            Err(e) => return KjResult::Err(format!("system status: {e}")),
+        };
         for context_id in summaries.keys() {
             let (label, ctype) = self.describe_context(*context_id);
-            for job in self
-                .kernel()
-                .background_processes()
-                .list_for_context(*context_id)
-            {
-                if job.status != "running" {
-                    continue;
-                }
-                let age = std::time::Duration::from_millis(
-                    now_unix_ms().saturating_sub(job.started_at_unix_ms),
-                );
-                lines.push(format!(
-                    "{:<6} {:<10} {:<20} {:<9} {:>8}  pid {}  {}",
-                    "job",
-                    &job.id,
-                    label,
-                    ctype,
-                    elapsed(age),
-                    job.pid,
-                    job.command
-                ));
+            let operations = match self.kernel().shell_operations().list_for_context(*context_id) {
+                Ok(operations) => operations,
+                Err(e) => return KjResult::Err(format!("system status: {e}")),
+            };
+            for operation in operations.into_iter().filter(|operation| operation.completed_at.is_none()) {
+                let age = std::time::Duration::from_millis(now_unix_ms().saturating_sub(operation.created_at as u64));
+                lines.push(format!("operation {}  {}  {}  {}", operation.receipt.operation_id, label, elapsed(age), operation.source));
                 rows.push(serde_json::json!({
-                    "kind": "job",
-                    "id": job.id,
-                    "pid": job.pid,
-                    "context": label,
-                    "context_type": ctype,
-                    "elapsed_ms": age.as_millis() as u64,
-                    "command": job.command,
+                    "kind": "operation", "id": operation.receipt.operation_id,
+                    "job_id": operation.receipt.job_id, "ask_id": operation.receipt.ask_id,
+                    "context": label, "context_type": ctype,
+                    "elapsed_ms": age.as_millis() as u64, "command": operation.source,
                 }));
             }
         }

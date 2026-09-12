@@ -8,9 +8,7 @@ description = "Core kernel with VFS abstraction for kaijutsu"
 workspace = true
 
 [dependencies]
-# "process" — tokio::process::Command/Child for background host-process
-# execution (background_exec.rs); the shell tool's synchronous path spawns
-# through the embedded kaish interpreter instead and doesn't need this.
+# "process" supports configured external MCP server transport.
 #
 # rt-multi-thread + macros: needed only by src/bin/mcp_stub_server.rs (a
 # minimal MCP stdio server used solely by this crate's own external-MCP
@@ -173,9 +171,7 @@ test-mock = []
 # production builds.
 test-util = ["dep:tempfile"]
 
-# "process" — setpgid/kill_process_group/PR_SET_PDEATHSIG for background_exec.rs
-# (own process group for group-kill semantics; parent-death signal so a
-# spawned background process can never outlive a crashed/killed kernel).
+# Process-group and parent-death handling for configured external MCP servers.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "0.38", features = ["fs", "process"] }
 

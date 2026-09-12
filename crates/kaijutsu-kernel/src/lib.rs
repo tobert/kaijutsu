@@ -13,7 +13,7 @@
 
 pub mod ansi_ingest;
 pub mod audio_inventory;
-pub mod background_exec;
+pub mod shell_operations;
 pub mod block_store;
 pub mod blocks;
 pub mod block_tools;
@@ -21,6 +21,7 @@ pub mod cc_inbox;
 pub mod image;
 pub mod config_seed;
 pub mod control;
+pub mod continuation;
 pub mod drift;
 pub mod editor;
 pub mod execution;

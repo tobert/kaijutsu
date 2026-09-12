@@ -40,6 +40,7 @@ fn default_empty_params() -> String {
 /// context/drift/fork management. Output is written to kernel blocks and
 /// observable in kaijutsu-app.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ShellRequest {
     /// The kaish command to execute, run in your current kernel context
     /// (e.g., "cargo check", "git status", "kj context list --tree",
@@ -48,9 +49,27 @@ pub struct ShellRequest {
         description = "kaish command to execute in the current kernel context (e.g., 'cargo check', 'kj context list --tree')"
     )]
     pub command: String,
-    /// Timeout in seconds (default: 300)
-    #[schemars(description = "Timeout in seconds (default: 300, max: 600)")]
+    /// Wait for completion. Defaults to false: return an operation receipt.
+    #[serde(default)]
+    pub foreground: bool,
+    /// Foreground wait timeout in seconds (default: 300, max: 600).
+    /// Reaching the timeout leaves the operation running.
+    #[schemars(description = "Foreground wait timeout in seconds (default: 300, max: 600); does not cancel the operation")]
     pub timeout_secs: Option<u64>,
+}
+
+#[cfg(test)]
+mod shell_request_tests {
+    use super::ShellRequest;
+
+    #[test]
+    fn shell_schema_defaults_to_async_and_rejects_background() {
+        let schema = serde_json::to_value(schemars::schema_for!(ShellRequest)).unwrap();
+        assert_eq!(schema["properties"]["foreground"]["default"], false);
+        assert!(serde_json::from_value::<ShellRequest>(serde_json::json!({
+            "command": "echo hello", "background": true,
+        })).is_err());
+    }
 }
 
 // ============================================================================

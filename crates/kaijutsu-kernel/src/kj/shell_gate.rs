@@ -26,17 +26,10 @@
 //!   kaish-level plan.
 //! - The `stdin` parameter `ShellParams` accepts separately from `command`
 //!   — content piped in that way never appears in the source this module
-//!   plans at all.
+//!   plans at all. It is captured separately and shown to the reviewer.
 //! - Write-then-run-later: a command that writes a script now and a LATER,
 //!   separately gated call executes it — each call is gated on its own
 //!   text, never on what an earlier call wrote to disk.
-//! - `background: true` (`ShellParams::background`) — a backgrounded
-//!   command runs as a direct host subprocess (`/bin/sh -c <command>`,
-//!   `mcp/servers/shell.rs`'s `start_background`), NOT through kaish, so
-//!   `plan_program` cannot describe it (it isn't kaish source in the first
-//!   place). Gating that path is separate, unbuilt work — background
-//!   execution is ungated today, and this comment is the record of that gap
-//!   rather than a silent one.
 //!
 //! The airtight configuration, as `docs/gate-and-shell-split.md` says
 //! plainly, is `subprocess` off. This gate improves the common case: a
@@ -106,7 +99,17 @@ impl std::fmt::Display for ShellGateBuildError {
 /// so the label that scopes confirmation to what was typed (the property
 /// kept from the deleted latch, `docs/gate-and-shell-split.md`) is the
 /// source text.
+#[cfg(test)]
 pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateBuildError> {
+    build_shell_gate_spec_with_stdin(source, None)
+}
+
+/// Build a shell gate spec and retain the separate stdin payload the command
+/// will receive if the approval executes it.
+pub(crate) fn build_shell_gate_spec_with_stdin(
+    source: &str,
+    exec_stdin: Option<String>,
+) -> Result<GateSpec, ShellGateBuildError> {
     let planned = kaish_kernel::plan_program(source).map_err(|errors| {
         let msg = errors
             .iter()
@@ -145,11 +148,15 @@ pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateB
     let label = source.trim().to_string();
     let preview: String = source.chars().take(200).collect();
     let truncated = source.chars().count() > 200;
-    let description = format!(
+    let mut description = format!(
         "shell_write: {} statement(s) — {preview}{}",
         statements.len(),
         if truncated { "…" } else { "" }
     );
+    if let Some(stdin) = &exec_stdin {
+        description.push_str("\n\nstdin captured for execution:\n");
+        description.push_str(stdin);
+    }
 
     Ok(GateSpec {
         origin: Origin::ShellGate,
@@ -163,6 +170,7 @@ pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateB
         // that coincidence is this origin's alone and a reader must not
         // generalize it.
         exec_source: Some(source.trim().to_string()),
+        exec_stdin,
         statements,
         // The same `plan_program` output `statements` was built from —
         // carried through so `gate::build_ask` can compute the free-variable
@@ -222,6 +230,14 @@ mod tests {
         assert_eq!(spec.origin, Origin::ShellGate);
         assert_eq!(spec.tool, TOOL);
         assert_eq!(spec.authorized_label, "rm -rf build/");
+    }
+
+    #[test]
+    fn separate_stdin_is_captured_for_review_and_execution() {
+        let spec = build_shell_gate_spec_with_stdin("cat", Some("review this exact input\n".into())).unwrap();
+        assert_eq!(spec.exec_stdin.as_deref(), Some("review this exact input\n"));
+        assert!(spec.description.contains("stdin captured for execution:"));
+        assert!(spec.description.contains("review this exact input"));
     }
 
     #[test]

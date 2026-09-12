@@ -29,7 +29,7 @@
 //!    never touched.
 
 mod common;
-use common::{join_root, run_local, run_real, run_shell, skip_unless_isotest, TestKernel};
+use common::{join_root, run_local, run_shell, skip_unless_isotest, TestKernel};
 
 use serde_json::json;
 
@@ -140,10 +140,9 @@ fn write_new_file_to_readonly_mount_fails_clean_and_creates_nothing() {
         // Nothing was created: a REAL host process (bypassing the VFS
         // entirely) confirms it, independent of whatever the VFS layer
         // might otherwise believe.
-        let stat = run_real(&kernel, &format!("test -e {probe} && echo EXISTS || echo ABSENT")).await;
         assert!(
-            stat.contains("ABSENT"),
-            "a refused write must not create the file on the real host fs: {stat}"
+            !std::path::Path::new(probe).exists(),
+            "a refused write must not create the file on the real host fs"
         );
     });
 }
@@ -174,7 +173,7 @@ fn write_existing_file_to_readonly_mount_fails_clean_and_does_not_poison_later_r
         // (a foreground `shell` call would route `echo >` through kaish's own
         // VFS-backed redirect builtin, which would refuse on this exact
         // read-only mount before the test even starts).
-        run_real(&kernel, &format!("echo -n on-disk-original > {probe}")).await;
+        std::fs::write(probe, "on-disk-original").expect("seed read-only probe");
 
         let w = file_tool(
             &kernel,
@@ -198,7 +197,7 @@ fn write_existing_file_to_readonly_mount_fails_clean_and_does_not_poison_later_r
         );
 
         // And the real on-disk bytes are untouched too.
-        let disk = run_real(&kernel, &format!("cat {probe}")).await;
+        let disk = std::fs::read_to_string(probe).expect("read real probe");
         assert_eq!(
             disk.trim(),
             "on-disk-original",
@@ -279,7 +278,8 @@ fn glob_does_not_over_refuse_a_real_directory() {
         grant_file_tools(&kernel).await;
         set_durable_cwd(&kernel, "/tmp").await;
 
-        run_real(&kernel, "mkdir -p /tmp/glob-probe && echo x > /tmp/glob-probe/a.rs").await;
+        std::fs::create_dir_all("/tmp/glob-probe").unwrap();
+        std::fs::write("/tmp/glob-probe/a.rs", "x\n").unwrap();
 
         let g = file_tool(
             &kernel,
@@ -325,7 +325,9 @@ fn symlink_escaping_its_mount_is_refused_on_read_and_write_and_target_is_untouch
 
         let target = "/opt/isotest-escape-target.txt";
         let link = "/tmp/isotest-evil-link.txt";
-        run_real(&kernel, &format!("echo -n original-target > {target} && ln -s {target} {link}")).await;
+        std::fs::write(target, "original-target").unwrap();
+        let _ = std::fs::remove_file(link);
+        std::os::unix::fs::symlink(target, link).unwrap();
 
         let r = file_tool(&kernel, FILE_READ, json!({ "path": link })).await;
         assert!(
@@ -346,7 +348,7 @@ fn symlink_escaping_its_mount_is_refused_on_read_and_write_and_target_is_untouch
             w.content
         );
 
-        let disk = run_real(&kernel, &format!("cat {target}")).await;
+        let disk = std::fs::read_to_string(target).unwrap();
         assert_eq!(
             disk.trim(),
             "original-target",
@@ -370,11 +372,10 @@ fn symlink_within_the_same_mount_is_not_over_refused() {
         grant_file_tools(&kernel).await;
         set_durable_cwd(&kernel, "/tmp").await;
 
-        run_real(
-            &kernel,
-            "mkdir -p /tmp/symlink-probe && echo -n inside-content > /tmp/symlink-probe/real.txt && ln -s real.txt /tmp/symlink-probe/inside-link.txt",
-        )
-        .await;
+        std::fs::create_dir_all("/tmp/symlink-probe").unwrap();
+        std::fs::write("/tmp/symlink-probe/real.txt", "inside-content").unwrap();
+        let _ = std::fs::remove_file("/tmp/symlink-probe/inside-link.txt");
+        std::os::unix::fs::symlink("real.txt", "/tmp/symlink-probe/inside-link.txt").unwrap();
 
         let r = file_tool(
             &kernel,
@@ -414,16 +415,11 @@ fn glob_does_not_descend_through_a_directory_symlink_that_escapes_the_mount() {
 
         // A directory outside /tmp holding a file that must never surface
         // in a glob confined to /tmp.
-        run_real(
-            &kernel,
-            "mkdir -p /opt/isotest-escape-dir && echo x > /opt/isotest-escape-dir/secret.rs",
-        )
-        .await;
-        run_real(
-            &kernel,
-            "mkdir -p /tmp/dirwalk-probe && ln -s /opt/isotest-escape-dir /tmp/dirwalk-probe/escape-link",
-        )
-        .await;
+        std::fs::create_dir_all("/opt/isotest-escape-dir").unwrap();
+        std::fs::write("/opt/isotest-escape-dir/secret.rs", "x\n").unwrap();
+        std::fs::create_dir_all("/tmp/dirwalk-probe").unwrap();
+        let _ = std::fs::remove_file("/tmp/dirwalk-probe/escape-link");
+        std::os::unix::fs::symlink("/opt/isotest-escape-dir", "/tmp/dirwalk-probe/escape-link").unwrap();
 
         let g = file_tool(
             &kernel,

@@ -36,8 +36,10 @@ pub enum ShellStatus {
     /// failure. Nothing ran, and the text is the caller's to fix.
     Rejected,
     /// A background command was started and is still running. Its output
-    /// streams into `block_id`; poll it with `read_background_output`.
+    /// is available through `read_shell_operation` and `kj wait --operation`.
     Running,
+    /// Accepted work waiting for an approval decision.
+    Waiting,
     /// The call gave up waiting for the command's outcome.
     Timeout,
     /// The event stream closed before the command's outcome arrived.
@@ -51,6 +53,7 @@ impl ShellStatus {
             ShellStatus::Error => "error",
             ShellStatus::Rejected => "rejected",
             ShellStatus::Running => "running",
+            ShellStatus::Waiting => "waiting",
             ShellStatus::Timeout => "timeout",
             ShellStatus::StreamClosed => "stream_closed",
         }
@@ -59,7 +62,7 @@ impl ShellStatus {
     /// Whether this status rides the tool-result error flag. `Done` and
     /// `Running` do not; everything else does.
     pub fn is_error(&self) -> bool {
-        !matches!(self, ShellStatus::Done | ShellStatus::Running)
+        !matches!(self, ShellStatus::Done | ShellStatus::Running | ShellStatus::Waiting)
     }
 }
 
@@ -91,7 +94,9 @@ pub struct ShellEnvelope {
     pub block_id: Option<String>,
     /// The handle for a backgrounded command, to poll or kill it. `null`
     /// unless `status` is `running`.
-    pub background_id: Option<String>,
+    pub operation_id: Option<String>,
+    /// The decision this operation is waiting for, when present.
+    pub ask_id: Option<String>,
     /// MIME type of the result block's content. `null` when unknown.
     pub content_type: Option<String>,
     /// Whether the result block is excluded from model hydration. `null`
@@ -117,7 +122,8 @@ impl ShellEnvelope {
             data: None,
             latch: None,
             block_id: None,
-            background_id: None,
+            operation_id: None,
+            ask_id: None,
             content_type: None,
             ephemeral: None,
             elapsed_ms: None,
@@ -214,7 +220,8 @@ impl ShellEnvelope {
         "data",
         "latch",
         "block_id",
-        "background_id",
+        "operation_id",
+        "ask_id",
         "content_type",
         "ephemeral",
         "elapsed_ms",
@@ -239,7 +246,7 @@ impl ShellEnvelope {
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["done", "error", "rejected", "running", "timeout", "stream_closed"]
+                    "enum": ["done", "error", "rejected", "running", "waiting", "timeout", "stream_closed"]
                 },
                 "did_spill": {
                     "type": ["boolean", "null"],
@@ -248,9 +255,10 @@ impl ShellEnvelope {
                 "data": { "description": "kj structured payload when present, else null" },
                 "latch": { "description": "kj confirmation-gate re-run hint when present, else null" },
                 "block_id": { "type": ["string", "null"] },
-                "background_id": {
+                "ask_id": { "type": ["string", "null"] },
+                "operation_id": {
                     "type": ["string", "null"],
-                    "description": "handle for a backgrounded command; set only when status is running"
+                    "description": "durable shell operation handle, retained while waiting and after completion"
                 },
                 "content_type": { "type": ["string", "null"] },
                 "ephemeral": { "type": ["boolean", "null"] },
@@ -262,7 +270,7 @@ impl ShellEnvelope {
             },
             "required": [
                 "stdout", "stderr", "exit_code", "status", "did_spill", "data", "latch",
-                "block_id", "background_id", "content_type", "ephemeral", "elapsed_ms", "error"
+                "block_id", "operation_id", "ask_id", "content_type", "ephemeral", "elapsed_ms", "error"
             ]
         })
     }

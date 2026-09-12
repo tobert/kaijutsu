@@ -232,36 +232,23 @@ pub async fn join_root(kernel: &KernelHandle) {
         .expect("join ROOT");
 }
 
-/// Start a background job through the shell tool; returns the bg id parsed
-/// from the tool's text reply ("started background process <id>; …").
+/// Start an asynchronous shell operation and return its durable receipt ID.
 pub async fn start_bg(kernel: &KernelHandle, command: &str) -> String {
     let r = kernel
-        .call_mcp_tool("shell", &serde_json::json!({"command": command, "background": true}))
+        .call_mcp_tool("shell_write", &serde_json::json!({"command": command, "foreground": false}))
         .await
-        .expect("call shell tool");
-    assert!(!r.is_error, "shell(background) errored: {}", r.content);
-    r.content
-        .strip_prefix("started background process ")
-        .and_then(|rest| rest.split([';', ' ']).next())
-        .unwrap_or_else(|| panic!("unparseable shell reply: {}", r.content))
-        .to_string()
+        .expect("call shell_write");
+    assert!(!r.is_error, "asynchronous shell_write errored: {}", r.content);
+    serde_json::from_str::<serde_json::Value>(&r.content)
+        .expect("shell_write envelope")
+        .get("operation_id").and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("missing operation_id: {}", r.content)).to_string()
 }
 
-/// Run a command through the FOREGROUND `shell` tool and return its output.
-///
-/// NOT a real host process: a foreground `shell` call materializes kaish and
-/// runs the command through kaish's own interpreter, whose filesystem
-/// builtins (`echo`, `cat`, `ln`, `mkdir`, `tee`, …) all route through
-/// kaijutsu's VFS/`MountTable` — the exact same read-only/writable mount
-/// policy the file-tool tests are probing. That makes this the right choice
-/// for `kj` control-plane commands (`kj context set …`) and for VFS-mediated
-/// reads that should reflect the real file either way, but the WRONG choice
-/// for seeding a file meant to exist independently of VFS policy: writing
-/// through a read-only mount here fails for the same reason the test wants
-/// to prove, before the test even starts. Use [`run_real`] for that.
+/// Execute kaish through the foreground shell tool; host fixtures use std::fs.
 pub async fn run_shell(kernel: &KernelHandle, command: &str) -> String {
     let r = kernel
-        .call_mcp_tool("shell", &serde_json::json!({"command": command, "background": false}))
+        .call_mcp_tool("shell_write", &serde_json::json!({"command": command, "foreground": true}))
         .await
         .expect("call shell tool");
     assert!(
@@ -269,73 +256,42 @@ pub async fn run_shell(kernel: &KernelHandle, command: &str) -> String {
         "setup command failed: `{command}` -> {}",
         r.content
     );
-    r.content
+    serde_json::from_str::<serde_json::Value>(&r.content)
+        .expect("shell_write envelope")
+        .get("stdout").and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("missing stdout: {}", r.content)).to_string()
 }
 
-/// Run a command as a REAL host process (`/bin/sh -c <command>`) and block
-/// until it exits, returning its accumulated output.
-///
-/// `background: true` on the `shell` tool bypasses kaish's materialization
-/// entirely (`background_exec.rs` module docs) and spawns a real host
-/// subprocess — the only way to touch the filesystem independently of
-/// kaijutsu's VFS/mount policy from this harness. Used to seed files whose
-/// existence must be independent of the mount under test (e.g. a file under
-/// the read-only root mount that the VFS itself could never have written)
-/// and to verify real on-disk bytes afterward. Panics (loudly, with the
-/// captured output) if the command doesn't exit zero within 15s — a broken
-/// setup step must never be silently accepted.
-pub async fn run_real(kernel: &KernelHandle, command: &str) -> String {
-    let bg_id = start_bg(kernel, command).await;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let status_line = loop {
-        let r = kernel
-            .call_mcp_tool("list_background_processes", &serde_json::json!({}))
-            .await
-            .expect("list_background_processes");
-        if let Some(line) = r.content.lines().find(|l| l.starts_with(&bg_id))
-            && line.contains("[exited")
-        {
-            break line.to_string();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "real host command didn't exit within 15s: `{command}`"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    let out = kernel
-        .call_mcp_tool(
-            "read_background_output",
-            &serde_json::json!({"id": bg_id, "offset": 0}),
-        )
-        .await
-        .expect("read_background_output");
-    assert!(
-        status_line.contains("[exited=0]"),
-        "real host setup command failed: `{command}` -> {status_line}\noutput: {}",
-        out.content
-    );
-    out.content
-}
-
-/// The reliable PID source: `list_background_processes` text lines are
-/// "<bg-id> pid=<PID> [<status>] <command>".
+/// Resolve an operation's kaish job PID through durable operation metadata.
 pub async fn bg_pid(kernel: &KernelHandle, bg_id: &str) -> u32 {
     let r = kernel
-        .call_mcp_tool("list_background_processes", &serde_json::json!({}))
+        .call_mcp_tool("list_shell_operations", &serde_json::json!({}))
         .await
-        .expect("list_background_processes");
-    for line in r.content.lines() {
-        if line.starts_with(bg_id)
-            && let Some(pid) = line
-                .split_whitespace()
-                .find_map(|w| w.strip_prefix("pid="))
-                .and_then(|p| p.parse().ok())
-        {
-            return pid;
+        .expect("list_shell_operations");
+    let operations: serde_json::Value = serde_json::from_str(&r.content).expect("operation list JSON");
+    let job_id = operations.as_array().and_then(|rows| rows.iter().find(|row|
+        row.pointer("/receipt/operation_id").and_then(|v| v.as_str()) == Some(bg_id)
+    )).and_then(|row| row.pointer("/receipt/job_id")).and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("no kaish job for operation {bg_id}: {}", r.content));
+    let job_id: u64 = job_id.parse().expect("numeric kaish job id");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let result = kernel.call_mcp_tool("shell_write", &serde_json::json!({
+            "command": "jobs --json", "foreground": true,
+        })).await.expect("jobs query");
+        assert!(!result.is_error, "jobs query failed: {}", result.content);
+        let envelope: serde_json::Value = serde_json::from_str(&result.content).expect("jobs envelope");
+        let jobs = envelope.get("data").filter(|data| data.is_array()).cloned()
+            .unwrap_or_else(|| serde_json::from_str(envelope["stdout"].as_str().expect("jobs stdout"))
+                .expect("jobs JSON"));
+        if let Some(pid) = jobs.as_array().and_then(|rows| rows.iter().find(|row|
+            row.get("id").and_then(|v| v.as_u64()) == Some(job_id)
+        )).and_then(|row| row.pointer("/pgids/0")).and_then(|v| v.as_u64()) {
+            return u32::try_from(pid).expect("process group fits pid");
         }
+        assert!(std::time::Instant::now() < deadline, "no external process for job {job_id}: {jobs}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("no pid for {bg_id} in: {}", r.content);
 }
 
 // ---------------------------------------------------------------------------

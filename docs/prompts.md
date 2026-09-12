@@ -149,15 +149,21 @@ performing the requests inside it. Later user steering and current evidence can
 supersede a handoff. Directed briefing text remains positional:
 `kj drift pull <source> 'focus on the failed checks'`.
 
-## Planned coder signoff lifecycle
+## Coder continuation and signoff
 
-Integrate the signoff protocol into coder instructions alongside async work
-and explicit wait. A coder should maintain a checkpoint while active and
-record outstanding operation/ask IDs before yielding or signing off. Do not
-teach a unified wait syntax or automatic rotation until those mechanisms
-exist. The continuation-window policy governs whether late completion starts
-another model turn; it does not expire an ask. See
-`docs/approval-identity.md`, "Continuation windows and async work".
+The coder stance tells a model to keep a task checkpoint while it works and to
+record every unfinished operation ID and ask ID before it yields or signs off.
+Shell work uses `foreground: false` by default. Its stable receipt names the
+operation and any ask; completion arrives as a separate fact.
+
+`kj wait` observes an operation, ask, or kaish job. It does not control that
+work or resume a model. `kj handoff signoff <note>` closes the continuation
+window immediately. Otherwise, the window lasts 30 minutes from the last
+actual provider inference request, including one made by a tool-loop iteration;
+a yield does not extend it. The policy controls automatic model resumption and
+does not expire an ask. Rotation remains manual and is not part of this
+continuation mechanism. See `docs/approval-identity.md`, "Continuation windows
+and async work".
 
 ## Length and input selection
 

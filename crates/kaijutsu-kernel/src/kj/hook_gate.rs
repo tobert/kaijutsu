@@ -109,6 +109,9 @@ pub(crate) fn build_hook_gate_spec(
         None => (None, Vec::new(), Vec::new()),
     };
 
+    let exec_stdin = exec_source.as_ref().and_then(|_| {
+        params.arguments.get("stdin").and_then(serde_json::Value::as_str).map(str::to_owned)
+    });
     GateSpec {
         origin: Origin::Hook,
         instance,
@@ -127,6 +130,7 @@ pub(crate) fn build_hook_gate_spec(
             source_index: None,
         }],
         exec_source,
+        exec_stdin,
         planned,
     }
 }
@@ -162,6 +166,16 @@ mod tests {
         let spec = build_hook_gate_spec("lfm2d-advisory", "d".into(), &params);
         assert_eq!(spec.exec_source.as_deref(), Some("dd if=/dev/zero of=${DEV}"));
         assert_eq!(spec.planned.len(), 1, "the planned statements ride the spec for the env snapshot");
+    }
+
+    #[test]
+    fn a_shell_hook_ask_captures_separate_stdin() {
+        let params = call("shell_write", serde_json::json!({
+            "command": "cat", "stdin": "exact input\n",
+        }));
+        let spec = build_hook_gate_spec("review", "review input".into(), &params);
+        assert_eq!(spec.exec_stdin.as_deref(), Some("exact input\n"));
+        assert!(spec.statements[0].rendered.contains("exact input"));
     }
 
     /// Falsified by `vars: vec![]` on the statement: the ledger's refusal of

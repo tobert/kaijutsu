@@ -312,7 +312,7 @@ mod tests {
             description: "review work after delegation changed".into(), authorized_label: "work".into(),
             statements: vec![gate::GatedStatement {
                 rendered: "work".into(), statement_kind: "test".into(), vars: vec![], source_index: None,
-            }], exec_source: None, planned: vec![],
+            }], exec_source: None, exec_stdin: None, planned: vec![],
         };
         let result = gate::run_gate(dispatcher.kernel_db(), &stale_caller, spec(), dispatcher.kernel().ledger_flows(), &gate_policy::no_config()).await;
         let request = result.ask.expect("new ask is routed after revocation");

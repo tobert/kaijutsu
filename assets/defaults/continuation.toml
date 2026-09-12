@@ -1,0 +1,4 @@
+[gate_resume]
+# Continue a yielded model automatically only while its last inference request
+# remains within this window.
+window_secs = 1800

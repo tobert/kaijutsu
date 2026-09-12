@@ -33,6 +33,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use kaish_kernel::interpreter::ExecResult;
+use kaish_kernel::tools::{ToolArgs, ToolCtx, ToolSchema};
+use kaish_kernel::Tool;
 use kaish_kernel::output_limit::OutputLimitConfig;
 use kaish_kernel::{
     ExecuteOptions, IgnoreConfig, Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig,
@@ -69,6 +71,58 @@ pub struct EmbeddedKaish {
     /// the wrapper accessor `timeouts()` for callers that build their own
     /// `ExecuteOptions` (e.g. `KjDispatcher::run_kai_script`).
     timeouts: kaijutsu_types::TimeoutPolicy,
+}
+
+/// Refuses kaish job-control operations in a read-only materialization.
+///
+/// A context shares its job manager across short-lived shells. Replacing these
+/// names after kaish registers builtins keeps a read-only shell from cancelling
+/// or changing another invocation's operation through that shared manager.
+struct ReadOnlyJobControlBuiltin {
+    name: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Tool for ReadOnlyJobControlBuiltin {
+    fn name(&self) -> &str { self.name }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(self.name, "Not available in a read-only kaijutsu shell.")
+    }
+
+    async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
+        ExecResult::failure(1, format!(
+            "{} is not available in a read-only kaijutsu shell: job control can change a shared context operation", self.name
+        ))
+    }
+}
+
+/// Read-only replacement for kaish's `jobs`: listing is observation, while
+/// cleanup changes the shared manager and therefore stays unavailable.
+struct ReadOnlyJobsBuiltin;
+
+#[async_trait::async_trait]
+impl Tool for ReadOnlyJobsBuiltin {
+    fn name(&self) -> &str { "jobs" }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new("jobs", "List context shell operations without changing them.")
+    }
+
+    async fn execute(&self, _args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
+        let Some(ctx) = ctx.as_any_mut().downcast_mut::<kaish_kernel::tools::ExecContext>() else {
+            return ExecResult::failure(1, "internal error: kernel builtin requires ExecContext");
+        };
+        let Some(manager) = &ctx.job_manager else {
+            return ExecResult::success("(no job manager)");
+        };
+        let jobs = manager.list().await;
+        let mut output = String::new();
+        for job in jobs {
+            output.push_str(&format!("[{}] {:?}: {}\n", job.id, job.status, job.command));
+        }
+        ExecResult::success(output)
+    }
 }
 
 /// Whether a materialized shell may spawn host subprocesses, and the `$PATH`
@@ -362,6 +416,12 @@ impl EmbeddedKaish {
         // (rc lifecycle, hook bodies, init scripts) can override via
         // `ExecuteOptions::with_timeout` for stricter per-context bounds.
         config.request_timeout = Some(kernel.timeouts().kaish_request_timeout);
+        // Shells materialized for one context share kaish's job table, while
+        // every call retains its own identity, backend, and tool registry.
+        // A background program therefore remains observable after this
+        // throwaway shell instance drops without crossing context boundaries.
+        let context_jobs = kernel.context_job_manager(context_id);
+        config = config.with_job_manager(context_jobs.clone());
 
         // Seed `HOME` for EVERY shell flavor (read-only included), not just
         // exec-granted ones. kaish is hermetic: it never reads the host
@@ -424,9 +484,20 @@ impl EmbeddedKaish {
                 vfs.mount_arc(DOCS_ROOT, docs_mount);
                 vfs.mount_arc(INPUT_ROOT, input_mount);
                 vfs.mount_arc(SWAP_ROOT, swap_fs);
+                if read_only {
+                    vfs.mount_arc("/v/jobs", Arc::new(ReadOnlyFs::new(
+                        Arc::new(kaish_kernel::JobFs::new(context_jobs.clone())),
+                    )));
+                }
             },
             |tools| {
                 configure_tools(ctx_for_tools, sid_for_tools, tools);
+                if read_only {
+                    for name in ["kill", "bg", "fg"] {
+                        tools.register(ReadOnlyJobControlBuiltin { name });
+                    }
+                    tools.register(ReadOnlyJobsBuiltin);
+                }
             },
         )?;
 
@@ -469,6 +540,23 @@ impl EmbeddedKaish {
         let context_id = self.context_id().map(|cid| cid.to_string());
         let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
         self.kernel.execute_with_options(code, opts).await
+    }
+
+    /// Start a complete kaish program as a context-owned background job.
+    ///
+    /// The underlying kaish API parses and validates before returning the job
+    /// receipt. Its shared manager is injected at construction, so callers
+    /// can observe, wait for, or cancel the receipt after this materialized
+    /// shell drops.
+    pub async fn execute_background_with_options(
+        &self,
+        code: &str,
+        opts: ExecuteOptions,
+    ) -> std::result::Result<kaish_kernel::scheduler::JobId, kaish_kernel::KernelError> {
+        let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+        let context_id = self.context_id().map(|cid| cid.to_string());
+        let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
+        self.kernel.execute_background_with_options(code, opts).await
     }
 
     /// Get a variable value.
@@ -1161,7 +1249,7 @@ mod tests {
     /// The external-exec policy end to end: `Allow` + a Local-mounted cwd runs
     /// a real host binary through kaish's subprocess path; `Deny` fails fast
     /// with `command not found` (127) — no PATH, no absolute-path escape.
-    /// Linux-shaped by design (the runner/CI are): `/bin/sh` is the probe.
+    /// Linux-shaped by design (the runner/CI are): `/usr/bin/id` is the probe.
     #[tokio::test]
     async fn external_exec_policy_gates_host_subprocesses() {
         let principal = kaijutsu_types::PrincipalId::system();
@@ -1196,22 +1284,24 @@ mod tests {
             ExternalExec::Allow { path: Some("/usr/bin:/bin".to_string()) },
         );
         let r = allowed
-            .execute_with_options("/bin/sh -c true", ExecuteOptions::default())
+            .execute_with_options("/usr/bin/id", ExecuteOptions::default())
             .await
             .unwrap();
         assert!(r.ok(), "Allow + absolute path must spawn: {}", r.err);
+        assert!(r.text_out().contains("uid="), "absolute id must execute: {}", r.text_out());
 
         // Allow + seeded PATH: bare names resolve too.
         let r = allowed
-            .execute_with_options("sh -c true", ExecuteOptions::default())
+            .execute_with_options("id", ExecuteOptions::default())
             .await
             .unwrap();
         assert!(r.ok(), "Allow + PATH must resolve bare names: {}", r.err);
+        assert!(r.text_out().contains("uid="), "bare id must execute: {}", r.text_out());
 
         // Deny: the same absolute path fails fast as command-not-found.
         let denied = mk("test-exec-deny", ExternalExec::Deny);
         let r = denied
-            .execute_with_options("/bin/sh -c true", ExecuteOptions::default())
+            .execute_with_options("/usr/bin/id", ExecuteOptions::default())
             .await
             .unwrap();
         assert!(!r.ok(), "Deny must refuse external exec");

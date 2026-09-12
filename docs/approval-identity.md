@@ -160,9 +160,8 @@ performer still requires assignment before kernel model work.
 
 ## Continuation windows and async work
 
-Design direction; the continuation policy and unified wait below are not yet
-implemented. An ask has no default expiry. Its captured operation can await
-an explicit decision without a human-time deadline. Cleanup may later cancel
+An ask has no default expiry. Its captured operation can await an explicit
+decision without a human-time deadline. Cleanup may later cancel
 obsolete requests with a recorded reason; elapsed waiting alone does not
 invalidate the approval request.
 
@@ -170,26 +169,30 @@ A **continuation window** governs automatic model resumption after yielding.
 It expresses expectations about retained KV state and the cost of continuing,
 not a known provider-cache expiry. Ending the window does not expire the ask,
 cancel its command, or erase its result. An explicit signoff can end a
-continuation before the window would otherwise close. The precise policy,
-configuration owner, and signals used to open or refresh the window remain
-to be designed; do not infer cache warmth from tool activity or polling.
+continuation before the window would otherwise close. `/config/kernel/
+continuation.toml` owns the policy: its shipped `[gate_resume] window_secs =
+1800` keeps the window open for 30 minutes after the last actual provider
+inference request. Each inference request, including a tool-loop iteration,
+refreshes that time. Yielding, polling, and tool activity do not. `kj handoff
+signoff <note>` closes the window immediately.
 
-Async shell submission should return a stable receipt naming the operation
-and any approval dependency. Completion should be a separate durable fact,
+Async shell submission returns a stable receipt naming the operation and any
+approval dependency. Completion is a separate durable fact,
 not a replacement for an acknowledgement already sent to the model. This
 keeps earlier conversation content stable while the coder does independent
 work, checkpoints, or signs off. The result must remain discoverable even
 when no model is automatically resumed.
 
-One explicit wait operation should cover shell operations, asks, and directed
-model work. Extend the existing `kj wait` contract rather than add a competing
-wait mechanism. A wait timeout ends that wait only; it neither cancels work
+`kj wait` covers a context's model turn by default, or a shell operation with
+`--operation <id>`, an ask with `--ask <id>`, and a native kaish job with
+`--job <integer>` (optionally selecting a context). A wait timeout ends that
+wait only; it neither cancels work
 nor expires an ask. Waiting on an ask's decision and waiting on the approved
 command's completion are distinct conditions. Waiting must not hold a context
 execution lock that prevents another invocation from writing a handoff or
 observing completion. Preserve the rule that no RPC waits indefinitely.
 
-The coder should maintain a handoff while active and update it before an
+The coder maintains a handoff while active and updates it before an
 explicit wait or signoff. Record outstanding operation and ask IDs with the
 objective, progress, evidence, and next actions. Beyond the continuation
 window, default to leaving results for explicit drive or rotation instead of
@@ -198,20 +201,29 @@ successor inspects outstanding asks and completed results. It does not inherit
 an old context's redemption authority. Re-asking and cancellation of a
 superseded request need explicit linkage so rotation does not duplicate work.
 
-Current implementation differs at these points:
+## Current implementation
 
 - A pending gate returns immediately. The model loop receives its tool result
   and can continue, including writing a handoff; pending does not itself force
   the turn to stop.
-- Approval execution fills the original waiting tool pair in place and evicts
-  the cached mailbox. The gate-resume driver can request another model turn
-  without a continuation-window check.
-- `kj wait` waits for a context's turn, not arbitrary operations or asks.
-- `shell_write` with `background: true` runs host shell source outside kaish
-  and skips the foreground approval gate; it still requires `exec` authority.
-  It cannot become the default async mode without preserving kaish execution,
-  approval identity, captured inputs, and command semantics.
-- Restart abandons unresolved asks, and archive abandons that context's asks.
+- Shell uses `foreground: false` by default. Both modes execute kaish and use
+  the same gate. An unknown old `background` parameter is rejected.
+  `foreground: true` waits for the result. The default returns a stable,
+  non-error receipt with `operation_id`; a gate receipt may also carry `ask_id`
+  and status `waiting`.
+- The original model receipt stays `done`. The operation has a separate,
+  excluded command/output pair, followed by a completion notification.
+- Native kaish jobs use a manager per context, so jobs survive materialized
+  shell instances. The RPC shell path runs kaish in a detached task to preserve cwd, env,
+  and session switching, while its job registration supplies the same waiting
+  and cancellation handles.
+- The continuation window is 30 minutes after the last actual provider
+  request, including each tool-loop iteration. `kj handoff signoff <note>`
+  closes it immediately. An approval still executes and records its result
+  outside the window; automatic model resume requires the matching yielded,
+  unsigned continuation epoch.
+- Restart abandons unresolved asks and unfinished operations, and archive
+  abandons that context's asks.
   Having no default expiry does not change those policies. Restart survival and
   rotation recovery need an explicit execution/recovery design before removal
   of those cleanup paths.

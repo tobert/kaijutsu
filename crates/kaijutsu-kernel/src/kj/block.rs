@@ -466,8 +466,7 @@ impl KjDispatcher {
             // comment trap, not a typo: kaish starts a comment at a `#` even
             // MID-WORD, so `kj block read 2d25fb02#3` arrives here as the
             // truncated `2d25fb02` and the `#3` is gone before kj ever runs
-            // (probed live 2026-08-17 against 0.14.1; bash and /bin/sh both
-            // pass `abc#3` through intact). Without this hint the message
+            // before argument parsing. Without this hint the message
             // names a value the user never typed, so a shell problem reads as
             // a kj bug.
             if prefix_looks_like_a_principal_short(id_str) {
@@ -1204,20 +1203,13 @@ impl KjDispatcher {
     /// edits, exclusions, search and hydration share, and reprojection is not
     /// allowed to become a back door that rewrites it. So the freshly stripped
     /// text is compared against the current content first, and a mismatch
-    /// refuses rather than clobbering whatever produced it. Two distinct
-    /// causes produce that mismatch, and are reported distinctly:
+    /// refuses rather than clobbering whatever produced it. Edits
+    /// produce a mismatch:
     ///
     /// - **Edited since ingest** (`snap.edited_since_ingest`): the block's
     ///   provenance row records what *arrived*, not what the document *is*
     ///   after `kj block edit`/`block_edit` ran. Reprojecting would overwrite
     ///   the edit.
-    /// - **Output was capped** (`background_exec::output_cap_marker`): a
-    ///   background block that hit `DEFAULT_OUTPUT_CAP` holds `strip(original)
-    ///   + the cap marker` *by design* (docs/ansi-and-beyond.md), so this
-    ///   block can never satisfy a byte-for-byte comparison — there is
-    ///   nothing to fix, and re-running the parser would just drop the
-    ///   marker. Not an edit; refusing for a different reason.
-    ///
     /// Only when the text still matches byte-for-byte are the new spans —
     /// which are addressed by offsets into exactly that text — safe to
     /// install.
@@ -1268,20 +1260,6 @@ impl KjDispatcher {
 
         let (text, spans) = kaijutsu_ansi::strip(&original);
         if text != snap.content {
-            if !snap.edited_since_ingest
-                && snap.content == format!("{text}{}", crate::background_exec::output_cap_marker())
-            {
-                return KjResult::Err(format!(
-                    "kj block reproject: block '{id_str}' output was capped, so it \
-                     cannot be reprojected — by design, a capped block's content is \
-                     `strip(original) + the cap marker`, never `strip(original)` alone, \
-                     so reprojection would drop the marker rather than restore anything. \
-                     Nothing is wrong with this block; there is nothing to fix. (original \
-                     projects to {} bytes of text, block holds {} bytes including the marker)",
-                    text.len(),
-                    snap.content.len(),
-                ));
-            }
             return KjResult::Err(format!(
                 "kj block reproject: content has diverged from the original (edited since \
                  ingest); reproject would overwrite edits. Reprojection updates styling \
@@ -2681,12 +2659,7 @@ mod tests {
     /// to say so.
     ///
     /// `kj block read 2d25fb02#3` reaches kj as `2d25fb02` — kaish starts a
-    /// comment at a `#` even mid-word and drops the rest of the line (probed
-    /// live 2026-08-17 on 0.14.1; bash and `/bin/sh` both pass `abc#3`
-    /// through). The old message named `'2d25fb02'`, a value the user never
-    /// typed, so a shell problem read as a kj bug. This is the one part of that
-    /// papercut that is worth fixing regardless of whether the display
-    /// delimiter changes.
+    /// comment at a `#` even mid-word and drops the rest of the line.
     #[test]
     fn bare_hex_prefix_error_names_the_kaish_comment_trap() {
         assert!(prefix_looks_like_a_principal_short("2d25fb02"));
@@ -4677,51 +4650,6 @@ mod tests {
         assert!(!result.is_ok(), "expected an error, got: {}", result.message());
     }
 
-    /// A background block whose output hit the cap holds `strip(original) +
-    /// the cap marker` by design (docs/ansi-and-beyond.md). Reproject must
-    /// name that as the cause — not "edited since ingest", which never
-    /// happened here — and must not touch the block.
-    #[tokio::test]
-    async fn block_reproject_names_a_capped_block_instead_of_blaming_an_edit() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context_with_doc(&d, Some("c"), principal);
-        let mut c = caller_with_context(ctx);
-        c.principal_id = principal;
-        let (text, _) = kaijutsu_ansi::strip(ANSI_ORIGINAL);
-        let capped_content = format!("{text}{}", crate::background_exec::output_cap_marker());
-        let bid = insert_projected_block(&d, ctx, ANSI_ORIGINAL, Some(&capped_content));
-
-        let result = d
-            .dispatch(&[s("block"), s("reproject"), bid.to_key()], &c)
-            .await;
-        assert!(!result.is_ok(), "expected a refusal, got: {}", result.message());
-        let msg = result.message();
-        assert!(msg.contains("capped"), "must name the cap as the cause: {msg}");
-        assert!(
-            !msg.contains("edited since ingest"),
-            "must not blame an edit that never happened: {msg}"
-        );
-
-        let after = d
-            .block_store()
-            .block_snapshots(ctx)
-            .unwrap()
-            .into_iter()
-            .find(|b| b.id == bid)
-            .unwrap();
-        assert_eq!(after.content, capped_content, "a refused reproject must leave content untouched");
-        assert!(
-            after.style_spans.is_empty(),
-            "a refused reproject must leave spans untouched"
-        );
-    }
-
-    // ── Published help: -c/--context on read/inspect/append/history ──────
-
-    /// The reflected `--help` output is what a model reads (CLAUDE.md
-    /// "Published text"); assert against it directly rather than the
-    /// `///` source, since a clap attribute typo would pass a source grep.
     #[tokio::test]
     async fn read_inspect_append_history_help_document_dash_c() {
         let d = test_dispatcher().await;

@@ -1731,6 +1731,8 @@ impl KjDispatcher {
                 // directory to run it in.
                 cwd: None,
                 exec_source: None,
+                exec_stdin: None,
+                continuation_epoch: None,
                 env: vec![],
             };
             let result = {
@@ -1938,6 +1940,7 @@ mod tests {
                 source_index: None,
             }],
             exec_source: None,
+            exec_stdin: None,
             planned: Vec::new(),
         }
     }
@@ -1964,6 +1967,7 @@ mod tests {
                 source_index: Some(0),
             }],
             exec_source: None,
+            exec_stdin: None,
             planned: Vec::new(),
         }
     }
@@ -3730,6 +3734,8 @@ mod tests {
                     signals: vec![],
                     cwd: None,
                     exec_source: None,
+                    exec_stdin: None,
+                    continuation_epoch: None,
                     env: vec![],
                 };
                 let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();
@@ -4032,6 +4038,8 @@ mod tests {
                     signals: vec![],
                     cwd: None,
                     exec_source: None,
+                    exec_stdin: None,
+                    continuation_epoch: None,
                     env: vec![],
                 };
                 let request_id = approval_ledger::ask::create_ask(conn, &ask).unwrap();

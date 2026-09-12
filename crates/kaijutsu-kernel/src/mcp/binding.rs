@@ -101,24 +101,12 @@ pub const KNOWN_AUTHORITIES: &[&str] = &[
 /// stale mismatch. Broad `facade:*` roles match both projections and see both
 /// tools — a harmless strict subset, accepted to keep the gate single-axis.
 ///
-/// `builtin.background` (`list_background_processes` /
-/// `read_background_output` / `kill_background_process`, `mcp/servers/
-/// background.rs`) rides **`"shell_write"`**, repointed with the flag day
-/// rather than left behind it.
-///
-/// It had to move. Leaving it on the string `"shell"` would have silently
-/// shifted its meaning from "whoever can shell out" to "whoever holds the new
-/// SAFE facade" — handing background visibility to safe-only roles like
-/// `toolie` that never had it, which is precisely the "widens the safe
-/// shell's reach" failure this rename exists to avoid. Background execution
-/// spawns host processes; it is the mutating path by construction, so it
-/// belongs with the mutating facade. `kill_background_process` still
-/// re-checks the `exec` authority on top, unchanged — that gate was never
-/// what made this correct.
+/// Shell operation inspection and cancellation are projected by
+/// `facade:shell_write`. Cancellation also checks that capability at call time.
 pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[
     ("builtin.shell", "shell"),
     ("builtin.shell_write", "shell_write"),
-    ("builtin.background", "shell_write"),
+    ("builtin.shell_operations", "shell_write"),
 ];
 
 /// A single capability grant or query. The allow-set is the positive surface a
@@ -732,7 +720,7 @@ mod tests {
         // `facade:shell` projects the SAFE shell and nothing else.
         //
         // This assertion changed with the 2026-08-17 shell/shell_write flag
-        // day and the change is the point: `builtin.background` used to ride
+        // day and the change is the point: `builtin.shell_operations` used to ride
         // the string `"shell"`, so it appeared here. It now rides
         // `"shell_write"`, because background execution spawns host processes
         // and is the mutating path by construction. A safe-facade holder
@@ -754,7 +742,7 @@ mod tests {
         wcands.sort();
         assert_eq!(
             wcands,
-            vec![inst("builtin.background"), inst("builtin.shell_write")],
+            vec![inst("builtin.shell_operations"), inst("builtin.shell_write")],
             "facade:shell_write projects the mutating shell and its background-job sibling"
         );
     }

@@ -39,6 +39,7 @@ use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_kernel::PairOwner;
 use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
 use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId, Status, ToolKind};
+use kaijutsu_types::shell_envelope::ShellStatus;
 use russh::keys::{Algorithm, PrivateKey};
 
 /// Poll until `check` returns true, or fail loudly. Every wait in this file
@@ -194,7 +195,10 @@ impl Seats {
         let kj = &self.worker_kj;
         kj.join_context(self.worker, "gate-exec-worker").await.unwrap();
         let refusal = kj
-            .call_mcp_tool("shell_write", &serde_json::json!({ "command": command }))
+            .call_mcp_tool("shell_write", &serde_json::json!({
+                "command": command,
+                "foreground": true,
+            }))
             .await;
         assert!(
             refusal.is_err(),
@@ -783,6 +787,63 @@ fn a_cancelled_turn_pair_tells_the_model_it_did_not_run() {
 /// run yet. Try the same call again", which is now a lie and would make the
 /// model run an approved action twice.
 #[test]
+fn default_async_shell_write_waits_then_approval_fills_its_operation_pair() {
+    run_local(async {
+        let scratch = Scratch::new("async-wait");
+        let s = seats().await;
+        let marker = scratch.marker();
+        let code = format!("echo async-approved > {}", marker.display());
+
+        s.worker_kj.join_context(s.worker, "gate-exec-worker").await.unwrap();
+        let receipt = s
+            .worker_kj
+            .call_mcp_tool("shell_write", &serde_json::json!({ "command": code }))
+            .await
+            .expect("default async shell_write returns a waiting receipt");
+        assert!(!receipt.is_error, "waiting is not an execution error: {receipt:?}");
+        let body: serde_json::Value = serde_json::from_str(&receipt.content)
+            .expect("shell receipt is JSON");
+        assert_eq!(body["status"], "waiting");
+        let operation_id = body["operation_id"].as_str().expect("stable operation id");
+        let ask_id = body["ask_id"].as_str().expect("waiting receipt names ask");
+        let operation = s
+            .kernel
+            .kernel
+            .shell_operations()
+            .get(operation_id, s.worker)
+            .unwrap()
+            .expect("waiting operation is durable");
+        assert_eq!(operation.receipt.ask_id.as_deref(), Some(ask_id));
+        assert!(operation.receipt.job_id.is_none(), "approval must precede kaish execution");
+        assert_eq!(s.block(&operation.receipt.command_block_id).status, Status::Waiting);
+        assert_eq!(s.block(&operation.receipt.output_block_id).status, Status::Waiting);
+
+        s.answer(ask_id, true).await;
+        wait_for("approved async operation to settle", || {
+            s.kernel
+                .kernel
+                .shell_operations()
+                .get(operation_id, s.worker)
+                .unwrap()
+                .is_some_and(|state| state.completed_at.is_some())
+        })
+        .await;
+        let completed = s
+            .kernel
+            .kernel
+            .shell_operations()
+            .get(operation_id, s.worker)
+            .unwrap()
+            .expect("completed operation remains readable");
+        assert_eq!(completed.envelope.expect("operation result").status, ShellStatus::Done);
+        assert_eq!(s.block(&operation.receipt.command_block_id).status, Status::Done);
+        assert_eq!(s.block(&operation.receipt.output_block_id).status, Status::Done);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "async-approved\n");
+        s.close().await;
+    });
+}
+
+#[test]
 fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
     run_local(async {
         let scratch = Scratch::new("nopair");
@@ -970,7 +1031,10 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
         s.kernel.kernel_db.lock().update_context_review(blocker_ctx, Some(actor), Some(reviewer)).unwrap();
         kj.join_context(blocker_ctx, "gate-exec-blocker").await.unwrap();
         let blocker_refusal = kj
-            .call_mcp_tool("shell_write", &serde_json::json!({ "command": "/bin/sleep 5" }))
+            .call_mcp_tool("shell_write", &serde_json::json!({
+                "command": "/bin/sleep 5",
+                "foreground": true,
+            }))
             .await;
         assert!(blocker_refusal.is_err(), "the blocker must be gated too");
         let blocker_ask = s

@@ -472,6 +472,8 @@ struct ShellExecuteOutcome {
     ok @0 :BlockId;         # commandBlockId
     refused @1 :Refusal;
   }
+  operationId @2 :Text;     # durable handle, including when waiting for approval
+  commandBlockId @3 :BlockId;
 }
 
 struct EditInputOutcome {

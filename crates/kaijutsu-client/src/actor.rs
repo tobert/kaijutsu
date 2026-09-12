@@ -495,7 +495,7 @@ enum RpcCommand {
         code: String,
         context_id: ContextId,
         user_initiated: bool,
-        reply: oneshot::Sender<Result<BlockId, CallError>>,
+        reply: oneshot::Sender<Result<crate::rpc::ShellSubmission, CallError>>,
     },
     SetBlockExcluded {
         context_id: ContextId,
@@ -1445,6 +1445,20 @@ impl ActorHandle {
         context_id: ContextId,
         user_initiated: bool,
     ) -> Result<BlockId, CallError> {
+        let submission = self.shell_submit(code, context_id, user_initiated).await?;
+        match submission.refusal {
+            Some(refusal) => Err(CallError::Refused(refusal)),
+            None => Ok(submission.command_block_id),
+        }
+    }
+
+    #[tracing::instrument(skip(self, code))]
+    pub async fn shell_submit(
+        &self,
+        code: &str,
+        context_id: ContextId,
+        user_initiated: bool,
+    ) -> Result<crate::rpc::ShellSubmission, CallError> {
         self.send(|reply| RpcCommand::ShellExecute {
             code: code.into(),
             context_id,
@@ -3724,7 +3738,7 @@ async fn dispatch_kernel_command(
         } => {
             dispatch!(
                 kernel, reply, close_tx, k,
-                k.shell_execute(&code, context_id, user_initiated)
+                k.shell_submit(&code, context_id, user_initiated)
             );
         }
         RpcCommand::SetBlockExcluded {

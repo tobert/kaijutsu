@@ -1,11 +1,11 @@
 # The shell envelope
 
-`kj shell 'echo hi'` and an MCP `shell` call return the same thirteen keys.
+`kj shell 'echo hi'` and an MCP `shell` call return the same fourteen keys.
 One tool name, one shape, one error rule.
 
 ```json
 {"stdout":"hi\n","stderr":"","exit_code":0,"status":"done","did_spill":false,
- "data":null,"latch":null,"block_id":null,"background_id":null,
+ "data":null,"latch":null,"block_id":null,"operation_id":null,"ask_id":null,
  "content_type":null,"ephemeral":null,"elapsed_ms":3,"error":null}
 ```
 
@@ -47,7 +47,8 @@ the code has not replicated to this caller yet.
 | `done` | ran, exited 0 |
 | `error` | ran, exited nonzero |
 | `rejected` | kaish refused the program; nothing ran, fix the text and retry |
-| `running` | backgrounded; output streams into `block_id` |
+| `running` | accepted asynchronous operation; `operation_id` identifies its receipt |
+| `waiting` | accepted operation is waiting on `ask_id`; this is not an error |
 | `timeout` | gave up waiting for the outcome |
 | `stream_closed` | the event stream closed before the outcome arrived |
 

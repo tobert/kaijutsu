@@ -1460,6 +1460,7 @@ impl KjDispatcher {
                     content: content.to_string(),
                     principal_id,
                     model: None,
+                    continuation_epoch: None,
                 });
         if delivered == 0 {
             self.kernel().mark_turn_ended(context_id);

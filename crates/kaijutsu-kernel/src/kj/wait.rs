@@ -69,11 +69,20 @@ impl TailFilter {
 #[derive(Parser, Debug)]
 #[command(
     name = "wait",
-    about = "Wait for a context's turn to finish and report what it produced.",
+    about = "Wait for a turn, shell operation, ask decision, or kaish job.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
 pub(crate) struct WaitArgs {
+    /// Wait for this shell operation to finish, including any approval wait.
+    #[arg(long, conflicts_with_all = ["ask", "job", "since"])]
+    operation: Option<String>,
+    /// Wait for this ask's decision. Approval may start work that is still running.
+    #[arg(long, conflicts_with_all = ["operation", "job", "since"])]
+    ask: Option<String>,
+    /// Wait for this kaish job in the target context.
+    #[arg(long, conflicts_with_all = ["operation", "ask", "since"])]
+    job: Option<u64>,
     /// Report only blocks after this one. Pass the `cursor` from a previous
     /// `kj wait` to page through a long turn without re-reading what you have.
     #[arg(long)]
@@ -215,6 +224,10 @@ impl KjDispatcher {
             }
         };
 
+        if parsed.operation.is_some() || parsed.ask.is_some() || parsed.job.is_some() {
+            return self.wait_for_work(target, &parsed).await;
+        }
+
         // Subscribe BEFORE the first read of the log. A turn can finish between
         // the read and the subscribe, and the bus has no catch-up — a
         // subscription taken second would park until the timeout on a turn that
@@ -327,6 +340,63 @@ impl KjDispatcher {
 
     /// Render the outcome: a compact human line plus the structured payload a
     /// delegating player reads.
+    async fn wait_for_work(&self, context_id: kaijutsu_types::ContextId, args: &WaitArgs) -> KjResult {
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(args.timeout);
+        let mut ledger = self.kernel().ledger_flows().subscribe("ledger.changed");
+        loop {
+            let (kind, id, settled, state) = if let Some(id) = &args.ask {
+                let row = match self.kernel_db().lock().get_approval(id) {
+                    Ok(Some(row)) if row.context_id == context_id.as_bytes() => row,
+                    Ok(_) => return KjResult::Err(format!("kj wait: ask {id} not found in context {context_id}")),
+                    Err(e) => return KjResult::Err(format!("kj wait: {e}")),
+                };
+                ("ask", id.clone(), row.status.is_terminal(), serde_json::json!(row))
+            } else if let Some(id) = &args.operation {
+                let state = match self.kernel().shell_operations().get(id, context_id) {
+                    Ok(Some(state)) => state,
+                    Ok(None) => return KjResult::Err(format!("kj wait: operation {id} not found in context {context_id}")),
+                    Err(e) => return KjResult::Err(format!("kj wait: {e}")),
+                };
+                ("operation", id.clone(), state.completed_at.is_some(), serde_json::json!(state))
+            } else {
+                let id = kaish_kernel::scheduler::JobId(args.job.expect("one work selector"));
+                let manager = self.kernel().context_job_manager(context_id);
+                let Some(job) = manager.get(id).await else {
+                    return KjResult::Err(format!("kj wait: job {id} not found in context {context_id}"));
+                };
+                let settled = matches!(job.status,
+                    kaish_kernel::scheduler::JobStatus::Done
+                    | kaish_kernel::scheduler::JobStatus::Failed
+                    | kaish_kernel::scheduler::JobStatus::Killed);
+                ("job", id.to_string(), settled, serde_json::json!(job))
+            };
+            let timed_out = !settled && tokio::time::Instant::now() >= deadline;
+            if settled || timed_out {
+                let status = if settled { "done" } else { "running" };
+                return KjResult::ok_with_data(
+                    format!("{kind} {id}: {status}"),
+                    serde_json::json!({
+                        "kind": kind, "id": id, "context_id": context_id,
+                        "status": status, "timed_out": timed_out, "state": state,
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                    }),
+                );
+            }
+            // State is authoritative. Quiet polling recovers missed events and
+            // observes job completion without consuming its result or handle.
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = tokio::time::sleep(QUIET) => {}
+                event = ledger.recv_event(), if args.ask.is_some() => {
+                    if event.is_none() {
+                        return KjResult::Err("kj wait: ledger notification stream closed".into());
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn wait_report(
         &self,
@@ -409,6 +479,15 @@ impl Classify for WaitArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_accepts_one_explicit_work_handle() {
+        for selector in ["--operation", "--ask", "--job"] {
+            assert!(WaitArgs::try_parse_from([selector, "1", "--timeout", "0"]).is_ok());
+        }
+        assert!(WaitArgs::try_parse_from(["--ask", "1", "--operation", "2"]).is_err());
+        assert!(WaitArgs::try_parse_from(["--job", "1", "--since", "block"]).is_err());
+    }
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -775,6 +854,91 @@ mod tests {
         );
     }
 
+    fn register_operation(
+        d: &KjDispatcher,
+        context: ContextId,
+        principal: PrincipalId,
+        source: &str,
+    ) -> crate::shell_operations::ShellOperationReceipt {
+        d.block_store()
+            .create_document(context, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let command = d.block_store().insert_block_as(
+            context, None, None, Role::Tool, BlockKind::ToolCall, source.to_string(),
+            Status::Running, ContentType::Plain, Some(principal),
+        ).unwrap();
+        let output = d.block_store().insert_block_as(
+            context, Some(&command), Some(&command), Role::Tool, BlockKind::ToolResult,
+            String::new(), Status::Running, ContentType::Plain, Some(principal),
+        ).unwrap();
+        d.kernel().shell_operations().register(
+            context, principal, principal, command, output, source, None,
+        ).unwrap()
+    }
+
+    #[tokio::test]
+    async fn operation_wait_timeout_does_not_cancel_the_registered_job() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("wait-timeout"), None, principal);
+        let receipt = register_operation(&d, context, principal, "sleep 30");
+        let manager = d.kernel().context_job_manager(context);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let job = manager.register("sleep 30".to_string(), receiver).await;
+        manager.set_cancel_token(job, tokio_util::sync::CancellationToken::new()).await;
+        d.kernel().shell_operations().attach_job(&receipt.operation_id, job, manager.clone()).unwrap();
+
+        let result = d.dispatch(&[
+            s("wait"), s("--operation"), receipt.operation_id.clone(), s("--timeout"), s("0"),
+        ], &caller_with_context(context)).await;
+        let data = data_of(&result);
+        assert_eq!(data["status"], "running");
+        assert_eq!(data["timed_out"], true);
+        let job_state = manager.get(job).await.expect("wait must not remove or cancel the job");
+        assert_eq!(job_state.status, kaish_kernel::scheduler::JobStatus::Running);
+
+        sender.send(kaish_kernel::interpreter::ExecResult::success("settled"))
+            .expect("the timeout must leave the job receiver intact");
+        assert_eq!(manager.wait(job).await.expect("job still completes").text_out(), "settled");
+    }
+
+    #[tokio::test]
+    async fn completed_operation_wait_is_repeatably_readable() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("wait-repeat"), None, principal);
+        let receipt = register_operation(&d, context, principal, "echo complete");
+        let mut envelope = kaijutsu_types::shell_envelope::ShellEnvelope::new(
+            kaijutsu_types::shell_envelope::ShellStatus::Done,
+        );
+        envelope.stdout = "complete".into();
+        envelope.exit_code = Some(0);
+        d.kernel().shell_operations().complete(&receipt.operation_id, envelope).unwrap();
+        let args = [s("wait"), s("--operation"), receipt.operation_id.clone(), s("--timeout"), s("0")];
+        let caller = caller_with_context(context);
+
+        let first = data_of(&d.dispatch(&args, &caller).await);
+        let second = data_of(&d.dispatch(&args, &caller).await);
+        assert_eq!(first["status"], "done");
+        assert_eq!(second["status"], "done");
+        assert_eq!(first["state"]["envelope"]["stdout"], "complete");
+        assert_eq!(second["state"], first["state"], "wait reads a durable result; it must not consume it");
+    }
+
+    #[tokio::test]
+    async fn operation_wait_cannot_read_another_contexts_receipt() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let owner_context = register_context(&d, Some("wait-owner"), None, principal);
+        let other_context = register_context(&d, Some("wait-other"), None, principal);
+        let receipt = register_operation(&d, owner_context, principal, "echo private");
+        let result = d.dispatch(&[
+            s("wait"), s("--operation"), receipt.operation_id, s("--timeout"), s("0"),
+        ], &caller_with_context(other_context)).await;
+        assert!(!result.is_ok(), "an operation receipt must remain context-scoped");
+        assert!(result.message().contains("not found in context"), "wrong-context error: {}", result.message());
+    }
+
     #[test]
     fn truncation_leaves_short_text_alone() {
         let (kept, truncated) = truncate_at_bytes("short", 2048);
@@ -782,4 +946,3 @@ mod tests {
         assert!(!truncated);
     }
 }
-

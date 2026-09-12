@@ -8,7 +8,7 @@
 //! - Control plane (consent mode)
 
 use async_trait::async_trait;
-use kaijutsu_types::PrincipalId;
+use kaijutsu_types::{ContextId, PrincipalId};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -167,11 +167,8 @@ pub struct Kernel {
     /// is kernel-wide — and the context feed's delivery filter drops anything
     /// that cannot name one.
     ledger_flows: SharedLedgerFlowBus,
-    /// Background host-process registry (`background_exec.rs`).
-    /// Kernel-owned (not per-materialized-shell) so a process started by one
-    /// `shell` tool call is still queryable/killable from the next — see the
-    /// module docs for the full ownership/cleanup contract.
-    background: Arc<crate::background_exec::BackgroundRegistry>,
+    /// Durable shell receipts and context-owned kaish jobs.
+    shell_operations: Arc<crate::shell_operations::ShellOperationRegistry>,
     /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
     /// "Order from here: kernel wiring of the inbox"). `OnceLock` like
     /// `beat_ingress`/`file_cache`: the server binds the real socket and
@@ -335,7 +332,7 @@ impl Kernel {
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             blocks,
             file_cache,
-            db,
+            db: db.clone(),
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -345,16 +342,11 @@ impl Kernel {
             )),
             editor_flows: shared_editor_flow_bus(default_flow_capacity()),
             ledger_flows: shared_ledger_flow_bus(default_flow_capacity()),
-            // spawn_reaper: a lightweight periodic sweep so terminal
-            // background-process entries are reaped even if nothing ever
-            // polls the registry again (e.g. a context is removed —
-            // cancelling its processes — and no other context ever calls
-            // list_background_processes/read_background_output afterward).
-            // See background_exec.rs's BackgroundRegistry::spawn_reaper docs.
-            background: {
-                let bg = Arc::new(crate::background_exec::BackgroundRegistry::new());
-                bg.spawn_reaper();
-                bg
+            shell_operations: {
+                let operations = crate::shell_operations::ShellOperationRegistry::new(db.clone())
+                    .expect("initialize shell operation registry");
+                operations.abandon_unfinished().expect("settle interrupted shell operations");
+                Arc::new(operations)
             },
             cc_inbox: OnceLock::new(),
             turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -442,7 +434,7 @@ impl Kernel {
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             blocks,
             file_cache,
-            db,
+            db: db.clone(),
             timelines: dashmap::DashMap::new(),
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
@@ -452,16 +444,11 @@ impl Kernel {
             )),
             editor_flows: shared_editor_flow_bus(default_flow_capacity()),
             ledger_flows: shared_ledger_flow_bus(default_flow_capacity()),
-            // spawn_reaper: a lightweight periodic sweep so terminal
-            // background-process entries are reaped even if nothing ever
-            // polls the registry again (e.g. a context is removed —
-            // cancelling its processes — and no other context ever calls
-            // list_background_processes/read_background_output afterward).
-            // See background_exec.rs's BackgroundRegistry::spawn_reaper docs.
-            background: {
-                let bg = Arc::new(crate::background_exec::BackgroundRegistry::new());
-                bg.spawn_reaper();
-                bg
+            shell_operations: {
+                let operations = crate::shell_operations::ShellOperationRegistry::new(db.clone())
+                    .expect("initialize shell operation registry");
+                operations.abandon_unfinished().expect("settle interrupted shell operations");
+                Arc::new(operations)
             },
             cc_inbox: OnceLock::new(),
             turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -973,17 +960,9 @@ impl Kernel {
             .register_silently(shell_server, InstancePolicy::for_kernel(self))
             .await?;
 
-        // builtin.background — `list_background_processes` /
-        // `read_background_output` / `kill_background_process`, the
-        // companion tools for `shell_write`'s `background: true` jobs
-        // (`background_exec.rs`). Sibling of `builtin.shell_write`, but STILL
-        // riding the `facade:shell` projection string in
-        // FACADE_PROJECTED_INSTANCES (unchanged by the flag day) — an open
-        // item, not a decision: see the doc comment on
-        // `FACADE_PROJECTED_INSTANCES` in `mcp/binding.rs` for why this
-        // silently widened to the new safe facade and wasn't fixed here.
+        // Context-owned shell operation inspection and cancellation.
         let background_server = Arc::new(
-            crate::mcp::servers::BackgroundServer::new(Arc::downgrade(&self.broker)),
+            crate::mcp::servers::ShellOperationsServer::new(Arc::downgrade(&self.broker)),
         );
         self.broker
             .register_silently(background_server, InstancePolicy::for_kernel(self))
@@ -1104,10 +1083,13 @@ impl Kernel {
         &self.share_registry
     }
 
-    /// Get the background host-process registry (`background_exec.rs`). See
-    /// that module's docs for the ownership/cleanup/output-bounding contract.
-    pub fn background_processes(&self) -> &Arc<crate::background_exec::BackgroundRegistry> {
-        &self.background
+    /// Get durable shell receipts and their context-owned kaish jobs.
+    pub fn shell_operations(&self) -> &Arc<crate::shell_operations::ShellOperationRegistry> {
+        &self.shell_operations
+    }
+
+    pub fn context_job_manager(&self, context_id: ContextId) -> Arc<kaish_kernel::scheduler::JobManager> {
+        self.shell_operations.context_job_manager(context_id)
     }
 
     /// Get the image backend registry.

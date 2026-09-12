@@ -163,6 +163,13 @@ pub struct ContextRow {
     pub director_id: Option<PrincipalId>,
 }
 
+/// One explicit model-drive epoch that may receive automatic continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContinuationOrigin {
+    pub epoch: i64,
+    pub opened_at: i64,
+}
+
 impl ContextRow {
     /// Whether this context is archived, and therefore inert: it runs
     /// nothing and answers nothing.
@@ -647,6 +654,15 @@ CREATE INDEX IF NOT EXISTS idx_contexts_workspace
 CREATE TABLE IF NOT EXISTS approval_identity_config (
     id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
     default_reviewer_id BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_continuations (
+    context_id     BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
+    epoch          INTEGER NOT NULL,
+    opened_at      INTEGER NOT NULL,
+    last_request_at INTEGER,
+    yielded_at     INTEGER,
+    signed_off_at  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS approval_reviewer_delegations (
@@ -1940,6 +1956,107 @@ impl KernelDb {
         }
     }
 
+    /// Open a new continuation epoch for an explicit model drive.
+    pub fn begin_continuation(&self, context_id: ContextId, opened_at: i64) -> KernelDbResult<ContinuationOrigin> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.begin_continuation(context_id, opened_at));
+        }
+        let previous: Option<i64> = self.conn.query_row(
+            "SELECT epoch FROM context_continuations WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+            |row| row.get(0),
+        ).optional()?;
+        let epoch = previous.unwrap_or(0).checked_add(1)
+            .ok_or_else(|| KernelDbError::Validation("continuation epoch overflow".into()))?;
+        self.conn.execute(
+            "INSERT INTO context_continuations (context_id, epoch, opened_at, last_request_at, yielded_at, signed_off_at)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)
+             ON CONFLICT(context_id) DO UPDATE SET epoch = excluded.epoch, opened_at = excluded.opened_at,
+                 last_request_at = NULL, yielded_at = NULL, signed_off_at = NULL",
+            params![blob_param(context_id.as_bytes()), epoch, opened_at],
+        )?;
+        Ok(ContinuationOrigin { epoch, opened_at })
+    }
+
+    /// Stamp an actual provider inference request for this open epoch.
+    pub fn record_continuation_request(&self, context_id: ContextId, epoch: i64, requested_at: i64) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.record_continuation_request(context_id, epoch, requested_at));
+        }
+        Ok(self.conn.execute(
+            "UPDATE context_continuations SET last_request_at = ?1
+             WHERE context_id = ?2 AND epoch = ?3 AND signed_off_at IS NULL",
+            params![requested_at, blob_param(context_id.as_bytes()), epoch],
+        )? != 0)
+    }
+
+    /// Return the current unsigned continuation epoch, if this context has one.
+    pub fn continuation_epoch(&self, context_id: ContextId) -> KernelDbResult<Option<i64>> {
+        self.conn.query_row(
+            "SELECT epoch FROM context_continuations WHERE context_id = ?1 AND signed_off_at IS NULL",
+            params![blob_param(context_id.as_bytes())],
+            |row| row.get(0),
+        ).optional().map_err(Into::into)
+    }
+
+    /// Mark the matching epoch as yielded without extending its window.
+    pub fn record_continuation_yield(&self, context_id: ContextId, epoch: i64, yielded_at: i64) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.record_continuation_yield(context_id, epoch, yielded_at));
+        }
+        Ok(self.conn.execute(
+            "UPDATE context_continuations SET yielded_at = ?1
+             WHERE context_id = ?2 AND epoch = ?3 AND signed_off_at IS NULL",
+            params![yielded_at, blob_param(context_id.as_bytes()), epoch],
+        )? != 0)
+    }
+
+    /// End the current continuation epoch through an explicit signoff.
+    pub fn sign_off_continuation(&self, context_id: ContextId, signed_off_at: i64) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.sign_off_continuation(context_id, signed_off_at));
+        }
+        Ok(self.conn.execute(
+            "UPDATE context_continuations SET signed_off_at = ?1
+             WHERE context_id = ?2 AND signed_off_at IS NULL",
+            params![signed_off_at, blob_param(context_id.as_bytes())],
+        )? != 0)
+    }
+
+    /// Whether a settled operation may automatically request another turn.
+    /// The epoch must have yielded, but the deadline is its last provider
+    /// inference request rather than the yield itself.
+    pub fn automatic_resume_allowed(
+        &self,
+        context_id: ContextId,
+        epoch: i64,
+        now: i64,
+        window_ms: i64,
+    ) -> KernelDbResult<bool> {
+        let row: Option<(i64, Option<i64>, Option<i64>, Option<i64>)> = self.conn.query_row(
+            "SELECT epoch, last_request_at, yielded_at, signed_off_at FROM context_continuations WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let Some((current, Some(last_request_at), Some(_), None)) = row else { return Ok(false) };
+        Ok(current == epoch && now.saturating_sub(last_request_at) <= window_ms)
+    }
+
+    /// Claim one automatic resume from an eligible yielded continuation.
+    pub fn claim_automatic_resume(&self, context_id: ContextId, epoch: i64, now: i64, window_ms: i64) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.claim_automatic_resume(context_id, epoch, now, window_ms));
+        }
+        if !self.automatic_resume_allowed(context_id, epoch, now, window_ms)? {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE context_continuations SET yielded_at = NULL WHERE context_id = ?1 AND epoch = ?2",
+            params![blob_param(context_id.as_bytes()), epoch],
+        )?;
+        Ok(true)
+    }
+
     /// Resolve a context's reviewer while holding the ledger write domain.
     pub fn effective_approval_reviewer(&self, context_id: ContextId) -> KernelDbResult<Option<PrincipalId>> {
         let Some(row) = self.get_context(context_id)? else { return Ok(None) };
@@ -2209,6 +2326,21 @@ impl KernelDb {
             tx.execute("ALTER TABLE contexts ADD COLUMN director_id BLOB", [])?;
             tx.execute("UPDATE contexts SET reviewer_id = NULL WHERE director_id IS NULL", [])?;
             tx.commit()?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS context_continuations (
+                context_id BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
+                epoch INTEGER NOT NULL,
+                opened_at INTEGER NOT NULL,
+                last_request_at INTEGER,
+                yielded_at INTEGER,
+                signed_off_at INTEGER
+            )",
+        )?;
+        match conn.execute("ALTER TABLE context_continuations ADD COLUMN last_request_at INTEGER", []) {
+            Ok(_) => {}
+            Err(error) if is_duplicate_column_error(&error) => {}
+            Err(error) => return Err(error.into()),
         }
         Self::migrate_context_model_rollover(conn)?;
         Self::migrate_preset_cast_narrowing(conn)?;
@@ -14461,6 +14593,38 @@ mod label_index_tests {
             .insert_context_with_document(&dup, ws_id)
             .expect_err("a second live ROOT must be refused");
         assert!(err.to_string().contains("already in use"), "{err}");
+    }
+
+    #[test]
+    fn continuation_window_requires_a_matching_yielded_unsigned_epoch() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("continuation"));
+        insert_context_with_doc(&db, &row, ws_id);
+
+        let origin = db.begin_continuation(row.context_id, 1_000).unwrap();
+        assert_eq!(origin.epoch, 1);
+        assert!(!db.automatic_resume_allowed(row.context_id, origin.epoch, 1_100, 600).unwrap());
+
+        db.record_continuation_request(row.context_id, origin.epoch, 1_500).unwrap();
+        db.record_continuation_yield(row.context_id, origin.epoch, 1_200).unwrap();
+        assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 2_100, 600).unwrap());
+        assert!(!db.automatic_resume_allowed(row.context_id, origin.epoch, 2_101, 600).unwrap());
+
+        db.sign_off_continuation(row.context_id, 1_300).unwrap();
+        assert!(!db.automatic_resume_allowed(row.context_id, origin.epoch, 1_400, 600).unwrap());
+
+        let next = db.begin_continuation(row.context_id, 2_000).unwrap();
+        assert_eq!(next.epoch, 2);
+        db.record_continuation_request(row.context_id, next.epoch, 2_150).unwrap();
+        db.record_continuation_yield(row.context_id, next.epoch, 2_100).unwrap();
+        assert!(!db.automatic_resume_allowed(row.context_id, origin.epoch, 2_200, 600).unwrap());
+        assert!(db.automatic_resume_allowed(row.context_id, next.epoch, 2_200, 600).unwrap());
+        assert!(db.claim_automatic_resume(row.context_id, next.epoch, 2_200, 600).unwrap());
+        assert!(!db.claim_automatic_resume(row.context_id, next.epoch, 2_200, 600).unwrap());
+        db.record_continuation_yield(row.context_id, next.epoch, 2_300).unwrap();
+        db.sign_off_continuation(row.context_id, 2_400).unwrap();
+        assert!(!db.claim_automatic_resume(row.context_id, next.epoch, 2_500, 600).unwrap());
     }
 
     #[test]

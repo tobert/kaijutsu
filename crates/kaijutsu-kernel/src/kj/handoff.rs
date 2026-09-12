@@ -62,6 +62,14 @@ enum HandoffCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         text: Vec<String>,
     },
+    /// Leave a handoff note and close this context's automatic continuation
+    /// window. A later explicit drive opens a new window.
+    Signoff {
+        /// Note text for the next character (all remaining words joined with
+        /// spaces).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
     /// Read the most recent notes from a handoff log.
     Tail {
         /// How many of the most recent notes to show. Default 12.
@@ -101,6 +109,7 @@ impl KjDispatcher {
             HandoffCommand::Note { for_character, text } => {
                 self.handoff_note(for_character.as_deref(), &text.join(" "), caller)
             }
+            HandoffCommand::Signoff { text } => self.handoff_signoff(&text.join(" "), caller),
             HandoffCommand::Tail { window, character } => {
                 self.handoff_tail(character.as_deref(), window, caller)
             }
@@ -204,6 +213,34 @@ impl KjDispatcher {
         }
 
         KjResult::ok(format!("noted to {}'s handoff", target.name))
+    }
+
+    fn handoff_signoff(&self, text: &str, caller: &KjCaller) -> KjResult {
+        if text.is_empty() {
+            return KjResult::Err("kj handoff signoff: note text must not be empty".to_string());
+        }
+        let Some(context_id) = caller.context_id else {
+            return KjResult::Err(
+                "kj handoff signoff: an active context is required to close its continuation window"
+                    .to_string(),
+            );
+        };
+        let noted = self.handoff_note(None, text, caller);
+        if matches!(noted, KjResult::Err(_)) {
+            return noted;
+        }
+        match self.kernel_db().lock().sign_off_continuation(
+            context_id,
+            kaijutsu_types::now_millis() as i64,
+        ) {
+            Ok(true) => KjResult::ok("noted handoff and closed this context's continuation window"),
+            Ok(false) => KjResult::Err(
+                "kj handoff signoff: this context has no open continuation window".to_string(),
+            ),
+            Err(error) => KjResult::Err(format!(
+                "kj handoff signoff: could not close continuation window: {error}"
+            )),
+        }
     }
 
     fn handoff_tail(&self, character: Option<&str>, window: Option<u32>, caller: &KjCaller) -> KjResult {
@@ -376,14 +413,14 @@ impl Classify for HandoffCommand {
     fn effect(&self) -> Effect {
         match self {
             Self::Tail { .. } => Effect::Read,
-            Self::Note { .. } => Effect::Write,
+            Self::Note { .. } | Self::Signoff { .. } => Effect::Write,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::test_dispatcher;
+    use super::super::test_helpers::{register_context, test_dispatcher};
     use super::super::KjResult;
     use kaijutsu_types::{PrincipalId, SessionId};
 
@@ -592,5 +629,44 @@ mod tests {
             panic!("expected Ok, got {result:?}");
         };
         assert!(message.contains("before retiring"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn signoff_leaves_a_note_and_closes_the_current_epoch() {
+        let d = test_dispatcher().await;
+        let mut caller = create_and_play(&d, "hajime").await;
+        let context = register_context(&d, Some("work"), None, caller.principal_id);
+        caller.context_id = Some(context);
+        let epoch = d
+            .kernel_db()
+            .lock()
+            .begin_continuation(context, 100)
+            .unwrap()
+            .epoch;
+        assert!(d
+            .kernel_db()
+            .lock()
+            .record_continuation_yield(context, epoch, 200)
+            .unwrap());
+
+        let result = d
+            .dispatch(
+                &[s("handoff"), s("signoff"), s("leave"), s("this"), s("for"), s("tomorrow")],
+                &caller,
+            )
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "{result:?}");
+        assert!(
+            !d.kernel_db()
+                .lock()
+                .automatic_resume_allowed(context, epoch, 201, 1_000)
+                .unwrap(),
+            "signoff must close automatic wakeup even within the configured window"
+        );
+        let tailed = d.dispatch(&[s("handoff"), s("tail")], &caller).await;
+        let KjResult::Ok { message, .. } = tailed else {
+            panic!("expected handoff note, got {tailed:?}");
+        };
+        assert!(message.contains("leave this for tomorrow"), "{message}");
     }
 }

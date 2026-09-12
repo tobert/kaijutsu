@@ -334,12 +334,8 @@ fn propagate_host_env(cmd: &mut Command) {
 /// (every external MCP server — kaibo, bevy_brp, … — is exactly this
 /// shape).
 ///
-/// Mirrors `background_exec::spawn_background`'s `pre_exec` exactly (see
-/// that module's "Ownership and cleanup" doc section for the full
-/// rationale, including why this was chosen over relying solely on
-/// `kill_on_drop` or `systemd`'s `KillMode=control-group`): its own process
-/// group (`setpgid`) plus Linux's `PR_SET_PDEATHSIG(SIGKILL)` so the OS
-/// kills the child the instant its parent dies, unconditionally.
+/// The child has its own process group (`setpgid`) and Linux parent-death
+/// signal (`PR_SET_PDEATHSIG(SIGKILL)`).
 /// `kill_on_drop` stays as a secondary, weaker backstop — it only fires on a
 /// clean in-process `Drop`, which a crash or `kill -9` never triggers.
 fn harden_child_command(cmd: &mut Command) {
@@ -353,7 +349,7 @@ fn harden_child_command(cmd: &mut Command) {
     {
         // SAFETY: `setpgid`/`set_parent_process_death_signal` are
         // async-signal-safe per POSIX; safe to call between fork and exec.
-        // Own process group matches kaish's and `background_exec`'s own
+        // Own process group matches kaish's
         // external-command spawn convention.
         #[allow(unsafe_code)]
         unsafe {
@@ -1196,9 +1192,7 @@ mod tests {
     //
     // `connect()`/`reconnect()` route every spawned Command through
     // `harden_child_command`, which sets `setpgid(None, None)` +
-    // `PR_SET_PDEATHSIG(SIGKILL)` in `pre_exec` (mirrors
-    // `background_exec::spawn_background` — see that module's "Ownership
-    // and cleanup" doc section). The test below exercises the exact same
+    // `PR_SET_PDEATHSIG(SIGKILL)` in `pre_exec`.
     #[test]
     fn http_transport_rejects_an_unusable_header_name() {
         let config = McpServerConfig {
@@ -1285,12 +1279,6 @@ mod tests {
     // an actual "kill this process and observe the child dies" system test,
     // which means forking the test binary — a multithreaded tokio
     // process — a genuinely risky thing to do inside `cargo test`.
-    // `background_exec.rs`'s own test suite makes the identical call: it
-    // has no direct PDEATHSIG test either, despite pre_exec setting it the
-    // exact same way. setpgid and PDEATHSIG are set back-to-back inside the
-    // SAME `pre_exec` closure, so a successful setpgid is the strongest
-    // indirect evidence available short of the two options above that the
-    // closure ran to completion and reached the PDEATHSIG call too.
     #[cfg(unix)]
     #[tokio::test]
     async fn spawned_child_command_gets_its_own_process_group() {

@@ -796,11 +796,13 @@ interpreter invocation whose real behavior is inside a string argument;
 `echo <payload> | python3` or any pipeline handing a program to an
 interpreter over stdin; the `ShellParams::stdin` parameter (content piped in
 separately from `command`, never part of what's planned); write-then-run
-across two separately gated calls; or `background: true` (a direct host
-subprocess via `/bin/sh -c`, not kaish — `plan_program` cannot describe
-source that was never kaish in the first place; background execution is
-ungated today, a named gap, not a silent one). The airtight configuration
-remains `subprocess` off; this gate improves the common case.
+across two separately gated calls. `foreground: false` does not create an
+exception: the gate plans and evaluates the same complete kaish program before
+it starts. The gate identifies individual statements, while an asynchronous
+operation runs the whole submitted program and writes one output block when it
+completes. The stable receipt names the operation and any pending ask. The
+airtight configuration remains `subprocess` off; this gate improves the common
+case.
 
 Tests (`kj::gate`, `kj::shell_gate`, `mcp::servers::shell`): a plain
 multi-statement submission with one statement covered by an active deny rule

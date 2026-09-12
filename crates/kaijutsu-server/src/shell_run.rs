@@ -33,6 +33,43 @@ use crate::rpc::{
 /// session map to update.
 pub(crate) type ContextSwitchSink<'a> = Option<&'a dyn Fn(ContextId)>;
 
+/// Persist a registered operation's final result after its block pair settles.
+pub(crate) fn complete_operation_from_blocks(
+    kernel: &Kernel,
+    context_id: ContextId,
+    output_block_id: &BlockId,
+) -> Result<(), String> {
+    use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
+
+    let Some(operation) = kernel.shell_operations()
+        .get_by_output(output_block_id, context_id).map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let block = kernel.blocks().get_block_snapshot(context_id, output_block_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("shell operation output {output_block_id} is missing"))?;
+    if matches!(block.status, Status::Running | Status::Waiting) {
+        return Err(format!("shell operation output {output_block_id} has not settled"));
+    }
+    let status = if block.status == Status::Error {
+        ShellStatus::Error
+    } else {
+        block.exit_code.map_or(ShellStatus::Done, |code| ShellEnvelope::status_for_exit(i64::from(code)))
+    };
+    let mut envelope = ShellEnvelope::new(status);
+    envelope.stdout = block.content;
+    envelope.stderr = block.stderr.unwrap_or_default();
+    envelope.exit_code = block.exit_code.map(i64::from);
+    envelope.block_id = Some(output_block_id.to_key());
+    envelope.operation_id = Some(operation.receipt.operation_id.to_string());
+    envelope.data = block.output.as_ref().map(|output| output.to_json());
+    envelope.content_type = Some(block.content_type.as_mime().to_owned());
+    kernel.shell_operations().complete(&operation.receipt.operation_id.to_string(), envelope)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Detect an in-shell context switch, tell the sink about it, and report the
 /// new context id. Mirrors `rpc::propagate_context_switch`, which is the
 /// connection-bound form of the same check.
@@ -65,6 +102,7 @@ fn context_switched(
 pub(crate) async fn run_into_blocks(
     kaish: &EmbeddedKaish,
     code: &str,
+    stdin: Option<String>,
     context_id: ContextId,
     command_block_id: &BlockId,
     output_block_id: &BlockId,
@@ -81,6 +119,41 @@ pub(crate) async fn run_into_blocks(
     // BlockInserted, causing DataMissing errors on the client side.
     tokio::task::yield_now().await;
 
+    let mut options = kaish_kernel::ExecuteOptions::default();
+    if let Some(stdin) = stdin {
+        options = options.with_stdin(stdin);
+    }
+    let tracked_job = match kernel.shell_operations().get_by_output(output_block_id, context_id) {
+        Ok(Some(operation)) => {
+            let manager = kernel.context_job_manager(context_id);
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let job = manager.register(code.to_owned(), receiver).await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            manager.set_cancel_token(job, cancel.clone()).await;
+            options.cancel_token = Some(cancel);
+            if let Err(error) = kernel.shell_operations().attach_job(&operation.receipt.operation_id, job, manager.clone()) {
+                let failure = kaish_kernel::interpreter::ExecResult::failure(1, error.clone());
+                manager.finalize_streams(job, &failure).await;
+                let _ = sender.send(failure);
+                let _ = documents.set_stderr(context_id, output_block_id, Some(error));
+                let _ = documents.set_status(context_id, output_block_id, Status::Error);
+                let _ = documents.set_status(context_id, command_block_id, Status::Error);
+                if let Err(error) = complete_operation_from_blocks(kernel, context_id, output_block_id) {
+                    log::error!("could not settle unstarted shell operation: {error}");
+                }
+                return;
+            }
+            Some((manager, job, sender))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            let _ = documents.set_stderr(context_id, output_block_id, Some(error));
+            let _ = documents.set_status(context_id, output_block_id, Status::Error);
+            let _ = documents.set_status(context_id, command_block_id, Status::Error);
+            return;
+        }
+    };
+
     // Snapshot the shell's durable surface (cwd + exported env) so we can
     // persist whatever this command changes (`cd`, `export`) back to L1.
     let state_before = snapshot_shell_state(kaish).await;
@@ -90,7 +163,7 @@ pub(crate) async fn run_into_blocks(
         code
     );
     match kaish
-        .execute_with_options(code, kaish_kernel::ExecuteOptions::default())
+        .execute_with_options(code, options)
         .await
     {
         Ok(result) => {
@@ -366,6 +439,24 @@ pub(crate) async fn run_into_blocks(
             }
         }
     }
+    if let Some((manager, job, sender)) = tracked_job {
+        let result = match documents.get_block_snapshot(context_id, output_block_id) {
+            Ok(Some(block)) => {
+                let mut result = kaish_kernel::interpreter::ExecResult::success(block.content);
+                result.err = block.stderr.unwrap_or_default();
+                result.code = block.exit_code.map(i64::from)
+                    .unwrap_or(if block.status == Status::Error { 1 } else { 0 });
+                result
+            }
+            Ok(None) => kaish_kernel::interpreter::ExecResult::failure(1, "shell output block is missing"),
+            Err(error) => kaish_kernel::interpreter::ExecResult::failure(1, error.to_string()),
+        };
+        manager.finalize_streams(job, &result).await;
+        let _ = sender.send(result);
+    }
+    if let Err(error) = complete_operation_from_blocks(kernel, context_id, output_block_id) {
+        log::error!("could not complete shell operation: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +492,7 @@ mod fill_tests {
         run_into_blocks(
             &kaish,
             "echo replaced",
+            None,
             ctx,
             &call,
             &result,

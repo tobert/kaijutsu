@@ -1524,6 +1524,10 @@ pub enum TurnFlow {
         principal_id: PrincipalId,
         /// Model override, or None to use the context's configured model.
         model: Option<String>,
+        /// Existing continuation epoch for an automatic resumption. `None`
+        /// starts a new explicit continuation window.
+        #[serde(default)]
+        continuation_epoch: Option<i64>,
     },
 
     /// A turn reached an ending the driver arrived at on purpose — it finished,
@@ -2216,6 +2220,7 @@ mod tests {
             content: "explore the auth module".into(),
             principal_id: principal,
             model: Some("claude-haiku-4-5".into()),
+            continuation_epoch: None,
         });
         assert_eq!(delivered, 1, "exactly one subscriber should receive it");
 
@@ -2228,12 +2233,14 @@ mod tests {
                 content,
                 principal_id,
                 model,
+                continuation_epoch,
             } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(after_block_id, after);
                 assert_eq!(content, "explore the auth module");
                 assert_eq!(principal_id, principal);
                 assert_eq!(model.as_deref(), Some("claude-haiku-4-5"));
+                assert_eq!(continuation_epoch, None);
             }
             other => panic!("expected Requested, got {other:?}"),
         }
@@ -2653,6 +2660,7 @@ mod tests {
                 content: "go".into(),
                 principal_id: principal,
                 model: None,
+                continuation_epoch: None,
             },
             TurnFlow::Completed {
                 context_id: ctx,

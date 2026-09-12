@@ -4,10 +4,10 @@ The Kaijutsu runtime image contains `kaijutsu-server`, `kaijutsu-mcp`, and
 `kaijutsu-acp`. It does not contain the Bevy app, Rust, Git, ALSA, or PipeWire.
 It runs as the non-root `kaijutsu` user (UID/GID 10001).
 
-Alpine's BusyBox `/bin/sh` remains deliberately. Kaijutsu owns host command
-execution through kaish; removing the shell would make permitted shell work
-fail before the kernel can apply that policy. Do not treat the runtime image as
-a general development environment.
+Alpine's BusyBox `/bin/sh` remains an operating-system dependency for the
+container image. It is not an alternate Kaijutsu command executor: every
+Kaijutsu shell request runs through kaish. Do not remove the deployment shell
+on that basis or treat the runtime image as a general development environment.
 
 ## Build
 

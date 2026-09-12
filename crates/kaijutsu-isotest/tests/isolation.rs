@@ -31,8 +31,7 @@ use kaijutsu_client::KeySource;
 // tests
 
 /// The PDEATHSIG proof: SIGKILL the kernel mid-job; the job must die with it.
-/// This is the `kill -9` / kaijutsu-runner.sh restart scenario the bespoke
-/// background_exec path calls its deciding factor.
+/// External children use kaish parent-death handling.
 #[test]
 fn orphan_guard_on_sigkill() {
     if skip_unless_isotest() { return; }
@@ -41,7 +40,7 @@ fn orphan_guard_on_sigkill() {
         let kernel = tk.connect().await;
         join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "sleep 300").await;
+        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
         let job = bg_pid(&kernel, &bg).await;
         assert!(pid_alive(job), "background job should be running");
 
@@ -71,7 +70,7 @@ fn orphan_guard_on_sigterm() {
         let kernel = tk.connect().await;
         join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "sleep 300").await;
+        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
         let job = bg_pid(&kernel, &bg).await;
         assert!(pid_alive(job));
 
@@ -85,8 +84,7 @@ fn orphan_guard_on_sigterm() {
     });
 }
 
-/// kill_background_process must take the whole setpgid process group, not
-/// just the direct sh child — pins background_exec.rs's process-group kill.
+/// Cancellation must reach the external command and its child process.
 #[test]
 fn kill_reaps_whole_process_tree() {
     if skip_unless_isotest() { return; }
@@ -95,7 +93,7 @@ fn kill_reaps_whole_process_tree() {
         let kernel = tk.connect().await;
         join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "sh -c 'sleep 301 & sleep 302 & wait'").await;
+        let bg = start_bg(&kernel, "/usr/bin/timeout 301 /usr/bin/sleep 302").await;
         let job = bg_pid(&kernel, &bg).await;
 
         // Wait for the grandchildren to exist before killing.
@@ -107,12 +105,12 @@ fn kill_reaps_whole_process_tree() {
         assert!(tree.len() >= 2, "grandchildren never appeared: {tree:?}");
 
         let r = kernel
-            .call_mcp_tool("kill_background_process", &json!({"id": bg}))
+            .call_mcp_tool("cancel_shell_operation", &json!({"id": bg}))
             .await
-            .expect("kill_background_process");
+            .expect("cancel_shell_operation");
         assert!(!r.is_error, "kill errored: {}", r.content);
 
-        assert!(wait_gone(job, Duration::from_secs(5)), "sh leader survived");
+        assert!(wait_gone(job, Duration::from_secs(5)), "timeout leader survived");
         for (pid, cmd) in tree {
             assert!(
                 wait_gone(pid, Duration::from_secs(5)),
@@ -137,7 +135,7 @@ fn restart_leaves_no_orphans_and_registry_stays_honest() {
         let kernel = tk.connect().await;
         join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "sleep 300").await;
+        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
         let job = bg_pid(&kernel, &bg).await;
         assert!(pid_alive(job));
 
@@ -151,17 +149,20 @@ fn restart_leaves_no_orphans_and_registry_stays_honest() {
         join_root(&kernel2).await;
 
         let r = kernel2
-            .call_mcp_tool("list_background_processes", &json!({}))
+            .call_mcp_tool("list_shell_operations", &json!({}))
             .await
-            .expect("list_background_processes after restart");
-        for line in r.content.lines() {
-            assert!(
-                !line.contains("[running]"),
-                "registry lies after restart — claims running: {line}"
-            );
-        }
+            .expect("list_shell_operations after restart");
+        let operations: serde_json::Value = serde_json::from_str(&r.content)
+            .expect("shell operation list JSON");
+        let operations = operations.as_array().expect("shell operation array");
         assert!(
-            pids_matching("sleep 300").is_empty(),
+            operations.iter().all(|row|
+                row.get("status").and_then(|value| value.as_str()) != Some("running")
+            ),
+            "registry lies after restart — claims running: {}", r.content
+        );
+        assert!(
+            pids_matching("/usr/bin/sleep 300").is_empty(),
             "a pre-restart job is still alive"
         );
 
@@ -170,12 +171,7 @@ fn restart_leaves_no_orphans_and_registry_stays_honest() {
     });
 }
 
-/// Pins the DOCUMENTED background contract (background_exec.rs module docs):
-/// a job "survives across shell tool invocations" and dies only with the
-/// context, the kernel, or an explicit kill — NOT with the client that
-/// happened to start it. Code reading suggests PDEATHSIG is bound to the
-/// server's per-connection thread, which would break this contract on
-/// client disconnect; this test is the empirical check.
+/// Jobs belong to the kernel context and survive a client disconnect.
 #[test]
 fn bg_job_survives_client_disconnect() {
     if skip_unless_isotest() { return; }
@@ -191,7 +187,7 @@ fn bg_job_survives_client_disconnect() {
                 .await;
             let (kernel, _id) = client.bind_kernel().await.expect("bind");
             join_root(&kernel).await;
-            let bg = start_bg(&kernel, "sleep 300").await;
+            let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
             let job = bg_pid(&kernel, &bg).await;
             assert!(pid_alive(job));
             job
@@ -272,7 +268,7 @@ fn agent_auth_production_path() {
         let (kernel, _id) = client.bind_kernel().await.expect("bind via agent auth");
         join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "sleep 300").await;
+        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
         let job = bg_pid(&kernel, &bg).await;
         assert!(pid_alive(job), "job started through agent-auth session");
 

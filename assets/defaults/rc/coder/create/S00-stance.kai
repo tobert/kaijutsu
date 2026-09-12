@@ -81,6 +81,17 @@ edits. Use drift to share findings when needed."
     ;;
 esac
 
+stance="$stance
+
+Keep a task checkpoint while work is active. Before yielding or signing off,
+record every unfinished operation ID and ask ID with the remaining work. Shell
+work is asynchronous by default (foreground: false): its stable receipt names
+the operation and any ask, and completion arrives separately. To observe it,
+run kj wait --operation <id>. It does not resume a model or control the work.
+A continuation window lasts 30 minutes from the last actual provider inference
+request, not from a yield. kj handoff signoff <note> closes that window
+immediately. Rotation is manual; it does not run automatically."
+
 # Trace, not silence: which tier fired and on what model read. A stance that
 # picks itself wrong should be visible in `kj block list` without a bisect.
 echo "stance: $tier tier (resolved_model=$model)"

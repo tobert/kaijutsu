@@ -263,6 +263,8 @@ pub(crate) struct GateSpec {
     /// caller must retry instead. That is not a silent fallback: the
     /// refusal's remedy says which of the two the caller is getting.
     pub exec_source: Option<String>,
+    /// The separately supplied stdin replayed with executable source.
+    pub exec_stdin: Option<String>,
     /// The `plan_program()` output of the program this ask runs: for
     /// `Origin::ShellGate` the submitted source `statements` was rendered
     /// from, for a shell-shaped `Origin::Hook` ask the `command` argument
@@ -418,6 +420,8 @@ fn build_ask(
         authorized_label: Some(spec.authorized_label.clone()),
         cwd,
         exec_source: spec.exec_source.clone(),
+        exec_stdin: spec.exec_stdin.clone(),
+        continuation_epoch: None,
         rc_run_id: None,
         expires_at: None,
         options: vec![
@@ -681,7 +685,7 @@ pub(crate) async fn run_gate(
 
     // Read before the row commits, so the directory recorded is the one the
     // ask was raised in rather than one a later `cd` moved to.
-    let ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
+    let mut ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
 
     // 3. Durable before asked — the row commits before anyone is told.
     let request_id = {
@@ -694,6 +698,12 @@ pub(crate) async fn run_gate(
             Ok(Some(reviewer)) => reviewer,
             Ok(None) => return GateOutcome::unavailable_without_row("approval gate could not resolve reviewer: no configured approval reviewer".into()),
             Err(error) => return GateOutcome::unavailable_without_row(format!("approval gate could not resolve reviewer: {error}")),
+        };
+        ask.continuation_epoch = match db.continuation_epoch(context) {
+            Ok(epoch) => epoch,
+            Err(error) => return GateOutcome::unavailable_without_row(format!(
+                "approval gate could not snapshot continuation epoch: {error}"
+            )),
         };
         approval_span.record("reviewer.id", reviewer.to_string());
         let mut ask = ask;
@@ -827,7 +837,7 @@ pub(crate) async fn record_dry_run_ask(
     if let Some(context) = caller.context_id {
         approval_span.record("context.id", context.to_string());
     }
-    let ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
+    let mut ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
     let request_id = {
         let db = db.lock();
         let context = match caller.context_id { Some(context) => context, None => { tracing::warn!("dry run ask has no context"); return None; } };
@@ -835,6 +845,10 @@ pub(crate) async fn record_dry_run_ask(
             Ok(Some(reviewer)) => reviewer,
             Ok(None) => { tracing::warn!("dry run ask has no configured reviewer"); return None; }
             Err(error) => { tracing::warn!("dry run could not resolve reviewer: {error}"); return None; }
+        };
+        ask.continuation_epoch = match db.continuation_epoch(context) {
+            Ok(epoch) => epoch,
+            Err(error) => { tracing::warn!("dry run could not snapshot continuation epoch: {error}"); return None; }
         };
         approval_span.record("reviewer.id", reviewer.to_string());
         let mut ask = ask;
@@ -946,6 +960,7 @@ mod tests {
                 source_index: None,
             }],
             exec_source: None,
+            exec_stdin: None,
             planned: Vec::new(),
         }
     }
@@ -976,6 +991,7 @@ mod tests {
                 },
             ],
             exec_source: None,
+            exec_stdin: None,
             planned: Vec::new(),
         }
     }
@@ -1607,6 +1623,8 @@ mod tests {
             signals: vec![],
             cwd: None,
             exec_source: None,
+            exec_stdin: None,
+        continuation_epoch: None,
             env: vec![],
         };
         let db = db.lock();
@@ -2400,6 +2418,8 @@ mod tests {
             signals: vec![],
             cwd: None,
             exec_source: None,
+            exec_stdin: None,
+        continuation_epoch: None,
             env: vec![],
         };
         let db = db.lock();

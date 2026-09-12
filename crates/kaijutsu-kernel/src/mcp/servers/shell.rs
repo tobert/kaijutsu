@@ -47,6 +47,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::super::broker::Broker;
 use super::super::context::CallContext;
@@ -68,19 +69,15 @@ pub struct ShellParams {
     /// stdin ignores it.
     #[serde(default)]
     pub stdin: Option<String>,
-    /// Run `command` in the background instead of waiting for it to finish.
-    /// Returns immediately with a `background_id` + the `block_id` its
-    /// output streams into — never the full output. Poll with
-    /// `read_background_output`, list with `list_background_processes`, stop
-    /// with `kill_background_process` (same server, `builtin.background`).
+    /// Wait for `command` to finish before returning. Defaults to `false`.
     ///
-    /// A backgrounded command runs as `/bin/sh -c <command>` directly on the
-    /// host — NOT through kaish — so shell syntax (`|`, `&&`, `>`) works but
-    /// `kj` verbs and kaish variables do not; use the foreground `shell` for
-    /// those. Requires the `exec` authority (same as any external command in
-    /// the foreground shell) and is never available on `read_only_shell`.
+    /// An asynchronous command runs the same complete kaish program as a
+    /// foreground command, with the same context identity, tools, mounts,
+    /// variables, working directory, and external-command policy. It returns
+    /// a stable job receipt before execution starts; read, wait, or cancel it
+    /// through the shell operation API.
     #[serde(default)]
-    pub background: bool,
+    pub foreground: bool,
 }
 
 // The kaish-language guidance (word-splitting, globs, `case`/`esac`,
@@ -125,7 +122,7 @@ pub(crate) fn composed_tool_description() -> &'static str {
 // every model that calls the tool.
 const RETURN_CONTRACT: &str = "Returns one JSON object, always the same \
      keys: {stdout, stderr, exit_code, status, did_spill, data, latch, \
-     block_id, background_id, content_type, ephemeral, elapsed_ms, error}. \
+     block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error}. \
      `stdout` and `stderr` are separate and are empty strings when the \
      command wrote none. Detect failure with `exit_code != 0` rather than \
      matching text. `status` is done, error, rejected, running, timeout or \
@@ -240,143 +237,6 @@ impl ShellServer {
         })
     }
 
-    /// `background: true` path — bypasses the kaish materialization entirely
-    /// (see `background_exec.rs` module docs for why: a per-call kaish
-    /// instance can't host a registry that outlives the call, and kaish's own
-    /// external-command capture isn't live). Spawns `command` as a direct
-    /// host process, streaming into a fresh `Running` block, and returns as
-    /// soon as it's registered — never the command's output.
-    async fn start_background(
-        &self,
-        command: &str,
-        dispatcher: &crate::kj::KjDispatcher,
-        ctx: &CallContext,
-    ) -> McpResult<KernelToolResult> {
-        // `read_only_shell` is structurally read-only (its materialized kaish
-        // pins `ExternalExec::Deny`) — background execution must be refused
-        // the same way, by construction, not left to the exec-authority
-        // check below (which a read-only role never holds anyway, but this
-        // keeps the refusal reason specific to the tool rather than a
-        // generic capability-denied).
-        if self.read_only {
-            return Err(McpError::Protocol(
-                "the safe `shell` tool cannot start background processes (it never spawns host subprocesses; use `shell_write`)"
-                    .to_string(),
-            ));
-        }
-
-        // Same authority a synchronous external command requires — `exec` —
-        // never a weaker gate. `facade:shell` alone (which `builtin.background`
-        // rides too, see FACADE_PROJECTED_INSTANCES) only grants kj/builtins;
-        // spawning a real host process needs the dedicated `exec` authority on
-        // top, exactly like `ExternalExec::Allow` vs `Deny` in
-        // `kj/context_shell.rs`.
-        let broker = self.broker()?;
-        let exec_granted = broker
-            .binding(&ctx.context_id)
-            .await
-            .is_some_and(|b| b.allows(&crate::mcp::Capability::Exec));
-        if !exec_granted {
-            return Err(McpError::Protocol(
-                "background execution requires the `exec` authority (deny-by-default — see `kj binding allow exec`)"
-                    .to_string(),
-            ));
-        }
-
-        let kernel = dispatcher.kernel();
-        let kernel_db = dispatcher.kernel_db();
-
-        // cwd: mirror the synchronous shell's persisted `context_shell.cwd`,
-        // but validated as a REAL host directory. A background spawn goes
-        // straight to the host (bypassing kaish's VFS), so a virtual-only cwd
-        // like `/v/docs` can't be honored — surfaced as an error rather than
-        // silently landing somewhere else.
-        let persisted_cwd = {
-            let db = kernel_db.lock();
-            db.get_context_shell(ctx.context_id)
-                .ok()
-                .flatten()
-                .and_then(|row| row.cwd)
-        };
-        let cwd = match persisted_cwd {
-            Some(p) => {
-                let path = std::path::PathBuf::from(&p);
-                if path.is_dir() {
-                    path
-                } else {
-                    return Err(McpError::Protocol(format!(
-                        "background execution needs a host-real cwd; this context's cwd ({p}) doesn't resolve on the host filesystem"
-                    )));
-                }
-            }
-            None => kaish_kernel::home_dir(),
-        };
-
-        // env: hermetic like the synchronous shell — PATH is the kernel's
-        // startup capture, HOME is seeded, and the context's durable env vars
-        // are exported (mirrors `EmbeddedKaish::apply_context_config`).
-        let mut env = vec![(
-            "HOME".to_string(),
-            kaish_kernel::home_dir().to_string_lossy().into_owned(),
-        )];
-        if let Some(path) = kernel.host_path() {
-            env.push(("PATH".to_string(), path.to_string()));
-        }
-        {
-            let db = kernel_db.lock();
-            if let Ok(vars) = db.get_context_env(ctx.context_id) {
-                for v in vars {
-                    env.push((v.key, v.value));
-                }
-            }
-        }
-
-        let blocks = dispatcher.block_store();
-        let block_id = blocks
-            .insert_block_as(
-                ctx.context_id,
-                None,
-                None,
-                kaijutsu_types::Role::Tool,
-                kaijutsu_types::BlockKind::ToolResult,
-                String::new(),
-                kaijutsu_types::Status::Running,
-                kaijutsu_types::ContentType::Plain,
-                Some(ctx.principal_id),
-            )
-            .map_err(|e| McpError::Protocol(format!("failed to create background output block: {e}")))?;
-
-        let registry = kernel.background_processes();
-        let bg_id = crate::background_exec::spawn_background(
-            registry,
-            blocks,
-            crate::background_exec::SpawnBackgroundParams {
-                command: command.to_string(),
-                cwd,
-                env,
-                context_id: ctx.context_id,
-                principal_id: ctx.principal_id,
-                block_id,
-            },
-        )
-        .map_err(|e| McpError::Protocol(format!("failed to start background process: {e}")))?;
-
-        // A started background command reports through the same envelope as
-        // every other `shell` return. `stdout` is empty because the output has
-        // not happened yet — it streams into `block_id`, which is why the
-        // instruction for reaching it rides `stderr` rather than being the
-        // whole body.
-        let mut env = ShellEnvelope::new(ShellStatus::Running);
-        env.background_id = Some(bg_id.to_string());
-        env.block_id = Some(block_id.to_key());
-        env.stderr = format!(
-            "started background process {bg_id}; output streams into block {}. \
-             Poll with read_background_output, list with list_background_processes, \
-             stop with kill_background_process (builtin.background).",
-            block_id.to_key()
-        );
-        Ok(envelope_result(env))
-    }
 }
 
 #[async_trait]
@@ -425,36 +285,17 @@ impl McpServerLike for ShellServer {
                 reason: "kj dispatcher not wired (Broker::set_kj_dispatcher)".to_string(),
             })?;
 
-        // Pair the kernel's semantic index with a block-backed source so the
-        // model's `kj search`/synthesis tools work inside the shell. Both come
-        // from the dispatcher (the server installs the index at bootstrap);
-        // when embeddings aren't configured the index is `None` and `kj` falls
-        // back to non-semantic search rather than failing.
-        if parsed.background {
-            // NOT gated (`docs/gate-and-shell-split.md`, "Slice 4"): a
-            // backgrounded command runs as a direct host subprocess
-            // (`start_background`, below), not through kaish, so
-            // `plan_program` cannot describe it — there is no kaish source
-            // here to plan. Gating this path is separate, unbuilt work; see
-            // `kj::shell_gate`'s module docs for the full list of what this
-            // gate does and does not cover.
-            return self.start_background(&parsed.command, &dispatcher, ctx).await;
-        }
-
-        // The hot, mutating tool is gated (`docs/gate-and-shell-split.md`,
-        // "Slice 4") — every foreground `shell_write` submission goes
-        // through the approval ledger before it runs. The safe `shell` tool
-        // (`self.read_only`) is never gated: it cannot mutate anything
-        // (`ExternalExec::Deny`), so a gate on it would be pure friction
-        // with nothing to protect against.
+        // Both shell flavors pass the same gate before dispatch. The safe
+        // shell's policy still prevents external commands and mutations, but
+        // its kaish program is planned and recorded by the same path.
         //
         // The gate is all-or-nothing per submission (kaish has no
         // per-command interception hook — `kj::shell_gate`'s module docs
         // explain why) and covers exactly what `plan_program` can see: the
         // kaish source text of `parsed.command`. It does NOT cover a
         // program handed to an interpreter as a string argument or over
-        // `parsed.stdin`, and it does not cover `start_background` above —
-        // see `kj::shell_gate`'s module docs for the full, honest list.
+        // `parsed.stdin` — see `kj::shell_gate`'s module docs for the full,
+        // honest list.
         // Populated only when `run_gate` redeems an escalated ask: the cwd
         // the human's approval was actually asked about. `None` on every
         // other path (the safe read-only tool, a rule-matched auto-allow,
@@ -469,7 +310,7 @@ impl McpServerLike for ShellServer {
             // is `Parse`, so this is always the model's mistake to fix and
             // never a fault: it takes the same D-28 `is_error` channel a
             // post-gate rejection takes, not `McpError::Protocol`.
-            let spec = match crate::kj::shell_gate::build_shell_gate_spec(&parsed.command) {
+            let spec = match crate::kj::shell_gate::build_shell_gate_spec_with_stdin(&parsed.command, parsed.stdin.clone()) {
                 Ok(spec) => spec,
                 Err(e) => {
                     let mut env = ShellEnvelope::new(ShellStatus::Rejected);
@@ -522,12 +363,77 @@ impl McpServerLike for ShellServer {
                         "an allowed gate outcome reached the refusal path"
                     ),
                 };
-                return Err(McpError::refused_gate(
-                    kind,
-                    Self::TOOL_WRITE,
-                    outcome.ask.clone(),
-                    &outcome.reason,
-                ));
+                if kind == RefusalKind::Pending && !parsed.foreground {
+                    let ask = outcome.ask.as_ref().expect("a pending gate outcome has an ask");
+                    let blocks = dispatcher.block_store();
+                    let command_block_id = blocks
+                        .insert_block_as(
+                            ctx.context_id, None, None,
+                            kaijutsu_types::Role::Tool,
+                            kaijutsu_types::BlockKind::ToolCall,
+                            parsed.command.clone(),
+                            kaijutsu_types::Status::Waiting,
+                            kaijutsu_types::ContentType::Plain,
+                            Some(ctx.actor_id),
+                        )
+                        .map_err(|error| McpError::Protocol(format!(
+                            "create waiting shell command block: {error}"
+                        )))?;
+                    let output_block_id = blocks
+                        .insert_block_as(
+                            ctx.context_id, Some(&command_block_id), Some(&command_block_id),
+                            kaijutsu_types::Role::Tool,
+                            kaijutsu_types::BlockKind::ToolResult,
+                            String::new(), kaijutsu_types::Status::Waiting,
+                            kaijutsu_types::ContentType::Plain,
+                            Some(ctx.principal_id),
+                        )
+                        .map_err(|error| McpError::Protocol(format!(
+                            "create waiting shell output block: {error}"
+                        )))?;
+                    for block_id in [&command_block_id, &output_block_id] {
+                        blocks.set_excluded(ctx.context_id, block_id, true).map_err(|error| {
+                            McpError::Protocol(format!("exclude waiting shell block: {error}"))
+                        })?;
+                    }
+                    let epoch = dispatcher.kernel_db().lock().continuation_epoch(ctx.context_id)
+                        .map_err(|error| McpError::Protocol(format!("snapshot shell continuation epoch: {error}")))?;
+                    let receipt = dispatcher.kernel().shell_operations().register(
+                        ctx.context_id, ctx.principal_id, ctx.actor_id,
+                        command_block_id, output_block_id, &parsed.command,
+                        epoch,
+                    ).map_err(|error| McpError::Protocol(format!(
+                        "register waiting shell operation: {error}"
+                    )))?;
+                    dispatcher.kernel().shell_operations().mark_waiting(
+                        &receipt.operation_id, &ask.request_id,
+                    ).map_err(|error| McpError::Protocol(format!(
+                        "mark waiting shell operation: {error}"
+                    )))?;
+                    dispatcher.kernel_db().lock().link_ask_blocks(
+                        &ask.request_id,
+                        &receipt.command_block_id,
+                        &receipt.output_block_id,
+                        crate::PairOwner::Turn,
+                    ).map_err(|error| McpError::Protocol(format!(
+                        "link waiting shell operation to ask: {error}"
+                    )))?;
+                }
+                if kind == RefusalKind::Pending && !parsed.foreground {
+                    let receipt = dispatcher.kernel().shell_operations().get_by_ask(
+                        &outcome.ask.as_ref().expect("pending gate outcome has an ask").request_id,
+                        ctx.context_id,
+                    ).map_err(|error| McpError::Protocol(format!(
+                        "load waiting shell operation: {error}"
+                    )))?.expect("pending shell gate registered its operation");
+                    let mut env = ShellEnvelope::new(ShellStatus::Waiting);
+                    env.operation_id = Some(receipt.receipt.operation_id);
+                    env.ask_id = outcome.ask.as_ref().map(|ask| ask.request_id.clone());
+                    env.block_id = Some(receipt.receipt.output_block_id.to_key());
+                    env.stderr = outcome.reason.clone();
+                    return Ok(envelope_result(env));
+                }
+                return Err(McpError::refused_gate(kind, self.tool, outcome.ask.clone(), &outcome.reason));
             }
             // An approval authorizes THAT operation, not a similar one run
             // wherever the context's cwd has drifted to since the ask was
@@ -594,6 +500,169 @@ impl McpServerLike for ShellServer {
         }
         if let Some(cwd) = pinned_cwd {
             opts = opts.with_cwd(cwd);
+        }
+        if !parsed.foreground {
+            let blocks = dispatcher.block_store();
+            let command_block_id = blocks
+                .insert_block_as(
+                    ctx.context_id,
+                    None,
+                    None,
+                    kaijutsu_types::Role::Tool,
+                    kaijutsu_types::BlockKind::ToolCall,
+                    parsed.command.clone(),
+                    kaijutsu_types::Status::Running,
+                    kaijutsu_types::ContentType::Plain,
+                    Some(ctx.actor_id),
+                )
+                .map_err(|error| McpError::Protocol(format!(
+                    "create asynchronous shell command block: {error}"
+                )))?;
+            let output_block_id = blocks
+                .insert_block_as(
+                    ctx.context_id,
+                    Some(&command_block_id),
+                    Some(&command_block_id),
+                    kaijutsu_types::Role::Tool,
+                    kaijutsu_types::BlockKind::ToolResult,
+                    String::new(),
+                    kaijutsu_types::Status::Running,
+                    kaijutsu_types::ContentType::Plain,
+                    Some(ctx.principal_id),
+                )
+                .map_err(|error| McpError::Protocol(format!(
+                    "create asynchronous shell output block: {error}"
+                )))?;
+            for block_id in [&command_block_id, &output_block_id] {
+                blocks.set_excluded(ctx.context_id, block_id, true).map_err(|error| {
+                    McpError::Protocol(format!("exclude asynchronous shell block: {error}"))
+                })?;
+            }
+            let epoch = dispatcher.kernel_db().lock().continuation_epoch(ctx.context_id)
+                .map_err(|error| McpError::Protocol(format!("snapshot shell continuation epoch: {error}")))?;
+            let receipt = dispatcher
+                .kernel()
+                .shell_operations()
+                .register(
+                    ctx.context_id,
+                    ctx.principal_id,
+                    ctx.actor_id,
+                    command_block_id,
+                    output_block_id,
+                    &parsed.command,
+                    epoch,
+                )
+                .map_err(|error| McpError::Protocol(format!(
+                    "register asynchronous shell operation: {error}"
+                )))?;
+            let job_id = match kaish.execute_background_with_options(&parsed.command, opts).await {
+                Ok(job_id) => job_id,
+                Err(error) => {
+                    let mut envelope = ShellEnvelope::new(if error.is_rejected() {
+                        ShellStatus::Rejected
+                    } else {
+                        ShellStatus::Error
+                    });
+                    envelope.operation_id = Some(receipt.operation_id.clone());
+                    envelope.block_id = Some(receipt.output_block_id.to_key());
+                    envelope.error = Some(error.to_string());
+                    for block_id in [&receipt.command_block_id, &receipt.output_block_id] {
+                        let _ = blocks.set_status(ctx.context_id, block_id, kaijutsu_types::Status::Error);
+                    }
+                    dispatcher.kernel().shell_operations().complete(&receipt.operation_id, envelope.clone())
+                        .map_err(|failure| McpError::Protocol(format!(
+                            "settle rejected asynchronous shell operation: {failure}"
+                        )))?;
+                    if error.is_rejected() {
+                        return Ok(envelope_result(envelope));
+                    }
+                    return Err(McpError::Protocol(format!(
+                        "shell asynchronous execution failed: {error}"
+                    )));
+                }
+            };
+            dispatcher
+                .kernel()
+                .shell_operations()
+                .attach_job(
+                    &receipt.operation_id,
+                    job_id,
+                    dispatcher.kernel().context_job_manager(ctx.context_id),
+                )
+                .map_err(|error| McpError::Protocol(format!(
+                    "attach asynchronous shell job: {error}"
+                )))?;
+            let operation_id = receipt.operation_id.clone();
+            let completion_kernel = dispatcher.kernel().clone();
+            let completion_principal = ctx.principal_id;
+            let completion_actor = ctx.actor_id;
+            let job_manager = dispatcher.kernel().context_job_manager(ctx.context_id);
+            let completion_blocks = blocks.clone();
+            let completion_context = ctx.context_id;
+            let completion_command = receipt.command_block_id;
+            let completion_output = receipt.output_block_id;
+            tokio::spawn(async move {
+                let mut envelope = match job_manager.wait(job_id).await {
+                    Some(result) => shell_result_to_envelope(result, 0),
+                    None => {
+                        let mut envelope = ShellEnvelope::new(ShellStatus::Error);
+                        envelope.error = Some("asynchronous kaish job stopped before it settled".to_string());
+                        envelope
+                    }
+                };
+                envelope.operation_id = Some(operation_id.clone());
+                envelope.block_id = Some(completion_output.to_key());
+                if let Err(error) = completion_blocks.replace_text_as(
+                    completion_context,
+                    &completion_output,
+                    &envelope.stdout,
+                    Some(kaijutsu_types::PrincipalId::system()),
+                ) {
+                    tracing::error!("asynchronous shell operation {operation_id}: write output block: {error}");
+                }
+                if let Err(error) = completion_blocks.set_stderr(
+                    completion_context,
+                    &completion_output,
+                    (!envelope.stderr.is_empty()).then_some(envelope.stderr.clone()),
+                ) {
+                    tracing::error!("asynchronous shell operation {operation_id}: write stderr: {error}");
+                }
+                let exit_code = envelope.exit_code.and_then(|code| i32::try_from(code).ok());
+                if let Err(error) = completion_blocks.set_exit_code(
+                    completion_context,
+                    &completion_output,
+                    exit_code,
+                ) {
+                    tracing::error!("asynchronous shell operation {operation_id}: write exit code: {error}");
+                }
+                let status = if envelope.is_error() {
+                    kaijutsu_types::Status::Error
+                } else {
+                    kaijutsu_types::Status::Done
+                };
+                for block_id in [&completion_command, &completion_output] {
+                    if let Err(error) = completion_blocks.set_status(completion_context, block_id, status) {
+                        tracing::error!("asynchronous shell operation {operation_id}: settle block: {error}");
+                    }
+                }
+                if let Err(error) = completion_kernel.complete_async_shell_operation(
+                    &operation_id,
+                    completion_context,
+                    completion_principal,
+                    completion_actor,
+                    envelope,
+                ).await {
+                    tracing::error!("asynchronous shell operation {operation_id}: persist completion: {error}");
+                }
+            }.instrument(tracing::Span::current()));
+            let mut env = ShellEnvelope::new(ShellStatus::Running);
+            env.operation_id = Some(receipt.operation_id);
+            env.block_id = Some(receipt.output_block_id.to_key());
+            env.stderr = format!(
+                "asynchronous kaish job {job_id} started; use shell operation {} to read, wait, or cancel it",
+                env.operation_id.as_deref().unwrap_or_default()
+            );
+            return Ok(envelope_result(env));
         }
         // A REJECTED program is not a plumbing fault. kaish refuses parse and
         // validation failures before anything runs, and that is the model's
@@ -822,13 +891,29 @@ mod tests {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE),
             tool: ShellServer::TOOL.to_string(),
-            arguments: serde_json::json!({ "command": command }),
+            arguments: serde_json::json!({ "command": command, "foreground": true }),
         }
     }
 
     /// Params targeting the HOT, mutating `shell_write` tool
     /// (`ExternalExec::Allow`) — granted not default.
     fn call_write(command: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+            tool: ShellServer::TOOL_WRITE.to_string(),
+            arguments: serde_json::json!({ "command": command, "foreground": true }),
+        }
+    }
+
+    fn call_async(command: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
+            arguments: serde_json::json!({ "command": command }),
+        }
+    }
+
+    fn call_write_async(command: &str) -> KernelCallParams {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
             tool: ShellServer::TOOL_WRITE.to_string(),
@@ -1469,9 +1554,9 @@ mod tests {
                 env.error = Some("parse error".into());
                 envelope_result(env)
             }),
-            ("background", {
+            ("operation", {
                 let mut env = ShellEnvelope::new(ShellStatus::Running);
-                env.background_id = Some("bg-1".into());
+                env.operation_id = Some("operation-1".into());
                 envelope_result(env)
             }),
         ];
@@ -1783,8 +1868,6 @@ mod tests {
     /// (what `materialize_context_kaish_inner`'s exec-authority check reads,
     /// via `self.kernel().broker()` — a different `Arc<Broker>` than the one
     /// `ShellServer` was registered on for the *synchronous* path; the
-    /// `background: true` path checks the server's own `self.broker`
-    /// instead, so background tests elsewhere in this file don't need this).
     #[tokio::test]
     async fn shell_write_grant_gets_full_external_exec_under_the_new_name() {
         let (broker, d) = wired().await;
@@ -1864,371 +1947,165 @@ mod tests {
         );
     }
 
-    /// `background: true` requires the `exec` authority on top of
-    /// `facade:shell_write` — the same gate a synchronous external command
-    /// hits, never a weaker one. A context with `facade:shell_write` alone
-    /// (no `exec`) must be refused, not silently degrade to a foreground run.
-    #[tokio::test]
-    async fn background_true_is_denied_without_exec_authority() {
-        let (broker, d) = wired().await;
-        let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("bg-noexec"), None, principal);
-        d.block_store()
-            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
-            .unwrap();
-
-        let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
-        broker.set_binding(ctx_id, binding).await.unwrap();
-
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
-            arguments: serde_json::json!({"command": "echo nope", "background": true}),
-        };
-        let err = broker
-            .call_tool(params, &cc, CancellationToken::new())
-            .await
-            .expect_err("background execution must be denied without the exec authority");
-        assert!(
-            matches!(err, McpError::Protocol(_)),
-            "expected a Protocol denial explaining the missing exec authority, got {err:?}"
-        );
-    }
-
-    /// End-to-end: `shell_write(background: true)` with `facade:shell_write`
-    /// + `exec` returns IMMEDIATELY (a handle + block id, never the command's
-    /// output), and the command actually runs — its output shows up in the
-    /// returned block a moment later, proving the async path is really
-    /// wired, not just accepting the flag and doing nothing.
-    #[tokio::test]
-    async fn background_true_returns_immediately_and_streams_into_its_block() {
-        let (broker, d) = wired().await;
-        let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("bg-ok"), None, principal);
-        d.block_store()
-            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
-            .unwrap();
-
-        let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
-        binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await.unwrap();
-
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
-            arguments: serde_json::json!({"command": "echo streamed-bg-output", "background": true}),
-        };
-        let result = broker
-            .call_tool(params, &cc, CancellationToken::new())
-            .await
-            .expect("background start should succeed");
-
-        assert!(!result.is_error, "starting a background process is not itself an error");
-        let structured = result.structured.clone().expect("structured envelope");
-        assert_eq!(structured["status"], serde_json::json!("running"));
-        let block_key = structured["block_id"].as_str().expect("block_id present").to_string();
-        assert!(structured["background_id"].as_str().is_some(), "background_id present");
-        // The response body must be a short confirmation, never the command's
-        // full output — that's the whole point of backgrounding.
-        let out = streams_of(&result);
-        assert!(
-            !out.contains("streamed-bg-output"),
-            "the immediate response must not carry the command's output, got: {out:?}"
-        );
-
-        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
-        let start = std::time::Instant::now();
+    async fn wait_for_operation(
+        d: &Arc<crate::kj::KjDispatcher>,
+        context: kaijutsu_types::ContextId,
+        operation_id: &str,
+    ) -> crate::shell_operations::ShellOperationState {
+        let started = std::time::Instant::now();
         loop {
-            let snap = d
-                .block_store()
-                .get_block_snapshot(ctx_id, &block_id)
-                .unwrap()
-                .expect("block exists");
-            if snap.content.contains("streamed-bg-output") {
-                break;
+            let state = d
+                .kernel()
+                .shell_operations()
+                .get(operation_id, context)
+                .expect("operation lookup")
+                .expect("operation receipt remains durable");
+            if state.completed_at.is_some() {
+                return state;
             }
-            assert!(start.elapsed() < std::time::Duration::from_secs(5), "timed out waiting for background output to stream in");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(5),
+                "timed out waiting for shell operation {operation_id}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
-    /// The safe `shell` tool must refuse `background: true` outright — it
-    /// never spawns host subprocesses by construction (its materialized
-    /// kaish pins `ExternalExec::Deny`), and background execution must not be
-    /// a back door around that.
     #[tokio::test]
-    async fn safe_shell_rejects_background_true() {
+    async fn async_default_runs_the_full_kaish_program_and_records_one_operation() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("ro-bg"), None, principal);
-
+        let context = register_context(&d, Some("async-program"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let epoch = d.kernel_db().lock().begin_continuation(context, 1).unwrap().epoch;
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell".into()));
-        // Even granting `exec` (which no real safe-shell-only role would
-        // have) must not open the door — the refusal is structural on
-        // `read_only`, checked before the capability gate.
-        binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await.unwrap();
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
 
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE),
-            tool: ShellServer::TOOL.to_string(),
-            arguments: serde_json::json!({"command": "echo nope", "background": true}),
-        };
-        let err = broker
-            .call_tool(params, &cc, CancellationToken::new())
-            .await
-            .expect_err("the safe shell tool must refuse background execution even with exec granted");
-        assert!(matches!(err, McpError::Protocol(_)), "expected a Protocol refusal, got {err:?}");
+        let receipt = broker.call_tool(call_async("echo first; echo second"), &cc, CancellationToken::new())
+            .await.expect("async safe shell starts a kaish program");
+        assert!(!receipt.is_error, "a receipt is not command failure: {receipt:?}");
+        let body = body_of(&receipt);
+        assert_eq!(body["status"], serde_json::json!("running"));
+        let operation_id = body["operation_id"].as_str().expect("stable operation id").to_owned();
+        assert!(body["ask_id"].is_null(), "safe builtin needs no approval");
+        let state = d.kernel().shell_operations().get(&operation_id, context).unwrap().unwrap();
+        assert_eq!(state.continuation_epoch, Some(epoch));
+
+        let completed = wait_for_operation(&d, context, &operation_id).await;
+        let envelope = completed.envelope.expect("completion envelope");
+        assert_eq!(envelope.status, ShellStatus::Done);
+        assert!(envelope.stdout.contains("first"));
+        assert!(envelope.stdout.contains("second"));
+        assert_eq!(d.kernel().shell_operations().list_for_context(context).unwrap().len(), 1);
     }
 
-    /// CHARACTERIZATION: block lifecycle, "created up front" half. The
-    /// output block's stored `Status` must already be `Running` the instant
-    /// `shell(background: true)` returns — not flipped to `Running` by some
-    /// later step. Distinct from the `"status": "running"` field in the tool
-    /// response (that's the background JOB's status, a different value from
-    /// the block's own status); this pins the block directly.
-    ///
-    /// Reaches into `d.block_store()` for the raw `Status` enum (the MCP tool
-    /// surface never exposes it) — expected to remain the shared
-    /// primitive across the background-engine swap, unlike
-    /// `background_exec`'s own types.
     #[tokio::test]
-    async fn background_true_creates_a_running_block_before_the_process_finishes() {
+    async fn async_safe_shell_denies_external_commands_without_host_fallback() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("bg-runblock"), None, principal);
-        d.block_store()
-            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
-            .unwrap();
-
+        let context = register_context(&d, Some("async-safe-external"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
         binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await.unwrap();
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
 
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
-            // Long enough that it cannot have exited by the time we check.
-            arguments: serde_json::json!({"command": "sleep 2", "background": true}),
-        };
-        let result = broker
-            .call_tool(params, &cc, CancellationToken::new())
-            .await
-            .expect("background start should succeed");
-        let structured = result.structured.unwrap();
-        let block_key = structured["block_id"].as_str().unwrap().to_string();
-        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
-        let bg_id = crate::background_exec::BackgroundId::parse(structured["background_id"].as_str().unwrap())
-            .expect("valid background id");
-
-        let snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
-        assert_eq!(
-            snap.status,
-            kaijutsu_types::Status::Running,
-            "the output block must be Running immediately after shell(background: true) returns"
-        );
-
-        // Clean up the still-running sleep.
-        d.kernel().background_processes().cancel(bg_id, ctx_id);
+        let receipt = broker.call_tool(call_async("id"), &cc, CancellationToken::new())
+            .await.expect("the async receipt is returned before kaish rejects external dispatch");
+        let operation_id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
+        let completed = wait_for_operation(&d, context, &operation_id).await;
+        let envelope = completed.envelope.unwrap();
+        assert!(envelope.is_error());
+        assert!(!envelope.stdout.contains("uid="), "safe shell must not spawn id");
+        assert!(envelope.stderr.contains("external") || envelope.stdout.contains("external"),
+            "kaish must name the configured external-command refusal: {envelope:?}");
     }
 
-    /// CHARACTERIZATION: block lifecycle, nonzero-exit case. A Running block
-    /// must transition to `Status::Error` (never silently `Done`, never
-    /// stuck `Running`) when the backgrounded command exits nonzero, and the
-    /// real exit code must survive into `list_background_processes`.
-    /// Complements
-    /// `background_exec::tests::spawn_background_nonzero_exit_marks_block_error_and_records_code`
-    /// (same contract, pinned directly against the internal `spawn_background`
-    /// API) with the MCP-tool-surface view expected to survive the engine
-    /// swap. Reaches into `d.block_store()` for the stored `Status` only.
     #[tokio::test]
-    async fn background_true_nonzero_exit_marks_the_block_error() {
+    async fn pending_async_shell_write_has_a_durable_waiting_operation_and_ask() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("bg-nonzero"), None, principal);
-        d.block_store()
-            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
-            .unwrap();
-
+        let reviewer = PrincipalId::new();
+        let context = register_context(&d, Some("async-pending"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+        }).unwrap();
+        d.kernel_db().lock().update_context_review(context, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
-        binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await.unwrap();
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
 
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
-            arguments: serde_json::json!({"command": "exit 5", "background": true}),
-        };
-        let result = broker
-            .call_tool(params, &cc, CancellationToken::new())
-            .await
-            .expect("background start should succeed");
-        let bg_id = result.structured.as_ref().unwrap()["background_id"].as_str().unwrap().to_string();
-        let block_key = result.structured.unwrap()["block_id"].as_str().unwrap().to_string();
-        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
-
-        let registry = d.kernel().background_processes();
-        let parsed_id = crate::background_exec::BackgroundId::parse(&bg_id).unwrap();
-        let start = std::time::Instant::now();
-        let snap = loop {
-            if let Some(s) = registry.get_for_context(parsed_id, ctx_id).filter(|s| s.status == "exited") {
-                break s;
-            }
-            assert!(start.elapsed() < std::time::Duration::from_secs(5), "timed out waiting for exit");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        };
-        assert_eq!(snap.exit_code, Some(5), "exit status must never be lost");
-
-        let block_snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
-        assert_eq!(
-            block_snap.status,
-            kaijutsu_types::Status::Error,
-            "a nonzero-exit background process must leave the block Error, not Done"
-        );
-        assert_eq!(block_snap.exit_code, Some(5));
+        let pending = broker.call_tool(call_write_async("echo waits-for-approval"), &cc, CancellationToken::new())
+            .await.expect("uncovered async write returns a durable waiting receipt");
+        assert!(!pending.is_error, "waiting for approval is not execution failure: {pending:?}");
+        let pending_body = body_of(&pending);
+        assert_eq!(pending_body["status"], serde_json::json!("waiting"));
+        let ask_id = pending_body["ask_id"].as_str().expect("ask id");
+        let operation = d.kernel().shell_operations().get_by_ask(ask_id, context).unwrap()
+            .expect("pending ask has a durable operation receipt");
+        assert_eq!(operation.receipt.ask_id.as_deref(), Some(ask_id));
+        assert!(operation.receipt.job_id.is_none(), "a pending ask must not start kaish");
+        assert!(operation.completed_at.is_none());
+        let output = d.block_store().get_block_snapshot(context, &operation.receipt.output_block_id).unwrap().unwrap();
+        assert_eq!(output.status, kaijutsu_types::Status::Waiting);
     }
 
-    /// CHARACTERIZATION: refusal guard. `background: true` must refuse a
-    /// persisted context cwd that isn't a REAL host directory — a background
-    /// spawn goes straight to the host (bypassing kaish's VFS), so a
-    /// virtual-only cwd like `/v/docs` can't be honored. Assert both the
-    /// refusal AND that it names the offending cwd, per Amy's "assert on the
-    /// behavior and the reason, not exact prose" standard.
+    /// A context shares one kaish JobManager across ephemeral shell
+    /// materializations. The read-only façade must never turn that shared
+    /// manager into a cancellation handle for another operation.
     #[tokio::test]
-    async fn background_true_refuses_a_non_host_real_cwd() {
+    async fn safe_shell_cannot_cancel_a_context_operation_through_kaish_job_control() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("bg-badcwd"), None, principal);
-        d.block_store()
-            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
-            .unwrap();
-
-        {
-            let db = d.kernel_db().lock();
-            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
-                context_id: ctx_id,
-                cwd: Some("/v/docs".to_string()),
-                updated_at: kaijutsu_types::now_millis() as i64,
-            })
-            .unwrap();
-        }
-
+        let context = register_context(&d, Some("safe-job-control"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
-        binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await.unwrap();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
 
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
-            arguments: serde_json::json!({"command": "echo nope", "background": true}),
-        };
-        let err = broker
-            .call_tool(params, &cc, CancellationToken::new())
-            .await
-            .expect_err("a non-host-real cwd must refuse background execution");
-        match err {
-            McpError::Protocol(msg) => {
-                assert!(msg.contains("/v/docs"), "refusal should name the offending cwd: {msg}");
-                assert!(
-                    msg.to_lowercase().contains("cwd") || msg.to_lowercase().contains("host"),
-                    "refusal should explain it's a host-realness problem, not a generic error: {msg}"
-                );
-            }
-            other => panic!("expected a Protocol refusal, got {other:?}"),
-        }
+        let receipt = broker.call_tool(call_async("sleep 2"), &cc, CancellationToken::new())
+            .await.expect("safe shell may run a read-only builtin asynchronously");
+        let operation_id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
+        let state = d.kernel().shell_operations().get(&operation_id, context).unwrap().unwrap();
+        let job_id = state.receipt.job_id.expect("operation is attached to shared kaish job");
+
+        let attempt = broker.call_tool(call(&format!("kill %{job_id}")), &cc, CancellationToken::new())
+            .await.expect("job-control refusal is a shell result");
+        assert!(attempt.is_error, "read-only shell must refuse cancellation through the shared manager");
+        assert!(streams_of(&attempt).contains("job control") || streams_of(&attempt).contains("read-only"),
+            "the refusal must name its capability boundary: {attempt:?}");
+        let still_running = d.kernel().shell_operations().get(&operation_id, context).unwrap().unwrap();
+        assert!(still_running.completed_at.is_none(), "a read-only job-control attempt must not cancel the operation");
+
+        let write_attempt = broker.call_tool(
+            call(&format!("echo altered > /v/jobs/{job_id}/stdout")),
+            &cc,
+            CancellationToken::new(),
+        ).await.expect("read-only jobfs refusal is a shell result");
+        assert!(write_attempt.is_error, "a safe shell must not write the shared job filesystem");
+        assert!(streams_of(&write_attempt).contains("read-only") || streams_of(&write_attempt).contains("Permission denied"),
+            "jobfs write must fail loudly: {write_attempt:?}");
+        d.kernel().shell_operations().cancel(&operation_id, context).await.unwrap();
     }
 
-    /// CHARACTERIZATION: hermetic env. `background_exec.rs` docs promise the
-    /// child's environment is the caller's EXPLICIT set (HOME, PATH from
-    /// `Kernel::host_path`, and the context's durable env vars) — never this
-    /// kernel process's own ambient OS environment. Proven two ways at once:
-    /// a var real in this test process's OS env but never threaded through
-    /// `start_background` must NOT reach the child, while a context-scoped
-    /// env var explicitly set via `kernel_db::set_context_env` — which IS
-    /// part of the documented hermetic set — must.
     #[tokio::test]
-    async fn background_true_env_is_hermetic_not_inherited() {
-        let leak_key = "KAIJUTSU_TEST_BG_ENV_LEAK_MARKER";
-        // SAFETY: unique var name avoids cross-test collisions; this crate's
-        // test suite already accepts this pattern (see llm/config.rs).
-        unsafe {
-            std::env::set_var(leak_key, "should-not-leak-into-the-child");
-        }
-
+    async fn foreground_true_keeps_the_completed_result_contract() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("bg-env"), None, principal);
-        d.block_store()
-            .create_document(ctx_id, kaijutsu_types::DocKind::Conversation, None)
-            .unwrap();
-
-        {
-            let db = d.kernel_db().lock();
-            db.set_context_env(ctx_id, "KJ_CONTEXT_VAR", "context-value").unwrap();
-        }
-
+        let context = register_context(&d, Some("explicit-foreground"), None, principal);
         let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
-        binding.grant(Capability::Exec);
-        broker.set_binding(ctx_id, binding).await.unwrap();
-
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
-        let params = KernelCallParams {
-            instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
-            tool: ShellServer::TOOL_WRITE.to_string(),
-            arguments: serde_json::json!({"command": "env", "background": true}),
-        };
-        let result = broker
-            .call_tool(params, &cc, CancellationToken::new())
-            .await
-            .expect("background start should succeed");
-        let block_key = result.structured.unwrap()["block_id"].as_str().unwrap().to_string();
-        let block_id = kaijutsu_types::BlockId::from_key(&block_key).expect("valid block key");
-
-        let start = std::time::Instant::now();
-        let content = loop {
-            let snap = d.block_store().get_block_snapshot(ctx_id, &block_id).unwrap().unwrap();
-            if snap.status != kaijutsu_types::Status::Running {
-                break snap.content;
-            }
-            assert!(start.elapsed() < std::time::Duration::from_secs(5), "timed out waiting for `env` to finish");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        };
-
-        // SAFETY: matches the set_var above.
-        unsafe {
-            std::env::remove_var(leak_key);
-        }
-
-        assert!(
-            !content.contains(leak_key),
-            "the child must not see this kernel process's own OS env, got: {content:?}"
-        );
-        assert!(
-            content.contains("KJ_CONTEXT_VAR=context-value"),
-            "the context's durable env var must reach the child, got: {content:?}"
-        );
-        assert!(
-            content.contains(&format!("HOME={}", kaish_kernel::home_dir().to_string_lossy())),
-            "HOME must be seeded from kaish_kernel::home_dir(), got: {content:?}"
-        );
-        if let Some(path) = d.kernel().host_path() {
-            assert!(
-                content.contains(&format!("PATH={path}")),
-                "PATH must be the kernel's startup capture, got: {content:?}"
-            );
-        }
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let result = broker.call_tool(call("echo foreground"), &cc, CancellationToken::new()).await.unwrap();
+        assert_eq!(body_of(&result)["status"], serde_json::json!("done"));
+        assert!(streams_of(&result).contains("foreground"));
+        assert!(body_of(&result)["operation_id"].is_null());
     }
+
 }

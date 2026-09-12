@@ -106,39 +106,34 @@ that hangs is exactly what makes a person reach for `kill -9`, which
 defeats the whole surface. When the deadline blows, the answer is seppuku
 — never "wait longer".
 
-## What rc needs that does not exist yet: a process table
+## What rc still needs: a system roster
 
-A shutdown hook that cancels things has to be able to see them, and today
-it cannot.
+A shutdown hook can observe individual operations and kaish jobs with `kj
+wait`, but it has no system-wide roster yet.
 
 What exists:
 
-- `BackgroundRegistry` (`kaijutsu-kernel/src/background_exec.rs`) tracks
-  real OS pids, commands, status, and start/finish times. It already has
-  `list_for_context`, the kernel-wide `summary_by_context`, `cancel`, and
-  `kill_all_for_context`.
-- An **MCP surface** on `builtin.background`:
-  `list_background_processes`, `read_background_output`,
-  `kill_background_process`.
+- `ShellOperationRegistry` stores a durable operation receipt, its command and
+  output blocks, optional ask and kaish job IDs, and its terminal envelope.
+  It is scoped by context and survives a materialized shell instance.
+- Each context owns one kaish `JobManager`. Materialized shells in that context
+  share its jobs; a job cannot appear in another context's job list.
+- An asynchronous `shell` call uses `foreground: false` by default. It runs a
+  complete kaish program, returns the operation receipt, and writes its output
+  block when that program completes. `foreground: true` waits for the completed
+  result.
 - The turn-liveness registry, which `kj system status` now reads.
 
-What is missing: **a `kj` verb**, which is what an rc script can actually
-call. An rc hook speaks kaish and `kj`, not MCP tool names.
+What is missing is a **`kj system ps` roster**. An rc hook speaks kaish and
+`kj`, not a private server API.
 
-A `kj system ps` would union the two rosters that matter — turns in flight
-(agent work, no pid) and background jobs (real processes, with pids) —
-which together are the honest answer to "what is this kernel doing".
+A `kj system ps` should union turns in flight and shell operations, including
+each operation's kaish job ID when it has one. That is the honest answer to
+"what is this kernel doing"; an OS pid is not the public execution identity.
 
-**On hooking up `kaish jobs` instead.** kaish already ships `jobs`, `ps`,
-`kill`, `bg`, `fg`, and `wait`. Inside a kaijutsu shell, `ps` lists host
-processes and `jobs` lists *kaish's* own jobs — not kaijutsu's
-per-context background registry. Making `jobs` report the kaijutsu
-registry would redefine an existing kaish public surface from inside an
-embedder, and kaish is the conservative side of this fleet (CLAUDE.md,
-"kaish and kaibo are not this"). Treat it as a question for the kaish
-lead — is there an embedder hook for job sources? — rather than something
-kaijutsu changes unilaterally. `kj system ps` does not need that answer to
-ship.
+Kaish's `jobs`, `ps`, `kill`, `bg`, `fg`, and `wait` retain their kaish
+meaning. The kernel injects the context's job manager rather than replacing
+those commands or exposing a second host-process executor.
 
 ## Who may call it
 
@@ -179,9 +174,9 @@ prints — a context (cancel its turn, kill its jobs) or a single job id.
 
 **Feasibility is split, and the split is a crate boundary.**
 
-- **The job half works today, directly.** `BackgroundRegistry` lives in
-  `kaijutsu-kernel`, so `kj` can call `cancel` and `kill_all_for_context`
-  with no new plumbing.
+- **The job half works today, directly.** `ShellOperationRegistry` lives in
+  `kaijutsu-kernel`; it owns the per-context kaish job manager and can cancel
+  an operation or every job in one context without a host-process path.
 - **The turn half cannot.** `ContextInterruptState` and `get_interrupt`
   live in **`kaijutsu-server`** (`interrupt.rs`, `rpc.rs`), and
   `kaijutsu-server` depends on `kaijutsu-kernel`, not the reverse. `kj`
@@ -207,9 +202,9 @@ advisable for chatty paths.* Applied to the surfaces `ps` overlaps:
 
 | surface | verdict |
 |---|---|
-| `list_background_processes` (MCP) | **Retirement candidate.** `kj system ps` and the bare `ps` builtin now render the same roster, and `ps` supplies the job ids the other two tools need. |
-| `read_background_output` (MCP) | **Keep.** Polling a running job's output mid-turn is the definition of a chatty path. It is not admin work and must not become a `kj` verb. |
-| `kill_background_process` (MCP) | **Judgment call.** Admin-shaped, but a model stopping its own runaway job mid-turn is ordinary operation, not administration. |
+| `list_shell_operations` (MCP) | **Keep.** Lists durable operation receipts in the caller's context. A future `kj system ps` provides the cross-context administrative roster. |
+| `read_shell_operation` (MCP) | **Keep.** Reads an operation's receipt or terminal envelope without waiting. It is a chatty ordinary-operation path, not a `kj` administration verb. |
+| `cancel_shell_operation` (MCP) | **Keep.** Cancels an operation with a cancellable kaish job. A model stopping its own runaway work is ordinary operation, not administration. |
 | `interruptContext` (RPC) | **Keep.** It has a real interactive caller — the app's Ctrl+C path (`kaijutsu-app/src/input/systems.rs`). Per-context and interactive; quiesce does not replace it. |
 
 Caution before acting on the one candidate: these are **MCP tools, so their

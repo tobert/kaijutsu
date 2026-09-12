@@ -105,6 +105,7 @@ fn shell_returns_stdout() {
 
         let out = mcp
             .shell_impl(ShellRequest {
+                foreground: true,
                 command: "echo hello".to_string(),
                 timeout_secs: Some(30),
             }, None)
@@ -131,6 +132,32 @@ fn shell_returns_stdout() {
             Some("hello\n"),
             "stdout did not replicate into the envelope: {env}"
         );
+    });
+}
+
+#[test]
+fn shell_defaults_to_a_receipt_and_wait_observes_completion() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        register_with_retry(&mcp, "async-receipt").await;
+        let request = serde_json::from_value(serde_json::json!({
+            "command": "sleep 3; echo async-finished",
+        })).unwrap();
+        let started = std::time::Instant::now();
+        let out = mcp.shell_impl(request, None).await;
+        let receipt = out.structured_content.expect("async shell receipt");
+        assert_eq!(receipt["status"], "running", "{receipt}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let operation = receipt["operation_id"].as_str().expect("operation id");
+        let out = mcp.shell_impl(ShellRequest {
+            command: format!("kj wait --operation {operation} --timeout 15"),
+            foreground: true,
+            timeout_secs: Some(20),
+        }, None).await;
+        let completion = out.structured_content.expect("wait result");
+        assert_eq!(completion["data"]["status"], "done", "{completion}");
+        assert_eq!(completion["data"]["state"]["envelope"]["stdout"], "async-finished\n");
     });
 }
 
@@ -176,6 +203,7 @@ fn shell_survives_dead_event_feed() {
         let started = std::time::Instant::now();
         let out = mcp
             .shell_impl(ShellRequest {
+                foreground: true,
                 // MUST be slow enough that the first completion poll misses.
                 // This test was `echo still-alive` and went VACUOUS the moment
                 // the poll started querying the server instead of the local
@@ -257,6 +285,7 @@ fn shell_returns_full_nontrivial_stdout() {
         const WANT_BYTES: usize = 4096;
         let out = mcp
             .shell_impl(ShellRequest {
+                foreground: true,
                 command: format!("head -c {WANT_BYTES} /dev/zero | tr '\\0' 'a'"),
                 timeout_secs: Some(30),
             }, None)
@@ -298,6 +327,7 @@ fn shell_returns_nonzero_exit_code() {
 
         let out = mcp
             .shell_impl(ShellRequest {
+                foreground: true,
                 command: "exit 17".to_string(),
                 timeout_secs: Some(30),
             }, None)
@@ -334,6 +364,7 @@ fn shell_sequential_commands() {
         for n in 1..=3 {
             let out = mcp
                 .shell_impl(ShellRequest {
+                foreground: true,
                     command: format!("echo line{n}"),
                     timeout_secs: Some(30),
                 }, None)

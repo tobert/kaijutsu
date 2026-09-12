@@ -2169,14 +2169,9 @@ impl KjDispatcher {
         // MCP subscription cleanup removed alongside the legacy MCP pool
         // in Phase 1 M5.
 
-        // Kill any background host processes this context still owns
-        // (`background_exec.rs`) before the document they stream into is
-        // deleted below — an orphaned `Running` entry pointing at a gone
-        // block would otherwise keep the OS process alive with nowhere for
-        // its output to land. Fire-and-forget: the supervising tasks tear
-        // the processes down independently, `context_remove` doesn't block
-        // on their exit.
-        self.kernel().background_processes().kill_all_for_context(target_id);
+        if let Err(e) = self.kernel().shell_operations().cancel_all_for_context(target_id).await {
+            return KjResult::Err(format!("could not cancel context shell operations: {e}"));
+        }
 
         // Delete from DB (CASCADE deletes edges)
         {
@@ -2588,7 +2583,7 @@ mod tests {
             db.update_context_review_assignment(context, Some(coder), Some(amy), None).unwrap();
         }
         let gate_caller = crate::kj::KjCaller { principal_id: amy, actor_id: coder, reviewer_id: Some(amy), context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
-        let spec = crate::kj::gate::GateSpec { origin: approval_ledger::types::Origin::Hook, instance: "test".into(), tool: "test".into(), hook_id: None, description: "pending".into(), authorized_label: "pending".into(), statements: vec![crate::kj::gate::GatedStatement { rendered: "pending".into(), statement_kind: "test".into(), vars: vec![], source_index: None }], exec_source: None, planned: vec![] };
+        let spec = crate::kj::gate::GateSpec { origin: approval_ledger::types::Origin::Hook, instance: "test".into(), tool: "test".into(), hook_id: None, description: "pending".into(), authorized_label: "pending".into(), statements: vec![crate::kj::gate::GatedStatement { rendered: "pending".into(), statement_kind: "test".into(), vars: vec![], source_index: None }], exec_source: None, exec_stdin: None, planned: vec![] };
         let outcome = crate::kj::gate::run_gate(d.kernel_db(), &gate_caller, spec, d.kernel().ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         assert!(outcome.ask.is_some());
         let amy_caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
@@ -3985,94 +3980,24 @@ mod tests {
         assert!(!result.is_ok(), "should not allow removing current context");
     }
 
-    /// CHARACTERIZATION: `kj context remove` (once confirmed) kills any
-    /// background host processes the removed context still owns
-    /// (`background_exec.rs`'s `kill_all_for_context`, wired at the tail of
-    /// `context_remove` above) — a removed context's processes are killed,
-    /// not orphaned into invisibility. Goes through the REAL `kj context
-    /// remove` verb (not a direct `kill_all_for_context` call, which
-    /// `background_exec::tests::kill_all_for_context_only_touches_that_context`
-    /// already pins) so this test proves the wiring, not just the primitive.
-    ///
-    /// Reaches into `crate::background_exec::spawn_background` directly
-    /// (crate-internal API, not the `shell` MCP tool) to keep this test
-    /// decoupled from broker/binding setup — if `spawn_background`'s
-    /// signature disappears in the kaish-job-system swap, THIS call site is
-    /// what needs rewriting, not the `kj context remove` behavior under test.
     #[tokio::test]
-    async fn context_remove_kills_owned_background_processes() {
+    async fn context_remove_cancels_owned_kaish_jobs() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
         let target = register_context(&d, Some("victim"), Some(parent), principal);
-        d.block_store()
-            .create_document(target, kaijutsu_types::DocKind::Conversation, None)
-            .unwrap();
-
-        let block_id = d
-            .block_store()
-            .insert_block_as(
-                target,
-                None,
-                None,
-                kaijutsu_types::Role::Tool,
-                kaijutsu_types::BlockKind::ToolResult,
-                String::new(),
-                kaijutsu_types::Status::Running,
-                kaijutsu_types::ContentType::Plain,
-                Some(principal),
-            )
-            .unwrap();
-
-        let registry = d.kernel().background_processes();
-        let bg_id = crate::background_exec::spawn_background(
-            registry,
-            d.block_store(),
-            crate::background_exec::SpawnBackgroundParams {
-                command: "sleep 30".to_string(),
-                cwd: std::env::temp_dir(),
-                env: vec![(
-                    "PATH".to_string(),
-                    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
-                )],
-                context_id: target,
-                principal_id: principal,
-                block_id,
-            },
-        )
-        .unwrap();
-
-        // Confirm it's actually running before we remove its context.
-        let wait_start = std::time::Instant::now();
-        loop {
-            if registry.get_for_context(bg_id, target).filter(|s| s.status == "running").is_some() {
-                break;
-            }
-            assert!(wait_start.elapsed() < std::time::Duration::from_secs(2), "background process never reported running");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-
+        d.block_store().create_document(target, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let manager = d.kernel().context_job_manager(target);
+        let kaish = kaish_kernel::Kernel::new(
+            kaish_kernel::KernelConfig::default().with_job_manager(manager.clone()),
+        ).unwrap();
+        let job = kaish.execute_background_with_options("sleep 30", kaish_kernel::ExecuteOptions::default()).await.unwrap();
         let c = confirmed_caller(parent);
-        let result = d
-            .dispatch(&[s("context"), s("remove"), s("victim")], &c)
-            .await;
-        assert!(result.is_ok(), "context remove should succeed: {}", result.message());
-
-        // The background process must be killed as a side effect of removing
-        // its owning context — never left `running` with an orphaned entry.
-        let wait_start = std::time::Instant::now();
-        loop {
-            match registry.get_for_context(bg_id, target) {
-                Some(snap) if snap.status == "killed" => break,
-                Some(_) => {}
-                None => panic!("entry vanished from the registry instead of being marked killed"),
-            }
-            assert!(
-                wait_start.elapsed() < std::time::Duration::from_secs(5),
-                "background process was never killed after its owning context was removed"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let result = d.dispatch(&[s("context"), s("remove"), s("victim")], &c).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), manager.wait(job)).await.unwrap().unwrap();
+        assert_ne!(result.code, 0);
+        assert_eq!(manager.get(job).await.unwrap().status, kaish_kernel::scheduler::JobStatus::Killed);
     }
 
     #[tokio::test]

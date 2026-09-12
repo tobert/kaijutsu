@@ -570,6 +570,7 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     content: _,
                     principal_id,
                     model,
+                    continuation_epoch,
                 } = msg.payload
                 else {
                     // The driver only subscribes to turn.requested. Completion
@@ -624,6 +625,7 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     // origin rides onto that event so the scheduler can tell an
                     // autonomous turn (which feeds the Act) from a human one.
                     TurnOrigin::Autonomous,
+                    continuation_epoch,
                 )
                 .await
                 {
@@ -715,6 +717,7 @@ enum ExecAction {
 /// turn's own pair, `Session` for a connected session's.
 struct ExecutableAsk {
     source: String,
+    stdin: Option<String>,
     cwd: Option<String>,
     actor: PrincipalId,
     reviewer: PrincipalId,
@@ -890,6 +893,9 @@ fn settle_pair_error(
     let _ = documents.set_stderr(context_id, output_block_id, Some(reason));
     let _ = documents.set_status(context_id, output_block_id, Status::Error);
     let _ = documents.set_status(context_id, command_block_id, Status::Error);
+    if let Err(error) = crate::shell_run::complete_operation_from_blocks(&kernel.kernel, context_id, output_block_id) {
+        log::error!("could not settle refused shell operation: {error}");
+    }
     // The pair may already be cached from an earlier turn as `Waiting`;
     // this settles it in place, so the next turn must hydrate cold to see
     // it (see `ConversationCache::evict`).
@@ -1188,6 +1194,7 @@ async fn act_on_executable_answer(
     crate::shell_run::run_into_blocks(
         &kaish,
         source,
+        ask.stdin.clone(),
         context_id,
         &command_block_id,
         &output_block_id,
@@ -1488,6 +1495,7 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                         };
                         ExecutableAsk {
                             source,
+                            stdin: row.exec_stdin.clone(),
                             cwd: row.cwd.clone(),
                             actor,
                             reviewer,
@@ -1590,7 +1598,66 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                         continue;
                     }
 
-                    kernel.kernel.mark_turn_begun(context_id);
+                    let Some(continuation_epoch) = row.continuation_epoch else {
+                        woken.insert(answer.request_id.clone());
+                        woken_this_event += 1;
+                        log::info!(
+                            "gate-resume: delivered {} to {context_id} without automatic continuation; the ask predates continuation epochs",
+                            answer.request_id
+                        );
+                        continue;
+                    };
+                    let window = match kernel.kernel.gate_resume_window().await {
+                        Ok(window) => window,
+                        Err(error) => {
+                            woken.insert(answer.request_id.clone());
+                            woken_this_event += 1;
+                            log::error!(
+                                "gate-resume: delivered {} but could not read continuation policy: {error}",
+                                answer.request_id
+                            );
+                            continue;
+                        }
+                    };
+                    let window_ms = match i64::try_from(window.as_millis()) {
+                        Ok(window_ms) => window_ms,
+                        Err(_) => {
+                            woken.insert(answer.request_id.clone());
+                            woken_this_event += 1;
+                            log::error!(
+                                "gate-resume: delivered {} but continuation window is too large",
+                                answer.request_id
+                            );
+                            continue;
+                        }
+                    };
+                    let automatic_resume_allowed = match kernel.kernel_db.lock()
+                        .automatic_resume_allowed(
+                            context_id,
+                            continuation_epoch,
+                            kaijutsu_types::now_millis() as i64,
+                            window_ms,
+                        )
+                    {
+                        Ok(allowed) => allowed,
+                        Err(error) => {
+                            log::error!(
+                                "gate-resume: delivered {} but could not check continuation epoch: {error}",
+                                answer.request_id
+                            );
+                            false
+                        }
+                    };
+                    if !automatic_resume_allowed {
+                        woken.insert(answer.request_id.clone());
+                        woken_this_event += 1;
+                        log::info!(
+                            "gate-resume: delivered {} to {context_id}; its continuation window is closed",
+                            answer.request_id
+                        );
+                        continue;
+                    }
+
                     let delivered =
                         kernel.kernel.turn_flows().publish(TurnFlow::Requested {
                             context_id,
@@ -1598,12 +1665,10 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                             content: seed,
                             principal_id,
                             model: None,
+                            continuation_epoch: Some(continuation_epoch),
                         });
                     if delivered == 0 {
-                        // No turn driver listening. Clear the flag we just
-                        // set and leave the answer uncollected rather than
-                        // recording a wake that never happened.
-                        kernel.kernel.mark_turn_ended(context_id);
+                        // Leave the answer uncollected when no driver can accept it.
                         log::warn!(
                             "gate-resume: no turn driver subscribed; {context_id} not woken"
                         );
@@ -5140,6 +5205,7 @@ impl kernel::Server for KernelImpl {
                     tool_ctx,
                     user_principal_id,
                     TurnOrigin::Interactive,
+                    None,
                 )
                 .await?;
 
@@ -5256,7 +5322,7 @@ impl kernel::Server for KernelImpl {
                 // above). A context absent from the map has no background
                 // history at all; `resolve_background_wire_fields` treats
                 // that identically to `BackgroundSummary::default()`.
-                let bg_by_ctx = kernel_arc.background_processes().summary_by_context();
+                let bg_by_ctx = kernel_arc.shell_operations().summary_by_context().map_err(capnp::Error::failed)?;
 
                 // Read from the kernel's drift router — runtime authority for provider/model
                 let drift = kernel_arc.drift().read();
@@ -5356,7 +5422,7 @@ impl kernel::Server for KernelImpl {
                     c.set_cache_ttl_secs(cache_ttl_secs);
 
                     // Background-process ambient state — app visibility into
-                    // `background_exec.rs` (kaijutsu.capnp ContextHandleInfo
+                    // `shell_operations.rs` (kaijutsu.capnp ContextHandleInfo
                     // doc comment). `resolve_background_wire_fields` is unit
                     // tested directly (`background_wire_tests` below).
                     let bg_summary = bg_by_ctx.get(&ctx.id).cloned().unwrap_or_default();
@@ -5731,23 +5797,18 @@ impl kernel::Server for KernelImpl {
                     return Ok(());
                 }
 
-                match execute_shell_command(
-                    &code,
-                    context_id,
-                    user_principal_id,
-                    user_initiated,
-                    &kernel,
-                    &connection,
-                )
-                .await?
-                {
-                    Ok(command_block_id) => {
-                        let mut b = results.get().init_outcome().init_ok();
-                        set_block_id_builder(&mut b, &command_block_id);
+                let submission = execute_shell_command(
+                    &code, context_id, user_principal_id, user_initiated, &kernel, &connection,
+                ).await?;
+                let mut outcome = results.get().init_outcome();
+                outcome.set_operation_id(&submission.operation_id);
+                set_block_id_builder(&mut outcome.reborrow().init_command_block_id(), &submission.command_block_id);
+                match submission.refusal {
+                    None => {
+                        set_block_id_builder(&mut outcome.init_ok(), &submission.command_block_id);
                     }
-                    Err(refusal) => {
-                        let mut b = results.get().init_outcome().init_refused();
-                        set_refusal(&mut b, &refusal);
+                    Some(refusal) => {
+                        set_refusal(&mut outcome.init_refused(), &refusal);
                     }
                 }
                 Ok(())
@@ -7502,7 +7563,7 @@ impl kernel::Server for KernelImpl {
                         return Err(capnp::Error::failed("input is empty".into()));
                     }
 
-                    match execute_shell_command(
+                    let submission = execute_shell_command(
                         &text,
                         context_id,
                         user_principal_id,
@@ -7510,9 +7571,10 @@ impl kernel::Server for KernelImpl {
                         &kernel,
                         &connection,
                     )
-                    .await?
-                    {
-                        Ok(command_block_id) => {
+                    .await?;
+                    match submission.refusal {
+                        None => {
+                            let command_block_id = submission.command_block_id;
                             // The command exists durably; the draft has done its job.
                             documents
                                 .clear_draft(context_id, user_principal_id)
@@ -7521,7 +7583,7 @@ impl kernel::Server for KernelImpl {
                             let mut b = results.get().init_outcome().init_ok();
                             set_block_id_builder(&mut b, &command_block_id);
                         }
-                        Err(refusal) => {
+                        Some(refusal) => {
                             // Refused, so nothing ran and the player still needs
                             // the text — the draft stays where they left it.
                             //
@@ -7584,6 +7646,7 @@ impl kernel::Server for KernelImpl {
                         tool_ctx,
                         user_principal_id,
                         TurnOrigin::Interactive,
+                        None,
                     )
                     .await?;
 
@@ -9942,6 +10005,12 @@ pub(crate) fn persist_shell_state(
     }
 }
 
+struct ShellCommandSubmission {
+    command_block_id: kaijutsu_types::BlockId,
+    operation_id: String,
+    refusal: Option<kaijutsu_types::Refusal>,
+}
+
 async fn execute_shell_command(
     code: &str,
     context_id: ContextId,
@@ -9949,7 +10018,7 @@ async fn execute_shell_command(
     user_initiated: bool,
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
-) -> Result<Result<kaijutsu_types::BlockId, kaijutsu_types::Refusal>, capnp::Error> {
+) -> Result<ShellCommandSubmission, capnp::Error> {
     // Materialize a single-use context shell seeded from L1 (durable env + cwd).
     // No caching: transient scope evaporates when this instance drops, so the
     // context's durable state only ever changes through `kj context set`.
@@ -10009,6 +10078,14 @@ async fn execute_shell_command(
         )
         .map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
 
+    let continuation_epoch = kernel.kernel_db.lock().continuation_epoch(context_id)
+        .map_err(|e| capnp::Error::failed(format!("read continuation: {e}")))?;
+    let receipt = kernel_arc.shell_operations().register(
+        context_id, user_principal_id, user_principal_id,
+        command_block_id, output_block_id, code, continuation_epoch,
+    ).map_err(|e| capnp::Error::failed(format!("register shell operation: {e}")))?;
+    let operation_id = receipt.operation_id.to_string();
+
     // Mark output block as Running — clients poll this to detect completion
     if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
         log::warn!("Failed to set output block to Running: {}", e);
@@ -10063,7 +10140,9 @@ async fn execute_shell_command(
             };
             let _ = documents.set_status(context_id, &output_block_id, status);
             let _ = documents.set_status(context_id, &command_block_id, status);
-            return Ok(Ok(command_block_id));
+            crate::shell_run::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
+                .map_err(|e| capnp::Error::failed(e))?;
+            return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: None });
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
             // No "denied" prefix: the refusal carries three different kinds
@@ -10109,7 +10188,14 @@ async fn execute_shell_command(
                     );
                 }
             }
-            return Ok(Err(refusal));
+            if let Some(ask_id) = refusal.ask_id() {
+                kernel_arc.shell_operations().mark_waiting(&operation_id, ask_id)
+                    .map_err(|e| capnp::Error::failed(format!("record shell ask: {e}")))?;
+            } else {
+                crate::shell_run::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
+                    .map_err(capnp::Error::failed)?;
+            }
+            return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: Some(refusal) });
         }
     }
 
@@ -10132,6 +10218,7 @@ async fn execute_shell_command(
         crate::shell_run::run_into_blocks(
             &kaish,
             &code,
+            None,
             context_id,
             &command_block_id_clone,
             &output_block_id_clone,
@@ -10145,7 +10232,7 @@ async fn execute_shell_command(
         .await;
     });
 
-    Ok(Ok(command_block_id))
+    Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: None })
 }
 
 struct KjCatalogEntry {
@@ -12218,14 +12305,14 @@ mod context_usage_wire_tests {
 
 /// Resolve one context's background-process ambient-state wire quintuple
 /// (`ContextHandleInfo.background*`, `kaijutsu.capnp` @23-@27) from its
-/// `BackgroundSummary` (`kaijutsu_kernel::background_exec`). Pulled out of
+/// `ShellOperationSummary` (`kaijutsu_kernel::shell_operations`). Pulled out of
 /// `list_contexts` so the sentinel selection — `0`/empty-string/`-1` for
 /// "nothing running, nothing finished" — is unit-testable independent of
 /// the capnp builder (`background_wire_tests` below). Never fabricates: a
 /// context with no background history at all gets every field's honest
 /// "none" sentinel, same spirit as `resolve_usage_wire_fields` above.
 fn resolve_background_wire_fields(
-    summary: &kaijutsu_kernel::background_exec::BackgroundSummary,
+    summary: &kaijutsu_kernel::shell_operations::ShellOperationSummary,
 ) -> (u32, u64, u64, &'static str, i32) {
     let oldest_running = summary.oldest_running_started_at_unix_ms.unwrap_or(0);
     match &summary.last_finished {
@@ -12248,7 +12335,7 @@ mod background_wire_tests {
     //! collide with a real (and legitimately zero-ish) value — mirroring
     //! `context_usage_wire_tests` above for the `contextUsedPct` sentinel.
     use super::resolve_background_wire_fields;
-    use kaijutsu_kernel::background_exec::{BackgroundFinishedSummary, BackgroundSummary};
+    use kaijutsu_kernel::shell_operations::{ShellOperationFinishedSummary as BackgroundFinishedSummary, ShellOperationSummary as BackgroundSummary};
 
     #[test]
     fn nothing_running_or_finished_is_every_sentinel() {

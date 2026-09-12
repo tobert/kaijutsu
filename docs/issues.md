@@ -6,6 +6,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Async completion recovery follow-ups
+
+- Completion during a model's final inference can reach the durable mailbox
+  after that request was sent. The current automatic wake check skips an
+  in-flight turn. Reconcile unread completion notifications when the turn
+  yields, using its mailbox cursor, so a late result within the continuation
+  window does not wait for the next explicit drive. Do not refresh the window
+  or replay already consumed results.
+- RPC PostCall hooks can replace output/status while the durable exit code
+  still records the executed command. Define separate command outcome and hook
+  outcome before changing job summaries to infer a synthetic exit code.
+- Shell operation inspection currently uses bounded result/block output.
+  Integrate kaish job streams and spill references for live, complete output
+  retrieval without invalidating pagination offsets.
+
 ## `kj block list --json` loses its command-specific metadata (2026-09-12)
 
 `BlockCommand::List` declares `--json` and builds a `{context_id, count,
@@ -48,30 +63,6 @@ payload and logging, in the order to try:
 - Untested from the diagnosis: `PASSIVE` instead of `TRUNCATE` for
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
-
-## Model resumption needs a continuation window (2026-09-12)
-
-`kj ledger allow` can resume the model whose linked pair it fills
-(`act_on_executable_answer`, `PairOwner::Turn`) without considering the cost of
-continuing after a long idle. Add a continuation-window policy to the wake
-path, separate from execution and result delivery. The window expresses KV
-and cost expectations; provider cache warmth is not always observable.
-An ask has no default expiry. Do not turn the window into an approval TTL.
-
-Async submission should return a stable receipt, completion should append a
-separate fact, and the coder should checkpoint before explicit wait/signoff.
-Extend `kj wait` to cover operations and approval dependencies, with wait
-cancellation separate from work cancellation. The current background shell
-runs outside kaish, so changing its default is not sufficient. Preserve the
-existing execution owner and approval checks when designing async execution.
-Contract and current gaps: `docs/approval-identity.md`, "Continuation windows
-and async work". This is design work; no new defaults have shipped.
-
-The gate-resume driver header still says executable asks never wake a model.
-The implementation returns `ExecAction::Tell` for model-owned pairs and can
-request a turn after filling them; the wire regression covers that path.
-Update that historical commentary with this work so it cannot guide a new
-continuation implementation toward the wrong branch.
 
 ## The cached mailbox never re-reads a block it has seen (2026-09-11)
 
@@ -222,13 +213,6 @@ issues. Code inspection confirmed the ordering; no DB fault was injected.
 tool calls start Running, but `kj block status` can set Pending explicitly.
 Define what a copied Pending tool call means before adding queued execution to
 forks; the model's repaired wire pair does not change that durable status.
-
-## Found during the 2026-09-08 sweep (lead-verified)
-
-- **`background_exec.rs` and CLAUDE.md disagree.** The module header says
-  kaish's job system is not reusable here and treats the migration as
-  rejected; AGENTS.md "Config and execution" still names it as the
-  ad-hoc exec site being retired. One of them is wrong; decide which.
 
 ## Living documents + project contexts (Amy, 2026-09-07)
 
@@ -575,9 +559,13 @@ loudly on a cross-mount absolute target.
 
 ## Remaining approval ergonomics
 
-- Shell/hook asks deliberately have no default expiry. A future janitor may
-  identify obsolete requests and record explicit cleanup; absence of a TTL
-  or sweeper is not itself a defect.
+- Shell/hook asks deliberately have no default expiry. A future janitor must
+  identify obsolete asks and unfinished operations, record explicit cleanup,
+  and preserve any re-ask linkage; absence of a TTL or sweeper is not itself a
+  defect.
+- Rotation remains manual. Design how a successor retains the predecessor's
+  unfinished operation and ask references without moving authority or
+  automatically resuming a different model context.
 - A gated `:kj` command still wraps the refusal in an error on some client
   paths; show the durable ask reference as a waiting result consistently.
 - Reviewer characters can have several live contexts. The ledger change feed

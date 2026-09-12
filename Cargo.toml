@@ -220,3 +220,12 @@ tracing-opentelemetry = "0.32"
 # Testing
 tempfile = "3"
 
+
+# Whole-program async kaish API, reviewed in tobert/kaish#445.
+[patch.crates-io]
+kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
+kaish-types = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
+kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
+kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
+kaish-glob = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
+kaish-help = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }

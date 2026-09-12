@@ -13,7 +13,7 @@
 FROM docker.io/library/archlinux:latest
 
 # The suite reads /proc directly and the background jobs under test only
-# need sh + coreutils, all present in the base image. Keep the package list
+# need coreutils, present in the base image. Keep the package list
 # minimal: every addition here is something the tests silently start
 # depending on. openssl/sqlite are present in base and cover the server's
 # dynamic links; the ldd preflight is the honest gate if that drifts.

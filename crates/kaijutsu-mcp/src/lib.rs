@@ -213,6 +213,7 @@ impl ShellCompletion {
     /// what happened in `exit_code` and `status`, so a caller that wants the
     /// finer distinction (a program kaish refused vs. one that ran and
     /// failed) reads the field rather than the flag.
+    #[cfg(test)]
     fn to_tool_result(&self) -> CallToolResult {
         let env = self.to_envelope();
         let value = env.to_value();
@@ -1280,14 +1281,28 @@ impl KaijutsuMcp {
         // Execute command — creates ToolCall + ToolResult blocks in the document.
         // The output block starts as Status::Running and transitions to Done/Error
         // when execution completes.
-        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
-            Ok(id) => id,
+        let submission = match actor.shell_submit(&req.command, ctx_id, false).await {
+            Ok(submission) => submission,
             Err(e) => {
                 return CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error starting command: {e}"
                 ))]);
             }
         };
+        let cmd_block_id = submission.command_block_id;
+        if !req.foreground || submission.refusal.is_some() {
+            let mut envelope = ShellEnvelope::new(if submission.refusal.is_some() {
+                ShellStatus::Waiting
+            } else {
+                ShellStatus::Running
+            });
+            envelope.operation_id = Some(submission.operation_id);
+            envelope.ask_id = submission.refusal.as_ref().and_then(|r| r.ask_id().map(str::to_owned));
+            envelope.data = Some(serde_json::json!({
+                "command_block_id": cmd_block_id.to_key(), "context_id": ctx_id,
+            }));
+            return CallToolResult::structured(envelope.to_value());
+        }
 
         tracing::info!(
             command = %req.command,
@@ -1297,7 +1312,7 @@ impl KaijutsuMcp {
         );
 
         let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
-        self.execute_and_poll_shell(
+        let completion = self.execute_and_poll_shell(
             remote,
             ctx_id,
             cmd_block_id,
@@ -1305,8 +1320,14 @@ impl KaijutsuMcp {
             timeout_secs,
             "Shell command",
         )
-        .await
-        .to_tool_result()
+        .await;
+        let mut envelope = completion.to_envelope();
+        envelope.operation_id = Some(submission.operation_id);
+        if envelope.is_error() {
+            CallToolResult::structured_error(envelope.to_value())
+        } else {
+            CallToolResult::structured(envelope.to_value())
+        }
     }
 }
 
@@ -1793,7 +1814,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns one JSON object, always the same keys: {stdout, stderr, exit_code, status, did_spill, data, latch, block_id, background_id, content_type, ephemeral, elapsed_ms, error} — the same shape the in-kernel `shell` tool returns. `stdout` and `stderr` are separate and are empty strings when the command wrote none. Detect failure via exit_code != 0 rather than text-matching. exit_code is null when it has not replicated yet — treat null as unknown, not success — and -1 when the command's outcome never reached the tool, where `status` and `error` say what went wrong. `status` is done, error, rejected, running, timeout or stream_closed. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). A key this path cannot fill is null, never absent. Output also lands as kernel blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
+        description = "Submit a kaish command in your current kernel context. Returns an operation receipt by default; set foreground=true to wait for completion. Use 'kj wait --operation <operation_id>' to wait later, or 'kj wait --ask <ask_id>' for an approval decision. A waiting receipt is accepted work awaiting review. Wait timeouts do not cancel work. All execution uses kaish, including pipes, variables, scripting, and kj commands. Foreground commands preserve durable cwd/env. Results use the same JSON envelope as the kernel shell: stdout, stderr, exit_code, status, did_spill, data, latch, block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error. Unknown values are null. Requires --connect and register_session.",
         annotations(open_world_hint = true),
         output_schema = shell_output_schema()
     )]
@@ -3583,7 +3604,7 @@ mod tests {
         .to_value();
         assert_eq!(value["did_spill"], serde_json::Value::Null);
         assert_eq!(value["latch"], serde_json::Value::Null);
-        assert_eq!(value["background_id"], serde_json::Value::Null);
+        assert_eq!(value["operation_id"], serde_json::Value::Null);
     }
 
     /// The declared schema and the envelope must not drift. Every `required`

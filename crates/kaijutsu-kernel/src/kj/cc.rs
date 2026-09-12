@@ -198,6 +198,7 @@ fn gate_spec_for_send(
         // caller retries; wiring a verb origin to execute on approval is
         // separate work.
         exec_source: None,
+        exec_stdin: None,
         // No source program to plan — see `env_snapshot::free_variable_values`,
         // whose union is empty over an empty statement list.
         planned: Vec::new(),
