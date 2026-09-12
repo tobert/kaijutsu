@@ -1072,6 +1072,8 @@ mod tests {
 
         let caller = crate::kj::KjCaller {
             principal_id: principal,
+            actor_id: principal,
+            reviewer_id: None,
             context_id: Some(ctx),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,

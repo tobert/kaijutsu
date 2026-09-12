@@ -105,6 +105,32 @@ pub async fn start_server_with_mock_llm() -> SocketAddr {
     start_server_with_mock_llm_model("mock-model").await
 }
 
+/// Start a mock-model server and expose its live kernel for a wire test that
+/// needs to arrange durable identity state before driving the RPC surface.
+#[allow(dead_code)]
+pub async fn start_server_with_mock_llm_kernel_handle(
+) -> (SocketAddr, kaijutsu_server::SharedKernel) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = SshServerConfig::ephemeral(addr.port());
+    if let Some(ref data_dir) = config.data_dir {
+        seed_mock_backend_with_model(data_dir, "mock-model");
+    }
+    let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_local(async move {
+        let server = SshServer::new(config);
+        if let Err(e) = server
+            .run_on_listener_with_kernel_sink(listener, kernel_tx)
+            .await
+        {
+            log::error!("Server error: {e}");
+        }
+    });
+    let kernel = kernel_rx.await.expect("server dropped the kernel handle before sending it");
+    tokio::task::yield_now().await;
+    (addr, kernel)
+}
+
 /// Like `start_server_with_mock_llm`, but the mock backend's registry-default
 /// model is caller-chosen instead of hardcoded to `"mock-model"`.
 ///

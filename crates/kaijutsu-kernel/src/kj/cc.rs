@@ -724,6 +724,8 @@ mod tests {
             let d = test_dispatcher().await;
             let c = KjCaller {
                 principal_id: kaijutsu_types::PrincipalId::new(),
+                actor_id: kaijutsu_types::PrincipalId::new(),
+                reviewer_id: None,
                 context_id: None,
                 session_id: kaijutsu_types::SessionId::new(),
                 confirmed: false,

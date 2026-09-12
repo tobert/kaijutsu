@@ -18,6 +18,8 @@ use super::super::types::{KernelToolResult, ToolContent};
 pub fn to_exec_context(ctx: &CallContext) -> ExecContext {
     ExecContext {
         principal_id: ctx.principal_id,
+        actor_id: ctx.actor_id,
+        reviewer_id: ctx.reviewer_id,
         context_id: ctx.context_id,
         cwd: ctx.cwd.clone(),
         session_id: ctx.session_id,

@@ -575,6 +575,7 @@ impl KjDispatcher {
             // A fork is the same performance's continuation by default —
             // whoever plays the source plays the child too.
             let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
+            let source_reviewer_id = source_row.as_ref().and_then(|r| r.reviewer_id);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -604,6 +605,7 @@ impl KjDispatcher {
                 cast_id: source_cast,
                 origin_host: None,
                 played_by: source_played_by,
+                reviewer_id: source_reviewer_id,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -930,6 +932,7 @@ impl KjDispatcher {
             // A fork is the same performance's continuation by default —
             // whoever plays the source plays the child too.
             let source_played_by = source_row.played_by;
+            let source_reviewer_id = source_row.reviewer_id;
 
             let row = ContextRow {
                 context_id: new_id,
@@ -955,6 +958,7 @@ impl KjDispatcher {
                 cast_id: source_cast,
                 origin_host: None,
                 played_by: source_played_by,
+                reviewer_id: source_reviewer_id,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1196,6 +1200,7 @@ impl KjDispatcher {
                     cast_id: row.cast_id,
                     origin_host: None,
                     played_by: row.played_by,
+                    reviewer_id: row.reviewer_id,
                 };
                 let default_ws =
                     match db.get_or_create_default_workspace(caller.principal_id) {

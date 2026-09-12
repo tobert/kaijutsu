@@ -479,6 +479,8 @@ impl McpServerLike for ShellServer {
             };
             let caller = crate::kj::KjCaller {
                 principal_id: ctx.principal_id,
+                actor_id: ctx.actor_id,
+                reviewer_id: ctx.reviewer_id,
                 context_id: Some(ctx.context_id),
                 session_id: ctx.session_id,
                 confirmed: false,
@@ -540,9 +542,11 @@ impl McpServerLike for ShellServer {
         let block_source = dispatcher.block_source();
         let kaish = if self.read_only {
             dispatcher
-                .materialize_context_kaish_read_only(
+                .materialize_context_kaish_read_only_as(
                     "model-shell-ro",
                     ctx.principal_id,
+                    ctx.actor_id,
+                    ctx.reviewer_id,
                     ctx.context_id,
                     ctx.session_id,
                     semantic_index,
@@ -551,9 +555,11 @@ impl McpServerLike for ShellServer {
                 .await
         } else {
             dispatcher
-                .materialize_context_kaish(
+                .materialize_context_kaish_as(
                     "model-shell",
                     ctx.principal_id,
+                    ctx.actor_id,
+                    ctx.reviewer_id,
                     ctx.context_id,
                     ctx.session_id,
                     semantic_index,
@@ -848,14 +854,15 @@ mod tests {
             .into_iter()
             .next()
             .expect("the gate must have left exactly one pending ask");
-        approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
+        let reviewer = row.reviewer_id.as_deref().expect("test ask has a reviewer");
+        approval_ledger::claim::claim(conn, &row.request_id, reviewer).unwrap();
         approval_ledger::decide::decide(
             conn,
             &row.request_id,
             approval_ledger::decide::DecideInput {
                 allow,
                 decided_by: Some(approval_ledger::decide::Answerer {
-                    principal: b"test-approver",
+                    principal: reviewer,
                     context: Some(b"another-seat"),
                 }),
                 decided_option: Some(if allow { "allow_once" } else { "deny" }),
@@ -875,13 +882,15 @@ mod tests {
     async fn facade_shell_runs_a_command_through_the_broker() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
+        let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("sh"), None, principal);
 
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
         let result = broker
             .call_tool(call("echo hello-shell"), &cc, CancellationToken::new())
             .await
@@ -900,13 +909,15 @@ mod tests {
     async fn facade_shell_write_runs_a_command_through_the_broker() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
+        let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("shw"), None, principal);
 
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
         let pending = broker
             .call_tool(call_write("echo hello-shell-write"), &cc, CancellationToken::new())
             .await
@@ -988,13 +999,15 @@ mod tests {
     async fn a_validator_rejection_after_approval_is_also_a_tool_failure() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
+        let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("validrej"), None, principal);
 
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
 
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
         let bad = "break";
 
         let _ = broker
@@ -1110,11 +1123,13 @@ mod tests {
     async fn shell_write_deny_refuses_the_whole_multi_statement_submission() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
+        let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("deny-multi"), None, principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
 
         let pending = broker
             .call_tool(
@@ -1155,11 +1170,13 @@ mod tests {
     async fn kj_ledger_answers_a_shell_write_ask_like_a_cc_send_ask() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
+        let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("ledger-shw"), None, principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
 
         let pending = broker
             .call_tool(
@@ -1177,7 +1194,7 @@ mod tests {
             .and_then(|r| r.ask_id().map(str::to_owned))
             .expect("a pending gate hands the caller its ask id");
 
-        let ledger_caller = test_caller();
+        let ledger_caller = test_caller().with_actor(reviewer, None);
         let listing = d
             .dispatch(&["ledger".to_string(), "list".to_string()], &ledger_caller)
             .await;
@@ -1230,6 +1247,7 @@ mod tests {
     async fn a_pin_that_no_longer_resolves_refuses_loudly_not_a_fallback() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
+        let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("dead-pin"), None, principal);
         {
             let db = d.kernel_db().lock();
@@ -1243,7 +1261,8 @@ mod tests {
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
 
         let pending = broker
             .call_tool(call_write("echo should-not-run"), &cc, CancellationToken::new())
@@ -1772,6 +1791,7 @@ mod tests {
             .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
             .await;
         let principal = PrincipalId::new();
+        let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("write-exec"), None, principal);
 
         let mut binding = ContextToolBinding::new();
@@ -1779,7 +1799,8 @@ mod tests {
         binding.grant(Capability::Exec);
         broker.set_binding(ctx_id, binding.clone()).await.unwrap();
         d.kernel().broker().set_binding(ctx_id, binding).await.unwrap();
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(reviewer));
 
         let pending = broker
             .call_tool(call_write("id"), &cc, CancellationToken::new())

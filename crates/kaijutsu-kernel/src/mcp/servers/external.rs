@@ -1033,6 +1033,8 @@ mod tests {
         let server = fake_server("test.ext");
         let ctx = CallContext {
             principal_id: PrincipalId::new(),
+            actor_id: PrincipalId::new(),
+            reviewer_id: None,
             context_id: ContextId::new(),
             session_id: SessionId::new(),
             kernel_id: KernelId::new(),
@@ -1070,6 +1072,8 @@ mod tests {
         let server = fake_server("test.ext");
         let ctx = CallContext {
             principal_id: PrincipalId::new(),
+            actor_id: PrincipalId::new(),
+            reviewer_id: None,
             context_id: ContextId::new(),
             session_id: SessionId::new(),
             kernel_id: KernelId::new(),

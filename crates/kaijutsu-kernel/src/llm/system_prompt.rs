@@ -5,7 +5,14 @@
 //! structured per-call situational addendum. The kernel supplies facts; it
 //! does not prepend a mandatory instruction body.
 
-use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, ContextState, Role, Status};
+use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, ContextState, PrincipalId, Role, Status};
+
+/// A character fact included in a model's runtime situation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterIdentity {
+    pub principal_id: PrincipalId,
+    pub name: String,
+}
 
 /// Read the instruction sections currently stored in a context.
 pub fn read_system_prompt_sections(
@@ -28,6 +35,10 @@ pub struct SituationalContext {
     pub context_state: Option<ContextState>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The character performing this turn.
+    pub performer: Option<CharacterIdentity>,
+    /// The character assigned to review this performer's asks.
+    pub reviewer: Option<CharacterIdentity>,
     /// Names of tools currently visible in this context.
     pub tool_names: Vec<String>,
 }
@@ -40,6 +51,8 @@ impl SituationalContext {
             && self.context_state.is_none()
             && self.provider.is_none()
             && self.model.is_none()
+            && self.performer.is_none()
+            && self.reviewer.is_none()
             && self.tool_names.is_empty()
     }
 }
@@ -55,6 +68,8 @@ impl SituationalContext {
 /// <situation>
 ///   <context id="…" label="…" state="live"/>
 ///   <model provider="anthropic" name="claude-haiku-4-5"/>
+///   <performer id="…" name="coder"/>
+///   <reviewer id="…" name="lead"/>
 ///   <tools count="N">name1, name2, ...</tools>
 /// </situation>
 /// ```
@@ -119,6 +134,22 @@ pub fn build_system_prompt(situational: &SituationalContext, rc_sections: &[Stri
             out.push_str(&format!(" name=\"{}\"", xml_escape(m)));
         }
         out.push_str("/>\n");
+    }
+
+    if let Some(performer) = &situational.performer {
+        out.push_str(&format!(
+            "  <performer id=\"{}\" name=\"{}\"/>\n",
+            performer.principal_id,
+            xml_escape(&performer.name)
+        ));
+    }
+
+    if let Some(reviewer) = &situational.reviewer {
+        out.push_str(&format!(
+            "  <reviewer id=\"{}\" name=\"{}\"/>\n",
+            reviewer.principal_id,
+            xml_escape(&reviewer.name)
+        ));
     }
 
     if !situational.tool_names.is_empty() {
@@ -229,6 +260,8 @@ mod tests {
             context_state: Some(ContextState::Live),
             provider: Some("anthropic".to_string()),
             model: Some("claude-haiku-4-5".to_string()),
+            performer: None,
+            reviewer: None,
             tool_names: vec!["block_create".to_string(), "shell".to_string()],
         };
         let out = build_system_prompt(&situational, &[]);
@@ -240,6 +273,23 @@ mod tests {
         assert!(out.contains("count=\"2\""));
         assert!(out.contains("block_create"));
         assert!(out.contains("shell"));
+    }
+
+    #[test]
+    fn performer_and_reviewer_are_distinct_runtime_facts() {
+        let performer = CharacterIdentity { principal_id: PrincipalId::new(), name: "coder <one>".into() };
+        let reviewer = CharacterIdentity { principal_id: PrincipalId::new(), name: "lead & two".into() };
+        let prompt = build_system_prompt(
+            &SituationalContext {
+                model: Some("test-model".into()),
+                performer: Some(performer.clone()),
+                reviewer: Some(reviewer.clone()),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert!(prompt.contains(&format!("<performer id=\"{}\" name=\"coder &lt;one&gt;\"/>", performer.principal_id)));
+        assert!(prompt.contains(&format!("<reviewer id=\"{}\" name=\"lead &amp; two\"/>", reviewer.principal_id)));
     }
 
     #[test]

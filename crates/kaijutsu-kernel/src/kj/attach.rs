@@ -118,8 +118,11 @@ mod tests {
     /// attaching FROM nowhere TO something). Non-privileged: attach is ungated,
     /// so this also guards that an unjoined, unprivileged session can attach.
     fn unjoined_caller() -> KjCaller {
+        let principal_id = PrincipalId::new();
         KjCaller {
-            principal_id: PrincipalId::new(),
+            principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id: None,
             session_id: SessionId::new(),
             confirmed: false,

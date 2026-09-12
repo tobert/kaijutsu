@@ -340,6 +340,8 @@ impl KjDispatcher {
                         child_depth,
                         extra_vars,
                         owner,
+                        caller.actor_id,
+                        caller.reviewer_id,
                     )
                     .await
                 }
@@ -512,6 +514,8 @@ async fn run_kai_script(
     child_depth: u8,
     extra_vars: &HashMap<String, String>,
     principal: PrincipalId,
+    actor: PrincipalId,
+    reviewer: Option<PrincipalId>,
 ) -> ScriptRunResult {
     use kaijutsu_types::SessionId;
 
@@ -521,9 +525,11 @@ async fn run_kai_script(
     // the phase see earlier ones' deliberate writes, never their transients.
     // rc uses the bare kj surface (no semantic index): `NoopBlockSource`.
     let kaish = match dispatcher
-        .materialize_context_kaish_rc(
+        .materialize_context_kaish_rc_as(
             "rc",
             principal,
+            actor,
+            reviewer,
             new_id,
             SessionId::new(),
             None,
@@ -1023,8 +1029,11 @@ mod tests {
     /// Operator-gated) as the trusted bootstrap/control plane would. The
     /// `context_id: None` models dispatching before a context is joined.
     fn unjoined_caller() -> KjCaller {
+        let principal_id = PrincipalId::new();
         KjCaller {
-            principal_id: PrincipalId::new(),
+            principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id: None,
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
@@ -1596,6 +1605,75 @@ mod tests {
             trace.id.principal_id, visitor.principal_id,
             "rc Trace block must NOT be smeared with the triggering caller"
         );
+    }
+
+    #[tokio::test]
+    async fn rc_nested_context_keeps_the_lead_as_reviewer() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        install_script(
+            &d,
+            "/config/rc/test/create/S00-spawn-coder.kai",
+            "test",
+            "create",
+            "S00",
+            "spawn-coder",
+            "kai",
+            "kj context create child-work --type child --as coder",
+        )
+        .await;
+        install_script(
+            &d,
+            "/config/rc/child/create/S00-noop.kai",
+            "child",
+            "create",
+            "S00",
+            "noop",
+            "kai",
+            "true",
+        )
+        .await;
+
+        let mut caller = unjoined_caller();
+        let lead = PrincipalId::new();
+        let coder = PrincipalId::new();
+        for (principal_id, name) in [
+            (caller.principal_id, "amy"),
+            (lead, "lead"),
+            (coder, "coder"),
+        ] {
+            d.kernel_db()
+                .lock()
+                .insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id,
+                    name: name.into(),
+                    created_at: 0,
+                    retired_at: None,
+                    handoff_ctx: None,
+                })
+                .expect("insert live character");
+        }
+        caller.actor_id = lead;
+        caller.reviewer_id = Some(caller.principal_id);
+
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "lead-work", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "parent create failed: {}", result.message());
+
+        let child_id = lookup_context_id(&d, "child-work");
+        let child = d
+            .kernel_db()
+            .lock()
+            .get_context(child_id)
+            .expect("read child")
+            .expect("rc created child context");
+        assert_eq!(child.created_by, caller.principal_id, "Amy requested the work");
+        assert_eq!(child.played_by, Some(coder));
+        assert_eq!(child.reviewer_id, Some(lead), "the lead reviews its coder");
     }
 
     /// Failure blocks are the loudest thing rc writes, so they are the worst

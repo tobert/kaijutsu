@@ -7,7 +7,8 @@ mod common;
 use common::*;
 
 use kaijutsu_client::KernelHandle;
-use kaijutsu_types::{BlockId, BlockKind, BlockQuery, BlockSnapshot, ContextId, Role, Status};
+use kaijutsu_kernel::kernel_db::CharacterRow;
+use kaijutsu_types::{BlockId, BlockKind, BlockQuery, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 
 // ============================================================================
 // Test helpers
@@ -607,12 +608,29 @@ fn test_shell_cd_and_export_persist_across_commands() {
 #[test]
 fn test_fork_with_prompt_drives_autonomous_turn() {
     run_local(async {
-        let addr = start_server_with_mock_llm().await;
+        let (addr, shared_kernel) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         let main_ctx = kernel.create_context("main").await.unwrap();
         let _joined = kernel.join_context(main_ctx, "test").await.unwrap();
+        let coder = PrincipalId::new();
+        let lead = PrincipalId::new();
+        {
+            let db = shared_kernel.kernel_db.lock();
+            for (principal_id, name) in [(coder, "coder"), (lead, "lead")] {
+                db.insert_character(&CharacterRow {
+                    principal_id,
+                    name: name.into(),
+                    created_at: 0,
+                    retired_at: None,
+                    handoff_ctx: None,
+                })
+                .unwrap();
+            }
+            db.update_context_review(main_ctx, Some(coder), Some(lead))
+                .unwrap();
+        }
 
         // Fork with a seed. POSIX-style: this returns immediately on the parent;
         // the child starts acting on the seed via the turn driver.

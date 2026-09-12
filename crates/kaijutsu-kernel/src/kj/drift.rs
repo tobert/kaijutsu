@@ -1102,6 +1102,7 @@ impl KjDispatcher {
                                 cast_id: None,
                                 origin_host: None,
                                 played_by: None,
+                                reviewer_id: None,
                             };
                             db.insert_context_with_document(&row, ws)
                                 .map_err(|e| format!("failed to persist lost+found context row: {e}"))

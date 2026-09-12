@@ -83,6 +83,8 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
     // own privileged kaish (materialize_context_kaish_rc), not this caller.
     let caller = KjCaller {
         principal_id: h.creator,
+        actor_id: h.creator,
+        reviewer_id: None,
         context_id: None,
         session_id: SessionId::new(),
         confirmed: false,

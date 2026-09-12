@@ -372,6 +372,8 @@ fn build_ask(
 
     NewAsk {
         context_id: caller_context_bytes(caller),
+        actor_id: caller.actor_id.as_bytes().to_vec(),
+        reviewer_id: caller.reviewer_id.unwrap_or(caller.actor_id).as_bytes().to_vec(),
         principal_id: caller.principal_id.as_bytes().to_vec(),
         origin: spec.origin,
         instance: Some(spec.instance.clone()),
@@ -599,6 +601,7 @@ pub(crate) async fn run_gate(
                 &spec.authorized_label,
                 Some(context.as_slice()),
                 Some(principal.as_slice()),
+                caller.actor_id.as_bytes(),
             )
             .and_then(|found| match found {
                 Some((request_id, status)) => {
@@ -934,8 +937,16 @@ mod tests {
     /// Answer an ask the way a human in another shell does — a DIFFERENT
     /// principal from the one that asked, via claim-then-decide.
     fn answer(d: &crate::kj::KjDispatcher, request_id: &str, allow: bool) {
-        let answerer = kaijutsu_types::PrincipalId::new();
-        // Another seat: peer-seat approval is allowed, self-approval is not.
+        let answerer = {
+            let db = d.kernel_db.lock();
+            let ask = approval_ledger::ask::get_approval(db.conn_for_ledger(), request_id)
+                .unwrap()
+                .expect("ask exists");
+            kaijutsu_types::PrincipalId::try_from_slice(
+                ask.reviewer_id.as_deref().expect("new asks snapshot a reviewer"),
+            )
+            .expect("reviewer is a principal id")
+        };
         let from = kaijutsu_types::ContextId::new();
         let db = d.kernel_db.lock();
         approval_ledger::claim::claim(db.conn_for_ledger(), request_id, answerer.as_bytes())
@@ -1040,6 +1051,157 @@ mod tests {
             ask.request_id, request_id,
             "the second attempt must redeem the SAME ask a human answered, not mint one"
         );
+    }
+
+    /// A lead can review a coder it directs even though both invocations share
+    /// the human requester. The performer and reviewer snapshots decide who
+    /// may answer; context and requester identity do not substitute for them.
+    #[tokio::test]
+    async fn a_lead_reviewer_can_allow_its_coders_ask_from_the_same_context() {
+        let d = gate_dispatcher().await;
+        let requester = kaijutsu_types::PrincipalId::new();
+        let coder = kaijutsu_types::PrincipalId::new();
+        let lead = kaijutsu_types::PrincipalId::new();
+        let context = register_context(&d, Some("lead-coder-gate"), None, requester);
+        let mut coder_call = test_caller();
+        coder_call.principal_id = requester;
+        coder_call.actor_id = coder;
+        coder_call.reviewer_id = Some(lead);
+        coder_call.context_id = Some(context);
+
+        let first = run_gate(
+            &d.kernel_db.clone(),
+            &coder_call,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        assert_eq!(first.verdict, GateVerdict::Pending);
+        let request_id = first.ask.expect("the coder's ask").request_id;
+
+        let coder_elsewhere = coder_call
+            .clone()
+            .with_actor(coder, Some(lead));
+        let coder_elsewhere = crate::kj::KjCaller {
+            context_id: Some(kaijutsu_types::ContextId::new()),
+            ..coder_elsewhere
+        };
+        let refused = d
+            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &coder_elsewhere)
+            .await;
+        assert!(!refused.is_ok(), "the coder cannot approve its own work from another context");
+        assert!(refused.message().contains("performed this operation"), "{}", refused.message());
+
+        let lead_call = coder_call.clone().with_actor(lead, Some(requester));
+        let allowed = d
+            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &lead_call)
+            .await;
+        assert!(allowed.is_ok(), "the assigned lead must be able to allow: {allowed:?}");
+
+        let redeemed = run_gate(
+            &d.kernel_db.clone(),
+            &coder_call,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        assert_eq!(redeemed.verdict, GateVerdict::Allowed);
+        assert_eq!(redeemed.ask.expect("the redeemed ask").request_id, request_id);
+
+        let spent = run_gate(
+            &d.kernel_db.clone(),
+            &coder_call,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        assert_eq!(spent.verdict, GateVerdict::Pending, "an approval is redeemed exactly once");
+        assert_ne!(spent.ask.expect("a replacement ask").request_id, request_id);
+    }
+
+    /// A direct command has no separate director, so its actor initially
+    /// reviews itself and cannot allow or deny. The actor must explicitly
+    /// route the pending ask to a distinct live character before it becomes
+    /// answerable.
+    #[tokio::test]
+    async fn a_direct_ask_requires_escalation_before_anyone_can_allow_it() {
+        let d = gate_dispatcher().await;
+        let mut direct = test_caller();
+        let actor = direct.actor_id;
+        let amy = kaijutsu_types::PrincipalId::new();
+        let context = register_context(&d, Some("direct-gate"), None, direct.principal_id);
+        direct.context_id = Some(context);
+        direct.reviewer_id = None;
+        {
+            let db = d.kernel_db.lock();
+            for (principal_id, name) in [(actor, "coder"), (amy, "amy")] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id,
+                    name: name.into(),
+                    created_at: 0,
+                    retired_at: None,
+                    handoff_ctx: None,
+                })
+                .unwrap();
+            }
+        }
+
+        let first = run_gate(
+            &d.kernel_db.clone(),
+            &direct,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        let request_id = first.ask.expect("the direct ask").request_id;
+
+        let self_allow = d
+            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &direct)
+            .await;
+        assert!(!self_allow.is_ok(), "a direct actor cannot approve its own ask");
+        assert!(self_allow.message().contains("performed this operation"), "{}", self_allow.message());
+
+        let self_target = d
+            .dispatch(
+                &[
+                    "ledger".into(), "escalate".into(), request_id.clone(), "--to".into(),
+                    "coder".into(),
+                ],
+                &direct,
+            )
+            .await;
+        assert!(!self_target.is_ok(), "the actor cannot escalate back to itself");
+        assert!(self_target.message().contains("performer as reviewer"), "{}", self_target.message());
+
+        let escalated = d
+            .dispatch(
+                &[
+                    "ledger".into(), "escalate".into(), request_id.clone(), "--to".into(),
+                    "amy".into(),
+                ],
+                &direct,
+            )
+            .await;
+        assert!(escalated.is_ok(), "the direct actor can assign a distinct reviewer: {escalated:?}");
+
+        let amy_call = direct.clone().with_actor(amy, None);
+        let allowed = d
+            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &amy_call)
+            .await;
+        assert!(allowed.is_ok(), "the escalated reviewer can allow in the same context: {allowed:?}");
+        let redeemed = run_gate(
+            &d.kernel_db.clone(),
+            &direct,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        assert_eq!(redeemed.verdict, GateVerdict::Allowed);
     }
 
     /// An approval authorizes exactly one execution. A third attempt after
@@ -1189,7 +1351,7 @@ mod tests {
         run_gate(&db, &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         let request_id = pending_id(&d);
 
-        let answerer = kaijutsu_types::PrincipalId::new();
+        let answerer = caller.reviewer_id.expect("fixture assigns a reviewer");
         {
             let db = db.lock();
             approval_ledger::claim::claim(db.conn_for_ledger(), &request_id, answerer.as_bytes()).unwrap();
@@ -1239,6 +1401,8 @@ mod tests {
     fn seed_deny_rule(db: &Arc<parking_lot::Mutex<KernelDb>>, digest: &str, label: &str) {
         let seed = approval_ledger::types::NewAsk {
             context_id: vec![],
+            actor_id: vec![9, 9, 9],
+            reviewer_id: vec![1, 2, 3],
             principal_id: vec![],
             origin: Origin::ShellGate,
             instance: Some("builtin.shell_write".into()),
@@ -2041,6 +2205,8 @@ mod tests {
     fn seed_allow_rule(db: &Arc<parking_lot::Mutex<KernelDb>>, digest: &str, label: &str) {
         let seed = approval_ledger::types::NewAsk {
             context_id: vec![],
+            actor_id: vec![9, 9, 9],
+            reviewer_id: vec![1, 2, 3],
             principal_id: vec![],
             origin: Origin::ShellGate,
             instance: Some("builtin.shell_write".into()),

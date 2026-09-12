@@ -10,9 +10,9 @@
 //!     `shell_write` tool over the wire, which refuses with `Pending` and
 //!     leaves the durable row behind;
 //!   * the answer comes from `kj ledger allow`/`deny` run through
-//!     `shell_execute`, which is what a human at another seat does — and
-//!     `kj ledger` refuses the seat that raised the ask, so every test here
-//!     answers from a second context.
+//!     `shell_execute`, which is what the assigned reviewer does. The worker
+//!     and reviewer use distinct authenticated credentials; eligibility comes
+//!     from the ask's snapped actor and reviewer IDs, not their contexts.
 //!
 //! Two origins produce an executable ask, and both are driven here:
 //!
@@ -30,14 +30,16 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use common::{connect_client, run_local, start_server_with_kernel_handle};
-use kaijutsu_client::{KernelHandle, RpcClient, RpcError};
+use common::run_local;
+use kaijutsu_client::{KernelHandle, KeySource, RpcClient, RpcError, SshClient, SshConfig};
 use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_kernel::PairOwner;
-use kaijutsu_server::SharedKernel;
+use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
 use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId, Status, ToolKind};
+use russh::keys::{Algorithm, PrivateKey};
 
 /// Poll until `check` returns true, or fail loudly. Every wait in this file
 /// is on work a background driver does, so a timeout IS the bug.
@@ -81,27 +83,78 @@ impl Drop for Scratch {
     }
 }
 
-/// Two contexts on one connection: one that raises asks, one that answers
-/// them. `kj ledger` refuses the seat that raised an ask, so a single
-/// context cannot both ask and answer.
+/// A worker actor and its assigned reviewer on distinct authenticated
+/// connections. They use separate contexts for the wire calls, but approval
+/// eligibility is the ask's snapped actor/reviewer identity, independent of
+/// which context the reviewer uses.
 struct Seats {
     /// Held so the connection outlives the handle taken from it.
-    _client: RpcClient,
-    kj: KernelHandle,
+    _worker_client: RpcClient,
+    _approver_client: RpcClient,
+    worker_kj: KernelHandle,
+    approver_kj: KernelHandle,
     kernel: SharedKernel,
     worker: ContextId,
     approver: ContextId,
 }
 
 async fn seats() -> Seats {
-    let (addr, kernel) = start_server_with_kernel_handle().await;
-    let client = connect_client(addr).await;
-    let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
-    let worker = kj.create_context("gate-exec-worker").await.unwrap();
-    let approver = kj.create_context("gate-exec-approver").await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let auth_db_path = tmp.path().join("auth.db");
+    let worker_principal = PrincipalId::new();
+    let approver_principal = PrincipalId::new();
+    let worker_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    let approver_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
+    let auth_db = AuthDb::open(&auth_db_path).unwrap();
+    auth_db.add_key(worker_principal, worker_key.public_key(), Some("gate-worker")).unwrap();
+    auth_db.add_key(approver_principal, approver_key.public_key(), Some("gate-approver")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = SshServerConfig::ephemeral(addr.port());
+    config.auth_db_path = Some(auth_db_path);
+    let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_local(async move {
+        SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
+    });
+    let kernel = kernel_rx.await.unwrap();
+    {
+        let db = kernel.kernel_db.lock();
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            principal_id: worker_principal,
+            name: "gate-worker".into(),
+            created_at: kaijutsu_types::now_millis() as i64,
+            retired_at: None,
+            handoff_ctx: None,
+        }).unwrap();
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            principal_id: approver_principal,
+            name: "gate-approver".into(),
+            created_at: kaijutsu_types::now_millis() as i64,
+            retired_at: None,
+            handoff_ctx: None,
+        }).unwrap();
+    }
+    let connect = |key: PrivateKey| async move {
+        let config = SshConfig { host: addr.ip().to_string(), port: addr.port(), username: "gate".into(), key_source: KeySource::InMemory(Arc::new(key)), insecure: true };
+        let mut ssh = SshClient::new(config);
+        RpcClient::new(ssh.connect().await.unwrap().into_stream()).await.unwrap()
+    };
+    let worker_client = connect(worker_key).await;
+    let approver_client = connect(approver_key).await;
+    let (worker_kj, _) = worker_client.bind_kernel().await.unwrap();
+    let (approver_kj, _) = approver_client.bind_kernel().await.unwrap();
+    let worker = worker_kj.create_context("gate-exec-worker").await.unwrap();
+    let approver = approver_kj.create_context("gate-exec-approver").await.unwrap();
+    kernel
+        .kernel_db
+        .lock()
+        .update_context_review(worker, Some(worker_principal), Some(approver_principal))
+        .unwrap();
     Seats {
-        _client: client,
-        kj,
+        _worker_client: worker_client,
+        _approver_client: approver_client,
+        worker_kj,
+        approver_kj,
         kernel,
         worker,
         approver,
@@ -113,7 +166,7 @@ impl Seats {
     /// with `Pending` and leaves one durable ask carrying `command` as its
     /// `exec_source`; this returns that ask's id.
     async fn raise(&self, command: &str) -> String {
-        let kj = &self.kj;
+        let kj = &self.worker_kj;
         kj.join_context(self.worker, "gate-exec-worker").await.unwrap();
         let refusal = kj
             .call_mcp_tool("shell_write", &serde_json::json!({ "command": command }))
@@ -133,7 +186,7 @@ impl Seats {
     /// Answer from the approver seat, the way a human does.
     async fn answer(&self, request_id: &str, allow: bool) {
         let verb = if allow { "allow" } else { "deny" };
-        let kj = &self.kj;
+        let kj = &self.approver_kj;
         kj.join_context(self.approver, "gate-exec-approver").await.unwrap();
         kj.shell_execute(
             &format!("kj ledger {verb} {request_id}"),
@@ -265,7 +318,7 @@ impl Seats {
     /// it refuses `Pending`; this returns that ask's id and the pair the
     /// refusal left `Waiting` in the worker context.
     async fn submit_from_shell_box(&self, code: &str) -> (String, BlockId, BlockId) {
-        let kj = &self.kj;
+        let kj = &self.worker_kj;
         kj.join_context(self.worker, "gate-exec-worker").await.unwrap();
         let refusal = match kj.shell_execute(code, self.worker, true).await {
             Err(RpcError::Refused(refusal)) => refusal,
@@ -440,6 +493,81 @@ fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
             seed_index > output_index,
             "the seed must land after the filled output block"
         );
+    });
+}
+
+/// An approval belongs to the performer who raised it. If that performer is
+/// replaced before a model turn's answer arrives, the old approval must settle
+/// the waiting pair without execution and be spent; restoring the old
+/// performer cannot make it redeemable again.
+#[test]
+fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
+    run_local(async {
+        let scratch = Scratch::new("stale-performer");
+        let s = seats().await;
+        let marker = scratch.marker();
+        let code = format!("echo stale-performer-ran > {}", marker.display());
+
+        let ask = s.raise(&code).await;
+        let (command_block_id, output_block_id) =
+            s.link_waiting_pair(&ask, &code, PairOwner::Turn);
+
+        let (original_performer, reviewer) = {
+            let db = s.kernel.kernel_db.lock();
+            let row = db.get_context(s.worker).unwrap().expect("worker context");
+            (row.played_by.expect("worker performer"), row.reviewer_id.expect("worker reviewer"))
+        };
+        let replacement = PrincipalId::new();
+        s.kernel
+            .kernel_db
+            .lock()
+            .insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                principal_id: replacement,
+                name: "gate-replacement".into(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                retired_at: None,
+                handoff_ctx: None,
+            })
+            .unwrap();
+        s.kernel
+            .kernel_db
+            .lock()
+            .update_context_review(s.worker, Some(replacement), Some(reviewer))
+            .unwrap();
+
+        s.answer(&ask, true).await;
+        wait_for("the stale turn pair to settle", || {
+            s.block(&output_block_id).status != Status::Waiting
+        })
+        .await;
+
+        assert_eq!(s.block(&command_block_id).status, Status::Error);
+        assert_eq!(s.block(&output_block_id).status, Status::Error);
+        assert!(
+            s.block(&output_block_id)
+                .stderr
+                .unwrap_or_default()
+                .contains("performer changed"),
+            "the pair must name the changed performer"
+        );
+        assert!(!marker.exists(), "a stale approval must not execute its command");
+        assert!(
+            !s.undelivered(&ask),
+            "the stale approved ask is consumed after settling its pair"
+        );
+
+        s.kernel
+            .kernel_db
+            .lock()
+            .update_context_review(s.worker, Some(original_performer), Some(reviewer))
+            .unwrap();
+        let retry = s.raise(&code).await;
+        assert_ne!(retry, ask, "restoring the performer must require a new approval");
+        assert!(
+            !s.decided(&retry),
+            "the retry is a new pending ask, not a reused answer"
+        );
+        assert!(!marker.exists(), "the retry remains gated until it is answered");
     });
 }
 
@@ -706,10 +834,27 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
         let marker = scratch.marker();
 
         // A third context whose approved command holds the single-threaded
-        // driver busy. Its own seat cannot answer it, so the approver seat
-        // does — same as every other answer here.
-        let kj = &s.kj;
+        // driver busy. Its performer cannot approve the ask, so the assigned
+        // reviewer does — same as every other answer here.
+        let kj = &s.worker_kj;
         let blocker_ctx = kj.create_context("gate-exec-blocker").await.unwrap();
+        let reviewer = s
+            .kernel
+            .kernel_db
+            .lock()
+            .get_context(s.worker)
+            .unwrap()
+            .and_then(|row| row.reviewer_id)
+            .expect("worker has its explicit reviewer");
+        let actor = s
+            .kernel
+            .kernel_db
+            .lock()
+            .get_context(s.worker)
+            .unwrap()
+            .and_then(|row| row.played_by)
+            .expect("worker has its explicit performer");
+        s.kernel.kernel_db.lock().update_context_review(blocker_ctx, Some(actor), Some(reviewer)).unwrap();
         kj.join_context(blocker_ctx, "gate-exec-blocker").await.unwrap();
         let blocker_refusal = kj
             .call_mcp_tool("shell_write", &serde_json::json!({ "command": "/bin/sleep 5" }))

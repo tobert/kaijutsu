@@ -709,18 +709,54 @@ enum ExecAction {
 /// What the driver needs off an approval row to act on its answer, lifted
 /// out of the row so nothing below has to name a ledger type.
 ///
-/// `pair` is `None` when the ask names no blocks — and also when a key no
-/// longer parses, because authoring a fresh pair shows the human something
-/// while a half-resolved pair would settle one block and strand the other.
+/// `pair` is `None` only when the ask names no blocks. Partial or malformed
+/// linkage is an error: it must never authorize a different output pair.
 /// The `PairOwner` decides who a fill has to tell: `Turn` for a model
 /// turn's own pair, `Session` for a connected session's.
 struct ExecutableAsk {
     source: String,
     cwd: Option<String>,
+    actor: PrincipalId,
+    reviewer: PrincipalId,
     pair: Option<(BlockId, BlockId, kaijutsu_kernel::PairOwner)>,
     /// The denial as the model reads it on the output block's stderr. Short
     /// on purpose — `kj ledger show <id>` is where the whole ask lives.
     denial: String,
+}
+
+fn approval_pair(
+    command: Option<&str>,
+    output: Option<&str>,
+    owner: Option<kaijutsu_kernel::PairOwner>,
+) -> Result<Option<(BlockId, BlockId, kaijutsu_kernel::PairOwner)>, &'static str> {
+    match (command, output, owner) {
+        (None, None, None) => Ok(None),
+        (Some(command), Some(output), Some(owner)) => {
+            let command = BlockId::from_key(command).ok_or("invalid command block ID")?;
+            let output = BlockId::from_key(output).ok_or("invalid output block ID")?;
+            Ok(Some((command, output, owner)))
+        }
+        _ => Err("incomplete approval block linkage"),
+    }
+}
+
+#[cfg(test)]
+mod approval_pair_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_complete_pair_or_no_pair_can_be_replayed() {
+        let context = ContextId::new();
+        let actor = PrincipalId::new();
+        let command = BlockId::new(context, actor, 1);
+        let output = BlockId::new(context, PrincipalId::system(), 1);
+        let owner = kaijutsu_kernel::PairOwner::Turn;
+        assert_eq!(approval_pair(None, None, None).unwrap(), None);
+        assert_eq!(approval_pair(Some(&command.to_key()), Some(&output.to_key()), Some(owner)).unwrap(), Some((command, output, owner)));
+        assert!(approval_pair(Some(&command.to_key()), None, Some(owner)).is_err());
+        assert!(approval_pair(Some(&command.to_key()), Some(&output.to_key()), None).is_err());
+        assert!(approval_pair(Some("invalid"), Some(&output.to_key()), Some(owner)).is_err());
+    }
 }
 
 /// Both halves of "archived", because they are stored separately: archiving
@@ -838,6 +874,25 @@ async fn act_on_executable_answer(
     let source = ask.source.as_str();
     let linked = ask.pair;
 
+    if linked.is_some_and(|(_, _, owner)| owner == kaijutsu_kernel::PairOwner::Turn) {
+        let assignment = {
+            let db = kernel.kernel_db.lock();
+            db.get_context(context_id).map(|row| row.and_then(|row| row.played_by))
+        };
+        if !matches!(assignment, Ok(Some(actor)) if actor == ask.actor) {
+            let reason = "The context's performer changed after this ask was raised; nothing was run.".to_string();
+            if let Some((command, output, _)) = linked {
+                settle_pair_error(kernel, context_id, &command, &output, reason.clone());
+            }
+            if let Err(e) = kernel.kernel_db.lock().redeem_ask(&answer.request_id) {
+                log::error!("gate-resume: could not consume stale ask {}: {e}", answer.request_id);
+                return ExecAction::Deferred;
+            }
+            log::error!("gate-resume: ask {}: {reason}", answer.request_id);
+            return ExecAction::Settled;
+        }
+    }
+
     // A denial runs nothing. With a pair to settle, the settling is the
     // whole delivery and the answer is consumed here; with no pair there is
     // nothing to show, so the caller keeps the wake it would have had and
@@ -911,9 +966,11 @@ async fn act_on_executable_answer(
     let name = format!("{}-gate-{}", kernel.name, session_id.short());
     let kaish = match kernel
         .kj_dispatcher
-        .materialize_context_kaish(
+        .materialize_context_kaish_as(
             &name,
             principal_id,
+            ask.actor,
+            Some(ask.reviewer),
             context_id,
             session_id,
             kernel.kj_dispatcher.semantic_index(),
@@ -950,7 +1007,7 @@ async fn act_on_executable_answer(
         Some((command_block_id, output_block_id, owner)) => {
             (command_block_id, output_block_id, matches!(owner, kaijutsu_kernel::PairOwner::Turn))
         }
-        None => match author_pair_for_ask(kernel, context_id, principal_id, source) {
+        None => match author_pair_for_ask(kernel, context_id, ask.actor, source) {
             Ok((command_block_id, output_block_id)) => (command_block_id, output_block_id, true),
             Err(e) => {
                 log::error!(
@@ -1030,9 +1087,8 @@ async fn act_on_executable_answer(
         kernel.kernel.block_flows(),
         &kernel.kernel_db,
         &kernel.kernel,
-        principal_id,
-        session_id,
-        kernel.id,
+        &kaijutsu_kernel::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id)
+            .with_actor(ask.actor, Some(ask.reviewer)),
         // Nothing to move a context switch onto: this run has no session
         // map of its own and no connection behind it.
         None,
@@ -1299,36 +1355,34 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                     // say `atobey@zorak approved`, not `a human approved` —
                     // it will not always be the same person.
                     let who = answerer_name(&kernel.kernel_db, row.decided_by.as_deref());
+                    let actor = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice);
+                    let reviewer = row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice);
+                    let (Some(actor), Some(reviewer)) = (actor, reviewer) else {
+                        log::error!("gate-resume: ask {} has no resolved actor/reviewer; nothing was run", answer.request_id);
+                        woken.insert(answer.request_id.clone());
+                        continue;
+                    };
+                    let pair = match approval_pair(
+                        row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner,
+                    ) {
+                        Ok(pair) => pair,
+                        Err(reason) => {
+                            log::error!("gate-resume: ask {}: {reason}; nothing was run", answer.request_id);
+                            woken.insert(answer.request_id.clone());
+                            continue;
+                        }
+                    };
                     let executable = row.exec_source.clone().map(|source| {
-                        let pair = row
-                            .command_block_id
-                            .as_deref()
-                            .and_then(BlockId::from_key)
-                            .zip(row.output_block_id.as_deref().and_then(BlockId::from_key))
-                            .map(|(command_block_id, output_block_id)| {
-                                // A row written before `pair_owner` existed
-                                // names a pair but no owner; asks are
-                                // abandoned at boot, so the only way to reach
-                                // here with one is a stale row from before
-                                // this column — treat it as session-owned
-                                // rather than guess silently.
-                                let owner = row.pair_owner.unwrap_or_else(|| {
-                                    log::warn!(
-                                        "gate-resume: ask {} names a linked pair but no \
-                                         pair_owner; treating it as session-owned",
-                                        answer.request_id
-                                    );
-                                    kaijutsu_kernel::PairOwner::Session
-                                });
-                                (command_block_id, output_block_id, owner)
-                            });
                         let denial = match row.decided_option.as_deref() {
+                            Some("cancel") => format!("cancelled by {who} — nothing was run"),
                             Some(option) => format!("denied by {who} ({option}) — nothing was run"),
                             None => format!("denied by {who} — nothing was run"),
                         };
                         ExecutableAsk {
                             source,
                             cwd: row.cwd.clone(),
+                            actor,
+                            reviewer,
                             pair,
                             denial,
                         }
@@ -1378,21 +1432,12 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                     }
 
                     let seed = executed_seed.unwrap_or_else(|| {
-                        let decision = match answer.status {
-                            kaijutsu_kernel::ApprovalStatus::Allowed => "approved",
-                            _ => "denied",
+                        let (decision, next) = match answer.status {
+                            kaijutsu_kernel::ApprovalStatus::Allowed => ("approved", "Try the same call again; this approval authorizes it once."),
+                            kaijutsu_kernel::ApprovalStatus::Abandoned => ("cancelled", "Do not retry the cancelled action. Continue with the rest of your work."),
+                            _ => ("denied", "Do not retry the denied action. Continue with the rest of your work."),
                         };
-                        // Written as the model reads it: the outcome first, then
-                        // what to do about it. It must not imply the action ran
-                        // — an approval authorizes the retry, it does not
-                        // perform it.
-                        format!(
-                            "{who} {decision} the action you were waiting on: {}\n\n\
-                             Nothing has run yet. Try the same call again — an approval \
-                             authorizes it exactly once. If it was denied, do not retry it; \
-                             say so and continue with the rest of your work.",
-                            answer.description
-                        )
+                        format!("{who} {decision} the action you were waiting on: {}\n\nNothing has run yet. {next}", answer.description)
                     });
 
                     let tail = kernel.documents.last_block_id(context_id);
@@ -1415,6 +1460,13 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                             continue;
                         }
                     };
+
+                    if answer.status == kaijutsu_kernel::ApprovalStatus::Abandoned {
+                        if let Err(e) = kernel.kernel_db.lock().redeem_ask(&answer.request_id) {
+                            log::error!("gate-resume: cancellation delivery could not be recorded for {}: {e}", answer.request_id);
+                            continue;
+                        }
+                    }
 
                     // A turn is already in flight: the seed just written is
                     // the trace of the fill, read on that turn's next
@@ -2320,6 +2372,7 @@ fn bootstrap_discovered_context(
         cast_id: None,
         origin_host: None,
         played_by: None,
+        reviewer_id: None,
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
@@ -2410,6 +2463,7 @@ mod context_bootstrap_tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
+            reviewer_id: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -3515,8 +3569,8 @@ async fn ensure_context_joinable(
 /// Does, in order: create the Conversation document + input doc, write the
 /// KernelDb row with `provider`/`model` left `None` (rolling back the
 /// document on failure — see the "neither path stamps" note inside) and
-/// `played_by` defaulted to `created_by`'s own character when it has one
-/// (rolling back the same way on a lookup failure), register in the
+/// explicit model performer left unset; MCP contexts record their credential
+/// character (rolling back the same way on a lookup failure), register in the
 /// DriftRouter (rolling back the row + document on failure), run the
 /// `create` rc lifecycle for `context_type` (failure is logged, not fatal —
 /// it surfaces as Error blocks in the new context), and arm the beat for
@@ -3563,16 +3617,12 @@ async fn create_context_inner(
     // context (lost on restart), nor a DB row without a drift entry.
     {
         let db = state.kernel_db.lock();
-        // `played_by` defaults to the creating principal's own character, if
-        // it has one — a context minted this way (a fresh session's root
-        // context, ROOT/cold-start bootstrap, `register_session`) has no
-        // enclosing context to inherit from, so the principal that asked for
-        // it is the only candidate default (`docs/character.md`, "A context
-        // is played by a character"). No character row means no default:
-        // `played_by` is metadata, not authority, and a principal without a
-        // sheet is a legitimate pre-character state, not an error.
+        // An external MCP model acts as its credential character. A context
+        // hosting a kernel model needs an explicit performer; the connected
+        // creator is its reviewer, never an inferred model identity.
         let played_by = match db.get_character(created_by) {
-            Ok(character) => character.map(|c| c.principal_id),
+            Ok(character) if context_type == "mcp" => character.map(|c| c.principal_id),
+            Ok(_) => None,
             Err(e) => {
                 drop(db);
                 let _ = state.documents.delete_document(context_id);
@@ -3606,6 +3656,7 @@ async fn create_context_inner(
             cast_id: None,
             origin_host: None,
             played_by,
+            reviewer_id: (context_type != "mcp").then_some(created_by),
         };
         // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
         // no row in `workspaces`, so it only turns a legible workspace error
@@ -3653,6 +3704,8 @@ async fn create_context_inner(
     // context; they don't abort creation.
     let rc_caller = kaijutsu_kernel::KjCaller {
         principal_id: created_by,
+        actor_id: created_by,
+        reviewer_id: None,
         context_id: Some(context_id),
         session_id,
         confirmed: false,
@@ -3716,6 +3769,7 @@ impl kernel::Server for KernelImpl {
                 // instance per execute call — durable env + cwd persist in the
                 // DB, transient scope dies with the instance.
                 let started_ctx = connection.borrow().require_context()?;
+                let reviewer = context_reviewer(&kernel, started_ctx)?;
                 let kaish = materialize_context_shell(&kernel, &connection).await?;
 
                 // Same ruling as `execute_shell_command`/`execute_kj_command`
@@ -3744,7 +3798,7 @@ impl kernel::Server for KernelImpl {
                         started_ctx,
                         session_id,
                         kernel.id,
-                    );
+                    ).with_actor(principal_id, reviewer);
                     match kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await {
                         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
                         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(_) => {
@@ -3818,7 +3872,7 @@ impl kernel::Server for KernelImpl {
                             started_ctx,
                             conn.session_id,
                             kernel.id,
-                        )
+                        ).with_actor(conn.principal, reviewer)
                     };
 
                     let exec_result = tokio::select! {
@@ -4121,6 +4175,7 @@ impl kernel::Server for KernelImpl {
             )
         };
         let cwd = context_cwd(&self.kernel, context_id);
+        let reviewer = pry!(context_reviewer(&self.kernel, context_id));
 
         Promise::from_future(
             async move {
@@ -4141,7 +4196,7 @@ impl kernel::Server for KernelImpl {
                         session_id,
                         kernel_arc.id(),
                     ),
-                };
+                }.with_actor(principal_id, reviewer);
 
                 // Phase 5 D-54: tool filter retired. Visibility is now
                 // enforced by the broker's `ContextToolBinding` +
@@ -5471,7 +5526,7 @@ impl kernel::Server for KernelImpl {
                     session_id,
                     kernel.kernel.id(),
                 ),
-            };
+            }.with_actor(principal_id, context_reviewer(&kernel, context_id)?);
             let exec = match kernel
                 .kernel
                 .dispatch_tool_via_broker(&tool_name, &arguments, &exec_ctx)
@@ -5834,7 +5889,7 @@ impl kernel::Server for KernelImpl {
                     context_id,
                     session_id,
                     kernel.id,
-                );
+                ).with_actor(principal_id, context_reviewer(&kernel, context_id)?);
                 let report = kernel
                     .kernel
                     .broker()
@@ -9601,6 +9656,7 @@ async fn materialize_context_shell_for(
             conn.session_id,
         )
     };
+    let reviewer = context_reviewer(kernel, context_id)?;
     // One materialization path for both shells: read the index + block source
     // off the dispatcher (the server installs the index there at bootstrap via
     // `set_semantic_index`), the same accessors the in-kernel model shell uses.
@@ -9608,9 +9664,11 @@ async fn materialize_context_shell_for(
     // from the same Arc — so the human and model shells can never drift apart.
     kernel
         .kj_dispatcher
-        .materialize_context_kaish(
+        .materialize_context_kaish_as(
             &name,
             principal,
+            principal,
+            reviewer,
             context_id,
             session_id,
             kernel.kj_dispatcher.semantic_index(),
@@ -9618,6 +9676,16 @@ async fn materialize_context_shell_for(
         )
         .await
         .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))
+}
+
+fn context_reviewer(
+    kernel: &SharedKernelState,
+    context_id: ContextId,
+) -> Result<Option<PrincipalId>, capnp::Error> {
+    kernel.kernel_db.lock().get_context(context_id)
+        .map_err(|e| capnp::Error::failed(format!("Could not read reviewer assignment: {e}")))?
+        .map(|row| row.reviewer_id)
+        .ok_or_else(|| capnp::Error::failed(format!("No such context: {context_id}")))
 }
 
 /// Validate and persist a durable cwd through the same backend used by `cd`.
@@ -9849,7 +9917,7 @@ async fn execute_shell_command(
         context_id,
         connection.borrow().session_id,
         kernel.id,
-    );
+    ).with_actor(user_principal_id, context_reviewer(kernel, context_id)?);
     match kernel_arc.broker().shell_pre_call_hooks(code, &call_ctx).await {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {
@@ -9930,9 +9998,6 @@ async fn execute_shell_command(
     let connection_switch = connection.clone();
     let kernel_db_for_persist = kernel.kernel_db.clone();
     let kernel_arc_for_hooks = kernel_arc.clone();
-    let kernel_id = kernel.id;
-    let session_id = connection.borrow().session_id;
-
     tokio::task::spawn_local(async move {
         // The connection's session map is what an in-shell `kj context
         // switch` has to move; a detached run has no such map, which is the
@@ -9950,9 +10015,7 @@ async fn execute_shell_command(
             &block_flows,
             &kernel_db_for_persist,
             &kernel_arc_for_hooks,
-            user_principal_id,
-            session_id,
-            kernel_id,
+            &call_ctx,
             Some(&record_switch),
         )
         .await;
@@ -10279,7 +10342,7 @@ async fn execute_kj_command(
         context_id,
         connection.borrow().session_id,
         kernel.id,
-    );
+    ).with_actor(principal, context_reviewer(kernel, context_id)?);
     match kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {

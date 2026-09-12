@@ -2277,6 +2277,8 @@ impl Broker {
         };
         let caller = crate::kj::KjCaller {
             principal_id: ctx.principal_id,
+            actor_id: ctx.actor_id,
+            reviewer_id: ctx.reviewer_id,
             context_id: Some(ctx.context_id),
             session_id: ctx.session_id,
             confirmed: false,
@@ -2393,6 +2395,8 @@ impl Broker {
 
         let caller = crate::kj::KjCaller {
             principal_id: ctx.principal_id,
+            actor_id: ctx.actor_id,
+            reviewer_id: ctx.reviewer_id,
             context_id: Some(ctx.context_id),
             session_id: ctx.session_id,
             confirmed: false,
@@ -2468,7 +2472,7 @@ impl Broker {
                     tool = %params.tool,
                     context_id = %ctx.context_id,
                     ask = %outcome.ask_description(),
-                    "permission ask recorded; waiting for a human (nothing ran)",
+                    "permission ask recorded; waiting for its reviewer (nothing ran)",
                 );
                 // Each layer adds what the one outside it does not have.
                 // `McpError::gate_pending` already says a human is being
@@ -2534,9 +2538,11 @@ impl Broker {
             }
         };
         let kaish = match dispatcher
-            .materialize_context_kaish_internal(
+            .materialize_context_kaish_internal_as(
                 "hook",
                 ctx.principal_id,
+                ctx.actor_id,
+                ctx.reviewer_id,
                 ctx.context_id,
                 kaijutsu_types::SessionId::new(),
                 None,
@@ -10048,6 +10054,7 @@ mod tests {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
+                reviewer_id: None,
             })
             .unwrap();
             // A real row in context_bindings (so the parent-row lookup
@@ -10158,14 +10165,15 @@ mod tests {
             .into_iter()
             .next()
             .expect("the gate must have left exactly one pending ask");
-        approval_ledger::claim::claim(conn, &row.request_id, b"test-approver").unwrap();
+        let reviewer = row.reviewer_id.as_deref().expect("test ask has a reviewer");
+        approval_ledger::claim::claim(conn, &row.request_id, reviewer).unwrap();
         approval_ledger::decide::decide(
             conn,
             &row.request_id,
             approval_ledger::decide::DecideInput {
                 allow,
                 decided_by: Some(approval_ledger::decide::Answerer {
-                    principal: b"test-approver",
+                    principal: reviewer,
                     context: Some(b"another-seat"),
                 }),
                 decided_option: Some(if allow { "allow_once" } else { "deny" }),
@@ -10363,14 +10371,15 @@ mod tests {
         {
             let db = db.lock();
             let conn = db.conn_for_ledger();
-            approval_ledger::claim::claim(conn, &request_id, b"test-approver").unwrap();
+            let reviewer = row.reviewer_id.as_deref().expect("test ask has a reviewer");
+            approval_ledger::claim::claim(conn, &request_id, reviewer).unwrap();
             approval_ledger::decide::decide(
                 conn,
                 &request_id,
                 approval_ledger::decide::DecideInput {
                     allow: true,
                     decided_by: Some(approval_ledger::decide::Answerer {
-                        principal: b"test-approver",
+                        principal: reviewer,
                         context: Some(b"another-seat"),
                     }),
                     decided_option: Some("allow_once"),

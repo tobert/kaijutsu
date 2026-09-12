@@ -13,10 +13,11 @@ mod common;
 
 use common::{connect_client, run_local, start_server_with_kernel_handle};
 use kaijutsu_client::ShellDryRunOutcome;
+use kaijutsu_kernel::kernel_db::CharacterRow;
 use kaijutsu_kernel::ApprovalStatus;
 use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_server::SharedKernel;
-use kaijutsu_types::AskStatus;
+use kaijutsu_types::{AskStatus, PrincipalId};
 
 /// Push one PreCall hook matched on `shell_write` onto the live broker.
 async fn install_hook(kernel: &SharedKernel, id: &str, action: HookAction) {
@@ -103,8 +104,23 @@ fn an_asking_hook_reports_a_would_ask_and_leaves_no_pending_ask() {
     run_local(async {
         let (addr, kernel) = start_server_with_kernel_handle().await;
         let client = connect_client(addr).await;
+        let actor = client.whoami().await.unwrap().principal_id;
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
         let context_id = kj.create_context("dry-run-ask-wire").await.unwrap();
+        let reviewer = PrincipalId::new();
+        {
+            let db = kernel.kernel_db.lock();
+            db.insert_character(&CharacterRow {
+                principal_id: reviewer,
+                name: "dry-run-reviewer".into(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+            })
+            .unwrap();
+            db.update_context_review(context_id, Some(actor), Some(reviewer))
+                .unwrap();
+        }
 
         install_hook(
             &kernel,
@@ -114,7 +130,7 @@ fn an_asking_hook_reports_a_would_ask_and_leaves_no_pending_ask() {
         .await;
 
         let report = kj
-            .shell_dry_run(context_id, "dd if=/dev/zero of=/tmp/kj-dry-run-wire-never")
+            .shell_dry_run(context_id, "echo dry-run-hook-ask")
             .await
             .expect("a dry run reports; it does not refuse");
 

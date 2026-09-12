@@ -437,6 +437,7 @@ impl BeatScheduler {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
+                reviewer_id: None,
             };
             db.insert_context_with_document(&row, ws).map_err(|e| {
                 format!("beat: creating score context for {}: {e}", track_id.as_str())
@@ -2060,6 +2061,8 @@ impl BeatScheduler {
         tokio::task::spawn_local(async move {
             let caller = KjCaller {
                 principal_id: PrincipalId::system(),
+                actor_id: PrincipalId::system(),
+                reviewer_id: None,
                 context_id: Some(ctx),
                 session_id: SessionId::new(),
                 confirmed: false,
@@ -4618,6 +4621,7 @@ mod tests {
                     cast_id: None,
                     origin_host: None,
                     played_by: None,
+                    reviewer_id: None,
                 },
                 ws,
             )
@@ -5971,6 +5975,7 @@ mod tests {
                     cast_id: None,
                     origin_host: None,
                     played_by: None,
+                    reviewer_id: None,
                 },
                 ws,
             )

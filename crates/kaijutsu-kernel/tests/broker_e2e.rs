@@ -73,6 +73,7 @@ fn insert_context_row(
         cast_id: None,
         origin_host: None,
         played_by: None,
+        reviewer_id: None,
     })
     .unwrap();
 }
@@ -383,6 +384,8 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
     // the rc lifecycle that assigns loadouts.
     let caller = KjCaller {
         principal_id: fx.exec_ctx.principal_id,
+        actor_id: fx.exec_ctx.actor_id,
+        reviewer_id: fx.exec_ctx.reviewer_id,
         context_id: Some(fx.ctx_id),
         session_id: SessionId::new(),
         confirmed: false,
@@ -1488,6 +1491,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
             cast_id: None,
             origin_host: None,
             played_by: None,
+            reviewer_id: None,
         })
         .unwrap();
     }

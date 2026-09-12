@@ -352,6 +352,19 @@ enum LedgerCommand {
         #[arg(long, requires = "remember")]
         family: bool,
     },
+    /// Withdraw a pending ask you performed or requested. Nothing runs.
+    Cancel {
+        /// The ask to withdraw.
+        request_id: String,
+    },
+    /// Assign a pending ask to another live character for review.
+    Escalate {
+        /// The ask to reassign.
+        request_id: String,
+        /// The live character who will review the ask next.
+        #[arg(long)]
+        to: String,
+    },
     /// List the gate rules in force for this context: standing rules a
     /// human taught (exact-text and family, newest first, capped at
     /// `--limit`, default 20), then the gate.toml tiers that apply to this
@@ -501,6 +514,8 @@ impl KjDispatcher {
             LedgerCommand::Deny { request_id, remember, family } => {
                 self.ledger_decide(&request_id, false, caller, remember, family)
             }
+            LedgerCommand::Cancel { request_id } => self.ledger_cancel(&request_id, caller),
+            LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, &to, caller),
             LedgerCommand::Rules { limit, since } => {
                 self.ledger_rules(limit, since.as_deref(), caller).await
             }
@@ -729,6 +744,31 @@ impl KjDispatcher {
         } else {
             Vec::new()
         };
+        let principal_name = |raw: &[u8]| -> Result<String, KjResult> {
+            let principal = PrincipalId::try_from_slice(raw)
+                .ok_or_else(|| KjResult::Err(format!("kj ledger show: malformed {}-byte principal id", raw.len())))?;
+            match db.get_character(principal) {
+                Ok(Some(character)) => Ok(character.name),
+                Ok(None) => Ok(principal.short()),
+                Err(e) => Err(KjResult::Err(format!("kj ledger show: could not resolve principal name: {e}"))),
+            }
+        };
+        let actor_name = match row.actor_id.as_deref().map(principal_name).transpose() {
+            Ok(name) => name,
+            Err(result) => return result,
+        };
+        let reviewer_name = match row.reviewer_id.as_deref().map(principal_name).transpose() {
+            Ok(name) => name,
+            Err(result) => return result,
+        };
+        let requester_name = match principal_name(&row.principal_id) {
+            Ok(name) => name,
+            Err(result) => return result,
+        };
+        let decided_by_name = match row.decided_by.as_deref().map(principal_name).transpose() {
+            Ok(name) => name,
+            Err(result) => return result,
+        };
 
         let mut lines = vec![
             format!("request:    {}", row.request_id),
@@ -746,7 +786,7 @@ impl KjDispatcher {
             // redeeming has one of them differing, and no other verb shows
             // either.
             format!("context:    {}", Self::ledger_id_display(ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()), &row.context_id)),
-            format!("principal:  {}", Self::ledger_id_display(PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()), &row.principal_id)),
+            format!("principal:  {} ({requester_name})", Self::ledger_id_display(PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()), &row.principal_id)),
             format!("description: {}", row.description),
         ];
         for s in &statements {
@@ -775,7 +815,7 @@ impl KjDispatcher {
         // Who answered, so a card closed from another surface can say so
         // (`docs/tui.md`, "Asks"). Absent on a pending or auto-decided ask.
         if let Some(by) = &row.decided_by {
-            lines.push(format!("decided_by: {}", Self::ledger_id_display(PrincipalId::try_from_slice(by).map(|p| p.to_string()), by)));
+            lines.push(format!("decided_by: {} ({})", Self::ledger_id_display(PrincipalId::try_from_slice(by).map(|p| p.to_string()), by), decided_by_name.as_deref().expect("decided identity has a name")));
         }
         if let Some(reason) = &row.auto_reason {
             lines.push(format!("auto:       {reason}"));
@@ -819,9 +859,15 @@ impl KjDispatcher {
             "request_id": row.request_id,
             "context_id": ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()),
             "principal_id": PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()),
+            "principal_name": requester_name,
+            "actor_id": row.actor_id.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+            "actor_name": actor_name,
+            "reviewer_id": row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+            "reviewer_name": reviewer_name,
             "created_at": row.created_at,
             "decided_at": row.decided_at,
             "decided_by": row.decided_by.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+            "decided_by_name": decided_by_name,
             "decided_option": row.decided_option,
             "remember_scope": row.remember_scope,
             "redeemed_at": redeemed_at,
@@ -844,6 +890,55 @@ impl KjDispatcher {
             data["signals"] = serde_json::Value::Array(signal_rows.iter().map(signal_row_json).collect());
         }
         KjResult::ok_with_data(lines.join("\n"), data)
+    }
+
+    fn ledger_cancel(&self, request_id: &str, caller: &KjCaller) -> KjResult {
+        let result = {
+            let db = self.kernel_db.lock();
+            approval_ledger::decide::cancel(db.conn_for_ledger(), request_id, caller.actor_id.as_bytes())
+        };
+        match result {
+            Ok(row) => {
+                crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
+                KjResult::ok_with_data(
+                    format!("cancelled ask {request_id}; nothing ran"),
+                    serde_json::json!({ "request_id": row.request_id, "status": row.status.to_string() }),
+                )
+            }
+            Err(e) => KjResult::Err(format!("kj ledger: {e}")),
+        }
+    }
+
+    fn ledger_escalate(&self, request_id: &str, to: &str, caller: &KjCaller) -> KjResult {
+        let result = {
+            let db = self.kernel_db.lock();
+            let target = match db.get_character_by_name(to) {
+                Ok(Some(character)) if character.retired_at.is_none() => character.principal_id,
+                Ok(Some(_)) => return KjResult::Err(format!("kj ledger: character '{to}' is retired")),
+                Ok(None) => return KjResult::Err(format!("kj ledger: no character named '{to}'")),
+                Err(e) => return KjResult::Err(format!("kj ledger: could not resolve character '{to}': {e}")),
+            };
+            approval_ledger::decide::escalate(
+                db.conn_for_ledger(),
+                request_id,
+                caller.actor_id.as_bytes(),
+                target.as_bytes(),
+            )
+        };
+        match result {
+            Ok(row) => {
+                crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
+                KjResult::ok_with_data(
+                    format!("escalated ask {request_id} to {to}"),
+                    serde_json::json!({
+                        "request_id": row.request_id,
+                        "reviewer_id": row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+                        "reviewer_name": to,
+                    }),
+                )
+            }
+            Err(e) => KjResult::Err(format!("kj ledger: {e}")),
+        }
     }
 
     /// Claim + decide one ask as the calling principal, then — only if
@@ -875,7 +970,7 @@ impl KjDispatcher {
         let result = {
             let db = self.kernel_db.lock();
             let conn = db.conn_for_ledger();
-            let principal = caller.principal_id.as_bytes();
+            let principal = caller.actor_id.as_bytes();
             let context = caller.context_id.map(|c| c.as_bytes().to_vec());
             let answerer = approval_ledger::decide::Answerer {
                 principal,
@@ -895,6 +990,48 @@ impl KjDispatcher {
             // inert".
             match approval_ledger::ask::get_approval(conn, request_id) {
                 Ok(Some(row)) => {
+                    if matches!(remember, Some(RememberScopeArg::Session)) {
+                        let ask_ctx = match ContextId::try_from_slice(&row.context_id) {
+                            Some(id) => id,
+                            None => return KjResult::Err(format!(
+                                "kj ledger: cannot --remember session for ask {request_id}: it has no valid context ID"
+                            )),
+                        };
+                        let ask_actor = match row
+                            .actor_id
+                            .as_deref()
+                            .and_then(PrincipalId::try_from_slice)
+                        {
+                            Some(id) => id,
+                            None => return KjResult::Err(format!(
+                                "kj ledger: cannot --remember session for ask {request_id}: it has no performer identity"
+                            )),
+                        };
+                        let requester = match PrincipalId::try_from_slice(&row.principal_id) {
+                            Some(id) => id,
+                            None => return KjResult::Err(format!(
+                                "kj ledger: cannot --remember session for ask {request_id}: it has no valid requester identity"
+                            )),
+                        };
+                        let current = match db.get_context(ask_ctx) {
+                            Ok(Some(context)) => context,
+                            Ok(None) => return KjResult::Err(format!(
+                                "kj ledger: cannot --remember session for ask {request_id}: context {} is missing",
+                                ask_ctx.short()
+                            )),
+                            Err(e) => return KjResult::Err(format!(
+                                "kj ledger: cannot --remember session for ask {request_id}: read context {}: {e}",
+                                ask_ctx.short()
+                            )),
+                        };
+                        let performer = current.played_by.unwrap_or(requester);
+                        if performer != ask_actor {
+                            return KjResult::Err(format!(
+                                "kj ledger: cannot --remember session for ask {request_id}: the context performer changed after this ask was raised"
+                            ));
+                        }
+                    }
+
                     if let Some(ask_ctx) = ContextId::try_from_slice(&row.context_id) {
                         // A MISSING context row reads as not-archived here,
                         // and that is a narrow reading of the ruling rather
@@ -1432,6 +1569,8 @@ impl KjDispatcher {
             );
             let ask = NewAsk {
                 context_id: context_id.as_bytes().to_vec(),
+                actor_id: caller.actor_id.as_bytes().to_vec(),
+                reviewer_id: caller.reviewer_id.unwrap_or(caller.actor_id).as_bytes().to_vec(),
                 principal_id: caller.principal_id.as_bytes().to_vec(),
                 origin: Origin::Hook,
                 instance: None,
@@ -1604,7 +1743,11 @@ impl Classify for LedgerCommand {
             | LedgerCommand::Show { .. }
             | LedgerCommand::Rules { .. }
             | LedgerCommand::Runs { .. } => Effect::Read,
-            LedgerCommand::Allow { .. } | LedgerCommand::Deny { .. } | LedgerCommand::Forget { .. } => {
+            LedgerCommand::Allow { .. }
+            | LedgerCommand::Deny { .. }
+            | LedgerCommand::Cancel { .. }
+            | LedgerCommand::Escalate { .. }
+            | LedgerCommand::Forget { .. } => {
                 Effect::Write
             }
             LedgerCommand::Signal { command } => command.effect(),
@@ -1624,7 +1767,7 @@ impl Classify for SignalCommand {
 mod tests {
     use super::*;
     use crate::kj::gate::{run_gate, GateSpec};
-    use crate::kj::test_helpers::{test_caller, test_dispatcher};
+    use crate::kj::test_helpers::{register_context, test_caller, test_dispatcher};
     use approval_ledger::types::VarBinding;
     use std::time::Duration;
 
@@ -1792,7 +1935,9 @@ mod tests {
     /// gate's own answer path"). `test_caller` mints a fresh `ContextId`, so
     /// this is a peer, and peer-seat approval is permitted.
     fn answering_seat() -> crate::kj::KjCaller {
-        test_caller()
+        let mut caller = test_caller();
+        caller.actor_id = crate::kj::test_helpers::test_reviewer_principal();
+        caller
     }
 
     /// No self-approval, at the surface a person actually types. The seat
@@ -1814,7 +1959,7 @@ mod tests {
             .await;
         assert!(!refused.is_ok(), "a seat must not answer its own ask");
         assert!(
-            refused.message().contains("this context raised the ask"),
+            refused.message().contains("the answering actor performed this operation"),
             "the refusal must say why, got: {}",
             refused.message()
         );
@@ -2004,13 +2149,13 @@ mod tests {
         // from another surface reads this to say who (`docs/tui.md`, "Asks").
         assert_eq!(
             data["decided_by"].as_str(),
-            Some(answerer.principal_id.to_string().as_str()),
+            Some(answerer.actor_id.to_string().as_str()),
             "{data}"
         );
         assert_eq!(data["decided_option"].as_str(), Some("allow_once"), "{data}");
         assert!(data["decided_at"].as_i64().is_some_and(|at| at > 0), "{data}");
         assert!(
-            unspent.message().contains(&format!("decided_by: {}", answerer.principal_id)),
+            unspent.message().contains(&format!("decided_by: {}", answerer.actor_id)),
             "show must name who decided: {}",
             unspent.message()
         );
@@ -2822,8 +2967,12 @@ mod tests {
     #[tokio::test]
     async fn a_session_scoped_family_covers_its_own_context_only() {
         let d = test_dispatcher().await;
-        let mine = crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new());
-        let theirs = crate::kj::test_helpers::caller_with_context(kaijutsu_types::ContextId::new());
+        let mut mine = test_caller();
+        let mine_context = register_context(&d, Some("session-family-mine"), None, mine.principal_id);
+        mine.context_id = Some(mine_context);
+        let mut theirs = test_caller();
+        let theirs_context = register_context(&d, Some("session-family-theirs"), None, theirs.principal_id);
+        theirs.context_id = Some(theirs_context);
         let first = gate_once(&d, &mine, planned_shell_spec("kj handoff note 'mine'")).await;
         let request_id = first.ask.expect("row").request_id;
         let result = d
@@ -2919,7 +3068,9 @@ mod tests {
     #[tokio::test]
     async fn remember_session_scope_round_trips_through_kj_ledger_rules() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let mut c = test_caller();
+        let context = register_context(&d, Some("session-rule"), None, c.principal_id);
+        c.context_id = Some(context);
         let label = "kaish-source";
         let rendered = "echo session-scoped";
 
@@ -2945,6 +3096,81 @@ mod tests {
         let ids = data.as_array().expect(".data must be a JSON array of rule ids");
         assert_eq!(ids.len(), 1, "{data}");
         assert!(ids[0].is_string(), "{data}");
+    }
+
+    /// Session rules attach to a performer, not merely a requester and a
+    /// context. A decision about coder A must not teach a rule that coder B
+    /// inherits after taking over the same context.
+    #[tokio::test]
+    async fn a_changed_performer_cannot_remember_an_old_ask_for_the_session() {
+        let d = test_dispatcher().await;
+        let mut coder_a = test_caller();
+        let requester = coder_a.principal_id;
+        let reviewer = crate::kj::test_helpers::test_reviewer_principal();
+        let context = register_context(&d, Some("session-rule-performer"), None, requester);
+        let actor_a = PrincipalId::new();
+        let actor_b = PrincipalId::new();
+        coder_a.actor_id = actor_a;
+        coder_a.reviewer_id = Some(reviewer);
+        coder_a.context_id = Some(context);
+        d.kernel_db
+            .lock()
+            .update_context_review(context, Some(actor_a), Some(reviewer))
+            .unwrap();
+
+        let first = gate_once(&d, &coder_a, shell_spec("performer-swap", "echo reviewed")).await;
+        let request_id = first.ask.expect("the first ask").request_id;
+        d.kernel_db
+            .lock()
+            .update_context_review(context, Some(actor_b), Some(reviewer))
+            .unwrap();
+
+        let reviewer_call = answering_seat();
+        let refused = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("session")],
+                &reviewer_call,
+            )
+            .await;
+        assert!(!refused.is_ok(), "a changed performer cannot inherit a session rule");
+        assert!(refused.message().contains("performer changed"), "{}", refused.message());
+        {
+            let db = d.kernel_db.lock();
+            let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                .unwrap()
+                .expect("the old ask remains pending");
+            assert_eq!(row.status, ApprovalStatus::Pending);
+            assert!(row.claimed_by.is_none());
+        }
+
+        let plain = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id)], &reviewer_call)
+            .await;
+        assert!(plain.is_ok(), "the historical decision itself remains auditable: {plain:?}");
+        let replay = gate_once(&d, &coder_a, shell_spec("performer-swap", "echo reviewed")).await;
+        assert!(replay.allowed(), "the old ask itself remains redeemable");
+        assert_eq!(replay.ask.expect("the old answer").request_id, request_id);
+
+        let replacement = gate_once(&d, &coder_a, shell_spec("performer-swap", "echo reviewed")).await;
+        let replacement_id = replacement.ask.expect("a replacement ask").request_id;
+        let family_refused = d
+            .dispatch(
+                &[
+                    s("ledger"), s("allow"), s(&replacement_id), s("--remember"), s("session"),
+                    s("--family"),
+                ],
+                &reviewer_call,
+            )
+            .await;
+        assert!(!family_refused.is_ok(), "family session learning has the same performer guard");
+        assert!(family_refused.message().contains("performer changed"), "{}", family_refused.message());
+
+        let db = d.kernel_db.lock();
+        let rules: i64 = db
+            .conn_for_ledger()
+            .query_row("SELECT COUNT(*) FROM approval_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rules, 0, "neither old ask may mint a session rule for actor B");
     }
 
     /// A remember with no way to un-remember is a trap: `kj ledger forget`
@@ -3043,6 +3269,8 @@ mod tests {
     fn unjoined_caller() -> KjCaller {
         KjCaller {
             principal_id: kaijutsu_types::PrincipalId::new(),
+            actor_id: kaijutsu_types::PrincipalId::new(),
+            reviewer_id: None,
             context_id: None,
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
@@ -3267,6 +3495,8 @@ mod tests {
             .map(|i| {
                 let ask = approval_ledger::types::NewAsk {
                     context_id: ctx.as_bytes().to_vec(),
+                    actor_id: principal.as_bytes().to_vec(),
+                    reviewer_id: principal.as_bytes().to_vec(),
                     principal_id: principal.as_bytes().to_vec(),
                     origin,
                     instance: None,
@@ -3561,6 +3791,8 @@ mod tests {
             for i in 0..3 {
                 let ask = approval_ledger::types::NewAsk {
                     context_id: ctx.as_bytes().to_vec(),
+                    actor_id: c.actor_id.as_bytes().to_vec(),
+                    reviewer_id: c.reviewer_id.unwrap_or(c.actor_id).as_bytes().to_vec(),
                     principal_id: c.principal_id.as_bytes().to_vec(),
                     origin: approval_ledger::types::Origin::ShellGate,
                     instance: None,
@@ -3694,6 +3926,8 @@ mod tests {
             let d = test_dispatcher().await;
             let c = KjCaller {
                 principal_id: kaijutsu_types::PrincipalId::new(),
+                actor_id: kaijutsu_types::PrincipalId::new(),
+                reviewer_id: None,
                 context_id: None,
                 session_id: kaijutsu_types::SessionId::new(),
                 confirmed: false,
@@ -3705,5 +3939,3 @@ mod tests {
         }
     }
 }
-
-

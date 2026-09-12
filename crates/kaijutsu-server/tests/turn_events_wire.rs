@@ -21,12 +21,44 @@ use std::time::Duration;
 
 use tokio::sync::broadcast::Receiver;
 
-use common::{connect_client, run_local, start_server_with_mock_llm};
+use common::{connect_client, run_local, start_server_with_mock_llm_kernel_handle};
 use kaijutsu_client::{
     KernelHandle, ServerEvent, TurnCompletedStopReason, TurnOrigin, turn_events_channel,
 };
 use kaijutsu_types::ContextId;
-use kaijutsu_types::{BlockKind, BlockQuery, Role};
+use kaijutsu_types::{BlockKind, BlockQuery, PrincipalId, Role};
+
+/// Model turns require an explicit, distinct performer/reviewer assignment.
+/// Wire context creation deliberately leaves the performer unset, so these
+/// turn-event tests arrange the identity contract before prompting.
+fn assign_turn_identity(
+    server: &kaijutsu_server::SharedKernel,
+    context: ContextId,
+    actor: PrincipalId,
+) {
+    let reviewer = PrincipalId::new();
+    let db = server.kernel_db.lock();
+    if db.get_character(actor).unwrap().is_none() {
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            principal_id: actor,
+            name: "turn-actor".into(),
+            created_at: 0,
+            retired_at: None,
+            handoff_ctx: None,
+        })
+        .unwrap();
+    }
+    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+        principal_id: reviewer,
+        name: "turn-reviewer".into(),
+        created_at: 0,
+        retired_at: None,
+        handoff_ctx: None,
+    })
+    .unwrap();
+    db.update_context_review(context, Some(actor), Some(reviewer))
+        .unwrap();
+}
 
 /// Drain the turn push channel until a terminal event for `context` arrives.
 ///
@@ -71,11 +103,13 @@ async fn get_all_blocks(
 #[test]
 fn interactive_turn_pushes_completed_with_its_output_block() {
     run_local(async {
-        let addr = start_server_with_mock_llm().await;
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
+        let actor = client.whoami().await.unwrap().principal_id;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         let ctx = kernel.create_context("turns").await.unwrap();
+        assign_turn_identity(&server, ctx, actor);
         let _joined = kernel.join_context(ctx, "test").await.unwrap();
 
         // Subscribe BEFORE prompting, so the event cannot be missed.
@@ -138,11 +172,13 @@ fn interactive_turn_pushes_completed_with_its_output_block() {
 #[test]
 fn cancelled_turn_pushes_a_cancelled_stop_reason() {
     run_local(async {
-        let addr = start_server_with_mock_llm().await;
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
+        let actor = client.whoami().await.unwrap().principal_id;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         let ctx = kernel.create_context("cancel").await.unwrap();
+        assign_turn_identity(&server, ctx, actor);
         let _joined = kernel.join_context(ctx, "test").await.unwrap();
 
         let (callback, mut rx) = turn_events_channel(64);
@@ -206,11 +242,13 @@ fn cancelled_turn_pushes_a_cancelled_stop_reason() {
 #[test]
 fn autonomous_fork_turn_pushes_started_then_completed_for_the_child() {
     run_local(async {
-        let addr = start_server_with_mock_llm().await;
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
+        let actor = client.whoami().await.unwrap().principal_id;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         let main_ctx = kernel.create_context("parent").await.unwrap();
+        assign_turn_identity(&server, main_ctx, actor);
         let _joined = kernel.join_context(main_ctx, "test").await.unwrap();
 
         let (callback, mut rx) = turn_events_channel(64);

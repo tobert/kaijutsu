@@ -31,6 +31,8 @@ pub struct KjBuiltin {
     dispatcher: Arc<KjDispatcher>,
     session_contexts: SessionContextMap,
     principal_id: PrincipalId,
+    actor_id: PrincipalId,
+    reviewer_id: Option<PrincipalId>,
     session_id: SessionId,
     /// Semantic index for synthesis commands. None if embedding model not configured.
     semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
@@ -57,11 +59,24 @@ impl KjBuiltin {
             dispatcher,
             session_contexts,
             principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             session_id,
             semantic_index,
             block_source,
             privileged,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_as(
+        dispatcher: Arc<KjDispatcher>, session_contexts: SessionContextMap,
+        principal_id: PrincipalId, actor_id: PrincipalId, reviewer_id: Option<PrincipalId>,
+        session_id: SessionId, semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>, privileged: bool,
+    ) -> Self {
+        Self { dispatcher, session_contexts, principal_id, actor_id, reviewer_id, session_id,
+            semantic_index, block_source, privileged }
     }
 
     fn current_context_id(&self) -> Option<ContextId> {
@@ -485,6 +500,8 @@ impl Tool for KjBuiltin {
 
         let caller = KjCaller {
             principal_id: self.principal_id,
+            actor_id: self.actor_id,
+            reviewer_id: self.reviewer_id,
             context_id: self.current_context_id(),
             session_id: self.session_id,
             confirmed,

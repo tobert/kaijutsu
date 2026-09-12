@@ -44,6 +44,10 @@ impl TraceContext {
 pub struct CallContext {
     /// Attribution only, never authorization (D-22).
     pub principal_id: PrincipalId,
+    /// Character performing this invocation; separate from its requester.
+    pub actor_id: PrincipalId,
+    /// Character delegated to review this actor's work.
+    pub reviewer_id: Option<PrincipalId>,
     pub context_id: ContextId,
     pub session_id: SessionId,
     pub kernel_id: KernelId,
@@ -62,6 +66,8 @@ impl CallContext {
     ) -> Self {
         Self {
             principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id,
             session_id,
             kernel_id,
@@ -75,6 +81,12 @@ impl CallContext {
         self
     }
 
+    pub fn with_actor(mut self, actor_id: PrincipalId, reviewer_id: Option<PrincipalId>) -> Self {
+        self.actor_id = actor_id;
+        self.reviewer_id = reviewer_id;
+        self
+    }
+
     pub fn with_trace(mut self, trace: TraceContext) -> Self {
         self.trace = trace;
         self
@@ -82,12 +94,14 @@ impl CallContext {
 
     /// Minimal context for tests.
     pub fn test() -> Self {
+        let principal_id = PrincipalId::new();
         Self::new(
-            PrincipalId::new(),
+            principal_id,
             ContextId::new(),
             SessionId::new(),
             KernelId::new(),
         )
+        .with_actor(principal_id, Some(PrincipalId::new()))
     }
 
     /// System-principal context used for broker-internal calls (e.g., the

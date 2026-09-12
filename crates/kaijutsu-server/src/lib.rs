@@ -16,6 +16,7 @@ pub mod sftp;
 pub mod share;
 pub mod shell_run;
 pub mod ssh;
+mod turn_identity;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {

@@ -24,7 +24,12 @@ use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 /// or workspace guard enforcement pull from here.
 #[derive(Debug, Clone)]
 pub struct ExecContext {
+    /// Authenticated requester. This remains the redemption identity.
     pub principal_id: PrincipalId,
+    /// Character performing this invocation.
+    pub actor_id: PrincipalId,
+    /// Character delegated to review this actor's work.
+    pub reviewer_id: Option<PrincipalId>,
     pub context_id: ContextId,
     pub cwd: Option<PathBuf>,
     pub session_id: SessionId,
@@ -44,6 +49,8 @@ impl ExecContext {
     ) -> Self {
         Self {
             principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id,
             cwd: Some(cwd.into()),
             session_id,
@@ -63,6 +70,8 @@ impl ExecContext {
     ) -> Self {
         Self {
             principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id,
             cwd: None,
             session_id,
@@ -71,13 +80,22 @@ impl ExecContext {
     }
 
     pub fn test() -> Self {
+        let principal_id = PrincipalId::new();
         Self {
-            principal_id: PrincipalId::new(),
+            principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id: ContextId::new(),
             cwd: Some(PathBuf::from("/")),
             session_id: SessionId::new(),
             kernel_id: KernelId::new(),
         }
+    }
+
+    pub fn with_actor(mut self, actor_id: PrincipalId, reviewer_id: Option<PrincipalId>) -> Self {
+        self.actor_id = actor_id;
+        self.reviewer_id = reviewer_id;
+        self
     }
 }
 

@@ -574,7 +574,8 @@ impl Kernel {
             tool_ctx.context_id,
             tool_ctx.session_id,
             tool_ctx.kernel_id,
-        );
+        )
+        .with_actor(tool_ctx.actor_id, tool_ctx.reviewer_id);
 
         // Surface a genuine binding-fetch failure (a real DB read error) as
         // this call's own error instead of letting it silently collapse to
@@ -646,6 +647,7 @@ impl Kernel {
             tool_ctx.session_id,
             tool_ctx.kernel_id,
         )
+        .with_actor(tool_ctx.actor_id, tool_ctx.reviewer_id)
         .with_trace(TraceContext::from_current_span());
         if let Some(cwd) = tool_ctx.cwd.clone() {
             call_ctx = call_ctx.with_cwd(cwd);

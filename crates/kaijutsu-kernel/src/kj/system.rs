@@ -58,7 +58,7 @@ pub(crate) struct SystemArgs {
 #[derive(Subcommand, Debug)]
 enum SystemCommand {
     /// Report whether the kernel is quiesced, how many turns are in flight,
-    /// and how many asks are waiting on a human.
+    /// and how many asks are waiting on their reviewers.
     Status,
     /// List the kernel's own processes: turns in flight and the child
     /// processes kaijutsu spawned, longest-running first. Not the host's
@@ -173,7 +173,7 @@ impl KjDispatcher {
             None => "running".to_string(),
         }];
         lines.push(format!("turns in flight: {}", turns.len()));
-        lines.push(format!("asks waiting on a human: {}", pending.len()));
+        lines.push(format!("asks waiting on reviewers: {}", pending.len()));
         let data = serde_json::json!({
             "quiesced": quiesced.is_some(),
             "quiesced_since_unix_ms": quiesced.as_ref().map(|q| q.since_unix_ms),

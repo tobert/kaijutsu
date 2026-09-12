@@ -324,6 +324,8 @@ mod tests {
     fn caller_with_context(principal: PrincipalId, ctx: Option<ContextId>) -> KjCaller {
         KjCaller {
             principal_id: principal,
+            actor_id: principal,
+            reviewer_id: None,
             context_id: ctx,
             session_id: SessionId::new(),
             confirmed: false,

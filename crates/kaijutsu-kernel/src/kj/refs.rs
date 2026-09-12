@@ -139,6 +139,8 @@ mod tests {
         let ctx_id = ContextId::new();
         let caller = KjCaller {
             principal_id: kaijutsu_types::PrincipalId::new(),
+            actor_id: kaijutsu_types::PrincipalId::new(),
+            reviewer_id: None,
             context_id: Some(ctx_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
@@ -181,12 +183,15 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
+            reviewer_id: None,
         };
         let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(&row, ws_id).unwrap();
 
         let caller = KjCaller {
             principal_id: principal,
+            actor_id: principal,
+            reviewer_id: None,
             context_id: Some(ctx_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
@@ -235,6 +240,7 @@ mod tests {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
+                reviewer_id: None,
             },
             ws_id,
         )
@@ -266,6 +272,7 @@ mod tests {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
+                reviewer_id: None,
             },
             ws_id,
         )
@@ -297,6 +304,7 @@ mod tests {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
+                reviewer_id: None,
             },
             ws_id,
         )
@@ -304,6 +312,8 @@ mod tests {
 
         let caller = KjCaller {
             principal_id: principal,
+            actor_id: principal,
+            reviewer_id: None,
             context_id: Some(child_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,

@@ -291,6 +291,35 @@ pub(crate) async fn spawn_llm_for_prompt(
     let kernel_db = kernel.kernel_db.clone();
     let conversation_cache = kernel.conversation_cache.clone();
 
+    let identity = {
+        let db = kernel_db.lock();
+        let row = db.get_context(context_id)
+            .map_err(|e| capnp::Error::failed(format!("Could not read performer assignment: {e}")))?
+            .ok_or_else(|| capnp::Error::failed(format!("No such context: {context_id}")))?;
+        crate::turn_identity::resolve(&db, row.played_by, row.reviewer_id)
+    };
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(detail) => {
+            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
+            return Err(capnp::Error::failed(detail));
+        }
+    };
+    let (performer, reviewer) = {
+        let db = kernel_db.lock();
+        let character = |principal_id: PrincipalId| -> Result<kaijutsu_kernel::CharacterIdentity, capnp::Error> {
+            let sheet = db.get_character(principal_id)
+                .map_err(|e| capnp::Error::failed(format!("Could not read assigned character: {e}")))?
+                .ok_or_else(|| capnp::Error::failed(format!("Assigned character {principal_id} has no sheet")))?;
+            if sheet.retired_at.is_some() {
+                return Err(capnp::Error::failed(format!("Assigned character {} is retired", sheet.name)));
+            }
+            Ok(kaijutsu_kernel::CharacterIdentity { principal_id, name: sheet.name })
+        };
+        (character(identity.actor)?, character(identity.reviewer)?)
+    };
+    let tool_ctx = tool_ctx.with_actor(identity.actor, Some(identity.reviewer));
+
     // Quiesce: the kernel accepts writes but starts no turns. This is the one
     // enforcement point — every turn that reaches a provider passes through
     // here, autonomous and interactive alike (docs/system-verbs.md).
@@ -514,6 +543,8 @@ pub(crate) async fn spawn_llm_for_prompt(
         context_state: ctx_state,
         provider: ctx_provider_name.clone(),
         model: Some(model_name.clone()),
+        performer: Some(performer),
+        reviewer: Some(reviewer),
         tool_names: tools.iter().map(|t| t.name.clone()).collect(),
     };
     let rc_sections = match kaijutsu_kernel::read_system_prompt_sections(&documents, context_id) {
@@ -1531,8 +1562,8 @@ async fn process_llm_stream(
     // (the floor then applies at the `apply_slot_tunables` seam below).
     slot_tunables: Option<SlotTunables>,
     conversation_cache: Arc<ConversationCache>,
-    // The turn's principal — authors the TurnFlow outcome event (and reserved
-    // for future per-user attribution on model-generated blocks).
+    // The requester authors the TurnFlow outcome event; provider blocks
+    // use the performing character carried by tool_ctx.
     user_principal_id: PrincipalId,
     tool_ctx: kaijutsu_kernel::ExecContext,
     interrupt: Arc<ContextInterruptState>,
@@ -1561,10 +1592,9 @@ async fn process_llm_stream(
     // tool results, structured tool errors, the max-iterations halt,
     // interrupt/quiesce/staging notices, warnings — and stamps
     // `PrincipalId::system()` directly at each site, never this binding.
-    // Resolved once so every provider-output site agrees; today it equals
-    // `PrincipalId::system()`, kept as its own binding so per-model
-    // attribution can retarget it later without touching call sites.
-    let actor_principal: PrincipalId = PrincipalId::system();
+    // The turn's performer is resolved before dispatch and also accompanies
+    // every tool call. A model change does not change this identity.
+    let actor_principal = tool_ctx.actor_id;
 
     // Get per-context mailbox lock — held for the entire stream,
     // serializing concurrent prompts to the same context (Fix D+E).
@@ -4338,6 +4368,7 @@ mod usage_tests {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
+                reviewer_id: None,
             })
             .unwrap();
             for bp in breakpoints {
@@ -5046,13 +5077,6 @@ mod authorship_tests {
     //! - a driven turn's real blocks carry the expected principal on each
     //!   category — regression coverage against a `None` author or a block
     //!   landing with an unrelated principal;
-    //! - the source itself is checked for the two call-site markers
-    //!   (`Some(actor_principal)` vs `Some(PrincipalId::system())`), because
-    //!   `actor_principal` equals `PrincipalId::system()` today (this is a
-    //!   no-behavior-change refactor) — no block's runtime value can tell a
-    //!   provider-output site that regressed to a literal `system()` call
-    //!   apart from one that didn't. Only the source text can, so that is
-    //!   what these two pin.
     use super::*;
     use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
     use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
@@ -5069,7 +5093,7 @@ mod authorship_tests {
     /// a structured Error child, the same shape `usage_tests` relies on —
     /// then a second iteration's final text closes the turn. Returns the
     /// documents store so the caller can inspect every block's author.
-    async fn drive_turn_with_tool_call(kernel: Arc<Kernel>) -> (SharedBlockStore, ContextId) {
+    async fn drive_turn_with_tool_call(kernel: Arc<Kernel>) -> (SharedBlockStore, ContextId, PrincipalId, PrincipalId) {
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let documents: SharedBlockStore = Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
         let ctx = ContextId::new();
@@ -5078,6 +5102,7 @@ mod authorship_tests {
             .unwrap();
 
         let player = PrincipalId::new();
+        let actor = PrincipalId::new();
         let after = documents
             .insert_block_as(
                 ctx,
@@ -5137,7 +5162,7 @@ mod authorship_tests {
             std::path::PathBuf::from("/"),
             SessionId::new(),
             kernel.id(),
-        );
+        ).with_actor(actor, Some(player));
 
         process_llm_stream(
             provider,
@@ -5162,28 +5187,24 @@ mod authorship_tests {
         )
         .await;
 
-        (documents, ctx)
+        (documents, ctx, actor, player)
     }
 
-    /// PROVIDER-OUTPUT blocks (Thinking, Text, ToolCall) carry the system
-    /// principal today, the value `actor_principal` resolves to. This alone
-    /// can't distinguish the shared binding from an independent literal call
-    /// (see module doc) — it pins that the split didn't regress to `None` or
-    /// some unrelated principal on any of these three kinds.
+    /// Provider output belongs to the performer; the prompt belongs to its requester.
     #[tokio::test]
-    async fn provider_output_blocks_carry_the_system_principal() {
+    async fn provider_output_blocks_carry_the_performer_and_prompt_keeps_requester() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let kernel = Arc::new(Kernel::new_ephemeral("authorship-provider").await);
-                let (documents, ctx) = drive_turn_with_tool_call(kernel).await;
+                let (documents, ctx, actor, player) = drive_turn_with_tool_call(kernel).await;
                 let blocks = documents.block_snapshots(ctx).unwrap();
 
                 let thinking = blocks
                     .iter()
                     .find(|b| b.kind == BlockKind::Thinking)
                     .expect("thinking block inserted");
-                assert_eq!(thinking.id.principal_id, PrincipalId::system());
+                assert_eq!(thinking.id.principal_id, actor);
 
                 let text_blocks: Vec<_> = blocks
                     .iter()
@@ -5191,14 +5212,17 @@ mod authorship_tests {
                     .collect();
                 assert!(!text_blocks.is_empty(), "at least one model text block");
                 for t in &text_blocks {
-                    assert_eq!(t.id.principal_id, PrincipalId::system());
+                    assert_eq!(t.id.principal_id, actor);
                 }
 
                 let tool_call = blocks
                     .iter()
                     .find(|b| b.kind == BlockKind::ToolCall)
                     .expect("tool call block inserted");
-                assert_eq!(tool_call.id.principal_id, PrincipalId::system());
+                assert_eq!(tool_call.id.principal_id, actor);
+                let prompt = blocks.iter().find(|b| b.role == Role::User).unwrap();
+                assert_eq!(prompt.id.principal_id, player);
+                assert_ne!(actor, player);
             })
             .await;
     }
@@ -5212,7 +5236,7 @@ mod authorship_tests {
         local
             .run_until(async {
                 let kernel = Arc::new(Kernel::new_ephemeral("authorship-kernel").await);
-                let (documents, ctx) = drive_turn_with_tool_call(kernel).await;
+                let (documents, ctx, _actor, _player) = drive_turn_with_tool_call(kernel).await;
                 let blocks = documents.block_snapshots(ctx).unwrap();
 
                 let tool_result = blocks
@@ -5230,52 +5254,9 @@ mod authorship_tests {
             .await;
     }
 
-    /// Source-level pin: `actor_principal` (PROVIDER-OUTPUT) and a literal
-    /// `PrincipalId::system()` (KERNEL-OUTPUT) resolve to the same value
-    /// today, so no block's content can tell the two call-site categories
-    /// apart at runtime — only the source text can. These counts are the
-    /// ones established at the refactor: 6 provider-output sites share the
-    /// binding, 15 kernel-output sites stamp `system()` directly. Moving a
-    /// site between categories, in either direction, changes both counts.
-    /// Only the code above this test module counts as a classification
-    /// site — the module's own doc comments and assertion strings quote
-    /// both markers verbatim and would otherwise inflate the count.
-    fn production_source() -> &'static str {
-        let source = include_str!("llm_stream.rs");
-        source
-            .split("mod authorship_tests")
-            .next()
-            .expect("this file contains its own module name")
-    }
 
-    #[test]
-    fn provider_output_sites_use_the_actor_principal_binding() {
-        let actor_sites = production_source().matches("Some(actor_principal)").count();
-        assert_eq!(
-            actor_sites, 6,
-            "expected 6 provider-output sites stamping `Some(actor_principal)` — a \
-             different count means a site was recategorized (or a provider-output site \
-             reverted to a literal `Some(PrincipalId::system())`) without updating this pin"
-        );
-    }
-
-    #[test]
-    fn kernel_output_sites_stamp_system_literally() {
-        let system_sites = production_source().matches("Some(PrincipalId::system())").count();
-        assert_eq!(
-            system_sites, 15,
-            "expected 15 kernel-output sites stamping `Some(PrincipalId::system())` \
-             directly — a different count means a kernel-output site was switched onto \
-             `actor_principal` (or a provider-output site off it) without updating this pin"
-        );
-    }
 }
 
-// This module is deliberately placed after `authorship_tests`:
-// `production_source` above scans everything before that module's text, and
-// this module's fixtures stamp `Some(PrincipalId::system())` on the tool
-// result the way the real gate-resume driver does, which would otherwise
-// throw off that count.
 #[cfg(test)]
 mod gate_resume_cache_eviction_tests {
     //! Regression for `ConversationCache::evict`

@@ -157,6 +157,8 @@ pub struct ContextRow {
     /// continuation by default. See `docs/character.md`, "A context is
     /// played by a character".
     pub played_by: Option<PrincipalId>,
+    /// The character assigned to review this context's performer.
+    pub reviewer_id: Option<PrincipalId>,
 }
 
 impl ContextRow {
@@ -629,7 +631,8 @@ CREATE TABLE IF NOT EXISTS contexts (
     -- it). A bare principal id, same as `created_by` — the kernel never
     -- reads `auth.db`, so no FK reaches it. See `ContextRow::played_by`'s
     -- doc comment.
-    played_by    BLOB
+    played_by    BLOB,
+    reviewer_id  BLOB
 );
 -- Labels are unique among LIVE contexts only. An archived context keeps its
 -- label as history and leaves this index, so the name can be given again.
@@ -2054,6 +2057,7 @@ impl KernelDb {
             "ALTER TABLE hooks ADD COLUMN action_ask_description TEXT",
             "ALTER TABLE contexts ADD COLUMN origin_host TEXT",
             "ALTER TABLE contexts ADD COLUMN played_by BLOB",
+            "ALTER TABLE contexts ADD COLUMN reviewer_id BLOB",
             "ALTER TABLE hooks ADD COLUMN action_kaish_path TEXT",
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
@@ -3423,14 +3427,14 @@ impl KernelDb {
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-                origin_host, played_by
+                origin_host, played_by, reviewer_id
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21,
-                ?22, ?23
+                ?22, ?23, ?24
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -3456,6 +3460,7 @@ impl KernelDb {
                     row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.origin_host,
                     row.played_by.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.reviewer_id.as_ref().map(|id| id.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -3475,7 +3480,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -3552,21 +3557,49 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Set or clear the character that plays a context. `None` means
-    /// nobody plays it — the NULL that preserves today's behavior on every
-    /// context that predates this column. No FK to `characters`: a bare
-    /// principal id, same as `created_by`. See `ContextRow::played_by`'s
-    /// doc comment.
+    /// Set a test fixture's performer while preserving its reviewer.
+    #[cfg(test)]
     pub fn update_played_by(
         &self,
         id: ContextId,
         played_by: Option<PrincipalId>,
     ) -> KernelDbResult<()> {
+        self.in_transaction(|db| {
+            let row = db.get_context(id)?
+                .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
+            db.update_context_review(id, played_by, row.reviewer_id)
+        })
+    }
+
+    /// Atomically set the context performer and its assigned reviewer.
+    pub fn update_context_review(
+        &self,
+        id: ContextId,
+        played_by: Option<PrincipalId>,
+        reviewer_id: Option<PrincipalId>,
+    ) -> KernelDbResult<()> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.update_context_review(id, played_by, reviewer_id));
+        }
+        let current = self.get_context(id)?
+            .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
+        if current.played_by != played_by {
+            let now = now_millis();
+            self.conn.execute(
+                "UPDATE approval_rules SET revoked_at = ?1 WHERE context_id = ?2 AND scope = 'session' AND revoked_at IS NULL",
+                params![now, blob_param(id.as_bytes())],
+            )?;
+            self.conn.execute(
+                "UPDATE approval_rule_families SET revoked_at = ?1 WHERE context_id = ?2 AND scope = 'session' AND revoked_at IS NULL",
+                params![now, blob_param(id.as_bytes())],
+            )?;
+        }
         let updated = self.conn.execute(
-            "UPDATE contexts SET played_by = ?1 WHERE context_id = ?2",
+            "UPDATE contexts SET played_by = ?1, reviewer_id = ?2 WHERE context_id = ?3",
             params![
                 played_by.as_ref().map(|p| p.as_bytes().to_vec()),
-                blob_param(id.as_bytes())
+                reviewer_id.as_ref().map(|p| p.as_bytes().to_vec()),
+                blob_param(id.as_bytes()),
             ],
         )?;
         if updated == 0 {
@@ -3909,7 +3942,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -3926,7 +3959,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -3977,7 +4010,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -3996,7 +4029,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -4035,7 +4068,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, dag.depth
+                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -4043,7 +4076,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(23)?;
+            let depth: i64 = row.get(24)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -4066,7 +4099,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, lineage.depth
+                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -4074,7 +4107,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(23)?;
+            let depth: i64 = row.get(24)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -4096,7 +4129,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, subtree.depth
+                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
             ORDER BY subtree.depth, c.created_at",
@@ -4104,7 +4137,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(23)?;
+            let depth: i64 = row.get(24)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -6278,7 +6311,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
              FROM contexts WHERE label = ?1 AND archived_at IS NULL",
         )?;
 
@@ -7204,7 +7237,7 @@ impl KernelDb {
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-                    origin_host, played_by
+             origin_host, played_by, reviewer_id
              FROM contexts WHERE played_by = ?1 AND archived_at IS NULL",
         )?;
         let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], row_to_context_row)?;
@@ -7374,6 +7407,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         cast_id: read_opt_cast_id(row, 20)?,
         origin_host: row.get(21)?,
         played_by: read_opt_principal_id(row, 22)?,
+        reviewer_id: read_opt_principal_id(row, 23)?,
     })
 }
 
@@ -7766,6 +7800,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         cast_id: None,
         origin_host: None,
         played_by: None,
+        reviewer_id: None,
     }
 }
 
@@ -9571,6 +9606,7 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
+            reviewer_id: None,
         };
 
         let ctx = row.to_context();
@@ -9626,11 +9662,13 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
+            reviewer_id: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
         // Insert child forked from parent, playing under `cast_id`.
         let child_id = ContextId::new();
+        let reviewer = PrincipalId::new();
         let child = ContextRow {
             context_id: child_id,
                         label: Some("child-fork".into()),
@@ -9655,6 +9693,7 @@ mod tests {
             cast_id: Some(cast_id),
             origin_host: None,
             played_by: None,
+            reviewer_id: Some(reviewer),
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -9675,10 +9714,12 @@ mod tests {
         assert!(recovered.preset_id.is_none());
         assert_eq!(recovered.cast_id, Some(cast_id));
         assert_eq!(recovered.played_by, None, "NULL played_by preserves today's behavior");
+        assert_eq!(recovered.reviewer_id, Some(reviewer));
 
         // Verify list_active_contexts returns both
         let active = db.list_active_contexts().unwrap();
         assert_eq!(active.len(), 2);
+        assert_eq!(active.iter().find(|row| row.context_id == child_id).unwrap().reviewer_id, Some(reviewer));
 
         // Verify to_context() preserves forked_from
         let ctx = recovered.to_context();
@@ -9709,6 +9750,29 @@ mod tests {
         db.update_played_by(child_id, None).unwrap();
         let cleared_played = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(cleared_played.played_by, None);
+
+        db.update_context_review(child_id, Some(character), Some(reviewer)).unwrap();
+        let reviewed = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(reviewed.played_by, Some(character));
+        assert_eq!(reviewed.reviewer_id, Some(reviewer));
+        db.conn.execute("INSERT INTO approval_statements (statement_digest, rendered, statement_kind, has_free_vars) VALUES ('review-test', 'echo ok', 'command', 0)", []).unwrap();
+        for scope in ["session", "global"] {
+            db.conn.execute("INSERT INTO approval_rules (rule_id, statement_digest, authorized_label, context_id, scope, allow) VALUES (?1, 'review-test', 'shell', ?2, ?1, 1)", params![scope, child_id.as_bytes().as_slice()]).unwrap();
+            db.conn.execute("INSERT INTO approval_rule_families (rule_id, family_key, context_id, scope, allow) VALUES (?1, 'echo', ?2, ?1, 1)", params![scope, child_id.as_bytes().as_slice()]).unwrap();
+        }
+        db.update_context_review(child_id, Some(character), Some(PrincipalId::new())).unwrap();
+        for table in ["approval_rules", "approval_rule_families"] {
+            let active: i64 = db.conn.query_row(&format!("SELECT count(*) FROM {table} WHERE revoked_at IS NULL"), [], |row| row.get(0)).unwrap();
+            assert_eq!(active, 2, "a reviewer change does not transfer the performer's rules");
+        }
+        db.update_context_review(child_id, None, None).unwrap();
+        for table in ["approval_rules", "approval_rule_families"] {
+            let scopes: Vec<String> = db.conn.prepare(&format!("SELECT scope FROM {table} WHERE revoked_at IS NULL")).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            assert_eq!(scopes, ["global"], "a new performer must not inherit session rules");
+        }
+        let cleared_review = db.get_context(child_id).unwrap().unwrap();
+        assert_eq!(cleared_review.played_by, None);
+        assert_eq!(cleared_review.reviewer_id, None);
     }
 
     // ── 22. FK violation produces Validation, not LabelConflict ──────────
@@ -9756,6 +9820,7 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
+            reviewer_id: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(

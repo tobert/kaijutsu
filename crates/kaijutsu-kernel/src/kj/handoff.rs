@@ -328,6 +328,7 @@ impl KjDispatcher {
             cast_id: None,
             origin_host: None,
             played_by: Some(target.principal_id),
+            reviewer_id: None,
         };
         db.insert_context_with_document(&row, default_ws)
             .map_err(|e| e.to_string())?;
@@ -395,6 +396,8 @@ mod tests {
     fn caller_as(principal_id: PrincipalId) -> super::super::KjCaller {
         super::super::KjCaller {
             principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id: None,
             session_id: SessionId::new(),
             confirmed: false,

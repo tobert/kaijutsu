@@ -511,6 +511,8 @@ mod tests {
         let caller = kaijutsu_types::PrincipalId::new();
         let unjoined = super::super::KjCaller {
             principal_id: caller,
+            actor_id: caller,
+            reviewer_id: None,
             context_id: None,
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,

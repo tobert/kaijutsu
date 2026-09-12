@@ -51,9 +51,24 @@ impl KjDispatcher {
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_as(name, principal, principal, None, context_id, session_id, semantic_index, block_source).await
+    }
+
+    /// Materialize a shell with an explicit performer and delegated reviewer.
+    /// `principal` stays the authenticated requester; nested `kj` commands
+    /// retain `actor` even when the shell switches its active context.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn materialize_context_kaish_as(
+        &self, name: &str, principal: PrincipalId, actor: PrincipalId,
+        reviewer: Option<PrincipalId>, context_id: ContextId, session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> Result<EmbeddedKaish> {
         self.materialize_context_kaish_inner(
             name,
             principal,
+            actor,
+            reviewer,
             context_id,
             session_id,
             semantic_index,
@@ -85,9 +100,22 @@ impl KjDispatcher {
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_internal_as(name, principal, principal, None, context_id, session_id, semantic_index, block_source).await
+    }
+
+    /// Internal-output materialization retaining an explicit performer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn materialize_context_kaish_internal_as(
+        &self, name: &str, principal: PrincipalId, actor: PrincipalId,
+        reviewer: Option<PrincipalId>, context_id: ContextId, session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> Result<EmbeddedKaish> {
         self.materialize_context_kaish_inner(
             name,
             principal,
+            actor,
+            reviewer,
             context_id,
             session_id,
             semantic_index,
@@ -112,9 +140,39 @@ impl KjDispatcher {
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_rc_as(
+            name,
+            principal,
+            principal,
+            None,
+            context_id,
+            session_id,
+            semantic_index,
+            block_source,
+        )
+        .await
+    }
+
+    /// Materialize a trusted rc shell while retaining the invoking actor and
+    /// reviewer. `principal` remains the requester so rc-authored blocks keep
+    /// their existing attribution.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn materialize_context_kaish_rc_as(
+        &self,
+        name: &str,
+        principal: PrincipalId,
+        actor: PrincipalId,
+        reviewer: Option<PrincipalId>,
+        context_id: ContextId,
+        session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> Result<EmbeddedKaish> {
         self.materialize_context_kaish_inner(
             name,
             principal,
+            actor,
+            reviewer,
             context_id,
             session_id,
             semantic_index,
@@ -146,9 +204,22 @@ impl KjDispatcher {
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_read_only_as(name, principal, principal, None, context_id, session_id, semantic_index, block_source).await
+    }
+
+    /// Read-only materialization retaining the performer of a model turn.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn materialize_context_kaish_read_only_as(
+        &self, name: &str, principal: PrincipalId, actor: PrincipalId,
+        reviewer: Option<PrincipalId>, context_id: ContextId, session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> Result<EmbeddedKaish> {
         self.materialize_context_kaish_inner(
             name,
             principal,
+            actor,
+            reviewer,
             context_id,
             session_id,
             semantic_index,
@@ -168,6 +239,8 @@ impl KjDispatcher {
         &self,
         name: &str,
         principal: PrincipalId,
+        actor: PrincipalId,
+        reviewer: Option<PrincipalId>,
         context_id: ContextId,
         session_id: SessionId,
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
@@ -228,10 +301,12 @@ impl KjDispatcher {
                     // tool name, so this replaces kaish's `ps` for kaijutsu
                     // shells only and leaves kaish's own surface untouched.
                     tools.register(crate::runtime::ps_builtin::PsBuiltin::new(true));
-                    tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
+                    tools.register(crate::runtime::kj_builtin::KjBuiltin::new_as(
                         d,
                         scm,
                         principal,
+                        actor,
+                        reviewer,
                         sid,
                         semantic_index,
                         block_source,

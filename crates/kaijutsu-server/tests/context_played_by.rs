@@ -22,13 +22,10 @@ use kaijutsu_server::{AuthDb, SshServer, SshServerConfig};
 use kaijutsu_types::PrincipalId;
 use russh::keys::{Algorithm, PrivateKey};
 
-/// A context created by the seeded `hajime` character (every ephemeral test
-/// kernel's anonymous auto-register target, and so every plain
-/// `connect_client` session in this suite) is played by hajime — the
-/// creating principal's own character, the only candidate default for a
-/// context with no enclosing context to inherit from.
+/// A normal wire-created context has a requester but no performer. Creating
+/// a context does not silently make the connected human the model actor.
 #[test]
-fn create_context_sets_played_by_to_the_creating_principals_character() {
+fn create_context_leaves_played_by_unset() {
     run_local(async {
         let (addr, kernel) = start_server_with_kernel_handle().await;
         let client = connect_client(addr).await;
@@ -56,8 +53,8 @@ fn create_context_sets_played_by_to_the_creating_principals_character() {
         );
         assert_eq!(
             row.played_by,
-            Some(hajime.principal_id),
-            "a context created by a character must default played_by to that character"
+            None,
+            "ordinary context creation records its requester, not an inferred performer"
         );
     });
 }

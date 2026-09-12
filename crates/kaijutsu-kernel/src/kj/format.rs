@@ -538,6 +538,7 @@ mod tests {
             cast_id: None,
             origin_host: None,
             played_by: None,
+            reviewer_id: None,
         }
     }
 

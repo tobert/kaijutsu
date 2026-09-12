@@ -19,7 +19,7 @@ use kaijutsu_kernel::{
     block_store::SharedBlockStore, flows::SharedBlockFlowBus, kernel_db::KernelDb, Kernel,
 };
 use kaijutsu_kernel::runtime::embedded_kaish::EmbeddedKaish;
-use kaijutsu_types::{BlockId, ContentType, ContextId, KernelId, PrincipalId, SessionId, Status};
+use kaijutsu_types::{BlockId, ContentType, ContextId, PrincipalId, Status};
 
 use crate::rpc::{
     block_output_data, exec_result_to_hook_tool_result, overwrite_block_text, persist_shell_state,
@@ -72,9 +72,7 @@ pub(crate) async fn run_into_blocks(
     block_flows: &SharedBlockFlowBus,
     kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
     kernel: &Arc<Kernel>,
-    principal_id: PrincipalId,
-    session_id: SessionId,
-    kernel_id: KernelId,
+    call_ctx: &kaijutsu_kernel::mcp::CallContext,
     on_context_switch: ContextSwitchSink<'_>,
 ) {
     // Yield to let the event loop flush BlockInserted events to clients
@@ -290,15 +288,9 @@ pub(crate) async fn run_into_blocks(
             // `call_tool` caller getting `Denied` instead of the result
             // it actually produced.
             let hook_result = exec_result_to_hook_tool_result(&result);
-            let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
-                principal_id,
-                context_id,
-                session_id,
-                kernel_id,
-            );
             match kernel
                 .broker()
-                .shell_post_call_hooks(code, &call_ctx, &hook_result)
+                .shell_post_call_hooks(code, call_ctx, &hook_result)
                 .await
             {
                 kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
@@ -355,17 +347,11 @@ pub(crate) async fn run_into_blocks(
             // `call_tool`'s OnError; `Proceed`/`Deny` both leave the
             // real error above standing — a failed command is already
             // the terminal state a `Deny` would produce.
-            let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
-                principal_id,
-                context_id,
-                session_id,
-                kernel_id,
-            );
             let mcp_err = kaijutsu_kernel::mcp::McpError::Protocol(e.to_string());
             if let kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) =
                 kernel
                     .broker()
-                    .shell_on_error_hooks(code, &call_ctx, &mcp_err)
+                    .shell_on_error_hooks(code, call_ctx, &mcp_err)
                     .await
             {
                 let text = shell_hook_result_text(&sc_result);
@@ -422,9 +408,9 @@ mod fill_tests {
             kernel.block_flows(),
             kernel.kernel_db(),
             &kernel,
-            PrincipalId::system(),
-            SessionId::new(),
-            kernel.id(),
+            &kaijutsu_kernel::mcp::CallContext::new(
+                PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id(),
+            ),
             None,
         )
         .await;

@@ -145,6 +145,10 @@ fn parse_positive_context_env(
 #[derive(Debug, Clone)]
 pub struct KjCaller {
     pub principal_id: PrincipalId,
+    /// Character performing the invocation, independent of its requester.
+    pub actor_id: PrincipalId,
+    /// Character delegated to review this actor's work.
+    pub reviewer_id: Option<PrincipalId>,
     pub context_id: Option<ContextId>,
     pub session_id: SessionId,
     /// True when the caller passed `--confirm` (destructive op confirmed).
@@ -164,6 +168,11 @@ pub struct KjCaller {
 }
 
 impl KjCaller {
+    pub fn with_actor(mut self, actor_id: PrincipalId, reviewer_id: Option<PrincipalId>) -> Self {
+        self.actor_id = actor_id;
+        self.reviewer_id = reviewer_id;
+        self
+    }
     /// Return the active context or a friendly `KjResult::Err` for subcommands that
     /// cannot operate without one. Use with `?` inside any dispatch leaf that reads
     /// `context_id` — the dispatcher's early-return in `dispatch()` normally catches
@@ -1368,8 +1377,11 @@ pub(crate) mod test_helpers {
     /// Capability tests construct non-privileged callers explicitly via
     /// [`caller_with_context`].
     pub fn test_caller() -> KjCaller {
+        let principal_id = PrincipalId::new();
         KjCaller {
-            principal_id: PrincipalId::new(),
+            principal_id,
+            actor_id: principal_id,
+            reviewer_id: Some(test_reviewer_principal()),
             context_id: Some(ContextId::new()),
             session_id: SessionId::new(),
             confirmed: false,
@@ -1378,10 +1390,21 @@ pub(crate) mod test_helpers {
         }
     }
 
+    /// The assigned reviewer for ordinary gate/ledger fixtures. Keeping one
+    /// stable identity lets a second test seat represent the director who
+    /// reviews work from otherwise fresh test callers.
+    pub fn test_reviewer_principal() -> PrincipalId {
+        static REVIEWER: std::sync::OnceLock<PrincipalId> = std::sync::OnceLock::new();
+        *REVIEWER.get_or_init(PrincipalId::new)
+    }
+
     /// Create a caller with a specific context_id.
     pub fn caller_with_context(context_id: ContextId) -> KjCaller {
+        let principal_id = PrincipalId::new();
         KjCaller {
-            principal_id: PrincipalId::new(),
+            principal_id,
+            actor_id: principal_id,
+            reviewer_id: Some(test_reviewer_principal()),
             context_id: Some(context_id),
             session_id: SessionId::new(),
             confirmed: false,
@@ -1395,8 +1418,11 @@ pub(crate) mod test_helpers {
     /// control-plane fixture, and some destructive-op tests target unregistered
     /// contexts that carry no binding.
     pub fn confirmed_caller(context_id: ContextId) -> KjCaller {
+        let principal_id = PrincipalId::new();
         KjCaller {
-            principal_id: PrincipalId::new(),
+            principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id: Some(context_id),
             session_id: SessionId::new(),
             confirmed: true,
@@ -1458,6 +1484,7 @@ pub(crate) mod test_helpers {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
+                reviewer_id: None,
             };
             db.insert_context(&row).unwrap();
 
@@ -1510,8 +1537,11 @@ mod unjoined_context_tests {
     /// A caller with no joined context — the state the kernel sees when the
     /// shell dispatches `kj <cmd>` before the user has run `kj context switch`.
     fn unjoined_caller() -> KjCaller {
+        let principal_id = PrincipalId::new();
         KjCaller {
-            principal_id: PrincipalId::new(),
+            principal_id,
+            actor_id: principal_id,
+            reviewer_id: None,
             context_id: None,
             session_id: SessionId::new(),
             confirmed: false,
