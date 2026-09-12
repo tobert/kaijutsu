@@ -63,7 +63,14 @@ pub struct ScreenPlugin;
 
 impl Plugin for ScreenPlugin {
     fn build(&self, app: &mut App) {
-        app.init_state::<Screen>().register_type::<Screen>();
+        // `State`/`NextState` are registered so BRP can read the screen and
+        // request a transition (`world.insert_resources` on `NextState<Screen>`
+        // with `{"Pending": "Fsn"}`), the only way into a screen no key
+        // reaches.
+        app.init_state::<Screen>()
+            .register_type::<Screen>()
+            .register_type::<State<Screen>>()
+            .register_type::<NextState<Screen>>();
 
         // ── Conversation ──
         app.add_systems(
