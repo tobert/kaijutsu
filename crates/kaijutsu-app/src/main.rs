@@ -292,6 +292,14 @@ fn main() {
         // The Ctrl+A prefix's own overlay — peeks while the prefix is armed,
         // `Ctrl+A h` holds it (docs/input.md).
         .add_plugins(ui::quick_context::QuickContextPlugin)
+        // Approval review (docs/tui.md "Asks" and "The ledger"): the ask
+        // sheet raises itself on a pending ask in the context on screen, and
+        // `Ctrl+A l` opens the ledger ribbon over it. Both read
+        // `LedgerMirror` and write their decisions back through it, so they
+        // must come after LedgerMirrorPlugin; the dock's hints line reads
+        // `AskNotice`, which AskSheetPlugin owns.
+        .add_plugins(ui::ask_sheet::AskSheetPlugin)
+        .add_plugins(ui::ledger_ribbon::LedgerRibbonPlugin)
         // Drift state - context list + staged queue polling
         .add_plugins(connection::drift::DriftPlugin)
         // Attached-peer roster polling (kernel peer registry) — powers the

@@ -37,6 +37,7 @@ pub enum Action {
     /// - Navigation: edit focused User Text block
     /// - Dialog: confirm
     /// - Dashboard: select
+    /// - Ledger ribbon: open the ask sheet on the selected row
     Activate,
 
     // ========================================================================
@@ -152,7 +153,8 @@ pub enum Action {
     // Scene navigation (RoomNav / WellZoomed / StationZoomed)
     // ========================================================================
     /// Step forward within the current level: next carousel station, next
-    /// ring seat (spinning it to the gate).
+    /// ring seat (spinning it to the gate), next ledger row, one line down
+    /// the ask sheet's plan.
     StepNext,
     /// Step backward within the current level.
     StepPrev,
@@ -224,6 +226,35 @@ pub enum Action {
     /// beneath it, so exactly one action fires — docs/input.md "Escape — two
     /// meanings total".
     UnpinQuickContext,
+
+    // ========================================================================
+    // Approval review (the ask sheet and the ledger ribbon; docs/tui.md
+    // "Asks" and "The ledger")
+    // ========================================================================
+    /// `a` on an ask — allow it this once (`kj ledger allow <id>`).
+    AskAllowOnce,
+    /// `A` on an ask — allow it and remember the rule
+    /// (`kj ledger allow <id> --remember always`).
+    AskAllowAlways,
+    /// `d` on an ask — deny it (`kj ledger deny <id>`). Only ever the letter
+    /// `d` with no prefix armed: `Ctrl+A d` is the detach chord, never a
+    /// deny.
+    AskDeny,
+    /// Esc on the ask sheet — put the card aside with the ask still pending.
+    /// A distinct action rather than [`Action::PopLevel`] for the reason
+    /// [`Action::UnpinQuickContext`] gives: the sheet floats over a screen
+    /// whose own PopLevel consumers are context-blind, so its own context
+    /// claims the key and no PopLevel is emitted at all.
+    AskAside,
+    /// `]` on the ask sheet — show the next pending ask, across every context.
+    AskNext,
+    /// `[` on the ask sheet — show the previous pending ask.
+    AskPrev,
+    /// `Ctrl+A l`, or `v` on the ask sheet — open the ledger ribbon. Firing
+    /// it again closes it.
+    OpenLedger,
+    /// Esc on the ledger ribbon — close it, and only it.
+    CloseLedger,
 
     // ========================================================================
     // Context Interrupt (Ctrl+C in TextInput/Navigation)

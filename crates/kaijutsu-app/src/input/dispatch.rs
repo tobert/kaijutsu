@@ -374,7 +374,13 @@ fn context_priority(ctx: InputContext) -> usize {
         // the level underneath. It does NOT outrank a modal: a dialog on
         // screen still owns Esc.
         InputContext::QuickContext => 2,
-        InputContext::Dialog => 3, // Dialog beats everything
+        // An approval ask waiting on you outranks a pinned peek: its Esc
+        // must put the ask aside, not release the overlay behind it. The
+        // ribbon in turn outranks the sheet, because it is what the sheet's
+        // `v` opens (`input::context::ApprovalSurfaces::claimant`).
+        InputContext::AskSheet => 3,
+        InputContext::LedgerRibbon => 4,
+        InputContext::Dialog => 5, // Dialog beats everything
     }
 }
 
@@ -457,5 +463,64 @@ mod tests {
             context_priority(InputContext::QuickContext) > context_priority(InputContext::RoomNav)
         );
         assert!(context_priority(InputContext::RoomNav) > context_priority(InputContext::Global));
+    }
+
+    /// An ask waiting on you outranks a pinned peek — its Esc must put the
+    /// ask aside, not release the overlay behind it — and the ribbon
+    /// outranks the sheet it opens over. A modal still beats both.
+    #[test]
+    fn context_priority_ranks_the_approval_surfaces_above_the_peek() {
+        assert!(
+            context_priority(InputContext::AskSheet) > context_priority(InputContext::QuickContext)
+        );
+        assert!(
+            context_priority(InputContext::LedgerRibbon)
+                > context_priority(InputContext::AskSheet)
+        );
+        assert!(
+            context_priority(InputContext::Dialog)
+                > context_priority(InputContext::LedgerRibbon)
+        );
+    }
+
+    /// Esc with the ask sheet up fires exactly one action, and it is the
+    /// sheet's — not the conversation's `PopLevel`, not the held overlay's
+    /// release.
+    #[test]
+    fn escape_on_the_ask_sheet_puts_the_ask_aside_and_nothing_else() {
+        let map = shipped_map();
+        let keys = ButtonInput::<KeyCode>::default();
+        let matched = find_direct_match(KeyCode::Escape, &keys, &map, |ctx| {
+            matches!(
+                ctx,
+                InputContext::Global
+                    | InputContext::Navigation
+                    | InputContext::QuickContext
+                    | InputContext::AskSheet
+            )
+        });
+        assert_eq!(matched, Some((Action::AskAside, InputContext::AskSheet)));
+    }
+
+    /// `a` and `d` on the sheet are the decision keys, not the well's
+    /// archive and demote — the sheet's context is the only surface one
+    /// derived while it is up, so there is nothing for them to collide with.
+    #[test]
+    fn the_sheet_claims_the_decision_letters() {
+        let map = shipped_map();
+        let keys = ButtonInput::<KeyCode>::default();
+        let active = |ctx| matches!(ctx, InputContext::Global | InputContext::AskSheet);
+        assert_eq!(
+            find_direct_match(KeyCode::KeyA, &keys, &map, active),
+            Some((Action::AskAllowOnce, InputContext::AskSheet))
+        );
+        assert_eq!(
+            find_direct_match(KeyCode::KeyD, &keys, &map, active),
+            Some((Action::AskDeny, InputContext::AskSheet))
+        );
+        assert_eq!(
+            find_direct_match(KeyCode::KeyV, &keys, &map, active),
+            Some((Action::OpenLedger, InputContext::AskSheet))
+        );
     }
 }

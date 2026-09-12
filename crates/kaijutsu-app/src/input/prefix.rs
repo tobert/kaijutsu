@@ -109,6 +109,9 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // on screen by the time this key is pressed: arming the prefix peeks
         // it (`ui::quick_context`), and `h` is what keeps it there.
         KeyCode::KeyH => Some(Action::HoldQuickContext),
+        // l — the ledger ribbon (docs/tui.md, "The ledger"): every pending
+        // ask across every context. A toggle; the surface latches.
+        KeyCode::KeyL => Some(Action::OpenLedger),
         // Esc cancels the pending prefix quietly.
         KeyCode::Escape => None,
         _ => None,
@@ -166,6 +169,32 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::KeyA, true, true),
             Some(Action::SwitchToPreviousContext)
+        );
+    }
+
+    /// `l` opens the ledger ribbon (docs/tui.md, "The ledger"). It is a
+    /// toggle: the chord fires the same action whether the ribbon is up or
+    /// down, and the surface latches.
+    #[test]
+    fn l_opens_the_ledger_ribbon() {
+        assert_eq!(
+            resolve_chord(KeyCode::KeyL, false, false),
+            Some(Action::OpenLedger)
+        );
+        assert_eq!(
+            resolve_chord(KeyCode::KeyL, true, false),
+            Some(Action::OpenLedger)
+        );
+    }
+
+    /// `Ctrl+A d` is the detach chord, and stays the detach chord while an
+    /// ask is on screen — a deny must never be one fumbled prefix away
+    /// (docs/tui.md, "Asks").
+    #[test]
+    fn ctrl_a_d_is_detach_never_a_deny() {
+        assert_eq!(
+            resolve_chord(KeyCode::KeyD, false, false),
+            Some(Action::DetachToConversation)
         );
     }
 

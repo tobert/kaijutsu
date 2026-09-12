@@ -573,7 +573,10 @@ pub fn render_quick_context(
 /// Semantic tone → an existing theme color. No new `ThemeData` fields: the
 /// panel borrows the same palette the dock chrome already uses, so a theme
 /// that never heard of this overlay still styles it correctly.
-fn tone_color(tone: LineTone, theme: &Theme) -> Color {
+///
+/// Shared with the approval surfaces (`ui::msdf_panel`), which are the same
+/// kind of panel and must not grow a second tone palette.
+pub(crate) fn tone_color(tone: LineTone, theme: &Theme) -> Color {
     match tone {
         LineTone::Head => theme.accent,
         LineTone::Row => theme.fg,

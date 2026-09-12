@@ -94,6 +94,16 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
    `InputContext::QuickContext`, whose one binding is Esc →
    `UnpinQuickContext` — see the Escape section for why that is a distinct
    action rather than `PopLevel`.
+5. **The approval surfaces take the keyboard** (`ui/ask_sheet.rs`,
+   `ui/ledger_ribbon.rs`, 2026-09-12). A pending ask in the context on
+   screen raises the **ask sheet**; `Ctrl+A l` opens the **ledger ribbon**.
+   While either is up, `derive_contexts` returns *only* its own context
+   beside `Global` and `KeyboardGrab::None` — the compose VimMachine is
+   suspended, which is what holds typed text, so `a` is an allow and never
+   an `a` in the draft. The prefix still wins over both (it is in front of
+   everything), so `Ctrl+A d` stays the detach chord and is never a deny.
+   Neither raises on `Screen::Editor` or `Screen::Diff`: a vi surface owns
+   the keys wherever it is live.
 
 ## The prefix table
 
@@ -115,6 +125,7 @@ list.
 | `Ctrl+A n` / `p` | Next / previous ring-0 seat | next/prev |
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
+| `Ctrl+A l` | Open the ledger ribbon — every pending approval ask across every context, plus the last few decisions (`docs/tui.md`, "The ledger"); again closes it. Conversation and Room only; elsewhere it says so on the hints line | (new) |
 | *(armed)* | The footer hint line shows the whole chord table while a prefix is pending — the legend appears exactly when you need it, so there is no separate `?` overlay | help |
 
 **The prefilled-`kj` prompt pattern** (Amy, 2026-07-16: "pop a kj so the
@@ -135,13 +146,18 @@ exactly one action.
 | Diff viewer (`Screen::Diff`) | To the app-local `DiffCore` (visual → normal). **Never closes the screen** — that is `q`/`ZQ`/`:q` (`docs/diff.md` slice 5) |
 | Compose overlay | To the VimMachine (mode switch); double-Esc in Normal mode dismisses (kept — works in practice) |
 | Quick-context overlay, **held** | Releases the hold, and nothing else — the level underneath stays put |
+| Ask sheet | `AskAside` — puts the ask **aside**, still pending, and nothing else |
+| Ledger ribbon | `CloseLedger` — closes the ribbon, returning to the sheet behind it if one was raised |
 | Everywhere else | `PopLevel`, one resolver walking the level ladder: well focus → overview → room; station → room; room → conversation; dialog → cancel |
 
 The held overlay is the one surface that floats over *every* screen, so it
 cannot rely on the usual mutual exclusion (each `PopLevel` consumer is gated
 by the screen it belongs to). It gets its Esc the way the doctrine says to:
 an `InputContext` in the table, `QuickContext`, ranked above every surface
-and below `Dialog` (a modal still owns Esc). Because context priority makes
+and below `Dialog` (a modal still owns Esc). The approval surfaces sit
+between them: `AskSheet` above `QuickContext` (an ask waiting on you outranks
+a pinned peek), `LedgerRibbon` above the sheet it opens over, and `Dialog`
+still above everything. Because context priority makes
 the dispatcher pick exactly one binding, Esc there fires
 `UnpinQuickContext` and **no `PopLevel` is emitted at all** — that is what
 keeps "exactly one action per Esc" true without adding a consumed flag.
@@ -157,6 +173,8 @@ releases the hold instead.
 | WellZoomed | `0–9` seat of *focused* ring · `←/→/Tab` spin · `↑/↓` ring (Up at the top ring → hero pose) · `Enter` focus/commit · `p d c z a` verbs · `h` horizon dive (stub) · `?` legend · `Esc` pop |
 | StationZoomed (plain) | `↑/Esc` pop |
 | QuickContext (overlay held) | `Esc` release the hold — the only binding it carries; layered over whichever surface is underneath |
+| AskSheet (an ask waiting on you) | `a` allow once · `A` allow always · `d` deny · `v` ledger · `]`/`[` next/previous pending ask, across every context · `j/k` scroll the plan · `Esc` aside |
+| LedgerRibbon (`Ctrl+A l`) | `a`/`A`/`d` answer the selected row · `j/k` (and `↑/↓`) move · `Enter` open the sheet on it · `Esc` close |
 
 `Screen::Diff` has no `InputContext` of its own on purpose: it is a *grab*,
 so its keys never reach the binding table. `v` in Navigation opens it; inside,

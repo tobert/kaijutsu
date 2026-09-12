@@ -858,19 +858,36 @@ discard or refetch results from the old connection. Peer reattachment is
 remembered by the actor only after its first `attach_peer` call; a cold-start
 failure before that call also needs a complete bootstrap retry.
 
-## Bevy approval review has no dedicated UI (2026-09-12)
+## Bevy approval review: the surfaces shipped, two gaps left (2026-09-12)
 
-`connection::ledger::LedgerMirror` now holds the pending set and the last
-three decided asks, rebuilt on connect, on a stream lag, and on every ledger
-generation bump. Two consumers read it: the switchboard lamp's ask hue and
-the dock's `!n`. What is still missing is the surface: no pending-ask list,
-no review controls, and a waiting block still gets a generic status label.
-Add a ledger surface through the shared action table, with the TUI's
-`Ctrl+A l` chord, the mirror's pending snapshot and `AskDetail::can_review`,
-and explicit requester/performer/reviewer detail. Context creation and
-review assignment also have no app UI: use `kj context create --as` so the
-performer exists before rc. The connected character is the director; reviewer assignment
-follows explicit delegation or the Amy default.
+The ask sheet (`ui/ask_sheet.rs`) and the ledger ribbon
+(`ui/ledger_ribbon.rs`, `Ctrl+A l`) read `connection::ledger::LedgerMirror`
+and write decisions back through it, with `InputContext::AskSheet` and
+`InputContext::LedgerRibbon` taking the keyboard while either is up. What is
+still missing:
+
+- **A waiting block still gets a generic status label.** The conversation
+  does not say "this turn is waiting on an ask", only the hints line's `!n`
+  and the sheet do.
+- **Context creation and review assignment have no app UI.** Use
+  `kj context create --as` so the performer exists before rc. The connected
+  character is the director; reviewer assignment follows explicit delegation
+  or the Amy default.
+- **The PLAN block renders a flat statement list**, which is all
+  `kj ledger show` carries. A plan tree and per-statement verdicts would
+  need kernel fields first; the block is shaped to take them.
+- **Neither surface's state is BRP-visible**, so a live check can only read
+  `ActiveInputContexts` to tell whether the sheet or the ribbon has the keys.
+  `AskSheetState` would need `Reflect` on its `HashSet<String>` and
+  `Option<ContextId>`; that plus a way to raise a test ask is what a
+  pixel-level check of the sheet needs.
+
+## `kaijutsu-kernel`'s broker_e2e test does not compile (2026-09-12)
+
+`crates/kaijutsu-kernel/tests/broker_e2e.rs:52` and `:1470` build a
+`ContextRow` without `director_id`, so `cargo test --workspace` fails to
+compile that target. Present before the approval surfaces landed (verified
+against a clean tree); two field initializers away from building.
 
 ## The tui and the app disagree on a few chords (2026-09-03)
 
@@ -883,8 +900,8 @@ stand:
   `Ctrl+A A` (rename), `Ctrl+A q` (close+demote), `Ctrl+A d` (detach). The
   tui names each one's future meaning on the status line.
 - **Tui ahead, not claimed in the app's table (no conflict rolling them in):**
-  `Ctrl+A l` (ledger — app has no ledger surface), `Ctrl+A [` (copy mode),
-  `Ctrl+A ]` (tui's own yank buffer, not the OS clipboard).
+  `Ctrl+A [` (copy mode), `Ctrl+A ]` (tui's own yank buffer, not the OS
+  clipboard). `Ctrl+A l` is now in both.
 - **`Ctrl+Z`** is suspend in the tui, `ToggleSurface` (chat/shell) in the app
   — the tui retired the shell surface for `:!`, the app still has the
   toggle. Name this in `docs/input.md` or retire the app's toggle.

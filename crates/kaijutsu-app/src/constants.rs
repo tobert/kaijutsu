@@ -22,6 +22,7 @@ pub const WINDOW_HEIGHT_FRACTION: f32 = 0.80;
 /// - **Cursor** (20): Cursor overlay in focused document
 /// - **HUD** (50): Dock containers (North/South) and HUD panels
 /// - **Modal** (100): Input layer, dropdowns, command palette
+/// - **AskSheet** (150) / **LedgerRibbon** (160): Approval review
 /// - **Dropdown** (200): Dropdown menus above modals
 /// - **Toast** (250): Notifications, transient messages
 ///
@@ -48,6 +49,19 @@ impl ZLayer {
     pub const QUICK_CONTEXT: i32 = 75;
     /// Modal overlays (input layer, command palette)
     pub const MODAL: i32 = 100;
+    /// The ask sheet (`ui::ask_sheet`) — an approval ask waiting on this
+    /// player.
+    ///
+    /// **Above [`Self::MODAL`], for the same reason
+    /// [`Self::QUICK_CONTEXT`] is below it**: painting order must agree with
+    /// input priority. While the sheet is up it takes the keyboard outright
+    /// — `input::context::derive_contexts` suspends the compose grab — so
+    /// the compose overlay at the modal layer must not paint over a surface
+    /// the keyboard no longer controls.
+    pub const ASK_SHEET: i32 = 150;
+    /// The ledger ribbon (`ui::ledger_ribbon`), which is what the sheet's
+    /// `v` opens — so it paints over the sheet, as it outranks it for keys.
+    pub const LEDGER_RIBBON: i32 = 160;
     /// Dropdown menus (above modals). No user today: the quick-context
     /// overlay deliberately takes [`Self::QUICK_CONTEXT`] instead (see
     /// there), so this stays reserved rather than deleted — a real dropdown

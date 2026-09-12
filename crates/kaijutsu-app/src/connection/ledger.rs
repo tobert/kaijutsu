@@ -105,7 +105,13 @@ impl LedgerMirror {
 
     /// One ask by request id, pending first, then the decided few. `None`
     /// means this mirror has never held it, not that the ledger lacks it.
-    ///
+    pub fn get(&self, request_id: &str) -> Option<&AskDetail> {
+        self.pending
+            .iter()
+            .chain(self.recent.iter())
+            .find(|ask| ask.request_id == request_id)
+    }
+
     /// Whether a round should start now. The caller adds its own conditions:
     /// a live connection and a current context to run `kj` in.
     pub fn should_start_round(&self) -> bool {
@@ -281,6 +287,107 @@ pub fn apply_round(mirror: &mut LedgerMirror, round: RoundData) -> Vec<String> {
 }
 
 // ============================================================================
+// Pure: the decision
+// ============================================================================
+
+/// What a decision key asks the kernel for. The three options
+/// `kj ledger allow|deny` carries, named the way the key line names them
+/// (`docs/tui.md`, "Asks").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// `a` — `kj ledger allow <id>`.
+    AllowOnce,
+    /// `A` — `kj ledger allow <id> --remember always`.
+    AllowAlways,
+    /// `d` — `kj ledger deny <id>`.
+    Deny,
+}
+
+impl Decision {
+    /// The words a notice uses, matching `decided_option` as the kernel
+    /// records it: `allow once`, `allow always`, `deny`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow once",
+            Self::AllowAlways => "allow always",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// `(allow, remember)` as [`kaijutsu_client::decide_ask_remember`] takes
+    /// them.
+    fn verb(self) -> (bool, Option<kaijutsu_client::RememberScope>) {
+        match self {
+            Self::AllowOnce => (true, None),
+            Self::AllowAlways => (true, Some(kaijutsu_client::RememberScope::Always)),
+            Self::Deny => (false, None),
+        }
+    }
+}
+
+/// A surface asks the kernel to decide one ask. The ask sheet and the ledger
+/// ribbon both write this rather than calling RPC themselves, so `kj ledger`
+/// keeps exactly one caller in the app.
+#[derive(Message, Debug, Clone)]
+pub struct AskDecisionRequested {
+    pub request_id: String,
+    pub decision: Decision,
+}
+
+/// How the kernel answered a decision. Every arm is reported to the player:
+/// a refused write is never a silent nothing (`docs/tui.md`, "Asks").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionOutcome {
+    /// The kernel took it. The mirror's next round brings the ask down.
+    Accepted,
+    /// The kernel refused because the ask was already answered — a race lost
+    /// to another surface, which the ledger's `claim`+`decide` transaction
+    /// makes normal rather than exceptional (`kaijutsu_client::ledger`).
+    AlreadyDecided,
+    /// The write could not be made at all.
+    Failed(String),
+}
+
+/// One finished decision, for a surface to turn into a notice.
+#[derive(Message, Debug, Clone)]
+pub struct AskDecisionSettled {
+    pub request_id: String,
+    pub decision: Decision,
+    pub outcome: DecisionOutcome,
+}
+
+/// Read one `kj ledger allow|deny` exit into an outcome.
+///
+/// A nonzero exit is a lost race when the kernel says so and a plain failure
+/// otherwise; `stderr` decides which, because the exit code alone does not
+/// distinguish them.
+pub fn classify_decision(exit_code: i32, stderr: &str) -> DecisionOutcome {
+    if exit_code == 0 {
+        return DecisionOutcome::Accepted;
+    }
+    let lowered = stderr.to_lowercase();
+    if lowered.contains("already decided")
+        || lowered.contains("alreadydecided")
+        || lowered.contains("not pending")
+    {
+        return DecisionOutcome::AlreadyDecided;
+    }
+    let detail = stderr.trim();
+    DecisionOutcome::Failed(if detail.is_empty() {
+        format!("exit {exit_code}")
+    } else {
+        detail.lines().next().unwrap_or(detail).to_string()
+    })
+}
+
+/// The first segment of a request id — `01a04eb6` of
+/// `01a04eb6-aaaa-…` — the handle `kj ledger list` keys on and every notice
+/// names (`docs/tui.md`, "Asks").
+pub fn short_request_id(request_id: &str) -> &str {
+    request_id.split('-').next().unwrap_or(request_id)
+}
+
+// ============================================================================
 // Bevy glue
 // ============================================================================
 
@@ -308,24 +415,148 @@ impl LedgerRoundChannel {
     }
 }
 
-/// The ledger mirror and the three systems that keep it current. Add after
-/// `ActorPlugin`: the poll systems read `RpcActor`, and every renderer that
-/// reads [`LedgerMirror`] needs the resource to exist.
+/// One finished decision on its way back from the task that made it.
+struct DecisionResult {
+    request_id: String,
+    decision: Decision,
+    outcome: DecisionOutcome,
+}
+
+/// Drain-once channel for finished decisions, the shape
+/// [`LedgerRoundChannel`] uses and for the same reason.
+#[derive(Resource)]
+struct DecisionChannel {
+    tx: crossbeam_channel::Sender<DecisionResult>,
+    rx: crossbeam_channel::Receiver<DecisionResult>,
+}
+
+impl DecisionChannel {
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        Self { tx, rx }
+    }
+}
+
+/// The ledger mirror, the decision write path, and the systems that keep
+/// them current. Add after `ActorPlugin`: the poll systems read `RpcActor`,
+/// and every renderer that reads [`LedgerMirror`] needs the resource to
+/// exist.
 pub struct LedgerMirrorPlugin;
 
 impl Plugin for LedgerMirrorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LedgerMirror>()
             .insert_resource(LedgerRoundChannel::new())
+            .insert_resource(DecisionChannel::new())
+            .add_message::<AskDecisionRequested>()
+            .add_message::<AskDecisionSettled>()
             .add_systems(
                 Update,
                 (
                     poll_ledger_events,
                     start_ledger_round,
                     drain_ledger_rounds,
+                    start_ask_decisions,
+                    drain_ask_decisions,
                 )
                     .chain(),
             );
+    }
+}
+
+/// Carry each requested decision to the kernel.
+///
+/// The surfaces do not change their own state on a keypress: this writes
+/// `kj ledger allow|deny` and the mirror's next round — the kernel bumps the
+/// ledger generation on a decision — is what brings the ask down. A request
+/// with no live connection is reported straight back as a failure rather
+/// than dropped, so a key never does nothing.
+fn start_ask_decisions(
+    actor: Option<Res<RpcActor>>,
+    conn: Res<RpcConnectionState>,
+    doc_cache: Res<crate::view::document::DocumentCache>,
+    channel: Res<DecisionChannel>,
+    mut requests: MessageReader<AskDecisionRequested>,
+    mut settled: MessageWriter<AskDecisionSettled>,
+) {
+    for AskDecisionRequested {
+        request_id,
+        decision,
+    } in requests.read()
+    {
+        let ready = actor
+            .as_ref()
+            .filter(|_| conn.connected)
+            .zip(doc_cache.active_id());
+        let Some((actor, context_id)) = ready else {
+            settled.write(AskDecisionSettled {
+                request_id: request_id.clone(),
+                decision: *decision,
+                outcome: DecisionOutcome::Failed("no live connection".to_string()),
+            });
+            continue;
+        };
+
+        let handle = actor.handle.clone();
+        let tx = channel.tx.clone();
+        let request_id = request_id.clone();
+        let decision = *decision;
+        let (allow, remember) = decision.verb();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                let outcome = match kaijutsu_client::decide_ask_remember(
+                    &handle,
+                    context_id,
+                    &request_id,
+                    allow,
+                    remember,
+                )
+                .await
+                {
+                    Ok(result) => classify_decision(result.exit_code, &result.stderr),
+                    Err(e) => DecisionOutcome::Failed(format!("{e}")),
+                };
+                let _ = tx.send(DecisionResult {
+                    request_id,
+                    decision,
+                    outcome,
+                });
+            })
+            .detach();
+    }
+}
+
+/// Publish finished decisions, and mark the mirror dirty on one the kernel
+/// took.
+///
+/// The generation bump normally covers that, but a bump we somehow miss must
+/// not leave an answered ask on screen — so this asks for a round outright
+/// rather than trusting the stream for the one change we started ourselves.
+fn drain_ask_decisions(
+    channel: Res<DecisionChannel>,
+    mut mirror: ResMut<LedgerMirror>,
+    mut settled: MessageWriter<AskDecisionSettled>,
+    event_loop_proxy: Res<EventLoopProxyWrapper>,
+) {
+    let mut any = false;
+    for result in channel.rx.try_iter() {
+        any = true;
+        match &result.outcome {
+            DecisionOutcome::Accepted | DecisionOutcome::AlreadyDecided => mirror.dirty = true,
+            DecisionOutcome::Failed(detail) => log::warn!(
+                "kj ledger {} {} failed: {detail}",
+                result.decision.label(),
+                short_request_id(&result.request_id)
+            ),
+        }
+        settled.write(AskDecisionSettled {
+            request_id: result.request_id,
+            decision: result.decision,
+            outcome: result.outcome,
+        });
+    }
+    if any {
+        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
     }
 }
 
@@ -835,6 +1066,83 @@ mod tests {
         assert_eq!(mirror.pending_count(), 3);
         assert!(mirror.context_is_asking(ctx(2)));
         assert!(!mirror.context_is_asking(ctx(3)));
+    }
+
+    #[test]
+    fn get_finds_an_ask_whether_it_is_pending_or_decided() {
+        let mut mirror = LedgerMirror::default();
+        mirror.pending = vec![ask("a", None, None)];
+        mirror.recent = vec![ask("b", None, Some(5))];
+        assert_eq!(mirror.get("a").map(|a| a.request_id.as_str()), Some("a"));
+        assert_eq!(mirror.get("b").map(|a| a.request_id.as_str()), Some("b"));
+        assert!(mirror.get("c").is_none(), "never held is not the same as not in the ledger");
+    }
+
+    // ── the decision ──
+
+    #[test]
+    fn a_clean_exit_is_the_kernel_taking_the_decision() {
+        assert_eq!(classify_decision(0, ""), DecisionOutcome::Accepted);
+    }
+
+    /// A lost race is normal, not a failure — two players share one ledger
+    /// and the kernel makes exactly one of them win.
+    #[test]
+    fn a_refusal_that_names_an_answered_ask_is_a_lost_race() {
+        for stderr in [
+            "error: ask already decided",
+            "AlreadyDecided",
+            "request 01a04eb6 is not pending",
+        ] {
+            assert_eq!(
+                classify_decision(1, stderr),
+                DecisionOutcome::AlreadyDecided,
+                "{stderr}"
+            );
+        }
+    }
+
+    /// Every other refusal keeps its own words, and a silent one still says
+    /// something — a key must never do nothing.
+    #[test]
+    fn any_other_refusal_reports_what_the_kernel_said() {
+        assert_eq!(
+            classify_decision(2, "permission denied\nbacktrace..."),
+            DecisionOutcome::Failed("permission denied".to_string()),
+            "the first line is the message, not the backtrace"
+        );
+        assert_eq!(
+            classify_decision(2, "   "),
+            DecisionOutcome::Failed("exit 2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_decision_names_itself_the_way_the_ledger_records_it() {
+        assert_eq!(Decision::AllowOnce.label(), "allow once");
+        assert_eq!(Decision::AllowAlways.label(), "allow always");
+        assert_eq!(Decision::Deny.label(), "deny");
+    }
+
+    #[test]
+    fn allow_always_is_the_only_option_that_remembers() {
+        assert_eq!(Decision::AllowOnce.verb(), (true, None));
+        assert_eq!(Decision::Deny.verb(), (false, None));
+        assert_eq!(
+            Decision::AllowAlways.verb(),
+            (true, Some(kaijutsu_client::RememberScope::Always))
+        );
+    }
+
+    /// The handle every notice uses is the ask's first id segment, the one
+    /// `kj ledger list` keys on.
+    #[test]
+    fn the_short_id_is_the_first_segment() {
+        assert_eq!(
+            short_request_id("01a04eb6-aaaa-bbbb-cccc-000000000001"),
+            "01a04eb6"
+        );
+        assert_eq!(short_request_id("bare"), "bare");
     }
 
     #[test]

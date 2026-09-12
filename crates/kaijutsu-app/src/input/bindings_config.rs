@@ -334,6 +334,8 @@ fn context_to_str(ctx: InputContext) -> String {
         InputContext::WellZoomed => "WellZoomed",
         InputContext::StationZoomed => "StationZoomed",
         InputContext::QuickContext => "QuickContext",
+        InputContext::AskSheet => "AskSheet",
+        InputContext::LedgerRibbon => "LedgerRibbon",
     }
     .to_string()
 }
@@ -348,6 +350,8 @@ fn parse_context(s: &str) -> Result<InputContext, String> {
         "WellZoomed" => Ok(InputContext::WellZoomed),
         "StationZoomed" => Ok(InputContext::StationZoomed),
         "QuickContext" => Ok(InputContext::QuickContext),
+        "AskSheet" => Ok(InputContext::AskSheet),
+        "LedgerRibbon" => Ok(InputContext::LedgerRibbon),
         _ => Err(format!("unknown context '{s}'")),
     }
 }
@@ -431,6 +435,14 @@ fn action_to_str(a: &Action) -> String {
         Action::PromptContextSwitch => "PromptContextSwitch".into(),
         Action::HoldQuickContext => "HoldQuickContext".into(),
         Action::UnpinQuickContext => "UnpinQuickContext".into(),
+        Action::AskAllowOnce => "AskAllowOnce".into(),
+        Action::AskAllowAlways => "AskAllowAlways".into(),
+        Action::AskDeny => "AskDeny".into(),
+        Action::AskAside => "AskAside".into(),
+        Action::AskNext => "AskNext".into(),
+        Action::AskPrev => "AskPrev".into(),
+        Action::OpenLedger => "OpenLedger".into(),
+        Action::CloseLedger => "CloseLedger".into(),
     }
 }
 
@@ -508,6 +520,14 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "PromptContextSwitch" => Ok(Action::PromptContextSwitch),
         "HoldQuickContext" => Ok(Action::HoldQuickContext),
         "UnpinQuickContext" => Ok(Action::UnpinQuickContext),
+        "AskAllowOnce" => Ok(Action::AskAllowOnce),
+        "AskAllowAlways" => Ok(Action::AskAllowAlways),
+        "AskDeny" => Ok(Action::AskDeny),
+        "AskAside" => Ok(Action::AskAside),
+        "AskNext" => Ok(Action::AskNext),
+        "AskPrev" => Ok(Action::AskPrev),
+        "OpenLedger" => Ok(Action::OpenLedger),
+        "CloseLedger" => Ok(Action::CloseLedger),
         "SwitchToActiveSeat" => Ok(Action::SwitchToActiveSeat(0)),
         "ActiveSeatStep" => Ok(Action::ActiveSeatStep(1)),
         // Payloaded variants without an explicit payload default to a

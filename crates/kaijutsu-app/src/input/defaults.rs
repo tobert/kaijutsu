@@ -556,6 +556,163 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
+    // AskSheet (an approval ask waiting on you; docs/tui.md "Asks")
+    // ====================================================================
+    // While the sheet is up this context is the only surface one derived and
+    // the compose grab is suspended (`input::context::derive_contexts`), so
+    // these letters are the sheet's and typed text is held. `Ctrl+A` still
+    // wins over all of them — it is the prefix, in front of everything —
+    // which is why `Ctrl+A d` stays the detach chord and never a deny.
+    b.push(Binding::key(
+        KeyCode::KeyA,
+        InputContext::AskSheet,
+        Action::AskAllowOnce,
+        "Allow this once",
+    ));
+    b.push(Binding::key_mod(
+        KeyCode::KeyA,
+        Modifiers::SHIFT,
+        InputContext::AskSheet,
+        Action::AskAllowAlways,
+        "Allow and remember",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyD,
+        InputContext::AskSheet,
+        Action::AskDeny,
+        "Deny",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyV,
+        InputContext::AskSheet,
+        Action::OpenLedger,
+        "View the ledger",
+    ));
+    b.push(Binding::key(
+        KeyCode::BracketRight,
+        InputContext::AskSheet,
+        Action::AskNext,
+        "Next pending ask",
+    ));
+    b.push(Binding::key(
+        KeyCode::BracketLeft,
+        InputContext::AskSheet,
+        Action::AskPrev,
+        "Previous pending ask",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyJ,
+        InputContext::AskSheet,
+        Action::StepNext,
+        "Scroll the plan down",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyK,
+        InputContext::AskSheet,
+        Action::StepPrev,
+        "Scroll the plan up",
+    ));
+    // Esc puts the ask aside, still pending. `AskAside` rather than
+    // `PopLevel` for the reason `UnpinQuickContext` gives: PopLevel's
+    // consumers are context-blind, so reusing it would pop the screen
+    // underneath from the same keypress (docs/input.md "Escape").
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::AskSheet,
+        Action::AskAside,
+        "Put the ask aside",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::East,
+        InputContext::AskSheet,
+        Action::AskAside,
+        "Put the ask aside",
+    ));
+
+    // ====================================================================
+    // LedgerRibbon (`Ctrl+A l`; docs/tui.md "The ledger")
+    // ====================================================================
+    b.push(Binding::key(
+        KeyCode::KeyA,
+        InputContext::LedgerRibbon,
+        Action::AskAllowOnce,
+        "Allow the selected ask once",
+    ));
+    b.push(Binding::key_mod(
+        KeyCode::KeyA,
+        Modifiers::SHIFT,
+        InputContext::LedgerRibbon,
+        Action::AskAllowAlways,
+        "Allow the selected ask and remember",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyD,
+        InputContext::LedgerRibbon,
+        Action::AskDeny,
+        "Deny the selected ask",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyJ,
+        InputContext::LedgerRibbon,
+        Action::StepNext,
+        "Next row",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyK,
+        InputContext::LedgerRibbon,
+        Action::StepPrev,
+        "Previous row",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowDown,
+        InputContext::LedgerRibbon,
+        Action::StepNext,
+        "Next row",
+    ));
+    b.push(Binding::key(
+        KeyCode::ArrowUp,
+        InputContext::LedgerRibbon,
+        Action::StepPrev,
+        "Previous row",
+    ));
+    b.push(Binding::key(
+        KeyCode::Enter,
+        InputContext::LedgerRibbon,
+        Action::Activate,
+        "Open the sheet on this ask",
+    ));
+    b.push(Binding::key(
+        KeyCode::Escape,
+        InputContext::LedgerRibbon,
+        Action::CloseLedger,
+        "Close the ledger",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::East,
+        InputContext::LedgerRibbon,
+        Action::CloseLedger,
+        "Close the ledger",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::South,
+        InputContext::LedgerRibbon,
+        Action::Activate,
+        "Open the sheet on this ask",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::DPadDown,
+        InputContext::LedgerRibbon,
+        Action::StepNext,
+        "Next row",
+    ));
+    b.push(Binding::gamepad(
+        GamepadButton::DPadUp,
+        InputContext::LedgerRibbon,
+        Action::StepPrev,
+        "Previous row",
+    ));
+
+    // ====================================================================
     // Gamepad bindings
     // ====================================================================
 

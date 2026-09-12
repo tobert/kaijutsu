@@ -1164,7 +1164,8 @@ mod tests {
     use super::{
         classify_connection_error, count_block_activity, format_background_activity,
         format_block_activity, format_context_usage, format_elapsed_ms, format_global_error_badge,
-        format_presence, format_token_count, hints_with_asks, hud_detached, room_slot_label,
+        format_presence, format_token_count, hints_with_asks, hints_with_notice, hud_detached,
+        room_slot_label,
         BackgroundActivityLevel, PRESENCE_MAX_AGE,
     };
     use crate::ui::theme::Theme;
@@ -1182,6 +1183,32 @@ mod tests {
         assert_eq!(hints_with_asks("i: chat", 0), "i: chat", "no asks, no marker");
         assert_eq!(hints_with_asks("", 3), "!3", "no separator with nothing to separate");
         assert_eq!(hints_with_asks("", 0), "");
+    }
+
+    /// An approval notice sits behind the count and ahead of the keys — the
+    /// count says how many are waiting, the notice says what just happened,
+    /// the keys say what to press.
+    #[test]
+    fn an_approval_notice_rides_the_hints_line_behind_the_count() {
+        assert_eq!(
+            hints_with_notice("i: chat", 1, Some("ask 01a04eb6 allow once by you")),
+            "!1 \u{2502} ask 01a04eb6 allow once by you \u{2502} i: chat"
+        );
+        // The last ask answered: no count left to lead with.
+        assert_eq!(
+            hints_with_notice("i: chat", 0, Some("ask 01a04eb6 expired")),
+            "ask 01a04eb6 expired \u{2502} i: chat"
+        );
+        assert_eq!(
+            hints_with_notice("i: chat", 2, None),
+            "!2 \u{2502} i: chat",
+            "no notice, the line is unchanged"
+        );
+        assert_eq!(
+            hints_with_notice("i: chat", 2, Some("")),
+            "!2 \u{2502} i: chat",
+            "an empty notice is no notice"
+        );
     }
 
     /// The dock's presence summary is allowed to say only what a *current*
@@ -1929,6 +1956,32 @@ pub(crate) fn hints_with_asks(hints: &str, pending_asks: usize) -> String {
     format!("!{pending_asks} \u{2502} {hints}")
 }
 
+/// The hints line with an approval notice in the middle: what became of an
+/// ask, or why a decision key did not take (`ui::ask_sheet::AskNotice`).
+///
+/// The notice goes between the count and the keys, where the TUI's status
+/// line puts it — visible on every screen, including the ones the ask sheet
+/// will not raise on, and costing no dock widget of its own. It ages out on
+/// its own ([`crate::ui::ask_sheet::NOTICE_TTL`]), which is when this line
+/// goes back to being the keys.
+pub(crate) fn hints_with_notice(hints: &str, pending_asks: usize, notice: Option<&str>) -> String {
+    let line = hints_with_asks(hints, pending_asks);
+    let Some(notice) = notice.filter(|n| !n.is_empty()) else {
+        return line;
+    };
+    if pending_asks == 0 {
+        if line.is_empty() {
+            return notice.to_string();
+        }
+        return format!("{notice} \u{2502} {line}");
+    }
+    // Behind the `!n` marker, ahead of the keys.
+    match line.split_once(" \u{2502} ") {
+        Some((marker, rest)) => format!("{marker} \u{2502} {notice} \u{2502} {rest}"),
+        None => format!("{line} \u{2502} {notice}"),
+    }
+}
+
 /// Update hints widget based on FocusArea and Screen.
 ///
 /// `Screen::Room` shows one of several hint lines depending on
@@ -1943,6 +1996,8 @@ pub fn update_hints(
     room: Res<crate::view::room::RoomState>,
     prefix: Res<crate::input::prefix::PrefixState>,
     ledger: Res<crate::connection::ledger::LedgerMirror>,
+    notice: Res<crate::ui::ask_sheet::AskNotice>,
+    time: Res<Time>,
     mut dock: ResMut<DockState>,
 ) {
     if !focus_area.is_changed()
@@ -1950,9 +2005,11 @@ pub fn update_hints(
         && !room.is_changed()
         && !prefix.is_changed()
         && !ledger.is_changed()
+        && !notice.is_changed()
     {
         return;
     }
+    let notice = notice.current(time.elapsed_secs_f64());
 
     // A pending Ctrl+A owns the footer while armed — this IS the prefix
     // legend (docs/input.md): it appears exactly when you need it and
@@ -1963,7 +2020,7 @@ pub fn update_hints(
     if prefix.armed() {
         let hints = "^A: 0-9 seat \u{2502} ^A last \u{2502} q close \u{2502} \
                      w well \u{2502} ' switch \u{2502} A rename \u{2502} d detach \u{2502} h hold";
-        let text = hints_with_asks(hints, ledger.pending_count());
+        let text = hints_with_notice(hints, ledger.pending_count(), notice);
         if dock.hints.text != text {
             dock.hints.text = text;
         }
@@ -1996,7 +2053,7 @@ pub fn update_hints(
         },
     };
 
-    let text = hints_with_asks(hints, ledger.pending_count());
+    let text = hints_with_notice(hints, ledger.pending_count(), notice);
     if dock.hints.text != text {
         dock.hints.text = text;
     }

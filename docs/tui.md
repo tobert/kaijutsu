@@ -1022,8 +1022,13 @@ Rules the figure carries:
 - Answered rows keep the answering principal and the redemption, because
   "was this consumed" is the question the redemption incident taught us to
   ask (`docs/issues.md`, the resolved redemption entry).
-- `Ctrl+A l` is not in the app's table today; it is proposed here and lands
-  in the shared `bindings.toml` (guidance 4), where the app inherits it.
+- `Ctrl+A l` is in the app's prefix table (`input/prefix.rs`; the Bevy
+  surfaces shipped 2026-09-12 as `ui/ask_sheet.rs` and
+  `ui/ledger_ribbon.rs`). The app's ribbon shows `recent n` rather than
+  "answered today": its `LedgerMirror` keeps the last three asks that left
+  the pending set, and nothing on the wire tells a client how many were
+  answered today. Its rows carry ages (`12s`, `4m`) rather than wall-clock
+  times, which is the app's convention everywhere else.
 
 ### Status line
 
