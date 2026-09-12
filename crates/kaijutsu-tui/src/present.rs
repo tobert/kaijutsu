@@ -294,8 +294,10 @@ pub fn collapses_by_default(kind: BlockKind) -> bool {
 /// rendered text.
 ///
 /// Streaming appends move `content`, a completing tool call moves `status`,
-/// an expand moves `collapsed`, and an edit moves `updated_at`. A version
-/// that missed one of those would serve a stale wrap forever.
+/// an expand moves `collapsed`, an edit moves `updated_at`, and a summary
+/// arriving after the block settled moves `summary` (`set_summary` leaves
+/// `updated_at` alone). A version that missed one of those would serve a
+/// stale wrap forever.
 pub fn block_version(block: &BlockSnapshot, collapsed: bool) -> u64 {
     let mut v = block.updated_at;
     v = v.wrapping_mul(31).wrapping_add(block.content.len() as u64);
@@ -303,6 +305,7 @@ pub fn block_version(block: &BlockSnapshot, collapsed: bool) -> u64 {
     v = v.wrapping_mul(31).wrapping_add(u64::from(collapsed));
     v = v.wrapping_mul(31).wrapping_add(u64::from(block.excluded));
     v = v.wrapping_mul(31).wrapping_add(u64::from(block.is_error));
+    v = v.wrapping_mul(31).wrapping_add(block.summary.as_deref().map_or(0, |s| s.len() as u64 + 1));
     v
 }
 
@@ -1040,6 +1043,23 @@ mod tests {
         let lines = render_block(&b, &v, 60, &Palette::builtin());
         let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(row, "▸ thinking · nothing to show");
+    }
+
+    /// A summary that lands after the block settled must move the wrap
+    /// cache's version, since `set_summary` leaves `updated_at` alone.
+    #[test]
+    fn a_late_summary_moves_the_block_version() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let before = BlockSnapshotBuilder::new(id, BlockKind::Thinking)
+            .role(Role::Model)
+            .content("Hmm.\nLet me think about this some more.")
+            .build();
+        let after = BlockSnapshotBuilder::new(id, BlockKind::Thinking)
+            .role(Role::Model)
+            .content("Hmm.\nLet me think about this some more.")
+            .summary("Let me think about this some more")
+            .build();
+        assert_ne!(block_version(&before, true), block_version(&after, true));
     }
 
     /// A completed thinking block's stub uses the kernel's summary, not the

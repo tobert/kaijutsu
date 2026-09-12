@@ -114,6 +114,7 @@ mod tests {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 

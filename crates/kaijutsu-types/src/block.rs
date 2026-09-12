@@ -1839,9 +1839,12 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub edited_since_ingest: bool,
 
-    /// Extractive, kernel-derived one-line stand-in for a `Thinking` block's
-    /// full text. See `BlockHeader::summary` for the field's contract; this
-    /// is the same value, carried on the full snapshot.
+    /// Kernel-derived one-line summary of a completed `Thinking` block's
+    /// text, computed once when the block settles (`summarize_thinking`)
+    /// and set through the store's `set_summary`. Display only: hydration
+    /// never reads it. `None` on every other kind, and when the summarizer
+    /// found nothing to say. `#[serde(default)]` is load-bearing: this
+    /// rides the at-rest CBOR, and rows written before the field exist.
     #[serde(default)]
     pub summary: Option<String>,
 }
@@ -1869,7 +1872,7 @@ pub struct BlockMetadata {
     /// reason as `BlockHeader::task_status` — see that field's doc.
     #[serde(default)]
     pub task_status: TaskStatus,
-    /// Kernel-derived summary — see `BlockHeader::summary`. Rides this
+    /// Kernel-derived summary — see `BlockSnapshot::summary`. Rides this
     /// generic scalar-metadata event the same way `task_status` does, since
     /// it is set once, after insertion, outside the DTE text frontier.
     #[serde(default)]
@@ -2896,7 +2899,7 @@ impl BlockSnapshotBuilder {
         self
     }
 
-    /// Set the kernel-derived summary (see `BlockHeader::summary`).
+    /// Set the kernel-derived summary (see `BlockSnapshot::summary`).
     pub fn summary(mut self, summary: impl Into<String>) -> Self {
         self.snap.summary = Some(summary.into());
         self

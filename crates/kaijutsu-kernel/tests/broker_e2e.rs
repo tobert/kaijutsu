@@ -52,6 +52,7 @@ fn insert_context_row(
     db.insert_context(&ContextRow {
         context_id: ctx_id,
         label: None,
+        director_id: None,
         provider: None,
         model: None,
         system_prompt: None,
@@ -1470,6 +1471,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
         g.insert_context(&ContextRow {
             context_id: ctx_id,
                         label: None,
+                        director_id: None,
             provider: None,
             model: None,
             system_prompt: None,
