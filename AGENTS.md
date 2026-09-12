@@ -46,8 +46,12 @@ Keep requester, performer, context type, and cast distinct. `created_by` names
 the requester who created a context; `played_by` records its performer when
 set. A `context_type` selects the role's rc bundle; a cast selects models for
 roles. `kj context create --as <character>` sets the performer explicitly; omitting
-it leaves the performer unset on this path. Provider-output attribution and
-composition with character rc are still planned. Accountable-to, default cast,
+it leaves the performer unset on this path. Model turns require a live performer
+and a distinct reviewer. Provider output and tools carry the performer; the connection keeps its own identity.
+`kj context set <context> --as <character> --reviewer <director>` assigns them;
+the reviewer controls reassignment, and the creator makes an initial assignment
+when no reviewer is set. See `docs/approval-identity.md`. Composition
+with character rc remains planned. Accountable-to, default cast,
 rc directory, memory root, and root context are also planned sheet fields.
 See `docs/character.md`, "Current implementation" and "Rollout, smallest first".
 
@@ -134,12 +138,6 @@ state, VFS, model work, MCP brokerage, and `kj`; `kaijutsu-server` owns SSH and
 embedded kaish; `kaijutsu-client` owns the RPC client and `ActorHandle`.
 `kaijutsu-app` is the Bevy GUI; `kaijutsu-tui` is the terminal client;
 `kaijutsu-mcp` is the stdio MCP bridge. Wire schema: `kaijutsu.capnp`.
-
-Run `hostname` before planning builds or live checks. **moltar** has the real
-GPU and hosts heavy builds, GUI runs, and BRP checks. **zorak** serves the
-kernel and inference; avoid burdening it with builds. The MacBook is a supported
-client: app changes need a macOS story. Read `docs/operating.md` before working
-on the live kernel, including builds beside it.
 
 For GUI work, Amy starts `./contrib/kaijutsu-runner.sh` in her Wayland session.
 Use `./contrib/kj status|tail|pause|resume|rebuild|restart` to operate that runner,

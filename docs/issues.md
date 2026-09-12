@@ -523,30 +523,15 @@ know another mount's host directory. Either the mount table resolves both
 sides to host paths when both are `LocalBackend`, or the surface fails
 loudly on a cross-mount absolute target.
 
-## After approval-executes: what is still retry-shaped (2026-09-02)
+## Remaining approval ergonomics
 
-Every shell ask executes on approval (`docs/gate-shape-b.md`). Still open,
-re-verified:
-
-- **A decided ask leaves its gate pair `waiting` forever** — nothing
-  completes the pair when the ask is decided, so a tui keeps a stale "gate
-  for … is waiting" block pinned.
-- **Approving a `:`-line statement wakes a model turn** even though a
-  `:`-line origin has no waiting turn to resume.
-- **A gated `:kj` statement still surfaces as an error**, not a result naming
-  the ask — `.context("execute addressed kj command")` (`kaijutsu-tui/src/bridge.rs:295`,
-  `kaijutsu-acp/src/bridge.rs:286`) still wraps it.
-- **`kj ledger cancel`** (withdrawal without a verdict) still does not exist
-  — confirmed, no `Cancel` variant in `kj/ledger.rs`. Orphaned asks from dead
-  seats pile up forever.
-- **No TTL on asks** — `expires_at` exists on the row; nothing sets or sweeps
-  it for shell/hook asks.
-- **`kj ledger list` should show the origin context.**
-- **Same-seat deny** — `ensure_not_self_approval` (`kj/ledger.rs:911`) still
-  refuses both verdicts from the raising context; permitting deny from the
-  same seat is the safe direction. The tui answers from another seat it
-  holds, side-stepping this for a human; it stands for a model wanting to
-  withdraw its own ask (the `cancel` verb above).
+- `expires_at` exists, but shell/hook asks have no default TTL or sweeper.
+- A gated `:kj` command still wraps the refusal in an error on some client
+  paths; show the durable ask reference as a waiting result consistently.
+- Reviewer characters can have several live contexts. The ledger change feed
+  informs connected clients; there is no dedicated context mailbox routing or
+  automatic wake for a kernel model assigned to review a coder. A directing
+  model currently reads the coder's response and uses `kj ledger list|show`.
 
 ## The scorer and the snapshot (2026-09-02)
 

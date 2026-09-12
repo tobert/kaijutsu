@@ -140,7 +140,7 @@ a collision appears in real prose, not in advance.
 | player | noun | Anyone acting on the instrument — human, model, connected app, sibling context. All players are inside one trust boundary. |
 | capability | noun | An ergonomic nudge that narrows focus and removes a footgun. Never a security control, and never a statement that a player is less trusted. |
 | loadout | noun | The set of capabilities a context is given. Where mistake-prevention is routed. |
-| gate | noun, verb | The check that stops a statement to ask a human. The one place that authority lives. |
+| gate | noun, verb | The check that stops a statement to ask its assigned reviewer. The one place that authority lives. |
 | ask | noun | A durable row a gate leaves behind, waiting for a decision. Answered through `kj ledger`. |
 | fork | noun, verb | Making a child context. The structural parent edge; the context graph is a forest. |
 | drift | noun, verb | An overlay edge between contexts, deliberately cyclic. Never unify it with fork. |

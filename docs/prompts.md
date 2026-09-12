@@ -23,7 +23,9 @@ demand. This reference was about 28 KB when introduced; that is a source size,
 not a token measurement. The system cache breakpoint permits reuse where the
 provider supports it; the initial request still pays for the reference.
 Kaijutsu never prepends a universal behavioral prompt.
-The kernel adds runtime facts; rc supplies the chosen instruction sections.
+The kernel adds runtime facts, including the performing character and its
+assigned reviewer (stable IDs and names); rc supplies the chosen instruction
+sections. Provider/model selection remains a separate fact.
 
 The link filename controls order: `S00-base.md` precedes `S00-stance.*`.
 The shared file ends with `頑張（がんば）って！`. Default handles general work;
@@ -55,8 +57,9 @@ instruction sections remains valid.
 Banto's principal in `played_by`, while `created_by` remains the requester.
 The character must exist and be live; unknown or retired names fail before
 creating a context. Omitting `--as` leaves `played_by` unset on this `kj` path.
-This does not change provider-output attribution or load a character rc
-bundle. See `docs/character.md`, "Current implementation".
+The caller becomes its reviewer. Model output and tools use the performer;
+the model turn refuses missing or self-reviewing assignments. This does not
+load a character rc bundle. See `docs/character.md`, "Current implementation".
 
 Director's stance and the shared `S16-handoff.kai` read `played_by_name` from
 context metadata. The handoff script reads that character's log, or the caller's

@@ -92,8 +92,9 @@ The lfm2d advisory gate escalates most `kj` writes from an MCP seat
 (create, rename, retag, resume, rebind, and today `handoff note`). An
 approval executes: `kj ledger allow <id>` runs the stored command in the
 ask's context. Chain with `&&` inside one command; `;` trips the
-shell-escape guard. A same-seat allow is refused, so an MCP seat needs a
-second seat to approve it.
+shell-escape guard. The performing character cannot approve its own ask. Its assigned reviewer
+can answer from the same context; external model leads need a credential bound
+to their own character. See `docs/approval-identity.md`.
 
 `kj context create --type <t>` is how to probe a type's rc. A reseed seeds
 from the **binary**, so build first. Ephemeral test kernels blank every

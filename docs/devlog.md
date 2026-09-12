@@ -1168,3 +1168,43 @@ directory before committing. The other session's diff against the new
 HEAD is then only its own change. Four coder-stance e2e tests turned out
 to have been red since the September 10 prompt rework, pinning phrases
 that no longer ship; they pin the current tier lines now.
+
+The next approval problem was identity. Amy asked why the TUI could not let
+her answer a coder in the context she was already reading: "When I connect
+via app or tui, I should appear as myself." The ledger compared contexts,
+the TUI chose a second one to answer, and model tools still carried the
+requester's principal. Replacing only the comparison would have made Amy
+and her coder indistinguishable. Her second scenario supplied the reviewer:
+"the coders would come back to the lead model which can evaluate & approave"
+
+Invocations now carry requester, performing character, and assigned reviewer.
+A model turn resolves its performer from `played_by` and its reviewer from
+the context, then keeps them through tools, shell commands, hooks, and
+replay. The requester stays the capability and redemption identity. Asks
+snapshot the three identities; reviewer decisions work in the raising
+context, and switching contexts never makes the performer eligible. The
+reviewer can pass an ask onward, and its requester or performer can cancel
+it. A performer change revokes learned session rules and prevents replay of
+a linked approval raised by the old performer. Decisions recheck reviewer
+eligibility under the ledger transaction, so escalation cannot race that
+check.
+
+The TUI's second-context workaround is gone. It displays the connected
+character and the ask's identities, implements full detail, and keeps
+unshown asks available for later presentation. ACP uses the same reviewer
+rule and sends decision failures into the client conversation. New ACP
+sessions select their performer explicitly with `--character`; creation
+uses `kj context create --as` so identity is present when rc runs.
+
+The regression tests exposed the useful mistakes: the MCP RPC entry point
+lost the reviewer, shell completion hooks rebuilt a requester-only caller,
+and recursive context queries still read depth from the column now holding
+the reviewer. The wire test exercises two real credentials: Amy answers the
+coder from the same context, then the coder is refused from another one.
+Terra agents implemented the ledger, invocation propagation, and clients;
+Astra integrated and reviewed the resulting paths. Amy authorized sending
+source through Kaibo for its independent review. It found that ACP treated a
+prompt timeout as the reviewer denying the ask. Timeouts and cancelled
+prompts now leave the durable ask pending; only a selected decision records
+a verdict. Review also separated the TUI's pending snapshot from its shown
+card set, preserving the next ask while another card is open.

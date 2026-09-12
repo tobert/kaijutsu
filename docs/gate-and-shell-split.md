@@ -1505,149 +1505,28 @@ outside PreCall, not a property of these paths.
 directly. The other two evaluate PostCall/OnError on a background task, where a
 slow hook delays only that task's own completion.
 
-## No self-approval — the gate's own answer path (Amy, 2026-08-26)
+## No self-approval — the gate's own answer path
 
-**An ask may not be answered from the context that raised it.** Compare
-`approvals.context_id` against `KjCaller.context_id` in `ledger_decide`,
-before `claim`, so a refusal does not burn the claim. Peer seats may answer
-each other; only the author is refused.
+An ask records the performing character and its assigned reviewer. Only that
+reviewer may allow or deny it, and the performer may never review itself.
+The reviewer can answer in the raising context; switching or forking contexts
+does not let the performer answer. Human and model reviewers follow the same
+rule. See `docs/approval-identity.md` for assignment and examples.
 
-**The context is part of the answerer's type, not a parameter beside it.**
-`DecideInput.decided_by` is an `Option<Answerer>`, and an `Answerer` carries
-a principal *and* the context it answers from. A caller cannot skip the check
-by forgetting to pass a context, because there is no way to name an answerer
-without one. The auto-decision path carries no `Answerer` at all, which is
-the same signal that already separates a classifier's decision from a
-person's.
+`principal_id` retains the authenticated requester and redemption identity.
+`actor_id` carries the performer through model tools, nested kaish and hooks.
+`reviewer_id` records the directing character. An ask snapshots all three;
+changing the context assignment does not transfer a pending ask's authority.
 
-Amy's framing, and it is why this is small: *"a simple scheme similar to pull
-request review rules: no self-approval."* Pull-request review never verifies
-that a reviewer is a human — it verifies the reviewer is not the author.
-Author-versus-not-author is a question the kernel answers from columns it
-already stores. Human-versus-model is not, and this design stops trying.
+`ledger_decide` checks eligibility before claiming, so an ineligible answerer
+cannot occupy the claim. `approval_ledger::decide` checks it again under
+`BEGIN IMMEDIATE`, preventing an escalation from racing the decision. Refused
+attempts commit an `approval_refusals` row with the answering character,
+context when present, and reason. Context is audit data, not eligibility.
 
-### The key is the context, never the principal
-
-The obvious translation of the PR rule is "author principal is not approver
-principal." It fails backwards here, and the failure is worth keeping written
-down:
-
-| fact | where |
-|---|---|
-| `Principal` is `{ id, username, display_name }` — no kind field. The doc calls it "a human user, an AI model, or the system itself" and offers no way to say which. | `kaijutsu-types/src/principal.rs:16` |
-| `CallContext.principal_id` is *"Attribution only, never authorization (D-22)"* | `kaijutsu-kernel/src/mcp/context.rs:45` |
-| Every seat on one machine authenticates with one SSH key. A Claude Code MCP seat's `whoami` returns `username: amy`. | live, 2026-08-26 |
-| `whoami`'s `agent_name` is **not a kernel fact** — it is composed in the kaijutsu-mcp client process from local environment detection, and the kernel never receives or stores it. It cannot back a gate. | `kaijutsu-mcp/src/lib.rs:2238` |
-| The app and an external agent call the identical RPC. `shell_execute(code, ctx, user_initiated)` — the app passes `true`, kaijutsu-mcp passes `false`. That bool is client-asserted and decides block authorship and exclusion only, never authorization. | `kaijutsu-app/src/input/systems.rs:937`, `kaijutsu-mcp/src/lib.rs:1287`, `kaijutsu-server/src/rpc.rs:8811` |
-
-So a principal comparison refuses a human at the app exactly as it refuses the
-model that raised the ask. The context is the seat, and seats are what differ.
-`approvals.context_id` is already `NOT NULL`
-(`approval-ledger/src/schema.rs:271`) and `KjCaller` already carries
-`context_id` (`kj/mod.rs:80`): no schema change, no new plumbing, no new fact.
-
-This matches how the rest of the gate already discriminates. Facades are gated
-on the calling context's binding precisely because the RPC handlers are the
-surface "which both the human app and external agents cross"
-(`mcp/broker.rs:1409`).
-
-### The classifier chain is not a self-approval, and the ledger already says so
-
-`decided_by` set with `auto_reason` NULL is a decision by an identity;
-`decided_by` NULL with `auto_reason` set is a classifier's auto-decision
-(`approval-ledger/src/ask.rs:54`). A check on `decided_by` therefore skips the
-lfm2d path by construction — no exemption to write, none to maintain.
-
-Amy: *"the classifier escalation chain can approve/deny, because it's a
-different system making the call, not the model who generated the ask."*
-
-### What the rule deletes: the gate could not answer itself
-
-Found while looking for an interface to answer a pending ask, 2026-08-26. `kj
-ledger` carries **no capability check of any kind** — `kj/ledger.rs` has no
-`Capability::` and no authority — so the verb that answers every gate in the
-system was guarded only by the classifier, which scores it:
-
-| clause | argmax | score | hook verdict |
-|---|---|---|---|
-| `kj ledger list` | informative | 0.775 | allow |
-| `kj ledger show <id>` | situation-normal | 0.403 | escalate |
-| `kj ledger allow <id>` | situation-normal | 0.527 | escalate |
-| `kj ledger deny <id>` | situation-normal | 0.577 | escalate |
-
-Measured against live `kube_ordinal_v10`. In any seat carrying
-`lfm2d-advisory`, answering an ask required a command that raised an ask, and
-reading an ask's detail raised one too — the queue's own footer prints `answer
-with: kj ledger allow <request-id>`, advice the seat reading it cannot follow.
-
-**S50 therefore stops scoring `kj ledger` entirely, reads and writes.** That is
-safe *because of* the rule above and not before it: ungating the answer verb on
-its own would make the gate clearable without a human by construction, the same
-objection that holds against an auto-allow band covering `kj ledger allow`. The
-deterministic invariant replaces a probabilistic accident, and one mechanism
-goes away rather than growing a carve-out.
-
-### Peer-seat approval is accepted, deliberately
-
-A sibling seat may answer an ask this seat raised, so an escalation is not
-guaranteed to reach a human. Amy: *"peer seat approval is okay... I wanna see
-what happens. We won't be running a lot without some other layers of
-containment for a long time... autonomy comes with safety features and building
-trust."* Revisit when autonomy widens, not before; a classifier over drift
-edges is the named candidate if it needs tightening.
-
-The rule also does not stop a seat holding `fork` from making a child context
-and answering from there. Real review rules have the same property — a colleague
-can always rubber-stamp — and the difference that matters is that the maneuver
-is now deliberate and leaves a fork edge in the record instead of being
-invisible.
-
-### Where this goes next: a stronger principal (Amy, 2026-08-26)
-
-*"Over time — gradually — I think I want to make the principal stronger as an
-identifier, and perhaps that can become a way to add more ways to manage
-these approvals."*
-
-Today the principal is the weakest identifier in the system: `Principal` is
-`{ id, username, display_name }` with no kind, and every seat on one machine
-shares one SSH key, which is why this rule keys on the context instead. A
-principal that actually distinguished who is acting would let approval policy
-say things the context cannot — who may answer for whom, which seats a person
-speaks through, whether an answer came from a person at all.
-
-Nothing here blocks that, and the invariant does not depend on it: the
-context check stays correct however strong the principal gets. Treat it as
-the direction, not a task — the ordering is that peer-seat approval runs
-first and teaches us what the policy needs.
-
-### Three details that are part of the rule
-
-- **The refusal is recorded, not merely returned.** A silently refused
-  self-approval is invisible to the measurement that justifies the gate.
-  Every refusal appends an `approval_refusals` row — actor, actor context,
-  reason — read back through `ask::list_refusals`.
-- **`KjCaller.context_id` is `Option<ContextId>`; `None` refuses.** A caller
-  with no context cannot show it is not the author.
-- **Not waivable.** A waivable invariant is not one, and the escape already
-  exists: any other seat.
-
-### Why refusals got their own table
-
-`approval_events` was the obvious home and it is the wrong one. `migrate` is
-built entirely from `CREATE ... IF NOT EXISTS` and has **no ALTER-TABLE
-path**, so widening `approval_events.kind`'s `CHECK` would never reach a
-database that already ran an earlier `migrate()` — and the INSERT would then
-fail a constraint the new code cannot see. A new table needs no migration
-machinery at all, which is the same reasoning `approval_redemptions` was
-built on.
-
-`approval_refusals.reason` carries no `CHECK` for that reason: the set of
-refusal reasons is expected to grow, and a value-enum `CHECK` would inherit
-the very trap the table exists to route around.
-
-The guard is called twice, deliberately. `ledger_decide` calls it before
-`claim`; `decide` calls it as the backstop that holds for any other caller.
-One function, two call sites, no second copy of the policy.
+Policy auto-decisions retain `decided_by = NULL` and an `auto_reason`.
+They are the configured classifier/rule path, separate from a character's
+answer. No client-supplied human/model flag grants authority.
 
 ### The exemption is the whole `kj ledger` verb
 
@@ -1675,7 +1554,7 @@ empty or unparseable program is not exempt. The dry run reports
 a second statement of the same rule; it goes in the tuning doc's slice 5,
 only after the hook's tier rules cover mixed programs, and
 `contrib/lfm2d-ladder-check.kai`'s copy stays for the reason below. Safe
-only while a seat cannot answer its own ask.
+only while a performer cannot answer its own ask.
 
 `contrib/lfm2d-ladder-check.kai` holds a **copy** of that predicate, on
 purpose: staying free of kernel, config and network is what lets the lfm2d

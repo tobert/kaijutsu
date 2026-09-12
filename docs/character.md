@@ -4,7 +4,7 @@
 > morning's conversation with Amy about her restart-every-session routine
 > and what kaijutsu needs so the morning is smooth, then revised through two
 > model reviews the same afternoon ("Review", below) and a readiness pass
-> the next day. **Slices 0a, 1, 2 and 4 are built and verified (2026-09-06/07); slices 3 and 5–8 are not.**
+> the next day. **Slices 0a–4 are built; slices 5–8 remain planned.**
 > Read "Current implementation" first; historical line references need rechecking.
 > Amy's statements are guidance, not rulings.
 
@@ -18,8 +18,11 @@ does not become an instruction to use nonexistent features.
 |---|---|
 | Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`; `kj character create\|list\|show\|retire` |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Performer metadata | `kj context create --as <character>` records `played_by` before create rc, rejects unknown/retired names, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
-| Client creation | Server `create_context_inner` defaults `played_by` to the creating principal's character when present; MCP session registration uses this path |
+| Performer | `kj context create --as <character>` records `played_by` before create rc, rejects unknown, retired, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
+| Client creation | Ordinary client contexts leave the performer unset and assign the authenticated creator as reviewer. MCP session registration records the credential character as performer |
+| Review assignment | `kj context set <context> --as <character> --reviewer <director>`; only the current reviewer, or the initial creator when unassigned, can change it. Fork preserves it |
+| Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn. Provider output and tool calls carry the performer; the requester stays separate |
+| Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context. See `docs/approval-identity.md` |
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
@@ -37,12 +40,12 @@ metadata instead. Existing contexts that used the bridge remain unassigned:
 create a successor with `--as banto` and verify it before archiving its
 predecessor. See `docs/prompts.md`, "Rotating a director context".
 
-Still planned: provider-output attribution (slice 3), character rc composition
-(slice 5), roster grouping and character drift addressing (slices 6–7), and
+Still planned: character rc composition (slice 5), roster grouping and character drift addressing (slices 6–7), and
 scheduled janitor/proctor work (slice 8). The sheet has no `accountable_to`,
 `default_cast_id`, `rc_dir`, `memory_root`, or `root_ctx` fields yet. The handoff
 is a context, not a transport track. Requester and performer remain separate;
-setting `played_by` does not change credentials, asks, or provider block authors.
+setting `played_by` changes subsequent model invocation and output attribution;
+it never changes credentials or rewrites existing asks and block authors.
 
 The original inventory and gap analysis below describe the pre-implementation
 state. Use this section and the rollout to distinguish them from current code.
