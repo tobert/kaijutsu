@@ -1017,6 +1017,97 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn gate_and_replay_spans_use_durable_distinct_identities() {
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Spans(Arc<Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>>);
+        struct Fields(std::collections::HashMap<String, String>);
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Spans {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                if attrs.metadata().name() != "approval.gate" {
+                    return;
+                }
+                let mut fields = Fields(std::collections::HashMap::new());
+                attrs.record(&mut fields);
+                self.0.lock().unwrap().insert(id.into_u64(), fields.0);
+            }
+            fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                let mut spans = self.0.lock().unwrap();
+                let Some(fields) = spans.get_mut(&id.into_u64()) else { return };
+                let mut recorded = Fields(std::collections::HashMap::new());
+                values.record(&mut recorded);
+                fields.extend(recorded.0);
+            }
+        }
+
+        let spans = Spans::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let d = gate_dispatcher().await;
+        let requester = PrincipalId::new();
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let context = ContextId::new();
+        let caller = KjCaller {
+            principal_id: requester,
+            actor_id: actor,
+            reviewer_id: Some(reviewer),
+            context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: true,
+        };
+        let pending = run_gate(&d.kernel_db.clone(), &caller, cc_spec("trace"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+        let request_id = pending.ask.expect("gate asks").request_id;
+        spans.0.lock().unwrap().clear();
+        answer(&d, &request_id, true);
+
+        let mut changed = caller.clone();
+        changed.reviewer_id = Some(PrincipalId::new());
+        let replay = run_gate(&d.kernel_db.clone(), &changed, cc_spec("trace"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+        assert!(replay.allowed());
+
+        {
+            let spans = spans.0.lock().unwrap();
+            assert_eq!(spans.len(), 1, "only the replay gate span remains captured");
+            let replay = spans.values().next().expect("replay gate span");
+            assert_eq!(replay.get("principal.id"), Some(&requester.to_string()));
+            assert_eq!(replay.get("actor.id"), Some(&actor.to_string()));
+            assert_eq!(replay.get("reviewer.id"), Some(&reviewer.to_string()));
+            assert_eq!(replay.get("context.id"), Some(&context.to_string()));
+            assert!(!replay.contains_key("actor.name"));
+            assert!(!replay.contains_key("reviewer.name"));
+        }
+        spans.0.lock().unwrap().clear();
+        let mut unassigned = caller;
+        unassigned.reviewer_id = None;
+        let unavailable = run_gate(
+            &d.kernel_db.clone(),
+            &unassigned,
+            cc_spec("unassigned"),
+            d.kernel.ledger_flows(),
+            &Err(crate::kj::gate_policy::GateConfigError::Parse("bad".into())),
+        )
+        .await;
+        assert_eq!(unavailable.verdict, GateVerdict::Unavailable);
+        let spans = spans.0.lock().unwrap();
+        let fields = spans.values().next().expect("fault gate span");
+        assert!(!fields.contains_key("reviewer.id"), "unassigned reviewer stays unset");
+    }
+
     /// An escalated gate records the question and returns — it does not
     /// wait, and it does not expire anything. The row it leaves is
     /// `Pending` and stays answerable for as long as a human takes.

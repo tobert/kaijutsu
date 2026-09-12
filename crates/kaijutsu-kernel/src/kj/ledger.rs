@@ -1998,6 +1998,69 @@ mod tests {
         caller
     }
 
+    #[tokio::test]
+    async fn decision_span_keeps_the_ask_and_deciding_actor_separate() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Spans(Arc<Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, String>>>>);
+        struct Fields(std::collections::HashMap<String, String>);
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) { self.0.insert(field.name().to_string(), value.to_string()); }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) { self.0.insert(field.name().to_string(), format!("{value:?}")); }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Spans {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                if attrs.metadata().name() != "approval.decision" { return; }
+                let mut fields = Fields(std::collections::HashMap::new());
+                attrs.record(&mut fields);
+                self.0.lock().unwrap().insert(id.into_u64(), fields.0);
+            }
+            fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                let mut spans = self.0.lock().unwrap();
+                let Some(fields) = spans.get_mut(&id.into_u64()) else { return };
+                let mut recorded = Fields(std::collections::HashMap::new());
+                values.record(&mut recorded);
+                fields.extend(recorded.0);
+            }
+        }
+
+        let spans = Spans::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let d = test_dispatcher().await;
+        let requester = kaijutsu_types::PrincipalId::new();
+        let actor = kaijutsu_types::PrincipalId::new();
+        let reviewer = kaijutsu_types::PrincipalId::new();
+        let context = kaijutsu_types::ContextId::new();
+        let caller = crate::kj::KjCaller {
+            principal_id: requester,
+            actor_id: actor,
+            reviewer_id: Some(reviewer),
+            context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: true,
+        };
+        let pending = gate_once(&d, &caller, spec()).await;
+        let request_id = pending.ask.expect("gate asks").request_id;
+        let mut director = caller.clone();
+        director.actor_id = reviewer;
+        let decision = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &director).await;
+        assert!(decision.is_ok(), "{decision:?}");
+
+        let spans = spans.0.lock().unwrap();
+        let fields = spans.values().find(|fields| fields.get("ask.id") == Some(&request_id)).expect("decision span");
+        assert_eq!(fields.get("decision.actor.id"), Some(&reviewer.to_string()));
+        assert_eq!(fields.get("principal.id"), Some(&requester.to_string()));
+        assert_eq!(fields.get("actor.id"), Some(&actor.to_string()));
+        assert_eq!(fields.get("reviewer.id"), Some(&reviewer.to_string()));
+        assert_eq!(fields.get("context.id"), Some(&context.to_string()));
+    }
+
     /// No self-approval, at the surface a person actually types. The seat
     /// that tripped the gate is refused; the ask stays answerable by anyone
     /// else, and the attempt is on the record.
