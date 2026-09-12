@@ -1221,3 +1221,31 @@ Its ask carried `coder` as performer and `kaijutsu-lead` as requester and
 reviewer. The coder stopped; the lead approved the exact echo; its output
 filled once and the coder resumed without a second tool call. The probe was
 archived and its scoped hook removed. Banto's ROOT now names Amy as reviewer.
+
+Amy then asked to look at the Bevy app and to "double check we are attaching
+the character info to otel spans where appropriate". The app already knew
+its SSH identity but used a random principal to find and hide its own draft.
+That principal now comes from `whoami`, is cleared while disconnected, and
+is refreshed on reconnect. Explicit key selectors make the credential choice
+available at launch. Submission errors reach the UI, and failed text stays
+with its original context and character. The app still needs a dedicated
+ledger surface; its shell is the current approval interface.
+
+Execution traces now distinguish requester, performer, reviewer, and deciding
+actor. Model turns also carry the character names resolved at turn start.
+Tool spans take IDs from the invocation, while approval replay takes them
+from the durable ask. The trace audit found two contributing factors beyond
+missing attributes: RPC injection read OTel's thread-local context instead
+of the active tracing span, and the MCP server-call span held an entered
+guard across suspension. Injection now uses the tracing span's OTel context,
+and the future carries its span while polled. Character IDs remain off
+metric attributes.
+
+Kaibo's GLM-5.3 review confirmed propagation and found a missed-status path
+in the app: a replacement actor could connect before the UI subscribed, so
+the old identity survived until the new `whoami` arrived. Connection status
+now identifies its actor and transport; lag recovery asks for the current
+state, and actor exit clears authenticated identity. The full headless app
+suite and client suite passed, with focused capture tests for exported trace
+parents, concurrent tool actors, and approval replay. GUI and macOS execution
+remain unverified; this followup did not restart Amy's running processes.

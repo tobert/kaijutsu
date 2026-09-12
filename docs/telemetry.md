@@ -48,6 +48,40 @@ W3C Trace Context (`traceparent`/`tracestate`) propagates in-band through
 Cap'n Proto method params. The client injects context via `inject_trace_context()`,
 the server extracts it via `extract_rpc_trace()`.
 
+Injection reads the current `tracing::Span` through its OpenTelemetry layer.
+An OTel thread-local context alone does not identify the active tracing span.
+Async work uses `.instrument(span)` so another task cannot inherit its identity
+while the future is suspended.
+
+### Character identity
+
+Execution spans distinguish the requester, performing character, and assigned
+reviewer. See `docs/approval-identity.md` for their authorization roles.
+
+| Attribute | Meaning |
+|-----------|---------|
+| `principal.id` | Requester principal; on execution RPCs, the authenticated caller |
+| `actor.id` | Character performing the work |
+| `reviewer.id` | Character assigned to review that work |
+| `actor.name`, `reviewer.name` | Character names resolved at model-turn start |
+| `context.id` | Context in which the work runs |
+| `ask.id` | Durable approval request |
+| `decision.actor.id` | Character attempting the decision, cancellation, or escalation |
+
+`llm.turn` carries the three principal IDs, context ID, and resolved performer
+and reviewer names. MCP broker and nested server tool spans carry IDs from the
+invocation. Approval spans carry the ask's identities; replay uses the durable
+ask snapshot, even if the context's reviewer has since changed. The deciding
+actor remains separate from the performer who raised the ask.
+
+App submission spans carry the authenticated principal, context, and `surface`
+(`chat` or `shell`). The app does not infer the model's performer or reviewer
+from the connected character. Unknown identities remain unset. Names are
+descriptive snapshots; IDs identify characters across renames.
+
+Keep character, context, and ask IDs off metric attributes. Resolve names once
+per model turn, without adding a character lookup to every tool call.
+
 ### Span Naming Convention
 
 | Layer | Pattern | Example | Sample Rate |
@@ -192,6 +226,10 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 | Other | 10% | Default |
 
 Parent-sampled spans always inherit (trace continuity).
+
+An unsampled parent does not force its children to be dropped. Each child
+still applies its category's rate, so an execution or model span can be
+exported even when its RPC parent was omitted.
 
 **Prefix collision caveat:** the 100% namespaces are **dot-qualified**
 (`drift.`, `engine.`, `tool.`, `gen_ai.`, `llm.`, `turn.`). Auto-named actor/method spans

@@ -45,6 +45,13 @@ External lead models need their own character-bound credential; two processes
 using the same credential are the same character. The `user_initiated` flag
 controls presentation, never approval authority.
 
+The Bevy app accepts `--key-fingerprint <fingerprint>` to select one SSH-agent
+key, or `--key-file <path>` to select a private-key file. The selectors are
+mutually exclusive and do not fall back to another key. Its displayed identity
+and draft ownership come from the authenticated connection's `whoami` result.
+The app currently reviews asks through shell `kj ledger` commands; it has no
+dedicated ledger controls yet.
+
 New ACP sessions select a kernel model performer at launch:
 
 ```sh

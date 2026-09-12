@@ -467,6 +467,54 @@ probe that presses it and then types is still the next step. The seat-digit
 disagreement between the picker and the status line, and the ask-card/ledger
 follow-ups, are their own entries below.
 
+## Telemetry span inventory needs a refresh (2026-09-12)
+
+The character identity section in `docs/telemetry.md` describes current
+execution attribution, but the older method inventory still lists removed
+wire methods such as `push_ops` and claims no trace instrumentation for
+`get_info` and `interrupt`, which now extract RPC traces. Audit that inventory
+against the current schema and span callsites before using its counts or
+method lists to plan observability work.
+
+## App draft edits need an ordered submission contract (2026-09-12)
+
+`input/systems.rs::handle_compose_input` spawns each `edit_input` separately,
+logs edit failures, and submits the server draft with another task. Local
+overlay text can therefore differ from the draft submitted after a failed or
+late edit. Visible submit failures do not repair that earlier divergence.
+Design batching, acknowledgement, and recovery with the TUI input work;
+Amy asked to discuss text input design before changing that contract.
+
+Kaibo's review also found two recovery UX edges. A retained failed submission
+can reappear after newer text is submitted and the overlay becomes empty;
+it does not overwrite text or submit itself, but needs an explicit recovery
+affordance. Text typed with no active or target context has no context to
+retain under an identity transition. Define ownership for that unassigned
+text alongside the draft-edit contract. Do not solve either case by silently
+dropping saved text.
+
+## App bootstrap results need consistent connection scoping (2026-09-12)
+
+Identity replies now carry actor generation and transport epoch. Other
+asynchronous bootstrap replies, including context lists/restoration and theme
+configuration, still do not. A reply queued before actor replacement can
+arrive after the new actor is installed. Audit those consumers together and
+discard or refetch results from the old connection. Peer reattachment is
+remembered by the actor only after its first `attach_peer` call; a cold-start
+failure before that call also needs a complete bootstrap retry.
+
+## Bevy approval review has no dedicated UI (2026-09-12)
+
+The app can issue `kj ledger` commands through its shell as the authenticated
+character, but it never subscribes to ledger changes and has no pending-ask
+list or review controls. A waiting block gets a generic status label. Add a
+ledger surface through the shared action table, with the TUI's `Ctrl+A l`
+chord, the shared complete pending snapshot and `AskDetail::can_review`, and
+explicit requester/performer/reviewer detail. Recover on reconnect or stream
+lag; do not issue an RPC each frame. Context creation and review assignment
+also have no app UI: use `kj context create --as` so the performer exists
+before rc, with the connected character as reviewer.
+
 ## The tui and the app disagree on a few chords (2026-09-03)
 
 Survey against `docs/input.md`'s prefix table and `docs/tui.md` "Keys".
