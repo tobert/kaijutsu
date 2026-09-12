@@ -1156,6 +1156,19 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Set the kernel-derived summary on a block. Meaningful only on
+    /// `Thinking` blocks; display only, never read by hydration.
+    pub fn set_summary(&mut self, id: &BlockId, summary: String) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
+        block.set_summary(summary);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the exit_code on a ToolResult block. The shell execution path
     /// calls this after the underlying command finishes, capturing the real
     /// exit code instead of truncating to the binary Done/Error status.
@@ -1345,11 +1358,11 @@ impl BlockDocument {
         }
 
         // Apply full-snapshot updates for known blocks: `set_stderr`,
-        // `set_signature`, `set_output`, `set_tool_use_id`, and
-        // `move_block` each touch a field that lives on `BlockSnapshot` but
-        // not `BlockHeader` (stderr/signature/output/tool_use_id/
-        // order_key), so a bare header can't carry the change through
-        // replay. A full overwrite here is safe for the same reason
+        // `set_signature`, `set_summary`, `set_output`, `set_tool_use_id`,
+        // and `move_block` each touch a field that lives on `BlockSnapshot`
+        // but not `BlockHeader` (stderr/signature/summary/output/
+        // tool_use_id/order_key), so a bare header can't carry the change
+        // through replay. A full overwrite here is safe for the same reason
         // `new_blocks`' overwrite is: replay is strictly
         // sequential self-application of this document's own history
         // (never a concurrent merge — CLAUDE.md "Durable state and the
@@ -1745,10 +1758,10 @@ pub struct SyncPayload {
     pub deleted_blocks: Vec<BlockId>,
     /// Full post-mutation snapshots for known blocks whose mutation touched
     /// a field that lives on `BlockSnapshot` but not `BlockHeader` —
-    /// `stderr`/`signature`/`output`/`tool_use_id` (write-once metadata) and
-    /// `order_key` (`move_block`). `updated_headers` alone can't carry these
-    /// through oplog replay (`merge_ops` never reads a field the header
-    /// doesn't have).
+    /// `stderr`/`signature`/`summary`/`output`/`tool_use_id` (write-once
+    /// metadata) and `order_key` (`move_block`). `updated_headers` alone
+    /// can't carry these through oplog replay (`merge_ops` never reads a
+    /// field the header doesn't have).
     ///
     /// `#[serde(default)]` is LOAD-BEARING: this struct is journaled as
     /// versioned CBOR (field-name-keyed maps, no `deny_unknown_fields`), so
@@ -1796,8 +1809,8 @@ impl SyncPayload {
 
     /// A payload carrying exactly one known block's full post-mutation
     /// snapshot — for a mutation (`set_stderr`, `set_signature`,
-    /// `set_output`, `set_tool_use_id`, `move_block`) that changed a field
-    /// living on `BlockSnapshot` but not `BlockHeader`, so
+    /// `set_summary`, `set_output`, `set_tool_use_id`, `move_block`) that
+    /// changed a field living on `BlockSnapshot` but not `BlockHeader`, so
     /// `from_updated_header` alone can't carry it through replay. See the
     /// doc on `updated_snapshots`.
     pub fn from_updated_snapshot(snapshot: BlockSnapshot) -> Self {

@@ -226,6 +226,12 @@ struct BlockSnapshot {
   styleSpans @42 :List(StyleSpan);
   provenanceTransform @43 :Text;
   provenanceVersion @44 :UInt32;
+
+  # Kernel-derived one-line summary of a completed Thinking block's text
+  # (docs/issues.md, "Thinking folds to a summary line once the player has
+  # moved on"). "" falls back to "none" — same "empty = unset" convention as
+  # contentType/taskStatus. Display only: never fed back into hydration.
+  summary @45 :Text;
 }
 
 # Scalar block metadata carried by onBlockMetadataChanged.
@@ -246,6 +252,9 @@ struct BlockMetadata {
   # Task lifecycle status (BlockKind::Task only); "" falls back to "open",
   # same "empty = default" convention as contentType.
   taskStatus @8 :Text;
+  # Kernel-derived summary (Thinking blocks only); "" falls back to "none",
+  # same "empty = unset" convention as contentType/taskStatus.
+  summary @9 :Text;
 }
 
 # Query for fetching blocks — union of all/byIds/byFilter

@@ -3495,6 +3495,12 @@ pub(crate) fn parse_block_metadata(
         .and_then(|t| t.to_str().ok())
         .and_then(kaijutsu_types::TaskStatus::from_str)
         .unwrap_or_default();
+    let summary = reader
+        .get_summary()
+        .ok()
+        .and_then(|t| t.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
     kaijutsu_types::BlockMetadata {
         exit_code: reader.get_has_exit_code().then(|| reader.get_exit_code()),
         is_error: reader.get_is_error(),
@@ -3503,6 +3509,7 @@ pub(crate) fn parse_block_metadata(
         tool_use_id,
         stderr,
         task_status,
+        summary,
     }
 }
 
@@ -4152,6 +4159,16 @@ pub(crate) fn parse_block_snapshot(
         && let Some(status) = kaijutsu_types::TaskStatus::from_str(s)
     {
         builder = builder.task_status(status);
+    }
+
+    // Kernel-derived summary (Thinking blocks; "" means none, same
+    // "empty = unset" convention as content_type/task_status)
+    if reader.has_summary()
+        && let Ok(s) = reader.get_summary()
+        && let Ok(s) = s.to_str()
+        && !s.is_empty()
+    {
+        builder = builder.summary(s);
     }
 
     // Styled spans + ingest provenance (docs/ansi-and-beyond.md). A writer
@@ -5111,6 +5128,12 @@ mod tests {
             builder.set_task_status(snap.task_status.as_str());
         }
 
+        // Kernel-derived summary ("" on the wire means none, same convention
+        // as content_type/task_status).
+        if let Some(ref summary) = snap.summary {
+            builder.set_summary(summary);
+        }
+
         // Styled spans + provenance, encoded exactly the way the server's
         // `set_block_snapshot` does (0 = none, 1 = indexed, 2 = packed rgb);
         // a snapshot carrying neither writes neither field.
@@ -5465,6 +5488,33 @@ mod tests {
             roundtrip_snapshot(&plain).task_status,
             kaijutsu_types::TaskStatus::Open
         );
+    }
+
+    /// Kernel-derived summary (docs/issues.md, "Thinking folds to a summary
+    /// line once the player has moved on") survives the wire, and "" falls
+    /// back to `None` — same "empty = unset" convention as task_status.
+    #[test]
+    fn test_thinking_summary_capnp_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+
+        let snap = kaijutsu_types::BlockSnapshotBuilder::new(id, BlockKind::Thinking)
+            .role(Role::Model)
+            .content("Hmm. Let me think about this carefully.")
+            .summary("Let me think about this carefully")
+            .build();
+        let round_tripped = roundtrip_snapshot(&snap);
+        assert_eq!(
+            round_tripped.summary,
+            Some("Let me think about this carefully".to_string())
+        );
+
+        // A block that never got a summary must decode as None, not Some("").
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Thinking).build();
+        assert_eq!(roundtrip_snapshot(&plain).summary, None);
     }
 
     /// Styled spans + provenance survive the wire intact (Stage 2C of the

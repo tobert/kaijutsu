@@ -411,6 +411,7 @@ mod tests {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         };
         let snap_b = BlockSnapshot {
             id: id_b,
@@ -449,6 +450,7 @@ mod tests {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         };
 
         // Build DAG manually (from_snapshots would not create cycles)

@@ -34,7 +34,18 @@ hydrate or a second or two after the thinking ends and I've likely moved on.
 I think in the tui, the thinking preview thing would collapse to the
 summarized line on the terminal history."*
 
-**Today.** The kernel keeps a durable `collapsed` flag per block, flipped
+**Shipped 2026-09-12, kernel/wire/tui half.** `kaijutsu_types::summarize_thinking`
+(sentence boundary needs trailing whitespace, 120-char cap, markdown
+markers stripped); `summary` on `BlockSnapshot`/`BlockMetadata` and the
+kernel's `BlockContent`, journaled as a full snapshot like `stderr`;
+capnp `BlockSnapshot.summary @45`, `BlockMetadata.summary @9`; set in the
+server's `ThinkingEnd` arm before the status flips to Done; the tui stub
+shows it; `kj block inspect --json` prints it. **Remaining: the app's
+per-viewer fold**, handed to the moltar session through the exomemory
+daily (fold on hydrate, fold a second or two after `onTurnCompleted`, an
+explicit toggle pins open, never `set_collapsed`).
+
+**Before.** The kernel keeps a durable `collapsed` flag per block, flipped
 only by an explicit toggle (`set_collapsed`, `CollapsedChanged`); nothing
 collapses on its own. The app shows thinking expanded until toggled. The tui
 holds the turn's thinking in its pane and, when the block completes, prints

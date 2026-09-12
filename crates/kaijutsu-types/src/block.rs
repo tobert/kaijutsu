@@ -1838,6 +1838,12 @@ pub struct BlockSnapshot {
     /// Meaningless when `provenance` is `None`.
     #[serde(default)]
     pub edited_since_ingest: bool,
+
+    /// Extractive, kernel-derived one-line stand-in for a `Thinking` block's
+    /// full text. See `BlockHeader::summary` for the field's contract; this
+    /// is the same value, carried on the full snapshot.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -1863,6 +1869,11 @@ pub struct BlockMetadata {
     /// reason as `BlockHeader::task_status` — see that field's doc.
     #[serde(default)]
     pub task_status: TaskStatus,
+    /// Kernel-derived summary — see `BlockHeader::summary`. Rides this
+    /// generic scalar-metadata event the same way `task_status` does, since
+    /// it is set once, after insertion, outside the DTE text frontier.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 impl BlockSnapshot {
@@ -1881,6 +1892,7 @@ impl BlockSnapshot {
             tool_use_id: self.tool_use_id.clone(),
             stderr: self.stderr.clone(),
             task_status: self.task_status,
+            summary: self.summary.clone(),
         }
     }
 
@@ -1898,6 +1910,7 @@ impl BlockSnapshot {
         self.tool_use_id = metadata.tool_use_id.clone();
         self.stderr = metadata.stderr.clone();
         self.task_status = metadata.task_status;
+        self.summary = metadata.summary.clone();
     }
 
     /// Create a new text block snapshot.
@@ -1948,6 +1961,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -1994,6 +2008,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2052,6 +2067,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2110,6 +2126,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2175,6 +2192,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2228,6 +2246,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2279,6 +2298,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2330,6 +2350,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2377,6 +2398,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2435,6 +2457,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2492,6 +2515,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2548,6 +2572,7 @@ impl BlockSnapshot {
             style_spans: Vec::new(),
             provenance: None,
             edited_since_ingest: false,
+            summary: None,
         }
     }
 
@@ -2609,6 +2634,9 @@ impl BlockSnapshot {
         // change is signaled explicitly by `BlockFlow::SpansChanged` and
         // must not make two otherwise-identical blocks read as different
         // content (docs/ansi-and-beyond.md; decided 2026-08-19).
+        //
+        // `summary` is excluded for the same reason: it is a kernel-derived
+        // display cache over `content`, not authored content itself.
     }
 }
 
@@ -2677,6 +2705,7 @@ impl BlockSnapshotBuilder {
                 style_spans: Vec::new(),
                 provenance: None,
                 edited_since_ingest: false,
+                summary: None,
             },
         }
     }
@@ -2864,6 +2893,12 @@ impl BlockSnapshotBuilder {
     /// BlockKind::Task)` constructor).
     pub fn task_status(mut self, status: TaskStatus) -> Self {
         self.snap.task_status = status;
+        self
+    }
+
+    /// Set the kernel-derived summary (see `BlockHeader::summary`).
+    pub fn summary(mut self, summary: impl Into<String>) -> Self {
+        self.snap.summary = Some(summary.into());
         self
     }
 

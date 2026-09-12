@@ -240,6 +240,16 @@ pub struct BlockContent {
     /// `ThinkingEnd` via [`set_signature`](Self::set_signature). See
     /// [`kaijutsu_types::BlockSnapshot::signature`].
     signature: Option<String>,
+    /// Kernel-derived one-line summary of a completed `Thinking` block's
+    /// text, computed once when the block settles (see
+    /// `kaijutsu_types::summarize_thinking`) and set via
+    /// [`set_summary`](Self::set_summary). Display only — never enters
+    /// model hydration. A snapshot/metadata-only field, like `stderr` and
+    /// `signature` above: it rides `BlockSnapshot`/`BlockMetadata`, both of
+    /// which carry `#[serde(default)]` on their own `summary` field for the
+    /// same at-rest-CBOR reason `BlockHeader::task_status` documents — this
+    /// in-memory copy has no serde concern of its own.
+    summary: Option<String>,
     source_context: Option<kaijutsu_types::ContextId>,
     source_model: Option<String>,
     drift_kind: Option<kaijutsu_types::DriftKind>,
@@ -291,6 +301,7 @@ impl BlockContent {
             output: None,
             stderr: None,
             signature: None,
+            summary: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -343,6 +354,7 @@ impl BlockContent {
         block.output = snap.output.clone();
         block.stderr = snap.stderr.clone();
         block.signature = snap.signature.clone();
+        block.summary = snap.summary.clone();
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
@@ -645,6 +657,19 @@ impl BlockContent {
         self.header.updated_at = now_millis();
     }
 
+    /// Get the kernel-derived summary (see
+    /// `kaijutsu_types::BlockSnapshot::summary`).
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    /// Set the kernel-derived summary. Display only — never read by
+    /// hydration. A snapshot-only field, like `set_stderr`/`set_signature`
+    /// above — does not touch `header.updated_at`.
+    pub fn set_summary(&mut self, summary: String) {
+        self.summary = Some(summary);
+    }
+
     pub fn ephemeral(&self) -> bool {
         self.header.ephemeral
     }
@@ -710,6 +735,7 @@ impl BlockContent {
             tick: self.tick,
             track: self.track.clone(),
             updated_at: self.header.updated_at,
+            summary: self.summary.clone(),
         }
     }
 

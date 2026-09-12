@@ -57,6 +57,7 @@ pub mod refusal;
 pub mod session;
 pub mod shell_envelope;
 pub mod share;
+pub mod summary;
 pub mod theme;
 pub mod tick;
 pub mod timeout;
@@ -155,6 +156,7 @@ pub use block::{
     format_tool_content_for_llm,
 };
 pub use error_block::IntoErrorPayload;
+pub use summary::summarize_thinking;
 pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use dag::ConversationDAG;
 pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind};

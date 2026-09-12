@@ -1837,6 +1837,49 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the kernel-derived summary on a `Thinking` block (docs/issues.md,
+    /// "Thinking folds to a summary line once the player has moved on").
+    /// Mirrors `set_stderr` exactly: `summary` is a write-once snapshot
+    /// field, not part of `BlockHeader`, so the full post-mutation snapshot
+    /// is journaled (a header-only payload can't carry it through oplog
+    /// replay). Same `MetadataChanged` flow event. Display only — the
+    /// summary never enters model hydration.
+    pub fn set_summary(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        summary: String,
+    ) -> BlockStoreResult<()> {
+        let (ops, version) = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            entry.doc.set_summary(block_id, summary)?;
+            entry.touch(self.principal_id());
+            let version = entry.version();
+            let snapshot = entry.doc.get_block_snapshot(block_id).expect(
+                "block must exist: the mutation against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_snapshot(snapshot), version)
+        };
+        self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            metadata,
+            version,
+            source: OpSource::Local,
+        });
+
+        Ok(())
+    }
+
     /// Persist the real exit code on a ToolResult block. Shell execution
     /// calls this after the tool returns so `BlockSnapshot::exit_code`
     /// carries the actual value rather than being truncated to the binary
@@ -5085,6 +5128,45 @@ mod tests {
         );
     }
 
+    /// `summary` is a write-once snapshot field like `stderr`/`signature`
+    /// above, not part of `BlockHeader` — `set_summary` must journal the
+    /// full post-mutation snapshot (`SyncPayload::from_updated_snapshot`),
+    /// same as `set_stderr`, or a restart replaying the real oplog loses it.
+    #[tokio::test]
+    async fn test_set_summary_survives_oplog_replay_without_compaction() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "Hmm. Let me think about this some more.",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        store
+            .set_summary(ctx, &block_id, "Let me think about this some more".to_string())
+            .unwrap();
+
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed
+            .get_block_snapshot(&block_id)
+            .expect("block should exist after replay");
+        assert_eq!(
+            snapshot.summary.as_deref(),
+            Some("Let me think about this some more"),
+            "summary set before the next compaction must survive a restart replay"
+        );
+    }
+
     /// Streaming append (`append_text`) does two independent things per
     /// chunk: publish the classified `TextAppended` flow event (the live
     /// path), and journal a `TextEdit` to the oplog (the durable-recovery
@@ -7385,6 +7467,78 @@ mod tests {
             store.version(ctx).unwrap(),
             "the last mutation's version must equal what `store.version()` reports"
         );
+    }
+
+    /// A completed `Thinking` block's summary is durable on its snapshot,
+    /// and the `MetadataChanged` event that carries it publishes strictly
+    /// before the `StatusChanged` event that flips the block to `Done` — a
+    /// client reacting to completion (the tui's stub line) must already
+    /// hold the summary. See docs/issues.md, "Thinking folds to a summary
+    /// line once the player has moved on".
+    #[tokio::test]
+    async fn thinking_summary_lands_before_status_done() {
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let text = "Hmm. Let me think about this problem a little more carefully.";
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                text,
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        while sub.try_recv().is_some() {} // drain the insert
+
+        let summary = kaijutsu_types::summarize_thinking(text).expect("long enough to summarize");
+        store.set_summary(ctx, &block_id, summary.clone()).unwrap();
+        store.set_status(ctx, &block_id, Status::Done).unwrap();
+
+        let mut saw_metadata_changed = false;
+        let mut saw_status_changed = false;
+        while let Some(msg) = sub.try_recv() {
+            match msg.payload {
+                BlockFlow::MetadataChanged { block_id: id, .. } if id == block_id => {
+                    assert!(
+                        !saw_status_changed,
+                        "MetadataChanged must publish before StatusChanged for the same block"
+                    );
+                    saw_metadata_changed = true;
+                }
+                BlockFlow::StatusChanged {
+                    block_id: id,
+                    status,
+                    ..
+                } if id == block_id && status == Status::Done => {
+                    assert!(
+                        saw_metadata_changed,
+                        "StatusChanged(Done) must publish after the summary's MetadataChanged"
+                    );
+                    saw_status_changed = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_metadata_changed,
+            "set_summary must emit MetadataChanged"
+        );
+        assert!(saw_status_changed, "set_status must emit StatusChanged");
+
+        let snap = store
+            .get_block_snapshot(ctx, &block_id)
+            .unwrap()
+            .expect("block must still exist");
+        assert_eq!(snap.summary, Some(summary));
     }
 
     // ========================================================================

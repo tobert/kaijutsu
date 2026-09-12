@@ -9588,6 +9588,7 @@ pub(crate) fn build_block_metadata(
         builder.set_stderr(stderr);
     }
     builder.set_task_status(meta.task_status.as_str());
+    builder.set_summary(meta.summary.as_deref().unwrap_or(""));
 }
 
 /// Fill a Cap'n Proto `RenderCue` builder from the typed cue (docs/pcm.md "The
@@ -10974,6 +10975,12 @@ pub(crate) fn set_block_snapshot(
     // the wire falls back to Open, same convention as content_type/Plain)
     if block.task_status != TaskStatus::default() {
         builder.set_task_status(block.task_status.as_str());
+    }
+
+    // Set kernel-derived summary (Thinking blocks only; "" on the wire falls
+    // back to none, same convention as content_type/task_status).
+    if let Some(ref summary) = block.summary {
+        builder.set_summary(summary);
     }
 
     // Styled spans + ingest provenance (docs/ansi-and-beyond.md). Both are

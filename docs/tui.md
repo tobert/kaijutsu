@@ -294,9 +294,12 @@ Rules the figure carries:
 ```
 
 …and once the block completes, scrollback holds one line in its place:
+the kernel's summary, computed once at completion. The pane wraps the block
+for the screen; the summarizer reads the block's own text, whose first
+sentence runs to "removed":
 
 ```text
-  ▸ thinking · 14 lines · The unlink bug: resolve() canonicalizes the final…
+  ▸ thinking · 14 lines · The unlink bug: resolve() canonicalizes the final component, so the symlink's target is what gets removed
 ```
 
 Reasoning pops up while the turn runs and gets out of the way when the
@@ -326,9 +329,12 @@ Rules the figure carries:
   latch with the flags).
 - **The block completing prints the stub**, in document order, so
   scrollback reads in sequence while the pane still holds the text: one
-  `▸ thinking · N lines · <first line>` line
-  (`present::thinking_stub_line`, from raw content). Thinking blocks leave
-  the stream while the pane holds them, so nothing draws twice.
+  `▸ thinking · N lines · <summary>` line (`present::thinking_stub_line`),
+  where `<summary>` is the kernel's extractive summary of the block
+  (`kaijutsu_types::summarize_thinking`, stamped on the block when it
+  settles), with the block's own first line as the fallback when no
+  summary exists. Thinking blocks leave the stream while the pane holds
+  them, so nothing draws twice.
 - **Copy mode renders the block whole**, collapse state ignored for
   `Thinking`, so the reasoning stays findable after the pane closes; so
   does `kj block read`.
@@ -979,10 +985,6 @@ subsystem.
   line in the transcript is still open.
 - Internal splits. Set aside for v1; wezterm splits with
   `kaijutsu-tui --context <id>` cover it. Revisit when the itch is real.
-- **The stub should carry a summary, not the first line.** Amy reads the
-  pane while it streams and wants the fold to keep "something visible". The
-  kernel derives the line at completion; plan and open questions in
-  `docs/issues.md`, "Thinking folds to a summary line".
 - **The player's edge on submit.** A message sent mid-turn should tell the
   model which block the player had seen when they pressed Enter. The tui's
   source is `last_printed` plus the live band's streaming block; the plan,

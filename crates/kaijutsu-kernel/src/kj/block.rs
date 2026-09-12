@@ -661,6 +661,7 @@ impl KjDispatcher {
             "tool_call_id": snap.tool_call_id.map(|id| id.to_key()),
             "is_error": snap.is_error,
             "exit_code": snap.exit_code,
+            "summary": snap.summary,
         });
 
         if json {

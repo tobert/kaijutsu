@@ -405,7 +405,12 @@ pub fn render_block(
     }
     if view.collapsed {
         if block.kind == BlockKind::Thinking {
-            lines.push(thinking_stub_line(text.trim(), width, base));
+            lines.push(thinking_stub_line(
+                block.summary.as_deref(),
+                text.trim(),
+                width,
+                base,
+            ));
         } else {
             lines.push(stub_line(COLLAPSED_MARK, &text, width, base));
         }
@@ -577,15 +582,22 @@ fn stub_line(mark: &str, text: &str, width: u16, style: Style) -> Line<'static> 
 
 /// The thinking pane's stub: `▸ thinking · 14 lines · The unlink bug…`,
 /// cut with `…` rather than wrapped. The size says how much reasoning the
-/// stub stands for; the first line says what it was about.
-fn thinking_stub_line(text: &str, width: u16, style: Style) -> Line<'static> {
+/// stub stands for; `summary` — the kernel's extractive summary, stamped on
+/// the block when it settles — says what it was about, with the block's own
+/// first line as the fallback when no summary exists (docs/issues.md,
+/// "Thinking folds to a summary line once the player has moved on").
+fn thinking_stub_line(summary: Option<&str>, text: &str, width: u16, style: Style) -> Line<'static> {
     let count = text.lines().count();
-    let body = match text.lines().next().map(str::trim_end) {
+    let detail = summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| text.lines().next().map(str::trim_end));
+    let body = match detail {
         // A provider can return a thinking block with no text to show.
         None | Some("") => format!("{COLLAPSED_MARK} thinking · nothing to show"),
-        Some(first) => {
+        Some(detail) => {
             let noun = if count == 1 { "line" } else { "lines" };
-            format!("{COLLAPSED_MARK} thinking · {count} {noun} · {first}")
+            format!("{COLLAPSED_MARK} thinking · {count} {noun} · {detail}")
         }
     };
     Line::from(Span::styled(truncate(&body, usize::from(width)), style))
@@ -1028,6 +1040,35 @@ mod tests {
         let lines = render_block(&b, &v, 60, &Palette::builtin());
         let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(row, "▸ thinking · nothing to show");
+    }
+
+    /// A completed thinking block's stub uses the kernel's summary, not the
+    /// block's first line.
+    #[test]
+    fn a_summarized_thinking_block_stubs_with_the_summary() {
+        let id = BlockId::new(ContextId::new(), PrincipalId::new(), 1);
+        let b = BlockSnapshotBuilder::new(id, BlockKind::Thinking)
+            .role(Role::Model)
+            .content("Hmm.\nLet me think about this some more.")
+            .summary("Let me think about this some more")
+            .build();
+        let mut v = view();
+        v.collapsed = true;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(row, "▸ thinking · 2 lines · Let me think about this some more");
+    }
+
+    /// With no summary (a legacy block, or the summarizer found nothing to
+    /// say), the stub falls back to the first line — today's behavior.
+    #[test]
+    fn a_thinking_block_without_a_summary_falls_back_to_the_first_line() {
+        let b = block(BlockKind::Thinking, Role::Model, "considering\nmore");
+        let mut v = view();
+        v.collapsed = true;
+        let lines = render_block(&b, &v, 60, &Palette::builtin());
+        let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(row, "▸ thinking · 2 lines · considering");
     }
 
     #[test]

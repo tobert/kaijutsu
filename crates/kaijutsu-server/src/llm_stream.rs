@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock as TokioRwLock;
 
 use kaijutsu_types::shell_envelope::ShellEnvelope;
-use kaijutsu_types::{BlockKind, ContentType, Role, Status};
+use kaijutsu_types::{BlockKind, ContentType, Role, Status, summarize_thinking};
 use kaijutsu_kernel::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_kernel::llm::stream::{
@@ -2268,6 +2268,19 @@ async fn process_llm_stream(
                         }
                     }
                     if let Some(ref block_id) = current_block_id {
+                        // Compute and persist the extractive summary BEFORE
+                        // the status flips to Done, so any client reacting
+                        // to the completion (the tui's stub line included)
+                        // already holds it (docs/issues.md, "Thinking folds
+                        // to a summary line once the player has moved on").
+                        // Display only — never fed to the model.
+                        if let Some(summary) = assistant_reasoning
+                            .last()
+                            .and_then(|(text, _)| summarize_thinking(text))
+                            && let Err(e) = documents.set_summary(context_id, block_id, summary)
+                        {
+                            log::warn!("Failed to persist thinking summary: {}", e);
+                        }
                         let _ = documents.set_status(context_id, block_id, Status::Done);
                     }
                     current_block_id = None;
