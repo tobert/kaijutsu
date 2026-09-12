@@ -340,7 +340,12 @@ CREATE TABLE IF NOT EXISTS approvals (
     -- `BlockId::to_key()` form. NULL when the calling path had no blocks to
     -- name at gate time.
     command_block_id TEXT,
-    output_block_id  TEXT
+    output_block_id  TEXT,
+    -- Who authored the pair above, and therefore who must be told when an
+    -- execution on approval fills it: 'turn' (a model turn's own pair, its
+    -- turn ended at the gate) or 'session' (a connected session watching its
+    -- own blocks, told nothing). NULL when no pair is linked.
+    pair_owner       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status_created
     ON approvals(status, created_at);
@@ -844,7 +849,7 @@ fn add_approvals_columns_if_missing(conn: &Connection) -> SqliteResult<()> {
         .prepare("PRAGMA table_info(approvals)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<SqliteResult<Vec<String>>>()?;
-    for column in ["cwd", "exec_source", "command_block_id", "output_block_id"] {
+    for column in ["cwd", "exec_source", "command_block_id", "output_block_id", "pair_owner"] {
         if !existing.iter().any(|name| name == column) {
             conn.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {column} TEXT"))?;
         }
@@ -991,10 +996,12 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
             cwd              TEXT,
             exec_source      TEXT,
             command_block_id TEXT,
-            output_block_id  TEXT",
+            output_block_id  TEXT,
+            pair_owner       TEXT",
         columns: "request_id, context_id, principal_id, origin, instance, tool, hook_id, description, \
             authorized_label, rc_run_id, status, created_at, expires_at, claimed_at, claimed_by, \
-            decided_at, decided_by, decided_option, remember_scope, auto_reason, cwd, exec_source, command_block_id, output_block_id",
+            decided_at, decided_by, decided_option, remember_scope, auto_reason, cwd, exec_source, \
+            command_block_id, output_block_id, pair_owner",
     },
     ValueEnumRebuildSpec {
         table: "approval_signals",
@@ -1269,6 +1276,80 @@ mod tests {
             .query_row("SELECT script_count FROM rc_runs WHERE run_id = 'r1'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(script_count, None, "a pre-existing row gains the column as NULL, not a guessed value");
+
+        // A second migrate() must not try to add the column again.
+        migrate(&conn).unwrap();
+    }
+
+    /// The same regression as
+    /// `migrate_adds_script_count_to_a_database_created_without_it`, for
+    /// `pair_owner`: a database that ran `migrate()` before this column
+    /// existed must gain it, as NULL, on its next `migrate()`, and the
+    /// column must round-trip a written value afterward.
+    #[test]
+    fn migrate_adds_pair_owner_to_a_database_created_without_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build the shape `approvals` had once `cwd`/`exec_source`/
+        // `command_block_id`/`output_block_id` already existed but
+        // `pair_owner` did not, rather than calling `migrate()` first —
+        // calling it would already create the column, defeating the point
+        // of this test.
+        conn.execute_batch(
+            "CREATE TABLE approvals (
+                request_id       TEXT    NOT NULL PRIMARY KEY,
+                context_id       BLOB    NOT NULL,
+                principal_id     BLOB    NOT NULL,
+                origin           TEXT    NOT NULL,
+                instance         TEXT,
+                tool             TEXT,
+                hook_id          TEXT,
+                description      TEXT    NOT NULL,
+                authorized_label TEXT,
+                rc_run_id        TEXT,
+                status           TEXT    NOT NULL DEFAULT 'pending',
+                created_at       INTEGER NOT NULL,
+                expires_at       INTEGER,
+                claimed_at       INTEGER,
+                claimed_by       BLOB,
+                decided_at       INTEGER,
+                decided_by       BLOB,
+                decided_option   TEXT,
+                remember_scope   TEXT,
+                auto_reason      TEXT,
+                cwd              TEXT,
+                exec_source      TEXT,
+                command_block_id TEXT,
+                output_block_id  TEXT
+            );
+            INSERT INTO approvals (request_id, context_id, principal_id, origin, description, created_at)
+            VALUES ('r1', X'01', X'02', 'shell_gate', 'x', 1000);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let has_column = conn
+            .prepare("PRAGMA table_info(approvals)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<SqliteResult<Vec<String>>>()
+            .unwrap()
+            .iter()
+            .any(|name| name == "pair_owner");
+        assert!(has_column, "pair_owner must be added to a pre-existing approvals table");
+
+        let pair_owner: Option<String> = conn
+            .query_row("SELECT pair_owner FROM approvals WHERE request_id = 'r1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pair_owner, None, "a pre-existing row gains the column as NULL, not a guessed value");
+
+        conn.execute("UPDATE approvals SET pair_owner = 'turn' WHERE request_id = 'r1'", [])
+            .unwrap();
+        let round_tripped: String = conn
+            .query_row("SELECT pair_owner FROM approvals WHERE request_id = 'r1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(round_tripped, "turn", "the column must round-trip a written value");
 
         // A second migrate() must not try to add the column again.
         migrate(&conn).unwrap();

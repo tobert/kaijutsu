@@ -31,6 +31,39 @@ use strum::EnumString;
 // Enums
 // ============================================================================
 
+/// Who authored the pair a linked ask fills on approval, and therefore who
+/// has to be told when it runs.
+///
+/// `Turn`: a model turn authored the pair (its own ToolCall/ToolResult) and
+/// that turn ended when the gate refused it. An execution on approval must
+/// tell it — the fill is an in-place edit its cached mailbox does not
+/// re-read on its own, so a seed block is the only trace that reaches it.
+///
+/// `Session`: a connected session authored the pair and watches its own
+/// blocks as they change. Nobody is told; the filled pair is the delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, EnumString, Serialize, Deserialize)]
+#[strum(ascii_case_insensitive, serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum PairOwner {
+    Turn,
+    Session,
+}
+
+impl PairOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Session => "session",
+        }
+    }
+}
+
+impl fmt::Display for PairOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Where an approval request originated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, EnumString, Serialize, Deserialize)]
 #[strum(ascii_case_insensitive, serialize_all = "snake_case")]
@@ -493,6 +526,10 @@ pub struct ApprovalRow {
     /// The block pair the call already authored, `BlockId::to_key()` form.
     pub command_block_id: Option<String>,
     pub output_block_id: Option<String>,
+    /// Who authored the linked pair above, and therefore who must be told
+    /// when it fills. `None` when no pair is linked, or for a row written
+    /// before this column existed.
+    pub pair_owner: Option<PairOwner>,
 }
 
 /// One `approval_options` row.
@@ -738,6 +775,9 @@ mod tests {
 
     #[test]
     fn every_enum_as_str_round_trips_through_from_str() {
+        for v in [PairOwner::Turn, PairOwner::Session] {
+            assert_eq!(PairOwner::from_str(v.as_str()).unwrap(), v);
+        }
         for v in [Origin::Hook, Origin::ShellGate, Origin::KjVerb] {
             assert_eq!(Origin::from_str(v.as_str()).unwrap(), v);
         }

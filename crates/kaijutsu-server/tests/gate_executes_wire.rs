@@ -35,6 +35,7 @@ use std::time::Duration;
 use common::{connect_client, run_local, start_server_with_kernel_handle};
 use kaijutsu_client::{KernelHandle, RpcClient, RpcError};
 use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
+use kaijutsu_kernel::PairOwner;
 use kaijutsu_server::SharedKernel;
 use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId, Status, ToolKind};
 
@@ -163,8 +164,10 @@ impl Seats {
     }
 
     /// Author a command/output pair sitting `Waiting` on `request_id`, the
-    /// shape `execute_shell_command` leaves behind when the gate refuses it.
-    fn link_waiting_pair(&self, request_id: &str, code: &str) -> (BlockId, BlockId) {
+    /// shape `execute_shell_command` (`owner: PairOwner::Session`) or a
+    /// model's own tool call (`owner: PairOwner::Turn`) leaves behind when
+    /// the gate refuses it.
+    fn link_waiting_pair(&self, request_id: &str, code: &str, owner: PairOwner) -> (BlockId, BlockId) {
         let documents = &self.kernel.documents;
         let after = documents.last_block_id(self.worker);
         let command_block_id = documents
@@ -202,7 +205,7 @@ impl Seats {
         self.kernel
             .kernel_db
             .lock()
-            .link_ask_blocks(request_id, &command_block_id, &output_block_id)
+            .link_ask_blocks(request_id, &command_block_id, &output_block_id, owner)
             .expect("link the pair to the ask");
         (command_block_id, output_block_id)
     }
@@ -297,11 +300,13 @@ impl Seats {
 /// The headline. An allowed ask whose blocks are already waiting on it goes
 /// `Waiting` → `Done` with the command's stdout in the output block, the
 /// approval is spent exactly once, and a later ledger change does not run it
-/// a second time.
+/// a second time. The pair is `PairOwner::Session` — a connected session's
+/// own blocks — so nobody gets told.
 ///
 /// Falsified by dropping the `redeem_ask` claim before the run (the second
 /// ledger change would re-run it and the marker file's contents would
-/// double), or by never executing (the pair stays `Waiting`).
+/// double), by never executing (the pair stays `Waiting`), or by telling a
+/// session-owned pair's context anyway (a seed block would appear).
 #[test]
 fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
     run_local(async {
@@ -315,7 +320,7 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
         );
 
         let ask = s.raise(&code).await;
-        let (command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code);
+        let (command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code, PairOwner::Session);
         assert_eq!(s.block(&output_block_id).status, Status::Waiting);
 
         s.answer(&ask, true).await;
@@ -350,6 +355,14 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
             "an executed ask must be redeemed, so its answer is no longer undelivered"
         );
 
+        // Give a seed time to appear if the driver were going to write one,
+        // then insist it did not: a session-owned pair tells nobody.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !s.worker_blocks().iter().any(|b| b.content.contains("It has run.")),
+            "a session-owned pair must not get a seed telling anyone it ran"
+        );
+
         // A second ledger change must not run it again — exactly-once lives
         // in the redemption row, not in the driver's memory.
         s.kernel
@@ -361,6 +374,71 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
             std::fs::read_to_string(&marker).unwrap(),
             "gate-executed\n",
             "a second ledger change must not re-run a redeemed ask"
+        );
+    });
+}
+
+/// A model's own linked pair (`PairOwner::Turn`) gets the same seed a
+/// driver-authored pair does: its turn ended at the gate too, and the fill
+/// is an in-place edit its cached mailbox will not re-read on its own
+/// (`docs/gate-shape-b.md`, "The subscriber, in order").
+///
+/// Falsified by treating every linked pair as told-nobody regardless of
+/// owner: no "It has run." seed would appear and a delegated turn would
+/// never learn its approved tool call ran.
+#[test]
+fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
+    run_local(async {
+        let scratch = Scratch::new("turnpair");
+        let s = seats().await;
+        let marker = scratch.marker();
+        let code = format!(
+            "echo turn-pair-ran >> {}\ncat {}",
+            marker.display(),
+            marker.display()
+        );
+
+        let ask = s.raise(&code).await;
+        let (command_block_id, output_block_id) =
+            s.link_waiting_pair(&ask, &code, PairOwner::Turn);
+
+        s.answer(&ask, true).await;
+
+        wait_for("the output block to settle", || {
+            s.block(&output_block_id).status != Status::Waiting
+        })
+        .await;
+
+        assert_eq!(s.block(&output_block_id).status, Status::Done);
+        assert_eq!(s.block(&command_block_id).status, Status::Done);
+        assert!(
+            s.block(&output_block_id).content.contains("turn-pair-ran"),
+            "the output block must hold the command's stdout, got {:?}",
+            s.block(&output_block_id).content
+        );
+        assert!(!s.undelivered(&ask), "an executed ask must be redeemed");
+
+        wait_for("the seed block saying it ran", || {
+            s.worker_blocks().iter().any(|b| {
+                b.kind == kaijutsu_types::BlockKind::Text
+                    && b.content.contains("approved the action")
+                    && b.content.contains("It has run.")
+            })
+        })
+        .await;
+
+        let blocks = s.worker_blocks();
+        let output_index = blocks
+            .iter()
+            .position(|b| b.id == output_block_id)
+            .expect("the filled output block");
+        let seed_index = blocks
+            .iter()
+            .position(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("It has run."))
+            .expect("the seed block");
+        assert!(
+            seed_index > output_index,
+            "the seed must land after the filled output block"
         );
     });
 }
@@ -393,7 +471,7 @@ fn an_allowed_ask_runs_with_the_values_it_was_asked_about() {
             db.set_context_env(s.worker, "GATE_FOO", "moved").unwrap();
             db.set_context_env(s.worker, "GATE_BAR", "appeared").unwrap();
         }
-        let (_command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code);
+        let (_command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code, PairOwner::Session);
 
         s.answer(&ask, true).await;
         wait_for("the output block to settle", || {
@@ -429,7 +507,7 @@ fn a_denied_ask_settles_its_pair_to_error_and_runs_nothing() {
         let code = format!("echo should-not-run > {}", marker.display());
 
         let ask = s.raise(&code).await;
-        let (command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code);
+        let (command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code, PairOwner::Session);
 
         s.answer(&ask, false).await;
 
@@ -574,7 +652,7 @@ fn an_allowed_ask_whose_cwd_is_gone_runs_nothing_and_names_the_directory() {
 
         let code = "echo dead-cwd > ./marker".to_string();
         let ask = s.raise(&code).await;
-        let (command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code);
+        let (command_block_id, output_block_id) = s.link_waiting_pair(&ask, &code, PairOwner::Session);
         assert_eq!(
             s.kernel
                 .kernel_db

@@ -16,9 +16,9 @@ use crate::events;
 use crate::time::now_millis;
 use crate::types::{
     ApprovalRow, AskEnvRow, AskStatementRow, EventKind, EventRow, NewAsk, NewPlanStatement,
-    NewPlannedValue, Origin, OptionRow, PlanCommandRow, PlanRedirectRow, PlanStatementRow,
-    PlannedValueRow, RefusalRow, SignalRow, SignalSourceKind, SignalVerdict, ValueKind,
-    VarBinding, parse_enum,
+    NewPlannedValue, Origin, OptionRow, PairOwner, PlanCommandRow, PlanRedirectRow,
+    PlanStatementRow, PlannedValueRow, RefusalRow, SignalRow, SignalSourceKind, SignalVerdict,
+    ValueKind, VarBinding, parse_enum,
 };
 
 /// Durably record one ask and return its `request_id`. Commits before
@@ -282,7 +282,7 @@ pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<Approv
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id
+                command_block_id, output_block_id, pair_owner
          FROM approvals WHERE request_id = ?1",
         params![request_id],
         row_to_approval,
@@ -294,6 +294,7 @@ pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<Approv
 pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRow> {
     let origin_raw: String = row.get(3)?;
     let status_raw: String = row.get(10)?;
+    let pair_owner_raw: Option<String> = row.get(24)?;
     Ok(ApprovalRow {
         request_id: row.get(0)?,
         context_id: row.get(1)?,
@@ -319,6 +320,10 @@ pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalR
         exec_source: row.get(21)?,
         command_block_id: row.get(22)?,
         output_block_id: row.get(23)?,
+        pair_owner: pair_owner_raw
+            .map(|raw| parse_enum::<PairOwner>("pair_owner", &raw))
+            .transpose()
+            .map_err(sql_err)?,
     })
 }
 
@@ -346,7 +351,7 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id
+                command_block_id, output_block_id, pair_owner
          FROM approvals WHERE status = 'pending' ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -374,14 +379,15 @@ pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id
+                command_block_id, output_block_id, pair_owner
          FROM approvals WHERE status IN ('pending', 'claimed') ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// Record the block pair an ask's call already authored.
+/// Record the block pair an ask's call already authored, and who authored
+/// it.
 ///
 /// Written by the caller AFTER the ask escalates, because the gate does not
 /// see these ids: the path that creates the pair reaches the gate through
@@ -390,17 +396,21 @@ pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
 /// one place where the two are in the same scope.
 ///
 /// Filling an existing pair is what keeps an execution on approval from
-/// authoring a second pair beside the first and stranding it.
+/// authoring a second pair beside the first and stranding it. `owner`
+/// decides who a fill has to tell: `PairOwner::Turn` for a model turn's own
+/// pair (its turn ended at the gate too), `PairOwner::Session` for a
+/// connected session watching its own blocks (told nothing).
 pub fn link_ask_blocks(
     conn: &Connection,
     request_id: &str,
     command_block_id: &str,
     output_block_id: &str,
+    owner: PairOwner,
 ) -> Result<()> {
     let updated = conn.execute(
-        "UPDATE approvals SET command_block_id = ?2, output_block_id = ?3
+        "UPDATE approvals SET command_block_id = ?2, output_block_id = ?3, pair_owner = ?4
          WHERE request_id = ?1",
-        params![request_id, command_block_id, output_block_id],
+        params![request_id, command_block_id, output_block_id, owner.as_str()],
     )?;
     if updated == 0 {
         return Err(LedgerError::NotFound(request_id.to_string()));
@@ -422,7 +432,7 @@ pub fn list_unresolved_for_context(
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id
+                command_block_id, output_block_id, pair_owner
          FROM approvals
          WHERE status IN ('pending', 'claimed') AND context_id = ?1
          ORDER BY created_at ASC",
@@ -452,7 +462,7 @@ pub fn list_history(conn: &Connection, limit: i64) -> Result<Vec<ApprovalRow>> {
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id
+                command_block_id, output_block_id, pair_owner
          FROM approvals WHERE status IN ('allowed', 'denied', 'expired', 'abandoned')
          ORDER BY created_at DESC LIMIT ?1",
     )?;
@@ -525,7 +535,7 @@ pub fn list_asks_filtered(conn: &Connection, filter: &AskListFilter) -> Result<(
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id
+                command_block_id, output_block_id, pair_owner
          FROM approvals {where_clause} ORDER BY created_at {order} LIMIT ?"
     );
     let mut select_params = params;
@@ -1660,9 +1670,10 @@ mod tests {
     }
 
     /// An ask starts with no blocks named, and the caller fills them in
-    /// afterwards. Both halves matter: an ask raised on a path with no
-    /// blocks must stay `None` rather than pointing at something, and one
-    /// raised on a path that has them must carry both.
+    /// afterwards, along with who authored them. Both halves matter: an ask
+    /// raised on a path with no blocks must stay `None` rather than
+    /// pointing at something, and one raised on a path that has them must
+    /// carry all three.
     ///
     /// Falsified by having `link_ask_blocks` write only one column.
     #[test]
@@ -1673,12 +1684,28 @@ mod tests {
         let before = get_approval(&conn, &request_id).unwrap().unwrap();
         assert_eq!(before.command_block_id, None, "nothing is named at ask time");
         assert_eq!(before.output_block_id, None);
+        assert_eq!(before.pair_owner, None);
 
-        link_ask_blocks(&conn, &request_id, "ctx_pri_1", "ctx_pri_2").unwrap();
+        link_ask_blocks(&conn, &request_id, "ctx_pri_1", "ctx_pri_2", PairOwner::Session).unwrap();
 
         let after = get_approval(&conn, &request_id).unwrap().unwrap();
         assert_eq!(after.command_block_id.as_deref(), Some("ctx_pri_1"));
         assert_eq!(after.output_block_id.as_deref(), Some("ctx_pri_2"));
+        assert_eq!(after.pair_owner, Some(PairOwner::Session));
+    }
+
+    /// The other owner variant round-trips the same way — a model turn's
+    /// own pair is recorded as `PairOwner::Turn`, never silently folded
+    /// into `Session`.
+    #[test]
+    fn an_ask_carries_the_turn_owner_variant_too() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        link_ask_blocks(&conn, &request_id, "ctx_pri_1", "ctx_pri_2", PairOwner::Turn).unwrap();
+
+        let after = get_approval(&conn, &request_id).unwrap().unwrap();
+        assert_eq!(after.pair_owner, Some(PairOwner::Turn));
     }
 
     /// Linking blocks to an ask that does not exist is an error, not a
@@ -1690,7 +1717,7 @@ mod tests {
     fn linking_blocks_to_an_unknown_ask_is_not_found() {
         let conn = open_memory();
         assert!(matches!(
-            link_ask_blocks(&conn, "no-such-ask", "a", "b"),
+            link_ask_blocks(&conn, "no-such-ask", "a", "b", PairOwner::Session),
             Err(LedgerError::NotFound(_))
         ));
     }

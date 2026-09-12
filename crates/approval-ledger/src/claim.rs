@@ -22,7 +22,7 @@ use crate::types::{ApprovalRow, EventKind};
 const APPROVAL_COLUMNS: &str = "request_id, context_id, principal_id, origin, instance, tool, hook_id, \
      description, authorized_label, rc_run_id, status, created_at, \
      expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option, \
-     remember_scope, auto_reason, cwd, exec_source, command_block_id, output_block_id";
+     remember_scope, auto_reason, cwd, exec_source, command_block_id, output_block_id, pair_owner";
 
 /// Claim one specific ask for `claimant`. On success, the returned row's
 /// `status` is `claimed`. On a losing race, `status` was not `pending`

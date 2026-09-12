@@ -1211,14 +1211,18 @@ fn ask_link_for<'a>(
     ask_id.zip(result_block_id)
 }
 
-/// Tell the ask which `ToolCall`/`ToolResult` pair is holding it.
+/// Tell the ask which `ToolCall`/`ToolResult` pair is holding it, as
+/// `PairOwner::Turn`: this pair belongs to a model's own tool call, and that
+/// turn ended when the gate refused it, so an execution on approval must
+/// tell it — `act_on_executable_answer`'s `tell`.
 ///
 /// **The one place the pair's ids and the refusal's ask id are in scope
 /// together.** The gate runs inside the broker's hook evaluation, which never
 /// sees a block id (`KernelDb::link_ask_blocks`'s own note), and the pair is
 /// authored only after the dispatch returns. The rpc shell path writes this
-/// same link for its own pair (`rpc.rs`'s `link_ask_blocks` site); this is
-/// that link for the path a model's tool call takes.
+/// same link for its own pair, as `PairOwner::Session` (`rpc.rs`'s
+/// `link_ask_blocks` site); this is that link for the path a model's tool
+/// call takes.
 ///
 /// Without it the gate-resume driver finds no pair to fill
 /// (`act_on_executable_answer`'s `linked`), so an allow authors a *second*
@@ -1250,7 +1254,12 @@ fn link_waiting_pair_to_ask(
     let Some((ask_id, output_block_id)) = ask_link_for(status, ask_id, result_block_id) else {
         return;
     };
-    if let Err(e) = kernel_db.lock().link_ask_blocks(ask_id, tool_call_block_id, output_block_id) {
+    if let Err(e) = kernel_db.lock().link_ask_blocks(
+        ask_id,
+        tool_call_block_id,
+        output_block_id,
+        kaijutsu_kernel::PairOwner::Turn,
+    ) {
         log::error!("ask {ask_id}: could not record the blocks waiting on it: {e}");
     }
 }

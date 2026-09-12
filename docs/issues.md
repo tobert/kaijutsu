@@ -36,16 +36,18 @@ payload and logging, in the order to try:
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
 
-## A failed ToolResult insert leaves the next anchor before its call (2026-09-11)
+## An old approval revives a turn whose prompt cache is cold (2026-09-12)
 
-In `process_llm_stream`'s tool dispatch, a tool whose ToolResult block
-fails to insert returns no anchor, so the "Unzip and update last_block_id"
-loop keeps the previous tool's anchor. When that tool was the last of the
-batch, the next iteration's blocks land before its ToolCall block in
-document order. Needs a block-insert failure, which is logged loudly, so it
-is rare; the fix is to fall back to the call block id as the anchor (the
-inline path already does). Found by Kaibo reviewing the error-child anchor
-fix.
+`kj ledger allow` resumes the model whose linked pair it fills
+(`act_on_executable_answer`, `PairOwner::Turn`). An ask answered hours
+later still resumes it, and on metered providers that re-prices the whole
+context, since nothing of the provider's prompt cache survives that long.
+Amy: "perhaps later we'll add a staleness check; I don't like reviving KV
+caches that much esp when we're not on a subscription." Shape to try: the
+driver compares the ask's `created_at` against a per-backend cache
+lifetime, and past it writes the seed without the turn request, so the
+next `kj drive` is a human's choice. Needs the lifetimes as backend rows,
+not constants.
 
 ## The cached mailbox never re-reads a block it has seen (2026-09-11)
 
@@ -522,21 +524,6 @@ re-verified:
   same seat is the safe direction. The tui answers from another seat it
   holds, side-stepping this for a human; it stands for a model wanting to
   withdraw its own ask (the `cancel` verb above).
-
-`kj wait <ctx>` after `kj ledger allow` reports `running` by timeout with no
-turn in flight: the approval runs the command without resuming the coder
-(`docs/gate-resume.md`), so nothing ends a turn for `wait` to see. Either
-`wait` should notice a filled pair, or `allow` should say the coder needs a
-`kj drive` to continue (2026-09-11).
-
-An approval that fills a linked pair leaves no trace for the model: the
-result block carries the output and the model's own earlier text says an
-ask was pending, so on the next drive it reads the two as contradictory
-(a probe coder "corrected" itself that it had fabricated the ask id). The
-authored-pair branch already seeds "<who> approved the action you were
-waiting on … It has run." (`act_on_executable_answer`, `ExecAction::Tell`);
-the linked-pair branch returns `Settled` with no seed. Seed the same
-sentence for a linked pair, delivered on the next drive (2026-09-11).
 
 ## The scorer and the snapshot (2026-09-02)
 

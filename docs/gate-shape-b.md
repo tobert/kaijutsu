@@ -394,9 +394,11 @@ which isolates the subscriber from the gate. The `shell_box_*` cases drive
 the shipped path whole: `shellExecute` authors the pair, a PreCall `Ask`
 hook on `shell_write` refuses it with the command as `exec_source` (the
 hook gate plans a shell-shaped call the way `shell_gate` does) and the
-pair linked, and the allow fills that same pair with no second pair and no
-seed block; the deny settles it `Error`. Dropping the link call in
-`execute_shell_command` fails the allow case.
+pair linked as `PairOwner::Session` — `execute_shell_command`'s own link
+call — and the allow fills that same pair with no second pair and no seed
+block, because a session-owned pair tells nobody; the deny settles it
+`Error`. Dropping the link call in `execute_shell_command` fails the allow
+case.
 
 ## What the ask must carry, and what it must not try to
 
@@ -466,9 +468,16 @@ delivery, so they exist before the answer is spent; a denial with no pair
 falls back to the wake. An allow: **redeem first**, re-check Live,
 materialize a shell for the ask's principal and context under a synthetic
 session id, resolve or author the pair, move to the ask's cwd, restore the
-ask's env, run. A run into a pair the caller authored tells nobody. A run
-into a pair the driver authored ends with a seed block naming the output
-and a turn request, because that caller's turn ended when the gate refused.
+ask's env, run.
+
+**`link_ask_blocks` records who owns the pair, not just its ids.** A run
+into a `PairOwner::Session` pair — a connected session's own blocks, which
+it watches directly — tells nobody. A run into a pair whose turn ended at
+the gate — `PairOwner::Turn` (a model's own tool call) or one the driver
+authored fresh because the ask named none — gets a seed block naming the
+output; the seed also carries a turn request when no turn is in flight, and
+stands alone when one already is, because the fill is an in-place edit a
+running turn's cached mailbox will not re-read on its own `catch_up`.
 
 **What a crash costs.** The redemption row is claimed before the run, so a
 crash between the two loses the action: the ask reads redeemed, nothing
@@ -482,8 +491,9 @@ place by design: the approval is spent, the pair says why, the human asks
 again if they still want it.
 
 **Not gated on `turn_in_flight`.** A running turn is a reason not to spend
-a turn waking someone, not a reason not to run an approved action; blocks
-that land during a live turn are discovered by that turn's next `catch_up`.
+a turn waking someone, not a reason not to run an approved action or to
+withhold a turn-owned pair's seed; only the turn request is skipped while
+one is already running.
 
 ## Archived contexts are inert
 

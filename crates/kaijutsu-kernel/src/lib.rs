@@ -75,7 +75,7 @@ pub use control::ConsentMode;
 // Re-exported because `KernelDb::undelivered_answers` hands these out and a
 // caller outside this crate has to be able to read the answer.
 pub use approval_ledger::ask::UndeliveredAnswer;
-pub use approval_ledger::types::ApprovalStatus;
+pub use approval_ledger::types::{ApprovalStatus, PairOwner};
 pub use kaijutsu_types::DocKind;
 pub use kernel::Kernel;
 pub use llm::{

@@ -692,9 +692,11 @@ enum ExecAction {
     /// carry the outcome, so the blocks settling IS the delivery and there
     /// is nobody left to wake.
     Settled,
-    /// The action ran into a pair this driver authored, and the model has
-    /// to be told with this text — its own turn ended when the gate
-    /// refused, so nothing else will notice the new blocks.
+    /// The action ran into a pair whose turn ended at the gate: one this
+    /// driver authored for a caller with no pair, or a model turn's own
+    /// linked pair (`PairOwner::Turn`). Either way nothing else will notice
+    /// the filled blocks on its own, so the turn has to be told with this
+    /// text.
     Tell(String),
     /// Not this branch's business: take the ordinary wake path, where the
     /// caller retries and its retry is what redeems.
@@ -710,10 +712,12 @@ enum ExecAction {
 /// `pair` is `None` when the ask names no blocks — and also when a key no
 /// longer parses, because authoring a fresh pair shows the human something
 /// while a half-resolved pair would settle one block and strand the other.
+/// The `PairOwner` decides who a fill has to tell: `Turn` for a model
+/// turn's own pair, `Session` for a connected session's.
 struct ExecutableAsk {
     source: String,
     cwd: Option<String>,
-    pair: Option<(BlockId, BlockId)>,
+    pair: Option<(BlockId, BlockId, kaijutsu_kernel::PairOwner)>,
     /// The denial as the model reads it on the output block's stderr. Short
     /// on purpose — `kj ledger show <id>` is where the whole ask lives.
     denial: String,
@@ -839,7 +843,7 @@ async fn act_on_executable_answer(
     // nothing to show, so the caller keeps the wake it would have had and
     // its retry collects the refusal.
     if !matches!(answer.status, kaijutsu_kernel::ApprovalStatus::Allowed) {
-        let Some((command_block_id, output_block_id)) = linked else {
+        let Some((command_block_id, output_block_id, _owner)) = linked else {
             return ExecAction::FallThrough;
         };
         settle_pair_error(
@@ -924,7 +928,7 @@ async fn act_on_executable_answer(
                  approval is spent and nothing ran",
                 answer.request_id
             );
-            if let Some((command_block_id, output_block_id)) = linked {
+            if let Some((command_block_id, output_block_id, _owner)) = linked {
                 settle_pair_error(
                     kernel,
                     context_id,
@@ -937,8 +941,15 @@ async fn act_on_executable_answer(
         }
     };
 
-    let (command_block_id, output_block_id, authored) = match linked {
-        Some((command_block_id, output_block_id)) => (command_block_id, output_block_id, false),
+    // `tell` is true for a pair whose turn ended at the gate: one this
+    // driver authors fresh below, or a model turn's own linked pair
+    // (`PairOwner::Turn`). A connected session's linked pair
+    // (`PairOwner::Session`) watches its own blocks, so a fill tells
+    // nobody.
+    let (command_block_id, output_block_id, tell) = match linked {
+        Some((command_block_id, output_block_id, owner)) => {
+            (command_block_id, output_block_id, matches!(owner, kaijutsu_kernel::PairOwner::Turn))
+        }
         None => match author_pair_for_ask(kernel, context_id, principal_id, source) {
             Ok((command_block_id, output_block_id)) => (command_block_id, output_block_id, true),
             Err(e) => {
@@ -970,7 +981,7 @@ async fn act_on_executable_answer(
             &output_block_id,
             reason,
         );
-        return if authored {
+        return if tell {
             ExecAction::Tell(format!(
                 "{who} approved the action you were waiting on: {}\n\n\
                  It did NOT run: {cwd} — the directory it was raised in — no longer \
@@ -993,7 +1004,7 @@ async fn act_on_executable_answer(
             &output_block_id,
             reason.clone(),
         );
-        return if authored {
+        return if tell {
             ExecAction::Tell(format!(
                 "{who} approved the action you were waiting on: {}\n\n\
                  It did NOT run: {why}. Block {} carries the same message. Ask again.",
@@ -1034,9 +1045,12 @@ async fn act_on_executable_answer(
     // output instead of the stale "waiting" text.
     kernel.conversation_cache.evict(context_id);
 
-    if authored {
-        // The output blocks reach the model as new blocks in its context;
-        // the seed only has to say who approved and that it ran.
+    if tell {
+        // Either the output blocks reach the model as new blocks in its
+        // context (driver-authored), or the fill is an in-place edit to a
+        // model turn's own pair that its cached mailbox will not re-read on
+        // its own (`PairOwner::Turn`); either way the seed only has to say
+        // who approved and that it ran.
         ExecAction::Tell(format!(
             "{who} approved the action you were waiting on: {}\n\nIt has run.",
             answer.description
@@ -1290,7 +1304,24 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                             .command_block_id
                             .as_deref()
                             .and_then(BlockId::from_key)
-                            .zip(row.output_block_id.as_deref().and_then(BlockId::from_key));
+                            .zip(row.output_block_id.as_deref().and_then(BlockId::from_key))
+                            .map(|(command_block_id, output_block_id)| {
+                                // A row written before `pair_owner` existed
+                                // names a pair but no owner; asks are
+                                // abandoned at boot, so the only way to reach
+                                // here with one is a stale row from before
+                                // this column — treat it as session-owned
+                                // rather than guess silently.
+                                let owner = row.pair_owner.unwrap_or_else(|| {
+                                    log::warn!(
+                                        "gate-resume: ask {} names a linked pair but no \
+                                         pair_owner; treating it as session-owned",
+                                        answer.request_id
+                                    );
+                                    kaijutsu_kernel::PairOwner::Session
+                                });
+                                (command_block_id, output_block_id, owner)
+                            });
                         let denial = match row.decided_option.as_deref() {
                             Some(option) => format!("denied by {who} ({option}) — nothing was run"),
                             None => format!("denied by {who} — nothing was run"),
@@ -1328,19 +1359,21 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                         }
                     };
 
-                    // A turn already running will make its own next attempt.
-                    // Not marked woken: if that turn ends without retrying,
-                    // the next ledger change picks this up again.
+                    let turn_in_flight = kernel.kernel.turn_in_flight(context_id);
+
+                    // A plain wake is skipped while a turn is already
+                    // running: it will make its own next attempt, and if it
+                    // ends without retrying, the next ledger change picks
+                    // this up again. Not marked woken, so that retry stays
+                    // possible.
                     //
-                    // An execution that already happened is different: its
-                    // blocks are in the log, and the running turn's mailbox
-                    // finds them on its next catch_up, so there is nothing
-                    // left to say.
-                    if kernel.kernel.turn_in_flight(context_id) {
-                        if executed_seed.is_some() {
-                            woken.insert(answer.request_id.clone());
-                            woken_this_event += 1;
-                        }
+                    // An executed seed is never skipped this way, in flight
+                    // or not: filling a pair is an in-place edit, and a
+                    // running turn's cached mailbox does not re-read an
+                    // already-seen block on its own `catch_up`
+                    // (`llm/mailbox.rs`) — the seed is the only trace of the
+                    // fill that reaches it.
+                    if executed_seed.is_none() && turn_in_flight {
                         continue;
                     }
 
@@ -1382,6 +1415,20 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
                             continue;
                         }
                     };
+
+                    // A turn is already in flight: the seed just written is
+                    // the trace of the fill, read on that turn's next
+                    // `catch_up` or on the next drive, and there is no turn
+                    // to request.
+                    if turn_in_flight {
+                        woken.insert(answer.request_id.clone());
+                        woken_this_event += 1;
+                        log::info!(
+                            "gate-resume: left a seed for {context_id}'s in-flight turn, ask {}",
+                            answer.request_id
+                        );
+                        continue;
+                    }
 
                     kernel.kernel.mark_turn_begun(context_id);
                     let delivered =
@@ -9844,12 +9891,14 @@ async fn execute_shell_command(
             // A verdict rides the result; only a fault still throws.
             let refusal = refusal_or_fault(err, "shell")?;
 
-            // Tell the ask which blocks are waiting on it. This is the one
-            // place the two are in scope together: the gate runs inside the
-            // broker's hook evaluation, which never sees a block id, and the
-            // pair above was authored before any of that. Without the link,
-            // an execution on approval would author a second pair beside
-            // this one and leave this one waiting forever.
+            // Tell the ask which blocks are waiting on it, as
+            // `PairOwner::Session`: this connected session watches its own
+            // blocks, so a fill tells nobody. This is the one place the two
+            // are in scope together: the gate runs inside the broker's hook
+            // evaluation, which never sees a block id, and the pair above
+            // was authored before any of that. Without the link, an
+            // execution on approval would author a second pair beside this
+            // one and leave this one waiting forever.
             //
             // Best-effort on purpose. The refusal is already correct and
             // already returned; failing the call because a convenience link
@@ -9857,9 +9906,12 @@ async fn execute_shell_command(
             // Logged, never swallowed.
             if let Some(ask_id) = refusal.ask_id() {
                 let db = kernel.kernel_db.lock();
-                if let Err(e) =
-                    db.link_ask_blocks(ask_id, &command_block_id, &output_block_id)
-                {
+                if let Err(e) = db.link_ask_blocks(
+                    ask_id,
+                    &command_block_id,
+                    &output_block_id,
+                    kaijutsu_kernel::PairOwner::Session,
+                ) {
                     log::error!(
                         "ask {ask_id}: could not record the blocks waiting on it: {e}"
                     );
