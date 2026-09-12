@@ -77,7 +77,7 @@ pub fn bump_for_restart(conn: &Connection) -> Result<i64> {
 mod tests {
     use rusqlite::params;
 
-    use crate::fixtures::{minimal_ask, open_memory, peer};
+    use crate::fixtures::{minimal_ask, open_memory, reviewer};
     use crate::schema::migrate;
 
     use super::*;
@@ -145,7 +145,7 @@ mod tests {
         crate::decide::decide(
             &conn,
             &request_id,
-            crate::decide::DecideInput { allow: true, decided_by: Some(peer(b"alice")), ..Default::default() },
+            crate::decide::DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() },
         )
         .unwrap();
 
@@ -162,7 +162,7 @@ mod tests {
         crate::decide::decide(
             &conn,
             &request_id,
-            crate::decide::DecideInput { allow: true, decided_by: Some(peer(b"alice")), ..Default::default() },
+            crate::decide::DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() },
         )
         .unwrap();
         let rule = crate::rules::learn_from_approval(&conn, &request_id, 0, crate::types::RuleScope::Always, true, None).unwrap();
@@ -185,7 +185,7 @@ mod tests {
         crate::decide::decide(
             &conn,
             &request_id,
-            crate::decide::DecideInput { allow: true, decided_by: Some(peer(b"alice")), ..Default::default() },
+            crate::decide::DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() },
         )
         .unwrap();
         let rule = crate::rules::learn_from_approval(&conn, &request_id, 0, crate::types::RuleScope::Always, true, None).unwrap();

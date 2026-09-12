@@ -19,7 +19,7 @@ use crate::events;
 use crate::time::now_millis;
 use crate::types::{ApprovalRow, EventKind};
 
-const APPROVAL_COLUMNS: &str = "request_id, context_id, principal_id, origin, instance, tool, hook_id, \
+const APPROVAL_COLUMNS: &str = "request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id, \
      description, authorized_label, rc_run_id, status, created_at, \
      expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option, \
      remember_scope, auto_reason, cwd, exec_source, command_block_id, output_block_id, pair_owner";

@@ -14,6 +14,8 @@ use rusqlite::Connection;
 fn minimal_ask() -> NewAsk {
     NewAsk {
         context_id: vec![1, 2, 3],
+        actor_id: vec![7, 8, 9],
+        reviewer_id: vec![10, 11, 12],
         principal_id: vec![4, 5, 6],
         origin: Origin::ShellGate,
         instance: Some("builtin.shell".into()),

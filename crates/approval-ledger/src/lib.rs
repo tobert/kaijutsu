@@ -93,22 +93,20 @@ pub(crate) mod fixtures {
         VarBinding,
     };
 
-    /// The context `minimal_ask` raises its ask from. An answer carrying
-    /// this context is a self-approval and must be refused.
+    /// The context `minimal_ask` raises its ask from.
     pub(crate) const ASKING_CONTEXT: &[u8] = &[1, 2, 3, 4];
 
-    /// A different seat. Peer-seat approval is permitted, so an answer from
-    /// here is the ordinary success path.
+    /// A second context used to prove context does not determine review.
     pub(crate) const PEER_CONTEXT: &[u8] = &[7, 7, 7, 7];
 
-    /// An answerer in another context — what a human in a second shell is.
-    pub(crate) fn peer(principal: &'static [u8]) -> Answerer<'static> {
+    /// An answerer acting as the assigned reviewer.
+    pub(crate) fn reviewer(principal: &'static [u8]) -> Answerer<'static> {
         Answerer { principal, context: Some(PEER_CONTEXT) }
     }
 
-    /// An answerer in the context that raised the ask.
-    pub(crate) fn author(principal: &'static [u8]) -> Answerer<'static> {
-        Answerer { principal, context: Some(ASKING_CONTEXT) }
+    /// An answerer acting as the performer, in another context.
+    pub(crate) fn actor(principal: &'static [u8]) -> Answerer<'static> {
+        Answerer { principal, context: Some(PEER_CONTEXT) }
     }
 
     pub(crate) fn open_memory() -> Connection {
@@ -152,6 +150,8 @@ pub(crate) mod fixtures {
     pub(crate) fn minimal_ask() -> NewAsk {
         NewAsk {
             context_id: ASKING_CONTEXT.to_vec(),
+            actor_id: b"coder".to_vec(),
+            reviewer_id: b"amy".to_vec(),
             principal_id: vec![9, 9, 9],
             origin: Origin::ShellGate,
             instance: Some("builtin.shell".into()),

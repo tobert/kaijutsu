@@ -35,19 +35,33 @@ pub enum LedgerError {
     #[error("approval request {request_id} cannot be claimed: status is `{status}`, not `pending`")]
     NotClaimable { request_id: String, status: String },
 
-    /// No self-approval: the answering context is the one that raised the
-    /// ask, or the answer named no context at all. A caller that cannot name
-    /// its context cannot show it is not the author, so both refuse.
-    /// `docs/gate-and-shell-split.md`, "No self-approval — the gate's own
-    /// answer path". Every refusal appends an `approval_refusals` row.
+    /// No self-approval: the answering actor performed the operation that
+    /// raised the ask. Every refusal appends an `approval_refusals` row.
     #[error(
-        "approval request {request_id} cannot be answered from this seat: {reason}. \
-         Answer it from another context"
+        "approval request {request_id} cannot be approved by its performing actor: {reason}"
     )]
     SelfApproval {
         request_id: String,
         reason: &'static str,
     },
+
+    /// The answerer is not the reviewer assigned to this ask.
+    #[error("approval request {request_id} may only be answered by its assigned reviewer")]
+    UnauthorizedReviewer { request_id: String },
+
+    /// The ask predates actor/reviewer provenance, so the ledger cannot
+    /// safely determine who may answer it.
+    #[error("approval request {request_id} has no recorded actor or reviewer and cannot be answered")]
+    UnresolvedIdentity { request_id: String },
+
+    #[error("approval request {request_id} may only be cancelled by its performer or requester")]
+    CancelUnauthorized { request_id: String },
+
+    #[error("approval request {request_id} may only be escalated by its assigned reviewer")]
+    EscalateUnauthorized { request_id: String },
+
+    #[error("approval request {request_id} cannot assign its performer as reviewer")]
+    ReviewerIsActor { request_id: String },
 
     /// Refused at the single write site that turns a decided approval's
     /// statement into a standing allow-always rule (guarantee 3): that

@@ -23,27 +23,20 @@ use crate::ask::row_to_approval;
 use crate::error::{LedgerError, Result};
 use crate::events;
 use crate::time::now_millis;
-use crate::types::{ApprovalRow, EventKind};
+use crate::types::{ApprovalRow, ApprovalStatus, EventKind};
 
-const APPROVAL_COLUMNS: &str = "request_id, context_id, principal_id, origin, instance, tool, hook_id, \
+const APPROVAL_COLUMNS: &str = "request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id, \
      description, authorized_label, rc_run_id, status, created_at, \
      expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option, \
      remember_scope, auto_reason, cwd, exec_source, command_block_id, output_block_id, pair_owner";
 
-/// Who is answering, and from where.
-///
-/// An answer that carries an identity must also name the context it came
-/// from, so [`ensure_not_self_approval`] cannot be skipped by a caller that
-/// simply forgets to pass one. The auto-decision path opts out by carrying no
-/// `Answerer` at all — which is the same signal the ledger already uses to
-/// tell a classifier's decision from a person's (`crate::ask::list_history`).
+/// Who is answering. Context is retained for the refusal audit; eligibility
+/// comes from the actor and reviewer snapshots on the ask.
 #[derive(Clone, Copy, Debug)]
 pub struct Answerer<'a> {
     /// Stored as `approvals.decided_by`.
     pub principal: &'a [u8],
-    /// The answering context, compared against `approvals.context_id`.
-    /// `None` is refused: a caller that cannot name its context cannot show
-    /// it is not the author.
+    /// The context that presented the answer, when known.
     pub context: Option<&'a [u8]>,
 }
 
@@ -61,9 +54,8 @@ pub struct DecideInput<'a> {
     pub auto_reason: Option<&'a str>,
 }
 
-/// Refuse an answer from the context that raised the ask — no self-approval
-/// (`docs/gate-and-shell-split.md`, "No self-approval — the gate's own answer
-/// path"). Peer contexts may answer each other; only the author is refused.
+/// Require the assigned reviewer to answer, while refusing the performing
+/// actor even if it switches contexts.
 ///
 /// Call this **before claiming**. [`decide`] calls it too, so the invariant
 /// holds for every caller, but a claim taken first would leave the ask
@@ -71,8 +63,8 @@ pub struct DecideInput<'a> {
 /// that may.
 ///
 /// Every refusal appends an `approval_refusals` row before returning
-/// [`LedgerError::SelfApproval`]: a refusal that is only returned to its
-/// caller is invisible to the measurement the gate is tuned on.
+/// a distinct identity error. A refusal that is only returned to its caller
+/// is invisible to the measurement the gate is tuned on.
 pub fn ensure_not_self_approval(
     conn: &Connection,
     request_id: &str,
@@ -82,23 +74,22 @@ pub fn ensure_not_self_approval(
         return Err(LedgerError::NotFound(request_id.to_string()));
     };
 
-    let reason = match answerer.context {
-        Some(ctx) if ctx != row.context_id.as_slice() => return Ok(()),
-        Some(_) => "this context raised the ask",
-        None => "the answer names no context",
+    let (Some(actor_id), Some(reviewer_id)) = (row.actor_id.as_deref(), row.reviewer_id.as_deref()) else {
+        events::append_refusal(conn, request_id, "unresolved_identity", Some(answerer.principal), answerer.context)?;
+        return Err(LedgerError::UnresolvedIdentity { request_id: request_id.to_string() });
     };
-
-    events::append_refusal(
-        conn,
-        request_id,
-        "self_approval",
-        Some(answerer.principal),
-        answerer.context,
-    )?;
-    Err(LedgerError::SelfApproval {
-        request_id: request_id.to_string(),
-        reason,
-    })
+    if answerer.principal == actor_id {
+        events::append_refusal(conn, request_id, "self_approval", Some(answerer.principal), answerer.context)?;
+        return Err(LedgerError::SelfApproval {
+            request_id: request_id.to_string(),
+            reason: "the answering actor performed this operation",
+        });
+    }
+    if answerer.principal != reviewer_id {
+        events::append_refusal(conn, request_id, "unauthorized_reviewer", Some(answerer.principal), answerer.context)?;
+        return Err(LedgerError::UnauthorizedReviewer { request_id: request_id.to_string() });
+    }
+    Ok(())
 }
 
 /// Decide a `pending` or `claimed` ask. On success, `status` becomes
@@ -111,17 +102,42 @@ pub fn ensure_not_self_approval(
 /// [`LedgerError::AlreadyDecided`] — the history is recorded, never
 /// silently dropped and never silently applied (guarantee 6).
 pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result<ApprovalRow> {
-    // The backstop, not the primary check: a caller should call this before
-    // claiming (see [`ensure_not_self_approval`]). Here it guarantees the
-    // invariant for every caller regardless. An auto-decision carries no
-    // `Answerer` and is untouched — a classifier is a different system from
-    // the one that raised the ask.
-    if let Some(answerer) = input.decided_by {
-        ensure_not_self_approval(conn, request_id, answerer)?;
-    }
-
     let decided_by = input.decided_by.map(|a| a.principal);
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Re-check identity after acquiring the write lock. The pre-claim guard
+    // above remains necessary to avoid a stranded claim, but a reviewer can
+    // be escalated between that guard and this terminal mutation.
+    if let Some(answerer) = input.decided_by {
+        let row = tx
+            .query_row(
+                &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
+                params![request_id],
+                row_to_approval,
+            )
+            .optional()?;
+        let Some(row) = row else { return Err(LedgerError::NotFound(request_id.to_string())); };
+        let (reason, error) = match (row.actor_id.as_deref(), row.reviewer_id.as_deref()) {
+            (Some(actor), Some(_)) if answerer.principal == actor => (
+                "self_approval",
+                LedgerError::SelfApproval { request_id: request_id.to_string(), reason: "the answering actor performed this operation" },
+            ),
+            (Some(_), Some(reviewer)) if answerer.principal != reviewer => (
+                "unauthorized_reviewer",
+                LedgerError::UnauthorizedReviewer { request_id: request_id.to_string() },
+            ),
+            (Some(_), Some(_)) => ("", LedgerError::NotFound(String::new())),
+            _ => ("unresolved_identity", LedgerError::UnresolvedIdentity { request_id: request_id.to_string() }),
+        };
+        if !reason.is_empty() {
+            tx.execute(
+                "INSERT INTO approval_refusals (request_id, seq, reason, actor, actor_context)
+                 VALUES (?1, (SELECT COALESCE(MAX(seq), -1) + 1 FROM approval_refusals WHERE request_id = ?1), ?2, ?3, ?4)",
+                params![request_id, reason, answerer.principal, answerer.context],
+            )?;
+            tx.commit()?;
+            return Err(error);
+        }
+    }
     let now = now_millis();
     let new_status = if input.allow { "allowed" } else { "denied" };
 
@@ -292,6 +308,67 @@ pub fn abandon_unresolved_for_archived_context(
     Ok(swept)
 }
 
+/// Withdraw a pending ask before anyone decides it. Only its performing
+/// actor or its requester may cancel it; both identities are stored on the
+/// row, so context changes cannot widen this authority.
+pub fn cancel(conn: &Connection, request_id: &str, caller: &[u8]) -> Result<ApprovalRow> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let row = tx
+        .query_row(
+            &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
+            params![request_id],
+            row_to_approval,
+        )
+        .optional()?;
+    let Some(row) = row else { return Err(LedgerError::NotFound(request_id.to_string())); };
+    if row.status != ApprovalStatus::Pending {
+        return Err(LedgerError::AlreadyDecided { request_id: request_id.to_string(), status: row.status.to_string() });
+    }
+    if row.actor_id.as_deref() != Some(caller) && row.principal_id.as_slice() != caller {
+        return Err(LedgerError::CancelUnauthorized { request_id: request_id.to_string() });
+    }
+    let now = now_millis();
+    let cancelled = tx.query_row(
+        &format!("UPDATE approvals SET status = 'abandoned', decided_at = ?2, decided_by = ?3, decided_option = 'cancel' WHERE request_id = ?1 AND status = 'pending' RETURNING {APPROVAL_COLUMNS}"),
+        params![request_id, now, caller], row_to_approval,
+    )?;
+    events::append(&tx, request_id, EventKind::Cancelled, Some(caller), None, None, None, Some("cancelled by actor or requester"))?;
+    tx.commit()?;
+    Ok(cancelled)
+}
+
+/// Reassign a pending ask to a new reviewer. The current reviewer alone may
+/// do this, and the performing actor can never become the reviewer.
+pub fn escalate(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[u8]) -> Result<ApprovalRow> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let row = tx.query_row(
+        &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
+        params![request_id], row_to_approval,
+    ).optional()?;
+    let Some(row) = row else { return Err(LedgerError::NotFound(request_id.to_string())); };
+    if row.status != ApprovalStatus::Pending {
+        return Err(LedgerError::AlreadyDecided { request_id: request_id.to_string(), status: row.status.to_string() });
+    }
+    if row.reviewer_id.as_deref() != Some(caller) {
+        return Err(LedgerError::EscalateUnauthorized { request_id: request_id.to_string() });
+    }
+    if row.actor_id.as_deref() == Some(reviewer) {
+        return Err(LedgerError::ReviewerIsActor { request_id: request_id.to_string() });
+    }
+    let escalated = tx.query_row(
+        &format!("UPDATE approvals SET reviewer_id = ?2 WHERE request_id = ?1 AND status = 'pending' RETURNING {APPROVAL_COLUMNS}"),
+        params![request_id, reviewer], row_to_approval,
+    )?;
+    let note = format!(
+        "reviewer reassigned from {} to {}",
+        caller.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        reviewer.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    );
+    events::append(&tx, request_id, EventKind::Escalated, Some(caller), None, None, None, Some(&note))?;
+    tx.commit()?;
+    Ok(escalated)
+}
+
 fn transition(
     conn: &Connection,
     request_id: &str,
@@ -376,7 +453,12 @@ pub fn redeem_ask(conn: &Connection, request_id: &str) -> Result<bool> {
         .query_row("SELECT status FROM approvals WHERE request_id = ?1", params![request_id], |row| row.get(0))
         .optional()?;
     let status = status.ok_or_else(|| LedgerError::NotFound(request_id.to_string()))?;
-    if status != "allowed" && status != "denied" {
+    let cancelled = conn.query_row(
+        "SELECT COALESCE(decided_option, '') = 'cancel' FROM approvals WHERE request_id = ?1",
+        params![request_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if status != "allowed" && status != "denied" && !(status == "abandoned" && cancelled) {
         return Err(LedgerError::NotDecided { request_id: request_id.to_string(), status });
     }
 
@@ -403,7 +485,7 @@ mod tests {
     use crate::ask::{create_ask, get_approval, list_events};
     use crate::error::LedgerError;
     use crate::ask::list_refusals;
-    use crate::fixtures::{ASKING_CONTEXT, PEER_CONTEXT, author, minimal_ask, open_memory, open_memory_with_legacy_kind_check, peer};
+    use crate::fixtures::{ASKING_CONTEXT, PEER_CONTEXT, actor, minimal_ask, open_memory, open_memory_with_legacy_kind_check, reviewer};
     use crate::types::{ApprovalStatus, EventKind};
 
     use super::*;
@@ -416,7 +498,7 @@ mod tests {
         let row = decide(
             &conn,
             &request_id,
-            DecideInput { allow: true, decided_by: Some(peer(b"alice")), decided_option: Some("allow_once"), ..Default::default() },
+            DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), decided_option: Some("allow_once"), ..Default::default() },
         )
         .unwrap();
         assert_eq!(row.status, ApprovalStatus::Allowed);
@@ -432,7 +514,7 @@ mod tests {
     fn decide_deny_is_not_allowed() {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
-        let row = decide(&conn, &request_id, DecideInput { allow: false, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
+        let row = decide(&conn, &request_id, DecideInput { allow: false, decided_by: Some(reviewer(b"amy")), ..Default::default() }).unwrap();
         assert_eq!(row.status, ApprovalStatus::Denied);
         assert!(!row.status.is_allowed());
     }
@@ -476,7 +558,7 @@ mod tests {
         let err = decide(
             &conn,
             &request_id,
-            DecideInput { allow: true, decided_by: Some(peer(b"late-alice")), decided_option: Some("allow_once"), ..Default::default() },
+            DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), decided_option: Some("allow_once"), ..Default::default() },
         )
         .unwrap_err();
         assert!(matches!(&err, LedgerError::AlreadyDecided { status, .. } if status == "expired"));
@@ -493,7 +575,7 @@ mod tests {
         assert_eq!(events.len(), 2, "expired event, then the rejected late attempt");
         assert_eq!(events[0].kind, EventKind::Expired);
         assert_eq!(events[1].kind, EventKind::LateDecision);
-        assert_eq!(events[1].actor.as_deref(), Some(b"late-alice".as_slice()));
+        assert_eq!(events[1].actor.as_deref(), Some(b"amy".as_slice()));
         assert_eq!(events[1].decided_option.as_deref(), Some("allow_once"));
     }
 
@@ -752,9 +834,9 @@ mod tests {
     fn sweep_does_not_touch_an_undelivered_allowed_or_denied_ask() {
         let conn = open_memory();
         let allowed = create_ask(&conn, &minimal_ask()).unwrap();
-        decide(&conn, &allowed, DecideInput { allow: true, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
+        decide(&conn, &allowed, DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() }).unwrap();
         let denied = create_ask(&conn, &minimal_ask()).unwrap();
-        decide(&conn, &denied, DecideInput { allow: false, decided_by: Some(peer(b"alice")), ..Default::default() }).unwrap();
+        decide(&conn, &denied, DecideInput { allow: false, decided_by: Some(reviewer(b"amy")), ..Default::default() }).unwrap();
 
         let count = abandon_unresolved_on_restart(&conn, "kernel restarted").unwrap();
         assert_eq!(count, 0, "no pending rows exist, so nothing should be swept");
@@ -823,26 +905,24 @@ mod tests {
         assert_eq!(events[0].note.as_deref(), Some("kernel restarted; nothing ran; ask again"));
     }
 
-    // ── No self-approval ────────────────────────────────────────────────
-    // `docs/gate-and-shell-split.md`, "No self-approval — the gate's own
-    // answer path". The author of an ask may not answer it; a peer may.
+    // ── Identity-based review ───────────────────────────────────────────
 
     /// Falsified by dropping the `ensure_not_self_approval` call from
     /// `decide`: the decide returns Ok and the ask reads `allowed`.
     #[test]
-    fn the_context_that_raised_an_ask_cannot_answer_it() {
+    fn a_coder_cannot_approve_its_ask_from_another_context() {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
 
         let err = decide(
             &conn,
             &request_id,
-            DecideInput { allow: true, decided_by: Some(author(b"the-asker")), ..Default::default() },
+            DecideInput { allow: true, decided_by: Some(actor(b"coder")), ..Default::default() },
         )
         .unwrap_err();
 
         assert!(
-            matches!(&err, LedgerError::SelfApproval { reason, .. } if *reason == "this context raised the ask"),
+            matches!(&err, LedgerError::SelfApproval { reason, .. } if *reason == "the answering actor performed this operation"),
             "expected a SelfApproval refusal, got: {err}"
         );
         // Nothing decided, and nothing consumed: the ask is still answerable
@@ -852,29 +932,26 @@ mod tests {
         assert!(row.decided_by.is_none());
     }
 
-    /// Peer-seat approval is permitted on purpose (Amy, 2026-08-26) — the
-    /// rule bans answering *yourself*, not answering for someone else.
+    /// Amy may approve a coder's ask in the coder's own context because
+    /// eligibility belongs to identity, not context.
     #[test]
-    fn a_different_context_may_answer() {
+    fn the_assigned_reviewer_may_answer_in_the_asking_context() {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
 
         let row = decide(
             &conn,
             &request_id,
-            DecideInput { allow: true, decided_by: Some(peer(b"a-neighbor")), ..Default::default() },
+            DecideInput { allow: true, decided_by: Some(Answerer { principal: b"amy", context: Some(ASKING_CONTEXT) }), ..Default::default() },
         )
         .unwrap();
         assert_eq!(row.status, ApprovalStatus::Allowed);
         assert!(list_refusals(&conn, &request_id).unwrap().is_empty());
     }
 
-    /// Fails closed: an answerer that cannot name its context cannot show it
-    /// is not the author, so it is refused exactly like the author is.
-    /// Falsified by treating `context: None` as "not the author" — the
-    /// decide succeeds and this trips.
+    /// An unrelated actor cannot approve, even from a different context.
     #[test]
-    fn an_answer_that_names_no_context_is_refused() {
+    fn an_unassigned_reviewer_is_refused() {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
 
@@ -883,16 +960,42 @@ mod tests {
             &request_id,
             DecideInput {
                 allow: true,
-                decided_by: Some(Answerer { principal: b"contextless", context: None }),
+                decided_by: Some(Answerer { principal: b"someone-else", context: Some(PEER_CONTEXT) }),
                 ..Default::default()
             },
         )
         .unwrap_err();
         assert!(
-            matches!(&err, LedgerError::SelfApproval { reason, .. } if *reason == "the answer names no context"),
-            "expected a SelfApproval refusal naming the missing context, got: {err}"
+            matches!(&err, LedgerError::UnauthorizedReviewer { .. }),
+            "expected an UnauthorizedReviewer refusal, got: {err}"
         );
         assert_eq!(get_approval(&conn, &request_id).unwrap().unwrap().status, ApprovalStatus::Pending);
+    }
+
+    /// A row without identity provenance must stay pending. Inferring either
+    /// field from requester or context would let a historical ask acquire an
+    /// authority relationship it never recorded.
+    #[test]
+    fn a_legacy_ask_without_actor_and_reviewer_is_refused() {
+        let conn = open_memory();
+        conn.execute(
+            "INSERT INTO approvals (request_id, context_id, principal_id, origin, description)
+             VALUES ('legacy', X'01', X'02', 'shell_gate', 'legacy ask')",
+            [],
+        )
+        .unwrap();
+
+        let err = decide(
+            &conn,
+            "legacy",
+            DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LedgerError::UnresolvedIdentity { .. }), "got: {err}");
+        assert_eq!(get_approval(&conn, "legacy").unwrap().unwrap().status, ApprovalStatus::Pending);
+        let refusals = list_refusals(&conn, "legacy").unwrap();
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[0].reason, "unresolved_identity");
     }
 
     /// A refusal that is only returned to its caller is invisible to the
@@ -907,7 +1010,7 @@ mod tests {
             decide(
                 &conn,
                 &request_id,
-                DecideInput { allow: true, decided_by: Some(author(b"the-asker")), ..Default::default() },
+                DecideInput { allow: true, decided_by: Some(actor(b"coder")), ..Default::default() },
             )
             .unwrap_err();
         }
@@ -917,8 +1020,8 @@ mod tests {
         assert_eq!(refusals[0].seq, 0);
         assert_eq!(refusals[1].seq, 1);
         assert_eq!(refusals[0].reason, "self_approval");
-        assert_eq!(refusals[0].actor.as_deref(), Some(&b"the-asker"[..]));
-        assert_eq!(refusals[0].actor_context.as_deref(), Some(ASKING_CONTEXT));
+        assert_eq!(refusals[0].actor.as_deref(), Some(&b"coder"[..]));
+        assert_eq!(refusals[0].actor_context.as_deref(), Some(PEER_CONTEXT));
 
         // A refusal is not an event: nothing was claimed, decided, or
         // late-decided, so `approval_events` stays empty.
@@ -959,15 +1062,15 @@ mod tests {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
 
-        ensure_not_self_approval(&conn, &request_id, author(b"the-asker")).unwrap_err();
+        ensure_not_self_approval(&conn, &request_id, actor(b"coder")).unwrap_err();
 
         // Still `pending`, so a peer's claim wins normally.
         let claimed = crate::claim::claim(&conn, &request_id, b"a-neighbor").unwrap();
         assert_eq!(claimed.status, ApprovalStatus::Claimed);
         assert_eq!(
-            ensure_not_self_approval(&conn, &request_id, peer(b"a-neighbor")).is_ok(),
+            ensure_not_self_approval(&conn, &request_id, reviewer(b"amy")).is_ok(),
             true,
-            "a peer context passes the guard"
+            "the assigned reviewer passes the guard"
         );
         assert_eq!(PEER_CONTEXT, &[7, 7, 7, 7]);
     }
@@ -977,8 +1080,63 @@ mod tests {
     #[test]
     fn the_guard_reports_an_unknown_ask_as_not_found() {
         let conn = open_memory();
-        let err = ensure_not_self_approval(&conn, "no-such-ask", peer(b"a-neighbor")).unwrap_err();
+        let err = ensure_not_self_approval(&conn, "no-such-ask", reviewer(b"amy")).unwrap_err();
         assert!(matches!(err, LedgerError::NotFound(_)), "got: {err}");
+    }
+
+    #[test]
+    fn actor_or_requester_can_cancel_a_pending_ask_and_records_it() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        let row = cancel(&conn, &request_id, b"coder").unwrap();
+        assert_eq!(row.status, ApprovalStatus::Abandoned);
+        let events = list_events(&conn, &request_id).unwrap();
+        assert_eq!(events.last().unwrap().kind, EventKind::Cancelled);
+        assert_eq!(events.last().unwrap().actor.as_deref(), Some(&b"coder"[..]));
+    }
+
+    #[test]
+    fn a_cancelled_ask_is_delivered_once_without_becoming_allowed() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        let row = cancel(&conn, &request_id, b"coder").unwrap();
+        assert!(!row.status.is_allowed());
+        let answers = crate::ask::undelivered_answers(&conn).unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].request_id, request_id);
+        assert_eq!(answers[0].status, ApprovalStatus::Abandoned);
+        assert!(redeem_ask(&conn, &request_id).unwrap());
+        assert!(crate::ask::undelivered_answers(&conn).unwrap().is_empty());
+        assert!(!get_approval(&conn, &request_id).unwrap().unwrap().status.is_allowed());
+    }
+
+    #[test]
+    fn unrelated_actor_cannot_cancel_and_the_ask_stays_pending() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        assert!(matches!(cancel(&conn, &request_id, b"stranger"), Err(LedgerError::CancelUnauthorized { .. })));
+        assert_eq!(get_approval(&conn, &request_id).unwrap().unwrap().status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn escalation_replaces_the_reviewer_and_only_the_new_reviewer_can_decide() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        let row = escalate(&conn, &request_id, b"amy", b"lead").unwrap();
+        assert_eq!(row.reviewer_id.as_deref(), Some(&b"lead"[..]));
+        assert_eq!(list_events(&conn, &request_id).unwrap().last().unwrap().kind, EventKind::Escalated);
+        assert!(matches!(decide(&conn, &request_id, DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() }), Err(LedgerError::UnauthorizedReviewer { .. })));
+        assert_eq!(decide(&conn, &request_id, DecideInput { allow: true, decided_by: Some(reviewer(b"lead")), ..Default::default() }).unwrap().status, ApprovalStatus::Allowed);
+    }
+
+    #[test]
+    fn cancellation_and_escalation_cannot_mutate_a_terminal_ask() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        expire(&conn, &request_id).unwrap();
+        assert!(matches!(cancel(&conn, &request_id, b"coder"), Err(LedgerError::AlreadyDecided { .. })));
+        assert!(matches!(escalate(&conn, &request_id, b"amy", b"lead"), Err(LedgerError::AlreadyDecided { .. })));
+        assert_eq!(get_approval(&conn, &request_id).unwrap().unwrap().status, ApprovalStatus::Expired);
     }
 
 }

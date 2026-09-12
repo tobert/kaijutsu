@@ -100,12 +100,14 @@ pub fn create_auto_allowed_ask(conn: &Connection, req: &NewAsk, auto_reason: &st
 fn insert_ask(tx: &Transaction, request_id: &str, req: &NewAsk) -> Result<()> {
     tx.execute(
         "INSERT INTO approvals (
-            request_id, context_id, principal_id, origin, instance, tool, hook_id,
+            request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
             description, authorized_label, rc_run_id, expires_at, cwd, exec_source
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             request_id,
             req.context_id,
+            req.actor_id,
+            req.reviewer_id,
             req.principal_id,
             req.origin.as_str(),
             req.instance,
@@ -278,7 +280,7 @@ fn split_value(value: &NewPlannedValue) -> (Option<&str>, Option<&str>, Option<&
 /// Fetch one approval by id.
 pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<ApprovalRow>> {
     conn.query_row(
-        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+        "SELECT request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
@@ -292,34 +294,36 @@ pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<Approv
 }
 
 pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRow> {
-    let origin_raw: String = row.get(3)?;
-    let status_raw: String = row.get(10)?;
-    let pair_owner_raw: Option<String> = row.get(24)?;
+    let origin_raw: String = row.get(5)?;
+    let status_raw: String = row.get(12)?;
+    let pair_owner_raw: Option<String> = row.get(26)?;
     Ok(ApprovalRow {
         request_id: row.get(0)?,
         context_id: row.get(1)?,
-        principal_id: row.get(2)?,
+        actor_id: row.get(2)?,
+        reviewer_id: row.get(3)?,
+        principal_id: row.get(4)?,
         origin: parse_enum::<Origin>("origin", &origin_raw).map_err(sql_err)?,
-        instance: row.get(4)?,
-        tool: row.get(5)?,
-        hook_id: row.get(6)?,
-        description: row.get(7)?,
-        authorized_label: row.get(8)?,
-        rc_run_id: row.get(9)?,
+        instance: row.get(6)?,
+        tool: row.get(7)?,
+        hook_id: row.get(8)?,
+        description: row.get(9)?,
+        authorized_label: row.get(10)?,
+        rc_run_id: row.get(11)?,
         status: parse_enum::<crate::types::ApprovalStatus>("status", &status_raw).map_err(sql_err)?,
-        created_at: row.get(11)?,
-        expires_at: row.get(12)?,
-        claimed_at: row.get(13)?,
-        claimed_by: row.get(14)?,
-        decided_at: row.get(15)?,
-        decided_by: row.get(16)?,
-        decided_option: row.get(17)?,
-        remember_scope: row.get(18)?,
-        auto_reason: row.get(19)?,
-        cwd: row.get(20)?,
-        exec_source: row.get(21)?,
-        command_block_id: row.get(22)?,
-        output_block_id: row.get(23)?,
+        created_at: row.get(13)?,
+        expires_at: row.get(14)?,
+        claimed_at: row.get(15)?,
+        claimed_by: row.get(16)?,
+        decided_at: row.get(17)?,
+        decided_by: row.get(18)?,
+        decided_option: row.get(19)?,
+        remember_scope: row.get(20)?,
+        auto_reason: row.get(21)?,
+        cwd: row.get(22)?,
+        exec_source: row.get(23)?,
+        command_block_id: row.get(24)?,
+        output_block_id: row.get(25)?,
         pair_owner: pair_owner_raw
             .map(|raw| parse_enum::<PairOwner>("pair_owner", &raw))
             .transpose()
@@ -347,7 +351,7 @@ fn sql_err(e: LedgerError) -> rusqlite::Error {
 /// queue would invite a second answerer to step on the first one's claim.
 pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
     let mut stmt = conn.prepare(
-        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+        "SELECT request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
@@ -375,7 +379,7 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
 /// [`list_pending`] for anything that answers asks while the kernel runs.
 pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
     let mut stmt = conn.prepare(
-        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+        "SELECT request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
@@ -428,7 +432,7 @@ pub fn list_unresolved_for_context(
     context_id: &[u8],
 ) -> Result<Vec<ApprovalRow>> {
     let mut stmt = conn.prepare(
-        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+        "SELECT request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
@@ -458,7 +462,7 @@ pub fn list_unresolved_for_context(
 /// `transition`) — `created_at` is the one timestamp every row has.
 pub fn list_history(conn: &Connection, limit: i64) -> Result<Vec<ApprovalRow>> {
     let mut stmt = conn.prepare(
-        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+        "SELECT request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
@@ -531,7 +535,7 @@ pub fn list_asks_filtered(conn: &Connection, filter: &AskListFilter) -> Result<(
 
     let order = if filter.newest_first { "DESC" } else { "ASC" };
     let select_sql = format!(
-        "SELECT request_id, context_id, principal_id, origin, instance, tool, hook_id,
+        "SELECT request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
@@ -914,6 +918,7 @@ pub fn find_redeemable(
     presented_label: &str,
     context_id: Option<&[u8]>,
     principal_id: Option<&[u8]>,
+    actor_id: &[u8],
 ) -> Result<Option<(String, crate::types::ApprovalStatus)>> {
     use std::collections::BTreeSet;
 
@@ -926,11 +931,12 @@ pub fn find_redeemable(
            AND authorized_label = ?1
            AND (?2 IS NULL OR context_id = ?2)
            AND (?3 IS NULL OR principal_id = ?3)
+           AND actor_id = ?4
            AND request_id NOT IN (SELECT request_id FROM approval_redemptions)
          ORDER BY created_at ASC",
     )?;
     let candidates: Vec<(String, String)> = candidates_q
-        .query_map(params![presented_label, context_id, principal_id], |row| {
+        .query_map(params![presented_label, context_id, principal_id, actor_id], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1008,7 +1014,7 @@ pub struct UndeliveredAnswer {
 pub fn undelivered_answers(conn: &Connection) -> Result<Vec<UndeliveredAnswer>> {
     let mut q = conn.prepare(
         "SELECT request_id, context_id, principal_id, status, description FROM approvals
-         WHERE status IN ('allowed', 'denied')
+         WHERE (status IN ('allowed', 'denied') OR (status = 'abandoned' AND decided_option = 'cancel'))
            AND auto_reason IS NULL
            AND request_id NOT IN (SELECT request_id FROM approval_redemptions)
          ORDER BY created_at ASC",
@@ -1020,10 +1026,12 @@ pub fn undelivered_answers(conn: &Connection) -> Result<Vec<UndeliveredAnswer>> 
                 request_id: row.get(0)?,
                 context_id: row.get(1)?,
                 principal_id: row.get(2)?,
-                // Total because the query admits exactly these two statuses.
+                // Only an explicit cancellation is delivery work; ordinary
+                // abandonment remains a terminal lifecycle fact.
                 status: match status.as_str() {
                     "allowed" => crate::types::ApprovalStatus::Allowed,
-                    _ => crate::types::ApprovalStatus::Denied,
+                    "denied" => crate::types::ApprovalStatus::Denied,
+                    _ => crate::types::ApprovalStatus::Abandoned,
                 },
                 description: row.get(4)?,
             })
@@ -1739,7 +1747,7 @@ mod tests {
         allow(&conn, &request_id);
 
         assert_eq!(
-            find_redeemable(&conn, &["fr-redeemed"], "rm target", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-redeemed"], "rm target", None, None, b"coder").unwrap(),
             Some((request_id.clone(), crate::types::ApprovalStatus::Allowed)),
             "an allowed, unredeemed ask matching label+digests must be found"
         );
@@ -1747,7 +1755,7 @@ mod tests {
         assert!(crate::decide::redeem_ask(&conn, &request_id).unwrap());
 
         assert_eq!(
-            find_redeemable(&conn, &["fr-redeemed"], "rm target", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-redeemed"], "rm target", None, None, b"coder").unwrap(),
             None,
             "an already-redeemed ask must not be found again"
         );
@@ -1805,17 +1813,17 @@ mod tests {
         allow(&conn, &request_id);
 
         assert_eq!(
-            find_redeemable(&conn, &["fr-digest-a"], "two statements", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-digest-a"], "two statements", None, None, b"coder").unwrap(),
             None,
             "presenting only one of the ask's two statements must not match"
         );
         assert_eq!(
-            find_redeemable(&conn, &["fr-digest-a", "fr-digest-c"], "two statements", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-digest-a", "fr-digest-c"], "two statements", None, None, b"coder").unwrap(),
             None,
             "presenting one real digest plus one the ask never covered must not match either"
         );
         assert_eq!(
-            find_redeemable(&conn, &["fr-digest-a", "fr-digest-b"], "two statements", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-digest-a", "fr-digest-b"], "two statements", None, None, b"coder").unwrap(),
             Some((request_id, crate::types::ApprovalStatus::Allowed)),
             "presenting the exact pair must match"
         );
@@ -1835,8 +1843,8 @@ mod tests {
         let request_id = create_ask(&conn, &ask).unwrap();
         allow(&conn, &request_id);
 
-        assert_eq!(find_redeemable(&conn, &["fr-label"], "rm /etc", None, None).unwrap(), None);
-        assert_eq!(find_redeemable(&conn, &["fr-label"], "rm target", None, None).unwrap(), Some((request_id, crate::types::ApprovalStatus::Allowed)));
+        assert_eq!(find_redeemable(&conn, &["fr-label"], "rm /etc", None, None, b"coder").unwrap(), None);
+        assert_eq!(find_redeemable(&conn, &["fr-label"], "rm target", None, None, b"coder").unwrap(), Some((request_id, crate::types::ApprovalStatus::Allowed)));
     }
 
     /// When two allowed, unredeemed asks are both eligible, the backlog
@@ -1858,7 +1866,7 @@ mod tests {
         let second = create_ask(&conn, &ask).unwrap();
         allow(&conn, &second);
 
-        assert_eq!(find_redeemable(&conn, &["fr-oldest"], "rm target", None, None).unwrap(), Some((first, crate::types::ApprovalStatus::Allowed)));
+        assert_eq!(find_redeemable(&conn, &["fr-oldest"], "rm target", None, None, b"coder").unwrap(), Some((first, crate::types::ApprovalStatus::Allowed)));
     }
 
     /// A `session`-scoped redemption boundary — not required by the task's
@@ -1889,14 +1897,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            find_redeemable(&conn, &["fr-denied"], "rm target", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-denied"], "rm target", None, None, b"coder").unwrap(),
             Some((request_id.clone(), crate::types::ApprovalStatus::Denied)),
             "a denied ask carries an answer and must be found, marked denied"
         );
 
         crate::decide::redeem_ask(&conn, &request_id).unwrap();
         assert_eq!(
-            find_redeemable(&conn, &["fr-denied"], "rm target", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-denied"], "rm target", None, None, b"coder").unwrap(),
             None,
             "once delivered, a denial is spent like an approval"
         );
@@ -1922,7 +1930,7 @@ mod tests {
             "fixture check: the ask really is allowed"
         );
         assert_eq!(
-            find_redeemable(&conn, &["fr-auto"], "rm target", None, None).unwrap(),
+            find_redeemable(&conn, &["fr-auto"], "rm target", None, None, b"coder").unwrap(),
             None,
             "a rule's own decision must never be handed to a later request as an answer"
         );
@@ -1975,13 +1983,13 @@ mod tests {
 
         // The agreement: what this reports, find_redeemable honors.
         assert!(
-            find_redeemable(&conn, &["ua-human"], "rm target", None, None)
+            find_redeemable(&conn, &["ua-human"], "rm target", None, None, b"coder")
                 .unwrap()
                 .is_some(),
             "an answer reported as undelivered must still authorize"
         );
         assert!(
-            find_redeemable(&conn, &["ua-auto"], "rm other", None, None)
+            find_redeemable(&conn, &["ua-auto"], "rm other", None, None, b"coder")
                 .unwrap()
                 .is_none(),
             "and one it refuses must not be reported"
@@ -2063,12 +2071,12 @@ mod tests {
 
         let other_context = vec![9, 8, 7, 6];
         assert_eq!(
-            find_redeemable(&conn, &["fr-scope"], "rm target", Some(&other_context), Some(&[9, 9, 9])).unwrap(),
+            find_redeemable(&conn, &["fr-scope"], "rm target", Some(&other_context), Some(&[9, 9, 9]), b"coder").unwrap(),
             None,
             "a different context must not match"
         );
         assert_eq!(
-            find_redeemable(&conn, &["fr-scope"], "rm target", Some(&[1, 2, 3, 4]), Some(&[9, 9, 9])).unwrap(),
+            find_redeemable(&conn, &["fr-scope"], "rm target", Some(&[1, 2, 3, 4]), Some(&[9, 9, 9]), b"coder").unwrap(),
             Some((request_id, crate::types::ApprovalStatus::Allowed)),
             "the ask's own context/principal must match"
         );

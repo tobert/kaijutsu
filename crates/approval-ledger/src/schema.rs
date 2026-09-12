@@ -294,6 +294,11 @@ CREATE TABLE IF NOT EXISTS approval_statement_vars (
 CREATE TABLE IF NOT EXISTS approvals (
     request_id       TEXT    NOT NULL PRIMARY KEY,
     context_id       BLOB    NOT NULL,
+    -- The performer and its assigned reviewer are separate from the
+    -- requester/redemption identity. Nullable preserves legacy rows without
+    -- inventing provenance for them.
+    actor_id         BLOB,
+    reviewer_id      BLOB,
     principal_id     BLOB    NOT NULL,
     origin           TEXT    NOT NULL,
     instance         TEXT,
@@ -849,7 +854,15 @@ fn add_approvals_columns_if_missing(conn: &Connection) -> SqliteResult<()> {
         .prepare("PRAGMA table_info(approvals)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<SqliteResult<Vec<String>>>()?;
-    for column in ["cwd", "exec_source", "command_block_id", "output_block_id", "pair_owner"] {
+    for column in [
+        "actor_id",
+        "reviewer_id",
+        "cwd",
+        "exec_source",
+        "command_block_id",
+        "output_block_id",
+        "pair_owner",
+    ] {
         if !existing.iter().any(|name| name == column) {
             conn.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {column} TEXT"))?;
         }
@@ -974,6 +987,8 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
         legacy_check: "CHECK (origin IN (",
         body: "request_id       TEXT    NOT NULL PRIMARY KEY,
             context_id       BLOB    NOT NULL,
+            actor_id         BLOB,
+            reviewer_id      BLOB,
             principal_id     BLOB    NOT NULL,
             origin           TEXT    NOT NULL,
             instance         TEXT,
@@ -998,7 +1013,7 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
             command_block_id TEXT,
             output_block_id  TEXT,
             pair_owner       TEXT",
-        columns: "request_id, context_id, principal_id, origin, instance, tool, hook_id, description, \
+        columns: "request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id, description, \
             authorized_label, rc_run_id, status, created_at, expires_at, claimed_at, claimed_by, \
             decided_at, decided_by, decided_option, remember_scope, auto_reason, cwd, exec_source, \
             command_block_id, output_block_id, pair_owner",
@@ -1328,21 +1343,28 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        let has_column = conn
+        let columns = conn
             .prepare("PRAGMA table_info(approvals)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .collect::<SqliteResult<Vec<String>>>()
-            .unwrap()
-            .iter()
-            .any(|name| name == "pair_owner");
-        assert!(has_column, "pair_owner must be added to a pre-existing approvals table");
+            .unwrap();
+        assert!(columns.iter().any(|name| name == "pair_owner"));
+        assert!(columns.iter().any(|name| name == "actor_id"));
+        assert!(columns.iter().any(|name| name == "reviewer_id"));
 
         let pair_owner: Option<String> = conn
             .query_row("SELECT pair_owner FROM approvals WHERE request_id = 'r1'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(pair_owner, None, "a pre-existing row gains the column as NULL, not a guessed value");
+
+        let identities: (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row("SELECT actor_id, reviewer_id FROM approvals WHERE request_id = 'r1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(identities, (None, None), "legacy rows must not gain guessed actor or reviewer identities");
 
         conn.execute("UPDATE approvals SET pair_owner = 'turn' WHERE request_id = 'r1'", [])
             .unwrap();

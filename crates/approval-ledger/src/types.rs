@@ -291,6 +291,8 @@ pub enum EventKind {
     /// written for a losing redemption attempt (an ask already redeemed),
     /// the same way `claim`'s losing side writes no `Claimed` row.
     Redeemed,
+    Cancelled,
+    Escalated,
 }
 
 impl EventKind {
@@ -302,6 +304,8 @@ impl EventKind {
             Self::Abandoned => "abandoned",
             Self::LateDecision => "late_decision",
             Self::Redeemed => "redeemed",
+            Self::Cancelled => "cancelled",
+            Self::Escalated => "escalated",
         }
     }
 }
@@ -463,6 +467,12 @@ pub struct NewSignal {
 #[derive(Clone, Debug)]
 pub struct NewAsk {
     pub context_id: Vec<u8>,
+    /// The character that performed the operation which raised this ask.
+    pub actor_id: Vec<u8>,
+    /// The character assigned to review this ask at creation time.
+    pub reviewer_id: Vec<u8>,
+    /// The requester and redemption identity. This is distinct from the
+    /// performing actor.
     pub principal_id: Vec<u8>,
     pub origin: Origin,
     pub instance: Option<String>,
@@ -503,6 +513,10 @@ pub struct NewAsk {
 pub struct ApprovalRow {
     pub request_id: String,
     pub context_id: Vec<u8>,
+    /// `None` means a row created before actor identity was recorded.
+    pub actor_id: Option<Vec<u8>>,
+    /// `None` means a row created before reviewer identity was recorded.
+    pub reviewer_id: Option<Vec<u8>>,
     pub principal_id: Vec<u8>,
     pub origin: Origin,
     pub instance: Option<String>,
