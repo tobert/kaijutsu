@@ -493,7 +493,7 @@ pub(crate) fn announce_ledger_change(
 /// `gate_policy::no_config()`.
 #[tracing::instrument(
     name = "approval.gate",
-    skip(db, spec, ledger_flows, config),
+    skip_all,
     fields(
         principal.id = %caller.principal_id,
         actor.id = %caller.actor_id,
@@ -623,34 +623,17 @@ pub(crate) async fn run_gate(
             )
             .and_then(|found| match found {
                 Some((request_id, status)) => {
+                    let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)?
+                        .ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request_id.clone()))?;
                     approval_ledger::decide::redeem_ask(db.conn_for_ledger(), &request_id)
-                        .map(|won| won.then_some((request_id, status)))
+                        .map(|won| won.then_some((request_id, status, row)))
                 }
                 None => Ok(None),
             })
         };
         match answered {
-            Ok(Some((request_id, status))) => {
+            Ok(Some((request_id, status, row))) => {
                 approval_span.record("ask.id", request_id.as_str());
-                let snapshot = {
-                    let db = db.lock();
-                    approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
-                };
-                let row = match snapshot {
-                    Ok(Some(row)) => row,
-                    Ok(None) => {
-                        tracing::error!(ask.id = %request_id, "redeemed approval disappeared before trace attribution");
-                        return GateOutcome::unavailable_without_row(
-                            "approval gate could not read the redeemed ask for attribution".to_string(),
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(ask.id = %request_id, %error, "could not read redeemed approval for trace attribution");
-                        return GateOutcome::unavailable_without_row(
-                            "approval gate could not read the redeemed ask for attribution".to_string(),
-                        );
-                    }
-                };
                 {
                     if let Some(id) = PrincipalId::try_from_slice(&row.principal_id) {
                         approval_span.record("principal.id", id.to_string());
@@ -672,16 +655,7 @@ pub(crate) async fn run_gate(
                 // row that has outlived whatever process raised it.
                 // Surfaced only on an allow: a denial runs nothing, so it
                 // has no directory to run in.
-                let cwd = allowed
-                    .then(|| {
-                        let db = db.lock();
-                        approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|row| row.cwd)
-                            .map(PathBuf::from)
-                    })
-                    .flatten();
+                let cwd = allowed.then(|| row.cwd.map(PathBuf::from)).flatten();
                 return GateOutcome {
                     verdict: if allowed { GateVerdict::Allowed } else { GateVerdict::Denied },
                     ask: Some(ask_ref(request_id, status)),
@@ -829,7 +803,7 @@ pub(crate) async fn run_gate(
 /// "Dry-run mode".
 #[tracing::instrument(
     name = "approval.gate.dry_run",
-    skip(db, spec, ledger_flows, reason),
+    skip_all,
     fields(
         principal.id = %caller.principal_id,
         actor.id = %caller.actor_id,
