@@ -85,6 +85,27 @@ impl RememberScopeArg {
     }
 }
 
+fn record_ask_identity(
+    span: &tracing::Span,
+    requester: &[u8],
+    actor: Option<&[u8]>,
+    reviewer: Option<&[u8]>,
+    context: &[u8],
+) {
+    if let Some(id) = PrincipalId::try_from_slice(requester) {
+        span.record("requester.id", id.to_string());
+    }
+    if let Some(id) = actor.and_then(PrincipalId::try_from_slice) {
+        span.record("actor.id", id.to_string());
+    }
+    if let Some(id) = reviewer.and_then(PrincipalId::try_from_slice) {
+        span.record("reviewer.id", id.to_string());
+    }
+    if let Some(id) = ContextId::try_from_slice(context) {
+        span.record("context.id", id.to_string());
+    }
+}
+
 /// `--origin <origin>` on `list` — a `ValueEnum` so a typo fails at parse
 /// time with clap's own "possible values are..." message rather than
 /// coming back as a silently empty result. Values match `approvals.origin`'s
@@ -893,12 +914,24 @@ impl KjDispatcher {
     }
 
     fn ledger_cancel(&self, request_id: &str, caller: &KjCaller) -> KjResult {
+        let span = tracing::info_span!(
+            "approval.cancel",
+            ask.id = %request_id,
+            decision.actor.id = %caller.actor_id,
+            requester.id = tracing::field::Empty,
+            actor.id = tracing::field::Empty,
+            reviewer.id = tracing::field::Empty,
+            context.id = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let result = {
             let db = self.kernel_db.lock();
             approval_ledger::decide::cancel(db.conn_for_ledger(), request_id, caller.actor_id.as_bytes())
         };
         match result {
             Ok(row) => {
+                record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
+                tracing::info!("approval ask cancelled");
                 crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
                 KjResult::ok_with_data(
                     format!("cancelled ask {request_id}; nothing ran"),
@@ -910,6 +943,16 @@ impl KjDispatcher {
     }
 
     fn ledger_escalate(&self, request_id: &str, to: &str, caller: &KjCaller) -> KjResult {
+        let span = tracing::info_span!(
+            "approval.escalate",
+            ask.id = %request_id,
+            decision.actor.id = %caller.actor_id,
+            requester.id = tracing::field::Empty,
+            actor.id = tracing::field::Empty,
+            reviewer.id = tracing::field::Empty,
+            context.id = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let result = {
             let db = self.kernel_db.lock();
             let target = match db.get_character_by_name(to) {
@@ -927,6 +970,8 @@ impl KjDispatcher {
         };
         match result {
             Ok(row) => {
+                record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
+                tracing::info!("approval ask escalated");
                 crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
                 KjResult::ok_with_data(
                     format!("escalated ask {request_id} to {to}"),
@@ -960,6 +1005,17 @@ impl KjDispatcher {
         family: bool,
     ) -> KjResult {
         let verb = if allow { "allow" } else { "deny" };
+        let span = tracing::info_span!(
+            "approval.decision",
+            ask.id = %request_id,
+            decision.actor.id = %caller.actor_id,
+            decision.verb = verb,
+            requester.id = tracing::field::Empty,
+            actor.id = tracing::field::Empty,
+            reviewer.id = tracing::field::Empty,
+            context.id = tracing::field::Empty,
+        );
+        let _guard = span.enter();
 
         // The ledger work is scoped so the `KernelDb` guard is RELEASED before
         // the notification below. `announce_ledger_change` takes the same
@@ -990,6 +1046,7 @@ impl KjDispatcher {
             // inert".
             match approval_ledger::ask::get_approval(conn, request_id) {
                 Ok(Some(row)) => {
+                    record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
                     if matches!(remember, Some(RememberScopeArg::Session)) {
                         let ask_ctx = match ContextId::try_from_slice(&row.context_id) {
                             Some(id) => id,
@@ -1109,6 +1166,7 @@ impl KjDispatcher {
                 },
             ) {
                 Ok(row) => {
+                    tracing::info!(decision.status = %row.status, "approval ask decided");
                     // Past tense is spelled out, not built by appending "ed"
                     // to `verb` — that produced "denyed" in shipped output.
                     // Past tense is spelled out rather than built by appending

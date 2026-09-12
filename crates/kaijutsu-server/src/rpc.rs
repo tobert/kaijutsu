@@ -146,7 +146,7 @@ fn extract_rpc_trace(
     };
     let span = kaijutsu_telemetry::extract_trace_context(&traceparent, &tracestate);
     // Override the default "rpc.request" name with the actual method name
-    let named_span = tracing::info_span!(parent: &span, "rpc", method = name);
+    let named_span = tracing::info_span!(parent: &span, "rpc", method = name, principal.id = tracing::field::Empty);
     named_span
 }
 
@@ -4282,6 +4282,7 @@ impl kernel::Server for KernelImpl {
                 conn.session_id,
             )
         };
+        trace_span.record("principal.id", principal_id.to_string());
         let cwd = context_cwd(&self.kernel, context_id);
         let reviewer = pry!(context_reviewer(&self.kernel, context_id));
 
@@ -5049,6 +5050,7 @@ impl kernel::Server for KernelImpl {
             let conn = self.connection.borrow();
             (conn.principal, conn.session_id)
         };
+        trace_span.record("principal.id", user_principal_id.to_string());
 
         Promise::from_future(
             async move {
@@ -5699,6 +5701,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
         let user_principal_id = self.connection.borrow().principal;
+        trace_span.record("principal.id", user_principal_id.to_string());
 
         Promise::from_future(
             async move {
@@ -5875,6 +5878,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
         let principal = self.connection.borrow().principal;
+        trace_span.record("principal.id", principal.to_string());
         Promise::from_future(async move {
             match execute_kj_command(context_id, principal, &argv, &kernel, &connection, quiet).await? {
                 Ok(executed) => {

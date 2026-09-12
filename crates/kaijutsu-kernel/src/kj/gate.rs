@@ -59,7 +59,7 @@ use approval_ledger::types::{
     NewPlanStatement, NewPlanVar, NewPlannedValue, Origin, VarBinding,
 };
 
-use kaijutsu_types::{AskRef, AskStatus};
+use kaijutsu_types::{AskRef, AskStatus, ContextId, PrincipalId};
 
 use crate::flows::SharedLedgerFlowBus;
 use crate::kernel_db::KernelDb;
@@ -498,6 +498,15 @@ pub(crate) async fn run_gate(
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
 ) -> GateOutcome {
+    let approval_span = tracing::info_span!(
+        "approval.gate",
+        requester.id = %caller.principal_id,
+        actor.id = %caller.actor_id,
+        reviewer.id = ?caller.reviewer_id,
+        context.id = ?caller.context_id,
+        ask.id = tracing::field::Empty,
+    );
+    let _approval_guard = approval_span.enter();
     // An archived context is inert — it runs nothing. This is the second of
     // two checks; `kj ledger` refuses to ANSWER an archived context's ask,
     // and this one refuses to act on an answer, because a context can be
@@ -613,6 +622,28 @@ pub(crate) async fn run_gate(
         };
         match answered {
             Ok(Some((request_id, status))) => {
+                approval_span.record("ask.id", request_id.as_str());
+                let snapshot = {
+                    let db = db.lock();
+                    approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
+                        .ok()
+                        .flatten()
+                };
+                if let Some(row) = snapshot {
+                    if let Some(id) = PrincipalId::try_from_slice(&row.principal_id) {
+                        approval_span.record("requester.id", id.to_string());
+                    }
+                    if let Some(id) = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice) {
+                        approval_span.record("actor.id", id.to_string());
+                    }
+                    if let Some(id) = row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice) {
+                        approval_span.record("reviewer.id", id.to_string());
+                    }
+                    if let Some(id) = ContextId::try_from_slice(&row.context_id) {
+                        approval_span.record("context.id", id.to_string());
+                    }
+                }
+                tracing::info!(decision.status = %status, "replaying a durable approval decision");
                 announce_ledger_change(db, ledger_flows);
                 let allowed = status.is_allowed();
                 // The directory this ask was raised in, read back off the
@@ -672,6 +703,8 @@ pub(crate) async fn run_gate(
             }
         }
     };
+    approval_span.record("ask.id", request_id.as_str());
+    tracing::info!(policy.verdict = ?verdict, "approval ask recorded");
 
     // An auto decision still gets its durable row, decided immediately with
     // no reviewer in the loop (`decided_by` None + `auto_reason` mark it).
@@ -779,6 +812,15 @@ pub(crate) async fn record_dry_run_ask(
     ledger_flows: &SharedLedgerFlowBus,
     reason: &str,
 ) -> Option<AskRef> {
+    let approval_span = tracing::info_span!(
+        "approval.gate.dry_run",
+        requester.id = %caller.principal_id,
+        actor.id = %caller.actor_id,
+        reviewer.id = ?caller.reviewer_id,
+        context.id = ?caller.context_id,
+        ask.id = tracing::field::Empty,
+    );
+    let _approval_guard = approval_span.enter();
     let ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
     let request_id = {
         let db = db.lock();
@@ -793,6 +835,8 @@ pub(crate) async fn record_dry_run_ask(
             }
         }
     };
+    approval_span.record("ask.id", request_id.as_str());
+    tracing::info!("dry-run approval ask recorded");
     let status = {
         let db = db.lock();
         match approval_ledger::decide::abandon(db.conn_for_ledger(), &request_id, Some(reason)) {
