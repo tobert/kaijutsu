@@ -979,6 +979,11 @@ subsystem.
   line in the transcript is still open.
 - Internal splits. Set aside for v1; wezterm splits with
   `kaijutsu-tui --context <id>` cover it. Revisit when the itch is real.
+- **The player's edge on submit.** A message sent mid-turn should tell the
+  model which block the player had seen when they pressed Enter. The tui's
+  source is `last_printed` plus the live band's streaming block; the plan,
+  wire field and open questions are in `docs/issues.md`, "Async input should
+  carry the player's edge of context".
 - **The buffer question** (Amy, 2026-09-08). The inline model prints every
   context into one terminal scrollback that no terminal reports the depth
   of, and switching contexts interleaves them with no boundary. A printed

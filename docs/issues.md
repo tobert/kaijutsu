@@ -6,6 +6,59 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Async input should carry the player's edge of context (Amy, 2026-09-12)
+
+Amy: *"the ui knows what the user is seeing when they send an async message.
+we also know wall clock time but that's not what matters; the context at the
+time the user sent it, so what if we look at what blocks are on the screen at
+the time, and share perhaps a summary or the relative turn id if we ever
+provide that (should we?), so when the message lands the model will have a
+reference to the user's edge of context at the time they hit enter."*
+
+**The problem.** A message submitted while a turn is running lands in the
+durable log at arrival and reaches the model through the mailbox on its next
+request, after every block the model produced meanwhile; snapshot repair may
+also move it past a tool pair (`docs/conversation-session.md`). The model
+reads it as a reply to its newest output. The player wrote it against
+whatever their client had shown at the moment they pressed Enter, which can
+be several blocks and a whole thinking pane earlier. Wall clock does not fix
+this: the reference the model needs is a position in the conversation, not a
+time.
+
+**The plan.**
+
+- The client attaches the player's **edge** to `submitInput`: the newest
+  block it had shown when the player submitted, as a `BlockId`, plus the
+  character count shown of that block if it was still streaming. The tui
+  already tracks this (`last_printed` in `crates/kaijutsu-tui/src/app.rs`,
+  plus the live band's streaming block); the app reads its viewport tail,
+  which is older than the log tail when the player has scrolled up. A client
+  that cannot say sends nothing; the kernel never guesses an edge.
+- The kernel stores the edge on the user block it creates, as columns, not a
+  JSON blob. It is a durable fact about that block and rides through fork.
+- Hydration renders it to the model as a runtime fact on that user message,
+  in the envelope `docs/prompts.md` already uses for changing observations:
+  the referenced block's role and kind and a short quoted excerpt (its first
+  line), so the model can find the spot in its own context without any
+  numbering. Emitted only when the edge is older than the block that precedes
+  the message in the model's conversation; a message that arrives between
+  turns says nothing extra.
+
+**Open, for Amy.**
+
+- Turn numbering (*"the relative turn id if we ever provide that — should
+  we?"*). A number the model can cite needs the hydrated conversation to
+  carry visible ordinals, a prompt-composition change with its own costs:
+  ordinals shift when history is edited or excluded, and every shift moves
+  the cache breakpoints. Lean: start with the excerpt, which costs nothing on
+  the prompt side and is enough to locate the spot; add ordinals only if
+  excerpts prove ambiguous (two blocks sharing a first line).
+- Enter or compose-start. Amy said Enter. A long draft typed across a minute
+  of streaming may want the earlier point, and the client knows both. Start
+  with Enter; record compose-start only if it turns out to matter.
+- The Bevy app is Fable's on moltar. The wire field lands first so both
+  clients can attach it; the tui goes first because its source exists.
+
 ## Async completion recovery follow-ups
 
 - Completion during a model's final inference can reach the durable mailbox
