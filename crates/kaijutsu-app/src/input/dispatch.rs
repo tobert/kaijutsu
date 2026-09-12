@@ -11,7 +11,6 @@
 //! Mouse wheel → ScrollDelta action.
 //! Gamepad buttons → direct binding match.
 //! Gamepad analog sticks → AnalogInput resource + continuous actions.
-//! Held fly keys / left stick → FlyAxis/FlyAltitude while FsnFly is active.
 
 use bevy::ecs::system::SystemParam;
 use bevy::input::gamepad::Gamepad;
@@ -192,48 +191,6 @@ pub fn dispatch_input(
         }
     }
 
-    // --- Held-key fly axes (FsnFly) ---
-    // Continuous movement doesn't fit just_pressed bindings; poll held keys
-    // like the analog-stick lane below. Consumers scale by their own dt.
-    if active_contexts.contains(InputContext::FsnFly) && !grabbed {
-        let mut axis = Vec2::ZERO;
-        if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
-            axis.y += 1.0;
-        }
-        if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) {
-            axis.y -= 1.0;
-        }
-        if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
-            axis.x -= 1.0;
-        }
-        if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
-            axis.x += 1.0;
-        }
-        if axis != Vec2::ZERO {
-            action_writer.write(ActionFired::new(
-                Action::FlyAxis {
-                    x: axis.x,
-                    y: axis.y,
-                },
-                InputContext::FsnFly,
-            ));
-        }
-
-        let mut altitude = 0.0_f32;
-        if keys.pressed(KeyCode::PageUp) || keys.pressed(KeyCode::Equal) {
-            altitude += 1.0;
-        }
-        if keys.pressed(KeyCode::PageDown) || keys.pressed(KeyCode::Minus) {
-            altitude -= 1.0;
-        }
-        if altitude != 0.0 {
-            action_writer.write(ActionFired::new(
-                Action::FlyAltitude(altitude),
-                InputContext::FsnFly,
-            ));
-        }
-    }
-
     // --- Gamepad buttons ---
     // Use first connected gamepad (single-player). Multi-gamepad later.
     if let Some(gamepad) = gamepads.iter().next() {
@@ -266,19 +223,6 @@ pub fn dispatch_input(
             action_writer.write(ActionFired::new(
                 Action::ScrollDelta(scroll_speed),
                 InputContext::Navigation,
-            ));
-        }
-
-        // Left stick → fly (FsnFly context); consumer applies speed * dt.
-        if active_contexts.contains(InputContext::FsnFly)
-            && (left.x.abs() > THRESHOLD || left.y.abs() > THRESHOLD)
-        {
-            action_writer.write(ActionFired::new(
-                Action::FlyAxis {
-                    x: left.x,
-                    y: left.y,
-                },
-                InputContext::FsnFly,
             ));
         }
 
@@ -424,9 +368,7 @@ fn context_priority(ctx: InputContext) -> usize {
         | InputContext::TextInput
         | InputContext::RoomNav
         | InputContext::WellZoomed
-        | InputContext::PatchBayZoomed
-        | InputContext::StationZoomed
-        | InputContext::FsnFly => 1,
+        | InputContext::StationZoomed => 1,
         // A held quick-context overlay outranks the surface it floats over,
         // so its Esc claims the key outright and no `PopLevel` is emitted for
         // the level underneath. It does NOT outrank a modal: a dialog on

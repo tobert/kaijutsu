@@ -132,30 +132,11 @@ Existing views slot in as stations #0 and #1.
 |---|---------|-----------|--------|
 | 0 | Conversation | Append-only block sequence | Shipped (2D view; joined to the well by the dive-through) |
 | 1 | Time well | Context forest by recency/placement | Shipped; `docs/timewell.md` |
-| 2 | Patch bay | Relation: endpoint edges, declared intent vs live reality | **Shipped (slices 0+1)** — `docs/scenes/patchbay.md`; `crates/kaijutsu-app/src/view/patch_bay/mod.rs`; viz-first (see below); circle-matrix direction (Amy, waves 1–3) |
+| 2 | Patch bay | Relation: endpoint edges, declared intent vs live reality | **Retired 2026-09-12** — a fun experiment, not practical; code and docs stay in git history before this commit |
 | 3 | Drift / mailboxes | Flows in flight between contexts; queues pooling | Concepting |
-| 4 | Track transport / score | Cyclic time: playhead, tempo, attached musicians | **Shipped** — the TRACKER station (2026-07-15), `crates/kaijutsu-app/src/view/tracker/{mod.rs,grid.rs}`; **vertical beat highway** (Guitar Hero / DDR lineage), not a score view; a score view comes later as a 2D special view, not core (Amy, wave 1). Wire slice shipped (`TrackInfo`) |
-| 5 | VFS / rc library | Tree with ownership zones; scripts as objects | **Designed (early)** — `docs/scenes/vfs.md`: fsn / Jurassic Park lineage with LOD-on-approach as a primitive (Amy, waves 1–2); interaction UX still to concept |
+| 4 | Track transport / score | Cyclic time: playhead, tempo, attached musicians | **Retired 2026-09-12** — a fun experiment, not practical; code and docs stay in git history before this commit |
+| 5 | VFS / rc library | Tree with ownership zones; scripts as objects | **Retired 2026-09-12** — a fun experiment, not practical; code and docs stay in git history before this commit |
 | — | MCP broker, LLM routing, … | Registry + in-flight invocations; providers/spend | Uninventoried; add when a station is designed |
-
-### Patch bay: viz-first, backend later (Amy, 2026-07-07)
-
-The patch bay **backend does not exist yet** and patching stays **CLI-only
-for a good long time**; if the backend gets complex, that's the signal to
-lean into PipeWire control rather than overbuild our own. The *viz* comes
-first anyway — it will look cool and guide the journey:
-
-- **Slice 0 renders observed reality only**: the live ALSA seq / PipeWire
-  graph (readable today — pawlsa reads the PipeWire side; `aconnect -l` the
-  ALSA side), no declared-intent layer, nothing writable from the scene.
-- The declared-vs-observed duality is still the design target: ghost wire =
-  declared but down, lit wire = live, a neighbor's manual patch rendered
-  *warm* — additive-by-default, never an alarm (crosstalk is a feature).
-- Design homes for the backend when it matures:
-  `docs/config-namespace.md` (the mount registry and namespace; the
-  per-client cascade under `/config/client` has no dedicated section yet),
-  `docs/mounts.md` (the wire-ownership note), `docs/midi.md` (distribute
-  intent, not pulses).
 
 ## Concept findings (running)
 

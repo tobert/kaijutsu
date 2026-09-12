@@ -140,14 +140,13 @@ impl WellBeats {
 
     /// The phasor's raw beat position (unbounded, NOT wrapped to `0..1` the
     /// way [`Self::envelope_and_frac`]'s `frac` is) for the track keyed by
-    /// `ctx` — `None` when no phasor is live under that key. This is the
-    /// **freeze signal** the tracker station's scroll math anchors on
-    /// (`tracker::grid::row_offset`'s `p` argument): `Some` while a track's
-    /// clock is rolling, `None` the instant a transport flush drops the
-    /// phasor ([`Self::reset`]). A caller scrolling rows on this position
-    /// caches the last `Some` value and simply stops writing on `None` —
-    /// exact freeze, not a fallback to `0.0` (which would snap the grid back
-    /// to the playhead instead of holding still).
+    /// `ctx` — `None` when no phasor is live under that key. This is a
+    /// **freeze signal** a caller scrolling on beat position can anchor on:
+    /// `Some` while a track's clock is rolling, `None` the instant a
+    /// transport flush drops the phasor ([`Self::reset`]). A caller caches
+    /// the last `Some` value and simply stops writing on `None` — exact
+    /// freeze, not a fallback to `0.0` (which would snap back to the
+    /// playhead instead of holding still).
     pub fn beat_position(&self, ctx: &ContextId, now: Instant) -> Option<f64> {
         self.phasors.get(ctx).map(|p| p.beat.position(now))
     }

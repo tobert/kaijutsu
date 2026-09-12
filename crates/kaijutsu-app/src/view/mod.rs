@@ -14,10 +14,9 @@
 //!   role-divider layout math).
 //! - Chat-adjacent surfaces: `overlay` (the input overlay), `shell_dock`,
 //!   `scroll`.
-//! - Room-level scenes reached from the shell: `room` (station carousel),
-//!   `time_well`, `patch_bay`, `fsn`, `tracker` — sharing the
-//!   `scene_geometry` datums (octagon shell, W-wall patch-wheel mount) they
-//!   have to agree on without eyeballing each other.
+//! - Room-level scenes reached from the shell: `room` (station carousel) and
+//!   `time_well` — sharing the `scene_geometry` datums (the octagon shell)
+//!   they have to agree on without eyeballing each other.
 //! - Styling: `scene_palette`.
 //! - Render plumbing: `ui_rtt` (the generic render-to-texture primitive +
 //!   sizing helpers; vello is gone from the app). Bevy
@@ -30,11 +29,9 @@ pub mod components;
 pub mod document;
 pub mod diff_view;
 pub mod editor;
-pub mod fsn;
 pub mod geometry;
 pub mod lifecycle;
 pub mod overlay;
-pub mod patch_bay;
 pub mod render_store;
 pub mod role_divider;
 pub mod room;
@@ -46,7 +43,6 @@ pub mod submit;
 pub mod surface;
 pub mod sync;
 pub mod time_well;
-pub mod tracker;
 pub mod ui_rtt;
 
 // Re-export all public types

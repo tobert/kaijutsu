@@ -33,11 +33,10 @@ pub enum Screen {
     /// The room level above the well — the shell's station carousel
     /// (`docs/scenes/shell.md`). Reached by Up-Up at the well's mouth ring;
     /// Left/Right cycle stations, Enter/Down dives, Esc drops to Conversation.
-    /// A bounded station (the patch bay wheel) is reached and left WITHOUT a
-    /// further screen transition — "diving" into it is a camera pose plus a
+    /// A bounded station is reached and left WITHOUT a further screen
+    /// transition — "diving" into it is a camera pose plus a
     /// `view::room::RoomState::zoomed` write, all still `Screen::Room`
-    /// (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
-    /// fullscreening a panel," superseding the earlier `Screen::PatchBay`).
+    /// ("diving IS fullscreening a panel").
     Room,
     /// The full diff viewer — an MSDF panel over a **frozen** `DiffCore`
     /// (`docs/diff.md` slice 5, `view::diff_view`). Full-viewport, chrome
@@ -45,17 +44,6 @@ pub enum Screen {
     /// focused diff block in the conversation, left by `q`/`ZQ`/`:q` (never by
     /// Esc — the vi surface owns Esc while it is live).
     Diff,
-    /// The FSN landscape (`docs/scenes/vfs.md` slice 0, `view::fsn`) — the
-    /// VFS-as-terrain world behind the room's N archway ("DATA HORIZON").
-    /// Unlike the room's bounded, furnished stations (patch bay, the well),
-    /// the landscape is an **unbounded world**, too big to stand as room
-    /// furniture (`docs/scenes/shell.md`: "N stays a dive-THROUGH door, not
-    /// a panel to fill the frame with") — so N-diving is a genuine `Screen`
-    /// transition, not a `view::room::RoomState::zoomed` write. Entered from
-    /// `Screen::Room` (Enter/Down on the focused `Station::Vfs`); Esc returns
-    /// to `Screen::Room`, not `Conversation` — the room is the level directly
-    /// below, same as every other dive.
-    Fsn,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -65,7 +53,7 @@ impl Plugin for ScreenPlugin {
     fn build(&self, app: &mut App) {
         // `State`/`NextState` are registered so BRP can read the screen and
         // request a transition (`world.insert_resources` on `NextState<Screen>`
-        // with `{"Pending": "Fsn"}`), the only way into a screen no key
+        // with `{"Pending": "Room"}`), the only way into a screen no key
         // reaches.
         app.init_state::<Screen>()
             .register_type::<Screen>()
@@ -112,17 +100,6 @@ impl Plugin for ScreenPlugin {
         // there is no second screen for a station dive to enter any more.
         app.add_systems(
             OnEnter(Screen::Room),
-            (hide_conversation_root, set_focus_conversation),
-        );
-
-        // ── Fsn ──
-        // The FSN landscape (`view::fsn`): full-viewport 3D like the room it
-        // dives from, reading raw keys for camera fly + select — hide the
-        // chrome and park focus off Compose (same reasoning as Room/Editor
-        // above). The world's own spawn/despawn rides `OnEnter`/`OnExit(Screen::Fsn)`
-        // in `view::fsn::scene`, not here — this only owns the chrome.
-        app.add_systems(
-            OnEnter(Screen::Fsn),
             (hide_conversation_root, set_focus_conversation),
         );
     }

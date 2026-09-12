@@ -41,8 +41,6 @@ pub struct ScenePalette {
     pub neon: LinearRgba,
     /// Terrace glyph rings: a paler tint of `neon`.
     pub terrace: LinearRgba,
-    /// Patch-bay chord wire hue (normalized; resting HDR in `gains.wire`).
-    pub wire: LinearRgba,
     /// Circuit-board floor trace fabrics.
     pub trace_crimson: LinearRgba,
     pub trace_cyan: LinearRgba,
@@ -53,20 +51,10 @@ pub struct ScenePalette {
     pub wall_base: LinearRgba,
     pub wall_mullion: LinearRgba,
     pub dark_surface: LinearRgba,
-    /// FSN landscape (`docs/scenes/vfs.md` slice 0, `view::fsn`): prism
-    /// wireframe edges — neon violet.
-    pub fsn_edge: LinearRgba,
-    /// FSN landscape: prism-top vertex points — magenta.
-    pub fsn_vertex: LinearRgba,
-    /// FSN landscape: quad-seam grid lines — faint violet, dimmer than
-    /// `fsn_edge`.
-    pub fsn_seam: LinearRgba,
 
     // ── Brightness tier ladder ──
-    pub etch: f32,
     pub marker: f32,
     pub trim: f32,
-    pub hardware: f32,
     pub crest: f32,
     pub trough_wiring: f32,
     pub trough_wall_trim: f32,
@@ -74,9 +62,6 @@ pub struct ScenePalette {
     pub trough_subtle: f32,
 
     // ── Live-signal gains (allowed to sustain HDR) ──
-    pub gain_pulse: f32,
-    pub gain_chord_selected: f32,
-    pub gain_wire: f32,
     pub gain_beat: f32,
     pub gain_active: f32,
     pub gain_focus_lift: f32,
@@ -122,7 +107,6 @@ impl ScenePalette {
             violet_thread: hue("violet_thread", &h.violet_thread, d.violet_thread),
             neon: hue("neon", &h.neon, d.neon),
             terrace: hue("terrace", &h.terrace, d.terrace),
-            wire: hue("wire", &h.wire, d.wire),
             trace_crimson: hue("trace_crimson", &h.trace_crimson, d.trace_crimson),
             trace_cyan: hue("trace_cyan", &h.trace_cyan, d.trace_cyan),
             trace_green: hue("trace_green", &h.trace_green, d.trace_green),
@@ -131,23 +115,15 @@ impl ScenePalette {
             wall_base: hue("wall_base", &h.wall_base, d.wall_base),
             wall_mullion: hue("wall_mullion", &h.wall_mullion, d.wall_mullion),
             dark_surface: hue("dark_surface", &h.dark_surface, d.dark_surface),
-            fsn_edge: hue("fsn_edge", &h.fsn_edge, d.fsn_edge),
-            fsn_vertex: hue("fsn_vertex", &h.fsn_vertex, d.fsn_vertex),
-            fsn_seam: hue("fsn_seam", &h.fsn_seam, d.fsn_seam),
 
-            etch: t.etch,
             marker: t.marker,
             trim: t.trim,
-            hardware: t.hardware,
             crest: t.crest,
             trough_wiring: t.trough_wiring,
             trough_wall_trim: t.trough_wall_trim,
             trough_pads: t.trough_pads,
             trough_subtle: t.trough_subtle,
 
-            gain_pulse: g.pulse,
-            gain_chord_selected: g.chord_selected,
-            gain_wire: g.wire,
             gain_beat: g.beat,
             gain_active: g.active,
             gain_focus_lift: g.focus_lift,
@@ -170,8 +146,8 @@ impl ScenePalette {
 
 impl Default for ScenePalette {
     /// Compiled defaults — the exact linear values the scene modules shipped
-    /// with (scene_geometry.rs / room / time_well / patch_bay constants as of the
-    /// color pass). A test pins these ≈ `SceneData::default()`'s hex.
+    /// with (scene_geometry.rs / room / time_well constants as of the color
+    /// pass). A test pins these ≈ `SceneData::default()`'s hex.
     fn default() -> Self {
         let lin = |r: f32, g: f32, b: f32| LinearRgba::rgb(r, g, b);
         Self {
@@ -186,7 +162,6 @@ impl Default for ScenePalette {
             violet_thread: lin(0.550, 0.180, 0.750),
             neon: lin(0.42, 0.30, 0.90),
             terrace: lin(0.55, 0.45, 0.95),
-            wire: lin(1.0, 0.16 / 1.4, 0.24 / 1.4),
             trace_crimson: lin(0.24, 0.055, 0.070),
             trace_cyan: lin(0.050, 0.170, 0.210),
             trace_green: lin(0.100, 0.260, 0.150),
@@ -195,24 +170,15 @@ impl Default for ScenePalette {
             wall_base: lin(0.062, 0.060, 0.094),
             wall_mullion: lin(0.040, 0.040, 0.058),
             dark_surface: lin(0.012, 0.013, 0.019),
-            // Frame 45's edge-line/vertex-point hues (docs/scenes/vfs.md).
-            fsn_edge: lin(0.254, 0.107, 1.000),
-            fsn_vertex: lin(1.000, 0.028, 0.631),
-            fsn_seam: lin(0.068, 0.036, 0.138),
 
-            etch: 0.28,
             marker: 0.42,
             trim: 0.50,
-            hardware: 0.55,
             crest: 1.25,
             trough_wiring: 0.55,
             trough_wall_trim: 0.60,
             trough_pads: 0.65,
             trough_subtle: 0.75,
 
-            gain_pulse: 6.0,
-            gain_chord_selected: 3.4,
-            gain_wire: 1.4,
             gain_beat: 2.8,
             gain_active: 0.5,
             gain_focus_lift: 0.35,
@@ -244,36 +210,12 @@ pub fn tonemapper_by_name(name: &str) -> Option<Tonemapping> {
     })
 }
 
-/// An unlit-material [`Color`] from a linear hue (values may exceed 1.0 —
-/// the scene lane's HDR-capable constructor). Shared by every scene module
-/// that reads [`ScenePalette`] hues (previously duplicated per-module
-/// `lin`/`lin_scaled` helpers in `room/mod.rs` and `patch_bay/mod.rs`).
-pub(crate) fn lin(c: LinearRgba) -> Color {
-    Color::LinearRgba(c)
-}
-
-/// [`lin`] scaled by a brightness tier or gain — the palette's hue × tier
-/// convention (docs/color.md's tier ladder).
+/// An unlit-material [`Color`] from a linear hue, scaled by a brightness
+/// tier or gain (values may exceed 1.0 — the scene lane's HDR-capable
+/// constructor) — the palette's hue × tier convention (docs/color.md's tier
+/// ladder). Shared by every scene module that reads [`ScenePalette`] hues.
 pub(crate) fn lin_scaled(c: LinearRgba, k: f32) -> Color {
     Color::LinearRgba(LinearRgba::rgb(c.red * k, c.green * k, c.blue * k))
-}
-
-/// FSN recency glow's baked vertex-color half of the color-composition law
-/// (`view::fsn` slice 1, lane A): a per-channel tint that, multiplied into
-/// `base` at render time by the material's own `base_color` (the
-/// `apply_fsn_lod`-owned half), reproduces `lerp(base, gold, w)` exactly —
-/// `tint_c = lerp(1.0, gold_c / base_c, w)`, so `tint_c × base_c =
-/// lerp(base_c, gold_c, w)` for every channel. `w = 0` yields all-ones (no
-/// tint at all — the untouched base color survives the multiply unchanged),
-/// `w = 1` yields the full `gold / base` ratio (base × that ratio = gold
-/// exactly). A near-zero `base` channel (`< 1e-6`) would blow the ratio up
-/// toward infinity for no visible gain (a near-black channel has nothing to
-/// tint), so that channel's tint holds at 1.0 regardless of `w` — the guard
-/// this fn's own doc promises. Alpha is always 1.0 (recency never carries
-/// transparency).
-pub(crate) fn warmth_tint(base: LinearRgba, gold: LinearRgba, w: f32) -> [f32; 4] {
-    let chan = |b: f32, g: f32| -> f32 { if b.abs() < 1e-6 { 1.0 } else { 1.0 + w * (g / b - 1.0) } };
-    [chan(base.red, gold.red), chan(base.green, gold.green), chan(base.blue, gold.blue), 1.0]
 }
 
 /// Hot-apply `[scene.post]` to the shared camera whenever the palette
@@ -282,17 +224,7 @@ pub(crate) fn warmth_tint(base: LinearRgba, gold: LinearRgba, w: f32) -> [f32; 4
 /// boundary contract (docs/color.md).
 pub fn apply_scene_post_on_change(
     palette: Res<ScenePalette>,
-    // `Without<FsnBackdropCamera>`: defense-in-depth. The FSN backdrop's
-    // off-screen RTT camera (`view::fsn::backdrop`) renders to an LDR
-    // target with a deliberate `Tonemapping::None` and no Bloom — today it
-    // can't match this query anyway (no `Bloom` component), but if someone
-    // later adds Bloom to the backdrop this filter keeps the palette's
-    // display post chain from silently retargeting a render texture that
-    // was never meant to receive it.
-    mut cameras: Query<
-        (&mut Bloom, &mut Tonemapping),
-        (With<Camera3d>, Without<crate::view::fsn::backdrop::FsnBackdropCamera>),
-    >,
+    mut cameras: Query<(&mut Bloom, &mut Tonemapping), With<Camera3d>>,
 ) {
     if !palette.is_changed() {
         return;
@@ -337,7 +269,6 @@ mod tests {
         close(compiled.violet_thread, parsed.violet_thread, "violet_thread");
         close(compiled.neon, parsed.neon, "neon");
         close(compiled.terrace, parsed.terrace, "terrace");
-        close(compiled.wire, parsed.wire, "wire");
         close(compiled.trace_crimson, parsed.trace_crimson, "trace_crimson");
         close(compiled.trace_cyan, parsed.trace_cyan, "trace_cyan");
         close(compiled.trace_green, parsed.trace_green, "trace_green");
@@ -346,12 +277,8 @@ mod tests {
         close(compiled.wall_base, parsed.wall_base, "wall_base");
         close(compiled.wall_mullion, parsed.wall_mullion, "wall_mullion");
         close(compiled.dark_surface, parsed.dark_surface, "dark_surface");
-        close(compiled.fsn_edge, parsed.fsn_edge, "fsn_edge");
-        close(compiled.fsn_vertex, parsed.fsn_vertex, "fsn_vertex");
-        close(compiled.fsn_seam, parsed.fsn_seam, "fsn_seam");
-        assert_eq!(compiled.etch, parsed.etch);
         assert_eq!(compiled.crest, parsed.crest);
-        assert_eq!(compiled.gain_pulse, parsed.gain_pulse);
+        assert_eq!(compiled.gain_beat, parsed.gain_beat);
         assert_eq!(compiled.tonemapper, parsed.tonemapper);
         assert_eq!(compiled.bloom_intensity, parsed.bloom_intensity);
     }
@@ -382,45 +309,6 @@ mod tests {
         assert_eq!(p.tonemapper, ScenePalette::default().tonemapper);
     }
 
-    // ── warmth_tint (FSN recency glow's color-composition law) ──
-
-    #[test]
-    fn warmth_tint_times_base_reproduces_the_lerp_toward_gold() {
-        let base = LinearRgba::rgb(0.254, 0.107, 1.0); // fsn_edge
-        let gold = LinearRgba::rgb(1.00, 0.78, 0.34);
-        for w in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
-            let tint = warmth_tint(base, gold, w);
-            let want = [
-                base.red + w * (gold.red - base.red),
-                base.green + w * (gold.green - base.green),
-                base.blue + w * (gold.blue - base.blue),
-            ];
-            let got = [tint[0] * base.red, tint[1] * base.green, tint[2] * base.blue];
-            for (g, wa) in got.iter().zip(want.iter()) {
-                assert!((g - wa).abs() < 1e-5, "w={w}: got {g} want {wa}");
-            }
-            assert_eq!(tint[3], 1.0, "alpha is always opaque");
-        }
-    }
-
-    #[test]
-    fn warmth_tint_at_zero_weight_is_all_ones() {
-        let base = LinearRgba::rgb(0.254, 0.107, 1.0);
-        let gold = LinearRgba::rgb(1.00, 0.78, 0.34);
-        assert_eq!(warmth_tint(base, gold, 0.0), [1.0, 1.0, 1.0, 1.0]);
-    }
-
-    #[test]
-    fn warmth_tint_guards_a_near_zero_base_channel() {
-        // A base channel near zero would blow the gold/base ratio toward
-        // infinity for a channel with nothing visible to tint — must hold
-        // at 1.0 (no tint), not explode or divide-by-zero into NaN/inf.
-        let base = LinearRgba::rgb(0.0, 0.5, 1.0);
-        let gold = LinearRgba::rgb(1.0, 1.0, 1.0);
-        let tint = warmth_tint(base, gold, 1.0);
-        assert_eq!(tint[0], 1.0, "near-zero base channel must not blow up");
-        assert!(tint[0].is_finite() && tint[1].is_finite() && tint[2].is_finite());
-    }
 
     #[test]
     fn parsed_troughs_never_sustain_hdr() {

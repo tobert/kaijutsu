@@ -1246,7 +1246,7 @@ clarity before it lands (guidance 4).
 | The rings | `list_contexts` + `assign_ring_seats` | picker sections ACTIVE / RECENT, `+N` horizon |
 | Live-state layer: tails, chatter energy | kernel-wide `ServerEvent` stream | picker tails; `●`/`@` flags |
 | Track rays, per-track phasors | `BeatSync` (`subscriptions.rs`), `listTracks` | TRACKS section; bar.beat + pulse in the status line |
-| Room, FSN, patch bay, tracker | — | not carried |
+| Room (3D stations) | — | not carried |
 
 **Timing to music.** The ratatui loop is event-driven; the beat is one more
 wake source. Arm a timer at the phasor's *predicted* next onset

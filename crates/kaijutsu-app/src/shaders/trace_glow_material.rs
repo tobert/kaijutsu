@@ -5,10 +5,8 @@
 //!
 //! Two modes, driven entirely by `globals.time` — one CPU uniform write per
 //! spawned element (phase/rate/trough baked in at spawn time from
-//! `bearing::hash01`), zero per-frame material churn (the same
-//! event-driven material-lane trick [`super::ChordMaterial`] uses for its
-//! traffic pulse, taken one step further: here nothing EVER needs a second
-//! write):
+//! `bearing::hash01`), zero per-frame material churn: here nothing EVER
+//! needs a second write.
 //! - **mode 0 — traveling wave** (floor traces, wall trim): one bright crest
 //!   glides along `uv.x` (`bearing::ribbon_vertices`'s cumulative-arclength
 //!   parametrization, or a length-tracking quad UV — `room::glow_quad_mesh`)
@@ -16,8 +14,7 @@
 //! - **mode 1 — breathing** (terminal pads, the inscribed ring): a slow
 //!   uniform sine breath, ignoring `uv` entirely — safe on primitives with
 //!   their own UV convention (`Torus`, `Annulus`) that this material never
-//!   has to match. (The W dais bezel was a user until the wheel wall-mounted
-//!   and the dais retired, 2026-07-10.)
+//!   has to match.
 //!
 //! `color` may carry brightness above 1.0 at the crest/breath's peak — the
 //! app camera's threshold-1.0 bloom pass (`main::setup_camera`) haloes it

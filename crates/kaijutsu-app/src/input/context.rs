@@ -31,13 +31,9 @@ pub enum InputContext {
     RoomNav,
     /// Screen::Room, zoomed into the time well
     WellZoomed,
-    /// Screen::Room, zoomed into the patch bay
-    PatchBayZoomed,
     /// Screen::Room, zoomed into a station with no keyboard of its own
-    /// (Tracks / Vfs / Radiators)
+    /// (Radiators)
     StationZoomed,
-    /// Screen::Fsn — landscape camera fly + select
-    FsnFly,
     /// The quick-context overlay is HELD (`Ctrl+A h`, `ui::quick_context`).
     /// Active on top of whatever surface is underneath, and outranked only
     /// by `Dialog` — a modal still owns Esc. Its single binding is Esc →
@@ -133,17 +129,8 @@ pub fn derive_contexts(
             contexts.push(match zoomed {
                 None => InputContext::RoomNav,
                 Some(Station::TimeWell) => InputContext::WellZoomed,
-                Some(Station::PatchBay) => InputContext::PatchBayZoomed,
                 Some(_) => InputContext::StationZoomed,
             });
-            return (contexts, KeyboardGrab::None);
-        }
-
-        // The FSN landscape was previously *forgotten* by the suppression
-        // list (latent Esc double-fire); deriving its own context fixes
-        // that structurally.
-        Screen::Fsn => {
-            contexts.push(InputContext::FsnFly);
             return (contexts, KeyboardGrab::None);
         }
 
@@ -274,36 +261,15 @@ mod tests {
     }
 
     #[test]
-    fn room_zoomed_patch_bay() {
-        let (ctxs, _) = derive_contexts(
-            Screen::Room,
-            Some(Station::PatchBay),
-            &FocusArea::Conversation,
-            false,
-        );
-        assert!(ctxs.contains(&InputContext::PatchBayZoomed));
-    }
-
-    #[test]
     fn room_zoomed_plain_station() {
         let (ctxs, _) = derive_contexts(
             Screen::Room,
-            Some(Station::Tracks),
+            Some(Station::Radiators),
             &FocusArea::Conversation,
             false,
         );
         assert!(ctxs.contains(&InputContext::StationZoomed));
         assert!(!ctxs.contains(&InputContext::WellZoomed));
-    }
-
-    #[test]
-    fn fsn_has_its_own_context_not_navigation() {
-        // The old suppression list forgot Fsn — Navigation leaked in and
-        // central Esc→pop double-fired with fsn_keyboard's Esc.
-        let (ctxs, grab) = derive_contexts(Screen::Fsn, None, &FocusArea::Conversation, false);
-        assert!(ctxs.contains(&InputContext::FsnFly));
-        assert!(!ctxs.contains(&InputContext::Navigation));
-        assert_eq!(grab, KeyboardGrab::None);
     }
 
     /// A held quick-context overlay adds its context ON TOP of whatever
@@ -314,7 +280,6 @@ mod tests {
         for (screen, zoomed, under) in [
             (Screen::Conversation, None, InputContext::Navigation),
             (Screen::Room, None, InputContext::RoomNav),
-            (Screen::Fsn, None, InputContext::FsnFly),
             (
                 Screen::Room,
                 Some(Station::TimeWell),

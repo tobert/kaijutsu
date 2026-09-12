@@ -73,10 +73,8 @@ pub struct CardParams {
 }
 
 /// The placement/root entity that re-roots the well's whole subtree into room
-/// space (Slice B, mirrors patch bay's `StationWPlacement` + `PatchBayRoot`
-/// folded into one entity — the well needs no separate placement/content
-/// split since, unlike the wall-mounted wheel, it has no change-of-basis
-/// rotation to compose). Carries [`placement_transform`] (identity this
+/// space — a single placement + root entity, with no change-of-basis
+/// rotation to compose. Carries [`placement_transform`] (identity this
 /// slice — see [`IDENTITY_PLACEMENT`]); every card/ring/ray/label is its
 /// `ChildOf` descendant, so `RoomRoot`'s own recursive despawn (Slice D: the
 /// well only ever enters as room furniture now, `spawn_well_furniture`
@@ -234,8 +232,7 @@ pub struct TimeWellState {
     /// catch (Slice C: that system is now dived-only — room-scale text is
     /// unreadably small pixels, so it doesn't run at all while ambient). Set
     /// by [`arm_dive`] on every zoom-in; cleared by `build_card_scenes` once
-    /// it actually rebuilds. Mirrors `patch_bay::PatchBayState::arm_text`'s
-    /// dirty-flag shape.
+    /// it actually rebuilds.
     pub card_text_dirty: bool,
     /// The one shared material every [`super::drape::LineageDrape`] ribbon
     /// reuses — built lazily on first use by
@@ -413,13 +410,8 @@ const TERRACE_RING_BAND_HALF_WIDTH: f32 = 0.09;
 
 /// Base spin rate (radians/sec-ish, tune by eye) for terrace ring `k`; each
 /// deeper ring spins a touch faster so the funnel reads as receding motion.
-/// **Amy-tunable — kept calm for the first cut.** `pub(crate)`: this is
-/// also the master gear of the room's kinetic ensemble — the FSN portal's
-/// orbit derives from it (`fsn::layout::ORBIT_RATE` = this ×
-/// `ORBIT_GEAR_RATIO`; Amy 2026-07-13: the two motions read gear-like, so
-/// they should BE geared — retune this one number and the whole train
-/// turns together).
-pub(crate) const TERRACE_RING_SPIN_BASE: f32 = 0.13;
+/// **Amy-tunable — kept calm for the first cut.**
+const TERRACE_RING_SPIN_BASE: f32 = 0.13;
 const TERRACE_RING_SPIN_STEP: f32 = 0.04;
 
 /// Overall alpha/intensity for the terrace rings. Started at 0.35 ("kept low
@@ -491,12 +483,10 @@ const RING_ALIGN: f32 = 1.0;
 // shell can be in, well included.
 
 // ============================================================================
-// PLACEMENT (Slice B seam, `lovely-swimming-prism.md` — mirrors patch bay's
-// `StationPlacement`, `patch_bay/mod.rs:71-98,275-293`)
+// PLACEMENT
 // ============================================================================
 
-/// A rigid-plus-uniform-scale placement of the well into room space — the same
-/// shape as patch bay's `StationPlacement`, minus the pitch/yaw pair: the well
+/// A rigid-plus-uniform-scale placement of the well into room space. The well
 /// needs no wall-mount change-of-basis (its recline already lives in the
 /// geometry itself, [`super::card::well_tilt_quat`]), so a single `Quat`
 /// covers whatever rotation a later slice needs.
@@ -533,8 +523,7 @@ pub const IDENTITY_PLACEMENT: StationCenterPlacement = StationCenterPlacement {
 /// `room::TABLE_PLINTH_RADIUS` (145): 500 × 0.3 = 150, bumped to 0.5 (250)
 /// after Amy's live look — the console read as too small a presence next to
 /// the room's other furniture at the first guess. **Still a live-tuning
-/// value** (lovely-swimming-prism.md, Slice C), same spirit as
-/// `patch_bay::STATION_W_SCALE`'s own 0.34 → 0.66 retune.
+/// value.**
 /// `pub(super)`: `card::horizon_label_pos`'s own doc/test converts between
 /// funnel-local and world units through it.
 pub(super) const STATION_CENTER_SCALE: f32 = 0.5;
@@ -616,8 +605,7 @@ pub(super) fn world_y_at_depth(depth: f32) -> f32 {
 }
 
 /// The `Transform` for the placement/root entity that re-roots the well's
-/// whole subtree into room space — mirrors patch bay's `placement_transform`
-/// (`patch_bay/mod.rs:275-279`). [`spawn_well_furniture`] spawns
+/// whole subtree into room space. [`spawn_well_furniture`] spawns
 /// [`TimeWellRoot`] with this; every card/ring/ray/label hangs off it via
 /// `ChildOf`.
 pub fn placement_transform(p: &StationCenterPlacement) -> Transform {
@@ -628,11 +616,10 @@ pub fn placement_transform(p: &StationCenterPlacement) -> Transform {
 
 /// Map a well-LOCAL point to room space through a placement — the same
 /// similarity transform [`placement_transform`] applies to the subtree, as a
-/// point mapping a caller can use without spawning an entity. Unlike patch
-/// bay's `#[cfg(test)]`-only twin (`patch_bay/mod.rs:290-293`), this one is
-/// NOT test-only: a later slice's camera-shot resolver composes the well's
-/// local camera poses (today's `ease_camera_to_focused_ring` math) through
-/// this placement, so it has to be a real, callable function from the start.
+/// point mapping a caller can use without spawning an entity. Not test-only:
+/// the camera-shot resolver (`room::shot::well_local_shot`) composes the
+/// well's local camera poses through this placement, so it has to be a real,
+/// callable function.
 pub(crate) fn placement_to_room(p: &StationCenterPlacement, local: Vec3) -> Vec3 {
     p.translation + p.rotation * (local * p.scale)
 }
@@ -642,18 +629,17 @@ pub(crate) fn placement_to_room(p: &StationCenterPlacement, local: Vec3) -> Vec3
 // ============================================================================
 
 /// Spawn the well's furniture — the placement/root
-/// ([`STATION_CENTER_PLACEMENT`], Slice C's room-center seat) + ring deck +
+/// ([`STATION_CENTER_PLACEMENT`], the room-center seat) + ring deck +
 /// terrace rings + focus card + horizon label, every entity `ChildOf` the
 /// placement. `parent`, when given, re-parents the placement root under it —
 /// `room::enter_room` passes `RoomRoot` (the well is room furniture, spawned
-/// once per room visit alongside the patch bay). `None` has no live caller
-/// left now that `Screen::TimeWell`'s direct-entry path is gone (Slice D);
-/// the parameter stays `Option` rather than dropping to a bare `Entity`
-/// since that's a signature change beyond this cleanup's scope.
+/// once per room visit). `None` has no live caller left; the parameter stays
+/// `Option` rather than dropping to a bare `Entity` since that's a signature
+/// change beyond this cleanup's scope.
 ///
 /// Not a Bevy system — a plain function taking `&mut Commands`/`&mut Assets`,
-/// the same shape `patch_bay::spawn_furniture` uses, so `room::enter_room`
-/// can call it directly alongside its own furniture spawns.
+/// so `room::enter_room` can call it directly alongside its own furniture
+/// spawns.
 ///
 /// **BSN trial (2026-08-16, Bevy 0.19's `bsn!`/`spawn_scene`).** The static
 /// furniture is authored as scenes rather than tuple spawns: the placement
@@ -875,8 +861,8 @@ fn terrace_ring_scene(
 }
 
 /// Re-arm [`TimeWellState`]/[`super::rays::WellTracks`] for a fresh room
-/// entry, called from `room::enter_room` right after [`spawn_well_furniture`]
-/// (mirrors `patch_bay::arm_scene`). `spawn_well_furniture` just built
+/// entry, called from `room::enter_room` right after [`spawn_well_furniture`].
+/// `spawn_well_furniture` just built
 /// brand-new (empty) furniture, but `state.entities`/`state.join` and
 /// `tracks`' own id→entity map are Resources that survive across room
 /// visits — without clearing them here, `sync_time_well`/`sync_track_rays`
@@ -900,9 +886,8 @@ pub fn arm_well(state: &mut TimeWellState, tracks: &mut super::rays::WellTracks)
 }
 
 /// Re-arm [`TimeWellState`] for a fresh dive (zoom-in), called from
-/// `room_keyboard`'s Enter-on-`TimeWell` branch (mirrors
-/// `patch_bay::PatchBayState::arm_text`, one field at a time rather than a
-/// single dirty bit, since the well has more per-dive state to reset).
+/// `room_keyboard`'s Enter-on-`TimeWell` branch, one field at a time rather
+/// than a single dirty bit, since the well has more per-dive state to reset.
 /// Resets `focused` (a fresh dive always starts at the ring overview, not
 /// mid-focus-on-a-card), `placement_pending` (a stale in-flight guard from
 /// a much earlier visit shouldn't block this dive's first placement verb),
@@ -927,9 +912,9 @@ pub fn arm_dive(state: &mut TimeWellState) {
 }
 
 /// Whether the room is currently zoomed onto the time well — the well's
-/// dived-only `run_if` gate. A plain, directly-testable predicate (mirrors
-/// `patch_bay::is_zoomed_into`'s pure half) rather than a `Res`-taking
-/// system, since every call site here already holds a plain `&RoomState`.
+/// dived-only `run_if` gate. A plain, directly-testable predicate rather
+/// than a `Res`-taking system, since every call site here already holds a
+/// plain `&RoomState`.
 pub fn well_zoomed(room: &crate::view::room::RoomState) -> bool {
     room.zoomed == Some(crate::view::room::nav::Station::TimeWell)
 }
@@ -1621,13 +1606,13 @@ mod tests {
     fn well_zoomed_true_only_when_the_room_is_zoomed_onto_the_well() {
         let mut room = crate::view::room::RoomState::default();
         assert!(!well_zoomed(&room), "unzoomed room is not well-zoomed");
-        room.zoomed = Some(crate::view::room::nav::Station::PatchBay);
+        room.zoomed = Some(crate::view::room::nav::Station::Radiators);
         assert!(!well_zoomed(&room), "zoomed on a different station is not well-zoomed");
         room.zoomed = Some(crate::view::room::nav::Station::TimeWell);
         assert!(well_zoomed(&room), "zoomed on TimeWell IS well-zoomed");
     }
 
-    // -- arm_well / arm_dive reset semantics (mirrors patch_bay's `arm_scene`) --
+    // -- arm_well / arm_dive reset semantics --
 
     /// A minimal `ContextInfo` sufficient to seat a join entry — the rest of
     /// the fields don't matter for these reset-semantics tests.
@@ -2147,10 +2132,9 @@ fn horizon_label_visible(zoomed: bool) -> bool {
     zoomed || HORIZON_LABEL_AT_ROOM_SCALE
 }
 
-/// Show/hide the [`HorizonLabel`] per [`horizon_label_visible`] — ambient, not
-/// dived-only (mirrors `crate::view::patch_bay`'s `apply_patch_lod`), so it
-/// reacts to a zoom-OUT too, not just zoom-in. Change-guarded like every other
-/// LOD gate here.
+/// Show/hide the [`HorizonLabel`] per [`horizon_label_visible`] — ambient,
+/// not dived-only, so it reacts to a zoom-OUT too, not just zoom-in.
+/// Change-guarded like every other LOD gate here.
 pub fn apply_horizon_label_lod(
     room: Res<crate::view::room::RoomState>,
     mut label: Query<&mut Visibility, With<HorizonLabel>>,

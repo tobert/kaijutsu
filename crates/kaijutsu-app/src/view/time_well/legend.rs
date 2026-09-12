@@ -108,12 +108,7 @@ pub fn toggle_legend(
     mut commands: Commands,
     mut actions: MessageReader<crate::input::ActionFired>,
     existing: Query<Entity, With<WellLegend>>,
-    // `Without<FsnBackdropCamera>`: the backdrop's off-screen RTT camera is
-    // ALSO a `Camera3d` (`view::fsn::backdrop`), and it's resident exactly
-    // while `Screen::Room` is live — the same screen this toggle fires in.
-    // Without the exclusion, two `Camera3d` entities would make `.single()`
-    // fail the instant the backdrop spawns.
-    camera: Query<(Entity, &Projection), (With<Camera3d>, Without<crate::view::fsn::backdrop::FsnBackdropCamera>)>,
+    camera: Query<(Entity, &Projection), With<Camera3d>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -210,10 +205,7 @@ pub fn toggle_legend(
 /// projection (cheap — one `Vec3` + one scale) so it tracks window-aspect/FOV
 /// changes.
 pub fn position_legend(
-    // Same `Without<FsnBackdropCamera>` exclusion as `toggle_legend` above —
-    // this system runs every frame `Screen::Room` is live, exactly when the
-    // backdrop's second `Camera3d` may also exist.
-    camera: Query<&Projection, (With<Camera3d>, Without<crate::view::fsn::backdrop::FsnBackdropCamera>)>,
+    camera: Query<&Projection, With<Camera3d>>,
     mut legend: Query<&mut Transform, With<WellLegend>>,
 ) {
     let Ok(mut tf) = legend.single_mut() else {
@@ -226,11 +218,11 @@ pub fn position_legend(
     *tf = legend_transform(fov_y, aspect);
 }
 
-/// Dismiss the legend on zoom-OUT (ambient tier, not dived-only — mirrors
-/// `patch_bay::apply_patch_lod`'s own reasoning: a dived-only system freezes
-/// whatever was live on the last dived frame instead of reacting to a
-/// zoom-out transition). The legend is transient — surfacing dismisses it
-/// rather than hiding it, so there's nothing to re-show on the next dive.
+/// Dismiss the legend on zoom-OUT (ambient tier, not dived-only: a
+/// dived-only system freezes whatever was live on the last dived frame
+/// instead of reacting to a zoom-out transition). The legend is transient —
+/// surfacing dismisses it rather than hiding it, so there's nothing to
+/// re-show on the next dive.
 pub fn despawn_legend_unzoomed(
     room: Res<crate::view::room::RoomState>,
     legend: Query<Entity, With<WellLegend>>,

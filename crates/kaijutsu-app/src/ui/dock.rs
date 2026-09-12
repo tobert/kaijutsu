@@ -133,7 +133,7 @@ pub struct DockState {
     pub presence: DockText,
     pub hints: DockText,
     pub contexts: ContextsState,
-    /// True while the active screen is a fleet/world view (`Room`, `Fsn`) —
+    /// True while the active screen is a fleet/world view (`Room`) —
     /// the HUD *detaches from the active context*: renders skip every
     /// context-bound widget (model badge, block/agent activity, background
     /// jobs, context badges, context usage, the activity sparkline) so the
@@ -942,12 +942,12 @@ pub fn handle_dock_click(
 // ============================================================================
 
 /// Whether a screen detaches the HUD from the active context (see
-/// [`DockState::detached`]). `Room` and `Fsn` are fleet/world views — one
-/// context's cockpit readout contradicts their stance. `Editor` and `Diff`
-/// stay attached: both render content *of* the active context.
+/// [`DockState::detached`]). `Room` is a fleet/world view — one context's
+/// cockpit readout contradicts its stance. `Editor` and `Diff` stay
+/// attached: both render content *of* the active context.
 pub(crate) fn hud_detached(screen: crate::ui::screen::Screen) -> bool {
     use crate::ui::screen::Screen;
-    matches!(screen, Screen::Room | Screen::Fsn)
+    matches!(screen, Screen::Room)
 }
 
 /// The mode slot's label while the room owns the viewport: where you are,
@@ -978,7 +978,7 @@ pub fn sync_hud_detach(
 /// When the user is in a text-editing surface (Compose/Dialog), shows the vim
 /// editing mode (NORMAL/INSERT/VISUAL). Otherwise shows the app-level mode.
 /// All labels come from the `mode_label_*` fields of `theme.toml` (kernel-owned,
-/// fetched over RPC from the kernel) — except the detached screens (Room/Fsn),
+/// fetched over RPC from the kernel) — except the detached `Room` screen,
 /// whose slot shows *where you are* ([`room_slot_label`]) instead of a vim
 /// mode that has no surface behind it there.
 pub fn update_mode(
@@ -1007,7 +1007,6 @@ pub fn update_mode(
         Screen::Editor | Screen::Diff => (theme.mode_normal, &theme.mode_label_normal),
         // Detached screens: the slot names the place, not a mode.
         Screen::Room => (theme.accent, room_slot_label(room.zoomed)),
-        Screen::Fsn => (theme.accent, crate::view::room::nav::Station::Vfs.label()),
     };
 
     if dock.mode.text != label || dock.mode.color != color {
@@ -1249,11 +1248,11 @@ mod tests {
         );
     }
 
-    /// Room and Fsn are the fleet/world views — the HUD detaches from the
-    /// active context there. Everything else (Conversation, and the two
-    /// surfaces that render the active context's own content: Editor, Diff)
-    /// stays attached. Exhaustive over `Screen` so a future screen variant
-    /// forces a deliberate choice here.
+    /// Room is the fleet/world view — the HUD detaches from the active
+    /// context there. Everything else (Conversation, and the two surfaces
+    /// that render the active context's own content: Editor, Diff) stays
+    /// attached. Exhaustive over `Screen` so a future screen variant forces
+    /// a deliberate choice here.
     #[test]
     fn hud_detaches_on_fleet_views_only() {
         use crate::ui::screen::Screen;
@@ -1262,9 +1261,8 @@ mod tests {
             Screen::Editor,
             Screen::Room,
             Screen::Diff,
-            Screen::Fsn,
         ] {
-            let expect = matches!(screen, Screen::Room | Screen::Fsn);
+            let expect = matches!(screen, Screen::Room);
             assert_eq!(hud_detached(screen), expect, "{screen:?}");
         }
     }
@@ -1900,10 +1898,8 @@ pub fn update_contexts(
 
 /// Update hints widget based on FocusArea and Screen.
 ///
-/// `Screen::Room` now shows one of two hint lines depending on
-/// `RoomState::zoomed` (2026-07-10 evening, the fullscreen-panel pivot: the
-/// old `Screen::PatchBay` hint line moved here, since diving no longer
-/// changes `Screen` at all).
+/// `Screen::Room` shows one of several hint lines depending on
+/// `RoomState::zoomed` — diving never changes `Screen`.
 pub fn update_hints(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
@@ -1951,20 +1947,13 @@ pub fn update_hints(
         }
         Screen::Room => match room.zoomed {
             None => "\u{2190}\u{2192}: station \u{2502} Enter/\u{2193}: zoom \u{2502} Esc: conversation",
-            Some(crate::view::room::nav::Station::PatchBay) => {
-                "\u{2190}\u{2192}: wire \u{2502} \u{2191}/Esc: room \u{2502} r: rescan"
-            }
             Some(crate::view::room::nav::Station::TimeWell) => {
                 "0-9/\u{2190}\u{2192}\u{2191}\u{2193}: seat & ring \u{2502} Enter: focus/commit \u{2502} c/p/d/z/a: act \u{2502} Esc: room"
             }
-            // Every wall station zooms now (`station_is_zoomable`,
-            // 2026-07-13); the plain panels (Tracks/Vfs/Radiators) share
-            // `plain_zoom_keyboard`'s surface-only keys.
+            // The plain panels (Radiators) share `plain_zoom_keyboard`'s
+            // surface-only keys.
             Some(_) => "\u{2191}/Esc: room",
         },
-        Screen::Fsn => {
-            "WASD/\u{2190}\u{2192}\u{2191}\u{2193}: fly \u{2502} PgUp/PgDn: altitude \u{2502} Esc: room"
-        }
     };
 
     if dock.hints.text != hints {

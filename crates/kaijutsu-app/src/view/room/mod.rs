@@ -1,83 +1,58 @@
-//! Room level — the shell's **Tardis chamber** (`docs/scenes/shell.md`, slice A:
-//! "the room exists"). A circular vaulted room that holds the stations at
-//! stable compass **bearings** around a central **console**. Left/Right cycle
-//! the station carousel, Enter/Down dives (a camera zoom now, not a scene cut
-//! — see Slice C below), Esc drops to the conversation.
+//! Room level — the shell's **Tardis chamber** (`docs/scenes/shell.md`). A
+//! circular vaulted room that holds the stations at stable compass
+//! **bearings** around a central **console**. Left/Right cycle the station
+//! carousel, Enter/Down zooms the focused station fullscreen (a camera move,
+//! not a scene cut), Esc drops to the conversation.
 //!
-//! What slice A builds:
 //! - **Geometry**: a dark floor disc inscribed with etched trace channels that
 //!   bow *around* the center (never under it — the open-center rule), a subtle
-//!   dark vault dome overhead, and the console emblem at center.
+//!   dark vault dome overhead, and the time well at center.
 //! - **Bearings**: stations at their compass placement (`bearing::focus_dir`) —
-//!   PatchBay W, Tracks E, VFS N, reserved S; the console is the center. The
-//!   camera **dollies to face** the focused bearing (travel by intent — the
-//!   same eased tween idiom as the well's `ease_camera_to_focused_ring`).
+//!   Switchboard S, reserved W/E/N; the console is the center. The camera
+//!   **dollies to face** the focused bearing (travel by intent — the same
+//!   eased tween idiom as the well's `ease_camera_to_focused_ring`).
 //! - **Nameplates**: engraved MSDF plates at the labeled bearings (the well's
-//!   plate pipeline). Unbuilt stations stay dimmed.
-//! - **Information radiators**: violet dark-glass content — now the diagonal
-//!   faces of the octagon wall shell (below), not free-floating slabs.
-//! - **Ambient telemetry = light**: the tracks (E) marker *breathes* with the
-//!   beat (the well's [`WellBeats`] phasors, read — not re-wired), and the
-//!   console emblem glows with context chatter ([`activity::BearingActivity`]).
-//!   Strong sustained HDR is reserved for live activity; decoration may also
-//!   carry its own FAINT, slowly moving glow (the circuit board, the wall
-//!   trim — below), capped at [`ScenePalette::crest`] and LDR on
-//!   time-average (Amy, 2026-07-10 — "make the circuit patterns and border
-//!   glow faintly like the concepts... a lil bloom or some other shader;
-//!   something faintly moving might be interesting").
+//!   plate pipeline). Unbuilt (reserved) bearings stay dimmed.
+//! - **Information radiators**: violet dark-glass content on the diagonal
+//!   faces of the octagon wall shell (below).
+//! - **Ambient telemetry = light**: the East bearing's marker *breathes* with
+//!   beat-sync traffic, the switchboard warms with turn traffic
+//!   ([`activity::BearingActivity`]). Strong sustained HDR is reserved for
+//!   live activity; decoration may also carry its own FAINT, slowly moving
+//!   glow (the circuit board, the wall trim — below), capped at
+//!   [`ScenePalette::crest`] and LDR on time-average (Amy, 2026-07-10 —
+//!   "make the circuit patterns and border glow faintly like the concepts...
+//!   a lil bloom or some other shader; something faintly moving might be
+//!   interesting").
 //!
-//! The console is the **slice-A stand-in** for the live well: an emblematic
-//! gold ring-stack, *not* the well scene (unifying the well is a later slice).
+//! **One shared scene graph** (`shell.md`'s "one shared scene graph"
+//! decision): every station is room furniture or a wall panel spawned when
+//! the room spawns, alive as long as `RoomRoot`. Diving onto a station is a
+//! *continuous camera descent*, not a scene cut: `enter_room`/`exit_room`
+//! only run on the Room↔Conversation boundary, one camera + one clear colour
+//! carry every station, and a dived view earns its focus by dimming the room
+//! and showing the station's own LOD, not by being a different world.
 //!
-//! **Slice B (2026-07-09): one shared scene graph** (shell.md open question 3,
-//! DECIDED). The patch bay is not a separate Bevy world reached by a scene cut —
-//! it is **room furniture at the W bearing**, spawned when the room spawns
-//! (`patch_bay::spawn_furniture`, under a placement entity) and alive as long as
-//! `RoomRoot`. Diving is a *continuous camera descent* onto it: `enter_room` /
-//! `exit_room` no longer despawn on the Room↔PatchBay hop (only leaving the shell
-//! for Conversation/the well tears down), one camera + one clear colour carry
-//! both screens, and the dived view earns its focus by dimming the room and
-//! showing the patch bay's own LOD, not by being a different world.
+//! **The octagon shell.** The room is enclosed by eight single-sided wall
+//! panels ([`bearing::octagon_panels`]) standing on the floor — the camera
+//! orbits OUTSIDE them for the overview pose, and the near panel(s) cull away
+//! (default back-face culling on an inward-facing quad), the dollhouse-cutaway
+//! read. The four diagonal faces carry the violet information threads; the
+//! four cardinal faces (W, E, N, S) each carry a marker pylon, and S's own
+//! [`Station::Switchboard`] mounts its lamp grid directly on the wall.
 //!
-//! **Slice B, retuned (2026-07-10): the octagon shell + the wheel-as-station**
-//! (`docs/scenes/scene_geometry.rs`'s station-W contract). The room is now enclosed by
-//! eight single-sided wall panels ([`bearing::octagon_panels`]) standing on the
-//! floor — the camera orbits OUTSIDE them for the overview pose, and the near
-//! panel(s) cull away (default back-face culling on an inward-facing quad),
-//! the dollhouse-cutaway read. The four diagonal faces carry the migrated
-//! violet information threads (the old free-floating radiators). The W
-//! bearing spawns no marker/plinth/cap/nameplate at all — the wheel occupies
-//! it directly.
-//!
-//! **Wall-mount retune (same day): the wheel hangs ON the W panel.** A first
-//! pass stood the wheel on a floor dais at the W bearing; Amy's call, later
-//! the same day, was to mount it flush on the wall panel itself instead
-//! ("the surface gets taken over by its content" — studio patch bays are
-//! wall panels, not tables). The dais and its furniture builder are gone;
-//! the patch bay's own placement (untouched here beyond reading
-//! `scene_geometry::WALL_APOTHEM`) re-orients the wheel face-out with a pitch+yaw
-//! composition and seats it flush against the panel `spawn_walls` already
-//! builds — no new room-side furniture at all.
-//!
-//! **Slice C (2026-07-11): the time well becomes the console.** The
-//! slice-A gold-ring-stack placeholder (`CONSOLE_RINGS`, the module's own old
-//! "emblem of the time well" stand-in) is gone; the real well
-//! (`time_well::scene::spawn_well_furniture`) now IS the console — room
-//! furniture at the Center bearing, seated above the existing
-//! `spawn_table` via `time_well::scene::STATION_CENTER_PLACEMENT`, the same
-//! "one placement transform seats the content" contract the wheel's
-//! `STATION_W_PLACEMENT` established at W. Unzoomed, the well's rings/cards
-//! sit ambient and dim (matching the wheel's chords-at-rest read); Enter/Down
-//! on the TimeWell carousel entry zooms the shared camera into the well's
-//! mouth via [`shot::RoomShot::WellOverview`] — no scene cut — and the
-//! well's own keyboard/HUD/nav take over while zoomed, exactly like the
-//! wheel's dive. Ctrl+W is now a **symmetric room toggle**
-//! (`time_well::scene::toggle_time_well`): Conversation → dive straight into
-//! the well; Room (any station, zoomed or not) → straight back to
-//! Conversation — reading only the current screen, never how it was
-//! reached. `Screen::TimeWell` itself — left unreachable-but-wired by this
-//! slice — is deleted cleanly by Slice D, along with its now-dead
-//! `OnEnter`/`OnExit` handlers and every other call site that matched on it.
+//! **The time well is the console.** The well
+//! (`time_well::scene::spawn_well_furniture`) stands at the Center bearing,
+//! seated above `spawn_table` via `time_well::scene::STATION_CENTER_PLACEMENT`
+//! — the same "one placement transform seats the content" contract every
+//! furnished bearing uses. Unzoomed, the well's rings/cards sit ambient and
+//! dim; Enter/Down on the TimeWell carousel entry zooms the shared camera
+//! into the well's mouth via [`shot::RoomShot::WellOverview`] — no scene cut
+//! — and the well's own keyboard/HUD/nav take over while zoomed. Ctrl+W is a
+//! **symmetric room toggle** (`time_well::scene::toggle_time_well`):
+//! Conversation → dive straight into the well; Room (any station, zoomed or
+//! not) → straight back to Conversation — reading only the current screen,
+//! never how it was reached.
 //!
 //! Materials are mostly built-in [`StandardMaterial`] with `unlit: true`,
 //! carrying brightness in `base_color` — LDR (< 1.0 linear) reads crisp, HDR
@@ -115,7 +90,6 @@ use crate::text::msdf::{
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::ui::screen::Screen;
 use crate::view::scene_geometry;
-use crate::view::patch_bay;
 use crate::view::scene_palette::{ScenePalette, lin_scaled};
 use crate::view::time_well::live::WellBeatsRes;
 use crate::view::time_well::panel::{commit_panel_glyphs, create_msdf_panel};
@@ -241,11 +215,8 @@ const TABLE_PLINTH_HEIGHT: f32 = 16.0;
 // `cull_mode`, no `Cuboid`, no `cull_mode: None`): a camera outside the
 // octagon sees a near panel's back face — culled — and the chamber shows
 // through (the dollhouse cutaway; see `bearing`'s own module comment for the
-// exact mechanics). No W-bearing dais stands here any more (the 2026-07-10
-// wall-mount retune, `scene_geometry.rs`'s "Station W contract"): the wheel mounts
-// directly on the W panel below via `patch_bay::STATION_W_PLACEMENT`, which
-// is why `WALL_APOTHEM` itself now lives in `scene_geometry.rs` — both files read
-// the same number, this one just for the panel geometry.
+// exact mechanics). `WALL_APOTHEM` itself lives in `scene_geometry.rs`, which
+// this file reads for the panel geometry.
 
 /// Panel height, standing on the floor (`y = 0` to `WALL_HEIGHT`).
 const WALL_HEIGHT: f32 = 560.0;
@@ -403,24 +374,20 @@ const GLOW_STEP: f32 = 1.0 / 64.0;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-/// Which station the room carousel focuses. Whoever *enters* the room sets the
-/// focus first (the well focuses TIME WELL; the patch bay focuses PATCH BAY),
-/// so arriving always faces where you came from.
+/// Which station the room carousel focuses. Defaults to the time well, so
+/// arriving always faces the console.
 #[derive(Resource)]
 pub struct RoomState {
     pub carousel: StationCarousel,
-    /// The station the camera is fullscreened onto, or `None` at room scale
-    /// (2026-07-10 evening, the fullscreen-panel pivot — supersedes the old
-    /// `Screen::PatchBay` state entirely: "diving" is now a camera pose plus
-    /// this field, not a screen). Only [`station_is_zoomable`] stations ever
-    /// occupy it; `room_keyboard` sets it on Enter/Down, clears it on Esc/Up,
-    /// and `exit_room` clears it unconditionally on the way out of the room
-    /// so a later re-entry always starts unzoomed. Reading this (not a
-    /// `State<Screen>`) is what `ease_shell_camera`, `apply_room_dive_visibility`,
-    /// and the patch bay's own LOD/keyboard gates key off now.
+    /// The station the camera is fullscreened onto, or `None` at room scale.
+    /// Only [`station_is_zoomable`] stations ever occupy it; `room_keyboard`
+    /// sets it on Enter/Down, clears it on Esc/Up, and `exit_room` clears it
+    /// unconditionally on the way out of the room so a later re-entry always
+    /// starts unzoomed. Reading this (not a `State<Screen>`) is what
+    /// `ease_shell_camera`, `apply_room_dive_visibility`, and the well's own
+    /// LOD/keyboard gates key off.
     pub zoomed: Option<Station>,
-    /// Re-lay-out the nameplates on the next frame (the patch bay's
-    /// `text_dirty` shape — `view/patch_bay/mod.rs`). `StationPlate` entities
+    /// Re-lay-out the nameplates on the next frame. `StationPlate` entities
     /// live for ONE room visit: `exit_room` despawns `RoomRoot` (cascading to
     /// every plate), `enter_room` respawns fresh, glyph-less ones — but this
     /// `RoomState` resource survives every visit. A process-lifetime "done"
@@ -564,7 +531,7 @@ impl Plugin for RoomPlugin {
 /// without re-arming `plates_dirty` here, a second (or later) visit finds it
 /// already cleared from the first and `room_plate_text` never fills the
 /// fresh, glyph-less plates just spawned — the blank-nameplate-on-re-entry
-/// bug this arm fixes. Mirrors patch_bay's `arm_on_enter`.
+/// bug this arm fixes.
 fn arm_on_enter(room: &mut RoomState) {
     room.plates_dirty = true;
 }
@@ -572,10 +539,8 @@ fn arm_on_enter(room: &mut RoomState) {
 fn enter_room(
     mut commands: Commands,
     mut room: ResMut<RoomState>,
-    mut pb_state: ResMut<patch_bay::PatchBayState>,
     mut well_state: ResMut<crate::view::time_well::scene::TimeWellState>,
     mut well_tracks: ResMut<crate::view::time_well::rays::WellTracks>,
-    mut tracker_state: ResMut<crate::view::tracker::TrackerState>,
     palette: Res<ScenePalette>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
@@ -584,33 +549,14 @@ fn enter_room(
     mut ring_mats: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
     mut terrace_mats: ResMut<Assets<crate::shaders::TerraceRingMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    // Camera + Transform + Projection folded into ONE query (not a separate
-    // `Query<(Entity, &Projection), _>` alongside it) to stay under Bevy's
-    // 16-param ceiling for a function-as-system — `enter_room` was the first
-    // system in this codebase to actually hit it (Slice C added enough new
-    // room-furniture params to tip it over).
-    // `Without<FsnBackdropCamera>`: defensive — `view::fsn::backdrop`'s
-    // off-screen RTT camera is also a `Camera3d`, spawned in the SAME
-    // `OnEnter(Screen::Room)` transition this system runs in
-    // (`FsnBackdropPlugin`'s own `spawn_backdrop`). Bevy runs `OnExit`
-    // before `OnEnter` for a state transition, so in practice this camera
-    // shouldn't exist yet the first time `enter_room` runs after entering
-    // `Screen::Room` — but nothing enforces which `OnEnter(Screen::Room)`
-    // system runs first between plugins, so the exclusion keeps
-    // `app_camera.single_mut()` safe regardless of registration order.
-    mut app_camera: Query<
-        (Entity, &mut Camera, &mut Transform),
-        (With<Camera3d>, Without<crate::view::fsn::backdrop::FsnBackdropCamera>),
-    >,
+    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
     existing: Query<Entity, With<RoomRoot>>,
 ) {
     // Defensive belt-and-braces, not a live path today: `OnEnter(Screen::Room)`
     // only fires on an actual `Screen` transition into `Room` (Bevy states
-    // no-op a `set()` to the state already active), and diving/surfacing no
-    // longer touches `Screen` at all since `RoomState::zoomed` replaced
-    // `Screen::PatchBay` — so nothing should ever call this while `RoomRoot`
-    // is still standing. Kept anyway so a stale root can never get a second
-    // one spawned on top of it.
+    // no-op a `set()` to the state already active) — so nothing should ever
+    // call this while `RoomRoot` is still standing. Kept anyway so a stale
+    // root can never get a second one spawned on top of it.
     if !existing.is_empty() {
         return;
     }
@@ -659,11 +605,9 @@ fn enter_room(
     // this just keeps "table, then what stands on it" readable in the diff.
     spawn_table(&mut commands, root, &palette, &mut meshes, &mut mats);
 
-    // The time well itself — room furniture at the Center bearing (Slice C,
-    // `lovely-swimming-prism.md`), replacing the slice-A `CONSOLE_RINGS`
-    // placeholder this loop used to spawn. Seated above the table's top face
-    // via `STATION_CENTER_PLACEMENT`; `arm_well` re-arms the per-visit join
-    // state the same frame (the `patch_bay::arm_scene` analog just below).
+    // The time well itself — room furniture at the Center bearing, seated
+    // above the table's top face via `STATION_CENTER_PLACEMENT`; `arm_well`
+    // re-arms the per-visit join state.
     crate::view::time_well::scene::spawn_well_furniture(
         &mut commands,
         Some(root),
@@ -679,12 +623,11 @@ fn enter_room(
 
     // Wall stations: a marker pylon at each bearing, plus an engraved nameplate
     // at every labeled one. A furnished bearing
-    // (`bearing::station_is_room_furniture` — PatchBay/W "the wheel IS the
-    // west station", Vfs/N's panel-spanning FSN portal, Tracks/E's pattern
-    // grid, and since 2026-08-10 Switchboard/S's lamp grid) gets neither: no
-    // marker, no plate — the station's own wall-mounted face stands in for
-    // both. (The switchboard briefly kept the generic marker; the first live
-    // look showed it planted dead-center in front of the lamp grid.)
+    // (`bearing::station_is_room_furniture` — Switchboard/S's lamp grid) gets
+    // neither: no marker, no plate — the station's own wall-mounted face
+    // stands in for both. (The switchboard briefly kept the generic marker;
+    // the first live look showed it planted dead-center in front of the lamp
+    // grid.)
     for wp in bearing::wall_placements() {
         if wp.station.is_some_and(bearing::station_is_room_furniture) {
             continue;
@@ -752,14 +695,8 @@ fn enter_room(
 
     // Pylon plinths + gold caps — the plain marker posts get grounded furniture
     // (`shell.md`'s "the atrium rules" read); every wall bearing wants a gold
-    // cap now ([`wants_gold_cap`]). Skips the furnished W bearing same as the
-    // marker/plate loop above.
+    // cap now ([`wants_gold_cap`]).
     spawn_pylons(&mut commands, root, &palette, &mut meshes, &mut mats);
-
-    // No W-bearing furniture spawns here any more (the 2026-07-10 wall-mount
-    // retune): the wheel mounts directly on the W wall panel `spawn_walls`
-    // builds below, via `patch_bay::STATION_W_PLACEMENT` — nothing for the
-    // room side to build or ground.
 
     // The octagon wall shell: eight single-sided panels enclosing the room,
     // corner mullions, hue-coded edge trim, and — on the four diagonals — the
@@ -767,46 +704,15 @@ fn enter_room(
     // radiators. The chamber, not room chrome (no RoomDistraction).
     spawn_walls(&mut commands, root, &palette, &mut meshes, &mut mats, &mut glow_mats);
 
-    // The switchboard's lamp grid — the south wall's own content, the same
-    // "mounted on its panel" idiom the wheel/tracker/portal use, spawned once
+    // The switchboard's lamp grid — the south wall's own content, mounted on
+    // its panel the same way the well is mounted on the console, spawned once
     // the octagon shell above stands. `switchboard::spawn_switchboard` reads
     // resources `enter_room` already holds (no new system params — this
     // function is already at Bevy's function-as-system arity ceiling, its
     // own doc above has the story).
     switchboard::spawn_switchboard(&mut commands, root, &mut meshes, &mut mats);
 
-    // Re-root the patch bay into the room as furniture at the W bearing (slice B,
-    // one shared scene graph). It rides `RoomRoot`, so it lives exactly as long as
-    // the room; `arm_scene` primes the first observed-graph poll so its chords —
-    // the W ambient — build straight away without a dive.
-    patch_bay::spawn_furniture(
-        &mut commands,
-        root,
-        &palette,
-        &mut meshes,
-        &mut mats,
-        &mut card_mats,
-        &mut images,
-    );
-    patch_bay::arm_scene(&mut pb_state);
-
-    // The tracker station at E — furniture the same "the instrument IS the
-    // station" way the wheel is at W (Tracker Station slice 0,
-    // `snazzy-jumping-hejlsberg.md`). `arm` clears the previous visit's
-    // stale column-entity ids the same way `well_tracks`' own re-arm does
-    // just above (the `clear_ray_entities` stale-id lesson).
-    crate::view::tracker::spawn_furniture(
-        &mut commands,
-        root,
-        &palette,
-        &mut meshes,
-        &mut mats,
-        &mut card_mats,
-        &mut images,
-    );
-    tracker_state.arm();
-
-    info!("room: entered (Tardis chamber — patch bay at W, the time well at center)");
+    info!("room: entered (Tardis chamber — the time well at center)");
 }
 
 pub(crate) fn exit_room(
@@ -817,17 +723,11 @@ pub(crate) fn exit_room(
     mut app_camera: Query<(Entity, &mut Camera), With<RoomCamera>>,
     well_legend: Query<Entity, With<crate::view::time_well::legend::WellLegend>>,
 ) {
-    // Unconditional (2026-07-10 evening, the fullscreen-panel pivot): diving
-    // used to be a second screen (`Screen::PatchBay`) sharing this scene
-    // graph, so leaving the shell FROM a dive could bypass this very
-    // `OnExit(Screen::Room)` — the state being left was `PatchBay`, not
-    // `Room` — and the dive's own exit had to duplicate this teardown or leak
-    // the room. Dissolving that state removes the whole class of bug: diving
-    // is now a `RoomState::zoomed` write, not a screen, so `Screen::Room` is
-    // the ONLY state this scene graph ever occupies, and every way out of it
-    // runs this one exit. Clear the zoom too, so a later re-entry always
-    // starts unzoomed rather than inheriting a stale target from a
-    // long-despawned visit.
+    // Diving onto a station is a `RoomState::zoomed` write, not a screen, so
+    // `Screen::Room` is the ONLY state this scene graph ever occupies, and
+    // every way out of it runs this one exit. Clear the zoom too, so a later
+    // re-entry always starts unzoomed rather than inheriting a stale target
+    // from a long-despawned visit.
     room.zoomed = None;
     teardown_room(&mut commands, &theme, &roots, &mut app_camera);
     // The transient legend, when up, is a `Camera3d` child, NOT a `RoomRoot`
@@ -842,8 +742,8 @@ pub(crate) fn exit_room(
 }
 
 /// Tear the room down: despawn `RoomRoot` (recursively — the chamber and all
-/// its furniture, the W patch bay included) and release the shared camera
-/// (drop the [`RoomCamera`] claim, restore the conversation clear colour).
+/// its furniture) and release the shared camera (drop the [`RoomCamera`]
+/// claim, restore the conversation clear colour).
 /// Kept as its own helper for readability even though [`exit_room`] is its
 /// only caller now (`docs/scenes/shell.md`'s "one shared scene graph" no
 /// longer has a second exit to share it with).
@@ -865,30 +765,24 @@ pub(crate) fn teardown_room(
 // ── Spawn helpers (called from `enter_room`) ─────────────────────────────────
 
 /// The circuit-board route bundles — the rainbow-board authoring table
-/// (`shell.md`, "the floor is the wiring"): crimson (MIDI) toward the W/E
-/// patch-bay↔tracks axis, VFS green and cyan (PCM) toward N, violet short
-/// stubs fanning the four radiator diagonals, and a couple of well-gold
-/// routes sparingly toward the reserved S quadrant (gold is the console's
-/// hue, not the floor's). ~24–36 total routes ([`bearing::expand_bundle`]
-/// expands each bundle's `count`). Angles are read straight off
-/// [`Bearing::dir`] via [`bearing::dir_theta`] so a re-placed bearing can't
-/// silently drift out of sync with its floor traces. **Amy-tunable.**
+/// (`shell.md`, "the floor is the wiring"): crimson toward the W/E axis,
+/// green and cyan toward N, violet short stubs fanning the four radiator
+/// diagonals, and a couple of well-gold routes sparingly toward the reserved
+/// S quadrant (gold is the console's hue, not the floor's). ~24–36 total
+/// routes ([`bearing::expand_bundle`] expands each bundle's `count`). Angles
+/// are read straight off [`Bearing::dir`] via [`bearing::dir_theta`] so a
+/// re-placed bearing can't silently drift out of sync with its floor traces.
+/// **Amy-tunable.**
 ///
-/// The W bundle's `pad_range` was retuned three times on 2026-07-10 (`shell.md`,
-/// "the wheel IS the west station"): first to cluster just past the W dais's
-/// foot, then for the wall-mount retune (the dais is gone, and the wiring
-/// flows all the way to the wall the wheel hangs on, terminating at the
-/// panel's base instead of the old floor-furniture foot), then again that
-/// evening when the octagon itself grew (`scene_geometry::WALL_APOTHEM` 800 → 1200,
-/// the fullscreen-panel pivot) — expressed as `WALL_APOTHEM` minus a fixed
-/// gap (160/30) rather than a re-guessed literal, so the pads stay the SAME
-/// distance short of the wall regardless of how far out the wall itself
-/// stands. The other wall-reaching bundles (E crimson, N green, N cyan, S
-/// gold) stretch their `pad_range` by the same ratio the floor itself grew
-/// (`FLOOR_RADIUS` 1100 → 1300, ×13/11) so the whole board still reaches
-/// proportionally toward the bigger room — the violet diagonal stubs don't
-/// reach a wall at all (they depart and land near the inscribed ring) and are
-/// untouched.
+/// The W bundle's `pad_range` clusters short of the W wall panel, expressed
+/// as `WALL_APOTHEM` minus a fixed gap (160/30) rather than a literal, so the
+/// pads stay the SAME distance short of the wall regardless of how far out
+/// the wall itself stands. The other wall-reaching bundles (E crimson, N
+/// green, N cyan, S gold) stretch their `pad_range` by the same ratio the
+/// floor itself grew (`FLOOR_RADIUS` 1100 → 1300, ×13/11) so the whole board
+/// still reaches proportionally toward the bigger room — the violet diagonal
+/// stubs don't reach a wall at all (they depart and land near the inscribed
+/// ring) and are untouched.
 fn route_bundles(palette: &ScenePalette) -> [bearing::RouteBundle; 9] {
     use bearing::{Bearing, RouteBundle, dir_theta};
     let west = dir_theta(Bearing::West.dir());
@@ -908,10 +802,10 @@ fn route_bundles(palette: &ScenePalette) -> [bearing::RouteBundle; 9] {
             count: 7,
             lane_range: (280.0, 620.0),
             arc_range: (0.25, 0.9),
-            // Terminates at the wall base under the mounted wheel — clustered
-            // a fixed 160/30 units short of the panel itself
-            // (`scene_geometry::WALL_APOTHEM`), so the gap from the wall stays the
-            // same size the 2026-07-10 evening apothem bump moved the wall.
+            // Terminates at the W wall's base — clustered a fixed 160/30
+            // units short of the panel itself (`scene_geometry::WALL_APOTHEM`),
+            // so the gap from the wall stays the same size regardless of how
+            // far out the wall itself stands.
             pad_range: (scene_geometry::WALL_APOTHEM - 160.0, scene_geometry::WALL_APOTHEM - 30.0),
             hue: trace_crimson,
             brightness_range: (0.7, 1.15),
@@ -923,10 +817,10 @@ fn route_bundles(palette: &ScenePalette) -> [bearing::RouteBundle; 9] {
             lane_range: (300.0, 650.0),
             arc_range: (0.25, 0.9),
             // Stretched ×13/11 from (450, 900) with `FLOOR_RADIUS` (1100 →
-            // 1300, the same evening apothem bump) — this bundle doesn't
-            // terminate AT a wall (Tracks keeps its floor marker, not a
-            // wall-mounted instrument), so it scales with the floor's own
-            // growth rather than `WALL_APOTHEM`'s fixed gap.
+            // 1300) — this bundle doesn't terminate AT a wall (E keeps its
+            // floor marker, not a wall-mounted instrument), so it scales
+            // with the floor's own growth rather than `WALL_APOTHEM`'s fixed
+            // gap.
             pad_range: (532.0, 1064.0),
             hue: trace_crimson,
             brightness_range: (0.7, 1.15),
@@ -1392,9 +1286,10 @@ fn wants_gold_cap(wp: &bearing::WallPlacement) -> bool {
 
 /// Pylon furniture: a wide low plinth grounding every marker to the floor,
 /// and a gold cap slab on top of every built station's pylon
-/// ([`wants_gold_cap`] gates the reserved South stub out). Skips the
-/// furnished W bearing entirely ([`bearing::station_is_room_furniture`]) —
-/// the wheel mounts on the wall panel itself, no pylon/plinth/cap of its own.
+/// ([`wants_gold_cap`] gates the reserved South stub out). Skips any
+/// furnished bearing entirely ([`bearing::station_is_room_furniture`]) —
+/// a station whose own wall-mounted face stands in for the marker gets no
+/// pylon/plinth/cap of its own.
 fn spawn_pylons(
     commands: &mut Commands,
     root: Entity,
@@ -1447,47 +1342,29 @@ fn spawn_pylons(
 // ── Systems ───────────────────────────────────────────────────────────────────
 
 /// Whether Enter/Down on a focused station fullscreens the camera onto it
-/// (`RoomState::zoomed`) rather than diving to a dedicated `Screen` — the
-/// wheel first (2026-07-10 evening, the fullscreen-panel pivot: "diving IS
-/// fullscreening a panel"), the time well with Slice C (its own
-/// `view/room/shot.rs::RoomShot::WellOverview` pose), and since 2026-07-13
-/// **every wall station**: the approach pose now frames the whole panel
-/// (plus neighbor slivers), and Enter zooms it fullscreen — one uniform
-/// gesture whether the panel carries an instrument, a portal, or nothing
-/// yet. That retune also ended N's "dive-THROUGH door" exception: Enter on
-/// N fullscreens the FSN portal (the primary FSN surface now — diving is
-/// de-emphasized; `Screen::Fsn` remains in code but is keyboard-unreachable,
-/// tracked in `docs/issues.md`). Kept as a table (not a bare `true`) so a
-/// future genuinely-unzoomable station has a row to flip — [`Station::Switchboard`]
+/// (`RoomState::zoomed`) rather than diving to a dedicated `Screen`: the
+/// approach pose frames the whole panel (plus neighbor slivers), and Enter
+/// zooms it fullscreen — one uniform gesture whether the panel carries an
+/// instrument or nothing yet. Kept as a table (not a bare `true`) so a future
+/// genuinely-unzoomable station has a row to flip — [`Station::Switchboard`]
 /// (the switchboard slice) is the first one to actually flip it: the lamp
 /// wall is room-scale-only by design (the mission brief: "NOT zoomable/divable
 /// yet"), so it's the one station carousel-focus can approach but Enter can't
 /// fullscreen. Pure — no Bevy types — unit-tested like
 /// `bearing::station_is_room_furniture`.
 fn station_is_zoomable(station: Station) -> bool {
-    matches!(
-        station,
-        Station::PatchBay
-            | Station::TimeWell
-            | Station::Tracks
-            | Station::Vfs
-            | Station::Radiators
-    )
+    matches!(station, Station::TimeWell | Station::Radiators)
 }
 
 /// Room keys: Left/Right cycle the carousel, Enter/Down zooms the focused
 /// station fullscreen, Esc drops to the conversation (the room is the top
-/// level). Since Slice C every zoomable station shares ONE dive mechanism:
-/// Enter/Down sets `RoomState::zoomed` — a camera pose, not a screen — and
-/// arms whatever per-station text/dive-state that station needs
-/// (`pb_state.arm_text()` for the wheel, `time_well::scene::arm_dive` for
-/// the well; the plain panels need nothing). Since 2026-07-13 that is EVERY
-/// wall station (`station_is_zoomable`'s doc has the story, including N's
-/// retired dive-through exception).
+/// level). Every zoomable station shares ONE dive mechanism: Enter/Down sets
+/// `RoomState::zoomed` — a camera pose, not a screen — and arms whatever
+/// per-station dive-state that station needs (`time_well::scene::arm_dive`
+/// for the well; the plain panels need nothing).
 ///
 /// While zoomed, this system steps back almost entirely: Left/Right and
-/// Esc/Up belong to the zoomed station's OWN keyboard system now (patch_bay's
-/// `patch_bay_keyboard` gated on `patch_bay_zoomed`; the well's
+/// Esc/Up belong to the zoomed station's OWN keyboard system now (the well's
 /// `time_well::scene::well_keyboard` gated on `time_well::scene::well_zoomed`;
 /// [`plain_zoom_keyboard`] for the stations with no zoomed content of their
 /// own) — "the zoomed station's own keys own them," the same reasoning
@@ -1495,20 +1372,19 @@ fn station_is_zoomable(station: Station) -> bool {
 /// The one thing this system still owns while zoomed is nothing at all; it
 /// simply returns, so there's no double-handling between the systems.
 ///
-/// **Must run before `well_keyboard`/`patch_bay_keyboard` in the same tick**
-/// (a kaibo review round, 2026-07-11, hardening what plugin registration
-/// order in `main.rs` already relied on implicitly): if a zoomed station's
-/// own Esc handler clears `RoomState::zoomed` to `None` BEFORE this system's
-/// own early-return check runs, this system would see the just-cleared
-/// `zoomed` in the SAME frame and fire ITS OWN Escape-to-Conversation branch
-/// too, skipping the room-overview stop entirely. `pub(crate)` so
-/// `time_well`/`patch_bay`'s plugins can declare `.after(room_keyboard)`
-/// explicitly instead of leaning on `main.rs`'s plugin-addition order (which
-/// is real today but easy to silently break by reordering plugins later).
+/// **Must run before `well_keyboard` in the same tick** (a kaibo review
+/// round, 2026-07-11, hardening what plugin registration order in `main.rs`
+/// already relied on implicitly): if a zoomed station's own Esc handler
+/// clears `RoomState::zoomed` to `None` BEFORE this system's own early-return
+/// check runs, this system would see the just-cleared `zoomed` in the SAME
+/// frame and fire ITS OWN Escape-to-Conversation branch too, skipping the
+/// room-overview stop entirely. `pub(crate)` so `time_well`'s plugin can
+/// declare `.after(room_keyboard)` explicitly instead of leaning on
+/// `main.rs`'s plugin-addition order (which is real today but easy to
+/// silently break by reordering plugins later).
 pub(crate) fn room_keyboard(
     mut actions: MessageReader<crate::input::ActionFired>,
     mut room: ResMut<RoomState>,
-    mut pb_state: ResMut<patch_bay::PatchBayState>,
     mut well_state: ResMut<crate::view::time_well::scene::TimeWellState>,
     mut next: ResMut<NextState<Screen>>,
 ) {
@@ -1528,22 +1404,12 @@ pub(crate) fn room_keyboard(
                 let station = room.carousel.focused_station();
                 if station_is_zoomable(station) {
                     room.zoomed = Some(station);
-                    // Arm the newly-zoomed station's own per-dive state — the old
-                    // `enter_patch_bay`'s job for the wheel, moved to the zoom-in site
-                    // since there's no more `OnEnter(Screen::PatchBay)` to hang it on;
-                    // the well's `arm_dive` (Slice C) follows the same shape.
-                    match station {
-                        Station::PatchBay => pb_state.arm_text(),
-                        Station::TimeWell => {
-                            crate::view::time_well::scene::arm_dive(&mut well_state)
-                        }
-                        _ => {}
+                    // Arm the newly-zoomed station's own per-dive state — the
+                    // well's `arm_dive` (Slice C).
+                    if station == Station::TimeWell {
+                        crate::view::time_well::scene::arm_dive(&mut well_state);
                     }
                 }
-                // No dive-through branch any more (2026-07-13): N zooms its portal
-                // like every other wall panel — `station_is_zoomable`'s doc has the
-                // story; `Screen::Fsn` is keyboard-unreachable for now
-                // (`docs/issues.md`).
                 return;
             }
             Action::PopLevel => {
@@ -1555,12 +1421,11 @@ pub(crate) fn room_keyboard(
 }
 
 /// Un-zoom keys for a zoomed station that has no zoomed-keyboard system of
-/// its own (today: Tracks, Vfs, Radiators — panels with no interactive
-/// zoomed content yet): Up/Esc surfaces back to room scale, mirroring the
-/// same keys `patch_bay_keyboard`/`well_keyboard` handle for their own
-/// stations. Without this, zooming onto a plain panel would be a trap —
-/// `room_keyboard` steps back entirely while zoomed, and nothing else would
-/// own the keys.
+/// its own (today: Radiators — a panel with no interactive zoomed content
+/// yet): Up/Esc surfaces back to room scale, mirroring the same keys
+/// `well_keyboard` handles for its own station. Without this, zooming onto a
+/// plain panel would be a trap — `room_keyboard` steps back entirely while
+/// zoomed, and nothing else would own the keys.
 ///
 /// Runs `.after(room_keyboard)` for the same same-frame reason that system's
 /// doc records for the well/wheel: room_keyboard (already run, saw `zoomed`
@@ -1622,10 +1487,11 @@ fn room_plate_text(
 }
 
 /// Focus presentation for the plates: brighten + grow the focused plate,
-/// brass-frame it; unbuilt stations stay dim even focused. PatchBay spawns no
-/// plate at all now (the wheel is the station) — the query below simply never
-/// yields one for it, so focusing PatchBay brightens nothing here and that's
-/// fine: the camera's approach on the mounted wheel is the feedback instead.
+/// brass-frame it; unbuilt stations stay dim even focused. A furnished
+/// bearing (`bearing::station_is_room_furniture`) spawns no plate at all —
+/// the query below simply never yields one for it, so focusing it brightens
+/// nothing here and that's fine: the camera's approach on the furniture
+/// itself is the feedback instead.
 fn room_focus_visuals(
     room: Res<RoomState>,
     mut materials: ResMut<Assets<WellCardMaterial>>,
@@ -1722,7 +1588,7 @@ fn apply_room_dive_visibility(
 
 /// Ingest the kernel-wide event stream into per-bearing activity, **ungated**
 /// (every screen) so the room opens warm. The freshest source, no re-wire:
-/// beat syncs warm the tracks (E) bearing, block chatter warms the console.
+/// beat syncs warm the East bearing, turn traffic warms the switchboard.
 fn ingest_room_activity(
     mut events: MessageReader<ServerEventMessage>,
     mut room_activity: ResMut<BearingActivity>,
@@ -1736,19 +1602,12 @@ fn ingest_room_activity(
     room_activity.tick(time.delta_secs());
 }
 
-/// Push ambient telemetry into the wall-bearing markers as light: the tracks
-/// (E) marker breathes with the well's beat phasor (HDR pulse decaying to
-/// LDR), and the focused station's marker takes a steady lift. Change-guarded +
-/// quantized so a settled marker never touches `Assets<StandardMaterial>`
-/// (the well's `sync_card_live_uniforms` discipline).
-///
-/// The `Bearing::East` branch below is now inert code, not deleted: Tracker
-/// Station slice 0 (`snazzy-jumping-hejlsberg.md`) made `Station::Tracks` a
-/// furnished bearing (`bearing::station_is_room_furniture`), so
-/// `enter_room` no longer spawns an East `BearingMarker` for this loop to
-/// find — the beat-breathe it used to carry is re-homed onto
-/// `tracker::pulse_tracker_playheads`, per-column and per-tempo instead of
-/// one shared pylon.
+/// Push ambient telemetry into the wall-bearing markers as light: the East
+/// marker breathes with the well's beat phasor (HDR pulse decaying to LDR),
+/// each bearing's own [`BearingActivity`] level lifts its marker, and the
+/// focused station's marker takes a steady lift. Change-guarded + quantized
+/// so a settled marker never touches `Assets<StandardMaterial>` (the well's
+/// `sync_card_live_uniforms` discipline).
 ///
 /// The console-emblem glow branch this used to carry (`ConsoleEmblem`,
 /// `CONSOLE_CHATTER_GAIN`) is gone with the slice-A placeholder it lit (Slice
@@ -1775,14 +1634,10 @@ fn sync_room_glow(
     for (marker, handle) in markers.iter() {
         let mut lift = 0.0;
         // The beat-phasor term stays East-only (`WellBeats::global_envelope`
-        // is a rolling-clock readout, not per-bearing activity — East/tracks
-        // is the one bearing a beat physically means anything at). Every
-        // bearing's OWN `BearingActivity` level lifts its marker, though:
-        // this used to be an East-only `if`, but `BearingActivity` is
-        // already indexed per-bearing (`event_bearing` just had only one
-        // producer wired in) — the FSN heat ingest (arriving in a follow-up,
-        // `activity::event_bearing`'s own doc) will feed North from VFS
-        // churn, and gating the read to East would silently drop it.
+        // is a rolling-clock readout, not per-bearing activity). Every
+        // bearing's OWN `BearingActivity` level lifts its marker too:
+        // `BearingActivity` is already indexed per-bearing, so gating the
+        // read to East alone would silently drop any other bearing's feed.
         if marker.bearing == Bearing::East {
             lift += beat * palette.gain_beat;
         }
@@ -2037,7 +1892,7 @@ mod tests {
     /// way out, so no visit can ever persist a lingering zoom.
     fn persisted_after_a_visit() -> RoomState {
         RoomState {
-            carousel: StationCarousel::new(Station::PatchBay),
+            carousel: StationCarousel::new(Station::Switchboard),
             zoomed: None,
             plates_dirty: false,
         }
@@ -2069,31 +1924,15 @@ mod tests {
         assert_eq!(room.carousel.focused, before, "arm_on_enter only touches plates_dirty");
     }
 
-    // -- station_is_zoomable / RoomState::zoomed (2026-07-10 evening,
-    //    the fullscreen-panel pivot: `zoomed` replaces `Screen::PatchBay`) --
+    // -- station_is_zoomable / RoomState::zoomed --
 
     /// Expected `station_is_zoomable` result, one row per station — a table
     /// to APPEND a row to (not restructure a boolean expression) as new
-    /// stations earn a fullscreen zoom. Restructured 2026-07-11 (time-well/
-    /// room integration plan, ahead of the parallel Tracker lane) from a
-    /// single `s == Station::PatchBay` comparison specifically because two
-    /// concurrent lanes were both about to need to edit that same expression
-    /// (TimeWell for this lane, Tracks for the Tracker lane) — a shared
-    /// boolean expression is a merge-conflict magnet; a table both lanes add
-    /// a line to is not. `Station::ALL.len()` guard below catches a station
-    /// added to the enum without a row here.
+    /// stations earn a fullscreen zoom. `Station::ALL.len()` guard below
+    /// catches a station added to the enum without a row here.
     const EXPECTED_ZOOMABLE: &[(Station, bool)] = &[
-        // ALL true since 2026-07-13 (the whole-wall approach retune): the
-        // approach frames the full panel, Enter zooms it — one gesture for
-        // every station, N's dive-through exception included (see
-        // `station_is_zoomable`'s doc). The table stays so a future
-        // genuinely-unzoomable station has a row to flip.
         (Station::TimeWell, true),
-        (Station::PatchBay, true),
-        (Station::Tracks, true),
-        (Station::Vfs, true),
-        // The first exception to "every wall station zooms" — the
-        // switchboard's lamp wall is room-scale-only by design, no dive
+        // The switchboard's lamp wall is room-scale-only by design, no dive
         // scene to fullscreen onto (`station_is_zoomable`'s doc).
         (Station::Switchboard, false),
         (Station::Radiators, true),
@@ -2113,30 +1952,28 @@ mod tests {
 
     #[test]
     fn zoom_round_trip_never_touches_the_carousel_or_plates_dirty() {
-        // Zooming in/out is a plain `RoomState` field write now — there is no
-        // `OnEnter`/`OnExit` hook attached to it at all (unlike the old
-        // `Screen::PatchBay` transition), so nothing can possibly despawn or
-        // rebuild anything on a zoom toggle. A resource-level check is the
-        // whole proof; no Bevy `App` is needed to demonstrate "the room stays
-        // alive" when there's no teardown wired to this write in the first
-        // place.
+        // Zooming in/out is a plain `RoomState` field write — there is no
+        // `OnEnter`/`OnExit` hook attached to it at all, so nothing can
+        // possibly despawn or rebuild anything on a zoom toggle. A
+        // resource-level check is the whole proof; no Bevy `App` is needed to
+        // demonstrate "the room stays alive" when there's no teardown wired
+        // to this write in the first place.
         let mut room = persisted_after_a_visit();
         let carousel_before = room.carousel.focused;
         let plates_dirty_before = room.plates_dirty;
 
-        room.zoomed = Some(Station::PatchBay);
-        assert_eq!(room.zoomed, Some(Station::PatchBay));
+        room.zoomed = Some(Station::Radiators);
+        assert_eq!(room.zoomed, Some(Station::Radiators));
         room.zoomed = None;
 
         assert_eq!(room.carousel.focused, carousel_before, "zooming never touches the carousel");
         assert_eq!(room.plates_dirty, plates_dirty_before, "zooming never touches plates_dirty");
     }
 
-    // -- fullscreen_pose / desired_camera math moved to `shot.rs`'s own test
-    //    module (2026-07-11, Slice A of the time-well/room integration) --
+    // -- fullscreen_pose / desired_camera math lives in `shot.rs`'s own test
+    //    module --
 
-    // -- exit_room lifecycle (2026-07-10 evening: unconditional, no more
-    //    `Screen::PatchBay` branch to get wrong) --
+    // -- exit_room lifecycle (unconditional teardown) --
 
     fn zoom_lifecycle_app() -> App {
         let mut app = App::new();
@@ -2159,16 +1996,13 @@ mod tests {
 
     #[test]
     fn exit_room_always_tears_down_and_clears_any_lingering_zoom() {
-        // The old leak class this replaces: `Screen::PatchBay` had its own
-        // `OnExit` (`exit_patch_bay`, deleted) because a transition leaving
-        // the shell FROM the dive bypassed `OnExit(Screen::Room)` entirely.
-        // With `zoomed` a resource field, `Screen::Room` is the only state
-        // this scene graph ever occupies — every way out runs THIS exit, and
-        // there is no more per-target branch for it to skip.
+        // `zoomed` is a resource field, and `Screen::Room` is the only state
+        // this scene graph ever occupies — every way out runs THIS exit, so
+        // there is no per-target branch for it to skip.
         let mut app = zoom_lifecycle_app();
         app.world_mut().spawn(RoomRoot);
         let cam = app.world_mut().spawn((Camera::default(), RoomCamera)).id();
-        app.world_mut().resource_mut::<RoomState>().zoomed = Some(Station::PatchBay);
+        app.world_mut().resource_mut::<RoomState>().zoomed = Some(Station::Radiators);
 
         set_screen(&mut app, Screen::Room);
         set_screen(&mut app, Screen::Conversation);
@@ -2371,10 +2205,8 @@ mod tests {
 
     #[test]
     fn wall_apothem_clears_the_old_radiator_radius_and_the_marker_radius() {
-        // WALL_APOTHEM moved to `scene_geometry.rs` (2026-07-10, the wall-mount
-        // slice) — a cross-file datum now that `patch_bay`'s placement reads
-        // it too, but `room::spawn_walls` still builds the panel geometry at
-        // this same radius.
+        // WALL_APOTHEM lives in `scene_geometry.rs`; `room::spawn_walls`
+        // builds the panel geometry at this same radius.
         assert!(
             scene_geometry::WALL_APOTHEM > ROOM_RADIUS,
             "the shell must enclose the wall stations: {}",
@@ -2504,10 +2336,10 @@ mod tests {
     }
 
     #[test]
-    fn a_beat_sync_warms_the_east_tracks_bearing_through_the_ingest_system() {
+    fn a_beat_sync_warms_the_east_bearing_through_the_ingest_system() {
         // The acceptance path end-to-end at the resource level: a jam's BeatSync
-        // event, ingested ungated, lifts the East (tracks) bearing's activity —
-        // what `sync_room_glow` then turns into the marker's breath.
+        // event, ingested ungated, lifts the East bearing's activity — what
+        // `sync_room_glow` then turns into the marker's breath.
         let mut app = App::new();
         app.add_plugins(bevy::time::TimePlugin)
             .init_resource::<BearingActivity>()
@@ -2522,7 +2354,7 @@ mod tests {
         app.update();
 
         let act = app.world().resource::<BearingActivity>();
-        assert!(act.level(Bearing::East) > 0.0, "the tracks bearing warmed");
+        assert!(act.level(Bearing::East) > 0.0, "the East bearing warmed");
         assert_eq!(act.level(Bearing::Center), 0.0, "console stayed dark");
     }
 }

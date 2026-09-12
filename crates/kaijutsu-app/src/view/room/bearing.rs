@@ -4,7 +4,7 @@
 //! helpers for the floor traces and the vault gradient.
 //!
 //! No Bevy types — `[f32; 3]` points (x, y, z; the room floor is XZ, +Y up)
-//! and plain `f32`, unit-tested, same stance as `view/patch_bay/geometry.rs`.
+//! and plain `f32`, unit-tested, same stance as `view/time_well/card.rs`.
 //! The Bevy glue in [`super`] turns these arrays into `Vec3`/`Transform`s and
 //! `Mesh`es.
 
@@ -20,8 +20,8 @@ use super::nav::Station;
 ///
 /// These are **hand-assigned and stable** — a bearing you learn is an address
 /// (the track-rays lesson, `docs/scenes/README.md`). Settling of open question
-/// 1 in `shell.md`: TimeWell = center, PatchBay = W, Tracks = E, VFS = N,
-/// reserved = S.
+/// 1 in `shell.md`: TimeWell = center, Switchboard = S; W, E, and N stay
+/// reserved (empty wall panels, no station).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bearing {
     /// `#[allow(dead_code)]`: the freeze-fix slice (2026-07-11) dropped
@@ -90,9 +90,6 @@ pub const RADIATOR_DIRS: [[f32; 3]; 4] = [
 pub fn focus_dir(station: Station) -> Option<[f32; 3]> {
     match station {
         Station::TimeWell => None,
-        Station::PatchBay => Some(Bearing::West.dir()),
-        Station::Tracks => Some(Bearing::East.dir()),
-        Station::Vfs => Some(Bearing::North.dir()),
         Station::Switchboard => Some(Bearing::South.dir()),
         Station::Radiators => Some(RADIATOR_FOCUS_DIR),
     }
@@ -113,31 +110,30 @@ pub struct WallPlacement {
 }
 
 /// The four cardinal wall placements, in `Station::ALL`-adjacent order (W, E,
-/// N, S). South now carries a real station too — [`Station::Switchboard`]
-/// (the presence-lamp wall, `view::room::switchboard`), replacing the old
-/// grey, station-less reserved stub — so it gets a marker, a nameplate, and
-/// a gold cap the same as every other built bearing (`super::wants_gold_cap`
-/// gates purely on `station.is_some()`, no special-casing needed). Hues avoid
-/// the reserved fabric hues except where a station owns one later: patch bay
-/// leans crimson (MIDI), tracks amber (rhythm), VFS green (data horizon);
-/// the switchboard stays a cool instrument-panel steel — the signal lives in
-/// its lamp grid, not its pylon. **Amy-tunable.**
+/// N, S). W, E, and N stay reserved (`station: None` — plain empty panels,
+/// each with only a dim, short waymarker post, `MARKER_HEIGHT_RESERVED`'s
+/// use case). South carries a real station — [`Station::Switchboard`] (the
+/// presence-lamp wall, `view::room::switchboard`) — so it gets a marker, a
+/// nameplate, and a gold cap the same as every other built bearing
+/// (`super::wants_gold_cap` gates purely on `station.is_some()`, no
+/// special-casing needed). The switchboard stays a cool instrument-panel
+/// steel — the signal lives in its lamp grid, not its pylon. **Amy-tunable.**
 pub fn wall_placements() -> [WallPlacement; 4] {
     [
         WallPlacement {
-            station: Some(Station::PatchBay),
+            station: None,
             bearing: Bearing::West,
             dir: Bearing::West.dir(),
             hue: [0.90, 0.28, 0.34],
         },
         WallPlacement {
-            station: Some(Station::Tracks),
+            station: None,
             bearing: Bearing::East,
             dir: Bearing::East.dir(),
             hue: [1.00, 0.60, 0.22],
         },
         WallPlacement {
-            station: Some(Station::Vfs),
+            station: None,
             bearing: Bearing::North,
             dir: Bearing::North.dir(),
             hue: [0.40, 0.85, 0.52],
@@ -153,39 +149,21 @@ pub fn wall_placements() -> [WallPlacement; 4] {
 
 /// Whether `station`'s wall bearing is occupied by the station's OWN
 /// instrument rather than a marker pylon + nameplate — true for
-/// [`Station::PatchBay`] (`shell.md` slice B, retuned 2026-07-10: "the wheel
-/// IS the west station", then wall-mounted the same day) and, since the
-/// time-well/room integration plan's Slice C, [`Station::TimeWell`] too — the
-/// well's own ring-carousel furniture now occupies the room's center bearing
-/// directly, the same "the instrument IS the station" contract the wheel
-/// established (there is no wall placement for `TimeWell` in
-/// [`wall_placements`] to skip in the first place — center has no wall — so
-/// this row matters for callers reasoning generically over "does this station
-/// have its own room-furniture," not for `enter_room`'s wall-placement loop
-/// specifically). [`Station::Vfs`] joined 2026-07-13: the N face wears the
-/// FSN portal (`fsn::backdrop`'s panel-spanning window) — the world seen
-/// through the glass IS the station; the "DATA HORIZON" plate and the marker
-/// pylon both stood square in front of the view they advertised, so N gets
-/// the same no-marker/no-plate treatment. [`Station::Tracks`] joined in the
-/// Tracker Station slice 0 (`snazzy-jumping-hejlsberg.md`): the pattern-grid
-/// face mounts directly on the E wall panel the same way the wheel mounts on
-/// W, so E gets the same no-marker/no-plate treatment — the East marker's
-/// old beat-breathe (`room::sync_room_glow`'s `Bearing::East` branch) is
-/// re-homed onto `tracker::pulse_tracker_playheads`, per-column instead of
-/// one shared pylon. `enter_room`'s wall-placement loop reads this to skip
-/// the marker/plinth/cap/plate for a furnished bearing — the station's own
-/// wall-mounted face stands in for both; a future in-room station rides the
-/// same gate. Pure — no Bevy types — so the gating is unit-testable without
-/// spawning anything (mirrors `super::wants_gold_cap`'s shape).
+/// [`Station::TimeWell`], whose own ring-carousel furniture occupies the
+/// room's center bearing directly (there is no wall placement for `TimeWell`
+/// in [`wall_placements`] to skip in the first place — center has no wall —
+/// so this row matters for callers reasoning generically over "does this
+/// station have its own room-furniture," not for `enter_room`'s
+/// wall-placement loop specifically), and for [`Station::Switchboard`]: its
+/// lamp grid mounts ON the wall panel, so the marker pylon that used to stand
+/// planted dead-center in FRONT of the grid, occluding the middle columns, is
+/// skipped the same way. `enter_room`'s wall-placement loop reads this to
+/// skip the marker/plinth/cap/plate for a furnished bearing — the station's
+/// own wall-mounted face stands in for both; a future in-room station rides
+/// the same gate. Pure — no Bevy types — so the gating is unit-testable
+/// without spawning anything (mirrors `super::wants_gold_cap`'s shape).
 pub fn station_is_room_furniture(station: Station) -> bool {
-    matches!(
-        station,
-        Station::PatchBay
-            | Station::TimeWell
-            | Station::Tracks
-            | Station::Vfs
-            | Station::Switchboard
-    )
+    matches!(station, Station::TimeWell | Station::Switchboard)
 }
 
 // ── Octagon wall shell (`shell.md`'s cutaway centerpiece) ───────────────────
@@ -698,24 +676,17 @@ mod tests {
 
     #[test]
     fn stations_map_to_their_stable_bearings() {
-        assert_eq!(focus_dir(Station::PatchBay), Some(Bearing::West.dir()));
-        assert_eq!(focus_dir(Station::Tracks), Some(Bearing::East.dir()));
-        assert_eq!(focus_dir(Station::Vfs), Some(Bearing::North.dir()));
         assert_eq!(focus_dir(Station::Switchboard), Some(Bearing::South.dir()));
         assert_eq!(focus_dir(Station::Radiators), Some(RADIATOR_FOCUS_DIR));
     }
 
     #[test]
-    fn tracks_bearing_is_east_where_the_beat_glow_lands() {
-        // The acceptance signal (a jam breathes the tracks marker) is keyed to
-        // the East bearing; guard the mapping so a re-order can't silently move
-        // the glow off the tracks station.
+    fn west_east_north_bearings_stay_reserved() {
         let placements = wall_placements();
-        let tracks = placements
-            .iter()
-            .find(|p| p.station == Some(Station::Tracks))
-            .expect("tracks has a wall placement");
-        assert_eq!(tracks.bearing, Bearing::East);
+        for b in [Bearing::West, Bearing::East, Bearing::North] {
+            let wp = placements.iter().find(|p| p.bearing == b).unwrap();
+            assert_eq!(wp.station, None, "{b:?} should have no station");
+        }
     }
 
     #[test]
@@ -734,27 +705,16 @@ mod tests {
 
     /// Expected `station_is_room_furniture` result, one row per station — see
     /// `room/mod.rs`'s `EXPECTED_ZOOMABLE` for why this is a table to append
-    /// a row to, not a boolean expression two concurrent lanes would both
-    /// need to edit (restructured 2026-07-11, time-well/room integration
-    /// plan, ahead of the parallel Tracker lane).
+    /// a row to, not a boolean expression concurrent lanes would both need to
+    /// edit.
     const EXPECTED_ROOM_FURNITURE: &[(Station, bool)] = &[
         (Station::TimeWell, true),
-        (Station::PatchBay, true),
-        // The pattern-grid face mounts directly on the E wall panel (Tracker
-        // Station slice 0, `snazzy-jumping-hejlsberg.md`; the fn doc has the
-        // story).
-        (Station::Tracks, true),
-        // N wears the FSN portal — the world through the glass is the
-        // station's own furniture/signage (2026-07-13; the fn doc has the
-        // story).
-        (Station::Vfs, true),
-        // The switchboard's lamp grid mounts ON the wall panel — same as the
-        // wheel/tracker/portal. The lane that built it first kept the generic
-        // marker + nameplate, but the first live look (2026-08-10) showed the
-        // marker pylon planted dead-center in FRONT of the lamp grid,
-        // occluding the middle columns — the exact occlusion this gate exists
-        // to prevent. The grid is the station's face; furniture like its
-        // siblings.
+        // The switchboard's lamp grid mounts ON the wall panel. The lane that
+        // built it first kept the generic marker + nameplate, but the first
+        // live look (2026-08-10) showed the marker pylon planted dead-center
+        // in FRONT of the lamp grid, occluding the middle columns — the
+        // exact occlusion this gate exists to prevent. The grid is the
+        // station's face; furniture like the well's.
         (Station::Switchboard, true),
         (Station::Radiators, false),
     ];

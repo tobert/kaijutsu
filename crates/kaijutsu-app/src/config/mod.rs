@@ -135,8 +135,7 @@ pub fn write_default_configs_if_missing() {
 # key = \"KeyJ\"
 # modifiers = \"CTRL\"        # empty, or +-joined: CTRL, SHIFT, ALT, SUPER
 # context = \"Navigation\"    # Global, Navigation, TextInput, Dialog,
-#                            # RoomNav, WellZoomed, PatchBayZoomed,
-#                            # StationZoomed, FsnFly
+#                            # RoomNav, WellZoomed, StationZoomed
 # action = \"FocusNextBlock\"
 # label = \"Next block\"
 ";

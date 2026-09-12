@@ -292,34 +292,19 @@ fn main() {
         // Attached-peer roster polling (kernel peer registry) — powers the
         // room's "seats at the table" wisps, one per connected client.
         .add_plugins(connection::peers::PeerRosterPlugin)
-        // Room level + patch bay station + time well (docs/scenes/): dive into
-        // a zoomed station via `RoomState::zoomed`, Ctrl+W to jump straight
-        // into the well. RoomPlugin MUST be added before any zoomable
-        // station's plugin: `room_keyboard` early-returns on
-        // `room.zoomed.is_some()`, and a zoomed station's own keyboard system
-        // (e.g. `well_keyboard`/`patch_bay_keyboard`) clears `zoomed` on
-        // Escape — if the station's plugin ran BEFORE RoomPlugin in the same
-        // Update tick, `room_keyboard` would observe the just-cleared
-        // `zoomed` in the SAME frame and immediately fire its own
-        // Escape-to-Conversation branch too, skipping the room-overview stop
-        // entirely (found live, BRP-driven: time-well/room integration
-        // Slice C — `TimeWellPlugin` used to sit BEFORE `RoomPlugin`, which
-        // was harmless while the well was its own `Screen::TimeWell` and
-        // never ran in the same tick as `room_keyboard` at all; it stopped
-        // being harmless the moment the well became a `RoomState::zoomed`
-        // station like patch bay, whose plugin already relied on this order).
+        // Room level + time well (docs/scenes/): dive into a zoomed station
+        // via `RoomState::zoomed`, Ctrl+W to jump straight into the well.
+        // RoomPlugin MUST be added before any zoomable station's plugin:
+        // `room_keyboard` early-returns on `room.zoomed.is_some()`, and a
+        // zoomed station's own keyboard system (`well_keyboard`) clears
+        // `zoomed` on Escape — if the station's plugin ran BEFORE RoomPlugin
+        // in the same Update tick, `room_keyboard` would observe the
+        // just-cleared `zoomed` in the SAME frame and immediately fire its
+        // own Escape-to-Conversation branch too, skipping the room-overview
+        // stop entirely (found live, BRP-driven).
         .add_plugins(view::room::RoomPlugin)
-        .add_plugins(view::patch_bay::PatchBayPlugin)
         // Time-well context browser (radial 3D well; Ctrl+W to enter, Esc to leave)
         .add_plugins(view::time_well::TimeWellPlugin)
-        // Tracker station — the pattern-grid face at E (Tracker Station
-        // slice 0, `snazzy-jumping-hejlsberg.md`).
-        .add_plugins(view::tracker::TrackerPlugin)
-        // The FSN landscape (VFS-as-terrain world; N-dive from the room, Esc
-        // to surface) — a genuine `Screen::Fsn` transition, not a
-        // `RoomState::zoomed` station, so it has no ordering dependency on
-        // `RoomPlugin` the way the zoomable stations above do.
-        .add_plugins(view::fsn::FsnPlugin)
         // In-app vi editor — screen/landing foundation (open_editor signal → Screen::Editor)
         .add_plugins(view::editor::EditorPlugin)
         .add_plugins(view::diff_view::DiffViewPlugin)

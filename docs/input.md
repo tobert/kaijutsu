@@ -57,13 +57,13 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
 ```
 
 1. **Contexts per surface.** New `InputContext` variants — `RoomNav`,
-   `WellZoomed`, `PatchBayZoomed`, `StationZoomed`, `FsnFly` — derived by
-   `sync_input_context` from `Screen` + `RoomState` instead of bailing.
-   Scenes consume `ActionFired` (`StepNext/StepPrev`, `LevelUp/LevelDown`,
-   `Dive`, `PopLevel`, well verbs, fly axes). Gamepad, `bindings.toml`,
-   and the `?` legend (rendered from `InputMap` labels) then cover the
-   scenes for free. The suppression list and the `.after` ordering
-   contracts die; that also fixes the Fsn double-fire structurally.
+   `WellZoomed`, `StationZoomed` — derived by `sync_input_context` from
+   `Screen` + `RoomState` instead of bailing. Scenes consume `ActionFired`
+   (`StepNext/StepPrev`, `LevelUp/LevelDown`, `Dive`, `PopLevel`, well
+   verbs). Gamepad, `bindings.toml`, and the `?` legend (rendered from
+   `InputMap` labels) then cover the scenes for free. The suppression list
+   and the `.after` ordering contracts die; that also fixes the old
+   double-fire class structurally.
 2. **Keyboard grabs are explicit.** The vi editor is the one sanctioned raw
    consumer — a declared exclusive grab, not a suppression side effect. The
    compose VimMachine becomes the second grab, which retires the
@@ -135,7 +135,7 @@ exactly one action.
 | Diff viewer (`Screen::Diff`) | To the app-local `DiffCore` (visual → normal). **Never closes the screen** — that is `q`/`ZQ`/`:q` (`docs/diff.md` slice 5) |
 | Compose overlay | To the VimMachine (mode switch); double-Esc in Normal mode dismisses (kept — works in practice) |
 | Quick-context overlay, **held** | Releases the hold, and nothing else — the level underneath stays put |
-| Everywhere else | `PopLevel`, one resolver walking the level ladder: well focus → overview → room; patch bay → room; fsn → room; room → conversation; dialog → cancel |
+| Everywhere else | `PopLevel`, one resolver walking the level ladder: well focus → overview → room; station → room; room → conversation; dialog → cancel |
 
 The held overlay is the one surface that floats over *every* screen, so it
 cannot rely on the usual mutual exclusion (each `PopLevel` consumer is gated
@@ -155,9 +155,7 @@ releases the hold instead.
 |---|---|
 | RoomNav (octagon) | `←/→/Tab` cycle stations · `Enter/↓` dive · `Esc` pop |
 | WellZoomed | `0–9` seat of *focused* ring · `←/→/Tab` spin · `↑/↓` ring (Up at the top ring → hero pose) · `Enter` focus/commit · `p d c z a` verbs · `h` horizon dive (stub) · `?` legend · `Esc` pop |
-| PatchBayZoomed | `←/→/Tab` wires · `r` rescan · `↑/Esc` pop |
 | StationZoomed (plain) | `↑/Esc` pop |
-| FsnFly | arrows + WASD fly (WASD kept until the keys are needed elsewhere) · `PgUp/PgDn` altitude · `Esc` pop |
 | QuickContext (overlay held) | `Esc` release the hold — the only binding it carries; layered over whichever surface is underneath |
 
 `Screen::Diff` has no `InputContext` of its own on purpose: it is a *grab*,
@@ -189,7 +187,7 @@ The scene should be fully navigable by pad once the contexts land.
 | DPad | Context-sensitive arrows: blocks / carousel / rings / seats |
 | South | Activate / dive / commit |
 | East | `PopLevel` — or `UnpinQuickContext` while the quick-context overlay is held, never both (`resolve_gamepad_bindings` resolves by context priority, as the keyboard always has) |
-| Left stick | Scroll (conversation) · fly (fsn) · ring spin (well) |
+| Left stick | Scroll (conversation) · ring spin (well) |
 | Triggers | Page up / down |
 | North | Cycle focus |
 

@@ -51,8 +51,7 @@ use crate::ui::screen::Screen;
 /// Wires the time-well browser into the app.
 ///
 /// Slice C (`lovely-swimming-prism.md`, time-well/room integration) split the
-/// old single `run_if(in_state(Screen::TimeWell))` tuple into three tiers,
-/// mirroring `patch_bay`'s own ambient/`PatchBayLod` split:
+/// old single `run_if(in_state(Screen::TimeWell))` tuple into three tiers:
 /// - **fully ungated** — runs on every screen, `live::ingest_live_events`'s
 ///   existing pattern ("the well opens warm"). [`scene::tick_ring_activity`]
 ///   joins it this slice: the `RingActivity` decay tick must not freeze
@@ -148,11 +147,10 @@ impl Plugin for TimeWellPlugin {
                         drape::sync_lineage_drapes,
                         scene::highlight_drift,
                         // The transient legend's dismissal lives in the ambient
-                        // tier, not dived-only, like `patch_bay::apply_patch_lod`
-                        // — it must react to BOTH transitions (dismissing the
-                        // legend on zoom-OUT, not just leaving it be on zoom-in),
-                        // so it has to keep running at room scale even while
-                        // unzoomed.
+                        // tier, not dived-only — it must react to BOTH
+                        // transitions (dismissing the legend on zoom-OUT, not
+                        // just leaving it be on zoom-in), so it has to keep
+                        // running at room scale even while unzoomed.
                         legend::despawn_legend_unzoomed,
                     )
                         .chain(),

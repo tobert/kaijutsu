@@ -514,47 +514,6 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
-    // PatchBayZoomed (Screen::Room, zoomed into the patch bay)
-    // ====================================================================
-
-    b.push(Binding::key(
-        KeyCode::ArrowRight,
-        InputContext::PatchBayZoomed,
-        Action::StepNext,
-        "Next wire",
-    ));
-    b.push(Binding::key(
-        KeyCode::Tab,
-        InputContext::PatchBayZoomed,
-        Action::StepNext,
-        "Next wire",
-    ));
-    b.push(Binding::key(
-        KeyCode::ArrowLeft,
-        InputContext::PatchBayZoomed,
-        Action::StepPrev,
-        "Previous wire",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyR,
-        InputContext::PatchBayZoomed,
-        Action::Rescan,
-        "Rescan audio inventory",
-    ));
-    b.push(Binding::key(
-        KeyCode::ArrowUp,
-        InputContext::PatchBayZoomed,
-        Action::PopLevel,
-        "Back to room",
-    ));
-    b.push(Binding::key(
-        KeyCode::Escape,
-        InputContext::PatchBayZoomed,
-        Action::PopLevel,
-        "Back to room",
-    ));
-
-    // ====================================================================
     // StationZoomed (zoomed station with no keyboard of its own)
     // ====================================================================
 
@@ -567,17 +526,6 @@ pub fn default_bindings() -> Vec<Binding> {
     b.push(Binding::key(
         KeyCode::Escape,
         InputContext::StationZoomed,
-        Action::PopLevel,
-        "Back to room",
-    ));
-
-    // ====================================================================
-    // FsnFly (Screen::Fsn — fly keys are polled continuously in dispatch)
-    // ====================================================================
-
-    b.push(Binding::key(
-        KeyCode::Escape,
-        InputContext::FsnFly,
         Action::PopLevel,
         "Back to room",
     ));
@@ -613,11 +561,7 @@ pub fn default_bindings() -> Vec<Binding> {
 
     // Scene navigation — dpad steps, South dives/commits (East pops via
     // the Global binding below).
-    for ctx in [
-        InputContext::RoomNav,
-        InputContext::WellZoomed,
-        InputContext::PatchBayZoomed,
-    ] {
+    for ctx in [InputContext::RoomNav, InputContext::WellZoomed] {
         b.push(Binding::gamepad(
             GamepadButton::DPadRight,
             ctx,

@@ -31,8 +31,7 @@ pub enum Action {
     /// (docs/input.md "Escape — two meanings total"):
     /// - Compose → Conversation (via double-Esc in Normal mode)
     /// - Dialog → cancel
-    /// - well focus → overview → room; patch bay/station → room;
-    ///   fsn → room; room → conversation
+    /// - well focus → overview → room; station → room; room → conversation
     PopLevel,
     /// Context-dependent "do the thing" (Enter)
     /// - Navigation: edit focused User Text block
@@ -150,10 +149,10 @@ pub enum Action {
     DebugToggle,
 
     // ========================================================================
-    // Scene navigation (RoomNav / WellZoomed / PatchBayZoomed / StationZoomed)
+    // Scene navigation (RoomNav / WellZoomed / StationZoomed)
     // ========================================================================
     /// Step forward within the current level: next carousel station, next
-    /// ring seat (spinning it to the gate), next patch-bay wire.
+    /// ring seat (spinning it to the gate).
     StepNext,
     /// Step backward within the current level.
     StepPrev,
@@ -183,16 +182,8 @@ pub enum Action {
     /// while the prototype is in flight.
     ActivateHorizon,
 
-    /// `r` in the patch bay — rescan the ALSA graph.
-    Rescan,
     /// `?` — toggle the in-scene keyboard legend.
     ToggleLegend,
-
-    // FSN fly (continuous — emitted per frame while held / deflected)
-    /// Camera-plane fly axis, -1..1 per component (WASD/arrows or left stick).
-    FlyAxis { x: f32, y: f32 },
-    /// Altitude axis, -1..1 (PgUp/PgDn, Equal/Minus).
-    FlyAltitude(f32),
 
     // ========================================================================
     // Ctrl+A prefix verbs (input/prefix.rs; docs/input.md "The prefix table")

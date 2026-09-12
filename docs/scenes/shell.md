@@ -67,8 +67,8 @@ breaks the cutaway.
 tuned (`palette::WALL_APOTHEM`, 1200) so a panel's own width against the
 fixed wall height reads as a 994:560 ≈ 16:9 frame. This reframes what
 "diving" means for a **bounded** station — one whose whole instrument
-already stands in the room as furniture (the patch-bay wheel, Tardis
-reading #3): Enter/Down no longer cuts to a dedicated screen, it eases the
+stands in the room as furniture (Tardis reading #3): Enter/Down no longer
+cuts to a dedicated screen, it eases the
 camera to a pose that fills the vertical frustum with exactly that
 station's panel, edge to edge (`room::fullscreen_pose`) — the room's own
 camera, not a scene cut, so the cutaway and the chamber never leave the
@@ -88,9 +88,9 @@ station (Amy: boring labels, plates recede; the wheel proved it first):
 | Bearing | Occupant | Shell rendering (as built / planned) |
 |---|---|---|
 | center | Time well (station #1) | itself — the console, on its table |
-| W | Patch bay | **the wheel itself, mounted ON the W panel** (built 2026-07-10, wall-mount retune same day): the live circle at 0.42 scale, re-oriented face-out into the room, its chords the W ambient; floor traces terminate at the wall base under it; no pylon, no plate. **Fullscreens** on Enter/Down (the fullscreen-panel pivot, same evening) instead of cutting to a dedicated screen |
-| E | Track transport | the vertical beat highway (mockup 33) on/before the E panel; notes fall toward the strike bar only while a track plays |
-| N | VFS / rc library | an **archway** opening onto the fsn landscape (mockup 43), dimmed to horizon glow — returns when the fsn scene exists |
+| W | *(reserved)* | empty wall panel with a dim waymarker post — available for a future station |
+| E | *(reserved)* | empty wall panel with a dim waymarker post — available for a future station |
+| N | *(reserved)* | empty wall panel with a dim waymarker post — available for a future station |
 | S | *(reserved)* | future: MCP broker switchboard / LLM engine room |
 | diagonals | Information radiators | **the four diagonal wall panels themselves** (built 2026-07-10): violet thread-columns on the glass — the free-floating slabs retired into the walls |
 | overhead | Drift / mailboxes | not a bearing — **the air**. PAUSED (Amy, 2026-07-10): decide what information rides it before building; a kernel-activity-responsive point cloud is the live candidate vs the aurora arcs below |
@@ -129,9 +129,9 @@ budget discipline:
 
 - Every bearing renders its station's **activity as light**, never its
   detail: bright/HDR = live action now (the well's tiering rule), LDR = calm
-  structure. The patch-bay wall flickers per event; the highway's notes fall
-  only while a track plays; the archway's horizon brightens with VFS churn;
-  drift arcs cross the air only when blocks actually move.
+  structure. The East bearing's marker breathes on a beat sync; the south
+  wall's switchboard warms on turn traffic; drift arcs cross the air only
+  when blocks actually move.
 - All ambience rides the **existing kernel-wide event stream** the well
   already ingests (`view/time_well/live.rs`) — the shell adds renderers,
   not wire.
@@ -175,24 +175,21 @@ budget discipline:
   Up-Up speedbump exit is retired (Slice C, with `WellEdgeBump`): leaving
   the well is Esc's job, the same generic zoom-out every zoomable station
   uses. In the room, Left/Right
-  cycle the stations — well, patch bay, tracks, radiators, … (unbuilt
+  cycle the stations — well, switchboard, radiators, … (unbuilt
   stations ride the carousel as dimmed nameplates) — and Down/Enter dives
   into the focused one. Esc always walks up one level, everywhere. The
   grammar is unchanged by the fullscreen-panel pivot below — only what a
   *bounded* station's own dive/surface pair DOES changed, not the arrows
   that reach it.
-- **Enter fullscreens, Esc pulls back** (2026-07-10 evening, superseding the
-  earlier `Screen::PatchBay` state): for a bounded station
-  (`station_is_zoomable`), Enter/Down eases the camera to fill the frame
-  with that station's own panel — a camera pose plus a
+- **Enter fullscreens, Esc pulls back** (2026-07-10 evening): for a bounded
+  station (`station_is_zoomable`), Enter/Down eases the camera to fill the
+  frame with that station's own panel — a camera pose plus a
   `RoomState::zoomed` write, not a screen transition — and Esc/Up eases it
   back out to the room-scale approach pose. The zoomed station's own keys
-  (the wheel's Left/Right wire-cycling, `r` rescan) own the keyboard while
-  zoomed; Left/Right at room scale still steps the carousel underneath, but
-  not while zoomed. The well now fullscreens in place like every other
-  zoomable station — `Screen::TimeWell` is retired (Slice D); nothing cuts
-  to a second screen except the true dive-throughs (the fsn landscape, the
-  vi editor).
+  own the keyboard while zoomed; Left/Right at room scale still steps the
+  carousel underneath, but not while zoomed. The well now fullscreens in
+  place like every other zoomable station — `Screen::TimeWell` is retired
+  (Slice D); nothing cuts to a second screen except the vi editor.
 - **Entry**: the `Ctrl+A` prefix — `Ctrl+A w` / `Ctrl+A "` (and gamepad
   Start) go to the well from anywhere; see `docs/input.md` (2026-07-16,
   retiring the bare Ctrl+W toggle — it was never sacred, just first). The
@@ -260,93 +257,54 @@ well scene**, not a new world. Slices, each shippable alone:
   live well (shared vs separate scene graph, open question 3, stays deferred to
   slice B). Acceptance met: a jam breathes the tracks bearing without visiting
   it.
-- **Slice B — first real bearing** (built 2026-07-09): the patch-bay circle
-  stands at W as **room furniture** (Tardis reading #3), and diving is a
-  *continuous camera descent* onto it — no scene cut, one camera, one clear
-  colour (open question 3, decided). The furniture rides ONE Amy-tunable
-  placement transform (`STATION_W_PLACEMENT` in `view/patch_bay/mod.rs`:
-  translation to W, uniform scale, yaw) so re-placing it — Amy's **pending
-  alternative, the table as the room floor** — is a transform edit, not a
-  rebuild. The dive dims the room chrome and shows the patch bay's own label/
-  tick/card LOD; at room scale the bare chords over the socket rings are the W
-  ambient. For now that live-chord glow **absorbs** the bearings-table's
-  wall-of-threads read — the elegant thread-wall over jack fields is deferred
-  and may return later as pure backdrop mood behind the table. This pairs the
-  first station dive with the first bearing — the whole grammar proven end to
-  end.
 - **Furnishing + enclosure (built 2026-07-10)**: the concept-approach wave —
   the ~35-route deterministic circuit-board floor with inscribed gold ring
   (the floor-is-the-wiring made literal), the well table under the console
   rings, pylon plinths/caps, and then the **octagon shell** (geometry
   section above): eight content-surface wall panels with the camera
-  cutaway, radiators retired into the diagonal panels, and (first cut) the
-  patch wheel seated on a floor dais as the W station itself — sign and
-  pylon gone. One style across the family: `view/palette.rs` holds the
-  shared hues, and the **all-unlit discipline** went scene-family-wide (the
-  patch bay's point light + lit metals deleted; a ~1%-albedo metallic
-  surface swallows any lamp — the tuning-pass lesson).
-- **Wall-mount retune (same day, 2026-07-10)**: the dais was a first cut —
-  Amy's call, later that day, was to mount the wheel ON the W panel itself
-  ("the surface gets taken over by its content"; studio patch bays are wall
-  panels, not tables; concept 06 draws the station wall-mounted with
-  threads dropping into the floor traces). The dais and its furniture
-  builder are gone; `patch_bay::STATION_W_PLACEMENT` gained a pitch+yaw
-  composition that re-orients the wheel face-out and seats it flush against
-  the panel `spawn_walls` already builds. `view/palette.rs`'s station-W
-  contract now holds `WALL_APOTHEM` (moved there — a cross-file datum) plus
-  the mount height/proudness/scale; the room side needs no furniture for W
-  at all any more.
+  cutaway, radiators retired into the diagonal panels. One style across the
+  family: `view/palette.rs` holds the shared hues, and the **all-unlit
+  discipline** went scene-family-wide — a ~1%-albedo metallic surface
+  swallows any lamp (the tuning-pass lesson).
 - **The fullscreen-panel pivot (2026-07-10 evening)**: "the walls are 16:9
   screens, and diving IS fullscreening a panel." The octagon apothem grew
   800 → 1200 so a panel's own aspect reads 16:9 (Geometry section above);
-  `Screen::PatchBay` — the second screen slice B introduced to hold the
-  dive — is **dissolved entirely**: `view::room::RoomState` gained a
-  `zoomed: Option<Station>` field, `room::room_keyboard` sets/clears it on
-  Enter/Down and Esc/Up, and `room::fullscreen_pose` computes the camera
-  pose that fills the frame with the zoomed station's panel, independent of
-  the station's own local placement transform. This deletes the whole
-  dive-exit special-casing slice B needed (the `OnExit(Screen::PatchBay)`
-  branch reading the *target* state during `OnExit(Screen::Room)`, and its
-  mirror in `exit_patch_bay`): `exit_room`'s teardown is now
-  **unconditional** — there is only one screen left for this scene graph to
-  occupy, so there is only one way out of it to get right. The patch bay's
-  own LOD and keyboard gate on `RoomState::zoomed` instead of
-  `in_state(Screen::PatchBay)`.
-- **Slice C+ — bearings accrete**: the N portal (fsn scene through the
-  glass) landed 2026-07-13; **E landed 2026-07-15 as the TRACKER station**
-  (`view/tracker/`, slice 0): a pattern-grid face mounted on the E panel
-  the same "surface taken over by its content" way as the W wheel — one
-  vertical column per track, rows scrolling at each track's own tempo
-  (independent clock domains, `docs/tracks.md`), a fixed playhead row
-  pulsing per-column on `WellBeats` phasors. The East marker's old
-  beat-breathe re-homed onto those playhead pulses (`sync_room_glow`'s E
-  branch is inert). Slice 0 is read-only track state; score cells are
-  slice 1. Only S (reserved) and the diagonals remain unfurnished.
+  `view::room::RoomState` carries a `zoomed: Option<Station>` field,
+  `room::room_keyboard` sets/clears it on Enter/Down and Esc/Up, and
+  `room::shot::fullscreen_pose` computes the camera pose that fills the
+  frame with the zoomed station's panel, independent of the station's own
+  local placement transform. `exit_room`'s teardown is **unconditional** —
+  there is only one screen this scene graph ever occupies, so there is only
+  one way out of it to get right.
+- **Three bounded and unbounded stations (patch bay/W, track transport/E,
+  the fsn VFS landscape/N) shipped and were later retired (2026-09-12):**
+  fun experiments, not practical for the instrument. Their code and design
+  docs stay in git history before this commit. W, E, and N are reserved,
+  empty wall panels again; only the switchboard (S) and the diagonals are
+  furnished today.
 
 ## Open questions
 
 1. Bearing assignments — **first concrete placement landed with slice A**
-   (`room::bearing`): console = center, PatchBay = W, Tracks = E, VFS = N,
-   reserved = S (a dim unlabeled marker), radiators on the four diagonals. The
-   `Radiators` carousel entry faces the NE panel. Still provisional — judge and
-   re-place now that the camera exists.
+   (`room::bearing`): console = center, switchboard = S, W/E/N reserved (dim
+   unlabeled markers), radiators on the four diagonals. The `Radiators`
+   carousel entry faces the NE panel. Still provisional — judge and re-place
+   now that the camera exists.
 2. Entry key for the room (Esc-from-well is decided; a direct binding is
    not), and whether the app's `Screen` formalization (timewell.md appendix,
    "ViewSpec + the kj→app seam") should land with slice A.
 3. **DECIDED (Amy, 2026-07-09): one shared scene graph.** Diving is continuous
    camera travel inside the persistent room, not a scene cut — the room and its
    station furniture never despawn/respawn on a dive. Camera continuity won over
-   the budget argument because a bounded station (the patch-bay circle) is cheap
-   to hold resident as furniture (Tardis reading #3), and the budget discipline
-   is recovered instead through **LOD**: the dive's detail layer (labels, ticks,
-   the inspection card) hides at room scale and the room chrome dims on the dive,
-   so only one station's *detail* is ever drawn. Built in slice B (below).
-   **Taken one step further (2026-07-10 evening):** the "one shared scene
-   graph" decision made the second screen (`Screen::PatchBay`) it was built
-   alongside redundant — diving was already continuous camera travel with
-   nothing to cut to, so a `RoomState` field does the same job as the
-   screen did, without a second exit path to keep in sync (the fullscreen-panel
-   pivot, Build path above).
+   the budget argument because a bounded station is cheap to hold resident as
+   furniture (Tardis reading #3), and the budget discipline is recovered
+   instead through **LOD**: the dive's detail layer (labels, ticks, the
+   inspection card) hides at room scale and the room chrome dims on the dive,
+   so only one station's *detail* is ever drawn. **Taken one step further
+   (2026-07-10 evening):** diving is continuous camera travel with nothing to
+   cut to, so a `RoomState` field (`zoomed: Option<Station>`) does the whole
+   job, without a second screen and exit path to keep in sync (the
+   fullscreen-panel pivot, Build path above).
 4. The vault itself: what does the dome show? (Starfield is the lazy
    default; a slowly rotating glyph firmament could carry kernel-wide state
    — deferred, taste call.)

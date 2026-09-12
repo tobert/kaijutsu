@@ -59,11 +59,10 @@ const OVERVIEW_LOOK: Vec3 = Vec3::new(0.0, 90.0, 0.0);
 const APPROACH_PANEL_STANDOFF: f32 = 850.0;
 
 /// Approach-pose eye height AND look height: the panel's own vertical
-/// center (the same number [`scene_geometry::STATION_W_MOUNT_Y`] names for the
-/// wheel's mount). Eye and look sharing a height is the point: the camera
-/// flies LEVEL between panels, no down-tilt (the pre-2026-07-13 pose looked
-/// from 260 down to 130). Derived from `WALL_HEIGHT`, so it follows any
-/// wall retune. **Amy-tunable** (as an offset choice, not a raw number).
+/// center. Eye and look sharing a height is the point: the camera flies
+/// LEVEL between panels, no down-tilt. Derived from `WALL_HEIGHT`, so it
+/// follows any wall retune. **Amy-tunable** (as an offset choice, not a raw
+/// number).
 const APPROACH_EYE_HEIGHT: f32 = super::WALL_HEIGHT * 0.5;
 
 /// The well's **hero pose** (Amy: "a final up arrow took the camera to focus
@@ -90,16 +89,6 @@ const WELL_HERO_BACK: f32 = 900.0;
 /// `fullscreen_pose_fills_the_frame_with_the_panel_height` locks the
 /// relationship instead of trusting two hand-written copies to agree.
 const CAMERA_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
-
-/// Fraction of the N portal's glass height that fills the vertical frustum
-/// when fullscreened (Amy, 2026-07-13: "the window should go fullscreen
-/// with no border, just the HUD") — deliberately < 1.0 so the camera
-/// stands INSIDE the glass edges: the frame crops slightly into the window
-/// rather than showing wall/trim around it. At 0.92 the borderless read
-/// holds up to ~2.0 aspect (the horizontal frustum outgrows the 880-wide
-/// glass past that; an ultrawide monitor would show panel slivers — accept
-/// or shrink this further). **Amy-tunable.**
-const PORTAL_OVERSCAN: f32 = 0.92;
 
 // ── The well's own camera-framing constants (Slice C — moved unchanged from
 // `time_well/scene.rs`'s old `ease_camera_to_focused_ring`, deleted as a
@@ -158,8 +147,7 @@ pub enum RoomShot {
     Approach(Station),
     /// Camera fills the frame with `station`'s wall panel — "diving IS
     /// fullscreening a panel." Only valid for a station with a wall bearing;
-    /// [`resolve`] panics otherwise. Today the sole such station,
-    /// `Station::PatchBay`, is the only one ever passed here.
+    /// [`resolve`] panics otherwise.
     Fullscreen(Station),
     /// The well's own dolly pose (Slice C) — composed through
     /// [`STATION_CENTER_PLACEMENT`] since the well has no wall bearing at all
@@ -197,18 +185,7 @@ pub fn resolve(shot: RoomShot) -> (Vec3, Vec3) {
             let dir = bearing::focus_dir(station).expect(
                 "RoomShot::Fullscreen is only constructed for a station with a wall bearing to fill the frame with",
             );
-            // N is the one panel whose face is a WINDOW: its fullscreen
-            // dollies through to the glass itself ([`portal_fullscreen_pose`]
-            // — no border, just the world and the HUD). Every other panel
-            // fills the frame with its own full height; they all share the
-            // same vertical center (`super::WALL_HEIGHT * 0.5` —
-            // `scene_geometry::STATION_W_MOUNT_Y` is this same number, named for
-            // the wheel's own placement contract).
-            if station == Station::Vfs {
-                portal_fullscreen_pose(Vec3::from_array(dir))
-            } else {
-                fullscreen_pose(Vec3::from_array(dir), super::WALL_HEIGHT * 0.5)
-            }
+            fullscreen_pose(Vec3::from_array(dir), super::WALL_HEIGHT * 0.5)
         }
         RoomShot::WellOverview(input) => {
             let (local_eye, local_look) = well_local_shot(input);
@@ -319,26 +296,6 @@ fn fullscreen_pose(bearing_dir: Vec3, mount_y: f32) -> (Vec3, Vec3) {
     (eye, panel)
 }
 
-/// [`fullscreen_pose`]'s sibling for the N portal (Amy, 2026-07-13): fit
-/// the GLASS, not the panel — the standoff comes from the window quad's own
-/// height (`fsn::backdrop::WINDOW_H`) scaled by [`PORTAL_OVERSCAN`], so the
-/// frame sits slightly inside the glass edges and no wall, trim, or panel
-/// margin survives around the world; the always-on HUD is the only chrome
-/// left. Looks at the window's own center height (`fsn::backdrop::
-/// WINDOW_Y`, which is also every panel's center today — read from the
-/// window's constant so a window retune moves this shot with it).
-fn portal_fullscreen_pose(bearing_dir: Vec3) -> (Vec3, Vec3) {
-    use crate::view::fsn::backdrop::{WINDOW_H, WINDOW_Y};
-    let d = (WINDOW_H * PORTAL_OVERSCAN * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
-    let glass = Vec3::new(
-        bearing_dir.x * scene_geometry::WALL_APOTHEM,
-        WINDOW_Y,
-        bearing_dir.z * scene_geometry::WALL_APOTHEM,
-    );
-    let eye = glass - bearing_dir * d;
-    (eye, glass)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,20 +305,20 @@ mod tests {
     #[test]
     fn fullscreen_pose_stands_the_pinhole_distance_back_from_the_panel() {
         let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (eye, look) = fullscreen_pose(dir, scene_geometry::STATION_W_MOUNT_Y);
-        let d = (super::super::WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
+        let (eye, look) = fullscreen_pose(dir, super::super::WALL_HEIGHT * 0.5);
+        let d = super::super::WALL_HEIGHT * 0.5 / (CAMERA_FOV_Y * 0.5).tan();
         assert!(
             ((look - eye).length() - d).abs() < 1e-3,
             "eye should stand exactly d={d} back from the panel, got {}",
             (look - eye).length()
         );
-        assert!((look.y - scene_geometry::STATION_W_MOUNT_Y).abs() < 1e-5, "looks at the given mount height");
+        assert!((look.y - super::super::WALL_HEIGHT * 0.5).abs() < 1e-5, "looks at the given mount height");
     }
 
     #[test]
     fn fullscreen_pose_looks_squarely_at_the_panel_center() {
         let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (_, look) = fullscreen_pose(dir, scene_geometry::STATION_W_MOUNT_Y);
+        let (_, look) = fullscreen_pose(dir, super::super::WALL_HEIGHT * 0.5);
         let look_r = look.x * dir.x + look.z * dir.z;
         assert!(
             (look_r - scene_geometry::WALL_APOTHEM).abs() < 1e-3,
@@ -372,41 +329,24 @@ mod tests {
     #[test]
     fn fullscreen_pose_stands_inside_the_octagon_not_through_the_wall() {
         let dir = Vec3::from_array(bearing::Bearing::West.dir());
-        let (eye, _) = fullscreen_pose(dir, scene_geometry::STATION_W_MOUNT_Y);
+        let (eye, _) = fullscreen_pose(dir, super::super::WALL_HEIGHT * 0.5);
         let eye_r = eye.x * dir.x + eye.z * dir.z;
         assert!(eye_r > 0.0, "eye stands on the room side of center: {eye_r}");
         assert!(eye_r < scene_geometry::WALL_APOTHEM, "eye stands short of the wall, inside the octagon: {eye_r}");
     }
 
     #[test]
-    fn fullscreen_shot_resolves_through_the_patch_bay_bearing() {
+    fn fullscreen_shot_resolves_through_the_focused_bearing() {
         // The real production path: `ease_shell_camera` builds
         // `RoomShot::Fullscreen(station)` straight from `RoomState::zoomed`,
         // not a pre-extracted direction. Lock that it matches the primitive
-        // above for the one station that ever reaches it today.
-        let via_shot = resolve(RoomShot::Fullscreen(Station::PatchBay));
+        // above for a station with a cardinal wall bearing.
+        let via_shot = resolve(RoomShot::Fullscreen(Station::Switchboard));
         let via_primitive = fullscreen_pose(
-            Vec3::from_array(bearing::Bearing::West.dir()),
-            scene_geometry::STATION_W_MOUNT_Y,
+            Vec3::from_array(bearing::Bearing::South.dir()),
+            super::super::WALL_HEIGHT * 0.5,
         );
         assert_eq!(via_shot, via_primitive);
-    }
-
-    #[test]
-    fn vfs_fullscreen_fits_the_glass_not_the_panel() {
-        // The N portal's fullscreen (2026-07-13) dollies through to the
-        // window itself: the standoff fits WINDOW_H × PORTAL_OVERSCAN in
-        // the vertical frustum — closer than the panel-height fit every
-        // other station uses — so the frame sits inside the glass edges
-        // (no border, just the world + HUD).
-        use crate::view::fsn::backdrop::{WINDOW_H, WINDOW_Y};
-        let (eye, look) = resolve(RoomShot::Fullscreen(Station::Vfs));
-        let glass_d = (WINDOW_H * PORTAL_OVERSCAN * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
-        let panel_d = (super::super::WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
-        let d = (look - eye).length();
-        assert!((d - glass_d).abs() < 1e-3, "stands the glass-fit distance back: {d} vs {glass_d}");
-        assert!(d < panel_d, "closer than the panel fit — inside the panel's own border");
-        assert!((look.y - WINDOW_Y).abs() < 1e-5, "looks at the glass center");
     }
 
     #[test]
@@ -431,15 +371,15 @@ mod tests {
     }
 
     #[test]
-    fn focused_shot_approaches_the_tracks_wall_from_the_same_side() {
-        // Tracks is East (+X). The camera stands on the SAME side as the
-        // focus — walking toward the station, not sitting on the opposite
-        // wall staring back through the console and the (occluding) west
-        // pylon.
-        let (pos, look) = resolve(RoomShot::focused(Station::Tracks));
-        assert!(pos.x > 0.0, "camera stands on the same (east) side: {pos:?}");
-        assert!(pos.x < super::super::ROOM_RADIUS, "the eye stops well short of the wall: {pos:?}");
-        assert!(look.x > pos.x, "looks further east, out toward the wall: {look:?}");
+    fn focused_shot_approaches_the_switchboard_wall_from_the_same_side() {
+        // Switchboard is South (+Z). The camera stands on the SAME side as
+        // the focus — walking toward the station, not sitting on the
+        // opposite wall staring back through the console and the (occluding)
+        // north pylon.
+        let (pos, look) = resolve(RoomShot::focused(Station::Switchboard));
+        assert!(pos.z > 0.0, "camera stands on the same (south) side: {pos:?}");
+        assert!(pos.z < super::super::ROOM_RADIUS, "the eye stops well short of the wall: {pos:?}");
+        assert!(look.z > pos.z, "looks further south, out toward the wall: {look:?}");
         assert_eq!(pos.y, APPROACH_EYE_HEIGHT);
     }
 
@@ -452,8 +392,8 @@ mod tests {
         //     distance that exactly fits the panel height, so the full
         //     560-tall panel subtends less than the vertical FOV and the
         //     horizontal frustum has spill left over for neighbor slivers.
-        let fit_d = (super::super::WALL_HEIGHT * 0.5) / (CAMERA_FOV_Y * 0.5).tan();
-        for s in [Station::PatchBay, Station::Tracks, Station::Vfs, Station::Radiators] {
+        let fit_d = super::super::WALL_HEIGHT * 0.5 / (CAMERA_FOV_Y * 0.5).tan();
+        for s in [Station::Switchboard, Station::Radiators] {
             let (pos, look) = resolve(RoomShot::focused(s));
             assert_eq!(pos.y, look.y, "{s:?}: the approach must be level, no down-tilt");
             let d = (look - pos).length();
@@ -470,7 +410,7 @@ mod tests {
         // the console keep-out, with the look point farther out than the eye
         // — the console can never fall in the sight line between them (the
         // occlusion bug this pose replaces).
-        for s in [Station::PatchBay, Station::Tracks, Station::Vfs, Station::Radiators] {
+        for s in [Station::Switchboard, Station::Radiators] {
             let (pos, look) = resolve(RoomShot::focused(s));
             let d = bearing::focus_dir(s).expect("wall station has a bearing");
             let eye_r = pos.x * d[0] + pos.z * d[2];
@@ -486,7 +426,7 @@ mod tests {
         // exceptions (marker radius vs apothem, furniture vs mount height):
         // the wall PANEL is the subject now, and every panel stands at the
         // apothem with its center at WALL_HEIGHT × 0.5.
-        for s in [Station::PatchBay, Station::Tracks, Station::Vfs, Station::Radiators] {
+        for s in [Station::Switchboard, Station::Radiators] {
             let (_, look) = resolve(RoomShot::focused(s));
             let d = bearing::focus_dir(s).unwrap();
             let look_r = look.x * d[0] + look.z * d[2];
@@ -548,7 +488,7 @@ mod tests {
         // The real production path (`room::ease_shell_camera`, which builds
         // `RoomShot::WellOverview` straight from `TimeWellState`) must match
         // the pure primitive it composes, the same "via_shot == via_primitive"
-        // lock `fullscreen_shot_resolves_through_the_patch_bay_bearing` uses.
+        // lock `fullscreen_shot_resolves_through_the_focused_bearing` uses.
         for ring in 0..card::N_BANDS {
             let input = WellShotInput { focused: false, focused_ring: ring };
             let (eye, look) = resolve(RoomShot::WellOverview(input));

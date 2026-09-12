@@ -275,6 +275,26 @@ message that knew where the player was looking"). Left:
 - Shell operation inspection currently uses bounded result/block output.
   Integrate kaish job streams and spill references for live, complete output
   retrieval without invalidating pagination offsets.
+## The scene palette still carries hues for retired stations (2026-09-12)
+
+`[scene]` in `theme.toml` (`kaijutsu-types::theme::SceneData`) keeps
+`wire`, `fsn_edge`, `fsn_vertex`, `fsn_seam`, the `etch` and `hardware`
+tiers, and the `pulse`, `chord_selected`, and `wire` gains, all of which
+belonged to the patch bay, tracker, and fsn stations deleted this day. The
+app-side `ScenePalette` no longer reads them. Removing them from the file
+contract is a kernel-owned change with a compiled-mirror test and a seeded
+default; do it in one pass with the next theme edit rather than now.
+
+## BRP-injected input lands one request late (2026-09-12)
+
+A key sent with `brp_extras/send_keys`, or a state change through
+`world.insert_resources`, takes effect only when the next BRP request
+arrives: a screenshot batched with the key shows the frame before it. The
+app's winit loop is reactive (100 ms focused, 500 ms unfocused,
+`main.rs`), and the injected event evidently does not wake it. Drivers
+work around it by following every input with a cheap read. Look at
+whether `bevy_brp_extras` should request a redraw after injecting, or
+whether the app should run continuous updates while BRP is enabled.
 
 ## `kj block list --json` loses its command-specific metadata (2026-09-12)
 
@@ -1794,15 +1814,6 @@ MiniBrute, which answers identity only on port 1. Also unfilled: USB
 `vendor:product` enrichment (`midi_in.rs:194`, `usb_id` left `None`), so
 matching is name-substring only.
 
-## FSN landscape follow-ups (`docs/scenes/vfs.md`)
-
-`docs/scenes/vfs.md` names this file as its tracker. Open: listings are
-cached forever (`view::fsn::sync::FsnState`; `VfsActivityEntry.generation`
-makes a per-cell stale-detect buildable, inotify is the real fix); the `/`
-fetch (depth 2, 4000-entry cap) truncates before late children get a field;
-`Screen::Fsn` dive is keyboard-unreachable on purpose — resurface or delete
-the screen.
-
 ## `rich_json` is unbounded on the wire (seeded 2026-07-18)
 
 `block_output_data` (`kaijutsu-server/src/rpc.rs:9080`) persists `.data`
@@ -1907,8 +1918,7 @@ with no log when `!ac.attachment.ooda_armed`, unlike the ephemeral/excluded
 guard right below it. Either crystallize driven turns regardless of the arm,
 or log loudly. Related: musician create-rc auto-attaches to a label-derived
 track before an explicit `--track` can move it (no `--track` passthrough on
-`context create`). The tracker station still has no score cells
-(`view/tracker/mod.rs:4`). The dock sparklines' data source is a placeholder
+`context create`). The dock sparklines' data source is a placeholder
 (events/sec, running-block count); decide what they mean before polishing.
 
 ## Control plane (kj): three real gaps

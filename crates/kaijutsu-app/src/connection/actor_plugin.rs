@@ -13,8 +13,7 @@ use std::sync::Mutex;
 use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use kaijutsu_client::{
-    ActorHandle, CallError, ContextMembership, Identity, KernelInfo, ServerEvent, SnapshotResult,
-    SshConfig,
+    ActorHandle, CallError, ContextMembership, Identity, KernelInfo, ServerEvent, SshConfig,
 };
 use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
@@ -287,28 +286,6 @@ pub struct RosterReadError {
     pub absent: bool,
 }
 
-/// Outcome of one `view::patch_bay` audio-inventory poll — a listing of
-/// `/run/audio` and, when a node directory exists, one node's raw
-/// `inventory.json` body. Folded into a single enum rather than two
-/// `RpcResultMessage` variants so the poll still lands as ONE task and ONE
-/// message even though it makes two VFS calls in sequence — the same
-/// one-task/one-message shape as `connection::roster::poll_roster_index`.
-/// `view::patch_bay::inventory` owns the JSON parse of the successful body;
-/// this type stays a leaf (raw strings only), same as `RosterReadError`.
-#[derive(Debug, Clone)]
-pub enum AudioInventoryFetch {
-    /// `/run/audio` doesn't exist, or exists with no node directories —
-    /// no daemon has published an inventory yet (`docs/audio-daemon.md`,
-    /// "One inventory owner"). Not an error.
-    NoNodes,
-    /// A node directory was chosen and its `inventory.json` body read
-    /// (the report's own `node` field, not the directory name, is what the
-    /// drain site displays — see `inventory::InventoryReport::node`).
-    Node { body: String },
-    /// A real VFS fault (not a missing path) at either step.
-    Error { detail: String },
-}
-
 #[derive(Message, Debug)]
 #[allow(dead_code)]
 pub enum RpcResultMessage {
@@ -381,22 +358,6 @@ pub enum RpcResultMessage {
     TracksReceived {
         tracks: Vec<kaijutsu_client::TrackInfo>,
     },
-    /// A `vfs_snapshot` reply landed (`view::fsn::sync`'s poll — the FSN
-    /// world's enumeration-on-demand scheduler, `docs/scenes/vfs.md` claim
-    /// 3). `path` is the query's own path (not necessarily the node's own
-    /// path if the kernel normalizes it), so the drain site can match the
-    /// reply back to whichever cell requested it.
-    VfsSnapshotReceived {
-        path: String,
-        result: SnapshotResult,
-    },
-    /// A `vfs_snapshot` request failed (RPC error, disconnect). Drained by
-    /// the same system as the success variant, whose only job on this arm is
-    /// clearing the one-in-flight debounce slot — without a failure reply the
-    /// FSN fetch queue would wedge forever on the first failed request.
-    /// Deliberately carries no auto-requeue semantics (a permanently-failing
-    /// path would hot-loop) — see `view::fsn::sync::apply_fsn_snapshot`.
-    VfsSnapshotFailed { path: String },
     /// Context created on server — spawn an actor to join it.
     ContextCreated(ContextId),
     /// Restore the last-viewed context on (re)connect, read from the kernel KV
@@ -453,10 +414,6 @@ pub enum RpcResultMessage {
     /// [`crate::input::scroll_config::apply_scroll_config`] into the
     /// `ScrollConfig` resource. Carries the resolved TOML body.
     ScrollConfigReceived(String),
-    /// `view::patch_bay::poll_audio_inventory`'s fetch resolved — see
-    /// [`AudioInventoryFetch`]'s own doc for the three outcomes it folds
-    /// together. Drained by `view::patch_bay::apply_audio_inventory`.
-    AudioInventoryReceived(AudioInventoryFetch),
 }
 
 // ============================================================================
@@ -1259,26 +1216,6 @@ fn poll_bootstrap_results(
                                         Err(e) => {
                                             log::warn!("Failed to register as peer: {e}");
                                         }
-                                    }
-                                })
-                                .detach();
-                        }
-
-                        // 1c. Subscribe to VFS activity digests (FSN slice 1
-                        // ambient heat — view::fsn::heat ingests them off the
-                        // shared event stream). interval 0 = server default
-                        // (1000ms). Best-effort and decorative: a failure
-                        // leaves the world cold, never blocks bootstrap. The
-                        // actor remembers the subscription and best-effort
-                        // re-issues it on every reconnect.
-                        {
-                            let h2 = h.clone();
-                            bevy::tasks::IoTaskPool::get()
-                                .spawn(async move {
-                                    if let Err(e) = h2.subscribe_vfs_activity(0).await {
-                                        log::warn!(
-                                            "VFS activity subscribe failed (heat stays cold): {e}"
-                                        );
                                     }
                                 })
                                 .detach();

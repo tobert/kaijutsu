@@ -6,11 +6,7 @@
 //! contexts.
 //!
 //! One live signal today: **beat/track events** ([`ServerEvent::BeatSync`]) →
-//! the **East** tracks bearing, so a jam warms the tracks marker. The
-//! rhythmic *breathing* on top of this comes from the well's beat phasors
-//! ([`super::super::time_well::live::WellBeats::global_envelope`]) read
-//! directly by the glow system — this decaying level is the sustained "a
-//! track is rolling" warmth under the pulse.
+//! the **East** bearing, so a jam warms its marker.
 //!
 //! Slice A also routed context chatter (block inserts / text ops / status) to
 //! a **Center** console bearing, warming the slice-A `ConsoleEmblem`
@@ -84,20 +80,7 @@ impl BearingActivity {
 
 /// Map a kernel event to `(bearing, weight)`, or `None` for events that aren't
 /// room-ambient signal. Only beat syncs feed room-ambient activity today (the
-/// tracks/East bearing — a clock is rolling).
-///
-/// **North (VFS/`Station::Vfs`) is deliberately absent here too**, but for a
-/// different reason than the Center drop below: it's not that nothing should
-/// feed it, it's that THIS function is the wrong seam for it. VFS churn
-/// arrives as a digest's cumulative TOTAL per path, not a discrete pulse like
-/// `BeatSync` — turning "total" into "an event just happened" needs baseline
-/// state across calls (`view::fsn::heat::FsnHeat::observe`'s whole reason for
-/// existing: first-sighting and kernel-restart re-baselining, `FsnHeat`'s own
-/// module doc). A stateless `ev -> (bearing, weight)` match can't hold that
-/// baseline. The FSN heat ingest (arriving in a follow-up — the one system
-/// lane A2 deliberately leaves unbuilt, `view::fsn::heat`'s own module doc)
-/// records North's `BearingActivity` directly, alongside recording into
-/// `FsnHeat` itself, rather than routing through this function.
+/// East bearing — a clock is rolling).
 ///
 /// Block/chatter events are deliberately NOT mapped here (freeze-fix slice,
 /// 2026-07-11): they used to warm a `Center` bearing for the slice-A
@@ -114,8 +97,7 @@ impl BearingActivity {
 /// traffic feeding the south wall trim glow" the mission brief asked for.
 /// A failure weighs a little more than a clean completion (a bigger blip,
 /// the rarer/more salient event), same relative-weight idiom `BeatSync`'s
-/// East arm below already established (this used to be the ONE producer;
-/// South was `BearingActivity`'s one bearing with no feed at all).
+/// East arm already established.
 pub fn event_bearing(ev: &ServerEvent) -> Option<(Bearing, f32)> {
     match ev {
         ServerEvent::BeatSync { .. } => Some((Bearing::East, 1.0)),
@@ -181,13 +163,13 @@ mod tests {
     }
 
     #[test]
-    fn beat_sync_lands_on_the_east_tracks_bearing() {
+    fn beat_sync_lands_on_the_east_bearing() {
         let ev = ServerEvent::BeatSync {
             context_id: ctx(1),
             beat_ref: kaijutsu_audio::BeatRef::new(0.0, 2.0),
         };
         let (b, w) = event_bearing(&ev).expect("beat sync is activity");
-        assert_eq!(b, Bearing::East, "the jam warms the tracks bearing");
+        assert_eq!(b, Bearing::East, "the jam warms the East bearing");
         assert!(w > 0.0);
     }
 

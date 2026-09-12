@@ -25,26 +25,23 @@ fog), clearing to the theme background. No `Camera2d` anywhere in the app;
 conversation UI renders after tonemapping so its colors are unaffected by
 bloom.
 
-**`Screen` state machine** (`ui/screen.rs`) — five variants, not two:
-`Conversation` (default), `Editor`, `Room`, `Diff`, `Fsn`. There is no
+**`Screen` state machine** (`ui/screen.rs`) — four variants:
+`Conversation` (default), `Editor`, `Room`, `Diff`. There is no
 `Screen::TimeWell`: the time well is a station reached through
 `Screen::Room`'s `RoomState::zoomed` (a camera pose + a resource write, not a
-screen transition) — same as the patch bay. Only the FSN landscape earns its
-own `Screen` variant among the room's dive targets, because it is an
-unbounded world rather than bounded room furniture (`ui/screen.rs`'s
-`Screen::Fsn` doc, quoting `docs/scenes/shell.md`).
+screen transition).
 
 **Plugin build order** (`main.rs`, `.add_plugins` calls in file order):
 `DefaultPlugins → MeshPicking → BrpExtras → KjText → Input → Cell →
 ConversationSurface → BlockRender → Peers → ShaderFx → Actor → ShareDial →
 Dj → MidiIn → MidiPresence → MidiExchange → AppScreen → Screen → Commands →
 Tiling → TilingReconciler → Dock → RosterFeed → QuickContext → Drift →
-PeerRoster → Room → PatchBay → TimeWell → Tracker → Fsn → Editor → DiffView →
+PeerRoster → Room → TimeWell → Editor → DiffView →
 Timeline → Tweening`. Two ordering invariants called out in comments there:
 `ConversationSurfacePlugin` must follow `CellPlugin` (its `Update` sets
 anchor `.after()` two systems `CellPlugin` registers); `RoomPlugin` must
-precede every zoomable station's plugin (`well_keyboard`/`patch_bay_keyboard`
-clear `RoomState::zoomed` on Escape, and if the station ran first in the same
+precede every zoomable station's plugin (`well_keyboard` clears
+`RoomState::zoomed` on Escape, and if the station ran first in the same
 tick `room_keyboard` would see the already-cleared flag and double-fire its
 own Escape branch — found live via BRP).
 
@@ -87,9 +84,8 @@ worth reading directly for more detail than fits here.
     layout math).
   - **Chat-adjacent surfaces** — `overlay` (input overlay), `shell_dock`
     (Ctrl+Z shell row), `scroll`.
-  - **Room-level scenes reached from the shell** — `room` (station carousel),
-    `time_well`, `patch_bay`, `fsn`, `tracker` — sharing `scene_geometry`'s
-    datums (octagon shell, W-wall patch-wheel mount).
+  - **Room-level scenes reached from the shell** — `room` (station carousel)
+    and `time_well` — sharing `scene_geometry`'s datum (the octagon shell).
   - **Styling** — `scene_palette` (the `[scene]` theme.toml lane).
   - **Render plumbing** — `ui_rtt` (the generic render-to-texture primitive +
     HiDPI-aware sizing helpers, no vello). Bevy Remote Protocol inspector glue

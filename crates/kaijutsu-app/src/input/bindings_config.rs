@@ -332,9 +332,7 @@ fn context_to_str(ctx: InputContext) -> String {
         InputContext::Dialog => "Dialog",
         InputContext::RoomNav => "RoomNav",
         InputContext::WellZoomed => "WellZoomed",
-        InputContext::PatchBayZoomed => "PatchBayZoomed",
         InputContext::StationZoomed => "StationZoomed",
-        InputContext::FsnFly => "FsnFly",
         InputContext::QuickContext => "QuickContext",
     }
     .to_string()
@@ -348,9 +346,7 @@ fn parse_context(s: &str) -> Result<InputContext, String> {
         "Dialog" => Ok(InputContext::Dialog),
         "RoomNav" => Ok(InputContext::RoomNav),
         "WellZoomed" => Ok(InputContext::WellZoomed),
-        "PatchBayZoomed" => Ok(InputContext::PatchBayZoomed),
         "StationZoomed" => Ok(InputContext::StationZoomed),
-        "FsnFly" => Ok(InputContext::FsnFly),
         "QuickContext" => Ok(InputContext::QuickContext),
         _ => Err(format!("unknown context '{s}'")),
     }
@@ -423,7 +419,6 @@ fn action_to_str(a: &Action) -> String {
         Action::PauseToggle => "PauseToggle".into(),
         Action::Archive => "Archive".into(),
         Action::ActivateHorizon => "ActivateHorizon".into(),
-        Action::Rescan => "Rescan".into(),
         Action::ToggleLegend => "ToggleLegend".into(),
         Action::SwitchToActiveSeat(n) => format!("SwitchToActiveSeat:{n}"),
         Action::SwitchToPreviousContext => "SwitchToPreviousContext".into(),
@@ -436,8 +431,6 @@ fn action_to_str(a: &Action) -> String {
         Action::PromptContextSwitch => "PromptContextSwitch".into(),
         Action::HoldQuickContext => "HoldQuickContext".into(),
         Action::UnpinQuickContext => "UnpinQuickContext".into(),
-        Action::FlyAxis { x, y } => format!("FlyAxis:{x},{y}"),
-        Action::FlyAltitude(v) => format!("FlyAltitude:{v}"),
     }
 }
 
@@ -505,7 +498,6 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "PauseToggle" => Ok(Action::PauseToggle),
         "Archive" => Ok(Action::Archive),
         "ActivateHorizon" => Ok(Action::ActivateHorizon),
-        "Rescan" => Ok(Action::Rescan),
         "ToggleLegend" => Ok(Action::ToggleLegend),
         "SwitchToPreviousContext" => Ok(Action::SwitchToPreviousContext),
         "CloseAndDemoteContext" => Ok(Action::CloseAndDemoteContext),
@@ -558,24 +550,6 @@ fn parse_action_with_payload(name: &str, payload: &str) -> Result<Action, String
                 format!("ActiveSeatStep payload '{payload}' must be a step: {e}")
             })?;
             Ok(Action::ActiveSeatStep(d))
-        }
-        "FlyAxis" => {
-            let (x, y) = payload
-                .split_once(',')
-                .ok_or_else(|| format!("FlyAxis payload '{payload}' must be 'x,y'"))?;
-            let x: f32 = x
-                .parse()
-                .map_err(|e| format!("FlyAxis x '{x}' must be a float: {e}"))?;
-            let y: f32 = y
-                .parse()
-                .map_err(|e| format!("FlyAxis y '{y}' must be a float: {e}"))?;
-            Ok(Action::FlyAxis { x, y })
-        }
-        "FlyAltitude" => {
-            let v: f32 = payload
-                .parse()
-                .map_err(|e| format!("FlyAltitude payload '{payload}' must be a float: {e}"))?;
-            Ok(Action::FlyAltitude(v))
         }
         _ => Err(format!(
             "action '{name}' does not take a payload (got ':{payload}')"
@@ -746,7 +720,6 @@ mod tests {
         "PauseToggle",
         "Archive",
         "ActivateHorizon",
-        "Rescan",
         "ToggleLegend",
         "SwitchToActiveSeat",
         "SwitchToPreviousContext",
