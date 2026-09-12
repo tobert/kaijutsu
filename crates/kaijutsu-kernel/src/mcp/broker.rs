@@ -21,6 +21,7 @@ use kaijutsu_types::{AskRef, BlockId, ContextId, NotificationPayload, RefusalKin
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::binding::{ContextToolBinding, ResolvedName};
 use super::coalescer::{NotificationCoalescer, ObserveOutcome};
@@ -1603,6 +1604,8 @@ impl Broker {
             tool = %params.tool,
             context.id = %ctx.context_id,
             principal.id = %ctx.principal_id,
+            actor.id = %ctx.actor_id,
+            reviewer.id = tracing::field::Empty,
         )
     )]
     async fn call_tool_inner(
@@ -1611,6 +1614,9 @@ impl Broker {
         ctx: &CallContext,
         cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
+        if let Some(reviewer) = ctx.reviewer_id {
+            tracing::Span::current().record("reviewer.id", tracing::field::display(reviewer));
+        }
         let server = {
             let guard = self.instances.read().await;
             guard
@@ -1727,15 +1733,19 @@ impl Broker {
         let timeout_ms = policy.call_timeout.as_millis() as u64;
         let call_params_for_hooks = params.clone();
         let cancel_for_call = cancel.clone();
-        let call_fut = async {
-            let span = tracing::info_span!(
-                "server.call_tool",
-                instance = %params.instance,
-                tool = %params.tool,
-            );
-            let _enter = span.enter();
-            server.call_tool(params, ctx, cancel_for_call).await
-        };
+        let span = tracing::info_span!(
+            "server.call_tool",
+            instance = %params.instance,
+            tool = %params.tool,
+            context.id = %ctx.context_id,
+            principal.id = %ctx.principal_id,
+            actor.id = %ctx.actor_id,
+            reviewer.id = tracing::field::Empty,
+        );
+        if let Some(reviewer) = ctx.reviewer_id {
+            span.record("reviewer.id", tracing::field::display(reviewer));
+        }
+        let call_fut = server.call_tool(params, ctx, cancel_for_call).instrument(span);
 
         // Race the call against (a) the per-instance timeout and (b) an
         // externally-supplied cancellation (M2-B5). Without (b) a hard
@@ -4822,6 +4832,202 @@ mod tests {
             matches!(err, McpError::InstanceNotFound(_)),
             "expected InstanceNotFound after unregister, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_call_spans_keep_requester_actor_and_reviewer_distinct() {
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Spans(Arc<std::sync::Mutex<HashMap<u64, (String, HashMap<String, String>)>>>);
+        struct Fields(HashMap<String, String>);
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Spans {
+            fn on_new_span(
+                &self,
+                attrs: &Attributes<'_>,
+                id: &Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if !matches!(attrs.metadata().name(), "broker.call_tool" | "server.call_tool") {
+                    return;
+                }
+                let mut fields = Fields(HashMap::new());
+                attrs.record(&mut fields);
+                self.0.lock().unwrap().insert(
+                    id.into_u64(),
+                    (attrs.metadata().name().to_string(), fields.0),
+                );
+            }
+            fn on_record(
+                &self,
+                id: &Id,
+                values: &Record<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut spans = self.0.lock().unwrap();
+                let Some((_, fields)) = spans.get_mut(&id.into_u64()) else {
+                    return;
+                };
+                let mut recorded = Fields(HashMap::new());
+                values.record(&mut recorded);
+                fields.extend(recorded.0);
+            }
+        }
+
+        let spans = Spans::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(spans.clone()),
+        );
+        let broker = Arc::new(Broker::new());
+        broker
+            .register_silently(
+                Arc::new(MockServer::new("identity").with_tool("check")),
+                InstancePolicy::default(),
+            )
+            .await
+            .unwrap();
+        let requester = kaijutsu_types::PrincipalId::new();
+        let actor = kaijutsu_types::PrincipalId::new();
+        let reviewer = kaijutsu_types::PrincipalId::new();
+        let context_id = kaijutsu_types::ContextId::new();
+        let ctx = CallContext::new(
+            requester,
+            context_id,
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        )
+        .with_actor(actor, Some(reviewer));
+
+        broker
+            .call_tool(params("identity", "check"), &ctx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let spans = spans.0.lock().unwrap();
+        for name in ["broker.call_tool", "server.call_tool"] {
+            let fields = spans
+                .values()
+                .find_map(|(span_name, fields)| (span_name == name).then_some(fields))
+                .unwrap_or_else(|| panic!("missing {name} span: {spans:?}"));
+            assert_eq!(fields.get("context.id"), Some(&context_id.to_string()));
+            assert_eq!(fields.get("principal.id"), Some(&requester.to_string()));
+            assert_eq!(fields.get("actor.id"), Some(&actor.to_string()));
+            assert_eq!(fields.get("reviewer.id"), Some(&reviewer.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn interleaved_server_calls_keep_their_own_actor_span() {
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone, Default)]
+        struct Capture {
+            actors: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+            events: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        }
+        struct Fields(HashMap<String, String>);
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> tracing_subscriber::Layer<S> for Capture {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
+                if attrs.metadata().name() != "server.call_tool" {
+                    return;
+                }
+                let mut fields = Fields(HashMap::new());
+                attrs.record(&mut fields);
+                self.actors.lock().unwrap().insert(
+                    id.into_u64(),
+                    fields.0.remove("actor.id").expect("server span has actor ID"),
+                );
+            }
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                let mut fields = Fields(HashMap::new());
+                event.record(&mut fields);
+                let Some(tool) = fields.0.remove("tool") else {
+                    return;
+                };
+                let actor = ctx
+                    .event_scope(event)
+                    .and_then(|scope| {
+                        scope
+                            .from_root()
+                            .find(|span| span.name() == "server.call_tool")
+                            .map(|span| span.id().into_u64())
+                    })
+                    .and_then(|id| self.actors.lock().unwrap().get(&id).cloned())
+                    .expect("tool event remains inside its server.call_tool span");
+                self.events.lock().unwrap().push((tool, actor));
+            }
+        }
+
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(capture.clone()),
+        );
+        let broker = Arc::new(Broker::new());
+        broker
+            .register_silently(
+                Arc::new(
+                    MockServer::new("interleaved")
+                        .with_tool("one")
+                        .with_tool("two")
+                        .on_call(|params| async move {
+                            tokio::task::yield_now().await;
+                            tracing::info!(tool = %params.tool, "interleaved MCP server call");
+                            Ok(KernelToolResult::text("ok"))
+                        }),
+                ),
+                InstancePolicy::default(),
+            )
+            .await
+            .unwrap();
+        let requester = kaijutsu_types::PrincipalId::new();
+        let first_actor = kaijutsu_types::PrincipalId::new();
+        let second_actor = kaijutsu_types::PrincipalId::new();
+        let first = CallContext::new(
+            requester,
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        )
+        .with_actor(first_actor, Some(kaijutsu_types::PrincipalId::new()));
+        let second = CallContext::new(
+            requester,
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        )
+        .with_actor(second_actor, Some(kaijutsu_types::PrincipalId::new()));
+
+        let (first_result, second_result) = tokio::join!(
+            broker.call_tool(params("interleaved", "one"), &first, CancellationToken::new()),
+            broker.call_tool(params("interleaved", "two"), &second, CancellationToken::new()),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let events = capture.events.lock().unwrap();
+        assert!(events.contains(&("one".to_string(), first_actor.to_string())));
+        assert!(events.contains(&("two".to_string(), second_actor.to_string())));
     }
 
     #[tokio::test]

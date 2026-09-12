@@ -160,8 +160,9 @@ fn build_exporters() -> (SpanExporter, MetricExporter, LogExporter) {
 pub(crate) fn inject_trace_context_impl() -> (String, String) {
     use opentelemetry::propagation::TextMapPropagator;
     use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-    let cx = Context::current();
+    let cx = tracing::Span::current().context();
     let propagator = TraceContextPropagator::new();
 
     let mut carrier = HashMap::new();
@@ -327,7 +328,7 @@ fn sampling_rate(name: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::sampling_rate;
+    use super::{extract_trace_context_impl, inject_trace_context_impl, sampling_rate};
 
     /// Regression: the auto-named actor/method span `drift_queue` (fired every
     /// 5s by the app's idle drift poll) must be sampled at the default rate,
@@ -376,5 +377,71 @@ mod tests {
     #[test]
     fn sync_prefixed_spans_use_the_default_rate_not_a_dead_bucket() {
         assert_eq!(sampling_rate("sync.push_ops"), 0.1);
+    }
+
+    #[test]
+    fn injected_trace_context_keeps_identity_span_as_its_remote_parent() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry::trace::TraceContextExt as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("identity-propagation")),
+        );
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        let parent_span_id = tracing::dispatcher::with_default(&dispatch, || {
+            let parent = tracing::info_span!(
+                "llm.turn",
+                principal.id = "requester",
+                actor.id = "coder",
+                reviewer.id = "lead",
+            );
+            let parent_context = parent.context();
+            let (traceparent, tracestate) = {
+                let _entered = parent.enter();
+                inject_trace_context_impl()
+            };
+            assert!(
+                !traceparent.is_empty(),
+                "the active tracing span must inject a W3C traceparent"
+            );
+            let child = extract_trace_context_impl(&traceparent, &tracestate);
+            assert_eq!(
+                child.context().span().span_context().trace_id(),
+                parent_context.span().span_context().trace_id(),
+                "the extracted RPC span must remain in the model turn's trace",
+            );
+            parent_context.span().span_context().span_id()
+        });
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let parent = spans
+            .iter()
+            .find(|span| span.name == "llm.turn")
+            .expect("the model turn span is exported");
+        for (key, value) in [
+            ("principal.id", "requester"),
+            ("actor.id", "coder"),
+            ("reviewer.id", "lead"),
+        ] {
+            assert!(
+                parent.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == key && attribute.value.as_str() == value
+                }),
+                "exported model-turn attributes must retain {key}",
+            );
+        }
+        let child = spans
+            .iter()
+            .find(|span| span.name == "rpc.request")
+            .expect("the extracted RPC span is exported");
+        assert_eq!(child.parent_span_id, parent_span_id);
     }
 }

@@ -543,8 +543,8 @@ pub(crate) async fn spawn_llm_for_prompt(
         context_state: ctx_state,
         provider: ctx_provider_name.clone(),
         model: Some(model_name.clone()),
-        performer: Some(performer),
-        reviewer: Some(reviewer),
+        performer: Some(performer.clone()),
+        reviewer: Some(reviewer.clone()),
         tool_names: tools.iter().map(|t| t.name.clone()).collect(),
     };
     let rc_sections = match kaijutsu_kernel::read_system_prompt_sections(&documents, context_id) {
@@ -596,6 +596,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         slot_tunables,
         conversation_cache,
         user_principal_id,
+        Some(TurnSpanIdentity { performer, reviewer }),
         tool_ctx,
         interrupt,
         interrupt_generation,
@@ -1524,12 +1525,24 @@ impl Drop for TurnUsageOnSpan {
 /// facts the `TurnEvents` wire push carries, so a trace and a subscriber tell the
 /// same story. Turn/LLM spans are 100%-sampled (`docs/telemetry.md`), so these
 /// land on every turn.
+#[derive(Debug, Clone)]
+struct TurnSpanIdentity {
+    performer: kaijutsu_kernel::CharacterIdentity,
+    reviewer: kaijutsu_kernel::CharacterIdentity,
+}
+
 #[tracing::instrument(
     name = "llm.turn",
     skip_all,
     fields(
         llm.provider = provider.name(),
         llm.model = %model_name,
+        context.id = %context_id,
+        principal.id = %user_principal_id,
+        actor.id = tracing::field::Empty,
+        reviewer.id = tracing::field::Empty,
+        actor.name = tracing::field::Empty,
+        reviewer.name = tracing::field::Empty,
         llm.usage.input_tokens = tracing::field::Empty,
         llm.usage.output_tokens = tracing::field::Empty,
         llm.usage.cache_read_tokens = tracing::field::Empty,
@@ -1565,6 +1578,10 @@ async fn process_llm_stream(
     // The requester authors the TurnFlow outcome event; provider blocks
     // use the performing character carried by tool_ctx.
     user_principal_id: PrincipalId,
+    // Resolved once when the turn begins. Tool calls receive IDs in their
+    // CallContext, but character names belong on the turn span only: no
+    // per-tool character database reads.
+    span_identity: Option<TurnSpanIdentity>,
     tool_ctx: kaijutsu_kernel::ExecContext,
     interrupt: Arc<ContextInterruptState>,
     interrupt_generation: u64,
@@ -1575,6 +1592,14 @@ async fn process_llm_stream(
     // id, not at spawn racing the model.
     origin: TurnOrigin,
 ) {
+    if let Some(identity) = span_identity {
+        let span = tracing::Span::current();
+        span.record("actor.id", tracing::field::display(identity.performer.principal_id));
+        span.record("reviewer.id", tracing::field::display(identity.reviewer.principal_id));
+        span.record("actor.name", identity.performer.name.as_str());
+        span.record("reviewer.name", identity.reviewer.name.as_str());
+    }
+
     // Records the final call's usage on the `llm.turn` span when this
     // function exits, whichever path it takes.
     let mut usage_on_span = TurnUsageOnSpan {
@@ -2949,6 +2974,7 @@ mod publish_tests {
             None,
             conversation_cache,
             player,
+            None,
             tool_ctx,
             interrupt,
             1,
@@ -3401,6 +3427,7 @@ mod publish_tests {
             None,
             conversation_cache,
             player,
+            None,
             tool_ctx,
             interrupt,
             1,
@@ -4288,6 +4315,8 @@ mod usage_tests {
             .unwrap();
 
         let player = PrincipalId::new();
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
 
         let mut last: Option<kaijutsu_types::BlockId> = None;
         for i in 0..pre_seed_blocks {
@@ -4384,7 +4413,8 @@ mod usage_tests {
             std::path::PathBuf::from("/"),
             SessionId::new(),
             kernel.id(),
-        );
+        )
+        .with_actor(actor, Some(reviewer));
 
         process_llm_stream(
             provider,
@@ -4401,6 +4431,16 @@ mod usage_tests {
             None,
             conversation_cache,
             player,
+            Some(TurnSpanIdentity {
+                performer: kaijutsu_kernel::CharacterIdentity {
+                    principal_id: actor,
+                    name: "Coder".to_string(),
+                },
+                reviewer: kaijutsu_kernel::CharacterIdentity {
+                    principal_id: reviewer,
+                    name: "Lead".to_string(),
+                },
+            }),
             tool_ctx,
             interrupt,
             1,
@@ -4781,6 +4821,7 @@ mod usage_tests {
         struct Seen {
             count: usize,
             last: Option<u64>,
+            text: Option<String>,
         }
         #[derive(Default)]
         struct SpanSeen {
@@ -4796,8 +4837,15 @@ mod usage_tests {
                 seen.count += 1;
                 seen.last = Some(value);
             }
-            fn record_debug(&mut self, field: &Field, _: &dyn std::fmt::Debug) {
-                self.0.entry(field.name().to_string()).or_default().count += 1;
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let seen = self.0.entry(field.name().to_string()).or_default();
+                seen.count += 1;
+                seen.text = Some(format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                let seen = self.0.entry(field.name().to_string()).or_default();
+                seen.count += 1;
+                seen.text = Some(value.to_string());
             }
         }
         impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RecordCounter {
@@ -4805,8 +4853,10 @@ mod usage_tests {
                 if attrs.metadata().name() != "llm.turn" {
                     return;
                 }
-                self.0.lock().unwrap().entry(id.into_u64()).or_default().thread =
-                    Some(std::thread::current().id());
+                let mut spans = self.0.lock().unwrap();
+                let seen = spans.entry(id.into_u64()).or_default();
+                seen.thread = Some(std::thread::current().id());
+                attrs.record(&mut Count(&mut seen.fields));
             }
             fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
                 let span = ctx.span(id).expect("a recorded span exists");
@@ -4873,6 +4923,16 @@ mod usage_tests {
             "this thread drove one turn, so one llm.turn span was created here"
         );
         let seen = &mine[0].fields;
+        for field in ["context.id", "principal.id", "actor.id", "reviewer.id"] {
+            assert!(
+                seen.get(field).and_then(|value| value.text.as_ref()).is_some(),
+                "{field} was not recorded on llm.turn",
+            );
+        }
+        assert_ne!(seen["principal.id"].text, seen["actor.id"].text);
+        assert_ne!(seen["actor.id"].text, seen["reviewer.id"].text);
+        assert_eq!(seen["actor.name"].text.as_deref(), Some("Coder"));
+        assert_eq!(seen["reviewer.name"].text.as_deref(), Some("Lead"));
         for field in [
             "llm.usage.input_tokens",
             "llm.usage.output_tokens",
@@ -4974,6 +5034,7 @@ mod error_child_anchor_tests {
             None,
             conversation_cache,
             player,
+            None,
             tool_ctx,
             interrupt,
             1,
@@ -5179,6 +5240,7 @@ mod authorship_tests {
             None,
             conversation_cache,
             player,
+            None,
             tool_ctx,
             interrupt,
             1,
@@ -5322,6 +5384,7 @@ mod gate_resume_cache_eviction_tests {
             None,
             conversation_cache,
             player,
+            None,
             tool_ctx,
             interrupt,
             1,
