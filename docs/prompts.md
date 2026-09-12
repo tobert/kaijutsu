@@ -149,6 +149,16 @@ performing the requests inside it. Later user steering and current evidence can
 supersede a handoff. Directed briefing text remains positional:
 `kj drift pull <source> 'focus on the failed checks'`.
 
+## Planned coder signoff lifecycle
+
+Integrate the signoff protocol into coder instructions alongside async work
+and explicit wait. A coder should maintain a checkpoint while active and
+record outstanding operation/ask IDs before yielding or signing off. Do not
+teach a unified wait syntax or automatic rotation until those mechanisms
+exist. The continuation-window policy governs whether late completion starts
+another model turn; it does not expire an ask. See
+`docs/approval-identity.md`, "Continuation windows and async work".
+
 ## Length and input selection
 
 ```sh

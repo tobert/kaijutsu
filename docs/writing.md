@@ -142,6 +142,7 @@ a collision appears in real prose, not in advance.
 | loadout | noun | The set of capabilities a context is given. Where mistake-prevention is routed. |
 | gate | noun, verb | The check that stops a statement to ask its assigned reviewer. The one place that authority lives. |
 | ask | noun | A durable row a gate leaves behind, waiting for a decision. Answered through `kj ledger`. |
+| continuation window | noun | Policy window for automatically resuming a model conversation after it yields. It expresses KV-cache and cost expectations, not a guaranteed cache lifetime or an ask expiry. Planned; see `docs/approval-identity.md`, "Continuation windows and async work". |
 | fork | noun, verb | Making a child context. The structural parent edge; the context graph is a forest. |
 | drift | noun, verb | An overlay edge between contexts, deliberately cyclic. Never unify it with fork. |
 | hydrate | verb | To build a conversation from a context. Happens only at a boundary event. |

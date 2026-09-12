@@ -49,18 +49,29 @@ payload and logging, in the order to try:
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
 
-## An old approval revives a turn whose prompt cache is cold (2026-09-12)
+## Model resumption needs a continuation window (2026-09-12)
 
-`kj ledger allow` resumes the model whose linked pair it fills
-(`act_on_executable_answer`, `PairOwner::Turn`). An ask answered hours
-later still resumes it, and on metered providers that re-prices the whole
-context, since nothing of the provider's prompt cache survives that long.
-Amy: "perhaps later we'll add a staleness check; I don't like reviving KV
-caches that much esp when we're not on a subscription." Shape to try: the
-driver compares the ask's `created_at` against a per-backend cache
-lifetime, and past it writes the seed without the turn request, so the
-next `kj drive` is a human's choice. Needs the lifetimes as backend rows,
-not constants.
+`kj ledger allow` can resume the model whose linked pair it fills
+(`act_on_executable_answer`, `PairOwner::Turn`) without considering the cost of
+continuing after a long idle. Add a continuation-window policy to the wake
+path, separate from execution and result delivery. The window expresses KV
+and cost expectations; provider cache warmth is not always observable.
+An ask has no default expiry. Do not turn the window into an approval TTL.
+
+Async submission should return a stable receipt, completion should append a
+separate fact, and the coder should checkpoint before explicit wait/signoff.
+Extend `kj wait` to cover operations and approval dependencies, with wait
+cancellation separate from work cancellation. The current background shell
+runs outside kaish, so changing its default is not sufficient. Preserve the
+existing execution owner and approval checks when designing async execution.
+Contract and current gaps: `docs/approval-identity.md`, "Continuation windows
+and async work". This is design work; no new defaults have shipped.
+
+The gate-resume driver header still says executable asks never wake a model.
+The implementation returns `ExecAction::Tell` for model-owned pairs and can
+request a turn after filling them; the wire regression covers that path.
+Update that historical commentary with this work so it cannot guide a new
+continuation implementation toward the wrong branch.
 
 ## The cached mailbox never re-reads a block it has seen (2026-09-11)
 
@@ -564,7 +575,9 @@ loudly on a cross-mount absolute target.
 
 ## Remaining approval ergonomics
 
-- `expires_at` exists, but shell/hook asks have no default TTL or sweeper.
+- Shell/hook asks deliberately have no default expiry. A future janitor may
+  identify obsolete requests and record explicit cleanup; absence of a TTL
+  or sweeper is not itself a defect.
 - A gated `:kj` command still wraps the refusal in an error on some client
   paths; show the durable ask reference as a waiting result consistently.
 - Reviewer characters can have several live contexts. The ledger change feed

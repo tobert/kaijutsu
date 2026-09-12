@@ -1276,3 +1276,20 @@ the context information needed for repair, and that eager default resolution
 overrode valid explicit assignments. Inspection now exposes the error;
 invalid default configuration clears its cached authority without replacing
 a valid explicit reviewer.
+
+Amy separated approval lifetime from coder continuation: "an ask doesn't
+really need to expire" and "I like continuation window". The window names a
+policy about retained KV state and model spend, not a measured cache deadline.
+She proposed mostly async shell work with a unified wait/block operation.
+The design now separates command submission, durable completion, waiting,
+and model activation. Signoff carries pending work into a successor without
+moving an old ask's authority to a new context. These are documented next
+steps; no execution default, prompt bundle, or restart policy changed.
+
+The source audit also corrected a lifecycle assumption: a pending tool gate
+does not force the model loop to stop. It receives the pending result and can
+write a handoff. Current approval completion edits that original pair in
+place; stable async receipts and separate completion records would avoid
+rewriting an earlier conversation result. Existing background shell execution
+uses host shell semantics, so making that flag the default would not deliver
+the intended async kaish contract.
