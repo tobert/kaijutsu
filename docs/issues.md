@@ -275,6 +275,36 @@ message that knew where the player was looking"). Left:
 - Shell operation inspection currently uses bounded result/block output.
   Integrate kaish job streams and spill references for live, complete output
   retrieval without invalidating pagination offsets.
+## Config defaults ARE the config; the VFS path proxies XDG (Amy, 2026-09-12)
+
+Design direction for `theme.toml` and the other `/config/kernel` singletons
+(`mcp.toml`, `gate.toml`, and the client configs). Today a file is seeded from
+an embedded snippet on first boot, and there are three copies of the theme:
+the app's compiled fallback (`ui/theme.rs`), the kernel's embedded seed
+(`config_seed.rs` `DEFAULT_THEME` from `assets/defaults`), and the live host
+file. Amy's shape:
+
+- The compiled defaults become Amy's actual settings, so the common case needs
+  no file on disk ("for now" — fine in a no-outside-users learning space).
+- Stop seeding a snippet. A host file exists only when someone writes one to
+  override; `seed_entries_into_dir` no longer plants theme et al.
+- The defaults are printable, not shipped: a `kj config` verb emits the
+  effective defaults as TOML so a human can capture a starting point to edit.
+- The VFS path `/config/kernel/theme.toml` stays the interface characters and
+  tools use (the raw XDG path is never exposed to them) and proxies to the XDG
+  host file. Copy-on-write from defaults: an absent file reads as the
+  synthesized defaults, a write creates the override.
+- The kernel's defaults become the one source; the app's pre-connect fallback
+  shrinks to a minimal neutral default instead of mirroring the whole theme.
+
+Interacts with `docs/color.md` (theme ownership — this keeps the kernel the
+owner but makes the default the body), the "theme changes never reach a
+running app" entry (the read is already live per connect; only the write side
+and the seed change), and the theme-lane / client-local question (whether the
+theme should move to the `/config/client` cascade since it is per-display
+presentation). Sequence AFTER the pending origin/main pull, which touches the
+approval/config area.
+
 ## The approval sheet and ribbon have no dim behind them (2026-09-12)
 
 The ask sheet and ledger ribbon float over the conversation or room at full
