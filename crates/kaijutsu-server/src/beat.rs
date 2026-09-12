@@ -438,6 +438,7 @@ impl BeatScheduler {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: Some(system),
             };
             db.insert_context_with_document(&row, ws).map_err(|e| {
                 format!("beat: creating score context for {}: {e}", track_id.as_str())
@@ -4622,6 +4623,7 @@ mod tests {
                     origin_host: None,
                     played_by: None,
                     reviewer_id: None,
+                    director_id: None,
                 },
                 ws,
             )
@@ -5976,6 +5978,7 @@ mod tests {
                     origin_host: None,
                     played_by: None,
                     reviewer_id: None,
+                    director_id: None,
                 },
                 ws,
             )

@@ -64,6 +64,8 @@ reviewer. See `docs/approval-identity.md` for their authorization roles.
 | `actor.id` | Character performing the work |
 | `reviewer.id` | Character assigned to review that work |
 | `actor.name`, `reviewer.name` | Character names resolved at model-turn start |
+| `director.id` | Director character associated with the context or delegation |
+| `review.source` | Effective reviewer selected by `default`, `delegation`, or `explicit` policy |
 | `context.id` | Context in which the work runs |
 | `ask.id` | Durable approval request |
 | `decision.actor.id` | Character attempting the decision, cancellation, or escalation |

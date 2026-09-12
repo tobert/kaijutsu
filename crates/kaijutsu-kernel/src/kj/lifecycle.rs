@@ -1608,7 +1608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rc_nested_context_keeps_the_lead_as_reviewer() {
+    async fn rc_nested_context_keeps_the_lead_as_director_and_amy_as_default_reviewer() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         install_script(
@@ -1673,7 +1673,13 @@ mod tests {
             .expect("rc created child context");
         assert_eq!(child.created_by, caller.principal_id, "Amy requested the work");
         assert_eq!(child.played_by, Some(coder));
-        assert_eq!(child.reviewer_id, Some(lead), "the lead reviews its coder");
+        assert_eq!(child.director_id, Some(lead), "the lead directs its coder");
+        assert_eq!(child.reviewer_id, None, "there is no implicit reviewer override");
+        assert_eq!(
+            d.kernel().resolve_context_review(child_id).await.unwrap().reviewer.principal_id,
+            caller.principal_id,
+            "Amy remains the default reviewer without an explicit delegation",
+        );
     }
 
     /// Failure blocks are the loudest thing rc writes, so they are the worst

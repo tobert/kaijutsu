@@ -4929,6 +4929,7 @@ mod tests {
     #[tokio::test]
     async fn interleaved_server_calls_keep_their_own_actor_span() {
         use tracing::field::{Field, Visit};
+        use tracing::instrument::WithSubscriber;
         use tracing::span::{Attributes, Id};
         use tracing_subscriber::layer::{Context, SubscriberExt};
         use tracing_subscriber::registry::LookupSpan;
@@ -4948,6 +4949,9 @@ mod tests {
             }
         }
         impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> tracing_subscriber::Layer<S> for Capture {
+            fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
             fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
                 if attrs.metadata().name() != "server.call_tool" {
                     return;
@@ -4979,10 +4983,6 @@ mod tests {
             }
         }
 
-        let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(capture.clone()),
-        );
         let broker = Arc::new(Broker::new());
         broker
             .register_silently(
@@ -5018,10 +5018,21 @@ mod tests {
         )
         .with_actor(second_actor, Some(kaijutsu_types::PrincipalId::new()));
 
-        let (first_result, second_result) = tokio::join!(
-            broker.call_tool(params("interleaved", "one"), &first, CancellationToken::new()),
-            broker.call_tool(params("interleaved", "two"), &second, CancellationToken::new()),
-        );
+        broker
+            .call_tool(params("interleaved", "one"), &first, CancellationToken::new())
+            .await
+            .expect("untraced prewarm call succeeds");
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+
+        let (first_result, second_result) = async {
+            tracing::callsite::rebuild_interest_cache();
+            tokio::join!(
+                broker.call_tool(params("interleaved", "one"), &first, CancellationToken::new()),
+                broker.call_tool(params("interleaved", "two"), &second, CancellationToken::new()),
+            )
+        }.with_subscriber(dispatch).await;
         first_result.unwrap();
         second_result.unwrap();
 
@@ -7920,7 +7931,7 @@ mod tests {
             kaish_script_id: None,
         });
 
-        let cc = CallContext::test();
+        let cc = approval_call_context(&kj, "kaish-escalate-allow");
         let pending = broker
             .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
@@ -7964,7 +7975,7 @@ mod tests {
             kaish_script_id: None,
         });
 
-        let cc = CallContext::test();
+        let cc = approval_call_context(&kj, "kaish-escalate-deny");
         let pending = broker
             .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
@@ -8410,15 +8421,7 @@ mod tests {
         name: &str,
     ) -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>, CallContext) {
         let (broker, _kernel, kj) = wired_kaish_broker(name).await;
-        let principal = kaijutsu_types::PrincipalId::new();
-        let context_id =
-            crate::kj::test_helpers::register_context(&kj, Some(name), None, principal);
-        let ctx = CallContext::new(
-            principal,
-            context_id,
-            kaijutsu_types::SessionId::new(),
-            kj.kernel_id(),
-        );
+        let ctx = approval_call_context(&kj, name);
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker
             .register_silently(svc, InstancePolicy::default())
@@ -10261,6 +10264,7 @@ mod tests {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             })
             .unwrap();
             // A real row in context_bindings (so the parent-row lookup
@@ -10391,6 +10395,19 @@ mod tests {
         row.request_id
     }
 
+    fn approval_call_context(kj: &crate::kj::KjDispatcher, label: &str) -> CallContext {
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let context_id = crate::kj::test_helpers::register_context(kj, Some(label), None, actor);
+        let db = kj.kernel_db();
+        let db = db.lock();
+        db.insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: reviewer, name: format!("{label}-reviewer"), created_at: 0, retired_at: None, handoff_ctx: None,
+        }).unwrap();
+        db.update_context_review(context_id, Some(actor), Some(reviewer)).unwrap();
+        CallContext::new(actor, context_id, kaijutsu_types::SessionId::new(), kj.kernel_id()).with_actor(actor, Some(reviewer))
+    }
+
     /// A hook `Ask` answered **allow** through the ledger lets the call
     /// proceed — the melt's happy path. The first call escalates and
     /// returns `GatePending` immediately (nothing run); once a human
@@ -10412,7 +10429,7 @@ mod tests {
             .entries
             .push(ask_entry("ask-allow", None));
 
-        let cc = CallContext::test();
+        let cc = approval_call_context(&d, "ask-allow");
         let pending = broker
             .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
@@ -10452,7 +10469,7 @@ mod tests {
             .entries
             .push(ask_entry("ask-deny", Some("about to do something risky")));
 
-        let cc = CallContext::test();
+        let cc = approval_call_context(&d, "ask-deny");
         let pending = broker
             .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
@@ -10499,8 +10516,9 @@ mod tests {
             .entries
             .push(ask_entry("ask-pending", None));
 
+        let cc = approval_call_context(&_d, "ask-pending");
         let err = broker
-            .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
+            .call_tool(params("svc", "t"), &cc, CancellationToken::new())
             .await
             .unwrap_err();
         match err {
@@ -10535,9 +10553,8 @@ mod tests {
             .entries
             .push(ask_entry("ask-row", Some("carries the row")));
 
-        let mut ctx = CallContext::test();
-        let target_ctx = ContextId::new();
-        ctx.context_id = target_ctx;
+        let ctx = approval_call_context(&d, "ask-row");
+        let target_ctx = ctx.context_id;
 
         // The first call escalates and returns immediately — no waiting, no
         // spawned task needed: the row is already durable by the time this

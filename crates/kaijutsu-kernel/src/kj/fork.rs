@@ -576,6 +576,7 @@ impl KjDispatcher {
             // whoever plays the source plays the child too.
             let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
             let source_reviewer_id = source_row.as_ref().and_then(|r| r.reviewer_id);
+            let source_director_id = source_row.as_ref().and_then(|r| r.director_id);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -606,6 +607,7 @@ impl KjDispatcher {
                 origin_host: None,
                 played_by: source_played_by,
                 reviewer_id: source_reviewer_id,
+                director_id: source_director_id,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -933,6 +935,7 @@ impl KjDispatcher {
             // whoever plays the source plays the child too.
             let source_played_by = source_row.played_by;
             let source_reviewer_id = source_row.reviewer_id;
+            let source_director_id = source_row.director_id;
 
             let row = ContextRow {
                 context_id: new_id,
@@ -959,6 +962,7 @@ impl KjDispatcher {
                 origin_host: None,
                 played_by: source_played_by,
                 reviewer_id: source_reviewer_id,
+                director_id: source_director_id,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1201,6 +1205,7 @@ impl KjDispatcher {
                     origin_host: None,
                     played_by: row.played_by,
                     reviewer_id: row.reviewer_id,
+                    director_id: None,
                 };
                 let default_ws =
                     match db.get_or_create_default_workspace(caller.principal_id) {

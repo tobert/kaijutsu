@@ -5240,6 +5240,7 @@ mod tests {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             })
             .unwrap();
 
@@ -6597,6 +6598,7 @@ mod tests {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             })
             .unwrap();
 

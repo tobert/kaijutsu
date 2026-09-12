@@ -2481,6 +2481,7 @@ fn bootstrap_discovered_context(
         origin_host: None,
         played_by: None,
         reviewer_id: None,
+        director_id: Some(PrincipalId::system()),
     };
     // No `unwrap_or_else(WorkspaceId::new)` here: a fabricated id names no row
     // in `workspaces`, so the fallback only converts a legible workspace error
@@ -2572,6 +2573,7 @@ mod context_bootstrap_tests {
             origin_host: None,
             played_by: None,
             reviewer_id: None,
+            director_id: None,
         };
         let ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -3727,7 +3729,8 @@ async fn create_context_inner(
         let db = state.kernel_db.lock();
         // An external MCP model acts as its credential character. A context
         // hosting a kernel model needs an explicit performer; the connected
-        // creator is its reviewer, never an inferred model identity.
+        // creator becomes its director, and the kernel resolves its effective
+        // reviewer from an explicit override, director delegation, or Amy's default.
         let played_by = match db.get_character(created_by) {
             Ok(character) if context_type == "mcp" => character.map(|c| c.principal_id),
             Ok(_) => None,
@@ -3764,7 +3767,8 @@ async fn create_context_inner(
             cast_id: None,
             origin_host: None,
             played_by,
-            reviewer_id: (context_type != "mcp").then_some(created_by),
+            reviewer_id: None,
+            director_id: Some(created_by),
         };
         // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
         // no row in `workspaces`, so it only turns a legible workspace error
@@ -3878,7 +3882,7 @@ impl kernel::Server for KernelImpl {
                 // instance per execute call — durable env + cwd persist in the
                 // DB, transient scope dies with the instance.
                 let started_ctx = connection.borrow().require_context()?;
-                let reviewer = context_reviewer(&kernel, started_ctx)?;
+                let reviewer = context_reviewer(&kernel, started_ctx).await;
                 let kaish = materialize_context_shell(&kernel, &connection).await?;
 
                 // Same ruling as `execute_shell_command`/`execute_kj_command`
@@ -4197,7 +4201,8 @@ impl kernel::Server for KernelImpl {
         };
         let writable = params.get_writable();
 
-        let kernel_arc = self.kernel.kernel.clone();
+        let kernel = self.kernel.clone();
+        let kernel_arc = kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "mount");
         Promise::from_future(
@@ -4271,8 +4276,9 @@ impl kernel::Server for KernelImpl {
         let tool_params = pry!(pry!(call.get_params()).to_str()).to_owned();
         let request_id = pry!(pry!(call.get_request_id()).to_str()).to_owned();
 
-        let kernel_arc = self.kernel.kernel.clone();
-        let _kernel_id = self.kernel.id;
+        let kernel = self.kernel.clone();
+        let kernel_arc = kernel.kernel.clone();
+        let _kernel_id = kernel.id;
 
         // Extract identity and resolve cwd from the context's durable L1 state.
         let (principal_id, context_id, session_id) = {
@@ -4284,13 +4290,13 @@ impl kernel::Server for KernelImpl {
             )
         };
         trace_span.record("principal.id", principal_id.to_string());
-        let cwd = context_cwd(&self.kernel, context_id);
-        let reviewer = pry!(context_reviewer(&self.kernel, context_id));
+        let cwd = context_cwd(&kernel, context_id);
 
         Promise::from_future(
             async move {
                 let mut result = results.get().init_result();
                 result.set_request_id(&request_id);
+                let reviewer = context_reviewer(&kernel, context_id).await;
 
                 let tool_ctx = match cwd {
                     Some(cwd) => kaijutsu_kernel::ExecContext::new(
@@ -5638,7 +5644,7 @@ impl kernel::Server for KernelImpl {
                     session_id,
                     kernel.kernel.id(),
                 ),
-            }.with_actor(principal_id, context_reviewer(&kernel, context_id)?);
+            }.with_actor(principal_id, context_reviewer(&kernel, context_id).await);
             let exec = match kernel
                 .kernel
                 .dispatch_tool_via_broker(&tool_name, &arguments, &exec_ctx)
@@ -6004,7 +6010,7 @@ impl kernel::Server for KernelImpl {
                     context_id,
                     session_id,
                     kernel.id,
-                ).with_actor(principal_id, context_reviewer(&kernel, context_id)?);
+                ).with_actor(principal_id, context_reviewer(&kernel, context_id).await);
                 let report = kernel
                     .kernel
                     .broker()
@@ -9771,7 +9777,7 @@ async fn materialize_context_shell_for(
             conn.session_id,
         )
     };
-    let reviewer = context_reviewer(kernel, context_id)?;
+    let reviewer = context_reviewer(kernel, context_id).await;
     // One materialization path for both shells: read the index + block source
     // off the dispatcher (the server installs the index there at bootstrap via
     // `set_semantic_index`), the same accessors the in-kernel model shell uses.
@@ -9793,14 +9799,17 @@ async fn materialize_context_shell_for(
         .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))
 }
 
-fn context_reviewer(
+async fn context_reviewer(
     kernel: &SharedKernelState,
     context_id: ContextId,
-) -> Result<Option<PrincipalId>, capnp::Error> {
-    kernel.kernel_db.lock().get_context(context_id)
-        .map_err(|e| capnp::Error::failed(format!("Could not read reviewer assignment: {e}")))?
-        .map(|row| row.reviewer_id)
-        .ok_or_else(|| capnp::Error::failed(format!("No such context: {context_id}")))
+) -> Option<PrincipalId> {
+    match kernel.kernel.resolve_context_review(context_id).await {
+        Ok(review) => Some(review.reviewer.principal_id),
+        Err(error) => {
+            log::warn!("approval reviewer unavailable for direct RPC in {context_id}: {error}");
+            None
+        }
+    }
 }
 
 /// Validate and persist a durable cwd through the same backend used by `cd`.
@@ -10032,7 +10041,7 @@ async fn execute_shell_command(
         context_id,
         connection.borrow().session_id,
         kernel.id,
-    ).with_actor(user_principal_id, context_reviewer(kernel, context_id)?);
+    ).with_actor(user_principal_id, context_reviewer(kernel, context_id).await);
     match kernel_arc.broker().shell_pre_call_hooks(code, &call_ctx).await {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {
@@ -10457,7 +10466,7 @@ async fn execute_kj_command(
         context_id,
         connection.borrow().session_id,
         kernel.id,
-    ).with_actor(principal, context_reviewer(kernel, context_id)?);
+    ).with_actor(principal, context_reviewer(kernel, context_id).await);
     match kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {

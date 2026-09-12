@@ -3,7 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use kaijutsu_types::{BlockId, ConsentMode, ContentType, ContextId, ContextState, EdgeKind, PrincipalId};
 
-use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome};
+use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
 
 use super::format::{
     format_context_info, format_context_table, format_context_tree, format_fork_lineage,
@@ -116,7 +116,7 @@ enum ContextCommand {
         /// Parent context to fork the structural edge from
         #[arg(long, short = 'p')]
         parent: Option<String>,
-        /// Existing live character performing model work. The caller reviews it
+        /// Existing live character performing model work. Amy reviews unless explicitly delegated
         #[arg(long = "as", value_name = "CHARACTER")]
         character: Option<String>,
         #[command(flatten)]
@@ -141,9 +141,15 @@ enum ContextCommand {
         /// Existing live character performing model work
         #[arg(long = "as", value_name = "CHARACTER")]
         character: Option<String>,
-        /// Existing live character directing and reviewing this work
+        /// Existing live character who explicitly reviews this context's work
         #[arg(long, value_name = "CHARACTER")]
         reviewer: Option<String>,
+        /// Remove this context's explicit reviewer override
+        #[arg(long)]
+        clear_reviewer: bool,
+        /// Existing live character directing this work
+        #[arg(long, value_name = "CHARACTER")]
+        director: Option<String>,
         #[command(flatten)]
         config: ContextConfigArgs,
     },
@@ -288,7 +294,10 @@ struct ContextConfig {
 struct ReviewAssignment {
     actor: Option<kaijutsu_types::PrincipalId>,
     reviewer: Option<kaijutsu_types::PrincipalId>,
-    assigned_by: kaijutsu_types::PrincipalId,
+    director: Option<kaijutsu_types::PrincipalId>,
+    caller_actor: kaijutsu_types::PrincipalId,
+    routing_changed: bool,
+    expected_reviewer: kaijutsu_types::PrincipalId,
 }
 
 /// A `--model` spec resolved against the LLM registry: a bare model name has
@@ -296,6 +305,44 @@ struct ReviewAssignment {
 struct ResolvedModel {
     provider: Option<String>,
     model: Option<String>,
+}
+
+/// Insert a new context only while its model approval assignment is valid.
+/// The check follows insertion within one database transaction so retirement or
+/// delegation changes cannot leave a visible self-reviewed model context.
+fn insert_new_context_checked(
+    db: &KernelDb,
+    row: &ContextRow,
+    parent_id: Option<ContextId>,
+) -> KernelDbResult<()> {
+    db.in_transaction(|db| {
+        if let Some(performer) = row.played_by {
+            if !db.get_character(performer)?.is_some_and(|sheet| sheet.retired_at.is_none()) {
+                return Err(KernelDbError::Validation("performer must name a live character".into()));
+            }
+            let default_ws = db.get_or_create_default_workspace(row.created_by)?;
+            db.insert_context_with_document(row, default_ws)?;
+            let reviewer = db.effective_approval_reviewer(row.context_id)?
+                .ok_or_else(|| KernelDbError::Validation("no configured approval reviewer".into()))?;
+            if performer == reviewer {
+                return Err(KernelDbError::Validation("the performer cannot review its own work".into()));
+            }
+        } else {
+            let default_ws = db.get_or_create_default_workspace(row.created_by)?;
+            db.insert_context_with_document(row, default_ws)?;
+        }
+        if let Some(source_id) = parent_id {
+            db.insert_edge(&ContextEdgeRow {
+                edge_id: uuid::Uuid::now_v7(),
+                source_id,
+                target_id: row.context_id,
+                kind: EdgeKind::Structural,
+                metadata: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+            })?;
+        }
+        Ok(())
+    })
 }
 
 impl KjDispatcher {
@@ -387,16 +434,39 @@ impl KjDispatcher {
                 if let Some(review) = &cfg.review {
                     let current = db.get_context(target_id)?
                         .ok_or_else(|| crate::kernel_db::KernelDbError::Validation("context disappeared before assignment".into()))?;
-                    if current.reviewer_id.unwrap_or(current.created_by) != review.assigned_by {
-                        return Err(crate::kernel_db::KernelDbError::Validation("only the assigned reviewer may change the performer or reviewer".into()));
+                    let is_default = db.cached_default_approval_reviewer()? == Some(review.caller_actor);
+                    if review.routing_changed && !is_default {
+                        return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
                     }
-                    for principal in [review.actor, review.reviewer].into_iter().flatten() {
-                        let live = db.get_character(principal)?.is_some_and(|sheet| sheet.retired_at.is_none());
-                        if !live {
-                            return Err(crate::kernel_db::KernelDbError::Validation("performer and reviewer must name live characters".into()));
+                    if !review.routing_changed && !is_default {
+                        let current_reviewer = db.effective_approval_reviewer(target_id)?
+                            .ok_or_else(|| crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()))?;
+                        if review.caller_actor != review.expected_reviewer || current_reviewer != review.expected_reviewer {
+                            return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
                         }
                     }
-                    db.update_context_review(target_id, review.actor, review.reviewer)?;
+                    if db.list_pending_asks()?.iter().any(|ask| ask.context_id.as_slice() == target_id.as_bytes()) {
+                        return Err(crate::kernel_db::KernelDbError::Validation("settle or cancel pending asks before changing this context's approval assignment".into()));
+                    }
+                    for (principal, must_be_live, field) in [
+                        (review.actor, review.actor.is_some(), "performer"),
+                        (review.reviewer, review.reviewer != current.reviewer_id, "reviewer"),
+                        (review.director, review.director != current.director_id, "director"),
+                    ] {
+                        if must_be_live {
+                            if let Some(principal) = principal {
+                                if !db.get_character(principal)?.is_some_and(|sheet| sheet.retired_at.is_none()) {
+                                    return Err(crate::kernel_db::KernelDbError::Validation(format!("{field} must name a live character")));
+                                }
+                            }
+                        }
+                    }
+                    db.update_context_review_assignment(target_id, review.actor, review.reviewer, review.director)?;
+                    let candidate_reviewer = db.effective_approval_reviewer(target_id)?
+                        .ok_or_else(|| crate::kernel_db::KernelDbError::Validation("no configured approval reviewer".into()))?;
+                    if review.actor == Some(candidate_reviewer) {
+                        return Err(crate::kernel_db::KernelDbError::Validation("the performer cannot review its own work".into()));
+                    }
                     changes.push("performer/reviewer".into());
                 }
 
@@ -566,8 +636,8 @@ impl KjDispatcher {
             ContextCommand::Rebind { context } => {
                 self.context_rebind(context.as_deref(), caller).await
             }
-            ContextCommand::Set { context, character, reviewer, config } => {
-                self.context_set(context.as_deref(), character.as_deref(), reviewer.as_deref(), config.into(), caller).await
+            ContextCommand::Set { context, character, reviewer, clear_reviewer, director, config } => {
+                self.context_set(context.as_deref(), character.as_deref(), reviewer.as_deref(), clear_reviewer, director.as_deref(), config.into(), caller).await
             }
             ContextCommand::Unset { context, env, cast } => {
                 self.context_unset(context.as_deref(), env.as_deref(), cast, caller)
@@ -864,18 +934,26 @@ impl KjDispatcher {
         if let Some(ref name) = played_by_name {
             info.push_str(&format!("\nPlayed by: {name}"));
         }
-        let reviewer_name = match row.reviewer_id {
-            Some(id) => {
-                let db = self.kernel_db().lock();
-                match db.get_character(id) {
-                    Ok(sheet) => sheet.map(|sheet| sheet.name),
-                    Err(e) => return KjResult::Err(format!("kj context info: reviewer lookup: {e}")),
-                }
+        let (effective_review, reviewer_error) = match self.kernel().resolve_context_review(row.context_id).await {
+            Ok(review) => (Some(review), None),
+            Err(error) => {
+                info.push_str(&format!("\nReviewer error: {error}"));
+                (None, Some(error))
             }
-            None => None,
         };
-        if let Some(ref name) = reviewer_name {
-            info.push_str(&format!("\nReviewer: {name}"));
+        let reviewer_name = effective_review.as_ref().map(|review| review.reviewer.name.clone());
+        if let Some(review) = effective_review.as_ref() {
+            info.push_str(&format!("\nReviewer: {} ({})", review.reviewer.name, review.source.as_str()));
+        }
+        if let Some(override_id) = row.reviewer_id {
+            info.push_str(&format!("\nReviewer override: {override_id}"));
+        }
+        if let Some(director) = row.director_id {
+            let director_name = match self.kernel_db().lock().get_character(director) {
+                Ok(character) => character.map(|character| character.name).unwrap_or_else(|| director.to_string()),
+                Err(error) => return KjResult::Err(format!("kj context info: director lookup: {error}")),
+            };
+            info.push_str(&format!("\nDirector: {director_name}"));
         }
 
         // Structured record: full ids and the same fields the text view
@@ -948,8 +1026,12 @@ impl KjDispatcher {
                 "context_used_pct": context_used_pct,
             })),
         });
-        record["reviewer_id"] = serde_json::json!(row.reviewer_id.map(|id| id.to_hex()));
+        record["reviewer_id"] = serde_json::json!(effective_review.as_ref().map(|review| review.reviewer.principal_id.to_hex()));
         record["reviewer_name"] = serde_json::json!(reviewer_name);
+        record["review_source"] = serde_json::json!(effective_review.as_ref().map(|review| review.source.as_str()));
+        record["reviewer_error"] = serde_json::json!(reviewer_error);
+        record["reviewer_override_id"] = serde_json::json!(row.reviewer_id.map(|id| id.to_hex()));
+        record["director_id"] = serde_json::json!(row.director_id.map(|id| id.to_hex()));
 
         KjResult::ok_with_data(info, record)
     }
@@ -983,7 +1065,7 @@ impl KjDispatcher {
     async fn context_prompt(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         // Same !Send guard-scoping constraint as context_info: KernelDb's
         // parking_lot::MutexGuard must not cross an `.await` below.
-        let (target_id, row, cast_label, performer, reviewer) = {
+        let (target_id, row, cast_label, performer, _) = {
             let db = self.kernel_db().lock();
 
             // Resolve target context (default: current)
@@ -1016,12 +1098,11 @@ impl KjDispatcher {
                 Ok(value) => value,
                 Err(error) => return error,
             };
-            let reviewer = match row.reviewer_id.map(character).transpose() {
-                Ok(value) => value,
-                Err(error) => return error,
-            };
-
-            (target_id, row, cast_label, performer, reviewer)
+            (target_id, row, cast_label, performer, ())
+        };
+        let reviewer = match self.kernel().resolve_context_review(target_id).await {
+            Ok(review) => Some(review.reviewer),
+            Err(error) => return KjResult::Err(format!("kj context prompt: {error}")),
         };
 
         // Situational label/state/provider/model come from the live
@@ -1244,12 +1325,14 @@ impl KjDispatcher {
         };
         let new_id = ContextId::new();
 
-        // Resolve the performer under the same lock as insertion so retirement
-        // cannot happen between validation and the new context becoming visible.
+        // Resolve the performer before validating its model assignment. The
+        // final insertion repeats the liveness and reviewer checks under its
+        // transaction because either can change while that async validation runs.
         // The requester remains the author of creation and rc output.
         {
-            let db = self.kernel_db().lock();
-            let played_by = match character {
+            let played_by = {
+                let db = self.kernel_db().lock();
+                match character {
                 Some(name) => match db.get_character_by_name(name) {
                     Ok(Some(row)) if row.retired_at.is_none() => Some(row.principal_id),
                     Ok(Some(_)) => return KjResult::Err(format!(
@@ -1260,16 +1343,14 @@ impl KjDispatcher {
                     )),
                     Err(e) => return KjResult::Err(format!("kj context create: {e}")),
                 },
-                None => None,
+                    None => None,
+                }
             };
-            if played_by == Some(caller.actor_id) {
-                return KjResult::Err("kj context create: the performer cannot review its own work; create a distinct performer".into());
+            if let Some(performer) = played_by {
+                if let Err(error) = self.kernel().validate_model_review_assignment(performer, Some(caller.actor_id), None).await {
+                    return KjResult::Err(format!("kj context create: {error}"));
+                }
             }
-            let default_ws = match db.get_or_create_default_workspace(caller.principal_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
-            };
-
             let row = ContextRow {
                 context_id: new_id,
                 label: Some(label.to_string()),
@@ -1294,25 +1375,12 @@ impl KjDispatcher {
                 cast_id: None,
                 origin_host: None,
                 played_by,
-                reviewer_id: Some(caller.actor_id),
+                reviewer_id: None,
+                director_id: Some(caller.actor_id),
             };
-            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
+            let db = self.kernel_db().lock();
+            if let Err(e) = insert_new_context_checked(&db, &row, parent_id) {
                 return KjResult::Err(format!("kj context create: {e}"));
-            }
-
-            // Insert structural edge if parent specified
-            if let Some(pid) = parent_id {
-                let edge = ContextEdgeRow {
-                    edge_id: uuid::Uuid::now_v7(),
-                    source_id: pid,
-                    target_id: new_id,
-                    kind: EdgeKind::Structural,
-                    metadata: None,
-                    created_at: kaijutsu_types::now_millis() as i64,
-                };
-                if let Err(e) = db.insert_edge(&edge) {
-                    tracing::warn!("failed to insert structural edge: {e}");
-                }
             }
         }
 
@@ -1531,7 +1599,8 @@ impl KjDispatcher {
                 cast_id: None,
                 origin_host: None,
                 played_by: None,
-                reviewer_id: Some(caller.actor_id),
+                reviewer_id: None,
+                director_id: Some(caller.actor_id),
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
@@ -1556,6 +1625,8 @@ impl KjDispatcher {
         target_arg: Option<&str>,
         character: Option<&str>,
         reviewer: Option<&str>,
+        clear_reviewer: bool,
+        director: Option<&str>,
         mut cfg: ContextConfig,
         caller: &KjCaller,
     ) -> KjResult {
@@ -1574,33 +1645,64 @@ impl KjDispatcher {
             }
         };
 
-        if character.is_some() || reviewer.is_some() {
-            let db = self.kernel_db().lock();
-            let assignment = (|| -> Result<ReviewAssignment, String> {
-                let row = db.get_context(target_id).map_err(|e| e.to_string())?
-                    .ok_or_else(|| "context not found".to_string())?;
-                if row.reviewer_id.unwrap_or(row.created_by) != caller.actor_id {
-                    return Err("only the assigned reviewer may change the performer or reviewer".into());
+        if character.is_some() || reviewer.is_some() || clear_reviewer || director.is_some() {
+            if reviewer.is_some() && clear_reviewer {
+                return KjResult::Err("kj context set: --reviewer and --clear-reviewer cannot be used together".into());
+            }
+            let changes_routing = reviewer.is_some() || clear_reviewer || director.is_some();
+            let authority = match self.kernel().default_approval_reviewer().await {
+                Ok(authority) => Some(authority),
+                Err(error) if changes_routing => return KjResult::Err(format!("kj context set: {error}")),
+                Err(error) => {
+                    tracing::warn!("could not load default approval reviewer while assigning performer: {error}");
+                    None
                 }
-                let resolve = |name: &str| -> Result<kaijutsu_types::PrincipalId, String> {
-                    let sheet = db.get_character_by_name(name).map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("no character named '{name}'"))?;
-                    if sheet.retired_at.is_some() {
-                        return Err(format!("character '{name}' is retired"));
-                    }
-                    Ok(sheet.principal_id)
-                };
-                let actor = character.map(resolve).transpose()?.or(row.played_by);
-                let reviewer = reviewer.map(resolve).transpose()?.or(row.reviewer_id).or(Some(caller.actor_id));
-                if actor.is_some() && actor == reviewer {
-                    return Err("the performer cannot review its own work".into());
-                }
-                Ok(ReviewAssignment { actor, reviewer, assigned_by: caller.actor_id })
-            })();
-            cfg.review = match assignment {
-                Ok(assignment) => Some(assignment),
-                Err(e) => return KjResult::Err(format!("kj context set: {e}")),
             };
+            if changes_routing && authority != Some(caller.actor_id) {
+                return KjResult::Err("kj context set: only the default reviewer may change approval routing".into());
+            }
+            let expected_reviewer = if authority != Some(caller.actor_id) {
+                let effective = match self.kernel().resolve_context_review(target_id).await {
+                    Ok(review) => review,
+                    Err(error) => return KjResult::Err(format!("kj context set: {error}")),
+                };
+                if caller.actor_id != effective.reviewer.principal_id {
+                    return KjResult::Err("kj context set: only the default or effective reviewer may assign a performer".into());
+                }
+                effective.reviewer.principal_id
+            } else {
+                caller.actor_id
+            };
+            let assignment = {
+                let db = self.kernel_db().lock();
+                (|| -> Result<ReviewAssignment, String> {
+                    let row = db.get_context(target_id).map_err(|e| e.to_string())?
+                        .ok_or_else(|| "context not found".to_string())?;
+                    if db.list_pending_asks().map_err(|e| e.to_string())?.iter().any(|ask| ask.context_id.as_slice() == target_id.as_bytes()) {
+                        return Err("settle or cancel pending asks before changing this context's approval assignment".into());
+                    }
+                    let resolve = |name: &str| -> Result<kaijutsu_types::PrincipalId, String> {
+                        let sheet = db.get_character_by_name(name).map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("no character named '{name}'"))?;
+                        if sheet.retired_at.is_some() { return Err(format!("character '{name}' is retired")); }
+                        Ok(sheet.principal_id)
+                    };
+                    let actor = character.map(resolve).transpose()?.or(row.played_by);
+                    let reviewer = if clear_reviewer { None } else { reviewer.map(resolve).transpose()?.or(row.reviewer_id) };
+                    let director = director.map(resolve).transpose()?.or(row.director_id);
+                    Ok(ReviewAssignment { actor, reviewer, director, caller_actor: caller.actor_id, routing_changed: changes_routing, expected_reviewer })
+                })()
+            };
+            let assignment = match assignment { Ok(value) => value, Err(error) => return KjResult::Err(format!("kj context set: {error}")) };
+            let review = if let Some(performer) = assignment.actor {
+                self.kernel().validate_model_review_assignment(performer, assignment.director, assignment.reviewer).await
+            } else {
+                self.kernel().resolve_review_assignment(assignment.actor, assignment.director, assignment.reviewer).await
+            };
+            if let Err(error) = review {
+                return KjResult::Err(format!("kj context set: {error}"));
+            }
+            cfg.review = Some(assignment);
         }
 
         match self
@@ -2250,11 +2352,12 @@ impl Classify for ContextCommand {
 
 #[cfg(test)]
 mod tests {
+    use super::{insert_new_context_checked, ContextConfig, ReviewAssignment};
     use crate::kernel_db::ContextEdgeRow;
     #[allow(unused_imports)]
     use crate::kj::KjResult;
     use crate::kj::test_helpers::*;
-    use kaijutsu_types::{ContextState, EdgeKind, PrincipalId};
+    use kaijutsu_types::{ConsentMode, ContextId, ContextState, EdgeKind, PrincipalId};
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -2401,6 +2504,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_reviewer_repairs_a_retired_explicit_reviewer() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let retired = PrincipalId::new();
+        let owner = PrincipalId::new();
+        let context = register_context(&d, Some("repair-reviewer"), None, owner);
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired-reviewer".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None }).unwrap();
+            db.set_default_approval_reviewer(amy).unwrap();
+            db.update_context_review_assignment(context, None, Some(retired), None).unwrap();
+        }
+        let caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let result = d.dispatch(&[s("context"), s("set"), s("."), s("--reviewer"), s("amy")], &caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(row.reviewer_id, Some(amy));
+        assert_eq!(d.kernel().resolve_context_review(context).await.unwrap().reviewer.principal_id, amy);
+    }
+
+    #[tokio::test]
+    async fn explicit_reviewer_can_assign_a_performer_when_default_is_retired() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let lead = PrincipalId::new();
+        let coder = PrincipalId::new();
+        let context = register_context(&d, Some("explicit-reviewer"), None, amy);
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id,
+                    name: name.into(),
+                    created_at: 0,
+                    retired_at: None,
+                    handoff_ctx: None,
+                }).unwrap();
+            }
+            db.update_context_review_assignment(context, None, Some(lead), Some(amy)).unwrap();
+            db.conn_for_ledger().execute(
+                "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1",
+                [amy.as_bytes().as_slice()],
+            ).unwrap();
+        }
+        let lead_caller = crate::kj::KjCaller {
+            principal_id: lead,
+            actor_id: lead,
+            reviewer_id: None,
+            context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: false,
+        };
+        let assign = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder")], &lead_caller).await;
+        assert!(assign.is_ok(), "{}", assign.message());
+        let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(row.played_by, Some(coder));
+        assert_eq!(row.reviewer_id, Some(lead));
+        assert_eq!(row.director_id, Some(amy), "retaining a retired director does not block performer repair");
+
+        let routing = d.dispatch(&[s("context"), s("set"), s("."), s("--reviewer"), s("coder")], &lead_caller).await;
+        assert!(!routing.is_ok());
+        assert!(routing.message().contains("retired") || routing.message().contains("default reviewer"), "{}", routing.message());
+        let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(row.reviewer_id, Some(lead));
+    }
+
+    #[tokio::test]
+    async fn pending_ask_blocks_default_reviewer_routing_changes() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let coder = PrincipalId::new();
+        let director = PrincipalId::new();
+        let context = register_context(&d, Some("pending-routing"), None, amy);
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name) in [(coder, "coder"), (director, "lead")] {
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None }).unwrap();
+            }
+            db.set_default_approval_reviewer(amy).unwrap();
+            db.update_context_review_assignment(context, Some(coder), Some(amy), None).unwrap();
+        }
+        let gate_caller = crate::kj::KjCaller { principal_id: amy, actor_id: coder, reviewer_id: Some(amy), context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let spec = crate::kj::gate::GateSpec { origin: approval_ledger::types::Origin::Hook, instance: "test".into(), tool: "test".into(), hook_id: None, description: "pending".into(), authorized_label: "pending".into(), statements: vec![crate::kj::gate::GatedStatement { rendered: "pending".into(), statement_kind: "test".into(), vars: vec![], source_index: None }], exec_source: None, planned: vec![] };
+        let outcome = crate::kj::gate::run_gate(d.kernel_db(), &gate_caller, spec, d.kernel().ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+        assert!(outcome.ask.is_some());
+        let amy_caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        for argv in [[s("context"), s("set"), s("."), s("--reviewer"), s("lead")], [s("context"), s("set"), s("."), s("--director"), s("lead")]] {
+            let result = d.dispatch(&argv, &amy_caller).await;
+            assert!(!result.is_ok());
+            assert!(result.message().contains("settle or cancel pending asks"), "{}", result.message());
+        }
+        let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(row.reviewer_id, Some(amy));
+        assert_eq!(row.director_id, None);
+    }
+
+    #[tokio::test]
+    async fn context_info_keeps_metadata_when_explicit_reviewer_is_retired() {
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let retired = PrincipalId::new();
+        let context = register_context(&d, Some("broken-review"), None, owner);
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None }).unwrap();
+            db.update_context_review_assignment(context, Some(owner), Some(retired), None).unwrap();
+        }
+        let caller = crate::kj::KjCaller { principal_id: owner, actor_id: owner, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let result = d.dispatch(&[s("context"), s("info"), s(".")], &caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert!(result.message().contains("Reviewer error:"));
+        let KjResult::Ok { data: Some(data), .. } = result else { panic!("context info has data") };
+        assert_eq!(data["reviewer_id"], serde_json::Value::Null);
+        assert!(data["reviewer_error"].as_str().unwrap().contains("retired"));
+        assert_eq!(data["reviewer_override_id"], retired.to_hex());
+        assert_eq!(data["played_by"], owner.to_hex());
+    }
+
+    #[tokio::test]
+    async fn final_assignment_rejects_reviewer_revoked_after_precheck() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let lead = PrincipalId::new();
+        let coder = PrincipalId::new();
+        let context = register_context(&d, Some("stale-reviewer"), None, amy);
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None }).unwrap();
+            }
+            db.set_default_approval_reviewer(amy).unwrap();
+            db.update_context_review_assignment(context, None, None, Some(lead)).unwrap();
+            db.grant_approval_delegation(lead, lead, amy).unwrap();
+        }
+        let expected = d.kernel().resolve_context_review(context).await.unwrap();
+        assert_eq!(expected.reviewer.principal_id, lead);
+        d.kernel_db().lock().revoke_approval_delegation(lead, amy).unwrap();
+        let cfg = ContextConfig { review: Some(ReviewAssignment { actor: Some(coder), reviewer: None, director: Some(lead), caller_actor: lead, routing_changed: false, expected_reviewer: lead }), ..Default::default() };
+        let error = d.apply_context_config(context, &cfg, None, None).await.unwrap_err();
+        assert!(error.contains("authority changed"), "{error}");
+        let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(row.played_by, None);
+        assert_eq!(row.director_id, Some(lead));
+    }
+
+    #[tokio::test]
     async fn context_create_basic() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
@@ -2437,10 +2688,20 @@ mod tests {
     #[tokio::test]
     async fn context_review_assignment_belongs_to_the_director() {
         let d = test_dispatcher().await;
-        let amy = test_caller();
+        let amy_id = test_reviewer_principal();
+        let amy = crate::kj::KjCaller {
+            principal_id: amy_id,
+            actor_id: amy_id,
+            reviewer_id: None,
+            context_id: None,
+            session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: true,
+        };
         let coder = PrincipalId::new();
         let lead = PrincipalId::new();
-        for (principal_id, name) in [(amy.actor_id, "amy"), (coder, "coder"), (lead, "lead")] {
+        for (principal_id, name) in [(coder, "coder"), (lead, "lead")] {
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
                 principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None,
             }).unwrap();
@@ -2455,9 +2716,8 @@ mod tests {
         let coder_call = amy.clone().with_actor(coder, Some(lead));
         let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("amy")], &coder_call).await;
         assert!(!refused.is_ok());
-        assert!(refused.message().contains("only the assigned reviewer"));
-        let lead_call = amy.with_actor(lead, None);
-        let self_review = d.dispatch(&[s("context"), s("set"), s("."), s("--reviewer"), s("coder")], &lead_call).await;
+        assert!(refused.message().contains("only the default or effective reviewer"));
+        let self_review = d.dispatch(&[s("context"), s("set"), s("."), s("--reviewer"), s("coder")], &amy).await;
         assert!(!self_review.is_ok());
         assert!(self_review.message().contains("cannot review"));
         let unchanged = d.kernel_db().lock().get_context(context).unwrap().unwrap();
@@ -2473,7 +2733,7 @@ mod tests {
         let help = result.message();
         println!("{help}");
         assert!(help.contains("--as <CHARACTER>"));
-        assert!(help.contains("caller reviews"));
+        assert!(help.contains("Amy reviews"));
         let set = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("banto")], &test_caller()).await;
         assert!(!set.is_ok(), "unknown context or character is refused");
     }
@@ -2608,12 +2868,8 @@ mod tests {
             principal_id: PrincipalId::new(), name: s("retired"), created_at: 1,
             retired_at: Some(2), handoff_ctx: None,
         }).unwrap();
-        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: caller.actor_id, name: s("self"), created_at: 1,
-            retired_at: None, handoff_ctx: None,
-        }).unwrap();
         let before = d.kernel_db().lock().list_documents().unwrap().len();
-        for (name, expected) in [("missing", "no character named"), ("retired", "is retired"), ("self", "cannot review")] {
+        for (name, expected) in [("missing", "no character named"), ("retired", "is retired")] {
             let result = d.dispatch(
                 &[s("context"), s("create"), s("refused"), s("--as"), s(name)], &caller,
             ).await;
@@ -2622,6 +2878,109 @@ mod tests {
             assert_eq!(d.kernel_db().lock().list_documents().unwrap().len(), before);
             assert!(d.kernel_db().lock().resolve_context("refused").is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn final_context_insert_rejects_a_performer_retired_after_validation() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let performer = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: performer,
+                name: s("retired-between-checks"),
+                created_at: 1,
+                retired_at: Some(2),
+                handoff_ctx: None,
+            }).unwrap();
+            db.set_default_approval_reviewer(amy).unwrap();
+        }
+        let context_id = ContextId::new();
+        let row = crate::kernel_db::ContextRow {
+            context_id,
+            label: Some(s("must-not-insert")),
+            provider: None,
+            model: None,
+            system_prompt: None,
+            consent_mode: ConsentMode::Collaborative,
+            context_state: ContextState::Live,
+            context_type: s("default"),
+            created_at: 1,
+            created_by: amy,
+            forked_from: None,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+            concluded_at: None,
+            last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            cast_id: None,
+            origin_host: None,
+            played_by: Some(performer),
+            reviewer_id: None,
+            director_id: Some(amy),
+        };
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, None).unwrap_err();
+        assert!(error.to_string().contains("performer must name a live character"), "{error}");
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(context_id).unwrap().is_none());
+        assert!(!db.list_documents().unwrap().iter().any(|doc| doc.document_id == context_id));
+    }
+
+    #[tokio::test]
+    async fn final_context_insert_rejects_a_reviewer_changed_to_the_performer() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let performer = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: performer,
+                name: s("reviewer-changed-after-validation"),
+                created_at: 1,
+                retired_at: None,
+                handoff_ctx: None,
+            }).unwrap();
+            db.set_default_approval_reviewer(amy).unwrap();
+            db.grant_approval_delegation(performer, performer, amy).unwrap();
+        }
+        let context_id = ContextId::new();
+        let row = crate::kernel_db::ContextRow {
+            context_id,
+            label: Some(s("must-not-self-review")),
+            provider: None,
+            model: None,
+            system_prompt: None,
+            consent_mode: ConsentMode::Collaborative,
+            context_state: ContextState::Live,
+            context_type: s("default"),
+            created_at: 1,
+            created_by: amy,
+            forked_from: None,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+            concluded_at: None,
+            last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            cast_id: None,
+            origin_host: None,
+            played_by: Some(performer),
+            reviewer_id: None,
+            director_id: Some(performer),
+        };
+        let error = insert_new_context_checked(&d.kernel_db().lock(), &row, None).unwrap_err();
+        assert!(error.to_string().contains("cannot review its own work"), "{error}");
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(context_id).unwrap().is_none());
+        assert!(!db.list_documents().unwrap().iter().any(|doc| doc.document_id == context_id));
     }
 
     #[tokio::test]

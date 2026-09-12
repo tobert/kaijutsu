@@ -1249,3 +1249,30 @@ state, and actor exit clears authenticated identity. The full headless app
 suite and client suite passed, with focused capture tests for exported trace
 parents, concurrent tool actors, and approval replay. GUI and macOS execution
 remain unverified; this followup did not restart Amy's running processes.
+
+Amy clarified the default: "Amy approves by default; delegate approval
+explicitly", then "Allow an explicit director-wide delegation". A creator's
+role as director is now separate from reviewer authority. Resolution prefers
+an explicit context override, then a grant for the director, then the
+configured default reviewer. A grant may name the director or a separate
+adjudicator; it neither creates that character nor schedules a review turn.
+Amy controls grants and routing changes, and can explicitly reclaim a pending
+ask from an unavailable reviewer. The audit keeps the caller separate from
+the old and new reviewer.
+
+Revocation exposed two timing boundaries. A running turn may retain an old
+reviewer, so the gate resolves the current assignment while inserting its
+ask. An assignment command may await configuration after checking authority,
+so its transaction checks authority again before committing. Pending asks
+must settle or cancel before their context's routing changes. The migration
+clears old automatic reviewer assignments with the new director column in
+one transaction; an injected reset failure verifies rollback and reopening.
+
+The SSH/RPC regression uses Amy, lead, coder, and judge credentials. It checks
+Amy-default review, refused self-grants, judge approval after explicit
+delegation, Amy reclaim, pending-ask refusal on revoke, and Amy routing after
+revoke. Kaibo's DeepSeek review found that broken reviewer metadata also hid
+the context information needed for repair, and that eager default resolution
+overrode valid explicit assignments. Inspection now exposes the error;
+invalid default configuration clears its cached authority without replacing
+a valid explicit reviewer.

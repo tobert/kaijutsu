@@ -329,6 +329,7 @@ impl KjDispatcher {
             origin_host: None,
             played_by: Some(target.principal_id),
             reviewer_id: None,
+            director_id: None,
         };
         db.insert_context_with_document(&row, default_ws)
             .map_err(|e| e.to_string())?;

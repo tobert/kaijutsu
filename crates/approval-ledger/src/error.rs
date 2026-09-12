@@ -57,7 +57,7 @@ pub enum LedgerError {
     #[error("approval request {request_id} may only be cancelled by its performer or requester")]
     CancelUnauthorized { request_id: String },
 
-    #[error("approval request {request_id} may only be escalated by its assigned reviewer")]
+    #[error("approval request {request_id} may only be escalated by its assigned reviewer or configured default review authority")]
     EscalateUnauthorized { request_id: String },
 
     #[error("approval request {request_id} cannot assign its performer as reviewer")]

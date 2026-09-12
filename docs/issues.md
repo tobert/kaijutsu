@@ -513,7 +513,8 @@ chord, the shared complete pending snapshot and `AskDetail::can_review`, and
 explicit requester/performer/reviewer detail. Recover on reconnect or stream
 lag; do not issue an RPC each frame. Context creation and review assignment
 also have no app UI: use `kj context create --as` so the performer exists
-before rc, with the connected character as reviewer.
+before rc. The connected character is the director; reviewer assignment
+follows explicit delegation or the Amy default.
 
 ## The tui and the app disagree on a few chords (2026-09-03)
 

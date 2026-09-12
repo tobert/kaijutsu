@@ -1,0 +1,3 @@
+# The character who reviews work unless a context overrides it or its director
+# has an active delegation. Use a character name or a full principal id.
+default_reviewer = "amy"

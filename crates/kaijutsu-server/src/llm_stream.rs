@@ -291,12 +291,20 @@ pub(crate) async fn spawn_llm_for_prompt(
     let kernel_db = kernel.kernel_db.clone();
     let conversation_cache = kernel.conversation_cache.clone();
 
-    let identity = {
+    let (actor, director) = {
         let db = kernel_db.lock();
         let row = db.get_context(context_id)
             .map_err(|e| capnp::Error::failed(format!("Could not read performer assignment: {e}")))?
             .ok_or_else(|| capnp::Error::failed(format!("No such context: {context_id}")))?;
-        crate::turn_identity::resolve(&db, row.played_by, row.reviewer_id)
+        (row.played_by, row.director_id)
+    };
+    let review = kernel_arc
+        .resolve_context_review(context_id)
+        .await
+        .map_err(capnp::Error::failed)?;
+    let identity = {
+        let db = kernel_db.lock();
+        crate::turn_identity::resolve(&db, actor, review.reviewer.principal_id)
     };
     let identity = match identity {
         Ok(identity) => identity,
@@ -305,7 +313,7 @@ pub(crate) async fn spawn_llm_for_prompt(
             return Err(capnp::Error::failed(detail));
         }
     };
-    let (performer, reviewer) = {
+    let performer = {
         let db = kernel_db.lock();
         let character = |principal_id: PrincipalId| -> Result<kaijutsu_kernel::CharacterIdentity, capnp::Error> {
             let sheet = db.get_character(principal_id)
@@ -316,8 +324,9 @@ pub(crate) async fn spawn_llm_for_prompt(
             }
             Ok(kaijutsu_kernel::CharacterIdentity { principal_id, name: sheet.name })
         };
-        (character(identity.actor)?, character(identity.reviewer)?)
+        character(identity.actor)?
     };
+    let reviewer = review.reviewer;
     let tool_ctx = tool_ctx.with_actor(identity.actor, Some(identity.reviewer));
 
     // Quiesce: the kernel accepts writes but starts no turns. This is the one
@@ -596,7 +605,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         slot_tunables,
         conversation_cache,
         user_principal_id,
-        Some(TurnSpanIdentity { performer, reviewer }),
+        Some(TurnSpanIdentity { performer, reviewer, director, review_source: review.source }),
         tool_ctx,
         interrupt,
         interrupt_generation,
@@ -1529,6 +1538,8 @@ impl Drop for TurnUsageOnSpan {
 struct TurnSpanIdentity {
     performer: kaijutsu_kernel::CharacterIdentity,
     reviewer: kaijutsu_kernel::CharacterIdentity,
+    director: Option<PrincipalId>,
+    review_source: kaijutsu_kernel::approval_identity::ReviewSource,
 }
 
 #[tracing::instrument(
@@ -1541,6 +1552,8 @@ struct TurnSpanIdentity {
         principal.id = %user_principal_id,
         actor.id = tracing::field::Empty,
         reviewer.id = tracing::field::Empty,
+        director.id = tracing::field::Empty,
+        review.source = tracing::field::Empty,
         actor.name = tracing::field::Empty,
         reviewer.name = tracing::field::Empty,
         llm.usage.input_tokens = tracing::field::Empty,
@@ -1596,6 +1609,15 @@ async fn process_llm_stream(
         let span = tracing::Span::current();
         span.record("actor.id", tracing::field::display(identity.performer.principal_id));
         span.record("reviewer.id", tracing::field::display(identity.reviewer.principal_id));
+        if let Some(director) = identity.director {
+            span.record("director.id", tracing::field::display(director));
+        }
+        let review_source = match identity.review_source {
+            kaijutsu_kernel::approval_identity::ReviewSource::Explicit => "explicit",
+            kaijutsu_kernel::approval_identity::ReviewSource::Delegation => "delegation",
+            kaijutsu_kernel::approval_identity::ReviewSource::Default => "default",
+        };
+        span.record("review.source", review_source);
         span.record("actor.name", identity.performer.name.as_str());
         span.record("reviewer.name", identity.reviewer.name.as_str());
     }
@@ -4398,6 +4420,7 @@ mod usage_tests {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             })
             .unwrap();
             for bp in breakpoints {
@@ -4440,6 +4463,8 @@ mod usage_tests {
                     principal_id: reviewer,
                     name: "Lead".to_string(),
                 },
+                director: Some(player),
+                review_source: kaijutsu_kernel::approval_identity::ReviewSource::Default,
             }),
             tool_ctx,
             interrupt,
@@ -4923,7 +4948,7 @@ mod usage_tests {
             "this thread drove one turn, so one llm.turn span was created here"
         );
         let seen = &mine[0].fields;
-        for field in ["context.id", "principal.id", "actor.id", "reviewer.id"] {
+        for field in ["context.id", "principal.id", "actor.id", "reviewer.id", "director.id", "review.source"] {
             assert!(
                 seen.get(field).and_then(|value| value.text.as_ref()).is_some(),
                 "{field} was not recorded on llm.turn",
@@ -4933,6 +4958,7 @@ mod usage_tests {
         assert_ne!(seen["actor.id"].text, seen["reviewer.id"].text);
         assert_eq!(seen["actor.name"].text.as_deref(), Some("Coder"));
         assert_eq!(seen["reviewer.name"].text.as_deref(), Some("Lead"));
+        assert_eq!(seen["review.source"].text.as_deref(), Some("default"));
         for field in [
             "llm.usage.input_tokens",
             "llm.usage.output_tokens",

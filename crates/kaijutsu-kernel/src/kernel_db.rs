@@ -157,8 +157,10 @@ pub struct ContextRow {
     /// continuation by default. See `docs/character.md`, "A context is
     /// played by a character".
     pub played_by: Option<PrincipalId>,
-    /// The character assigned to review this context's performer.
+    /// Explicit approval reviewer override for this context.
     pub reviewer_id: Option<PrincipalId>,
+    /// Director responsible for this context's performer.
+    pub director_id: Option<PrincipalId>,
 }
 
 impl ContextRow {
@@ -632,7 +634,8 @@ CREATE TABLE IF NOT EXISTS contexts (
     -- reads `auth.db`, so no FK reaches it. See `ContextRow::played_by`'s
     -- doc comment.
     played_by    BLOB,
-    reviewer_id  BLOB
+    reviewer_id  BLOB,
+    director_id  BLOB
 );
 -- Labels are unique among LIVE contexts only. An archived context keeps its
 -- label as history and leaves this index, so the name can be given again.
@@ -640,6 +643,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL AND archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS approval_identity_config (
+    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+    default_reviewer_id BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS approval_reviewer_delegations (
+    director_id BLOB NOT NULL PRIMARY KEY,
+    reviewer_id BLOB NOT NULL,
+    granted_by BLOB NOT NULL,
+    granted_at INTEGER NOT NULL,
+    revoked_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS approval_reviewer_delegation_events (
+    event_id BLOB NOT NULL PRIMARY KEY,
+    director_id BLOB NOT NULL,
+    reviewer_id BLOB,
+    actor_id BLOB NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('grant', 'revoke')),
+    occurred_at INTEGER NOT NULL
+);
 
 -- ── Context Edges ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS context_edges (
@@ -1889,6 +1913,114 @@ impl KernelDb {
         Ok(approval_ledger::ask::load_ask_env(self.conn_for_ledger(), request_id)?)
     }
 
+    /// Cache the configured default reviewer for atomic ask routing.
+    pub fn set_default_approval_reviewer(&self, reviewer: PrincipalId) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO approval_identity_config (id, default_reviewer_id) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET default_reviewer_id = excluded.default_reviewer_id
+             WHERE approval_identity_config.default_reviewer_id != excluded.default_reviewer_id",
+            params![blob_param(reviewer.as_bytes())],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the cached configured default reviewer after configuration can no
+    /// longer be resolved. Gates must fail rather than reuse an old default.
+    pub fn clear_default_approval_reviewer(&self) -> KernelDbResult<()> {
+        self.conn.execute("DELETE FROM approval_identity_config WHERE id = 1", [])?;
+        Ok(())
+    }
+
+    /// Read the default reviewer cached from approval.toml.
+    pub fn cached_default_approval_reviewer(&self) -> KernelDbResult<Option<PrincipalId>> {
+        let cached = self.conn.query_row("SELECT default_reviewer_id FROM approval_identity_config WHERE id = 1", [], |row| read_principal_id(row, 0)).optional()?;
+        match cached {
+            Some(reviewer) if self.get_character(reviewer)?.is_some_and(|character| character.retired_at.is_none()) => Ok(Some(reviewer)),
+            Some(_) | None => Ok(None),
+        }
+    }
+
+    /// Resolve a context's reviewer while holding the ledger write domain.
+    pub fn effective_approval_reviewer(&self, context_id: ContextId) -> KernelDbResult<Option<PrincipalId>> {
+        let Some(row) = self.get_context(context_id)? else { return Ok(None) };
+        let reviewer = match row.reviewer_id {
+            Some(reviewer) => Some(reviewer),
+            None => match row.director_id {
+                Some(director) => self.active_approval_delegation(director)?,
+                None => None,
+            }.or(self.cached_default_approval_reviewer()?),
+        };
+        match reviewer {
+            Some(reviewer) if self.get_character(reviewer)?.is_some_and(|character| character.retired_at.is_none()) => Ok(Some(reviewer)),
+            Some(_) => Err(KernelDbError::Validation("effective approval reviewer is not a live character".into())),
+            None => Ok(None),
+        }
+    }
+
+    /// Return the active reviewer delegation for one director.
+    pub fn active_approval_delegation(&self, director: PrincipalId) -> KernelDbResult<Option<PrincipalId>> {
+        self.conn.query_row(
+            "SELECT reviewer_id FROM approval_reviewer_delegations WHERE director_id = ?1 AND revoked_at IS NULL",
+            params![blob_param(director.as_bytes())],
+            |row| read_principal_id(row, 0),
+        ).optional().map_err(Into::into)
+    }
+
+    /// Grant or replace one director-wide reviewer delegation and record its actor.
+    pub fn grant_approval_delegation(&self, director: PrincipalId, reviewer: PrincipalId, granted_by: PrincipalId) -> KernelDbResult<()> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.grant_approval_delegation(director, reviewer, granted_by));
+        }
+        let now = now_millis() as i64;
+        self.conn.execute(
+            "INSERT INTO approval_reviewer_delegations (director_id, reviewer_id, granted_by, granted_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(director_id) DO UPDATE SET reviewer_id = excluded.reviewer_id, granted_by = excluded.granted_by, granted_at = excluded.granted_at, revoked_at = NULL",
+            params![blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(granted_by.as_bytes()), now],
+        )?;
+        self.conn.execute(
+            "INSERT INTO approval_reviewer_delegation_events (event_id, director_id, reviewer_id, actor_id, operation, occurred_at) VALUES (?1, ?2, ?3, ?4, 'grant', ?5)",
+            params![uuid::Uuid::now_v7().as_bytes(), blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(granted_by.as_bytes()), now],
+        )?;
+        Ok(())
+    }
+
+    /// List active director-wide reviewer delegations.
+    pub fn list_approval_delegations(&self) -> KernelDbResult<Vec<(PrincipalId, PrincipalId, PrincipalId, i64)>> {
+        let mut statement = self.conn.prepare("SELECT director_id, reviewer_id, granted_by, granted_at FROM approval_reviewer_delegations WHERE revoked_at IS NULL ORDER BY granted_at")?;
+        let rows = statement.query_map([], |row| Ok((read_principal_id(row, 0)?, read_principal_id(row, 1)?, read_principal_id(row, 2)?, row.get(3)?)))?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Revoke an active director-wide reviewer delegation and record its actor.
+    pub fn revoke_approval_delegation(&self, director: PrincipalId, revoked_by: PrincipalId) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.revoke_approval_delegation(director, revoked_by));
+        }
+        let current = self.active_approval_delegation(director)?;
+        let Some(reviewer) = current else { return Ok(false) };
+        let now = now_millis() as i64;
+        self.conn.execute(
+            "UPDATE approval_reviewer_delegations SET revoked_at = ?1 WHERE director_id = ?2 AND revoked_at IS NULL",
+            params![now, blob_param(director.as_bytes())],
+        )?;
+        self.conn.execute(
+            "INSERT INTO approval_reviewer_delegation_events (event_id, director_id, reviewer_id, actor_id, operation, occurred_at) VALUES (?1, ?2, ?3, ?4, 'revoke', ?5)",
+            params![uuid::Uuid::now_v7().as_bytes(), blob_param(director.as_bytes()), blob_param(reviewer.as_bytes()), blob_param(revoked_by.as_bytes()), now],
+        )?;
+        Ok(true)
+    }
+
+    /// Whether a pending ask belongs to a context whose director is this character.
+    pub fn has_pending_asks_for_director(&self, director: PrincipalId) -> KernelDbResult<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM approvals a JOIN contexts c ON c.context_id = a.context_id
+             WHERE a.status = 'pending' AND c.director_id = ?1",
+            params![blob_param(director.as_bytes())], |row| row.get(0),
+        )?;
+        Ok(count != 0)
+    }
+
     /// The public face of `approval_ledger::ask::list_pending` — the asks
     /// waiting on a human right now.
     ///
@@ -2065,12 +2197,18 @@ impl KernelDb {
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
         ];
         for sql in alters {
-            if let Err(e) = conn.execute(sql, []) {
-                if is_duplicate_column_error(&e) {
-                    continue;
-                }
-                return Err(e.into());
+            match conn.execute(sql, []) {
+                Ok(_) => {}
+                Err(e) if is_duplicate_column_error(&e) => {}
+                Err(e) => return Err(e.into()),
             }
+        }
+        let has_director: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('contexts') WHERE name = 'director_id')", [], |row| row.get(0))?;
+        if !has_director {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("ALTER TABLE contexts ADD COLUMN director_id BLOB", [])?;
+            tx.execute("UPDATE contexts SET reviewer_id = NULL WHERE director_id IS NULL", [])?;
+            tx.commit()?;
         }
         Self::migrate_context_model_rollover(conn)?;
         Self::migrate_preset_cast_narrowing(conn)?;
@@ -3427,14 +3565,14 @@ impl KernelDb {
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-                origin_host, played_by, reviewer_id
+                origin_host, played_by, reviewer_id, director_id
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21,
-                ?22, ?23, ?24
+                ?22, ?23, ?24, ?25
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -3461,6 +3599,7 @@ impl KernelDb {
                     row.origin_host,
                     row.played_by.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.reviewer_id.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.director_id.as_ref().map(|id| id.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -3480,7 +3619,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -3578,8 +3717,20 @@ impl KernelDb {
         played_by: Option<PrincipalId>,
         reviewer_id: Option<PrincipalId>,
     ) -> KernelDbResult<()> {
+        let director_id = self.get_context(id)?.and_then(|row| row.director_id);
+        self.update_context_review_assignment(id, played_by, reviewer_id, director_id)
+    }
+
+    /// Atomically set performer, explicit reviewer override, and director.
+    pub fn update_context_review_assignment(
+        &self,
+        id: ContextId,
+        played_by: Option<PrincipalId>,
+        reviewer_id: Option<PrincipalId>,
+        director_id: Option<PrincipalId>,
+    ) -> KernelDbResult<()> {
         if self.conn.is_autocommit() {
-            return self.in_transaction(|db| db.update_context_review(id, played_by, reviewer_id));
+            return self.in_transaction(|db| db.update_context_review_assignment(id, played_by, reviewer_id, director_id));
         }
         let current = self.get_context(id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
@@ -3595,10 +3746,11 @@ impl KernelDb {
             )?;
         }
         let updated = self.conn.execute(
-            "UPDATE contexts SET played_by = ?1, reviewer_id = ?2 WHERE context_id = ?3",
+            "UPDATE contexts SET played_by = ?1, reviewer_id = ?2, director_id = ?3 WHERE context_id = ?4",
             params![
                 played_by.as_ref().map(|p| p.as_bytes().to_vec()),
                 reviewer_id.as_ref().map(|p| p.as_bytes().to_vec()),
+                director_id.as_ref().map(|p| p.as_bytes().to_vec()),
                 blob_param(id.as_bytes()),
             ],
         )?;
@@ -3942,7 +4094,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY COALESCE(last_activity_at, created_at)",
@@ -3959,7 +4111,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
              FROM contexts
              ORDER BY COALESCE(last_activity_at, created_at)",
         )?;
@@ -4010,7 +4162,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -4029,7 +4181,7 @@ impl KernelDb {
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id
+                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -4068,7 +4220,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, dag.depth
+                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
             ORDER BY dag.depth, c.created_at",
@@ -4076,7 +4228,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(24)?;
+            let depth: i64 = row.get(25)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -4099,7 +4251,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, lineage.depth
+                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
             ORDER BY lineage.depth",
@@ -4107,7 +4259,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(24)?;
+            let depth: i64 = row.get(25)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -4129,7 +4281,7 @@ impl KernelDb {
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, subtree.depth
+                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
             ORDER BY subtree.depth, c.created_at",
@@ -4137,7 +4289,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(24)?;
+            let depth: i64 = row.get(25)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -6311,7 +6463,7 @@ impl KernelDb {
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
-                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id
+                    last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
              FROM contexts WHERE label = ?1 AND archived_at IS NULL",
         )?;
 
@@ -7237,7 +7389,7 @@ impl KernelDb {
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
-             origin_host, played_by, reviewer_id
+             origin_host, played_by, reviewer_id, director_id
              FROM contexts WHERE played_by = ?1 AND archived_at IS NULL",
         )?;
         let rows = stmt.query_map(params![blob_param(principal_id.as_bytes())], row_to_context_row)?;
@@ -7408,6 +7560,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         origin_host: row.get(21)?,
         played_by: read_opt_principal_id(row, 22)?,
         reviewer_id: read_opt_principal_id(row, 23)?,
+        director_id: read_opt_principal_id(row, 24)?,
     })
 }
 
@@ -7801,6 +7954,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         origin_host: None,
         played_by: None,
         reviewer_id: None,
+        director_id: None,
     }
 }
 
@@ -8235,6 +8389,45 @@ mod tests {
         insert_context_with_doc(&db, &row, ws_id);
         let loaded = db.get_context(row.context_id).unwrap().unwrap();
         assert_eq!(loaded.last_activity_at, None, "fresh row: never touched");
+    }
+
+    #[test]
+    fn director_migration_clears_implicit_reviewers_atomically_and_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        let db = KernelDb::open(&path).unwrap();
+        let ws = setup_test_db(&db);
+        let mut row = make_context_row(Some("legacy-review"));
+        row.played_by = Some(PrincipalId::new());
+        row.reviewer_id = Some(row.created_by);
+        insert_context_with_doc(&db, &row, ws);
+        db.conn.execute("ALTER TABLE contexts DROP COLUMN director_id", []).unwrap();
+        db.conn.execute_batch(
+            "CREATE TRIGGER refuse_reviewer_reset BEFORE UPDATE OF reviewer_id ON contexts
+             BEGIN SELECT RAISE(ABORT, 'injected reset failure'); END;",
+        ).unwrap();
+        let error = KernelDb::apply_additive_migrations(&db.conn).unwrap_err();
+        assert!(error.to_string().contains("injected reset failure"), "{error}");
+        let has_director: bool = db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('contexts') WHERE name = 'director_id')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!has_director, "a failed reset must roll back the migration marker column too");
+        db.conn.execute("DROP TRIGGER refuse_reviewer_reset", []).unwrap();
+        drop(db);
+
+        let db = KernelDb::open(&path).unwrap();
+        let migrated = db.get_context(row.context_id).unwrap().unwrap();
+        assert_eq!(migrated.played_by, row.played_by);
+        assert_eq!(migrated.created_by, row.created_by);
+        assert_eq!(migrated.reviewer_id, None);
+        assert_eq!(migrated.director_id, None, "migration must not infer a director from requester");
+        assert!(db.list_approval_delegations().unwrap().is_empty());
+        let explicit = PrincipalId::new();
+        db.update_context_review_assignment(row.context_id, row.played_by, Some(explicit), None).unwrap();
+        drop(db);
+        let db = KernelDb::open(&path).unwrap();
+        assert_eq!(db.get_context(row.context_id).unwrap().unwrap().reviewer_id, Some(explicit));
     }
 
     /// Same idempotency contract as `last_activity_at_migration_...` above,
@@ -9607,6 +9800,7 @@ mod tests {
             origin_host: None,
             played_by: None,
             reviewer_id: None,
+            director_id: None,
         };
 
         let ctx = row.to_context();
@@ -9663,6 +9857,7 @@ mod tests {
             origin_host: None,
             played_by: None,
             reviewer_id: None,
+            director_id: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
@@ -9694,6 +9889,7 @@ mod tests {
             origin_host: None,
             played_by: None,
             reviewer_id: Some(reviewer),
+            director_id: None,
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -9821,6 +10017,7 @@ mod tests {
             origin_host: None,
             played_by: None,
             reviewer_id: None,
+            director_id: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(
@@ -9868,6 +10065,20 @@ mod tests {
         // reachable with `include_retired`.
         assert!(db.list_characters(false).unwrap().is_empty());
         assert_eq!(db.list_characters(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cached_default_reviewer_requires_a_live_character_sheet() {
+        let db = KernelDb::temporary().unwrap();
+        let reviewer = PrincipalId::new();
+        db.set_default_approval_reviewer(reviewer).unwrap();
+        assert_eq!(db.cached_default_approval_reviewer().unwrap(), None);
+        db.insert_character(&CharacterRow {
+            principal_id: reviewer, name: "amy".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+        }).unwrap();
+        assert_eq!(db.cached_default_approval_reviewer().unwrap(), Some(reviewer));
+        assert!(db.retire_character(reviewer, 1).unwrap());
+        assert_eq!(db.cached_default_approval_reviewer().unwrap(), None);
     }
 
     /// A duplicate name fails loudly rather than minting a second principal

@@ -52,15 +52,16 @@ struct Cli {
     /// rc bundle for contexts this bridge creates.
     ///
     /// `coder` by default: over ACP, kaijutsu *is* the agent and the client is
-    /// the reviewer's seat, so a new session should get the model-facing stance —
+    /// the connected player's seat, so a new session should get the model-facing stance —
     /// unlike kaijutsu-mcp, where kaijutsu is the tool and `mcp` is right.
     #[arg(long, default_value = "coder")]
     context_type: String,
 
     /// Character that performs work in each new ACP context.
     ///
-    /// The authenticated SSH character remains the reviewer. The named
-    /// character must already exist and be live.
+    /// The connected character becomes the context's director. The reviewer
+    /// follows explicit assignment, delegation, or the configured default (Amy).
+    /// The named character must already exist and be live.
     #[arg(long)]
     character: Option<String>,
 

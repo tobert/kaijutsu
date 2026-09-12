@@ -414,8 +414,8 @@ impl KernelBridge {
     }
 
     /// Create a performer-assigned context through `kj` so the kernel validates
-    /// the character before inserting it and runs that character's rc create
-    /// lifecycle with the correct identity already on the row.
+    /// the character before inserting it and runs the selected context type's
+    /// rc create lifecycle with the correct identity already on the row.
     async fn create_context(&self, label: &str) -> Result<ContextId> {
         let character = self.character.as_ref().expect("new-session path validates --character first");
         let contexts = self.list_contexts().await?;

@@ -57,8 +57,10 @@ instruction sections remains valid.
 Banto's principal in `played_by`, while `created_by` remains the requester.
 The character must exist and be live; unknown or retired names fail before
 creating a context. Omitting `--as` leaves `played_by` unset on this `kj` path.
-The caller becomes its reviewer. Model output and tools use the performer;
-the model turn refuses missing or self-reviewing assignments. This does not
+The caller's acting character becomes its director. The reviewer follows
+explicit context assignment, explicit director-wide delegation, then the
+configured Amy default. Model output and tools use the performer;
+the model turn refuses missing or self-reviewing identities. This does not
 load a character rc bundle. See `docs/character.md`, "Current implementation".
 
 Director's stance and the shared `S16-handoff.kai` read `played_by_name` from

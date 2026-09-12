@@ -56,6 +56,19 @@ fn create_context_leaves_played_by_unset() {
             None,
             "ordinary context creation records its requester, not an inferred performer"
         );
+        assert_eq!(
+            row.director_id,
+            Some(hajime.principal_id),
+            "ordinary context creation records the authenticated creator as director"
+        );
+        assert_eq!(
+            row.reviewer_id,
+            None,
+            "ordinary context creation does not persist a reviewer override"
+        );
+        drop(kj);
+        drop(client);
+        tokio::task::yield_now().await;
     });
 }
 
@@ -108,9 +121,10 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
         };
         let mut ssh_client = kaijutsu_client::SshClient::new(ssh_config);
         let rpc_channel = ssh_client.connect().await.expect("SSH connect failed");
-        let client = RpcClient::new(rpc_channel.into_stream())
+        let mut client = RpcClient::new(rpc_channel.into_stream())
             .await
             .expect("RPC client init failed");
+        client.retain_ssh_session(ssh_client);
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
 
         let context_id = kj.create_context("played-by-null-test").await.unwrap();
@@ -134,5 +148,14 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
             row.played_by, None,
             "a characterless creating principal must leave played_by NULL, not fail"
         );
+        assert_eq!(
+            row.director_id,
+            Some(unmapped),
+            "the authenticated creator remains the director even before a character sheet exists"
+        );
+        assert_eq!(row.reviewer_id, None);
+        drop(kj);
+        drop(client);
+        tokio::task::yield_now().await;
     });
 }

@@ -329,7 +329,7 @@ mod tests {
         );
 
         let all = d.kernel_db().lock().list_characters(true).unwrap();
-        assert_eq!(all.len(), 1, "only one row must exist for the name");
+        assert_eq!(all.iter().filter(|sheet| sheet.name == "hajime").count(), 1, "only one row must exist for the name");
     }
 
     /// `list` surfaces only live characters by default, as a full-id array.

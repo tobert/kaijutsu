@@ -27,6 +27,7 @@ pub mod execution;
 pub mod file_tools;
 pub mod flows;
 pub mod hyoushigi;
+pub mod approval_identity;
 pub mod kernel;
 pub mod kernel_db;
 pub mod kj;

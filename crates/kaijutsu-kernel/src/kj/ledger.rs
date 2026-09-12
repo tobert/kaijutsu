@@ -399,6 +399,11 @@ enum LedgerCommand {
         #[arg(long)]
         since: Option<String>,
     },
+    /// Manage director-wide approval reviewer delegations.
+    Delegation {
+        #[command(subcommand)]
+        command: DelegationCommand,
+    },
     /// Forget a standing rule so its statement escalates to a human again.
     Forget {
         /// The rule to forget. Rule ids come from `kj ledger rules`.
@@ -433,6 +438,25 @@ enum LedgerCommand {
     Signal {
         #[command(subcommand)]
         command: SignalCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DelegationCommand {
+    /// List active director-wide reviewer delegations.
+    List,
+    /// Grant a director's asks to a live reviewer.
+    Grant {
+        /// Existing live director character.
+        director: String,
+        /// Existing live reviewer character.
+        #[arg(long)]
+        to: String,
+    },
+    /// Revoke a director-wide reviewer delegation after pending asks are settled.
+    Revoke {
+        /// Existing director character. A retired director's delegation may be revoked.
+        director: String,
     },
 }
 
@@ -536,7 +560,8 @@ impl KjDispatcher {
                 self.ledger_decide(&request_id, false, caller, remember, family)
             }
             LedgerCommand::Cancel { request_id } => self.ledger_cancel(&request_id, caller),
-            LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, &to, caller),
+            LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, &to, caller).await,
+            LedgerCommand::Delegation { command } => self.ledger_delegation(command, caller).await,
             LedgerCommand::Rules { limit, since } => {
                 self.ledger_rules(limit, since.as_deref(), caller).await
             }
@@ -913,6 +938,61 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
+    async fn ledger_delegation(&self, command: DelegationCommand, caller: &KjCaller) -> KjResult {
+        if !matches!(command, DelegationCommand::List) {
+            if let Err(error) = self.kernel().default_approval_reviewer().await {
+                return KjResult::Err(format!("kj ledger delegation: {error}"));
+            }
+        }
+        let db = self.kernel_db().lock();
+        if !matches!(command, DelegationCommand::List) {
+            match db.cached_default_approval_reviewer() {
+                Ok(Some(authority)) if authority == caller.actor_id => {}
+                Ok(_) => return KjResult::Err("kj ledger delegation: only the configured default reviewer may grant or revoke delegations".into()),
+                Err(error) => return KjResult::Err(format!("kj ledger delegation: could not resolve current authority: {error}")),
+            }
+        }
+        let resolve = |name: &str| -> Result<PrincipalId, String> {
+            let character = db.get_character_by_name(name).map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("no character named '{name}'"))?;
+            if character.retired_at.is_some() { return Err(format!("character '{name}' is retired")); }
+            Ok(character.principal_id)
+        };
+        match command {
+            DelegationCommand::List => match db.list_approval_delegations() {
+                Ok(rows) => KjResult::ok_with_data(rows.iter().map(|(director, reviewer, _, _)| format!("{director} -> {reviewer}")).collect::<Vec<_>>().join("\n"), serde_json::json!(rows.iter().map(|(director, reviewer, grantor, granted_at)| serde_json::json!({"director_id": director.to_string(), "reviewer_id": reviewer.to_string(), "granted_by": grantor.to_string(), "granted_at": granted_at})).collect::<Vec<_>>())),
+                Err(error) => KjResult::Err(format!("kj ledger delegation: {error}")),
+            },
+            DelegationCommand::Grant { director, to } => {
+                let director_id = match resolve(&director) { Ok(id) => id, Err(error) => return KjResult::Err(format!("kj ledger delegation: {error}")) };
+                let reviewer_id = match resolve(&to) { Ok(id) => id, Err(error) => return KjResult::Err(format!("kj ledger delegation: {error}")) };
+                match db.has_pending_asks_for_director(director_id) {
+                    Ok(true) => return KjResult::Err("kj ledger delegation: settle or cancel pending asks before changing a delegation".into()),
+                    Ok(false) => {}
+                    Err(error) => return KjResult::Err(format!("kj ledger delegation: could not inspect pending asks: {error}")),
+                }
+                let span = tracing::info_span!("approval.delegation", operation = "grant", principal.id = %caller.principal_id, actor.id = %caller.actor_id, director.id = %director_id, reviewer.id = %reviewer_id);
+                let _guard = span.enter();
+                match db.grant_approval_delegation(director_id, reviewer_id, caller.actor_id) { Ok(()) => KjResult::ok(format!("delegated contexts directed by {director} to reviewer {to}")), Err(error) => KjResult::Err(format!("kj ledger delegation: {error}")) }
+            }
+            DelegationCommand::Revoke { director } => {
+                let director_id = match db.get_character_by_name(&director) {
+                    Ok(Some(character)) => character.principal_id,
+                    Ok(None) => return KjResult::Err(format!("kj ledger delegation: no character named '{director}'")),
+                    Err(error) => return KjResult::Err(format!("kj ledger delegation: {error}")),
+                };
+                match db.has_pending_asks_for_director(director_id) {
+                    Ok(true) => return KjResult::Err("kj ledger delegation: settle or cancel pending asks before revoking a delegation".into()),
+                    Ok(false) => {}
+                    Err(error) => return KjResult::Err(format!("kj ledger delegation: could not inspect pending asks: {error}")),
+                }
+                let span = tracing::info_span!("approval.delegation", operation = "revoke", principal.id = %caller.principal_id, actor.id = %caller.actor_id, director.id = %director_id, reviewer.id = tracing::field::Empty);
+                let _guard = span.enter();
+                match db.revoke_approval_delegation(director_id, caller.actor_id) { Ok(true) => KjResult::ok(format!("revoked {director} approval delegation")), Ok(false) => KjResult::Err(format!("kj ledger delegation: {director} has no active delegation")), Err(error) => KjResult::Err(format!("kj ledger delegation: {error}")) }
+            }
+        }
+    }
+
     fn ledger_cancel(&self, request_id: &str, caller: &KjCaller) -> KjResult {
         let span = tracing::info_span!(
             "approval.cancel",
@@ -942,7 +1022,10 @@ impl KjDispatcher {
         }
     }
 
-    fn ledger_escalate(&self, request_id: &str, to: &str, caller: &KjCaller) -> KjResult {
+    async fn ledger_escalate(&self, request_id: &str, to: &str, caller: &KjCaller) -> KjResult {
+        if let Err(error) = self.kernel().default_approval_reviewer().await {
+            tracing::warn!(%error, "default review authority unavailable; only the assigned reviewer may escalate");
+        }
         let span = tracing::info_span!(
             "approval.escalate",
             ask.id = %request_id,
@@ -955,17 +1038,19 @@ impl KjDispatcher {
         let _guard = span.enter();
         let result = {
             let db = self.kernel_db.lock();
+            let default_authority = match db.cached_default_approval_reviewer() {
+                Ok(authority) => authority,
+                Err(error) => return KjResult::Err(format!("kj ledger: could not resolve current authority: {error}")),
+            };
             let target = match db.get_character_by_name(to) {
                 Ok(Some(character)) if character.retired_at.is_none() => character.principal_id,
                 Ok(Some(_)) => return KjResult::Err(format!("kj ledger: character '{to}' is retired")),
                 Ok(None) => return KjResult::Err(format!("kj ledger: no character named '{to}'")),
                 Err(e) => return KjResult::Err(format!("kj ledger: could not resolve character '{to}': {e}")),
             };
-            approval_ledger::decide::escalate(
-                db.conn_for_ledger(),
-                request_id,
-                caller.actor_id.as_bytes(),
-                target.as_bytes(),
+            approval_ledger::decide::escalate_with_authority(
+                db.conn_for_ledger(), request_id, caller.actor_id.as_bytes(), target.as_bytes(),
+                default_authority.as_ref().map(|authority| authority.as_bytes().as_slice()),
             )
         };
         match result {
@@ -1800,12 +1885,14 @@ impl Classify for LedgerCommand {
             LedgerCommand::List { .. }
             | LedgerCommand::Show { .. }
             | LedgerCommand::Rules { .. }
-            | LedgerCommand::Runs { .. } => Effect::Read,
+            | LedgerCommand::Runs { .. }
+            | LedgerCommand::Delegation { command: DelegationCommand::List } => Effect::Read,
             LedgerCommand::Allow { .. }
             | LedgerCommand::Deny { .. }
             | LedgerCommand::Cancel { .. }
             | LedgerCommand::Escalate { .. }
-            | LedgerCommand::Forget { .. } => {
+            | LedgerCommand::Forget { .. }
+            | LedgerCommand::Delegation { .. } => {
                 Effect::Write
             }
             LedgerCommand::Signal { command } => command.effect(),
@@ -1825,7 +1912,7 @@ impl Classify for SignalCommand {
 mod tests {
     use super::*;
     use crate::kj::gate::{run_gate, GateSpec};
-    use crate::kj::test_helpers::{register_context, test_caller, test_dispatcher};
+    use crate::kj::test_helpers::{register_context, registered_caller, test_caller, test_dispatcher};
     use approval_ledger::types::VarBinding;
     use std::time::Duration;
 
@@ -1906,7 +1993,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_is_empty_then_shows_a_gated_ask() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
         assert!(result.is_ok());
@@ -2001,6 +2088,7 @@ mod tests {
     #[tokio::test]
     async fn decision_span_keeps_the_ask_and_deciding_actor_separate() {
         use std::sync::{Arc, Mutex};
+        use tracing::instrument::WithSubscriber;
         use tracing::field::{Field, Visit};
         use tracing::span::{Attributes, Id, Record};
         use tracing_subscriber::layer::SubscriberExt;
@@ -2013,6 +2101,9 @@ mod tests {
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) { self.0.insert(field.name().to_string(), format!("{value:?}")); }
         }
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Spans {
+            fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
             fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
                 if attrs.metadata().name() != "approval.decision" { return; }
                 let mut fields = Fields(std::collections::HashMap::new());
@@ -2029,12 +2120,19 @@ mod tests {
         }
 
         let spans = Spans::default();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(spans.clone()));
         let d = test_dispatcher().await;
         let requester = kaijutsu_types::PrincipalId::new();
         let actor = kaijutsu_types::PrincipalId::new();
         let reviewer = kaijutsu_types::PrincipalId::new();
-        let context = kaijutsu_types::ContextId::new();
+        let context = register_context(&d, Some("decision-context"), None, requester);
+        {
+            let db = d.kernel_db.lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+            }).unwrap();
+            db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+        }
         let caller = crate::kj::KjCaller {
             principal_id: requester,
             actor_id: actor,
@@ -2049,7 +2147,7 @@ mod tests {
         let request_id = pending.ask.expect("gate asks").request_id;
         let mut director = caller.clone();
         director.actor_id = reviewer;
-        let decision = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &director).await;
+        let decision = d.dispatch(&[s("ledger"), s("allow"), s(&request_id)], &director).with_subscriber(dispatch).await;
         assert!(decision.is_ok(), "{decision:?}");
 
         let spans = spans.0.lock().unwrap();
@@ -2070,7 +2168,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_allow_refuses_the_seat_that_raised_the_ask() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let first = gate_once(&d, &c, spec()).await;
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
@@ -2109,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_allow_opens_the_gate_and_a_second_answer_is_loud() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let first = gate_once(&d, &c, spec()).await;
         assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
@@ -2138,7 +2236,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_show_renders_the_statement_being_authorized() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let db = d.kernel_db.clone();
         let caller = c.clone();
@@ -2207,7 +2305,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_show_reports_the_principal_and_whether_the_answer_is_spent() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let first = gate_once(&d, &c, spec()).await;
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
@@ -2375,7 +2473,7 @@ mod tests {
     #[tokio::test]
     async fn a_decision_reports_itself_in_correct_english() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         // A distinct label per verb, or the `deny` iteration's ask would
         // collide with the `allow` iteration's (same digest + label) and get
@@ -2438,7 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_auto_allow_creates_an_allowed_ask() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let argv = signal_add_argv("rm build artifacts now", &["--auto-allow"]);
         let result = d.dispatch(&argv, &c).await;
@@ -2473,7 +2571,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_attaches_to_an_existing_ask_via_request_id() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let first = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
         assert!(first.is_ok(), "{first:?}");
@@ -2504,7 +2602,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_stmt_and_cmd_seq_round_trip_through_storage_and_show() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let created = d
             .dispatch(
@@ -2550,7 +2648,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_without_stmt_seq_shows_clause_as_dash() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let created = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
         let request_id = match &created {
@@ -2579,7 +2677,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_requires_auto_allow_or_request_id() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d.dispatch(&signal_add_argv("echo hi", &[]), &c).await;
         assert!(!result.is_ok());
         assert!(result.message().contains("--auto-allow"), "{}", result.message());
@@ -2589,7 +2687,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_auto_allow_and_request_id_are_mutually_exclusive() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d
             .dispatch(&signal_add_argv("echo hi", &["--auto-allow", "--request-id", "deadbeef"]), &c)
             .await;
@@ -2600,7 +2698,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_attach_to_an_unknown_ask_errors_loudly() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d
             .dispatch(&signal_add_argv("echo hi", &["--request-id", "does-not-exist"]), &c)
             .await;
@@ -2611,7 +2709,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_signal_add_invalid_verdict_fails_at_parse_time() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d
             .dispatch(
                 &[
@@ -2634,7 +2732,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_show_signals_flag_includes_signal_detail() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let created = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
         let request_id = match &created {
@@ -2670,7 +2768,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_signals_flag_adds_a_signals_column_and_reshapes_data() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let created = d.dispatch(&signal_add_argv("rm build artifacts now", &["--auto-allow"]), &c).await;
         let request_id = match &created {
@@ -2714,7 +2812,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_history_shows_a_decided_ask_and_the_plain_list_drops_it() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let db = d.kernel_db.clone();
         let caller = c.clone();
@@ -2768,7 +2866,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_history_limit_caps_the_data_array_newest_first() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         // A distinct label per decision, or the second ask would collide
         // with the first's (same digest + label) and get REDEEMED instead
@@ -2830,7 +2928,7 @@ mod tests {
     #[tokio::test]
     async fn remembering_an_allow_makes_the_next_identical_ask_auto_allow() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let label = "kaish-source";
         let rendered = "ls -la /srv/builds";
 
@@ -2887,7 +2985,7 @@ mod tests {
     #[tokio::test]
     async fn remembering_a_family_allows_the_next_ask_of_that_family_whatever_its_arguments() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let first = gate_once(&d, &c, planned_shell_spec("kj handoff note 'first'")).await;
         assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
@@ -2949,7 +3047,7 @@ mod tests {
     #[tokio::test]
     async fn a_remembered_family_deny_refuses_the_next_ask_of_that_family() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let first = gate_once(&d, &c, planned_shell_spec("git push origin main")).await;
         let request_id = first.ask.expect("row").request_id;
         let result = d
@@ -2978,7 +3076,7 @@ mod tests {
     #[tokio::test]
     async fn a_family_is_refused_when_the_ask_s_program_has_a_redirect_and_the_decision_stands() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let first = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
         let request_id = first.ask.expect("row").request_id;
         let result = d
@@ -3030,7 +3128,7 @@ mod tests {
     #[tokio::test]
     async fn forgetting_a_family_makes_the_identical_ask_escalate_again() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let source = "kj handoff note 'the same note'";
         let first = gate_once(&d, &c, planned_shell_spec(source)).await;
         let request_id = first.ask.expect("row").request_id;
@@ -3060,7 +3158,7 @@ mod tests {
     #[tokio::test]
     async fn a_remembered_family_allow_outranks_a_config_deny() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let first = gate_once(&d, &c, planned_shell_spec("rg -n todo src")).await;
         let request_id = first.ask.expect("row").request_id;
         let result = d
@@ -3114,7 +3212,7 @@ mod tests {
     #[tokio::test]
     async fn a_kj_verb_ask_cannot_teach_a_family() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let first = gate_once(&d, &c, spec()).await;
         let request_id = first.ask.expect("row").request_id;
         let result = d
@@ -3139,7 +3237,7 @@ mod tests {
     #[tokio::test]
     async fn remembering_an_allow_is_refused_when_a_statement_has_a_free_variable() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let first = gate_once(&d, &c, spec()).await;
         assert_eq!(first.verdict, crate::kj::gate::GateVerdict::Pending);
@@ -3300,7 +3398,7 @@ mod tests {
     #[tokio::test]
     async fn forgetting_a_rule_makes_the_next_identical_ask_escalate_again() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let label = "kaish-source";
         let rendered = "echo forget-me";
 
@@ -3345,7 +3443,7 @@ mod tests {
     #[tokio::test]
     async fn forgetting_an_unknown_rule_id_errors_loudly() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d.dispatch(&[s("ledger"), s("forget"), s("no-such-rule")], &c).await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such rule"));
@@ -3354,7 +3452,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_rules_on_a_fresh_ledger_is_empty() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d.dispatch(&[s("ledger"), s("rules")], &c).await;
         assert!(result.is_ok());
         assert!(result.message().contains("no active rules"));
@@ -3403,7 +3501,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_runs_on_a_fresh_ledger_is_empty() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d.dispatch(&[s("ledger"), s("runs")], &c).await;
         assert!(result.is_ok(), "{result:?}");
         assert!(result.message().contains("no rc runs recorded"), "{}", result.message());
@@ -3582,7 +3680,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_runs_show_of_an_unknown_id_errors_loudly() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d.dispatch(&[s("ledger"), s("runs"), s("no-such-run")], &c).await;
         assert!(!result.is_ok());
         assert!(result.message().contains("no such run"), "{}", result.message());
@@ -3660,7 +3758,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_default_limit_caps_the_pending_queue_and_says_so() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let ctx = c.context_id.expect("test caller has a context");
         {
             let db = d.kernel_db.lock();
@@ -3689,7 +3787,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_no_truncation_notice_when_nothing_is_cut() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let ctx = c.context_id.expect("test caller has a context");
         {
             let db = d.kernel_db.lock();
@@ -3718,7 +3816,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_limit_flag_narrows_the_pending_queue() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let ctx = c.context_id.expect("test caller has a context");
         {
             let db = d.kernel_db.lock();
@@ -3743,7 +3841,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_since_excludes_older_asks() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let ctx = c.context_id.expect("test caller has a context");
         let now = kaijutsu_types::now_millis() as i64;
         let (old_ids, new_ids) = {
@@ -3784,7 +3882,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_bad_since_errors_loudly_instead_of_silently_matching_everything() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d.dispatch(&[s("ledger"), s("list"), s("--since"), s("5x")], &c).await;
         assert!(!result.is_ok(), "garbage --since must be refused, not treated as \"no filter\"");
         assert!(result.message().contains("--since"), "{}", result.message());
@@ -3802,7 +3900,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_origin_filter_narrows_to_the_requested_origin() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let ctx = c.context_id.expect("test caller has a context");
         let (hook_ids, shell_ids) = {
             let db = d.kernel_db.lock();
@@ -3829,7 +3927,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_invalid_status_fails_at_parse_time() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let result = d.dispatch(&[s("ledger"), s("list"), s("--status"), s("bogus")], &c).await;
         assert!(!result.is_ok());
         assert!(result.message().contains("pending") && result.message().contains("allowed"), "{}", result.message());
@@ -3840,7 +3938,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_status_allowed_implies_history_without_the_flag() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let db = d.kernel_db.clone();
         let caller = c.clone();
@@ -3871,7 +3969,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_list_status_claimed_shows_rows_hidden_by_default() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
 
         let db = d.kernel_db.clone();
         let caller = c.clone();
@@ -3903,7 +4001,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_rules_limit_and_since_cap_and_report_truncation() {
         let d = test_dispatcher().await;
-        let c = test_caller();
+        let c = registered_caller(&d);
         let ctx = c.context_id.expect("test caller has a context");
         let mut rule_ids = Vec::new();
         {
@@ -4007,6 +4105,56 @@ mod tests {
         assert!(!bad_verb.is_ok(), "an unwired verb must be refused at parse time, not silently accepted");
     }
 
+    #[tokio::test]
+    async fn retired_director_delegation_can_be_revoked_by_default_reviewer() {
+        let d = test_dispatcher().await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let lead = PrincipalId::new();
+        let judge = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None }).unwrap();
+            }
+            db.set_default_approval_reviewer(amy).unwrap();
+        }
+        let amy_caller = KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        assert!(d.dispatch(&[s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")], &amy_caller).await.is_ok());
+        d.kernel_db().lock().conn_for_ledger().execute("UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [lead.as_bytes().as_slice()]).unwrap();
+        let result = d.dispatch(&[s("ledger"), s("delegation"), s("revoke"), s("lead")], &amy_caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert_eq!(d.kernel_db().lock().active_approval_delegation(lead).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn assigned_reviewer_can_escalate_when_default_authority_is_unavailable() {
+        let d = test_dispatcher().await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let lead = PrincipalId::new();
+        let judge = PrincipalId::new();
+        let caller = crate::kj::test_helpers::registered_caller(&d);
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None,
+                }).unwrap();
+            }
+            db.update_context_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
+        }
+        let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
+        d.kernel_db().lock().conn_for_ledger().execute(
+            "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [amy.as_bytes().as_slice()],
+        ).unwrap();
+        let reviewer = caller.with_actor(lead, Some(lead));
+        let listed = d.dispatch(&[s("ledger"), s("delegation"), s("list")], &reviewer).await;
+        assert!(listed.is_ok(), "delegation inspection remains available: {}", listed.message());
+        let result = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone(), s("--to"), s("judge")], &reviewer).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
+        assert_eq!(row.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
+    }
+
     /// AGENTS.md "Writing style" → "Published text": help is a product
     /// surface. The old wording claimed the default queue shows asks
     /// still "`pending` or `claimed`" — the query is `status = 'pending'`
@@ -4031,7 +4179,7 @@ mod tests {
         #[tokio::test]
         async fn ledger_bare_renders_help() {
             let d = test_dispatcher().await;
-            let c = test_caller();
+            let c = registered_caller(&d);
             let result = d.dispatch(&[s("ledger")], &c).await;
             assert!(
                 matches!(&result, KjResult::Ok { ephemeral: true, .. }),

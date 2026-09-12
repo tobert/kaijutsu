@@ -15,7 +15,7 @@
 //!
 //! **Which way does the agency point?** In MCP, kaijutsu is a *tool* another
 //! agent calls. In ACP, kaijutsu is the *agent* and the ACP client is the
-//! reviewer's seat. So a session's context is created with `context_type=coder`
+//! connected player's seat. So a session's context is created with `context_type=coder`
 //! by default — the model-facing stance bundle — not `mcp`.
 //!
 //! ## Version stance

@@ -28,6 +28,9 @@ pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.
 /// `kj::gate_policy` reads beneath the ledger's rules.
 pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gate.toml");
 
+/// Embedded default approval identity configuration.
+pub const DEFAULT_APPROVAL_CONFIG: &str = include_str!("../../../assets/defaults/approval.toml");
+
 /// Embedded drift-briefing instruction. The host file is the live body.
 pub const DEFAULT_DISTILLATION_PROMPT: &str =
     include_str!("../../../assets/defaults/prompts/distillation.md");
@@ -74,6 +77,7 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("theme.toml"), DEFAULT_THEME),
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
         (config_path("gate.toml"), DEFAULT_GATE_CONFIG),
+        (config_path("approval.toml"), DEFAULT_APPROVAL_CONFIG),
         (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
         (config_path("continuation.md"), DEFAULT_CONTINUATION_PROMPT),
     ]
@@ -198,6 +202,7 @@ mod tests {
         assert!(names.contains(&config_path("theme.toml").as_str()));
         assert!(names.contains(&config_path("mcp.toml").as_str()));
         assert!(names.contains(&config_path("gate.toml").as_str()));
+        assert!(names.contains(&config_path("approval.toml").as_str()));
         assert!(names.contains(&config_path("distillation.md").as_str()));
         assert!(names.contains(&config_path("continuation.md").as_str()));
         assert!(

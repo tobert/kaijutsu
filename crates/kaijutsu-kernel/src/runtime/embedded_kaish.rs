@@ -1452,6 +1452,7 @@ mod tests {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             },
             ws_id,
         )
@@ -1552,6 +1553,7 @@ mod tests {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             },
             ws_id,
         )
@@ -1647,6 +1649,7 @@ mod tests {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             },
             ws_id,
         )

@@ -98,9 +98,24 @@ struct Seats {
     approver: ContextId,
 }
 
+impl Seats {
+    async fn close(self) {
+        let Self {
+            _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker: _, approver: _,
+        } = self;
+        drop(worker_kj);
+        drop(approver_kj);
+        drop(_worker_client);
+        drop(_approver_client);
+        drop(kernel);
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn seats() -> Seats {
     let tmp = tempfile::tempdir().unwrap();
     let auth_db_path = tmp.path().join("auth.db");
+    let amy_principal = PrincipalId::new();
     let worker_principal = PrincipalId::new();
     let approver_principal = PrincipalId::new();
     let worker_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
@@ -120,6 +135,13 @@ async fn seats() -> Seats {
     {
         let db = kernel.kernel_db.lock();
         db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+            principal_id: amy_principal,
+            name: "amy".into(),
+            created_at: kaijutsu_types::now_millis() as i64,
+            retired_at: None,
+            handoff_ctx: None,
+        }).unwrap();
+        db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
             principal_id: worker_principal,
             name: "gate-worker".into(),
             created_at: kaijutsu_types::now_millis() as i64,
@@ -137,7 +159,10 @@ async fn seats() -> Seats {
     let connect = |key: PrivateKey| async move {
         let config = SshConfig { host: addr.ip().to_string(), port: addr.port(), username: "gate".into(), key_source: KeySource::InMemory(Arc::new(key)), insecure: true };
         let mut ssh = SshClient::new(config);
-        RpcClient::new(ssh.connect().await.unwrap().into_stream()).await.unwrap()
+        let channel = ssh.connect().await.unwrap();
+        let mut client = RpcClient::new(channel.into_stream()).await.unwrap();
+        client.retain_ssh_session(ssh);
+        client
     };
     let worker_client = connect(worker_key).await;
     let approver_client = connect(approver_key).await;
@@ -450,6 +475,7 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
             "gate-executed\n",
             "a second ledger change must not re-run a redeemed ask"
         );
+        s.close().await;
     });
 }
 
@@ -515,6 +541,7 @@ fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
             seed_index > output_index,
             "the seed must land after the filled output block"
         );
+        s.close().await;
     });
 }
 
@@ -590,6 +617,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
             "the retry is a new pending ask, not a reused answer"
         );
         assert!(!marker.exists(), "the retry remains gated until it is answered");
+        s.close().await;
     });
 }
 
@@ -640,6 +668,7 @@ fn an_allowed_ask_runs_with_the_values_it_was_asked_about() {
             "asked-\n",
             "the approved text must expand to the values the human read"
         );
+        s.close().await;
     });
 }
 
@@ -682,6 +711,7 @@ fn a_denied_ask_settles_its_pair_to_error_and_runs_nothing() {
             !s.undelivered(&ask),
             "settling the blocks IS the delivery, so a denial with a pair is redeemed"
         );
+        s.close().await;
     });
 }
 
@@ -711,6 +741,7 @@ fn a_denied_turn_pair_tells_the_model_it_did_not_run() {
         .await;
         assert!(!marker.exists(), "a denied turn action must not run");
         assert!(!s.undelivered(&ask), "the delivered denial is redeemed");
+        s.close().await;
     });
 }
 
@@ -739,6 +770,7 @@ fn a_cancelled_turn_pair_tells_the_model_it_did_not_run() {
         .await;
         assert!(!marker.exists(), "a cancelled turn action must not run");
         assert!(!s.undelivered(&ask), "the delivered cancellation is redeemed");
+        s.close().await;
     });
 }
 
@@ -830,6 +862,7 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
             "no shouting at the model, got: {}",
             seed.content
         );
+        s.close().await;
     });
 }
 
@@ -892,6 +925,7 @@ fn an_allowed_ask_whose_cwd_is_gone_runs_nothing_and_names_the_directory() {
             !scratch.marker().exists(),
             "nothing may run when the ask's directory is gone"
         );
+        s.close().await;
     });
 }
 
@@ -981,6 +1015,7 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
             s.undelivered(&ask),
             "an answer nothing acted on stays uncollected rather than being spent"
         );
+        s.close().await;
     });
 }
 
@@ -1064,6 +1099,7 @@ fn shell_box_pair_fills_when_its_own_ask_is_allowed() {
             !blocks.iter().any(|b| b.content.contains("It has run.")),
             "a run into a caller-authored pair tells nobody"
         );
+        s.close().await;
     });
 }
 
@@ -1093,5 +1129,6 @@ fn shell_box_pair_settles_error_when_its_own_ask_is_denied() {
         assert_eq!(s.block(&command_block_id).status, Status::Error);
         assert!(!marker.exists(), "a denied submission must not run");
         assert!(!s.undelivered(&ask), "a denial delivered into its pair is redeemed");
+        s.close().await;
     });
 }

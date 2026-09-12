@@ -373,7 +373,7 @@ fn build_ask(
     NewAsk {
         context_id: caller_context_bytes(caller),
         actor_id: caller.actor_id.as_bytes().to_vec(),
-        reviewer_id: caller.reviewer_id.unwrap_or(caller.actor_id).as_bytes().to_vec(),
+        reviewer_id: Vec::new(),
         principal_id: caller.principal_id.as_bytes().to_vec(),
         origin: spec.origin,
         instance: Some(spec.instance.clone()),
@@ -510,9 +510,6 @@ pub(crate) async fn run_gate(
     config: &super::gate_policy::GateConfigLoad,
 ) -> GateOutcome {
     let approval_span = tracing::Span::current();
-    if let Some(reviewer) = caller.reviewer_id {
-        approval_span.record("reviewer.id", reviewer.to_string());
-    }
     if let Some(context) = caller.context_id {
         approval_span.record("context.id", context.to_string());
     }
@@ -689,14 +686,21 @@ pub(crate) async fn run_gate(
     // 3. Durable before asked — the row commits before anyone is told.
     let request_id = {
         let db = db.lock();
+        let context = match caller.context_id {
+            Some(context) => context,
+            None => return GateOutcome::unavailable_without_row("approval gate could not resolve reviewer: approval asks require a context".into()),
+        };
+        let reviewer = match db.effective_approval_reviewer(context) {
+            Ok(Some(reviewer)) => reviewer,
+            Ok(None) => return GateOutcome::unavailable_without_row("approval gate could not resolve reviewer: no configured approval reviewer".into()),
+            Err(error) => return GateOutcome::unavailable_without_row(format!("approval gate could not resolve reviewer: {error}")),
+        };
+        approval_span.record("reviewer.id", reviewer.to_string());
+        let mut ask = ask;
+        ask.reviewer_id = reviewer.as_bytes().to_vec();
         match approval_ledger::ask::create_ask(db.conn_for_ledger(), &ask) {
             Ok(id) => id,
-            Err(e) => {
-                return GateOutcome::unavailable_without_row(format!(
-                    "approval gate could not record the ask: {e} (fail-closed — this is a \
-                     ledger fault, not a decision)"
-                ));
-            }
+            Err(e) => return GateOutcome::unavailable_without_row(format!("approval gate could not record the ask: {e} (fail-closed — this is a ledger fault, not a decision)")),
         }
     };
     approval_span.record("ask.id", request_id.as_str());
@@ -820,15 +824,21 @@ pub(crate) async fn record_dry_run_ask(
     reason: &str,
 ) -> Option<AskRef> {
     let approval_span = tracing::Span::current();
-    if let Some(reviewer) = caller.reviewer_id {
-        approval_span.record("reviewer.id", reviewer.to_string());
-    }
     if let Some(context) = caller.context_id {
         approval_span.record("context.id", context.to_string());
     }
     let ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
     let request_id = {
         let db = db.lock();
+        let context = match caller.context_id { Some(context) => context, None => { tracing::warn!("dry run ask has no context"); return None; } };
+        let reviewer = match db.effective_approval_reviewer(context) {
+            Ok(Some(reviewer)) => reviewer,
+            Ok(None) => { tracing::warn!("dry run ask has no configured reviewer"); return None; }
+            Err(error) => { tracing::warn!("dry run could not resolve reviewer: {error}"); return None; }
+        };
+        approval_span.record("reviewer.id", reviewer.to_string());
+        let mut ask = ask;
+        ask.reviewer_id = reviewer.as_bytes().to_vec();
         match approval_ledger::ask::create_ask(db.conn_for_ledger(), &ask) {
             Ok(id) => id,
             Err(e) => {
@@ -913,7 +923,8 @@ mod tests {
     use super::*;
     use crate::kernel_db::ContextShellRow;
     use crate::kj::test_helpers::{
-        caller_with_context, register_context, test_caller, test_dispatcher_with_timeouts,
+        caller_with_context, register_context, registered_caller, test_caller,
+        test_dispatcher_with_timeouts,
     };
     use kaijutsu_types::TimeoutPolicy;
 
@@ -1020,6 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn gate_and_replay_spans_use_durable_distinct_identities() {
         use std::sync::Mutex;
+        use tracing::instrument::WithSubscriber;
         use tracing::field::{Field, Visit};
         use tracing::span::{Attributes, Id, Record};
         use tracing_subscriber::layer::SubscriberExt;
@@ -1036,6 +1048,9 @@ mod tests {
             }
         }
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Spans {
+            fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
             fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
                 if attrs.metadata().name() != "approval.gate" {
                     return;
@@ -1054,12 +1069,19 @@ mod tests {
         }
 
         let spans = Spans::default();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(spans.clone()));
         let d = gate_dispatcher().await;
         let requester = PrincipalId::new();
         let actor = PrincipalId::new();
         let reviewer = PrincipalId::new();
-        let context = ContextId::new();
+        let context = register_context(&d, Some("trace-context"), None, requester);
+        {
+            let db = d.kernel_db.lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+            }).unwrap();
+            db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+        }
         let caller = KjCaller {
             principal_id: requester,
             actor_id: actor,
@@ -1070,14 +1092,20 @@ mod tests {
             rc_depth: 0,
             privileged: true,
         };
-        let pending = run_gate(&d.kernel_db.clone(), &caller, cc_spec("trace"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+        let pending = async {
+            tracing::callsite::rebuild_interest_cache();
+            run_gate(&d.kernel_db.clone(), &caller, cc_spec("trace"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await
+        }.with_subscriber(dispatch.clone()).await;
         let request_id = pending.ask.expect("gate asks").request_id;
         spans.0.lock().unwrap().clear();
         answer(&d, &request_id, true);
 
         let mut changed = caller.clone();
         changed.reviewer_id = Some(PrincipalId::new());
-        let replay = run_gate(&d.kernel_db.clone(), &changed, cc_spec("trace"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+        let replay = async {
+            tracing::callsite::rebuild_interest_cache();
+            run_gate(&d.kernel_db.clone(), &changed, cc_spec("trace"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await
+        }.with_subscriber(dispatch.clone()).await;
         assert!(replay.allowed());
 
         {
@@ -1094,13 +1122,16 @@ mod tests {
         spans.0.lock().unwrap().clear();
         let mut unassigned = caller;
         unassigned.reviewer_id = None;
-        let unavailable = run_gate(
+        let unavailable = async {
+            tracing::callsite::rebuild_interest_cache();
+            run_gate(
             &d.kernel_db.clone(),
             &unassigned,
             cc_spec("unassigned"),
             d.kernel.ledger_flows(),
             &Err(crate::kj::gate_policy::GateConfigError::Parse("bad".into())),
-        )
+        ).await }
+        .with_subscriber(dispatch)
         .await;
         assert_eq!(unavailable.verdict, GateVerdict::Unavailable);
         let spans = spans.0.lock().unwrap();
@@ -1117,7 +1148,8 @@ mod tests {
     #[tokio::test]
     async fn an_escalated_gate_returns_pending_and_leaves_a_durable_row() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let mut caller = test_caller();
+        caller.context_id = Some(register_context(&d, Some("gate-caller"), None, caller.principal_id));
         let outcome = run_gate(
             &d.kernel_db.clone(),
             &caller,
@@ -1161,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_from_another_principal_is_redeemed_by_the_next_attempt() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
 
         let first = run_gate(
             &d.kernel_db.clone(),
@@ -1203,6 +1235,13 @@ mod tests {
         let coder = kaijutsu_types::PrincipalId::new();
         let lead = kaijutsu_types::PrincipalId::new();
         let context = register_context(&d, Some("lead-coder-gate"), None, requester);
+        {
+            let db = d.kernel_db.lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+            }).unwrap();
+            db.update_context_review(context, Some(coder), Some(lead)).unwrap();
+        }
         let mut coder_call = test_caller();
         coder_call.principal_id = requester;
         coder_call.actor_id = coder;
@@ -1262,22 +1301,22 @@ mod tests {
         assert_ne!(spent.ask.expect("a replacement ask").request_id, request_id);
     }
 
-    /// A direct command has no separate director, so its actor initially
-    /// reviews itself and cannot allow or deny. The actor must explicitly
-    /// route the pending ask to a distinct live character before it becomes
-    /// answerable.
+    /// Amy's own direct ask resolves to Amy by default, but she cannot approve
+    /// her own operation. She must explicitly assign a distinct reviewer.
     #[tokio::test]
     async fn a_direct_ask_requires_escalation_before_anyone_can_allow_it() {
         let d = gate_dispatcher().await;
         let mut direct = test_caller();
-        let actor = direct.actor_id;
-        let amy = kaijutsu_types::PrincipalId::new();
+        let actor = crate::kj::test_helpers::test_reviewer_principal();
+        direct.actor_id = actor;
+        direct.principal_id = actor;
+        let judge = kaijutsu_types::PrincipalId::new();
         let context = register_context(&d, Some("direct-gate"), None, direct.principal_id);
         direct.context_id = Some(context);
         direct.reviewer_id = None;
         {
             let db = d.kernel_db.lock();
-            for (principal_id, name) in [(actor, "coder"), (amy, "amy")] {
+            for (principal_id, name) in [(judge, "judge")] {
                 db.insert_character(&crate::kernel_db::CharacterRow {
                     principal_id,
                     name: name.into(),
@@ -1309,7 +1348,7 @@ mod tests {
             .dispatch(
                 &[
                     "ledger".into(), "escalate".into(), request_id.clone(), "--to".into(),
-                    "coder".into(),
+                    "amy".into(),
                 ],
                 &direct,
             )
@@ -1321,16 +1360,16 @@ mod tests {
             .dispatch(
                 &[
                     "ledger".into(), "escalate".into(), request_id.clone(), "--to".into(),
-                    "amy".into(),
+                    "judge".into(),
                 ],
                 &direct,
             )
             .await;
         assert!(escalated.is_ok(), "the direct actor can assign a distinct reviewer: {escalated:?}");
 
-        let amy_call = direct.clone().with_actor(amy, None);
+        let judge_call = direct.clone().with_actor(judge, None);
         let allowed = d
-            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &amy_call)
+            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &judge_call)
             .await;
         assert!(allowed.is_ok(), "the escalated reviewer can allow in the same context: {allowed:?}");
         let redeemed = run_gate(
@@ -1361,7 +1400,7 @@ mod tests {
     #[tokio::test]
     async fn an_approval_is_spent_after_one_use() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
 
         run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
             .await;
@@ -1409,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn a_denial_is_delivered_once_and_then_spent() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
 
         run_gate(&d.kernel_db.clone(), &caller, cc_spec("fleet-lead"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
             .await;
@@ -1448,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn an_escalated_ask_is_announced_before_the_gate_returns() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
 
         // Subscribe BEFORE the gate runs, or the notification races us.
         let mut sub = d.kernel.ledger_flows().subscribe("ledger.>");
@@ -1486,7 +1525,7 @@ mod tests {
         // target is exactly what this gate exists to prevent.
         let d = gate_dispatcher().await;
         let db = d.kernel_db.clone();
-        let caller = test_caller();
+        let caller = registered_caller(&d);
 
         run_gate(&db, &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         let request_id = pending_id(&d);
@@ -1607,7 +1646,7 @@ mod tests {
     #[tokio::test]
     async fn a_denied_statement_among_several_refuses_the_whole_submission_and_names_it() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let label = "kaish-source";
         let second = "rm -rf foo";
         let digest = statement_digest(Origin::ShellGate, second);
@@ -1646,7 +1685,7 @@ mod tests {
     #[tokio::test]
     async fn an_uncovered_multi_statement_submission_escalates() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let outcome = run_gate(
             &d.kernel_db.clone(),
             &caller,
@@ -1670,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn a_ledger_fault_is_unavailable_not_denied() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
 
         // Take the rules table out from under the gate so `rules::redeem`
         // fails on its very first read — before any row is written, which
@@ -1967,13 +2006,9 @@ mod tests {
         );
     }
 
-    /// A caller with no `context_id` has no persisted cwd to record —
-    /// documented behavior for the synthetic/internal-caller case, not a
-    /// gap. Its escalation still leaves a normal pending row; only the
-    /// directory is absent, so its later redemption runs with no cwd
-    /// override.
+    /// An ask requires a context so its reviewer can be resolved durably.
     #[tokio::test]
-    async fn a_caller_with_no_context_id_records_no_cwd() {
+    async fn a_caller_with_no_context_id_cannot_record_an_ask() {
         let d = gate_dispatcher().await;
         let mut caller = test_caller();
         caller.context_id = None;
@@ -1986,14 +2021,10 @@ mod tests {
             &crate::kj::gate_policy::no_config(),
         )
         .await;
-        assert_eq!(outcome.verdict, GateVerdict::Pending);
-        let request_id = outcome.ask.expect("still a normal escalation").request_id;
-
-        assert_eq!(
-            ask_cwd(&d.kernel_db, &request_id),
-            None,
-            "a caller with no context_id has no persisted cwd to record"
-        );
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable);
+        assert!(outcome.reason.contains("require a context"), "{}", outcome.reason);
+        assert!(outcome.ask.is_none());
+        assert!(d.kernel_db.lock().list_pending_asks().unwrap().is_empty());
     }
 
     /// `PENDING_REASON` splits on whether the ask can execute on approval:
@@ -2007,7 +2038,7 @@ mod tests {
     #[tokio::test]
     async fn pending_reason_selects_on_whether_the_ask_can_execute() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
 
         let mut executing = cc_spec("kaijutsu-chan");
         executing.exec_source = Some("echo hi".into());
@@ -2109,8 +2140,7 @@ mod tests {
         assert!(row.description.contains("FOO=\"bar\""), "{}", row.description);
     }
 
-    /// A caller with no `context_id` has no persisted `context_env` to
-    /// snapshot — same shape as [`a_caller_with_no_context_id_records_no_cwd`].
+    /// Free variables do not make a contextless ask routable.
     #[tokio::test]
     async fn a_caller_with_no_context_id_records_no_env() {
         let d = gate_dispatcher().await;
@@ -2119,11 +2149,9 @@ mod tests {
 
         let spec = crate::kj::shell_gate::build_shell_gate_spec("echo ${FOO}").unwrap();
         let outcome = run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
-        assert_eq!(outcome.verdict, GateVerdict::Pending);
-        let request_id = outcome.ask.expect("still a normal escalation").request_id;
-
-        let env = d.kernel_db.lock().ask_env(&request_id).unwrap();
-        assert!(env.is_empty(), "no context_id means no context_env to snapshot: {env:?}");
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable);
+        assert!(outcome.ask.is_none());
+        assert!(d.kernel_db.lock().list_pending_asks().unwrap().is_empty());
     }
 
     // ── The gate policy evaluator (`kj/gate_policy.rs`) ─────────────────
@@ -2147,7 +2175,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_only_shell_program_auto_allows_with_a_row_naming_the_builtin_layer() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
         let outcome =
             run_gate(&d.kernel_db.clone(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
@@ -2179,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn a_user_deny_rule_outranks_the_builtin_allow() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
         let digest = statement_digest(Origin::ShellGate, &spec.statements[0].rendered);
         seed_deny_rule(&d.kernel_db, &digest, &spec.authorized_label);
@@ -2201,7 +2229,7 @@ mod tests {
     #[tokio::test]
     async fn a_kj_verb_ask_never_meets_the_builtin_layer() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let mut spec = cc_spec("kaijutsu-chan");
         spec.statements[0].rendered = "kj block list".into();
         spec.statements[0].vars.clear();
@@ -2218,7 +2246,7 @@ mod tests {
     #[tokio::test]
     async fn a_hook_ask_on_a_read_only_shell_call_auto_allows() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let params = crate::mcp::types::KernelCallParams {
             instance: crate::mcp::types::InstanceId::new("builtin.shell_write"),
             tool: "shell_write".into(),
@@ -2249,7 +2277,7 @@ mod tests {
     #[tokio::test]
     async fn a_config_deny_refuses_the_shell_gate_with_a_row() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let spec = crate::kj::shell_gate::build_shell_gate_spec("dd if=/dev/zero of=/dev/sda").unwrap();
         let config = gate_config("[global]\ndeny = [\"dd\"]\n");
         let outcome =
@@ -2265,7 +2293,7 @@ mod tests {
     #[tokio::test]
     async fn a_config_ask_escalates_a_statement_the_builtin_layer_would_allow() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
         let config = gate_config("[global]\nask = [\"kj block list\"]\n");
         let outcome =
@@ -2278,7 +2306,7 @@ mod tests {
     #[tokio::test]
     async fn a_user_allow_rule_outranks_a_config_deny() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let source = "dd if=/dev/zero of=/tmp/scratch";
         let config = gate_config("[global]\ndeny = [\"dd\"]\n");
 
@@ -2315,7 +2343,7 @@ mod tests {
         assert!(outcome.reason.contains("context_type config (explorer) denies"), "{}", outcome.reason);
 
         // Another context of no particular type gets the global allow.
-        let other = test_caller();
+        let other = registered_caller(&d);
         let spec = crate::kj::shell_gate::build_shell_gate_spec("kj context create x").unwrap();
         let outcome =
             run_gate(&d.kernel_db.clone(), &other, spec, d.kernel.ledger_flows(), &config).await;
@@ -2327,7 +2355,7 @@ mod tests {
     #[tokio::test]
     async fn an_unusable_gate_toml_makes_the_gate_unavailable() {
         let d = gate_dispatcher().await;
-        let caller = test_caller();
+        let caller = registered_caller(&d);
         let spec = crate::kj::shell_gate::build_shell_gate_spec("kj block list").unwrap();
         let config: crate::kj::gate_policy::GateConfigLoad =
             Err(crate::kj::gate_policy::GateConfigError::Parse("line 3: bad".into()));

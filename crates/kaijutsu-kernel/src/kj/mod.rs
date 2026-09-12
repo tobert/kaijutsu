@@ -1226,6 +1226,16 @@ pub(crate) mod test_helpers {
             let db = kernel_db.lock();
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
+            let reviewer = test_reviewer_principal();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: reviewer,
+                name: "amy".to_string(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+            })
+            .unwrap();
+            db.set_default_approval_reviewer(reviewer).unwrap();
         }
         // One throwaway root holds BOTH the kernel data_dir and the seeded
         // /config/rc tree, so the kernel's cleanup guard removes them together when
@@ -1413,6 +1423,14 @@ pub(crate) mod test_helpers {
         }
     }
 
+    /// A normal gate caller whose context exists and can therefore resolve
+    /// the configured approval reviewer.
+    pub fn registered_caller(dispatcher: &KjDispatcher) -> KjCaller {
+        let mut caller = test_caller();
+        caller.context_id = Some(register_context(dispatcher, None, None, caller.principal_id));
+        caller
+    }
+
     /// Create a confirmed caller (for testing destructive ops post-latch).
     /// Privileged for the same reason as [`test_caller`]: it's a trusted
     /// control-plane fixture, and some destructive-op tests target unregistered
@@ -1485,6 +1503,7 @@ pub(crate) mod test_helpers {
                 origin_host: None,
                 played_by: None,
                 reviewer_id: None,
+                director_id: None,
             };
             db.insert_context(&row).unwrap();
 

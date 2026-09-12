@@ -1172,6 +1172,10 @@ mod tests {
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("ledger-shw"), None, principal);
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+        }).unwrap();
+        d.kernel_db().lock().update_context_review(ctx_id, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
