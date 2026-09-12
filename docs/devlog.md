@@ -1128,3 +1128,43 @@ mapping now withholds the payload for a Waiting dispatch and no child is
 authored; and both dispatch paths anchor the next block past an error
 child when one is. Four tests pin it, two of them reproducing the exact
 `#18 #19 #17` order from the probe before the fix.
+
+## The approval that resumed its coder (September 12)
+
+Saturday opened on a five-item list, smallest first, and the first three
+landed by mid-morning. The approval chain from Friday had one piece left:
+an allow filled a model's own Waiting pair, but the driver's rule dated
+from when only a human's shell pair was linked, so a linked pair "told
+nobody" and the coder read its own stale "waiting on a human" text as the
+last word. The design doc already had the answer: a pair whose turn ended
+at the gate gets a seed block and a turn request. The ledger now records
+who owns a linked pair, `turn` from the model tool path and `session` from
+the interactive shell, and a turn-owned fill wakes the model exactly as a
+driver-authored one does. Amy confirmed the consequence: "kj ledger allow
+should auto-resume", with a staleness check to follow, since an approval
+answered hours later revives a turn whose prompt cache is long gone and
+that costs real money off a subscription. The seed is written even while
+a turn is running, because the fill is an in-place edit a cached mailbox
+never re-reads; only the turn request waits.
+
+Two smaller ones rode along. The activity stamp on every streamed delta
+rewrote the contexts page in the WAL to move a millisecond timestamp the
+readers show in minutes; it is throttled to once a second per context, to
+be measured on the next bounce. And `kj rc list`, the one surface that
+compares live rc against the shipped seed, walked `lib/hooks` and then
+dropped every entry because a hook body is not a lifecycle script path.
+That was how Thursday's stale lfm2d hook stayed invisible for a day. Hook
+bodies now list and show beside the scripts.
+
+The morning also had two of Amy's sessions in one checkout. A second
+session began an approval-identity change in the same ledger files the
+pair-owner lane had just finished in, building on the uncommitted work and
+re-indexing its row reads. Separating the hunks by hand would have broken
+the other session mid-edit, so the lead rebuilt its own versions of the
+five shared files from HEAD plus the lane's known edits, staged them with
+`hash-object` and `update-index` without touching the working tree, and
+proved the staged tree on a detached worktree with its own target
+directory before committing. The other session's diff against the new
+HEAD is then only its own change. Four coder-stance e2e tests turned out
+to have been red since the September 10 prompt rework, pinning phrases
+that no longer ship; they pin the current tier lines now.
