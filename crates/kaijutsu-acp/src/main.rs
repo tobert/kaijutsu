@@ -52,7 +52,7 @@ struct Cli {
     /// rc bundle for contexts this bridge creates.
     ///
     /// `coder` by default: over ACP, kaijutsu *is* the agent and the client is
-    /// the human's seat, so a new session should get the model-facing stance —
+    /// the reviewer's seat, so a new session should get the model-facing stance —
     /// unlike kaijutsu-mcp, where kaijutsu is the tool and `mcp` is right.
     #[arg(long, default_value = "coder")]
     context_type: String,
