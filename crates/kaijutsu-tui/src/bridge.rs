@@ -222,6 +222,11 @@ impl KernelBridge {
         Ok(self.actor.whoami().await.context("whoami")?.principal_id)
     }
 
+    /// The authenticated character identity for this terminal seat.
+    pub async fn identity(&self) -> Result<kaijutsu_client::Identity> {
+        self.actor.whoami().await.context("whoami")
+    }
+
     /// The context's draft as the kernel holds it right now, for the first
     /// compose buffer of a session.
     pub async fn read_input(&self, context_id: ContextId) -> Result<String> {

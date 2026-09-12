@@ -123,7 +123,9 @@ pub async fn run(
     // which principal is ours before it can pick its own draft out of the
     // mirror. A draft this or another client left behind is picked up rather
     // than overwritten.
-    app.principal = Some(bridge.principal().await?);
+    let identity = bridge.identity().await?;
+    app.identity = identity.display_name;
+    app.principal = Some(identity.principal_id);
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
 
     // The inline viewport's first cursor query runs before the key reader
@@ -999,21 +1001,43 @@ async fn open_ledger(bridge: &KernelBridge, app: &mut App) {
         app.note("no context attached");
         return;
     };
-    let pending_ids = kaijutsu_client::list_pending(bridge.actor(), ctx).await.unwrap_or_default();
-    let history_ids = kaijutsu_client::list_history(bridge.actor(), ctx).await.unwrap_or_default();
+    let pending_ids = match kaijutsu_client::list_pending(bridge.actor(), ctx).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            app.note(format!("cannot read pending ledger asks: {error}"));
+            return;
+        }
+    };
+    let history_ids = match kaijutsu_client::list_history(bridge.actor(), ctx).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            app.note(format!("cannot read ledger history: {error}"));
+            return;
+        }
+    };
 
     let mut rows = Vec::with_capacity(pending_ids.len() + history_ids.len());
     for id in pending_ids {
-        if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
-            rows.push(asks::LedgerRow::Pending(pending_row(app, &detail)));
+        match kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
+            Ok(Some(detail)) => rows.push(asks::LedgerRow::Pending(pending_row(app, &detail))),
+            Ok(None) => app.note(format!("cannot decode pending ask {}", short_ask(&id))),
+            Err(error) => app.note(format!("cannot read pending ask {}: {error}", short_ask(&id))),
         }
     }
     for id in history_ids {
-        if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
-            rows.push(asks::LedgerRow::Answered(answered_row(app, &detail)));
+        match kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
+            Ok(Some(detail)) => rows.push(asks::LedgerRow::Answered(answered_row(app, &detail))),
+            Ok(None) => app.note(format!("cannot decode answered ask {}", short_ask(&id))),
+            Err(error) => app.note(format!("cannot read answered ask {}: {error}", short_ask(&id))),
         }
     }
-    app.ledger_view = Some(asks::LedgerViewState { rows, filter: String::new(), selected: 0, filtering: false });
+    app.ledger_view = Some(asks::LedgerViewState {
+        rows,
+        filter: String::new(),
+        selected: 0,
+        filtering: false,
+        detail: None,
+    });
 }
 
 /// One `AskDetail` as the ledger view's PENDING row.
@@ -1031,6 +1055,9 @@ fn pending_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::PendingR
         context_label,
         context_type,
         hook: detail.tool.clone().unwrap_or_else(|| "-".to_string()),
+        asker: detail.actor_name.clone(),
+        reviewer: detail.reviewer_name.clone(),
+        reviewable: app.principal == detail.reviewer_id && app.principal != detail.actor_id,
         statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
     }
 }
@@ -1053,7 +1080,13 @@ fn answered_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::Answere
         time: detail.decided_at.map(|at| render::wallclock(at as u64)),
         context_label,
         decision: Some(decision_words(detail)),
-        principal: detail.decided_by.map(|by| if app.principal == Some(by) { "you".to_string() } else { by.short() }),
+        principal: detail.decided_by.map(|by| {
+            if app.principal == Some(by) {
+                "you".to_string()
+            } else {
+                detail.decided_by_name.clone().unwrap_or_else(|| by.short())
+            }
+        }),
         redeemed,
         statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
     }
@@ -1070,20 +1103,26 @@ async fn handle_ask_decision(
         open_ledger(bridge, app).await;
         return;
     }
+    if app.principal != card.detail.reviewer_id || app.principal == card.detail.actor_id {
+        app.note(format!(
+            "ask {} awaits its assigned reviewer; cancel it or ask that reviewer to escalate",
+            short_ask(&card.request_id)
+        ));
+        app.ask_card = Some(card);
+        return;
+    }
     let allow = !matches!(decision, asks::AskDecision::Deny);
     let remember = matches!(decision, asks::AskDecision::AllowAlways)
         .then_some(kaijutsu_client::RememberScope::Always);
-    // Never from the ask's own context: the kernel refuses that seat, and
-    // the card is always the current context's ask.
-    let Some(seat) = app.answering_seat(card.context_id) else {
-        app.note(format!("ask {} needs another seat to answer from; none open", short_ask(&card.request_id)));
+    let Some(ctx) = app.current else {
+        app.note("no context attached");
         return;
     };
     report_decision(
         app,
         &card.request_id,
         allow,
-        kaijutsu_client::decide_ask_remember(bridge.actor(), seat, &card.request_id, allow, remember).await,
+        kaijutsu_client::decide_ask_remember(bridge.actor(), ctx, &card.request_id, allow, remember).await,
     );
 }
 
@@ -1093,6 +1132,14 @@ async fn handle_ask_decision(
 /// count; re-fetching and re-selecting inline is a follow-up, not this
 /// pass's scope.
 async fn handle_ledger_key(bridge: &KernelBridge, app: &mut App, key: crossterm::event::KeyEvent) {
+    if app.ledger_view.as_ref().is_some_and(|view| view.detail.is_some()) {
+        if key.code == crossterm::event::KeyCode::Esc && key.modifiers.is_empty() {
+            if let Some(view) = app.ledger_view.as_mut() {
+                view.detail = None;
+            }
+        }
+        return;
+    }
     let Some(view) = app.ledger_view.as_mut() else { return };
     let filtering = view.filtering;
     match asks::ledger_key_to_action(key, filtering) {
@@ -1106,37 +1153,41 @@ async fn handle_ledger_key(bridge: &KernelBridge, app: &mut App, key: crossterm:
         }
         asks::LedgerAction::CommitFilter | asks::LedgerAction::CancelFilter => view.filtering = false,
         asks::LedgerAction::Show => {
-            // Full-detail render (`render_ask_detail`) needs its own grown
-            // view to host it; wiring that is a follow-up, not this pass.
-            if let Some(id) = view.selected_request_id() {
-                app.note(format!("ask {id}: full detail view not yet wired"));
+            let Some(request_id) = view.selected_request_id() else { return };
+            let Some(ctx) = app.current else { return };
+            match kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &request_id).await {
+                Ok(Some(detail)) => {
+                    if let Some(view) = app.ledger_view.as_mut() {
+                        view.detail = Some(detail);
+                    }
+                }
+                Ok(None) => app.note(format!("cannot decode ask {}", short_ask(&request_id))),
+                Err(error) => app.note(format!("cannot read ask {}: {error}", short_ask(&request_id))),
             }
         }
         asks::LedgerAction::AllowOnce | asks::LedgerAction::AllowAlways | asks::LedgerAction::Deny => {
             let Some(request_id) = view.selected_request_id() else { return };
+            let reviewable = asks::filtered_rows(&view.rows, &view.filter)
+                .get(view.selected)
+                .is_some_and(|row| row.reviewable());
+            if !reviewable {
+                app.note(format!(
+                    "ask {} awaits its assigned reviewer; cancel it or ask that reviewer to escalate",
+                    short_ask(&request_id)
+                ));
+                return;
+            }
             let Some(ctx) = app.current else { return };
             let action = asks::ledger_key_to_action(key, filtering);
             let allow = !matches!(action, asks::LedgerAction::Deny);
             let remember = matches!(action, asks::LedgerAction::AllowAlways)
                 .then_some(kaijutsu_client::RememberScope::Always);
             app.ledger_view = None;
-            // The row does not carry the ask's context; read it, then answer
-            // from a seat that is not it (the kernel refuses the author's).
-            let raised_in = kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &request_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|d| d.context_id)
-                .unwrap_or(ctx);
-            let Some(seat) = app.answering_seat(raised_in) else {
-                app.note(format!("ask {} needs another seat to answer from; none open", short_ask(&request_id)));
-                return;
-            };
             report_decision(
                 app,
                 &request_id,
                 allow,
-                kaijutsu_client::decide_ask_remember(bridge.actor(), seat, &request_id, allow, remember).await,
+                kaijutsu_client::decide_ask_remember(bridge.actor(), ctx, &request_id, allow, remember).await,
             );
         }
         asks::LedgerAction::Ignored => {}

@@ -583,21 +583,6 @@ impl App {
         None
     }
 
-    /// The seat this client answers an ask from: any context it holds that
-    /// is not `raised_in` — the last context first, then the rank in seat
-    /// order, then any context it knows. `None` when every context it can
-    /// name is the ask's own. The kernel refuses an answer from the context
-    /// that raised the ask (`docs/gate-and-shell-split.md`, "No
-    /// self-approval"): peer seats answer each other, and a player with
-    /// several seats is that peer.
-    pub fn answering_seat(&self, raised_in: ContextId) -> Option<ContextId> {
-        self.previous
-            .into_iter()
-            .chain(self.seats.iter().map(|s| s.context_id))
-            .chain(self.contexts.iter().map(|c| c.id))
-            .find(|id| *id != raised_in)
-    }
-
     /// Whether any tracked ask belongs to `context_id` — [`SeatCell::ask`]'s
     /// derivation.
     pub fn has_pending_ask(&self, context_id: ContextId) -> bool {
@@ -1054,6 +1039,12 @@ mod tests {
             detail: kaijutsu_client::AskDetail {
                 request_id: request_id.to_string(),
                 context_id: Some(context_id),
+                principal_id: None,
+                principal_name: None,
+                actor_id: None,
+                actor_name: None,
+                reviewer_id: None,
+                reviewer_name: None,
                 status: "pending".to_string(),
                 origin: "shell_gate".to_string(),
                 tool: Some("shell_write".to_string()),
@@ -1068,33 +1059,12 @@ mod tests {
                 created_at: None,
                 decided_at: None,
                 decided_by: None,
+                decided_by_name: None,
                 decided_option: None,
                 remember_scope: None,
                 redeemed_at: None,
             },
         }
-    }
-
-    /// An ask is answered from a seat that is not its own context — the
-    /// last context when there is one, else the first other seat — and a
-    /// client holding only the ask's context has no seat to answer from.
-    #[test]
-    fn an_ask_is_answered_from_another_seat_the_client_holds() {
-        let (mut app, a, b) = app_with_two();
-        app.switch_to(a);
-        assert_eq!(app.answering_seat(a), Some(b), "the other seat answers a's ask");
-        assert_eq!(app.answering_seat(b), Some(a));
-        app.switch_to(b);
-        app.switch_to(a);
-        assert_eq!(app.answering_seat(a), Some(b), "the last context answers first");
-        let (only, id) = {
-            let mut only = App::new("amy");
-            let c = ctx("alone");
-            let id = c.id;
-            only.set_contexts(vec![c]);
-            (only, id)
-        };
-        assert_eq!(only.answering_seat(id), None, "no seat but the ask's own");
     }
 
     /// An ask answered from another surface leaves the pending set on the

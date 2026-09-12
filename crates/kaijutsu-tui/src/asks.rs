@@ -103,6 +103,9 @@ pub struct AskCard<'a> {
     pub context_label: &'a str,
     pub context_type: &'a str,
     pub statement: &'a str,
+    pub asker: Option<&'a str>,
+    pub reviewer: Option<&'a str>,
+    pub can_review: bool,
 }
 
 /// `⚠ ask <id>  <hook>  from <context> (<type>)`, the statement flush-left,
@@ -112,18 +115,25 @@ pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         format!(
-            "⚠ ask {}  {}  from {} ({})",
-            card.request_id, card.hook, card.context_label, card.context_type
+            "⚠ ask {}  {}  from {} ({}){}{}",
+            card.request_id,
+            card.hook,
+            card.context_label,
+            card.context_type,
+            card.asker.map(|name| format!("  asker {name}")).unwrap_or_default(),
+            card.reviewer.map(|name| format!("  reviewer {name}")).unwrap_or_default(),
         ),
         palette.warning(),
     )));
     for row in wrap_plain(card.statement, width.saturating_sub(2)) {
         lines.push(Line::from(Span::styled(format!("  {row}"), palette.status())));
     }
-    lines.push(Line::from(Span::styled(
-        "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside".to_string(),
-        palette.divider(),
-    )));
+    let keys = if card.can_review {
+        "  [a]llow once  [A]llow always (global)  [d]eny  [v]iew ledger  Esc aside"
+    } else {
+        "  awaiting assigned reviewer — use kj ledger cancel or escalate  [v]iew ledger  Esc aside"
+    };
+    lines.push(Line::from(Span::styled(keys.to_string(), palette.divider())));
     lines
 }
 
@@ -149,6 +159,9 @@ pub struct PendingRow {
     pub context_label: String,
     pub context_type: String,
     pub hook: String,
+    pub asker: Option<String>,
+    pub reviewer: Option<String>,
+    pub reviewable: bool,
     pub statement: String,
 }
 
@@ -211,6 +224,10 @@ impl LedgerRow {
         }
     }
 
+    pub fn reviewable(&self) -> bool {
+        matches!(self, Self::Pending(row) if row.reviewable)
+    }
+
     /// Substring match across every column a filter might target — the id,
     /// context, hook (pending only) and statement.
     fn matches(&self, needle: &str) -> bool {
@@ -220,8 +237,13 @@ impl LedgerRow {
         let needle = needle.to_ascii_lowercase();
         let hay = match self {
             Self::Pending(r) => format!(
-                "{} {} {} {}",
-                r.request_id, r.context_label, r.hook, r.statement
+                "{} {} {} {} {} {}",
+                r.request_id,
+                r.context_label,
+                r.hook,
+                r.asker.as_deref().unwrap_or(""),
+                r.reviewer.as_deref().unwrap_or(""),
+                r.statement
             ),
             Self::Answered(r) => format!(
                 "{} {} {}",
@@ -281,12 +303,14 @@ pub fn render_ledger(
         }
         let text = match row {
             LedgerRow::Pending(r) => format!(
-                "! {:<36} {:>6}  {:<12} {:<10} {:<14} {}",
+                "! {:<36} {:>6}  {:<12} {:<10} {:<14} {:<12} {:<12} {}",
                 r.request_id,
                 r.age.as_deref().unwrap_or("—"),
                 clip(&r.context_label, 12),
                 clip(&r.context_type, 10),
                 clip(&r.hook, 14),
+                clip(r.asker.as_deref().unwrap_or("—"), 12),
+                clip(r.reviewer.as_deref().unwrap_or("—"), 12),
                 r.statement,
             ),
             LedgerRow::Answered(r) => format!(
@@ -315,7 +339,7 @@ pub fn render_ledger(
     }
 
     lines.push(Line::from(Span::styled(
-        "a allow once  A allow always  d deny  Enter show  j/k move  / filter  Esc back".to_string(),
+        "a allow once  A allow always (global)  d deny  Enter show  j/k move  / filter  Esc back".to_string(),
         palette.divider(),
     )));
     lines
@@ -397,6 +421,15 @@ pub fn render_ask_detail(detail: &AskDetailView<'_>, width: u16, palette: &Palet
     if let Some(hook) = detail.hook {
         lines.push(Line::from(Span::styled(format!("hook:       {hook}"), palette.status())));
     }
+    if let Some(requester) = detail.requester {
+        lines.push(Line::from(Span::styled(format!("requester:  {requester}"), palette.status())));
+    }
+    if let Some(asker) = detail.asker {
+        lines.push(Line::from(Span::styled(format!("asker:      {asker}"), palette.status())));
+    }
+    if let Some(reviewer) = detail.reviewer {
+        lines.push(Line::from(Span::styled(format!("reviewer:   {reviewer}"), palette.status())));
+    }
     for statement in detail.statements {
         for row in wrap_plain(statement, width.saturating_sub(12)) {
             lines.push(Line::from(Span::styled(format!("statement:  {row}"), palette.status())));
@@ -436,6 +469,9 @@ pub struct AskDetailView<'a> {
     pub hook: Option<&'a str>,
     pub context_label: &'a str,
     pub context_type: &'a str,
+    pub requester: Option<&'a str>,
+    pub asker: Option<&'a str>,
+    pub reviewer: Option<&'a str>,
     pub statements: &'a [String],
     pub exec_source: Option<&'a str>,
     pub cwd: Option<&'a str>,
@@ -515,6 +551,8 @@ pub struct LedgerViewState {
     pub filter: String,
     pub selected: usize,
     pub filtering: bool,
+    /// The selected ask after `Enter`; `Esc` returns to its row list.
+    pub detail: Option<kaijutsu_client::AskDetail>,
 }
 
 impl LedgerViewState {
@@ -579,10 +617,44 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
             context_label: &context_label,
             context_type: &context_type,
             statement,
+            asker: card.detail.actor_name.as_deref(),
+            reviewer: card.detail.reviewer_name.as_deref(),
+            can_review: app.principal == card.detail.reviewer_id && app.principal != card.detail.actor_id,
         };
         return Some(render_ask_card(&view, width, &app.palette));
     }
     if let Some(view) = &app.ledger_view {
+        if let Some(detail) = &view.detail {
+            let (context_label, context_type) = detail
+                .context_id
+                .map(|ctx| context_facts(app, ctx))
+                .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
+            let env: Vec<(String, Option<String>)> = detail
+                .env
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.value.clone()))
+                .collect();
+            let view = AskDetailView {
+                request_id: &detail.request_id,
+                status: &detail.status,
+                origin: &detail.origin,
+                hook: detail.tool.as_deref(),
+                context_label: &context_label,
+                context_type: &context_type,
+                requester: detail.principal_name.as_deref(),
+                asker: detail.actor_name.as_deref(),
+                reviewer: detail.reviewer_name.as_deref(),
+                statements: &detail.statements,
+                exec_source: detail.exec_source.as_deref(),
+                cwd: detail.cwd.as_deref(),
+                env: &env,
+                redeemed: match detail.redeemed_at {
+                    Some(at) => RedeemedMark::At(crate::render::wallclock(at as u64)),
+                    None => RedeemedMark::Never,
+                },
+            };
+            return Some(render_ask_detail(&view, width, &app.palette));
+        }
         return Some(render_ledger(&view.rows, &view.filter, view.selected, width, &app.palette));
     }
     None
@@ -606,10 +678,32 @@ pub fn active_view_viewport_lines(app: &crate::app::App, width: u16) -> Option<u
             context_label: &context_label,
             context_type: &context_type,
             statement,
+            asker: card.detail.actor_name.as_deref(),
+            reviewer: card.detail.reviewer_name.as_deref(),
+            can_review: app.principal == card.detail.reviewer_id && app.principal != card.detail.actor_id,
         };
         return Some(ask_card_viewport_lines(&view, width));
     }
     if let Some(view) = &app.ledger_view {
+        if let Some(detail) = &view.detail {
+            let (context_label, context_type) = detail
+                .context_id
+                .map(|ctx| context_facts(app, ctx))
+                .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
+            let env: Vec<(String, Option<String>)> = detail
+                .env
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.value.clone()))
+                .collect();
+            let detail = AskDetailView {
+                request_id: &detail.request_id, status: &detail.status, origin: &detail.origin,
+                hook: detail.tool.as_deref(), context_label: &context_label, context_type: &context_type,
+                requester: detail.principal_name.as_deref(), asker: detail.actor_name.as_deref(), reviewer: detail.reviewer_name.as_deref(),
+                statements: &detail.statements, exec_source: detail.exec_source.as_deref(), cwd: detail.cwd.as_deref(), env: &env,
+                redeemed: RedeemedMark::Never,
+            };
+            return Some(u16::try_from(render_ask_detail(&detail, width, &Palette::builtin()).len()).unwrap_or(u16::MAX));
+        }
         return Some(ledger_viewport_lines(&view.rows, &view.filter, view.selected));
     }
     None
@@ -658,12 +752,15 @@ mod tests {
             context_label: "kaijutsu",
             context_type: "coder",
             statement: "rm -rf ~/src/wt/kaish-arith",
+            asker: Some("coder"),
+            reviewer: Some("amy"),
+            can_review: true,
         };
         let lines = render_ask_card(&card, 80, &Palette::builtin());
         let text: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(text[0], "⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)");
+        assert_eq!(text[0], "⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)  asker coder  reviewer amy");
         assert_eq!(text[1], "  rm -rf ~/src/wt/kaish-arith");
-        assert_eq!(text[2], "  [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside");
+        assert_eq!(text[2], "  [a]llow once  [A]llow always (global)  [d]eny  [v]iew ledger  Esc aside");
     }
 
     #[test]
@@ -674,10 +771,25 @@ mod tests {
             context_label: "kaijutsu",
             context_type: "coder",
             statement: "one two three four five six seven eight nine ten",
+            asker: None,
+            reviewer: None,
+            can_review: true,
         };
         let lines = render_ask_card(&card, 24, &Palette::builtin());
         // Header, N wrapped statement lines, key line.
         assert!(lines.len() > 3, "expected the statement to wrap: {lines:?}");
+    }
+
+    #[test]
+    fn an_ask_the_viewer_cannot_review_offers_cancel_or_escalation_not_approval() {
+        let card = AskCard {
+            request_id: "id", hook: "shell_write", context_label: "kaijutsu", context_type: "coder",
+            statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), can_review: false,
+        };
+        let text: Vec<String> = render_ask_card(&card, 120, &Palette::builtin())
+            .iter().map(line_text).collect();
+        assert!(text.last().unwrap().contains("awaiting assigned reviewer"));
+        assert!(!text.last().unwrap().contains("allow once"));
     }
 
     /// [`ask_card_viewport_lines`] must count the same wrapped render
@@ -692,6 +804,9 @@ mod tests {
             context_label: "kaijutsu",
             context_type: "coder",
             statement: "one two three four five six seven eight nine ten eleven twelve",
+            asker: None,
+            reviewer: None,
+            can_review: true,
         };
         let narrow_rendered = render_ask_card(&card, 16, &Palette::builtin()).len();
         assert_eq!(usize::from(ask_card_viewport_lines(&card, 16)), narrow_rendered);
@@ -725,6 +840,9 @@ mod tests {
             context_label: ctx.to_string(),
             context_type: "coder".to_string(),
             hook: "shell_write".to_string(),
+            asker: Some("coder".to_string()),
+            reviewer: Some("amy".to_string()),
+            reviewable: true,
             statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
         })
     }
@@ -761,7 +879,7 @@ mod tests {
         assert!(text.iter().any(|l| l == "ANSWERED"));
         assert!(text.iter().any(|l| l.contains("p1") && l.contains("shell_write")));
         assert!(text.iter().any(|l| l.contains("a1") && l.contains("redeemed 13:58")));
-        assert_eq!(text.last().unwrap(), "a allow once  A allow always  d deny  Enter show  j/k move  / filter  Esc back");
+        assert_eq!(text.last().unwrap(), "a allow once  A allow always (global)  d deny  Enter show  j/k move  / filter  Esc back");
     }
 
     #[test]
@@ -839,6 +957,9 @@ mod tests {
             hook: Some("shell_write"),
             context_label: "kaijutsu",
             context_type: "coder",
+            requester: Some("amy"),
+            asker: Some("coder"),
+            reviewer: Some("amy"),
             statements: &["rm -rf ~/src/wt/kaish-arith".to_string()],
             exec_source: Some("kaish"),
             cwd: Some("/home/amy/src/wt/kaish-arith"),
@@ -851,6 +972,8 @@ mod tests {
         assert!(text.iter().any(|l| l == "env:        TARGET=kaish-arith"));
         assert!(text.iter().any(|l| l == "env:        FORCE unset"));
         assert!(text.iter().any(|l| l.contains("redeemed:   —")));
+        assert!(text.iter().any(|l| l == "asker:      coder"));
+        assert!(text.iter().any(|l| l == "reviewer:   amy"));
     }
 
     #[test]

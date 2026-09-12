@@ -262,6 +262,21 @@ pub struct EnvVar {
 pub struct AskDetail {
     pub request_id: String,
     pub context_id: Option<ContextId>,
+    /// The authenticated principal that submitted the request. This is
+    /// distinct from the actor that performed the work: a person can direct
+    /// a coder character, or a lead character can direct another character.
+    pub principal_id: Option<PrincipalId>,
+    /// The current name for [`Self::principal_id`], if its character sheet
+    /// still exists.
+    pub principal_name: Option<String>,
+    /// The character that performed the work which raised this ask.
+    pub actor_id: Option<PrincipalId>,
+    /// The current name for [`Self::actor_id`].
+    pub actor_name: Option<String>,
+    /// The character the delegation names as the eligible reviewer.
+    pub reviewer_id: Option<PrincipalId>,
+    /// The current name for [`Self::reviewer_id`].
+    pub reviewer_name: Option<String>,
     pub status: String,
     pub origin: String,
     /// Ledger `tool` column, e.g. `"shell_write"` — the figure in
@@ -283,6 +298,8 @@ pub struct AskDetail {
     pub decided_at: Option<i64>,
     /// Who decided it; `None` while pending or when a rule auto-decided it.
     pub decided_by: Option<PrincipalId>,
+    /// The current name for [`Self::decided_by`].
+    pub decided_by_name: Option<String>,
     /// `allow_once` / `allow_always` / `deny` / `auto_allow`; `None` while
     /// pending. Finer than `status`, which says only `allowed`/`denied`.
     pub decided_option: Option<String>,
@@ -350,6 +367,12 @@ fn decode_ask_detail(data: &serde_json::Value) -> Option<AskDetail> {
             .get("context_id")
             .and_then(|v| v.as_str())
             .and_then(|s| ContextId::parse(s).ok()),
+        principal_id: str_field("principal_id").and_then(|s| PrincipalId::parse(&s).ok()),
+        principal_name: str_field("principal_name"),
+        actor_id: str_field("actor_id").and_then(|s| PrincipalId::parse(&s).ok()),
+        actor_name: str_field("actor_name"),
+        reviewer_id: str_field("reviewer_id").and_then(|s| PrincipalId::parse(&s).ok()),
+        reviewer_name: str_field("reviewer_name"),
         status: str_field("status").unwrap_or_default(),
         origin: str_field("origin").unwrap_or_default(),
         tool: str_field("tool"),
@@ -364,16 +387,16 @@ fn decode_ask_detail(data: &serde_json::Value) -> Option<AskDetail> {
         created_at: data.get("created_at").and_then(|v| v.as_i64()),
         decided_at: data.get("decided_at").and_then(|v| v.as_i64()),
         decided_by: str_field("decided_by").and_then(|s| PrincipalId::parse(&s).ok()),
+        decided_by_name: str_field("decided_by_name"),
         decided_option: str_field("decided_option"),
         remember_scope: str_field("remember_scope"),
         redeemed_at: data.get("redeemed_at").and_then(|v| v.as_i64()),
     })
 }
 
-/// `--remember <scope>` on `kj ledger allow|deny` — mirrors the kernel's
-/// `RememberScopeArg` (`kaijutsu-kernel/src/kj/ledger.rs`): `Session` covers
-/// only the context/principal that asked, `Always` covers any
-/// context/principal presenting the same statement + label.
+/// `--remember <scope>` on `kj ledger allow|deny`. `Session` covers the
+/// original ask; `Always` creates a global remembered rule for matching
+/// statements and labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RememberScope {
     Session,
@@ -454,9 +477,15 @@ mod detail_tests {
             "request_id": "01a04eb6-aaaa-bbbb-cccc-000000000001",
             "context_id": "0198f2b0-0000-7000-8000-000000000001",
             "principal_id": "0198f2b0-0000-7000-8000-000000000002",
+            "principal_name": "amy",
+            "actor_id": "0198f2b0-0000-7000-8000-000000000004",
+            "actor_name": "coder",
+            "reviewer_id": "0198f2b0-0000-7000-8000-000000000003",
+            "reviewer_name": "amy",
             "created_at": 1_756_819_300_000i64,
             "decided_at": 1_756_819_330_000i64,
             "decided_by": "0198f2b0-0000-7000-8000-000000000003",
+            "decided_by_name": "amy",
             "decided_option": "allow_once",
             "remember_scope": null,
             "redeemed_at": 1_756_819_331_000i64,
@@ -479,6 +508,9 @@ mod detail_tests {
         let detail = decode_ask_detail(&full_show_data()).expect("decodes");
         assert_eq!(detail.request_id, "01a04eb6-aaaa-bbbb-cccc-000000000001");
         assert!(detail.context_id.is_some());
+        assert_eq!(detail.principal_name.as_deref(), Some("amy"));
+        assert_eq!(detail.actor_name.as_deref(), Some("coder"));
+        assert_eq!(detail.reviewer_name.as_deref(), Some("amy"));
         assert_eq!(detail.status, "allowed");
         assert_eq!(detail.origin, "shell_gate");
         assert_eq!(detail.tool.as_deref(), Some("shell_write"));
@@ -495,6 +527,7 @@ mod detail_tests {
             Some("0198f2b0-0000-7000-8000-000000000003")
         );
         assert_eq!(detail.decided_option.as_deref(), Some("allow_once"));
+        assert_eq!(detail.decided_by_name.as_deref(), Some("amy"));
         assert_eq!(detail.remember_scope, None);
         assert_eq!(
             detail.env,

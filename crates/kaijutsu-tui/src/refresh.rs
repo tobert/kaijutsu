@@ -47,10 +47,12 @@ pub struct Refreshed {
 /// The ledger half of a round.
 #[derive(Default)]
 pub struct AskPoll {
-    /// `seen_asks` after the poll: every id still pending, the new ones
-    /// included.
+    /// `seen_asks` after the poll: only ids already offered as cards. An ask
+    /// stays unseen until the TUI can present it.
     pub seen: HashSet<String>,
     pub new_asks: Vec<PendingAsk>,
+    /// Every ask still pending, including asks not yet presented as a card.
+    pub pending_count: usize,
     /// The card to open: the first new ask raised in the polled context,
     /// read in full. Opened only if no card is up when the round lands.
     pub card: Option<AskCardState>,
@@ -89,14 +91,18 @@ async fn poll(
     // modal for a seat you are not looking at (`docs/tui.md`, "Asks").
     let mut opened = None;
     for ask in &new_asks {
-        seen.insert(ask.request_id.clone());
         if opened.is_none() && ask.info.context_id == ctx {
             if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(actor, ctx, &ask.request_id).await {
+                // An id becomes seen only when it has actually been offered
+                // as a card. Marking every listed id here loses later asks.
+                seen.insert(ask.request_id.clone());
                 opened = Some(AskCardState { request_id: ask.request_id.clone(), context_id: ctx, detail });
             }
         }
     }
-    Some(AskPoll { seen, new_asks, card: opened, answered })
+    let pending_count = seen.len()
+        + new_asks.iter().filter(|ask| !seen.contains(&ask.request_id)).count();
+    Some(AskPoll { pending_count, seen, new_asks, card: opened, answered })
 }
 
 /// Fold a finished round into the app. No await: this runs on the loop.
@@ -125,7 +131,7 @@ pub fn apply(app: &mut App, refreshed: Refreshed, seen_asks: &mut HashSet<String
             app.ask_card = Some(card);
         }
         app.forget_asks_not_pending(&poll.seen);
-        app.pending_asks = poll.seen.len();
+        app.pending_asks = poll.pending_count;
         *seen_asks = poll.seen;
     }
     if let Some(tracks) = refreshed.tracks {
@@ -174,6 +180,12 @@ mod tests {
         AskDetail {
             request_id: request_id.to_string(),
             context_id: Some(ctx),
+            principal_id: None,
+            principal_name: None,
+            actor_id: None,
+            actor_name: None,
+            reviewer_id: None,
+            reviewer_name: None,
             status: "pending".to_string(),
             origin: "shell".to_string(),
             tool: Some("shell_write".to_string()),
@@ -188,6 +200,7 @@ mod tests {
             created_at: None,
             decided_at: None,
             decided_by: None,
+            decided_by_name: None,
             decided_option: None,
             remember_scope: None,
             redeemed_at: None,
@@ -205,6 +218,7 @@ mod tests {
         AskPoll {
             seen: seen.iter().map(|s| s.to_string()).collect(),
             new_asks,
+            pending_count: seen.len(),
             card,
             answered: None,
         }

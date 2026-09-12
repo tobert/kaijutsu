@@ -1370,6 +1370,12 @@ mod tests {
             detail: kaijutsu_client::AskDetail {
                 request_id: "01a04eb6".to_string(),
                 context_id: Some(id),
+                principal_id: None,
+                principal_name: None,
+                actor_id: None,
+                actor_name: None,
+                reviewer_id: None,
+                reviewer_name: None,
                 status: "pending".to_string(),
                 origin: "shell_gate".to_string(),
                 tool: Some("shell_write".to_string()),
@@ -1384,6 +1390,7 @@ mod tests {
                 created_at: None,
                 decided_at: None,
                 decided_by: None,
+                decided_by_name: None,
                 decided_option: None,
                 remember_scope: None,
                 redeemed_at: None,
@@ -1413,6 +1420,12 @@ mod tests {
             detail: kaijutsu_client::AskDetail {
                 request_id: "01a04eb6".to_string(),
                 context_id: Some(id),
+                principal_id: None,
+                principal_name: None,
+                actor_id: None,
+                actor_name: None,
+                reviewer_id: None,
+                reviewer_name: None,
                 status: "pending".to_string(),
                 origin: "shell_gate".to_string(),
                 tool: Some("shell_write".to_string()),
@@ -1427,6 +1440,7 @@ mod tests {
                 created_at: None,
                 decided_at: None,
                 decided_by: None,
+                decided_by_name: None,
                 decided_option: None,
                 remember_scope: None,
                 redeemed_at: None,
@@ -1435,7 +1449,7 @@ mod tests {
         let live = live_lines(&mut app, 16, 0, false);
         let last_content: String = live[live.len() - 2].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            last_content.contains("[a]llow"),
+            last_content.contains("Esc aside"),
             "key hints must be the last content line before the status line, got {last_content:?} in {live:?}"
         );
     }
@@ -1454,6 +1468,9 @@ mod tests {
                     context_label: "kaijutsu".to_string(),
                     context_type: "coder".to_string(),
                     hook: "shell_write".to_string(),
+                    asker: None,
+                    reviewer: None,
+                    reviewable: true,
                     statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
                 })
             })
@@ -1463,6 +1480,7 @@ mod tests {
             filter: String::new(),
             selected: 0,
             filtering: false,
+            detail: None,
         });
         let live = live_lines(&mut app, 96, 0, false);
         let last_content: String = live[live.len() - 2].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1486,6 +1504,12 @@ mod tests {
             detail: kaijutsu_client::AskDetail {
                 request_id: "01a04eb6".to_string(),
                 context_id: Some(id),
+                principal_id: None,
+                principal_name: None,
+                actor_id: None,
+                actor_name: None,
+                reviewer_id: None,
+                reviewer_name: None,
                 status: "pending".to_string(),
                 origin: "shell_gate".to_string(),
                 tool: Some("shell_write".to_string()),
@@ -1500,6 +1524,7 @@ mod tests {
                 created_at: None,
                 decided_at: None,
                 decided_by: None,
+                decided_by_name: None,
                 decided_option: None,
                 remember_scope: None,
                 redeemed_at: None,
@@ -1521,6 +1546,9 @@ mod tests {
                     context_label: "kaijutsu".to_string(),
                     context_type: "coder".to_string(),
                     hook: "shell_write".to_string(),
+                    asker: None,
+                    reviewer: None,
+                    reviewable: true,
                     statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
                 })
             })
@@ -1530,6 +1558,7 @@ mod tests {
             filter: String::new(),
             selected: 0,
             filtering: false,
+            detail: None,
         });
         assert!(viewport_lines(&app, 96) > VIEWPORT_LINES);
     }
@@ -1549,6 +1578,9 @@ mod tests {
                     context_label: "kaijutsu".to_string(),
                     context_type: "coder".to_string(),
                     hook: "shell_write".to_string(),
+                    asker: None,
+                    reviewer: None,
+                    reviewable: true,
                     statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
                 })
             })
@@ -1558,6 +1590,7 @@ mod tests {
             filter: String::new(),
             selected: 0,
             filtering: false,
+            detail: None,
         });
         // The full view needs more than 4 rows; hand draw_live a terminal
         // that only has 4.
@@ -1634,11 +1667,15 @@ mod tests {
                 context_label: "kaijutsu".to_string(),
                 context_type: "coder".to_string(),
                 hook: "shell_write".to_string(),
+                asker: None,
+                reviewer: None,
+                reviewable: true,
                 statement: "git worktree remove --force".to_string(),
             })],
             filter: String::new(),
             selected: 0,
             filtering: false,
+            detail: None,
         });
         // LEDGER header + PENDING + one row + key line + status: 5 lines,
         // the full render `viewport_lines` would grow the real viewport to
