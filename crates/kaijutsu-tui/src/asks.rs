@@ -338,8 +338,10 @@ pub fn render_ledger(
         )));
     }
 
+    let hints = "a allow once  A allow always (global)  d deny  Enter show  j/k move  / filter  Esc back";
+    let short_hints = "a allow once  A global  d deny  Enter  j/k  /  Esc back";
     lines.push(Line::from(Span::styled(
-        "a allow once  A allow always (global)  d deny  Enter show  j/k move  / filter  Esc back".to_string(),
+        if hints.len() <= width_usize { hints } else { short_hints }.to_string(),
         palette.divider(),
     )));
     lines
@@ -619,7 +621,7 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
             statement,
             asker: card.detail.actor_name.as_deref(),
             reviewer: card.detail.reviewer_name.as_deref(),
-            can_review: app.principal == card.detail.reviewer_id && app.principal != card.detail.actor_id,
+            can_review: app.principal.is_some_and(|principal| card.detail.can_review(principal)),
         };
         return Some(render_ask_card(&view, width, &app.palette));
     }
@@ -680,7 +682,7 @@ pub fn active_view_viewport_lines(app: &crate::app::App, width: u16) -> Option<u
             statement,
             asker: card.detail.actor_name.as_deref(),
             reviewer: card.detail.reviewer_name.as_deref(),
-            can_review: app.principal == card.detail.reviewer_id && app.principal != card.detail.actor_id,
+            can_review: app.principal.is_some_and(|principal| card.detail.can_review(principal)),
         };
         return Some(ask_card_viewport_lines(&view, width));
     }

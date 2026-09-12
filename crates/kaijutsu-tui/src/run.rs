@@ -1057,7 +1057,7 @@ fn pending_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::PendingR
         hook: detail.tool.clone().unwrap_or_else(|| "-".to_string()),
         asker: detail.actor_name.clone(),
         reviewer: detail.reviewer_name.clone(),
-        reviewable: app.principal == detail.reviewer_id && app.principal != detail.actor_id,
+        reviewable: app.principal.is_some_and(|principal| detail.can_review(principal)),
         statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
     }
 }
@@ -1103,7 +1103,7 @@ async fn handle_ask_decision(
         open_ledger(bridge, app).await;
         return;
     }
-    if app.principal != card.detail.reviewer_id || app.principal == card.detail.actor_id {
+    if !app.principal.is_some_and(|principal| card.detail.can_review(principal)) {
         app.note(format!(
             "ask {} awaits its assigned reviewer; cancel it or ask that reviewer to escalate",
             short_ask(&card.request_id)

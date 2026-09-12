@@ -47,15 +47,18 @@ pub struct Refreshed {
 /// The ledger half of a round.
 #[derive(Default)]
 pub struct AskPoll {
-    /// `seen_asks` after the poll: only ids already offered as cards. An ask
-    /// stays unseen until the TUI can present it.
-    pub seen: HashSet<String>,
+    /// The authoritative ledger snapshot. This retains indicators for asks
+    /// that have not yet been shown as cards.
+    pub pending_ids: HashSet<String>,
     pub new_asks: Vec<PendingAsk>,
     /// Every ask still pending, including asks not yet presented as a card.
     pub pending_count: usize,
     /// The card to open: the first new ask raised in the polled context,
     /// read in full. Opened only if no card is up when the round lands.
     pub card: Option<AskCardState>,
+    /// A pending card's newest detail, so a reassignment is reflected while
+    /// it remains on screen.
+    pub card_refresh: Option<AskCardState>,
     /// The request's card, once its ask left the pending set: its id and
     /// its decision. `None` inside when `kj ledger show` could not be read.
     pub answered: Option<(String, Option<AskDetail>)>,
@@ -75,34 +78,39 @@ pub async fn fetch(bridge: KernelBridge, request: Request) -> Refreshed {
 async fn poll(
     bridge: &KernelBridge,
     ctx: ContextId,
-    mut seen: HashSet<String>,
+    seen: HashSet<String>,
     card: Option<(String, ContextId)>,
 ) -> Option<AskPoll> {
     let actor = bridge.actor();
-    let new_asks = kaijutsu_client::poll_new_asks(actor, ctx, &mut seen).await.ok()?;
-    let answered = match card {
-        Some((id, card_ctx)) if !seen.contains(&id) => {
-            let detail = kaijutsu_client::show_ask_detail(actor, card_ctx, &id).await.ok().flatten();
-            Some((id, detail))
+    let snapshot = kaijutsu_client::poll_new_asks(actor, ctx, &seen).await.ok()?;
+    let new_asks = snapshot.new_asks;
+    let answered = match card.as_ref() {
+        Some((id, card_ctx)) if !snapshot.pending_ids.contains(id) => {
+            let detail = kaijutsu_client::show_ask_detail(actor, *card_ctx, id).await.ok().flatten();
+            Some((id.clone(), detail))
         }
         _ => None,
     };
     // A card is auto-shown only for the polled context's own ask, never a
     // modal for a seat you are not looking at (`docs/tui.md`, "Asks").
     let mut opened = None;
-    for ask in &new_asks {
-        if opened.is_none() && ask.info.context_id == ctx {
-            if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(actor, ctx, &ask.request_id).await {
-                // An id becomes seen only when it has actually been offered
-                // as a card. Marking every listed id here loses later asks.
-                seen.insert(ask.request_id.clone());
-                opened = Some(AskCardState { request_id: ask.request_id.clone(), context_id: ctx, detail });
+    if card.is_none() {
+        for ask in &new_asks {
+            if opened.is_none() && ask.info.context_id == ctx {
+                if let Ok(Some(detail)) = kaijutsu_client::show_ask_detail(actor, ctx, &ask.request_id).await {
+                    opened = Some(AskCardState { request_id: ask.request_id.clone(), context_id: ctx, detail });
+                }
             }
         }
     }
-    let pending_count = seen.len()
-        + new_asks.iter().filter(|ask| !seen.contains(&ask.request_id)).count();
-    Some(AskPoll { pending_count, seen, new_asks, card: opened, answered })
+    let card_refresh = match card.as_ref() {
+        Some((id, card_ctx)) if snapshot.pending_ids.contains(id) => {
+            kaijutsu_client::show_ask_detail(actor, *card_ctx, id).await.ok().flatten()
+                .map(|detail| AskCardState { request_id: id.clone(), context_id: *card_ctx, detail })
+        }
+        _ => None,
+    };
+    Some(AskPoll { pending_count: snapshot.pending_ids.len(), pending_ids: snapshot.pending_ids, new_asks, card: opened, card_refresh, answered })
 }
 
 /// Fold a finished round into the app. No await: this runs on the loop.
@@ -113,7 +121,7 @@ pub fn apply(app: &mut App, refreshed: Refreshed, seen_asks: &mut HashSet<String
     if let Some(poll) = refreshed.asks {
         // A card whose ask left the pending set comes down first, so the
         // next ask below gets the card instead of only a `!`.
-        if let Some(card) = app.take_answered_card(&poll.seen) {
+        if let Some(card) = app.take_answered_card(&poll.pending_ids) {
             let detail = poll
                 .answered
                 .as_ref()
@@ -130,9 +138,17 @@ pub fn apply(app: &mut App, refreshed: Refreshed, seen_asks: &mut HashSet<String
         {
             app.ask_card = Some(card);
         }
-        app.forget_asks_not_pending(&poll.seen);
+        if let Some(card) = poll.card_refresh
+            && app.ask_card.as_ref().is_some_and(|current| current.request_id == card.request_id)
+        {
+            app.ask_card = Some(card);
+        }
+        app.forget_asks_not_pending(&poll.pending_ids);
         app.pending_asks = poll.pending_count;
-        *seen_asks = poll.seen;
+        seen_asks.retain(|id| poll.pending_ids.contains(id));
+        if let Some(card) = app.ask_card.as_ref() {
+            seen_asks.insert(card.request_id.clone());
+        }
     }
     if let Some(tracks) = refreshed.tracks {
         app.tracks = tracks.iter().map(picker::track_row_from).collect();
@@ -216,10 +232,11 @@ mod tests {
 
     fn poll_with(seen: &[&str], new_asks: Vec<PendingAsk>, card: Option<AskCardState>) -> AskPoll {
         AskPoll {
-            seen: seen.iter().map(|s| s.to_string()).collect(),
+            pending_ids: seen.iter().map(|s| s.to_string()).collect(),
             new_asks,
             pending_count: seen.len(),
             card,
+            card_refresh: None,
             answered: None,
         }
     }

@@ -40,7 +40,7 @@ pub use context_feed::{
 };
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
 pub use ledger::{
-    AskDetail, AskInfo, EnvVar, LedgerError, PendingAsk, RememberScope, decide_ask,
+    AskDetail, AskInfo, EnvVar, LedgerError, PendingAsk, PendingAskPoll, RememberScope, decide_ask,
     decide_ask_remember, list_history, list_pending, poll_new_asks, show_ask, show_ask_detail,
 };
 pub use kernel_clock::{KernelClockHandle, local_epoch_ns};

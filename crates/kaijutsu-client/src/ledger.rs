@@ -63,6 +63,15 @@ pub struct PendingAsk {
     pub info: AskInfo,
 }
 
+/// One authoritative pending-ledger snapshot plus asks not yet presented by
+/// this client. `pending_ids` is not presentation state: callers use it to
+/// retain indicators for asks that are still waiting behind another card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAskPoll {
+    pub pending_ids: HashSet<String>,
+    pub new_asks: Vec<PendingAsk>,
+}
+
 /// Failure decoding a `kj ledger` round trip: either the RPC call itself
 /// failed, or it ran and the verb reported a nonzero exit.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -174,14 +183,13 @@ pub async fn decide_ask(
 /// not yet in `seen`, in list order. Pure and unit-testable without a
 /// kernel — the one decision in [`poll_new_asks`] that isn't an RPC round
 /// trip.
-fn diff_new(ids: &[String], seen: &mut HashSet<String>) -> Vec<String> {
-    let still_pending: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    seen.retain(|id| still_pending.contains(id.as_str()));
+fn diff_new(ids: &[String], seen: &HashSet<String>) -> Vec<String> {
     ids.iter().filter(|id| !seen.contains(id.as_str())).cloned().collect()
 }
 
-/// One poll of the ledger: list pending asks, prune `seen` to what's still
-/// pending, and read the fields of every ask not yet in `seen`.
+/// One poll of the ledger: list pending asks and read the fields of every ask
+/// not yet in `seen`. The returned snapshot lets callers prune presentation
+/// state without mistaking it for the ledger's pending set.
 ///
 /// This does **not** insert into `seen` — that is the caller's job, once it
 /// has decided which of the returned asks it will actually offer (e.g.
@@ -195,8 +203,8 @@ fn diff_new(ids: &[String], seen: &mut HashSet<String>) -> Vec<String> {
 pub async fn poll_new_asks(
     actor: &ActorHandle,
     ctx: ContextId,
-    seen: &mut HashSet<String>,
-) -> Result<Vec<PendingAsk>, LedgerError> {
+    seen: &HashSet<String>,
+) -> Result<PendingAskPoll, LedgerError> {
     let ids = list_pending(actor, ctx).await?;
     let new_ids = diff_new(&ids, seen);
 
@@ -206,7 +214,7 @@ pub async fn poll_new_asks(
             new_asks.push(PendingAsk { request_id: id, info });
         }
     }
-    Ok(new_asks)
+    Ok(PendingAskPoll { pending_ids: ids.into_iter().collect(), new_asks })
 }
 
 /// List every asks id in the decided history (`kj ledger list --history`):
@@ -308,6 +316,18 @@ pub struct AskDetail {
     /// it never was, or the ask is still pending. `docs/tui.md`'s "was this
     /// consumed" question.
     pub redeemed_at: Option<i64>,
+}
+
+impl AskDetail {
+    /// Whether `principal` is the reviewer this ask snapshots, while the ask
+    /// still names a distinct performer. Legacy or incomplete rows carry no
+    /// review authority.
+    pub fn can_review(&self, principal: PrincipalId) -> bool {
+        matches!(
+            (self.actor_id, self.reviewer_id),
+            (Some(actor), Some(reviewer)) if principal == reviewer && principal != actor
+        )
+    }
 }
 
 /// Read one ask's full detail via `kj ledger show`. `Ok(None)` when the
@@ -539,6 +559,24 @@ mod detail_tests {
     }
 
     #[test]
+    fn ask_review_requires_complete_distinct_identity_assignment() {
+        let detail = decode_ask_detail(&full_show_data()).expect("decodes");
+        let actor = detail.actor_id.expect("fixture actor");
+        let reviewer = detail.reviewer_id.expect("fixture reviewer");
+        assert!(detail.can_review(reviewer));
+        assert!(!detail.can_review(actor));
+        assert!(!detail.can_review(PrincipalId::new()), "an unknown principal cannot review");
+
+        let mut missing_actor = detail.clone();
+        missing_actor.actor_id = None;
+        assert!(!missing_actor.can_review(reviewer), "missing actor is unresolved identity");
+
+        let mut missing_reviewer = detail;
+        missing_reviewer.reviewer_id = None;
+        assert!(!missing_reviewer.can_review(reviewer), "missing reviewer is unresolved identity");
+    }
+
+    #[test]
     fn decode_ask_detail_rejects_a_value_with_no_request_id() {
         assert!(decode_ask_detail(&serde_json::json!({ "status": "pending" })).is_none());
     }
@@ -564,7 +602,7 @@ mod tests {
         let mut seen = HashSet::new();
         seen.insert("a".to_string());
         let ids = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(diff_new(&ids, &mut seen), vec!["b".to_string()]);
+        assert_eq!(diff_new(&ids, &seen), vec!["b".to_string()]);
     }
 
     #[test]
@@ -574,14 +612,14 @@ mod tests {
         seen.insert("still-pending".to_string());
         let ids = vec!["still-pending".to_string()];
 
-        assert_eq!(diff_new(&ids, &mut seen), Vec::<String>::new());
-        assert_eq!(seen, HashSet::from(["still-pending".to_string()]));
+        assert_eq!(diff_new(&ids, &seen), Vec::<String>::new());
+        assert_eq!(seen, HashSet::from(["answered".to_string(), "still-pending".to_string()]));
     }
 
     #[test]
     fn diff_new_with_nothing_seen_returns_everything() {
         let mut seen = HashSet::new();
         let ids = vec!["x".to_string(), "y".to_string()];
-        assert_eq!(diff_new(&ids, &mut seen), ids);
+        assert_eq!(diff_new(&ids, &seen), ids);
     }
 }
