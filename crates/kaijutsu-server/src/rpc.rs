@@ -3868,6 +3868,7 @@ impl kernel::Server for KernelImpl {
         let code = pry!(pry!(p.get_code()).to_str()).to_owned();
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
+        trace_span.record("principal.id", self.connection.borrow().principal.to_string());
 
         // Non-blocking execute: return exec_id immediately, spawn execution in background.
 
@@ -5597,13 +5598,14 @@ impl kernel::Server for KernelImpl {
         // context's binding; a fresh binding seed is auto-populated by
         // dispatch_tool_via_broker on first touch.
         let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "call_mcp_tool").entered();
+        let trace_span = extract_rpc_trace(p.get_trace(), "call_mcp_tool");
         let call = pry!(p.get_call());
         let tool_name = pry!(pry!(call.get_tool()).to_str()).to_owned();
         let arguments = pry!(pry!(call.get_arguments()).to_str()).to_owned();
 
         let connection = self.connection.clone();
         let kernel = self.kernel.clone();
+        trace_span.record("principal.id", self.connection.borrow().principal.to_string());
         Promise::from_future(async move {
             let session_id = connection.borrow().session_id;
             let principal_id = connection.borrow().principal;
@@ -5670,7 +5672,7 @@ impl kernel::Server for KernelImpl {
             out.set_content(content);
             out.set_is_error(!exec.success);
             Ok(())
-        })
+        }.instrument(trace_span))
     }
 
     // =========================================================================
@@ -5993,6 +5995,7 @@ impl kernel::Server for KernelImpl {
             let conn = self.connection.borrow();
             (conn.principal, conn.session_id)
         };
+        trace_span.record("principal.id", principal_id.to_string());
         Promise::from_future(
             async move {
                 require_context_exists(&kernel, context_id)?;

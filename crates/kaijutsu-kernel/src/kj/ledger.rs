@@ -93,7 +93,7 @@ fn record_ask_identity(
     context: &[u8],
 ) {
     if let Some(id) = PrincipalId::try_from_slice(requester) {
-        span.record("requester.id", id.to_string());
+        span.record("principal.id", id.to_string());
     }
     if let Some(id) = actor.and_then(PrincipalId::try_from_slice) {
         span.record("actor.id", id.to_string());
@@ -918,7 +918,7 @@ impl KjDispatcher {
             "approval.cancel",
             ask.id = %request_id,
             decision.actor.id = %caller.actor_id,
-            requester.id = tracing::field::Empty,
+            principal.id = tracing::field::Empty,
             actor.id = tracing::field::Empty,
             reviewer.id = tracing::field::Empty,
             context.id = tracing::field::Empty,
@@ -947,7 +947,7 @@ impl KjDispatcher {
             "approval.escalate",
             ask.id = %request_id,
             decision.actor.id = %caller.actor_id,
-            requester.id = tracing::field::Empty,
+            principal.id = tracing::field::Empty,
             actor.id = tracing::field::Empty,
             reviewer.id = tracing::field::Empty,
             context.id = tracing::field::Empty,
@@ -1010,7 +1010,7 @@ impl KjDispatcher {
             ask.id = %request_id,
             decision.actor.id = %caller.actor_id,
             decision.verb = verb,
-            requester.id = tracing::field::Empty,
+            principal.id = tracing::field::Empty,
             actor.id = tracing::field::Empty,
             reviewer.id = tracing::field::Empty,
             context.id = tracing::field::Empty,

@@ -491,6 +491,17 @@ pub(crate) fn announce_ledger_change(
 /// `Unavailable`, a fault and not a decision, naming the file and the
 /// remedy. An origin the config layers do not apply to passes
 /// `gate_policy::no_config()`.
+#[tracing::instrument(
+    name = "approval.gate",
+    skip(db, spec, ledger_flows, config),
+    fields(
+        principal.id = %caller.principal_id,
+        actor.id = %caller.actor_id,
+        reviewer.id = tracing::field::Empty,
+        context.id = tracing::field::Empty,
+        ask.id = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn run_gate(
     db: &Arc<parking_lot::Mutex<KernelDb>>,
     caller: &KjCaller,
@@ -498,15 +509,13 @@ pub(crate) async fn run_gate(
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
 ) -> GateOutcome {
-    let approval_span = tracing::info_span!(
-        "approval.gate",
-        requester.id = %caller.principal_id,
-        actor.id = %caller.actor_id,
-        reviewer.id = ?caller.reviewer_id,
-        context.id = ?caller.context_id,
-        ask.id = tracing::field::Empty,
-    );
-    let _approval_guard = approval_span.enter();
+    let approval_span = tracing::Span::current();
+    if let Some(reviewer) = caller.reviewer_id {
+        approval_span.record("reviewer.id", reviewer.to_string());
+    }
+    if let Some(context) = caller.context_id {
+        approval_span.record("context.id", context.to_string());
+    }
     // An archived context is inert — it runs nothing. This is the second of
     // two checks; `kj ledger` refuses to ANSWER an archived context's ask,
     // and this one refuses to act on an answer, because a context can be
@@ -626,12 +635,25 @@ pub(crate) async fn run_gate(
                 let snapshot = {
                     let db = db.lock();
                     approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)
-                        .ok()
-                        .flatten()
                 };
-                if let Some(row) = snapshot {
+                let row = match snapshot {
+                    Ok(Some(row)) => row,
+                    Ok(None) => {
+                        tracing::error!(ask.id = %request_id, "redeemed approval disappeared before trace attribution");
+                        return GateOutcome::unavailable_without_row(
+                            "approval gate could not read the redeemed ask for attribution".to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(ask.id = %request_id, %error, "could not read redeemed approval for trace attribution");
+                        return GateOutcome::unavailable_without_row(
+                            "approval gate could not read the redeemed ask for attribution".to_string(),
+                        );
+                    }
+                };
+                {
                     if let Some(id) = PrincipalId::try_from_slice(&row.principal_id) {
-                        approval_span.record("requester.id", id.to_string());
+                        approval_span.record("principal.id", id.to_string());
                     }
                     if let Some(id) = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice) {
                         approval_span.record("actor.id", id.to_string());
@@ -805,6 +827,17 @@ pub(crate) async fn run_gate(
 ///
 /// Nothing here runs the gated action. See `docs/gate-and-shell-split.md`,
 /// "Dry-run mode".
+#[tracing::instrument(
+    name = "approval.gate.dry_run",
+    skip(db, spec, ledger_flows, reason),
+    fields(
+        principal.id = %caller.principal_id,
+        actor.id = %caller.actor_id,
+        reviewer.id = tracing::field::Empty,
+        context.id = tracing::field::Empty,
+        ask.id = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn record_dry_run_ask(
     db: &Arc<parking_lot::Mutex<KernelDb>>,
     caller: &KjCaller,
@@ -812,15 +845,13 @@ pub(crate) async fn record_dry_run_ask(
     ledger_flows: &SharedLedgerFlowBus,
     reason: &str,
 ) -> Option<AskRef> {
-    let approval_span = tracing::info_span!(
-        "approval.gate.dry_run",
-        requester.id = %caller.principal_id,
-        actor.id = %caller.actor_id,
-        reviewer.id = ?caller.reviewer_id,
-        context.id = ?caller.context_id,
-        ask.id = tracing::field::Empty,
-    );
-    let _approval_guard = approval_span.enter();
+    let approval_span = tracing::Span::current();
+    if let Some(reviewer) = caller.reviewer_id {
+        approval_span.record("reviewer.id", reviewer.to_string());
+    }
+    if let Some(context) = caller.context_id {
+        approval_span.record("context.id", context.to_string());
+    }
     let ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
     let request_id = {
         let db = db.lock();
