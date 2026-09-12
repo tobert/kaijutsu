@@ -340,6 +340,11 @@ pub fn cancel(conn: &Connection, request_id: &str, caller: &[u8]) -> Result<Appr
 /// Reassign a pending ask to a new reviewer. The current reviewer alone may
 /// do this, and the performing actor can never become the reviewer.
 pub fn escalate(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[u8]) -> Result<ApprovalRow> {
+    escalate_with_authority(conn, request_id, caller, reviewer, None)
+}
+
+/// Reassign a pending ask as its current reviewer or an explicit default authority.
+pub fn escalate_with_authority(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[u8], default_authority: Option<&[u8]>) -> Result<ApprovalRow> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let row = tx.query_row(
         &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
@@ -349,7 +354,7 @@ pub fn escalate(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[
     if row.status != ApprovalStatus::Pending {
         return Err(LedgerError::AlreadyDecided { request_id: request_id.to_string(), status: row.status.to_string() });
     }
-    if row.reviewer_id.as_deref() != Some(caller) {
+    if row.reviewer_id.as_deref() != Some(caller) && default_authority != Some(caller) {
         return Err(LedgerError::EscalateUnauthorized { request_id: request_id.to_string() });
     }
     if row.actor_id.as_deref() == Some(reviewer) {
@@ -361,7 +366,7 @@ pub fn escalate(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[
     )?;
     let note = format!(
         "reviewer reassigned from {} to {}",
-        caller.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        row.reviewer_id.as_deref().unwrap_or_default().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         reviewer.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
     );
     events::append(&tx, request_id, EventKind::Escalated, Some(caller), None, None, None, Some(&note))?;
@@ -1127,6 +1132,22 @@ mod tests {
         assert_eq!(list_events(&conn, &request_id).unwrap().last().unwrap().kind, EventKind::Escalated);
         assert!(matches!(decide(&conn, &request_id, DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() }), Err(LedgerError::UnauthorizedReviewer { .. })));
         assert_eq!(decide(&conn, &request_id, DecideInput { allow: true, decided_by: Some(reviewer(b"lead")), ..Default::default() }).unwrap().status, ApprovalStatus::Allowed);
+    }
+
+    #[test]
+    fn default_authority_can_reclaim_with_its_own_audit_actor() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+        assert!(matches!(escalate_with_authority(&conn, &request_id, b"stranger", b"amy", Some(b"amy")), Err(LedgerError::EscalateUnauthorized { .. })));
+        escalate(&conn, &request_id, b"amy", b"lead").unwrap();
+        let row = escalate_with_authority(&conn, &request_id, b"amy", b"amy", Some(b"amy")).unwrap();
+        assert_eq!(row.reviewer_id.as_deref(), Some(&b"amy"[..]));
+        let event = list_events(&conn, &request_id).unwrap().pop().unwrap();
+        assert_eq!(event.actor.as_deref(), Some(&b"amy"[..]));
+        assert_eq!(event.note.as_deref(), Some("reviewer reassigned from 6c656164 to 616d79"));
+        let self_ask = create_ask(&conn, &minimal_ask()).unwrap();
+        escalate(&conn, &self_ask, b"amy", b"lead").unwrap();
+        assert!(matches!(escalate_with_authority(&conn, &self_ask, b"amy", b"coder", Some(b"amy")), Err(LedgerError::ReviewerIsActor { .. })));
     }
 
     #[test]
