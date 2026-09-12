@@ -2678,8 +2678,12 @@ async fn process_llm_stream(
                     // (`insert_error_block_as`), so it is the new tail of
                     // this tool's output; returning the result id here would
                     // put the next iteration's thinking and text between the
-                    // result and its own error child.
-                    let mut anchor_block_id = result_block_id;
+                    // result and its own error child. A result block that
+                    // failed to insert leaves the call block as this tool's
+                    // tail: returning `None` would keep the previous tool's
+                    // anchor and put the next iteration's blocks before this
+                    // call in document order.
+                    let mut anchor_block_id = result_block_id.or(tool_call_block_id.clone());
                     if let (Some(rb_id), Some(payload)) = (&result_block_id, &error_payload) {
                         match documents.insert_error_block_as(
                             context_id,
