@@ -120,6 +120,12 @@ impl SessionRegistry {
     pub fn any_context_id(&self) -> Option<ContextId> {
         self.sessions.lock().values().next().map(|s| s.context_id)
     }
+
+    /// One live ACP session to host a kernel-wide notification when the
+    /// reviewed work belongs to a different context.
+    pub fn any_session_id(&self) -> Option<SessionId> {
+        self.sessions.lock().keys().next().cloned()
+    }
 }
 
 /// Stream one context's blocks to an ACP client as `session/update`

@@ -86,11 +86,38 @@ fn parse_cast_config(toml_text: &str) -> Option<String> {
     (!cast.is_empty()).then(|| cast.to_string())
 }
 
+/// The addressed `kj` invocation that creates an ACP context. Keeping argv
+/// construction pure makes the creation contract visible without a kernel.
+fn context_create_argv(label: &str, context_type: &str, character: &str) -> Vec<String> {
+    vec![
+        "context".into(),
+        "create".into(),
+        label.into(),
+        "--type".into(),
+        context_type.into(),
+        "--as".into(),
+        character.into(),
+    ]
+}
+
+/// `kj context create` reports the authoritative new id as structured data.
+/// Parsing text would turn a presentation change into orphaned ACP sessions.
+fn context_id_from_create_result(result: &KjExecutionResult) -> Result<ContextId> {
+    let id = result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("context_id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("kj context create succeeded without context_id data"))?;
+    ContextId::parse(id).context("kj context create returned an invalid context_id")
+}
+
 /// A live connection to a kaijutsu kernel.
 #[derive(Clone)]
 pub struct KernelBridge {
     actor: ActorHandle,
     context_type: String,
+    character: Option<String>,
 }
 
 impl KernelBridge {
@@ -104,6 +131,7 @@ impl KernelBridge {
     pub async fn connect(
         config: SshConfig,
         context_type: String,
+        character: Option<String>,
         connect_timeout: std::time::Duration,
     ) -> Result<Self> {
         let client = connect_ssh(config.clone())
@@ -191,11 +219,16 @@ impl KernelBridge {
         Ok(Self {
             actor,
             context_type,
+            character,
         })
     }
 
     pub fn actor(&self) -> &ActorHandle {
         &self.actor
+    }
+
+    pub fn has_character(&self) -> bool {
+        self.character.is_some()
     }
 
     /// Advertise the ACP client process as one peer, independent of how many
@@ -358,10 +391,7 @@ impl KernelBridge {
                     label = %fresh,
                     "prior context is concluded/archived; taking a fresh label"
                 );
-                let id = self
-                    .actor
-                    .create_context_typed(&fresh, &self.context_type)
-                    .await?;
+                let id = self.create_context(&fresh).await?;
                 self.actor.join_context(id).await?;
                 Ok(OpenedContext {
                     context_id: id,
@@ -371,10 +401,7 @@ impl KernelBridge {
                 })
             }
             None => {
-                let id = self
-                    .actor
-                    .create_context_typed(label, &self.context_type)
-                    .await?;
+                let id = self.create_context(label).await?;
                 self.actor.join_context(id).await?;
                 Ok(OpenedContext {
                     context_id: id,
@@ -384,6 +411,35 @@ impl KernelBridge {
                 })
             }
         }
+    }
+
+    /// Create a performer-assigned context through `kj` so the kernel validates
+    /// the character before inserting it and runs that character's rc create
+    /// lifecycle with the correct identity already on the row.
+    async fn create_context(&self, label: &str) -> Result<ContextId> {
+        let character = self.character.as_ref().expect("new-session path validates --character first");
+        let contexts = self.list_contexts().await?;
+        let executor = contexts
+            .iter()
+            .find(|context| {
+                context.concluded_at.is_none() && !context.archived && context.forked_from.is_none()
+            })
+            .or_else(|| {
+                contexts
+                    .iter()
+                    .find(|context| context.concluded_at.is_none() && !context.archived)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ACP session/new needs an existing live context to create a performer-assigned context; load or resume a session first"
+                )
+            })?;
+        let result = self.execute_kj(executor.id, context_create_argv(label, &self.context_type, character)).await?;
+        if result.exit_code != 0 {
+            let detail = if result.stderr.trim().is_empty() { &result.stdout } else { &result.stderr };
+            bail!("ACP could not create a context for character '{character}': {detail}");
+        }
+        context_id_from_create_result(&result)
     }
 
     /// Join a context by id (the `session/load` path).
@@ -661,6 +717,36 @@ mod tests {
     #[test]
     fn cast_config_is_none_for_malformed_toml() {
         assert_eq!(parse_cast_config("this is not { toml"), None);
+    }
+
+    #[test]
+    fn new_context_uses_kernel_create_with_type_and_performer() {
+        assert_eq!(
+            context_create_argv("acp-work", "coder", "jun"),
+            vec!["context", "create", "acp-work", "--type", "coder", "--as", "jun"]
+        );
+    }
+
+    #[test]
+    fn context_create_requires_a_structured_context_id() {
+        let id = ContextId::new();
+        let result = KjExecutionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            command_block_id: None,
+            latch: None,
+            data: Some(serde_json::json!({ "context_id": id.to_hex() })),
+        };
+        assert_eq!(context_id_from_create_result(&result).unwrap(), id);
+
+        let missing = KjExecutionResult { data: None, ..result };
+        assert!(
+            context_id_from_create_result(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("without context_id data")
+        );
     }
 
     #[test]

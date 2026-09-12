@@ -22,9 +22,8 @@
 //!    [`poll_ledger`], which calls `kaijutsu_client::ledger::poll_new_asks`
 //!    in an arbitrary live session's context — the ledger reads kernel-wide
 //!    state, so which context it runs in doesn't matter.
-//! 3. For every ask that call returns, if no ACP session here is bound to
-//!    its `context_id`, the ask is **skipped, not denied** — see "Not ours
-//!    to answer" below.
+//! 3. For every ask that call returns, inspect its durable reviewer. Only an
+//!    ask assigned to this connection's authenticated character is offered.
 //! 4. Otherwise the round trip is spawned (`cx.spawn`): a
 //!    `session/request_permission` call to the client, and on answer,
 //!    `kaijutsu_client::ledger::decide_ask` to write the decision back.
@@ -48,18 +47,14 @@
 //! while this pump's `session/request_permission` prompt is still on the
 //! client's screen — the ledger's `claim`+`decide` transaction makes
 //! exactly one answerer win (`approval-ledger`'s guarantee 5). The loser's
-//! `kj ledger allow|deny` comes back `AlreadyDecided`; this is logged at
-//! `debug!` and otherwise ignored — it is not a failure, it is two players
-//! sharing one ledger.
+//! `kj ledger allow|deny` comes back nonzero; the returned reason is recorded
+//! at `info!`, so a race and an ineligible reviewer are distinguishable.
 //!
 //! # Not ours to answer
 //!
-//! The old pump denied any ask whose context had no live ACP session,
-//! because ACP was the only possible answerer. That is no longer true: the
-//! ledger is answerable from any surface, so a context with no ACP session
-//! here may still have a human at a shell, or another connected client,
-//! about to answer it. This pump now **skips** such an ask rather than
-//! denying it — the single biggest behavioral change in this rewrite.
+//! A lead may review a coder context without an ACP session attached to that
+//! coder. The request uses an existing ACP session for the same reviewer;
+//! an ask with another reviewer stays pending for that reviewer.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -67,10 +62,11 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionId, ToolCallUpdate, ToolCallUpdateFields,
+    RequestPermissionResponse, SessionId, SessionNotification, SessionUpdate, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use kaijutsu_client::ledger::{self, AskInfo, PendingAsk};
+use kaijutsu_types::PrincipalId;
 use tokio::sync::broadcast;
 
 use crate::bridge::KernelBridge;
@@ -78,10 +74,31 @@ use crate::rank;
 use crate::session::SessionRegistry;
 use crate::AcpBridge;
 
+fn decision_failure_message(request_id: &str, verb: &str, reason: &str) -> String {
+    format!("Approval {verb} for {request_id} did not apply: {reason}")
+}
+
+fn permission_prompt_failure_message(request_id: &str, reason: &str) -> String {
+    format!("Approval prompt for {request_id} failed: {reason}; denying")
+}
+
+fn notify_decision_failure(cx: &ConnectionTo<Client>, session_id: &SessionId, message: String) {
+    let _ = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentMessageChunk(crate::update::text_chunk(&message)),
+    ));
+}
+
 /// Bound on one outgoing `session/request_permission` call — NOT a budget
 /// for the ledger ask itself (see module docs, "The kernel is the authority
 /// and the timeout").
 pub const REQUEST_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether the ask's durable reviewer assignment belongs to this connection.
+/// Missing provenance is not authority.
+fn is_assigned_reviewer(reviewer_id: Option<PrincipalId>, me: PrincipalId) -> bool {
+    reviewer_id == Some(me)
+}
 
 /// Subscribe to the kernel-wide ledger-change stream and drive the pump for
 /// the life of the connection — the `.with_spawned` task
@@ -123,8 +140,7 @@ pub async fn run_permission_pump(
 }
 
 /// One poll: read every newly-seen pending ask and spawn a round trip for
-/// each one that belongs to a context this bridge has a live ACP session
-/// for.
+/// each one assigned to this ACP connection's authenticated character.
 async fn poll_ledger(
     kernel: &KernelBridge,
     sessions: &SessionRegistry,
@@ -145,27 +161,46 @@ async fn poll_ledger(
             return;
         }
     };
+    let me = match kernel.actor().whoami().await {
+        Ok(identity) => identity.principal_id,
+        Err(error) => {
+            tracing::warn!(error = %error, "cannot identify ACP reviewer; skipping ledger poll");
+            return;
+        }
+    };
 
     for PendingAsk { request_id: id, info: ask } in new_asks {
-        let session_id = rank::session_id_of(ask.context_id);
-        if sessions.get(&session_id).is_none() {
-            // Not ours to answer (see module docs) — some other surface
-            // (a shell, another client) may be about to.
-            //
-            // Deliberately NOT marked seen. A session can attach to that
-            // context after the ask was raised — ACP sessions come and go
-            // while the ledger row waits out the whole gate budget — and an
-            // ask suppressed here would then never be offered to the client
-            // that just arrived to answer it. Re-showing a foreign ask on
-            // each bump is one cheap read; silently never offering it is a
-            // prompt the human never sees.
+        let detail = match ledger::show_ask_detail(kernel.actor(), admin_ctx, &id).await {
+            Ok(Some(detail)) => detail,
+            Ok(None) => {
+                tracing::warn!(request = %id, "ledger ask could not be decoded; retrying on the next change");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(request = %id, error = %error, "cannot inspect ledger ask; retrying on the next change");
+                continue;
+            }
+        };
+        if !is_assigned_reviewer(detail.reviewer_id, me) {
             tracing::debug!(
                 request = %id,
-                context = %ask.context_id.short(),
-                "ledger ask belongs to a context with no live ACP session here; skipping"
+                reviewer = ?detail.reviewer_id,
+                "ledger ask is assigned to another reviewer; skipping"
             );
             continue;
         }
+
+        // A lead can review a coder's ask without attaching ACP directly to
+        // the coder context. Prefer that context's session, then send the
+        // request through any live session owned by this connection.
+        let session_id = rank::session_id_of(ask.context_id);
+        let session_id = if sessions.get(&session_id).is_some() {
+            session_id
+        } else if let Some(session_id) = sessions.any_session_id() {
+            session_id
+        } else {
+            continue;
+        };
 
         // Ours, and about to be offered exactly once.
         seen.insert(id.clone());
@@ -197,7 +232,7 @@ async fn answer_ask(
     } else {
         ask.description
     };
-    let request = permission_request(session_id, request_id.clone(), title, options);
+    let request = permission_request(session_id.clone(), request_id.clone(), title, options);
 
     let allow = match tokio::time::timeout(
         REQUEST_PERMISSION_TIMEOUT,
@@ -208,6 +243,7 @@ async fn answer_ask(
         Ok(Ok(response)) => map_response(&response, &kinds),
         Ok(Err(e)) => {
             tracing::warn!(request = %request_id, error = %e, "permission ask errored answering the client; denying");
+            notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, &e.to_string()));
             false
         }
         Err(_) => {
@@ -216,29 +252,33 @@ async fn answer_ask(
                 timeout = ?REQUEST_PERMISSION_TIMEOUT,
                 "permission ask timed out waiting on the client; denying"
             );
+            notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, "timed out waiting for the client"));
             false
         }
     };
 
     let verb = if allow { "allow" } else { "deny" };
-    // The decide verb doesn't care which context it runs in — the ask's
-    // own context is as good as any.
+    // The decision is authored in the work context. The ledger validates the
+    // reviewer actor, so a coder cannot approve its own ask from any context.
     match ledger::decide_ask(kernel.actor(), ask.context_id, &request_id, allow).await {
         Ok(result) if result.exit_code == 0 => {
-            tracing::debug!(request = %request_id, verb, "ledger ask answered");
+            tracing::info!(request = %request_id, verb, "ledger ask answered");
         }
         Ok(result) => {
-            // A race with another answerer (AlreadyDecided) lands here too
-            // — expected, not a failure (module docs, "Racing is fine").
-            tracing::debug!(
+            // A nonzero result is visible operationally. `AlreadyDecided`
+            // is a race; every other refusal (including an ineligible
+            // reviewer) needs its returned reason to diagnose the contract.
+            tracing::info!(
                 request = %request_id,
                 verb,
                 stderr = %result.stderr,
-                "kj ledger {verb} did not apply (already decided, or expired)"
+                "kj ledger {verb} did not apply"
             );
+            notify_decision_failure(cx, &session_id, decision_failure_message(&request_id, verb, result.stderr.trim()));
         }
         Err(e) => {
             tracing::warn!(request = %request_id, verb, error = %e, "kj ledger {verb} errored");
+            notify_decision_failure(cx, &session_id, decision_failure_message(&request_id, verb, &e.to_string()));
         }
     }
 }
@@ -343,6 +383,30 @@ mod tests {
     fn selecting_deny_maps_to_false() {
         let (_, kinds) = build_options();
         assert!(!map_response(&selected(OPT_DENY), &kinds));
+    }
+
+    #[test]
+    fn only_the_assigned_reviewer_is_offered_an_ask() {
+        let reviewer = PrincipalId::new();
+        assert!(is_assigned_reviewer(Some(reviewer), reviewer));
+        assert!(!is_assigned_reviewer(None, reviewer));
+        assert!(!is_assigned_reviewer(Some(PrincipalId::new()), reviewer));
+    }
+
+    #[test]
+    fn decision_failures_name_the_action_and_kernel_reason() {
+        assert_eq!(
+            decision_failure_message("req-1", "allow", "already decided"),
+            "Approval allow for req-1 did not apply: already decided"
+        );
+    }
+
+    #[test]
+    fn prompt_failures_tell_the_client_that_a_deny_follows() {
+        assert_eq!(
+            permission_prompt_failure_message("req-1", "timed out waiting for the client"),
+            "Approval prompt for req-1 failed: timed out waiting for the client; denying"
+        );
     }
 
     #[test]

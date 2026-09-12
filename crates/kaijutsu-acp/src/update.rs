@@ -812,7 +812,7 @@ fn task_plan_entries(blocks: &[BlockSnapshot]) -> Vec<PlanEntry> {
     entries
 }
 
-fn text_chunk(text: &str) -> ContentChunk {
+pub(crate) fn text_chunk(text: &str) -> ContentChunk {
     ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
 }
 

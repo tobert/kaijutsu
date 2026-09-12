@@ -283,6 +283,11 @@ async fn handle_new_session(
     if let Err(e) = validate_acp_cwd(&req.cwd) {
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
+    if !bridge.kernel.has_character() {
+        return responder.respond_with_error(Error::invalid_params().data(serde_json::json!({
+            "reason": "ACP session/new needs --character <name>; load or resume an existing session instead",
+        })));
+    }
     bridge.note_client_cwd(&req.cwd);
     let label = new_session_label(&req.cwd);
     let opened = match bridge.kernel.open_or_create(&label).await {

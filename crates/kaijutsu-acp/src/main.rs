@@ -57,6 +57,13 @@ struct Cli {
     #[arg(long, default_value = "coder")]
     context_type: String,
 
+    /// Character that performs work in each new ACP context.
+    ///
+    /// The authenticated SSH character remains the reviewer. The named
+    /// character must already exist and be live.
+    #[arg(long)]
+    character: Option<String>,
+
     /// Deprecated compatibility flag. ACP lifecycle requests supply the
     /// authoritative cwd; this value is accepted but never used as fallback.
     #[arg(long)]
@@ -143,12 +150,14 @@ async fn run(cli: Cli) -> Result<()> {
         port = config.port,
         user = %config.username,
         context_type = %cli.context_type,
+        character = ?cli.character,
         "kaijutsu-acp starting"
     );
 
     let kernel = KernelBridge::connect(
         config,
         cli.context_type,
+        cli.character,
         std::time::Duration::from_secs(cli.connect_timeout),
     )
     .await?;
