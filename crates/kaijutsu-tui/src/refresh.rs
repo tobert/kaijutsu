@@ -314,6 +314,21 @@ mod tests {
     }
 
     #[test]
+    fn an_other_context_pending_ask_keeps_its_seat_indicator() {
+        let current = ContextId::new();
+        let other = ContextId::new();
+        let mut app = App::new("amy");
+        app.current = Some(current);
+        let mut seen = HashSet::new();
+        let mut poll = poll_with(&["other-1"], vec![pending("other-1", other)], None);
+        poll.pending_ids = HashSet::from(["other-1".to_string()]);
+        apply(&mut app, Refreshed { asks: Some(poll), ..Default::default() }, &mut seen);
+        assert!(app.has_pending_ask(other));
+        assert!(app.ask_card.is_none(), "a different context never steals the live card");
+        assert!(!seen.contains("other-1"), "the other-context ask remains unpresented");
+    }
+
+    #[test]
     fn a_card_whose_ask_left_pending_comes_down_with_who_decided_it() {
         let ctx = ContextId::new();
         let me = PrincipalId::new();

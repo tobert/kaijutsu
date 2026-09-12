@@ -222,6 +222,7 @@ async fn event_loop(
     // Ask polling is driven by the ledger's own change stream, not by the
     // refresh timer (`refresh::Request::poll_asks`).
     let mut ledger_events = bridge.actor().subscribe_ledger_events();
+    let mut ledger_open = true;
     let mut seen_asks = std::collections::HashSet::new();
     let mut poll_asks = true;
     let mut refresh = tokio::time::interval(REFRESH);
@@ -253,10 +254,10 @@ async fn event_loop(
                 match event {
                     Event::Key(key) => {
                         dirty = true;
+                        let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
                         if app.picker.is_some() {
                             handle_picker_key(bridge, app, key, &wires.feed_tx).await?;
                         } else {
-                            let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
                             let width = terminal.size()?.width;
                             if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &wires.feed_tx, &wires.term_lock, width)
                                 .await?
@@ -265,9 +266,9 @@ async fn event_loop(
                                 suspend(terminal, &wires.term_lock)?;
                                 cursor_shape = None;
                             }
-                            if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
-                                poll_asks = true;
-                            }
+                        }
+                        if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
+                            poll_asks = true;
                         }
                     }
                     Event::Resize(..) => dirty = true,
@@ -329,12 +330,15 @@ async fn event_loop(
                     app.note("kernel connection lost; turn liveness reset");
                 }
                 app.connection = Some(connection);
+                if matches!(app.connection, Some(kaijutsu_client::ConnectionStatus::Connected { .. })) {
+                    poll_asks = true;
+                }
                 dirty = true;
             }
-            received = ledger_events.recv() => {
+            received = ledger_events.recv(), if ledger_open => {
                 match received {
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => poll_asks = true,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => ledger_open = false,
                 }
             }
             _ = refresh.tick() => {
