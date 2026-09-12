@@ -275,6 +275,24 @@ message that knew where the player was looking"). Left:
 - Shell operation inspection currently uses bounded result/block output.
   Integrate kaish job streams and spill references for live, complete output
   retrieval without invalidating pagination offsets.
+## The app runs as Amy, so she cannot answer her own gated asks (2026-09-12)
+
+Verified live. A `shell_write` in the app that trips the `lfm2d-advisory`
+gate raises an ask whose requester, performer, and reviewer are all `amy`
+(the app authenticates as Amy). `AskDetail::can_review` requires
+`principal == reviewer && principal != actor`, so it returns false: the ask
+sheet correctly shows "not yours to answer — the reviewer runs: kj ledger
+allow <id>" and offers no decision keys, and `kj ledger allow|deny` from the
+app is refused for the same reason (self-approval is barred by the
+2026-09-12 approval-identity work). The ask is then stuck pending until it
+expires. So the app's own shell cannot run any gated command today. The fix
+is an identity decision, not app UI: the app should attach as a distinct
+performer character (`kj context create --as`, or a dedicated app
+character) with Amy as the reviewer, or a non-Amy reviewer must be
+configured for the app's context. Coordinate with the approval-identity
+work (commits dcb5fc8b, fd27b822). Probe ask `01a096d2-358d-…` was left
+pending by this check; it is fail-closed and will expire.
+
 ## The scene palette still carries hues for retired stations (2026-09-12)
 
 `[scene]` in `theme.toml` (`kaijutsu-types::theme::SceneData`) keeps
