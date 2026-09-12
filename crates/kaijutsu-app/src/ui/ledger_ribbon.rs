@@ -52,9 +52,15 @@ const W_TOOL: usize = 12;
 const W_OPTION: usize = 12;
 const W_REDEEMED: usize = 11;
 
-/// The ribbon's key line.
+/// The ribbon's key line when the selected ask is the viewer's to answer.
 pub const RIBBON_KEYS: &str =
     "a allow once  A allow always  d deny  Enter sheet  j/k move  Esc back";
+
+/// The key line when the selected ask is NOT the viewer's to answer — the
+/// decision keys are gone rather than offered and then refused, the same
+/// honesty the sheet keeps (`ui::ask_sheet::sheet_keys`).
+pub const RIBBON_KEYS_READONLY: &str =
+    "Enter sheet  j/k move  Esc back  \u{00b7} not yours to answer";
 
 // ============================================================================
 // STATE
@@ -216,6 +222,7 @@ pub fn answered_row(
 /// A pending section with nothing in it says so: an empty body under a
 /// PENDING heading must never be allowed to mean "we did not look".
 pub fn ribbon_rows(
+    can_review_selected: bool,
     pending: &[AskDetail],
     recent: &[AskDetail],
     selected: usize,
@@ -265,7 +272,10 @@ pub fn ribbon_rows(
     // thing to go (`docs/tui.md`, "Asks": it crops from the top of the
     // overflow, never over the keys).
     let keys = PanelLine {
-        text: truncate(RIBBON_KEYS, cols),
+        text: truncate(
+            if can_review_selected || pending.is_empty() { RIBBON_KEYS } else { RIBBON_KEYS_READONLY },
+            cols,
+        ),
         tone: LineTone::Head,
     };
     let room = rows.saturating_sub(1).max(1);
@@ -464,6 +474,7 @@ pub fn spawn_ledger_ribbon(
 pub fn render_ledger_ribbon(
     ribbon: Res<LedgerRibbonState>,
     mirror: Res<LedgerMirror>,
+    session: Res<crate::cell::SessionPrincipal>,
     drift: Res<crate::connection::drift::DriftState>,
     theme: Res<Theme>,
     time: Res<Time>,
@@ -509,10 +520,16 @@ pub fn render_ledger_ribbon(
             .map(|c| c.label.clone())
     };
 
+    let selected = clamp_selection(ribbon.selected, mirror.pending.len());
+    let can_review_selected = mirror
+        .pending
+        .get(selected)
+        .is_some_and(|ask| session.0.is_some_and(|me| ask.can_review(me)));
     let lines = ribbon_rows(
+        can_review_selected,
         &mirror.pending,
         &mirror.recent,
-        clamp_selection(ribbon.selected, mirror.pending.len()),
+        selected,
         kaijutsu_types::now_millis() as i64,
         cols,
         rows,
@@ -699,7 +716,7 @@ mod tests {
     #[test]
     fn the_header_counts_what_the_mirror_holds() {
         let pending = vec![ask("aaaaaaaa"), ask("bbbbbbbb")];
-        let rows = ribbon_rows(&pending, &[], 0, 0, 200, 40, no_labels);
+        let rows = ribbon_rows(true, &pending, &[], 0, 0, 200, 40, no_labels);
         assert_eq!(rows[0].text, "LEDGER    pending 2   recent 0");
     }
 
@@ -707,7 +724,7 @@ mod tests {
     /// look".
     #[test]
     fn an_empty_ledger_says_nothing_is_waiting() {
-        let rows = ribbon_rows(&[], &[], 0, 0, 200, 40, no_labels);
+        let rows = ribbon_rows(true, &[], &[], 0, 0, 200, 40, no_labels);
         let all = text(&rows);
         assert!(all.contains("PENDING"), "{all}");
         assert!(all.contains("nothing waiting"), "{all}");
@@ -718,7 +735,7 @@ mod tests {
     fn the_key_line_is_always_the_last_row() {
         let pending: Vec<AskDetail> = (0..40).map(|i| ask(&format!("{i:08}"))).collect();
         for rows in [6usize, 12, 60] {
-            let out = ribbon_rows(&pending, &[], 0, 0, 200, rows, no_labels);
+            let out = ribbon_rows(true, &pending, &[], 0, 0, 200, rows, no_labels);
             assert_eq!(out.last().expect("rows").text, RIBBON_KEYS, "rows={rows}");
         }
     }
@@ -728,7 +745,7 @@ mod tests {
     #[test]
     fn a_ledger_taller_than_the_panel_counts_what_it_dropped() {
         let pending: Vec<AskDetail> = (0..40).map(|i| ask(&format!("{i:08}"))).collect();
-        let out = ribbon_rows(&pending, &[], 0, 0, 200, 10, no_labels);
+        let out = ribbon_rows(true, &pending, &[], 0, 0, 200, 10, no_labels);
         assert_eq!(out.len(), 10);
         assert!(out[8].text.contains("more rows"), "{:?}", out[8].text);
         assert_eq!(out[8].tone, LineTone::Warn);
@@ -745,7 +762,7 @@ mod tests {
         decided.decided_at = Some(0);
         decided.statements = vec!["y".repeat(400)];
         for cols in [30usize, 60, 100] {
-            let out = ribbon_rows(&pending, &[decided.clone()], 0, 0, cols, 40, no_labels);
+            let out = ribbon_rows(true, &pending, &[decided.clone()], 0, 0, cols, 40, no_labels);
             assert_eq!(out.len(), 6, "cols={cols}: rows never wrap into more rows");
             for row in &out {
                 assert!(
@@ -777,4 +794,16 @@ mod tests {
         assert_eq!(step_selection(1, 3, 1), 2);
         assert_eq!(step_selection(0, 0, 1), 0);
     }
+    #[test]
+    fn the_key_line_drops_the_decision_keys_when_the_row_is_not_yours() {
+        let pending = vec![ask("a")];
+        let mine = ribbon_rows(true, &pending, &[], 0, 0, 200, 40, no_labels);
+        assert_eq!(mine.last().expect("keys").text, RIBBON_KEYS);
+        let theirs = ribbon_rows(false, &pending, &[], 0, 0, 200, 40, no_labels);
+        assert_eq!(theirs.last().expect("keys").text, RIBBON_KEYS_READONLY);
+        // An empty ledger keeps the full key line — there is no row to gate on.
+        let empty = ribbon_rows(false, &[], &[], 0, 0, 200, 40, no_labels);
+        assert_eq!(empty.last().expect("keys").text, RIBBON_KEYS);
+    }
+
 }
