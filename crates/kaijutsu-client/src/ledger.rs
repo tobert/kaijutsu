@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_new_prunes_seen_ids_that_are_no_longer_pending() {
+    fn diff_new_leaves_presentation_state_unchanged() {
         let mut seen = HashSet::new();
         seen.insert("answered".to_string());
         seen.insert("still-pending".to_string());
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn diff_new_with_nothing_seen_returns_everything() {
-        let mut seen = HashSet::new();
+        let seen = HashSet::new();
         let ids = vec!["x".to_string(), "y".to_string()];
         assert_eq!(diff_new(&ids, &seen), ids);
     }
