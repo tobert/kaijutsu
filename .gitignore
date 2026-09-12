@@ -39,3 +39,4 @@ docs/kaijutsu-agent-feedback.md
 backups/
 __pycache__/
 /target-lanes/
+/demo/
