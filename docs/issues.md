@@ -25,7 +25,10 @@ be several blocks and a whole thinking pane earlier. Wall clock does not fix
 this: the reference the model needs is a position in the conversation, not a
 time.
 
-**The plan.**
+**The plan** (Amy, later the same day: *"maybe it can be an rc script
+anyways that fires, then we can defer the experiments, just make it
+possible"*). The kernel carries the fact and fires a script; the rendering
+is rc, so every experiment is a script edit and no kernel change.
 
 - The client attaches the player's **edge** to `submitInput`: the newest
   block it had shown when the player submitted, as a `BlockId`, plus the
@@ -35,14 +38,27 @@ time.
   which is older than the log tail when the player has scrolled up. A client
   that cannot say sends nothing; the kernel never guesses an edge.
 - The kernel stores the edge on the user block it creates, as columns, not a
-  JSON blob. It is a durable fact about that block and rides through fork.
-- Hydration renders it to the model as a runtime fact on that user message,
-  in the envelope `docs/prompts.md` already uses for changing observations:
-  the referenced block's role and kind and a short quoted excerpt (its first
-  line), so the model can find the spot in its own context without any
-  numbering. Emitted only when the edge is older than the block that precedes
-  the message in the model's conversation; a message that arrives between
-  turns says nothing extra.
+  JSON blob. It is a durable fact about that block, rides through fork, and
+  shows in `kj block inspect`.
+- A new rc verb, `submit`, fires after the user block is durable, the way
+  `drift` fires after a drift block lands (`kj/drift.rs`, `run_rc_lifecycle`
+  with `DriftInfo`). Its scripts get the facts as variables:
+  `KJ_INPUT_BLOCK` (the user block), `KJ_EDGE_BLOCK` and `KJ_EDGE_SHOWN`
+  (empty when the client sent none), `KJ_LOG_TAIL` (the newest block at
+  arrival, so a script can see the gap without a query), and `KJ_TURN_LIVE`
+  (whether a turn was running). A script renders whatever it likes as a
+  `(System, Notification)` block through `kj block create --kind
+  notification`, as `S25-datetime.kai` does, and the mailbox folds it before
+  the model's next request. No script, no-op.
+- The verb joins `RC_VERBS` in `kj/lifecycle.rs`, which feeds both the
+  firing gate and the path validator; `kj rc list` grows the verb. It runs
+  awaited inline, as `drift` does, so the notification is durable before
+  `submitInput` returns and cannot race the next request; the cost is the
+  script's runtime on the submit path, zero when no script exists.
+- Shipped scripts: one example under `lib/submit/` that emits the excerpt
+  (role, kind, first line of the edge block) only when the edge is older than
+  the log tail. No type links it by default; a type opts in by symlink. The
+  ordinal and summary experiments are further scripts, or edits to this one.
 
 **Open, for Amy.**
 
