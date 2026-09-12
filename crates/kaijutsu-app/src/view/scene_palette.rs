@@ -24,7 +24,8 @@ use bevy::prelude::*;
 use kaijutsu_types::theme::SceneData;
 
 /// The scene lane's colors, tiers, gains, and post chain. See module docs.
-#[derive(Resource, Debug, Clone)]
+#[derive(Resource, Debug, Clone, Reflect)]
+#[reflect(Resource)]
 pub struct ScenePalette {
     // ── Identity hues (linear) ──
     /// Room clear color (the octagon's void).

@@ -327,9 +327,11 @@ fn main() {
         .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.toml
         .insert_resource(theme)
+        .register_type::<ui::theme::Theme>()
         // The 3D scene lane's palette ([scene] in theme.toml, docs/color.md):
         // compiled defaults until the kernel's theme arrives over RPC.
         .init_resource::<view::scene_palette::ScenePalette>()
+        .register_type::<view::scene_palette::ScenePalette>()
         // Startup config errors (drained into GlobalErrorQueue on first frame)
         .insert_resource(startup_errors)
         // Startup window-geometry choice (--fullscreen / --maximize); read by

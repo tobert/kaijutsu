@@ -20,7 +20,7 @@ use kaijutsu_types::BlockSnapshot;
 /// - 5/13: Magenta/Bright Magenta
 /// - 6/14: Cyan/Bright Cyan
 /// - 7/15: White/Bright White
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Reflect)]
 pub struct AnsiColors {
     pub black: Color,
     pub red: Color,
@@ -118,7 +118,7 @@ impl AnsiColors {
 ///
 /// Defaults are derived from the ANSI palette (Tokyo Night).
 #[allow(dead_code)] // Phase 4: syntax highlighting via Parley spans
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Reflect)]
 pub struct SyntaxColors {
     pub keyword: Color,     // if, for, fn, while
     pub string: Color,      // "hello", 'world'
@@ -138,7 +138,8 @@ pub struct SyntaxColors {
 ///
 /// Contains all colors used throughout the application, from base UI
 /// to vim-style mode colors and cursor colors.
-#[derive(Resource, Clone)]
+#[derive(Resource, Clone, Reflect)]
+#[reflect(Resource)]
 #[allow(dead_code)]
 pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
