@@ -6,6 +6,60 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Thinking folds to a summary line once the player has moved on (Amy, 2026-09-12)
+
+Amy: *"I'm watching y'all work, and you're thinking, I often read/scan it
+because I'm curious, but it takes up a lot of space, so I'd like to collapse
+it but keep *something* visible. so I want it to collapse in the app on
+hydrate or a second or two after the thinking ends and I've likely moved on.
+I think in the tui, the thinking preview thing would collapse to the
+summarized line on the terminal history."*
+
+**Today.** The kernel keeps a durable `collapsed` flag per block, flipped
+only by an explicit toggle (`set_collapsed`, `CollapsedChanged`); nothing
+collapses on its own. The app shows thinking expanded until toggled. The tui
+holds the turn's thinking in its pane and, when the block completes, prints
+one stub into scrollback: `▸ thinking · N lines · <first line>`
+(`present::thinking_stub_line`). The first line is a poor stand-in for a
+summary. No block carries a summary today; `kaijutsu_index::synthesis`
+has an extractive `best_sentence` that could produce one without a model.
+
+**The plan.**
+
+- **The kernel derives the summary, once, at completion.** When a
+  `Thinking` block settles, the kernel computes one line and stores it on
+  the block, published on `BlockSnapshot` as a new field and through the
+  change feed. Start extractive (`best_sentence` over the block, capped),
+  which is synchronous and free; a model-written summary, lfm2d or a
+  flash-tier cloud model, is a later swap behind the same field and can be
+  driven by rc. Display only: the summary never enters hydration.
+- **The app folds locally.** A completed thinking block reads as collapsed
+  on hydrate, and a block that completes while watched folds a second or two
+  after it settles, showing the summary line. This is per-viewer
+  presentation state, not the durable `collapsed` flag: one player folding
+  must not fold a sibling's screen. An explicit toggle still works and pins
+  the block open. Timing constants live in one place and are relative to
+  settle, not to wall clock at hydrate.
+- **The tui's stub uses the summary.** Same stub, summary in place of the
+  first line, first line as the fallback when no summary exists. The stub
+  prints when the block completes, as now; an extractive summary is ready
+  by then. A model-written summary would arrive later, and the stub cannot
+  be redrawn once printed, so that path either delays the stub (risking
+  document order against a fast answer) or lands the summary elsewhere. Do
+  not ship a slow summary source without answering this.
+
+**Open, for Amy.**
+
+- Summary source order: extractive now, model later? Lean yes; a model line
+  costs a request per thinking block and the first cut should show whether
+  a line is enough.
+- Whether the fold should also write the durable `collapsed` flag so
+  `kj block list` agrees with the screen. Lean no; the flag stays the
+  explicit toggle.
+- The fold delay. "A second or two" is the spec; whether it counts from the
+  thinking block settling or from the turn ending matters for the tui pane,
+  which is the turn's, not the block's.
+
 ## Async input should carry the player's edge of context (Amy, 2026-09-12)
 
 Amy: *"the ui knows what the user is seeing when they send an async message.

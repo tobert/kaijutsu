@@ -979,6 +979,10 @@ subsystem.
   line in the transcript is still open.
 - Internal splits. Set aside for v1; wezterm splits with
   `kaijutsu-tui --context <id>` cover it. Revisit when the itch is real.
+- **The stub should carry a summary, not the first line.** Amy reads the
+  pane while it streams and wants the fold to keep "something visible". The
+  kernel derives the line at completion; plan and open questions in
+  `docs/issues.md`, "Thinking folds to a summary line".
 - **The player's edge on submit.** A message sent mid-turn should tell the
   model which block the player had seen when they pressed Enter. The tui's
   source is `last_printed` plus the live band's streaming block; the plan,
