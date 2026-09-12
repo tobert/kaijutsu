@@ -48,7 +48,8 @@ enum RcCommand {
         #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
     },
-    /// List installed scripts, optionally filtered. Each entry is marked
+    /// List installed scripts and the hook bodies under
+    /// /config/rc/lib/hooks, optionally filtered. Each entry is marked
     /// against its embedded seed: in-sync, differs (edited since seeding),
     /// no-seed (a live-only, user-authored script), not-installed (a seed
     /// ships for the path and nothing is live at it — a script added to the
@@ -60,10 +61,10 @@ enum RcCommand {
     /// itself is fine.
     #[command(alias = "ls")]
     List {
-        /// Filter by context_type
+        /// Filter by context_type (`lib` selects the shared bodies)
         #[arg(long = "type")]
         type_filter: Option<String>,
-        /// Filter by verb (create|fork|attach|drift|tick|rotate)
+        /// Filter by verb (create|fork|attach|drift|tick|rotate), or `hooks`
         #[arg(long = "verb")]
         verb_filter: Option<String>,
     },
@@ -73,10 +74,10 @@ enum RcCommand {
         /// Canonical rc path to remove
         path: String,
     },
-    /// Print one script's content + metadata.
+    /// Print one script's or hook body's content + metadata.
     #[command(alias = "cat")]
     Show {
-        /// Canonical rc path to show
+        /// Canonical rc path, or a hook body path, to show
         path: String,
     },
 }
@@ -172,6 +173,84 @@ pub struct RcPathParts {
     pub sort_key: String,
     pub name: String,
     pub extension: String,
+}
+
+/// The bucket and slot a hook body lives in: `/config/rc/lib/hooks/<name>.kai`.
+/// A hook body is not a lifecycle script (no verb, no sort key); the hook
+/// table reads it fresh at every fire (`HookBody::KaishPath`), and it ships
+/// as a seed, so `kj rc list` and `kj rc show` address it beside the scripts.
+const HOOK_BUCKET: &str = "lib";
+const HOOK_SLOT: &str = "hooks";
+
+fn hook_body_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            r"^{}/{HOOK_BUCKET}/{HOOK_SLOT}/([a-z][a-z0-9_-]*)\.kai$",
+            paths::RC_ROOT
+        ))
+        .expect("hook body regex compiles")
+    })
+}
+
+/// What an rc path names: a lifecycle script or a hook body.
+pub enum RcEntry {
+    Script(RcPathParts),
+    HookBody { name: String },
+}
+
+impl RcEntry {
+    fn context_type(&self) -> &str {
+        match self {
+            Self::Script(p) => &p.context_type,
+            Self::HookBody { .. } => HOOK_BUCKET,
+        }
+    }
+
+    fn verb(&self) -> &str {
+        match self {
+            Self::Script(p) => &p.verb,
+            Self::HookBody { .. } => HOOK_SLOT,
+        }
+    }
+
+    fn sort_key(&self) -> Option<&str> {
+        match self {
+            Self::Script(p) => Some(&p.sort_key),
+            Self::HookBody { .. } => None,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Script(p) => &p.name,
+            Self::HookBody { name } => name,
+        }
+    }
+
+    fn extension(&self) -> &str {
+        match self {
+            Self::Script(p) => &p.extension,
+            Self::HookBody { .. } => "kai",
+        }
+    }
+}
+
+/// Split a path `kj rc list` and `kj rc show` address: a canonical script
+/// path ([`parse_rc_path`]) or a hook body path. The error is the script
+/// path's, extended with the hook form.
+pub fn parse_rc_entry(path: &str) -> Result<RcEntry, String> {
+    if let Some(caps) = hook_body_regex().captures(path) {
+        return Ok(RcEntry::HookBody {
+            name: caps[1].to_string(),
+        });
+    }
+    parse_rc_path(path).map(RcEntry::Script).map_err(|e| {
+        format!(
+            "{e}\n- or a hook body: {}/{HOOK_BUCKET}/{HOOK_SLOT}/<name>.kai",
+            paths::RC_ROOT
+        )
+    })
 }
 
 /// Validate and split a canonical rc path.
@@ -357,12 +436,12 @@ impl KjDispatcher {
     ) -> Result<Vec<(String, Option<String>, RcSeedStatus)>, String> {
         let mut paths = self.walk_rc_paths().await?;
         let matches_filters = |p: &str| {
-            let parts = match parse_rc_path(p) {
-                Ok(parts) => parts,
+            let entry = match parse_rc_entry(p) {
+                Ok(entry) => entry,
                 Err(_) => return false, // stray non-canonical file
             };
-            type_filter.is_none_or(|t| parts.context_type == t)
-                && verb_filter.is_none_or(|v| parts.verb == v)
+            type_filter.is_none_or(|t| entry.context_type() == t)
+                && verb_filter.is_none_or(|v| entry.verb() == v)
         };
         paths.retain(|p| matches_filters(p));
         paths.sort();
@@ -535,8 +614,8 @@ impl KjDispatcher {
     }
 
     async fn rc_show(&self, path: &str) -> KjResult {
-        let parts = match parse_rc_path(path) {
-            Ok(p) => p,
+        let entry = match parse_rc_entry(path) {
+            Ok(entry) => entry,
             Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
         };
         // Read straight from the kernel-owned backend. NotFound = absent script;
@@ -556,11 +635,11 @@ impl KjDispatcher {
         // the kernel block, not here.
         let record = serde_json::json!({
             "path": path,
-            "context_type": parts.context_type,
-            "verb": parts.verb,
-            "sort_key": parts.sort_key,
-            "name": parts.name,
-            "extension": parts.extension,
+            "context_type": entry.context_type(),
+            "verb": entry.verb(),
+            "sort_key": entry.sort_key(),
+            "name": entry.name(),
+            "extension": entry.extension(),
             "symlink": symlink_target,
             "content_length": content.len(),
             "content": content,
@@ -572,19 +651,25 @@ impl KjDispatcher {
             Some(t) => format!("symlink:    → {t}\n"),
             None => String::new(),
         };
+        // A hook body has no sort key; the line is omitted rather than
+        // printed empty.
+        let sort_line = match entry.sort_key() {
+            Some(k) => format!("sort_key:   {k}\n"),
+            None => String::new(),
+        };
         // Fence content with the extension so .md renders as markdown and
         // .kai displays as a shell-ish block in surfaces that highlight it.
         let out = format!(
-            "path:       {}\ntype:       {}\nverb:       {}\nsort_key:   {}\nname:       {}\nextension:  {}\n{}length:     {} bytes\n\n```{}\n{}\n```\n",
+            "path:       {}\ntype:       {}\nverb:       {}\n{}name:       {}\nextension:  {}\n{}length:     {} bytes\n\n```{}\n{}\n```\n",
             path,
-            parts.context_type,
-            parts.verb,
-            parts.sort_key,
-            parts.name,
-            parts.extension,
+            entry.context_type(),
+            entry.verb(),
+            sort_line,
+            entry.name(),
+            entry.extension(),
             link_line,
             content.len(),
-            parts.extension,
+            entry.extension(),
             content,
         );
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
@@ -1131,6 +1216,84 @@ mod tests {
                 "expected differs marker: {message}"
             ),
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// A hook body under `/config/rc/lib/hooks` is read fresh at every fire
+    /// (`HookBody::KaishPath`) and ships as a seed, so the listing compares
+    /// it the way it compares a lifecycle script. Its path is not a
+    /// lifecycle script path (no verb, no sort key), which is what used to
+    /// drop it from the listing and leave a stale hook invisible.
+    ///
+    /// Falsified by filtering rows through `parse_rc_path` alone.
+    #[tokio::test]
+    async fn rc_list_reports_a_hook_body_against_its_seed() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let path = "/config/rc/lib/hooks/lfm2d.kai";
+
+        let listed = |result: KjResult| match result {
+            KjResult::Ok { message, .. } => message,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        let message = listed(d.dispatch(&[s("rc"), s("list")], &c).await);
+        assert!(
+            message.contains(&format!("{path} [in-sync]")),
+            "an unfiltered listing includes the hook body: {message}"
+        );
+
+        d.write_rc_file(path, "# a hook body from an older build")
+            .await
+            .expect("a hook body is an ordinary rc file write");
+
+        let message = listed(
+            d.dispatch(
+                &[s("rc"), s("list"), s("--type"), s("lib"), s("--verb"), s("hooks")],
+                &c,
+            )
+            .await,
+        );
+        assert!(
+            message.contains(&format!("{path} [differs from seed]")),
+            "a stale hook body is reported as differing: {message}"
+        );
+        assert!(
+            !message.contains("/config/rc/coder/"),
+            "the lib/hooks filter excludes lifecycle scripts: {message}"
+        );
+    }
+
+    /// `kj rc show` reads a hook body too, with the metadata its path
+    /// carries: the `lib` bucket, the `hooks` slot, and the name.
+    #[tokio::test]
+    async fn rc_show_reads_a_hook_body() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let path = "/config/rc/lib/hooks/shell-guard.kai";
+
+        match d.dispatch(&[s("rc"), s("show"), s(path)], &c).await {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["path"], path);
+                assert_eq!(v["context_type"], "lib");
+                assert_eq!(v["verb"], "hooks");
+                assert_eq!(v["name"], "shell-guard");
+                assert_eq!(v["extension"], "kai");
+                assert!(v["sort_key"].is_null(), "a hook body has no sort key: {v}");
+                assert!(
+                    v["content"].as_str().is_some_and(|c| !c.is_empty()),
+                    "the body is the seed's content: {v}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
         }
     }
 

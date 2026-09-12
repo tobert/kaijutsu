@@ -19,11 +19,12 @@ payload and logging, in the order to try:
   The unit runs `RUST_LOG=info` since 2026-09-11 11:18 EDT (matches
   `contrib/install-systemd.sh`), and INFO is a turn-level log now
   (`docs/devlog.md`, "The kernel that fsynced every word").
-- Each delta is still about 14 write syscalls and 13 KB: WAL pages for the
-  `oplog` row and the `contexts` activity touch. Batching the activity
-  touch (once per turn, or on a timer) halves the page writes; batching
-  deltas into fewer op rows is a design conversation, since the op row is
-  the durable unit the change feed replays.
+- Each delta was about 14 write syscalls and 13 KB: WAL pages for the
+  `oplog` row and the `contexts` activity touch. The touch is throttled to
+  once a second per context since 2026-09-12 (`ACTIVITY_STAMP_INTERVAL_MS`,
+  `block_store.rs`); measure the per-delta figure again on the next bounce.
+  Batching deltas into fewer op rows is a design conversation, since the
+  op row is the durable unit the change feed replays.
 - The "idle" 50–100 KB/s measured today is unverified: the audio
   inventory store is in-memory (`audio_inventory.rs`, no db), and every
   sample so far overlapped either Amy's turns or this session's own hook
@@ -122,21 +123,6 @@ layer, so the evaluator is not where it drops: look between the broker's
 PreCall (`mcp/broker.rs`, `evaluate_planned` over its own plan of the
 command) and the hook path that raised the ask, on the running binary
 (`04538700`).
-
-## `kj rc list` does not report hook bodies, so a stale hook is invisible (2026-09-10)
-
-`/config/rc/lib/hooks/*.kai` are read by `HookBody::KaishPath` at every
-fire but never listed by `kj rc list`, so its in-sync/differs marks say
-nothing about them. Observed live: the lfm2d hook body on disk was the
-2026-09-01 version through the whole day of gate-policy bounces — slice 2's
-two hook rules (ask tier firm, allow tier dropped from scoring) were in the
-running binary's embedded seed and not on disk. Consequence: a compound
-program mixing an allowed clause with any non-exempt clause still scores
-every clause (`kj context create --help; echo ---; kj cast show house`
-escalated on a Read verb because `echo` broke the all-or-nothing jq
-exemption), and an ask-tier statement is not firm in the hook stack. Fix
-is a `kaijutsu-server rc reseed --force` on a build of HEAD; the gap to
-close is `kj rc list` covering `lib/hooks` with the same seed comparison.
 
 ## `kj context info --json` reports `resolved_cast: null` for a cast-slot model (2026-09-10)
 
