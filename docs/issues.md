@@ -6,6 +6,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## `kj block list --json` loses its command-specific metadata (2026-09-12)
+
+`BlockCommand::List` declares `--json` and builds a `{context_id, count,
+total, blocks}` object, but `KjBuiltin::execute` treats every bare `--json`
+as kaish's global output flag and removes it before block dispatch. The
+dispatcher therefore receives `json = false`, returns its for-loop block-id
+array as `.data`, and kaish renders that array. A live `kj block list
+--context approval-identity-probe --json` consequently prints block ids
+instead of the declared metadata object. The direct `kj/block.rs` tests call
+the dispatcher and do not cover the embedded-kaish path; add that boundary
+test when separating global output formatting from command-specific JSON
+shapes.
+
 ## A streaming turn still writes ~2 MB/s and logs ~160 lines/s (2026-09-11, perf)
 
 The fsync storm is fixed and measured (`docs/devlog.md`, "The kernel that

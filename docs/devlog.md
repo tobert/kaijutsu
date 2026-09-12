@@ -1215,3 +1215,9 @@ cached conversation, and resume it with an explicit no-run receipt. A failed
 shell materialization tells the waiting model too; connected session pairs
 continue to receive their result through the block feed. Wire regressions
 cover both denial and cancellation without executing the command.
+
+The local deployment verified the same contract with a DeepSeek Flash coder.
+Its ask carried `coder` as performer and `kaijutsu-lead` as requester and
+reviewer. The coder stopped; the lead approved the exact echo; its output
+filled once and the coder resumed without a second tool call. The probe was
+archived and its scoped hook removed. Banto's ROOT now names Amy as reviewer.
