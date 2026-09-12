@@ -42,6 +42,9 @@ pub struct Refreshed {
     pub contexts: Option<Vec<ContextInfo>>,
     pub tracks: Option<Vec<TrackInfo>>,
     pub asks: Option<AskPoll>,
+    /// A failed pending-ledger snapshot. Applying it must not discard the
+    /// last good presentation, but the player needs to see why it is stale.
+    pub ask_error: Option<String>,
 }
 
 /// The ledger half of a round.
@@ -67,12 +70,15 @@ pub struct AskPoll {
 /// Run one round against the kernel. Every await in the refresh lives here.
 pub async fn fetch(bridge: KernelBridge, request: Request) -> Refreshed {
     let contexts = bridge.list_contexts().await.ok();
-    let asks = match (request.poll_asks, request.current) {
-        (true, Some(ctx)) => poll(&bridge, ctx, request.seen_asks, request.card).await,
-        _ => None,
+    let (asks, ask_error) = match (request.poll_asks, request.current) {
+        (true, Some(ctx)) => match poll(&bridge, ctx, request.seen_asks, request.card).await {
+            Ok(asks) => (Some(asks), None),
+            Err(error) => (None, Some(format!("cannot refresh pending asks: {error}"))),
+        },
+        _ => (None, None),
     };
     let tracks = bridge.actor().list_tracks().await.ok();
-    Refreshed { contexts, tracks, asks }
+    Refreshed { contexts, tracks, asks, ask_error }
 }
 
 async fn poll(
@@ -80,9 +86,9 @@ async fn poll(
     ctx: ContextId,
     seen: HashSet<String>,
     card: Option<(String, ContextId)>,
-) -> Option<AskPoll> {
+) -> Result<AskPoll, kaijutsu_client::LedgerError> {
     let actor = bridge.actor();
-    let snapshot = kaijutsu_client::poll_new_asks(actor, ctx, &seen).await.ok()?;
+    let snapshot = kaijutsu_client::poll_new_asks(actor, ctx, &seen).await?;
     let new_asks = snapshot.new_asks;
     let answered = match card.as_ref() {
         Some((id, card_ctx)) if !snapshot.pending_ids.contains(id) => {
@@ -110,7 +116,7 @@ async fn poll(
         }
         _ => None,
     };
-    Some(AskPoll { pending_count: snapshot.pending_ids.len(), pending_ids: snapshot.pending_ids, new_asks, card: opened, card_refresh, answered })
+    Ok(AskPoll { pending_count: snapshot.pending_ids.len(), pending_ids: snapshot.pending_ids, new_asks, card: opened, card_refresh, answered })
 }
 
 /// Fold a finished round into the app. No await: this runs on the loop.
@@ -149,6 +155,9 @@ pub fn apply(app: &mut App, refreshed: Refreshed, seen_asks: &mut HashSet<String
         if let Some(card) = app.ask_card.as_ref() {
             seen_asks.insert(card.request_id.clone());
         }
+    }
+    if let Some(error) = refreshed.ask_error {
+        app.note(error);
     }
     if let Some(tracks) = refreshed.tracks {
         app.tracks = tracks.iter().map(picker::track_row_from).collect();
@@ -364,6 +373,25 @@ mod tests {
         assert!(app.has_pending_ask(ctx));
         assert_eq!(app.pending_asks, 1);
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_pending_snapshot_keeps_the_card_count_and_indicator_visible() {
+        let ctx = ContextId::new();
+        let mut app = App::new("amy");
+        app.current = Some(ctx);
+        app.ask_card = Some(AskCardState { request_id: "a-1".into(), context_id: ctx, detail: detail("a-1", ctx) });
+        app.note_ask("a-1".into(), ctx);
+        app.pending_asks = 1;
+        let mut seen = HashSet::from(["a-1".to_string()]);
+        apply(&mut app, Refreshed {
+            ask_error: Some("cannot refresh pending asks: malformed ledger list".into()),
+            ..Default::default()
+        }, &mut seen);
+        assert_eq!(app.ask_card.as_ref().map(|card| card.request_id.as_str()), Some("a-1"));
+        assert!(app.has_pending_ask(ctx));
+        assert_eq!(app.pending_asks, 1);
+        assert_eq!(app.notice(), Some("cannot refresh pending asks: malformed ledger list"));
     }
 
     #[test]
