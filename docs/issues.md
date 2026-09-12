@@ -36,6 +36,29 @@ payload and logging, in the order to try:
   compaction's checkpoint, and `chattr +C` on a rebuilt db. The 913 MB db
   has 16,147 extents.
 
+## A denied turn-owned pair still tells nobody (2026-09-12)
+
+`a5e20034` tells a model turn when an approval fills its own linked pair
+(`PairOwner::Turn`). Two legs of `act_on_executable_answer` (rpc.rs) still
+discard the owner and return `Settled`, so the model's last word stays
+"waiting on a human" and no turn request is published:
+
+- the denial branch (`_owner` discarded; settle `Error`, redeem, return
+  `Settled`). A `Turn` pair needs the same treatment as a no-pair denial's
+  wake: seed "<who> denied the action you were waiting on: … Nothing was
+  run. Do not retry it; say so and continue." and `Tell` it.
+- the "no shell could be built" leg of the allow path (settles the pair,
+  returns `Settled` before `tell` is computed). A `Turn` pair needs
+  `Tell("… It did NOT run: no shell could be built … Block <id> carries the
+  same message. Ask again.")` like the cwd-gone and env-restore legs.
+
+Both wire denial tests link `PairOwner::Session`; add
+`a_denied_ask_on_a_turns_pair_tells_the_model` (deny → pair `Error` +
+"denied" seed, no "It has run."). `docs/gate-shape-b.md`, "The subscriber,
+in order", still says a denial's settled blocks ARE the delivery; rewrite it
+with the fix. Found by Kaibo (deepseek) reviewing `a5e20034`. Held on
+2026-09-12 because Codex was mid-rewrite of the same function.
+
 ## An old approval revives a turn whose prompt cache is cold (2026-09-12)
 
 `kj ledger allow` resumes the model whose linked pair it fills
