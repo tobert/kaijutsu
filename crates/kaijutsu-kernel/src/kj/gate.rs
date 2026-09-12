@@ -2,7 +2,7 @@
 //! ([`crate::kj::cc`]) and the `shell_write` gate ([`crate::kj::shell_gate`]).
 //!
 //! First consumer: `kj cc send` — injecting a turn into a Claude Code
-//! session is exactly the "agent action a human should authorize" case the
+//! session is exactly the "agent action an assigned reviewer should authorize" case the
 //! ledger exists for (Amy, 2026-08-16: *"yeah kj cc send should go through
 //! the ledger"*). The shape here is the template gate, extended, then, to
 //! `shell_write` (`docs/gate-and-shell-split.md`, "Slice 4").
@@ -30,7 +30,7 @@
 //!    commits before anything waits (ledger guarantee 1). The ask row is the
 //!    durable record regardless of how the wait ends.
 //! 3. **Return, without waiting.** The gate hands back
-//!    [`GateVerdict::Pending`] with the request id and nothing runs. A human
+//!    [`GateVerdict::Pending`] with the request id and nothing runs. Its assigned reviewer
 //!    answers from `kj ledger` whenever they answer — minutes or a night
 //!    later — and the next attempt at the same request redeems that answer
 //!    once (step 2 above). Fail-closed throughout: an unanswered ask
@@ -78,15 +78,15 @@ use crate::kj::KjCaller;
 /// name and the refusal shapes required one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GateVerdict {
-    /// A human or a rule decided yes.
+    /// An assigned reviewer or a rule decided yes.
     Allowed,
-    /// A human or a rule decided no. A real verdict.
+    /// An assigned reviewer or a rule decided no. A real verdict.
     Denied,
     /// No decision was reached: the ledger could not be read or written, or
     /// the ask row went missing. Still fail-closed — the call does not
     /// proceed — but it is not a verdict, and must never be reported as one.
     Unavailable,
-    /// A durable ask is waiting for a human, and **nothing ran**. Not a
+    /// A durable ask is waiting for its assigned reviewer, and **nothing ran**. Not a
     /// refusal and not a fault: the question was asked and is answerable
     /// from `kj ledger` for as long as it takes. The action runs when the
     /// answer lands, not when this call returns.
@@ -126,7 +126,7 @@ pub(crate) struct GateOutcome {
     pub verdict: GateVerdict,
     /// The ledger row this outcome belongs to, when there is one. `None`
     /// means the gate failed before recording anything: there is no id to
-    /// show a human and nothing for `kj ledger` to find, and saying so
+    /// show a reviewer and nothing for `kj ledger` to find, and saying so
     /// beats printing an empty string where an id belongs.
     pub ask: Option<AskRef>,
     /// Human-readable reason, always populated — on refusal it says exactly
@@ -145,18 +145,18 @@ pub(crate) struct GateOutcome {
 
 /// What a player does about a pending ask whose `exec_source` is `Some` —
 /// answering it runs the command, so this says where and with what values.
-/// "waiting for a human" is deliberately absent: that fact belongs to the
+/// "waiting for its assigned reviewer" is deliberately absent: that fact belongs to the
 /// refusal that wraps this, and stating it here made the composed message
 /// say it three times. Named rather than inline so the layering test reads
 /// the real text.
-pub const PENDING_REASON_EXECUTES: &str = "nothing was run. Answer with `kj ledger \
+pub const PENDING_REASON_EXECUTES: &str = "nothing was run. The assigned reviewer answers with `kj ledger \
      allow <id>` and the command runs, in the directory and with the free-variable \
      values this ask recorded; `kj ledger deny <id>` runs nothing.";
 
 /// What a player does about a pending ask whose `exec_source` is `None` —
 /// there is nothing durable to execute, so the caller must resubmit once
 /// it is answered.
-pub const PENDING_REASON_RETRY: &str = "nothing was run. Answer with `kj ledger \
+pub const PENDING_REASON_RETRY: &str = "nothing was run. The assigned reviewer answers with `kj ledger \
      allow <id>` or `kj ledger deny <id>`, then run the same command again — \
      an allowed ask authorizes it exactly once.";
 
@@ -199,7 +199,7 @@ impl GateOutcome {
 /// or binds. The ledger refuses to learn ALLOW rules for a statement with
 /// any free variable (guarantee 3) — which is precisely why
 /// [`crate::kj::cc`] marks its message body free: every send stays
-/// human-approved until the policy changes deliberately.
+/// reviewer-approved until the policy changes deliberately.
 #[derive(Debug)]
 pub(crate) struct GatedStatement {
     pub rendered: String,
@@ -357,7 +357,7 @@ fn build_ask(
     // The values every free variable in this submission held at ask time —
     // `Amy, 2026-09-02: snapshot the free variables' values onto the ask at
     // ask time, restore them verbatim at execution, and show them to the
-    // human in the review rendering` (docs/gate-shape-b.md). `None` for a
+    // reviewer in the review rendering` (docs/gate-shape-b.md). `None` for a
     // caller with no `context_id`, same as `caller_cwd`: there is no
     // persisted `context_env` to read.
     let env = caller
@@ -394,7 +394,7 @@ fn build_ask(
                 // A synthetic single command wrapping the whole rendered
                 // text — NOT kaish's real per-command/per-arg structure.
                 // `rendered` (shown verbatim by `kj ledger show`) is the
-                // full-fidelity surface a human reads; this satisfies the
+                // full-fidelity surface the reviewer reads; this satisfies the
                 // schema's NOT NULL `approval_plan_commands` row without
                 // claiming a command-level breakdown this gate doesn't
                 // build. Threading kaish's real `PlannedCommand` tree
@@ -477,8 +477,8 @@ pub(crate) fn announce_ledger_change(
 /// Run the gate: rules → an already-answered ask → a durable ask, returning
 /// immediately in every case.
 ///
-/// **Nothing here waits.** A gated call that needs a human returns
-/// [`GateVerdict::Pending`] with the ask id; the human answers whenever they
+/// **Nothing here waits.** A gated call that needs a reviewer returns
+/// [`GateVerdict::Pending`] with the ask id; the assigned reviewer answers whenever they
 /// answer, and the action runs then. See `docs/gate-resume.md` for why the
 /// blocking shape could not reach the waits it was asked for.
 ///
@@ -577,7 +577,7 @@ pub(crate) async fn run_gate(
     let verdict = policy.verdict();
 
     // 2. An answer already given. Nothing waits any more, so a caller told
-    //    `Pending` comes back and asks again — and the human's answer is
+    //    `Pending` comes back and asks again — and the reviewer's answer is
     //    sitting in the ledger from last time. Delivering it here is what
     //    closes the loop; without this step the retry would build the same
     //    free-variable statement, find no rule (guarantee 3 forbids one),
@@ -585,7 +585,7 @@ pub(crate) async fn run_gate(
     //
     //    A denial is delivered the same way an approval is. Redeeming only
     //    approvals would leave a denied caller looping exactly as above,
-    //    with the answer already given and no way for a human to stop it by
+    //    with the answer already given and no way for a reviewer to stop it by
     //    answering again.
     //
     //    Strictly after the rules, so a DENY rule added since the answer
@@ -638,13 +638,13 @@ pub(crate) async fn run_gate(
                          it is now spent"
                             .to_string()
                     } else {
-                        "this exact request was already denied by a human; \
+                        "this exact request was already denied by its assigned reviewer; \
                          nothing was run"
                             .to_string()
                     },
                 };
             }
-            // No answer waiting is the ordinary path — ask a human.
+            // No answer waiting is the ordinary path — ask the assigned reviewer.
             Ok(None) => {}
             Err(e) => {
                 return GateOutcome::unavailable_without_row(format!(
@@ -674,7 +674,7 @@ pub(crate) async fn run_gate(
     };
 
     // An auto decision still gets its durable row, decided immediately with
-    // no human in the loop (`decided_by` None + `auto_reason` mark it).
+    // no reviewer in the loop (`decided_by` None + `auto_reason` mark it).
     if matches!(verdict, AskVerdict::Allow | AskVerdict::Deny) {
         let allow = matches!(verdict, AskVerdict::Allow);
         let auto_reason = policy.describe(&spec.statements, allow);
@@ -734,7 +734,7 @@ pub(crate) async fn run_gate(
     // a client disconnects, `Broker::call_tool` loses its cancellation race
     // and drops this future mid-poll. Any of those leaves the row `pending`
     // with nobody behind it — indistinguishable, in `kj ledger list`, from
-    // an ask someone is actually waiting on. A human would answer it and
+    // an ask someone is actually waiting on. Its reviewer would answer it and
     // nothing would run, having been told that answering did something.
     //
     // So the signal is taken from the drop itself rather than from any one
@@ -759,7 +759,7 @@ pub(crate) async fn run_gate(
 /// free-variable snapshot, the cwd — and is then abandoned in the same
 /// call. Abandoned is the only status that records a question without
 /// asserting an answer to it, and it is inert in all three directions that
-/// matter: `list_pending_asks` never offers it to a human who could not act
+/// matter: `list_pending_asks` never offers it to a reviewer who could not act
 /// on it, `find_redeemable` admits `allowed`/`denied` only so it can never
 /// authorize a later call, and `undelivered_answers` shares that predicate
 /// so no context is ever woken for it.

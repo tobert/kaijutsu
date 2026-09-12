@@ -757,6 +757,49 @@ mod approval_pair_tests {
         assert!(approval_pair(Some(&command.to_key()), Some(&output.to_key()), None).is_err());
         assert!(approval_pair(Some("invalid"), Some(&output.to_key()), Some(owner)).is_err());
     }
+
+    #[test]
+    fn no_shell_turn_seed_says_the_approved_action_did_not_run() {
+        let context = ContextId::new();
+        let output = BlockId::new(context, PrincipalId::system(), 1);
+        let seed = no_shell_turn_seed(
+            "gate-approver",
+            "write the release",
+            Some(&output),
+            &"shell unavailable",
+        );
+
+        assert!(seed.contains("approved the action"), "{seed}");
+        assert!(seed.contains("It did NOT run: no shell could be built"), "{seed}");
+        assert!(seed.contains(&output.to_key()), "{seed}");
+    }
+
+    #[test]
+    fn no_shell_seed_routes_to_turns_and_unlinked_asks_but_not_sessions() {
+        let context = ContextId::new();
+        let command = BlockId::new(context, PrincipalId::new(), 1);
+        let output = BlockId::new(context, PrincipalId::system(), 2);
+
+        assert!(needs_no_shell_turn_seed(None));
+        assert!(needs_no_shell_turn_seed(Some((
+            command.clone(),
+            output.clone(),
+            kaijutsu_kernel::PairOwner::Turn,
+        ))));
+        assert!(!needs_no_shell_turn_seed(Some((
+            command,
+            output,
+            kaijutsu_kernel::PairOwner::Session,
+        ))));
+
+        let seed = no_shell_turn_seed(
+            "gate-approver",
+            "write the release",
+            None,
+            &"shell unavailable",
+        );
+        assert!(seed.contains("No output block was created"), "{seed}");
+    }
 }
 
 /// Both halves of "archived", because they are stored separately: archiving
@@ -853,6 +896,54 @@ fn settle_pair_error(
     kernel.conversation_cache.evict(context_id);
 }
 
+/// Tell a model whose own tool pair was settled without execution. A turn's
+/// cached mailbox cannot observe the in-place error edit, so this is the
+/// durable conversation-side receipt that prevents it from retrying blindly.
+fn unrun_turn_seed(
+    who: &str,
+    status: kaijutsu_kernel::ApprovalStatus,
+    description: &str,
+    output_block_id: &BlockId,
+) -> String {
+    let decision = match status {
+        kaijutsu_kernel::ApprovalStatus::Abandoned => "cancelled",
+        _ => "denied",
+    };
+    format!(
+        "{who} {decision} the action you were waiting on: {description}\n\n\
+         It did NOT run. Block {} carries the same message. Do not retry the \
+         {decision} action.",
+        output_block_id.to_key()
+    )
+}
+
+/// Tell a model that its approved tool action could not acquire a shell.
+/// Unlike an ordinary session pair, a turn pair was edited in place and needs
+/// this new block to learn that the command did not run.
+fn no_shell_turn_seed(
+    who: &str,
+    description: &str,
+    output_block_id: Option<&BlockId>,
+    error: &dyn std::fmt::Display,
+) -> String {
+    let receipt = match output_block_id {
+        Some(output_block_id) => format!("Block {} carries the same message.", output_block_id.to_key()),
+        None => "No output block was created because the shell was unavailable.".to_string(),
+    };
+    format!(
+        "{who} approved the action you were waiting on: {description}\n\n\
+         It did NOT run: no shell could be built ({error}). {receipt} Ask \
+         again after fixing the context."
+    )
+}
+
+/// A newly authored pair belongs to a model turn, so a shell failure before
+/// authoring it needs a seed too. Only a connected session's existing pair
+/// observes its own settled error without one.
+fn needs_no_shell_turn_seed(linked: Option<(BlockId, BlockId, kaijutsu_kernel::PairOwner)>) -> bool {
+    !matches!(linked, Some((_, _, kaijutsu_kernel::PairOwner::Session)))
+}
+
 /// Run an answered ask that carries executable source, or settle the blocks
 /// waiting on it when it was refused.
 ///
@@ -893,12 +984,11 @@ async fn act_on_executable_answer(
         }
     }
 
-    // A denial runs nothing. With a pair to settle, the settling is the
-    // whole delivery and the answer is consumed here; with no pair there is
-    // nothing to show, so the caller keeps the wake it would have had and
-    // its retry collects the refusal.
+    // A denial runs nothing. A connected session sees its settled pair
+    // directly. A model turn does not: its cached mailbox cannot observe an
+    // in-place edit, so it also receives an explicit no-run seed.
     if !matches!(answer.status, kaijutsu_kernel::ApprovalStatus::Allowed) {
-        let Some((command_block_id, output_block_id, _owner)) = linked else {
+        let Some((command_block_id, output_block_id, owner)) = linked else {
             return ExecAction::FallThrough;
         };
         settle_pair_error(
@@ -916,8 +1006,18 @@ async fn act_on_executable_answer(
                  redemption did not write ({e}); it may be delivered again",
                 answer.request_id
             );
+            return ExecAction::Deferred;
         }
-        return ExecAction::Settled;
+        return if owner == kaijutsu_kernel::PairOwner::Turn {
+            ExecAction::Tell(unrun_turn_seed(
+                who,
+                answer.status,
+                &answer.description,
+                &output_block_id,
+            ))
+        } else {
+            ExecAction::Settled
+        };
     }
 
     match kernel.kernel_db.lock().redeem_ask(&answer.request_id) {
@@ -993,6 +1093,14 @@ async fn act_on_executable_answer(
                     &output_block_id,
                     format!("approved, but no shell could be built to run it: {e}"),
                 );
+            }
+            if needs_no_shell_turn_seed(linked) {
+                return ExecAction::Tell(no_shell_turn_seed(
+                    who,
+                    &answer.description,
+                    linked.as_ref().map(|(_, output_block_id, _)| output_block_id),
+                    &e,
+                ));
             }
             return ExecAction::Settled;
         }

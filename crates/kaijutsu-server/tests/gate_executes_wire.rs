@@ -203,6 +203,28 @@ impl Seats {
         wait_for("the answer to land in the ledger", || self.decided(request_id)).await;
     }
 
+    /// Withdraw from the actor seat. Cancellation is terminal without
+    /// granting permission, but the subscriber still has to settle and
+    /// deliver a linked turn pair.
+    async fn cancel(&self, request_id: &str) {
+        let kj = &self.worker_kj;
+        kj.join_context(self.worker, "gate-exec-worker").await.unwrap();
+        kj.shell_execute(
+            &format!("kj ledger cancel {request_id}"),
+            self.worker,
+            true,
+        )
+        .await
+        .expect("shell_execute for cancellation");
+        wait_for("the cancellation to land in the ledger", || {
+            matches!(
+                self.kernel.kernel_db.lock().get_approval(request_id).unwrap(),
+                Some(row) if row.status == kaijutsu_kernel::ApprovalStatus::Abandoned
+            )
+        })
+        .await;
+    }
+
     /// Has a human's answer been recorded on this ask yet?
     fn decided(&self, request_id: &str) -> bool {
         matches!(
@@ -660,6 +682,63 @@ fn a_denied_ask_settles_its_pair_to_error_and_runs_nothing() {
             !s.undelivered(&ask),
             "settling the blocks IS the delivery, so a denial with a pair is redeemed"
         );
+    });
+}
+
+/// A model's `Turn` pair is an in-place edit that its cached mailbox cannot
+/// see. Terminal refusal therefore needs a new seed saying the command did
+/// not run; a session-owned pair above deliberately stays settle-only.
+#[test]
+fn a_denied_turn_pair_tells_the_model_it_did_not_run() {
+    run_local(async {
+        let scratch = Scratch::new("denied-turn");
+        let s = seats().await;
+        let marker = scratch.marker();
+        let code = format!("echo should-not-run > {}", marker.display());
+        let ask = s.raise(&code).await;
+        let (_command, output) = s.link_waiting_pair(&ask, &code, PairOwner::Turn);
+
+        s.answer(&ask, false).await;
+        wait_for("the denied turn pair to settle", || s.block(&output).status == Status::Error).await;
+        wait_for("the no-run denial seed", || {
+            s.worker_blocks().iter().any(|block| {
+                block.kind == BlockKind::Text
+                    && block.content.contains("denied the action")
+                    && block.content.contains("It did NOT run.")
+                    && block.content.contains(&output.to_key())
+            })
+        })
+        .await;
+        assert!(!marker.exists(), "a denied turn action must not run");
+        assert!(!s.undelivered(&ask), "the delivered denial is redeemed");
+    });
+}
+
+/// Cancellation follows the same delivery path as denial: it settles the
+/// waiting model pair, is spent, and explicitly says that no command ran.
+#[test]
+fn a_cancelled_turn_pair_tells_the_model_it_did_not_run() {
+    run_local(async {
+        let scratch = Scratch::new("cancelled-turn");
+        let s = seats().await;
+        let marker = scratch.marker();
+        let code = format!("echo should-not-run > {}", marker.display());
+        let ask = s.raise(&code).await;
+        let (_command, output) = s.link_waiting_pair(&ask, &code, PairOwner::Turn);
+
+        s.cancel(&ask).await;
+        wait_for("the cancelled turn pair to settle", || s.block(&output).status == Status::Error).await;
+        wait_for("the no-run cancellation seed", || {
+            s.worker_blocks().iter().any(|block| {
+                block.kind == BlockKind::Text
+                    && block.content.contains("cancelled the action")
+                    && block.content.contains("It did NOT run.")
+                    && block.content.contains(&output.to_key())
+            })
+        })
+        .await;
+        assert!(!marker.exists(), "a cancelled turn action must not run");
+        assert!(!s.undelivered(&ask), "the delivered cancellation is redeemed");
     });
 }
 

@@ -462,10 +462,12 @@ On each `ledger.changed` the driver re-reads the undelivered answers and,
 for each it has not acted on: resolves the context and refuses anything not
 Live; reads the whole approval row, because `exec_source` decides the branch
 and the answer summary does not carry it. No `exec_source`: the old wake,
-unchanged. A denial with a linked pair: settle the pair `Error` with the
-reason on stderr, then redeem — the blocks carrying the reason ARE the
-delivery, so they exist before the answer is spent; a denial with no pair
-falls back to the wake. An allow: **redeem first**, re-check Live,
+unchanged. A denial or cancellation with a linked pair: settle the pair
+`Error` with the reason on stderr, then redeem. A `Session` pair's blocks
+are its delivery. A `Turn` pair also gets a new seed saying that the action
+did not run, because its cached mailbox cannot observe the in-place edit. A
+terminal answer with no pair falls back to the wake. An allow: **redeem
+first**, re-check Live,
 materialize a shell for the ask's principal and context under a synthetic
 session id, resolve or author the pair, move to the ask's cwd, restore the
 ask's env, run.
@@ -477,7 +479,10 @@ the gate — `PairOwner::Turn` (a model's own tool call) or one the driver
 authored fresh because the ask named none — gets a seed block naming the
 output; the seed also carries a turn request when no turn is in flight, and
 stands alone when one already is, because the fill is an in-place edit a
-running turn's cached mailbox will not re-read on its own `catch_up`.
+running turn's cached mailbox will not re-read on its own `catch_up`. The
+same distinction applies when an allowed action cannot materialize a shell,
+restore its environment, or enter its recorded directory: a `Turn` receives
+an explicit no-run seed; a `Session` pair stays settled-only.
 
 **What a crash costs.** The redemption row is claimed before the run, so a
 crash between the two loses the action: the ask reads redeemed, nothing
