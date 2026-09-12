@@ -59,6 +59,7 @@
 //!    `(principal, instance)` to dedupe subscriptions across reconnects.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -905,6 +906,10 @@ pub struct ActorHandle {
     /// so a caller can read "are we connected?" without racing the one-shot
     /// broadcast. See [`Self::current_status`] / [`Self::watch_status`].
     status_watch_rx: watch::Receiver<ConnectionStatus>,
+    /// Increases once for each successfully connected transport. Callers that
+    /// start work against a connection can reject its result after a later
+    /// reconnect, even though this actor handle itself remains the same.
+    connection_epoch: Arc<AtomicU64>,
     /// The seat a MIDI-capable client installs its hardware worker into, so
     /// the kernel's `exchange` calls have somewhere to land
     /// (`docs/midi-next.md` "SysEx: the exchange pattern"). Shared with every
@@ -956,6 +961,7 @@ impl ActorHandle {
             event_tx,
             status_tx,
             status_watch_rx,
+            connection_epoch: Arc::new(AtomicU64::new(0)),
             midi_exchange: crate::midi_exchange::MidiExchangeSlot::new(),
             ledger_tx,
             clock: crate::KernelClockHandle::new(),
@@ -1048,6 +1054,12 @@ impl ActorHandle {
     /// drive UI through every state — use [`Self::subscribe_status`].
     pub fn current_status(&self) -> ConnectionStatus {
         self.status_watch_rx.borrow().clone()
+    }
+
+    /// Monotonic epoch for the live transport. It changes only after a
+    /// successful handshake, before that connection is announced as live.
+    pub fn connection_epoch(&self) -> u64 {
+        self.connection_epoch.load(Ordering::Acquire)
     }
 
     /// A `watch` receiver for connection status. `watch_status().wait_for(..)`
@@ -2253,6 +2265,8 @@ struct RpcActor {
     /// `status_tx` so observers can read the current level without racing the
     /// broadcast's one-shot edges.
     status_watch_tx: watch::Sender<ConnectionStatus>,
+    /// Shared with [`ActorHandle`]; bumped before each Connected transition.
+    connection_epoch: Arc<AtomicU64>,
 }
 
 impl RpcActor {
@@ -2291,6 +2305,7 @@ impl RpcActor {
         event_tx: broadcast::Sender<ServerEvent>,
         status_tx: broadcast::Sender<ConnectionStatus>,
         status_watch_tx: watch::Sender<ConnectionStatus>,
+        connection_epoch: Arc<AtomicU64>,
         midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
         ledger_tx: broadcast::Sender<i64>,
         clock: crate::KernelClockHandle,
@@ -2324,6 +2339,7 @@ impl RpcActor {
             event_tx,
             status_tx,
             status_watch_tx,
+            connection_epoch,
         }
     }
 
@@ -2432,6 +2448,7 @@ impl RpcActor {
         self.state = ActorState::Connected {
             since: Instant::now(),
         };
+        self.advance_connection_epoch();
 
         // Context feeds are intent, like peer attachment: the observer
         // capability died with the old connection, but the consumer's receiver
@@ -2494,6 +2511,13 @@ impl RpcActor {
         }
 
         self.broadcast_state();
+    }
+
+    /// Mark a newly installed transport before observers can act on its
+    /// Connected notification. Keeping this tiny transition separate makes
+    /// the stale-result boundary directly testable without network I/O.
+    fn advance_connection_epoch(&self) -> u64 {
+        self.connection_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Transition to `Closing` from any state where a connection might be live.
@@ -4121,6 +4145,7 @@ pub fn spawn_actor(
     // Seed the level mirror with Idle — the state the actor starts in, before
     // `run()` issues its first `broadcast_state`.
     let (status_watch_tx, status_watch_rx) = watch::channel(ConnectionStatus::Idle);
+    let connection_epoch = Arc::new(AtomicU64::new(0));
 
     // One slot, shared by the actor (which hands it to every block-events
     // forwarder it builds, reconnects included) and the handle (where a
@@ -4148,6 +4173,7 @@ pub fn spawn_actor(
         event_tx.clone(),
         status_tx.clone(),
         status_watch_tx,
+        connection_epoch.clone(),
         midi_exchange.clone(),
         ledger_tx.clone(),
         clock.clone(),
@@ -4159,6 +4185,7 @@ pub fn spawn_actor(
         event_tx,
         status_tx,
         status_watch_rx,
+        connection_epoch,
         midi_exchange,
         ledger_tx,
         clock,
@@ -4520,6 +4547,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(8);
         let (status_tx, _) = broadcast::channel(8);
         let (status_watch_tx, _) = watch::channel(ConnectionStatus::Idle);
+        let connection_epoch = Arc::new(AtomicU64::new(0));
         let (ledger_tx, _) = broadcast::channel(8);
         RpcActor::new(
             SshConfig::default(),
@@ -4530,10 +4558,19 @@ mod tests {
             event_tx,
             status_tx,
             status_watch_tx,
+            connection_epoch,
             crate::midi_exchange::MidiExchangeSlot::new(),
             ledger_tx,
             crate::KernelClockHandle::new(),
         )
+    }
+
+    #[test]
+    fn connected_transition_advances_connection_epoch() {
+        let actor = test_actor();
+        assert_eq!(actor.connection_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(actor.advance_connection_epoch(), 1);
+        assert_eq!(actor.advance_connection_epoch(), 2);
     }
 
     /// Regression test for the backoff reset bug: `finish_closing` used to

@@ -30,7 +30,7 @@ use bevy::window::{
 use bevy::winit::{UpdateMode, WinitSettings};
 use bevy_brp_extras::BrpExtrasPlugin;
 use clap::Parser;
-use kaijutsu_client::SshConfig;
+use kaijutsu_client::{KeySource, SshConfig};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// 会術 Kaijutsu — collaborative workspace
@@ -48,6 +48,15 @@ struct Cli {
     /// Skip SSH known_hosts verification (TOFU)
     #[arg(long)]
     insecure: bool,
+
+    /// Select exactly one SSH-agent key by its `SHA256:<base64>` fingerprint.
+    /// The app fails if the agent does not hold that key.
+    #[arg(long, conflicts_with = "key_file")]
+    key_fingerprint: Option<String>,
+
+    /// Authenticate with this private-key file. Conflicts with `--key-fingerprint`.
+    #[arg(long, conflicts_with = "key_fingerprint")]
+    key_file: Option<std::path::PathBuf>,
 
     /// Start borderless-fullscreen on the primary monitor (runner/gamescope)
     #[arg(long, conflicts_with = "maximize")]
@@ -95,10 +104,23 @@ fn main() {
             .exit();
     }
 
+    let key_source = match key_source_from_selectors(
+        cli.key_fingerprint.as_deref(),
+        cli.key_file.as_deref(),
+    ) {
+        Ok(key_source) => key_source,
+        Err(e) => {
+            use clap::CommandFactory;
+            Cli::command()
+                .error(clap::error::ErrorKind::ValueValidation, e)
+                .exit();
+        }
+    };
     let ssh_config = SshConfig {
         host: cli.host,
         port: cli.port,
         insecure: cli.insecure,
+        key_source,
         ..SshConfig::default()
     };
 
@@ -341,6 +363,21 @@ fn main() {
         .run();
 }
 
+fn key_source_from_selectors(
+    fingerprint: Option<&str>,
+    key_file: Option<&std::path::Path>,
+) -> Result<KeySource, String> {
+    match (fingerprint, key_file) {
+        (Some(_), Some(_)) => Err("choose either --key-fingerprint or --key-file, not both".into()),
+        (Some(fingerprint), None) if fingerprint.is_empty() => {
+            Err("--key-fingerprint must name an SSH SHA256 fingerprint".into())
+        }
+        (Some(fingerprint), None) => Ok(KeySource::agent_key(fingerprint)),
+        (None, Some(path)) => Ok(KeySource::from_file(path)),
+        (None, None) => Ok(KeySource::Agent),
+    }
+}
+
 /// Setup the single, always-on app camera.
 ///
 /// It is a `Camera3d` (not `Camera2d`) so the time well's 3D card meshes and the
@@ -536,5 +573,27 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["kaijutsu", "--fullscreen", "--maximize"]).is_err());
         assert!(Cli::try_parse_from(["kaijutsu", "--fullscreen"]).is_ok());
         assert!(Cli::try_parse_from(["kaijutsu", "--maximize"]).is_ok());
+    }
+
+    #[test]
+    fn key_selectors_are_exclusive_and_choose_one_source() {
+        assert!(Cli::try_parse_from([
+            "kaijutsu",
+            "--key-fingerprint",
+            "SHA256:chosen",
+            "--key-file",
+            "/tmp/key",
+        ])
+        .is_err());
+
+        assert!(matches!(
+            key_source_from_selectors(Some("SHA256:chosen"), None),
+            Ok(KeySource::AgentKey { fingerprint }) if fingerprint == "SHA256:chosen"
+        ));
+        assert!(matches!(
+            key_source_from_selectors(None, Some(std::path::Path::new("/tmp/key"))),
+            Ok(KeySource::File { path, passphrase: None }) if path == std::path::Path::new("/tmp/key")
+        ));
+        assert!(matches!(key_source_from_selectors(None, None), Ok(KeySource::Agent)));
     }
 }

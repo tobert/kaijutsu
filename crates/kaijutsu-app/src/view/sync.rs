@@ -18,7 +18,7 @@ use crate::cell::{
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 use crate::ui::screen::Screen;
 use kaijutsu_client::ServerEvent;
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{ContextId, PrincipalId};
 
 /// The `Screen` a *landed* context switch should reveal, or `None` if the
 /// current screen already shows the active context.
@@ -238,6 +238,22 @@ fn spawn_full_rehydrate(
 }
 
 /// Sync the MainCell's content with the active document in DocumentCache.
+fn needs_render_sync(
+    viewing: Option<&ViewingConversation>,
+    context_id: ContextId,
+    version: u64,
+    principal_id: Option<PrincipalId>,
+) -> bool {
+    match viewing {
+        Some(viewing) => {
+            viewing.conversation_id != context_id
+                || viewing.last_sync_version != version
+                || viewing.principal_id != principal_id
+        }
+        None => true,
+    }
+}
+
 pub fn sync_main_cell_to_conversation(
     doc_cache: Res<crate::cell::DocumentCache>,
     entities: Res<EditorEntities>,
@@ -257,17 +273,18 @@ pub fn sync_main_cell_to_conversation(
 
     let ctx_id = cached.mirror.context_id();
     let sync_version = cached.mirror.version();
+    let authenticated_principal = session_principal.0;
 
     let Ok((mut editor, viewing_opt)) = main_cell.get_mut(entity) else {
         return;
     };
 
-    let needs_sync = match viewing_opt {
-        Some(ref viewing) => {
-            viewing.conversation_id != ctx_id || viewing.last_sync_version != sync_version
-        }
-        None => true,
-    };
+    let needs_sync = needs_render_sync(
+        viewing_opt.as_deref(),
+        ctx_id,
+        sync_version,
+        authenticated_principal,
+    );
 
     if !needs_sync {
         return;
@@ -291,9 +308,10 @@ pub fn sync_main_cell_to_conversation(
     // transcript too would double-render it. A co-player's draft is left
     // alone deliberately: watching a neighbor type is a feature, not a bug
     // (see `block_border.rs`'s `Status::Draft` handling).
-    let principal_id = editor.store.principal_id();
+    let principal_id = session_principal.0.unwrap_or_else(|| editor.store.principal_id());
     let store = editor.store.rebuild(ctx_id, principal_id, cached.mirror.blocks(), |block| {
-        block.status == kaijutsu_types::Status::Draft && block.id.principal_id == session_principal.0
+        block.status == kaijutsu_types::Status::Draft
+            && session_principal.0.is_some_and(|principal| block.id.principal_id == principal)
     });
     let mut store = match store {
         Ok(store) => store,
@@ -314,11 +332,13 @@ pub fn sync_main_cell_to_conversation(
         Some(mut viewing) => {
             viewing.conversation_id = ctx_id;
             viewing.last_sync_version = sync_version;
+            viewing.principal_id = authenticated_principal;
         }
         None => {
             commands.entity(entity).insert(ViewingConversation {
                 conversation_id: ctx_id,
                 last_sync_version: sync_version,
+                principal_id: authenticated_principal,
             });
         }
     }
@@ -454,6 +474,21 @@ pub fn handle_server_context_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_principal_change_rebuilds_the_same_context_version() {
+        let context_id = ContextId::new();
+        let prior = PrincipalId::new();
+        let next = PrincipalId::new();
+        let viewing = ViewingConversation {
+            conversation_id: context_id,
+            last_sync_version: 7,
+            principal_id: Some(prior),
+        };
+
+        assert!(needs_render_sync(Some(&viewing), context_id, 7, Some(next)));
+        assert!(!needs_render_sync(Some(&viewing), context_id, 7, Some(prior)));
+    }
 
     /// Already on Conversation → no transition (don't churn the FSM on every
     /// in-conversation switch, e.g. dock clicks).

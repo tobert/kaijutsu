@@ -11,20 +11,18 @@ pub use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::view::render_store::RenderBlockStore;
 
-/// Session-scoped agent identity.
+/// Authenticated principal for this app connection.
 ///
-/// Created once at startup, reused for the `CellEditor` render buffer's
-/// local `RenderBlockStore`, and — since Lane C slice 3 — for finding this
-/// principal's own compose draft among the ordinary blocks in a context's
-/// `ContextMirror` (`DocumentEntry::draft_text`). Without this, each frame
-/// or context switch would generate a fresh PrincipalId, fragmenting block
-/// authorship.
+/// `None` until `whoami` completes, and again while reconnecting. The app
+/// must not invent an author for a draft: the SSH connection is authoritative.
+/// Once known, this identifies the compose draft among ordinary blocks in a
+/// context's `ContextMirror` (`DocumentEntry::draft_text`).
 #[derive(Resource)]
-pub struct SessionPrincipal(pub PrincipalId);
+pub struct SessionPrincipal(pub Option<PrincipalId>);
 
 impl Default for SessionPrincipal {
     fn default() -> Self {
-        Self(PrincipalId::new())
+        Self(None)
     }
 }
 
@@ -40,6 +38,9 @@ pub struct ViewingConversation {
     pub conversation_id: ContextId,
     /// Last sync version to detect changes.
     pub last_sync_version: u64,
+    /// Authenticated principal used to classify local drafts in this render.
+    #[reflect(ignore)]
+    pub principal_id: Option<PrincipalId>,
 }
 
 // ============================================================================
@@ -299,9 +300,10 @@ pub struct InputOverlay {
     /// Vim mode display string (e.g. "-- INSERT --", None = Normal).
     /// Updated by vim_dispatch_compose each frame.
     pub vim_mode: Option<String>,
-    /// Target context for this input (None = use active context).
+    /// Context that owns this input. Set when text first enters the overlay
+    /// and retained through a context switch until the text is submitted or
+    /// recovered.
     #[reflect(ignore)]
-    #[allow(dead_code)] // Floating-chat context targeting; submit path not yet reading it.
     pub target_context: Option<ContextId>,
 }
 
@@ -468,11 +470,26 @@ pub struct MainCell;
 /// Message fired when prompt submission fails (e.g. disconnected).
 ///
 /// Carries the original text so it can be restored to the compose block.
-#[derive(Message)]
+#[derive(Message, Clone)]
 pub struct SubmitFailed {
     pub text: String,
     pub reason: String,
+    pub is_shell: bool,
+    pub context_id: ContextId,
+    pub principal_id: PrincipalId,
 }
+
+/// Failed submissions retained until their original context and principal are
+/// visible again. A delayed failure must never overwrite another context's
+/// compose text.
+#[derive(Resource, Default)]
+pub struct PendingSubmitRecoveries(pub Vec<SubmitFailed>);
+
+/// A proven connection identity replaced another while compose text was
+/// visible. The submit handler moves that text into recoverable storage
+/// before the new principal can submit it.
+#[derive(Resource, Default)]
+pub struct PendingIdentityTransition(pub Option<(PrincipalId, Option<PrincipalId>)>);
 
 /// Marker component for compose blocks in error state.
 ///

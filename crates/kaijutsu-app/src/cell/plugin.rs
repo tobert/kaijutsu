@@ -37,7 +37,8 @@ use crate::view::overlay::{OverlayStyle, OverlaySummonState};
 use crate::view::shell_dock::ShellDockSummonState;
 use crate::view::{
     ContextSwitchRequested, ConversationContainer, ConversationScrollState, DocumentCache,
-    EditorEntities, FocusTarget, MainCell, PendingContextSwitch, SessionPrincipal, SubmitFailed,
+    EditorEntities, FocusTarget, MainCell, PendingContextSwitch, PendingIdentityTransition,
+    PendingSubmitRecoveries, SessionPrincipal, SubmitFailed,
     ViewingConversation,
 };
 
@@ -100,6 +101,8 @@ impl Plugin for CellPlugin {
         app.init_resource::<FocusTarget>()
             .init_resource::<ConversationScrollState>()
             .init_resource::<SessionPrincipal>()
+            .init_resource::<PendingSubmitRecoveries>()
+            .init_resource::<PendingIdentityTransition>()
             .init_resource::<DocumentCache>()
             .init_resource::<crate::cell::ScrollOffsets>()
             .init_resource::<PendingContextSwitch>()
@@ -118,7 +121,6 @@ impl Plugin for CellPlugin {
                 view_sync::drain_context_hydrations.after(view_sync::handle_block_events),
                 view_sync::handle_context_switch.after(view_sync::handle_block_events),
                 view_sync::handle_server_context_switch.before(view_sync::handle_context_switch),
-                view_submit::handle_submit_failed.after(view_sync::handle_context_switch),
                 // Drains each followed context's change feed — the
                 // docs/change-feed.md steady-state + recovery driver that
                 // replaced `check_cache_staleness`. Must run before
@@ -134,6 +136,12 @@ impl Plugin for CellPlugin {
                     .after(view_sync::drain_context_feeds),
             )
                 .in_set(CellPhase::Sync),
+        );
+        app.add_systems(
+            Update,
+            view_submit::handle_submit_failed
+                .in_set(CellPhase::Input)
+                .before(crate::input::systems::handle_compose_input),
         );
 
         // ====================================================================

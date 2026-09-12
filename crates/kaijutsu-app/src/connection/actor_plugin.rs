@@ -103,6 +103,27 @@ pub struct RpcConnectionState {
     pub last_error: Option<String>,
 }
 
+fn set_session_principal(
+    session_principal: &mut crate::cell::SessionPrincipal,
+    identity: Option<&Identity>,
+) {
+    session_principal.0 = identity.map(|identity| identity.principal_id);
+}
+
+fn accepts_identity_connection(
+    active_generation: Option<u64>,
+    active_connection_epoch: Option<u64>,
+    state_connected: bool,
+    actor_connected: bool,
+    generation: u64,
+    connection_epoch: u64,
+) -> bool {
+    state_connected
+        && actor_connected
+        && active_generation == Some(generation)
+        && active_connection_epoch == Some(connection_epoch)
+}
+
 /// Channel for async tasks to send results back to Bevy systems.
 ///
 /// `rx` is `Mutex<UnboundedReceiver>` because tokio's receiver is Send but
@@ -255,8 +276,21 @@ pub enum AudioInventoryFetch {
 pub enum RpcResultMessage {
     /// Kernel info received after attach/reconnect.
     KernelAttached(Result<KernelInfo, String>),
-    /// Identity received.
-    IdentityReceived(Identity),
+    /// Identity received from one connected transport of an actor generation.
+    IdentityReceived {
+        generation: u64,
+        connection_epoch: u64,
+        identity: Identity,
+    },
+    /// A compose or shell submission failed after its overlay was cleared.
+    /// The UI restores the saved text through its ordinary failure message.
+    SubmitFailed {
+        text: String,
+        reason: String,
+        is_shell: bool,
+        context_id: ContextId,
+        principal_id: kaijutsu_types::PrincipalId,
+    },
     /// Context joined — membership info only. The change-feed hydration
     /// (docs/change-feed.md rules 21-26: subscribe, then `getBlocks`, then
     /// apply) travels separately on `ContextHydrationChannel` — a live
@@ -418,6 +452,7 @@ impl Plugin for ActorPlugin {
         app.insert_resource(bootstrap_channel)
             .insert_resource(RpcResultChannel::new())
             .insert_resource(ContextHydrationChannel::new())
+            .init_resource::<crate::cell::PendingIdentityTransition>()
             .insert_resource(RpcConnectionState {
                 ssh_config,
                 ..Default::default()
@@ -441,7 +476,8 @@ impl Plugin for ActorPlugin {
                 restore_context_on_message,
                 apply_theme_from_rpc,
             )
-                .chain(),
+                .chain()
+                .before(crate::cell::plugin::CellPhase::Input),
         );
         // The current-context persistence observer runs independently — it only
         // needs to see the latest `DocumentCache::active_id`.
@@ -457,7 +493,7 @@ impl Plugin for ActorPlugin {
 // drained by `view::sync::drain_context_feeds` — replacing both this system
 // and `view::sync::check_cache_staleness`.
 
-/// Re-fetch the theme/metronome/scroll config trio whenever the actor
+/// Re-fetch the authenticated identity and theme/metronome/scroll config trio whenever the actor
 /// reports a reconnect. Uses the SAME `ServerEvent::Reconnected` trigger the
 /// now-deleted `bump_sync_generation_on_reconnect` used to (see the comment
 /// just above) — the actor's one canonical "we came back from an outage"
@@ -487,12 +523,29 @@ fn refetch_config_on_reconnect(
     if !reconnected {
         return;
     }
-    log::info!("reconnect signalled — refetching theme/metronome/scroll config");
+    log::info!("reconnect signalled — refreshing identity and theme/metronome/scroll config");
     let h = actor.handle.clone();
+    let generation = actor.generation;
+    let connection_epoch = h.connection_epoch();
     let tx = result_channel.sender();
     let client_id = client_id.0.to_string();
     bevy::tasks::IoTaskPool::get()
         .spawn(async move {
+            match h.whoami().await {
+                Ok(identity) => {
+                    let _ = tx.send(RpcResultMessage::IdentityReceived {
+                        generation,
+                        connection_epoch,
+                        identity,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(RpcResultMessage::RpcError {
+                        operation: "identity refresh after reconnect".into(),
+                        error: e.to_string(),
+                    });
+                }
+            }
             // `visible_on_failure = true`: unlike cold start, a failure here
             // means we just had a live config and lost track of whether it's
             // still current — that must be visible, not a silent fallback to
@@ -632,6 +685,34 @@ async fn fetch_layered_config<F, Fut>(
 #[cfg(test)]
 mod reconnect_config_refetch_tests {
     use super::*;
+
+    #[test]
+    fn session_principal_tracks_only_a_proven_connection_identity() {
+        let principal = kaijutsu_types::PrincipalId::new();
+        let identity = Identity {
+            username: "amy".into(),
+            display_name: "Amy".into(),
+            principal_id: principal,
+        };
+        let mut session = crate::cell::SessionPrincipal::default();
+
+        assert_eq!(session.0, None, "an unconnected app must not guess an author");
+        set_session_principal(&mut session, Some(&identity));
+        assert_eq!(session.0, Some(principal));
+        set_session_principal(&mut session, None);
+        assert_eq!(session.0, None, "a disconnected app must not retain a stale principal");
+    }
+
+    #[test]
+    fn stale_actor_connection_identity_is_rejected() {
+        assert!(accepts_identity_connection(Some(3), Some(8), true, true, 3, 8));
+        assert!(!accepts_identity_connection(Some(3), Some(8), true, true, 2, 8));
+        assert!(!accepts_identity_connection(Some(3), Some(8), true, true, 3, 7));
+        assert!(!accepts_identity_connection(None, Some(8), true, true, 3, 8));
+        assert!(!accepts_identity_connection(Some(3), None, true, true, 3, 8));
+        assert!(!accepts_identity_connection(Some(3), Some(8), false, true, 3, 8));
+        assert!(!accepts_identity_connection(Some(3), Some(8), true, false, 3, 8));
+    }
 
     /// Drain every message currently buffered on an unbounded receiver
     /// without blocking — the tests below await the fetch future to
@@ -1027,10 +1108,17 @@ fn poll_bootstrap_results(
                         fetch_startup_configs(h.clone(), client_id.clone(), tx.clone(), false)
                             .await;
 
-                        // 1. whoami — now guaranteed not to be NotReady
+                        // 1. whoami — now guaranteed not to be NotReady.
+                        // Capture before await: this response belongs to this
+                        // transport, even if a later reconnect wins first.
+                        let connection_epoch = h.connection_epoch();
                         let identity = match h.whoami().await {
                             Ok(id) => {
-                                let _ = tx.send(RpcResultMessage::IdentityReceived(id.clone()));
+                                let _ = tx.send(RpcResultMessage::IdentityReceived {
+                                    generation,
+                                    connection_epoch,
+                                    identity: id.clone(),
+                                });
                                 Some(id)
                             }
                             Err(e) => {
@@ -1322,17 +1410,26 @@ fn poll_rpc_results(
 /// Update `RpcConnectionState` from connection status and RPC result messages.
 fn update_connection_state(
     mut state: ResMut<RpcConnectionState>,
+    actor: Option<Res<RpcActor>>,
+    mut session_principal: ResMut<crate::cell::SessionPrincipal>,
+    mut identity_transition: ResMut<crate::cell::PendingIdentityTransition>,
     mut status_events: MessageReader<ConnectionStatusMessage>,
     mut result_events: MessageReader<RpcResultMessage>,
+    mut submit_failures: MessageWriter<crate::cell::SubmitFailed>,
     mut error_queue: ResMut<crate::view::components::GlobalErrorQueue>,
     time: Res<Time>,
 ) {
     for ConnectionStatusMessage(status) in status_events.read() {
         match status {
             kaijutsu_client::ConnectionStatus::Idle => {
+                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
+                    identity_transition.0 = Some((previous, None));
+                }
                 state.connected = false;
                 state.reconnect_attempt = 0;
                 state.last_error = None;
+                state.identity = None;
+                set_session_principal(&mut session_principal, None);
             }
             kaijutsu_client::ConnectionStatus::Connected {
                 kernel_id,
@@ -1346,29 +1443,48 @@ fn update_connection_state(
                 state.last_error = None;
             }
             kaijutsu_client::ConnectionStatus::Connecting { attempt } => {
+                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
+                    identity_transition.0 = Some((previous, None));
+                }
                 state.connected = false;
                 state.reconnect_attempt = *attempt;
+                state.identity = None;
+                set_session_principal(&mut session_principal, None);
                 // Intentionally leave last_error in place — the cause from
                 // the previous cycle is what drives this Connecting.
             }
             kaijutsu_client::ConnectionStatus::Closing { cause } => {
+                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
+                    identity_transition.0 = Some((previous, None));
+                }
                 state.connected = false;
                 state.last_error = Some(cause.clone());
+                state.identity = None;
+                set_session_principal(&mut session_principal, None);
             }
             kaijutsu_client::ConnectionStatus::Cooldown {
                 next_attempt,
                 last_error,
                 ..
             } => {
+                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
+                    identity_transition.0 = Some((previous, None));
+                }
                 state.connected = false;
                 state.reconnect_attempt = *next_attempt;
                 state.last_error = Some(last_error.clone());
+                state.identity = None;
+                set_session_principal(&mut session_principal, None);
             }
             kaijutsu_client::ConnectionStatus::Terminal { reason } => {
+                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
+                    identity_transition.0 = Some((previous, None));
+                }
                 state.connected = false;
                 state.last_error = Some(reason.clone());
                 state.identity = None;
                 state.current_kernel = None;
+                set_session_principal(&mut session_principal, None);
             }
         }
     }
@@ -1378,8 +1494,42 @@ fn update_connection_state(
             RpcResultMessage::KernelAttached(Ok(info)) => {
                 state.current_kernel = Some(info.clone());
             }
-            RpcResultMessage::IdentityReceived(identity) => {
+            RpcResultMessage::IdentityReceived {
+                generation,
+                connection_epoch,
+                identity,
+            } => {
+                if !accepts_identity_connection(
+                    actor.as_ref().map(|actor| actor.generation),
+                    actor.as_ref().map(|actor| actor.handle.connection_epoch()),
+                    state.connected,
+                    actor.as_ref().is_some_and(|actor| {
+                        matches!(
+                            actor.handle.current_status(),
+                            kaijutsu_client::ConnectionStatus::Connected { .. }
+                        )
+                    }),
+                    *generation,
+                    *connection_epoch,
+                ) {
+                    log::warn!(
+                        "Discarding authenticated identity from stale actor connection generation={generation} epoch={connection_epoch}"
+                    );
+                    continue;
+                }
+                let previous = state.identity.as_ref().map(|prior| prior.principal_id);
+                if let Some(previous) = previous
+                    && previous != identity.principal_id
+                {
+                    identity_transition.0 = Some((previous, Some(identity.principal_id)));
+                    error_queue.push(
+                        "identity",
+                        "the authenticated identity changed; existing compose text is held for its original principal",
+                        time.elapsed_secs_f64(),
+                    );
+                }
                 state.identity = Some(identity.clone());
+                set_session_principal(&mut session_principal, Some(identity));
                 // If we got identity, the connection succeeded — mark connected.
                 // This was the original workaround for the deferred-subscription
                 // race (the one-shot ConnectionStatus::Connected fired before
@@ -1397,6 +1547,22 @@ fn update_connection_state(
             RpcResultMessage::RpcError { operation, error } => {
                 log::warn!("RPC error ({operation}): {error}");
                 error_queue.push(operation, error, time.elapsed_secs_f64());
+            }
+            RpcResultMessage::SubmitFailed {
+                text,
+                reason,
+                is_shell,
+                context_id,
+                principal_id,
+            } => {
+                error_queue.push("submit", reason.clone(), time.elapsed_secs_f64());
+                submit_failures.write(crate::cell::SubmitFailed {
+                    text: text.clone(),
+                    reason: reason.clone(),
+                    is_shell: *is_shell,
+                    context_id: *context_id,
+                    principal_id: *principal_id,
+                });
             }
             _ => {}
         }

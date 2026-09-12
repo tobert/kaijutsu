@@ -4,10 +4,15 @@
 //! `TextInputReceived` messages instead of raw keyboard events.
 
 use bevy::prelude::*;
+use tracing::Instrument;
 
 use super::Action;
 use super::events::ActionFired;
 use super::focus::FocusArea;
+
+fn submission_needs_restore(error: &kaijutsu_client::CallError) -> bool {
+    !matches!(error, kaijutsu_client::CallError::Refused(refusal) if refusal.is_pending())
+}
 
 // ============================================================================
 // FOCUS CYCLING — Tab/Shift+Tab
@@ -73,11 +78,13 @@ pub fn handle_focus_compose(
             if overlay.text.is_empty()
                 && let Some(ctx_id) = doc_cache.active_id()
                 && let Some(cached) = doc_cache.get(ctx_id)
-                && let Some(draft_text) = cached.draft_text(session_principal.0)
+                && let Some(principal_id) = session_principal.0
+                && let Some(draft_text) = cached.draft_text(principal_id)
                 && !draft_text.is_empty()
             {
                 overlay.text = draft_text.to_string();
                 overlay.cursor = overlay.text.len();
+                overlay.target_context = Some(ctx_id);
             }
 
             // Always reset vim state to Normal first — clears any stale
@@ -872,6 +879,8 @@ pub fn handle_compose_input(
     >,
     mut clipboard: Option<ResMut<super::SystemClipboard>>,
     actor: Option<Res<crate::connection::RpcActor>>,
+    rpc_results: Res<crate::connection::RpcResultChannel>,
+    session_principal: Res<crate::cell::SessionPrincipal>,
     doc_cache: Res<crate::cell::DocumentCache>,
     mut focus: ResMut<FocusArea>,
     surface: Res<super::focus::ActiveSurface>,
@@ -889,12 +898,15 @@ pub fn handle_compose_input(
         }
     };
 
-    let ctx_id = doc_cache.active_id();
+    let ctx_id = overlay.target_context.or(doc_cache.active_id());
 
     let is_shell = surface.is_shell();
 
     // Handle text insertion
     for super::events::TextInputReceived(text) in text_events.read() {
+        if overlay.target_context.is_none() {
+            overlay.target_context = doc_cache.active_id();
+        }
         let pos_before = overlay.cursor;
         overlay.insert(text);
 
@@ -922,6 +934,15 @@ pub fn handle_compose_input(
                 if !overlay.is_empty()
                     && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
                 {
+                    let Some(principal_id) = session_principal.0 else {
+                        let _ = rpc_results.sender().send(
+                            crate::connection::RpcResultMessage::RpcError {
+                                operation: "submit".into(),
+                                error: "cannot submit until the authenticated connection identity is known".into(),
+                            },
+                        );
+                        continue;
+                    };
                     let handle = actor.handle.clone();
 
                     // A local submit (shell or chat) is a strong signal of
@@ -932,21 +953,47 @@ pub fn handle_compose_input(
                     if is_shell {
                         // Shell: call shell_execute directly with local text
                         let code = overlay.text.clone();
+                        let result_tx = rpc_results.sender();
+                        let span = tracing::info_span!(
+                            "app.submit",
+                            principal.id = %principal_id,
+                            context.id = %ctx,
+                            surface = "shell",
+                        );
                         bevy::tasks::IoTaskPool::get()
                             .spawn(async move {
                                 match handle.shell_execute(&code, ctx, true).await {
                                     Ok(block_id) => {
                                         log::info!("shell_execute ok: {:?}", block_id)
                                     }
-                                    Err(e) => log::error!("shell_execute failed: {e}"),
+                                    Err(e) => {
+                                        log::error!("shell_execute failed: {e}");
+                                        let message = e.to_string();
+                                        let result = if submission_needs_restore(&e) {
+                                            crate::connection::RpcResultMessage::SubmitFailed {
+                                                text: code,
+                                                reason: message,
+                                                is_shell: true,
+                                                context_id: ctx,
+                                                principal_id,
+                                            }
+                                        } else {
+                                            crate::connection::RpcResultMessage::RpcError {
+                                                operation: "shell submit".into(),
+                                                error: message,
+                                            }
+                                        };
+                                        let _ = result_tx.send(result);
+                                    }
                                 }
-                            })
+                            }.instrument(span))
                             .detach();
 
                         // Clear shell overlay locally (no kernel involvement)
                         overlay.text.clear();
                         overlay.cursor = 0;
                         overlay.selection_anchor = None;
+                        overlay.target_context = None;
                     } else {
                         // Chat: submit_input flips the draft block's status
                         // away from Draft, turning it into a regular message
@@ -955,20 +1002,47 @@ pub fn handle_compose_input(
                         // carry that change back on the feed; clear the
                         // overlay optimistically now so the compose box
                         // doesn't sit full in the meantime.
+                        let text = overlay.text.clone();
+                        let result_tx = rpc_results.sender();
+                        let span = tracing::info_span!(
+                            "app.submit",
+                            principal.id = %principal_id,
+                            context.id = %ctx,
+                            surface = "chat",
+                        );
                         bevy::tasks::IoTaskPool::get()
                             .spawn(async move {
                                 match handle.submit_input(ctx, false).await {
                                     Ok(result) => {
                                         log::info!("submit_input ok: {:?}", result.block_id)
                                     }
-                                    Err(e) => log::error!("submit_input failed: {e}"),
+                                    Err(e) => {
+                                        log::error!("submit_input failed: {e}");
+                                        let message = e.to_string();
+                                        let result = if submission_needs_restore(&e) {
+                                            crate::connection::RpcResultMessage::SubmitFailed {
+                                                text,
+                                                reason: message,
+                                                is_shell: false,
+                                                context_id: ctx,
+                                                principal_id,
+                                            }
+                                        } else {
+                                            crate::connection::RpcResultMessage::RpcError {
+                                                operation: "chat submit".into(),
+                                                error: message,
+                                            }
+                                        };
+                                        let _ = result_tx.send(result);
+                                    }
                                 }
-                            })
+                            }.instrument(span))
                             .detach();
 
                         overlay.text.clear();
                         overlay.cursor = 0;
                         overlay.selection_anchor = None;
+                        overlay.target_context = None;
                     }
 
                     // Dismiss overlay by transitioning focus
@@ -1135,10 +1209,25 @@ fn primary_selection_text(clip: &mut arboard::Clipboard) -> Result<String, arboa
 mod tests {
     use super::{
         NavigationDirection, find_latest_error_block, handle_navigate_blocks, next_focus_index,
-        scroll_to_rect_visible,
+        scroll_to_rect_visible, submission_needs_restore,
     };
     use crate::cell::ConversationScrollState;
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Status};
+
+    #[test]
+    fn pending_refusal_is_visible_without_restoring_a_retryable_submission() {
+        let pending = kaijutsu_client::CallError::Refused(kaijutsu_types::Refusal {
+            kind: kaijutsu_types::RefusalKind::Pending,
+            reason: "review pending".into(),
+            subject: "shell".into(),
+            ask: None,
+            remedy: None,
+        });
+        let fault = kaijutsu_client::CallError::Rpc("connection reset".into());
+
+        assert!(!submission_needs_restore(&pending));
+        assert!(submission_needs_restore(&fault));
+    }
 
     /// `c` must toggle collapse with NOTHING but `EditorEntities.main_cell`
     /// set. The handler used to key off `FocusTarget.entity`, whose only
