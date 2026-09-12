@@ -48,17 +48,12 @@ has an extractive `best_sentence` that could produce one without a model.
   document order against a fast answer) or lands the summary elsewhere. Do
   not ship a slow summary source without answering this.
 
-**Open, for Amy.**
-
-- Summary source order: extractive now, model later? Lean yes; a model line
-  costs a request per thinking block and the first cut should show whether
-  a line is enough.
-- Whether the fold should also write the durable `collapsed` flag so
-  `kj block list` agrees with the screen. Lean no; the flag stays the
-  explicit toggle.
-- The fold delay. "A second or two" is the spec; whether it counts from the
-  thinking block settling or from the turn ending matters for the tui pane,
-  which is the turn's, not the block's.
+**Decided** (Amy, 2026-09-12): *"yes extractive now, model later. agreed no
+on durable flag, for now anyways. from turn end I think."* So: the summary
+is extractive in the first cut with a model source as a later swap; the fold
+never writes the durable `collapsed` flag; the app's fold delay counts from
+the turn ending, not from the block settling, which also matches the tui
+pane's lifetime.
 
 ## Async input should carry the player's edge of context (Amy, 2026-09-12)
 
