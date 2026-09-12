@@ -101,8 +101,8 @@ fn insert_ask(tx: &Transaction, request_id: &str, req: &NewAsk) -> Result<()> {
     tx.execute(
         "INSERT INTO approvals (
             request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id,
-            description, authorized_label, rc_run_id, expires_at, cwd, exec_source
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            description, authorized_label, rc_run_id, expires_at, cwd, exec_source, continuation_epoch
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             request_id,
             req.context_id,
@@ -119,6 +119,7 @@ fn insert_ask(tx: &Transaction, request_id: &str, req: &NewAsk) -> Result<()> {
             req.expires_at,
             req.cwd,
             req.exec_source,
+            req.continuation_epoch,
         ],
     )?;
 
@@ -284,7 +285,7 @@ pub fn get_approval(conn: &Connection, request_id: &str) -> Result<Option<Approv
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id, pair_owner
+                command_block_id, output_block_id, pair_owner, continuation_epoch
          FROM approvals WHERE request_id = ?1",
         params![request_id],
         row_to_approval,
@@ -328,6 +329,7 @@ pub(crate) fn row_to_approval(row: &rusqlite::Row) -> rusqlite::Result<ApprovalR
             .map(|raw| parse_enum::<PairOwner>("pair_owner", &raw))
             .transpose()
             .map_err(sql_err)?,
+        continuation_epoch: row.get(27)?,
     })
 }
 
@@ -355,7 +357,7 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ApprovalRow>> {
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id, pair_owner
+                command_block_id, output_block_id, pair_owner, continuation_epoch
          FROM approvals WHERE status = 'pending' ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -383,7 +385,7 @@ pub fn list_unresolved(conn: &Connection) -> Result<Vec<ApprovalRow>> {
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id, pair_owner
+                command_block_id, output_block_id, pair_owner, continuation_epoch
          FROM approvals WHERE status IN ('pending', 'claimed') ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], row_to_approval)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -436,7 +438,7 @@ pub fn list_unresolved_for_context(
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id, pair_owner
+                command_block_id, output_block_id, pair_owner, continuation_epoch
          FROM approvals
          WHERE status IN ('pending', 'claimed') AND context_id = ?1
          ORDER BY created_at ASC",
@@ -466,7 +468,7 @@ pub fn list_history(conn: &Connection, limit: i64) -> Result<Vec<ApprovalRow>> {
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id, pair_owner
+                command_block_id, output_block_id, pair_owner, continuation_epoch
          FROM approvals WHERE status IN ('allowed', 'denied', 'expired', 'abandoned')
          ORDER BY created_at DESC LIMIT ?1",
     )?;
@@ -539,7 +541,7 @@ pub fn list_asks_filtered(conn: &Connection, filter: &AskListFilter) -> Result<(
                 description, authorized_label, rc_run_id, status, created_at,
                 expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option,
                 remember_scope, auto_reason, cwd, exec_source,
-                command_block_id, output_block_id, pair_owner
+                command_block_id, output_block_id, pair_owner, continuation_epoch
          FROM approvals {where_clause} ORDER BY created_at {order} LIMIT ?"
     );
     let mut select_params = params;
@@ -1240,7 +1242,8 @@ mod tests {
     #[test]
     fn create_ask_round_trips_through_get_approval() {
         let conn = open_memory();
-        let ask = minimal_ask();
+        let mut ask = minimal_ask();
+        ask.continuation_epoch = Some(42);
         let request_id = create_ask(&conn, &ask).unwrap();
 
         let row = get_approval(&conn, &request_id).unwrap().expect("row must exist");
@@ -1250,6 +1253,8 @@ mod tests {
         assert_eq!(row.origin, ask.origin);
         assert_eq!(row.description, ask.description);
         assert_eq!(row.authorized_label, ask.authorized_label);
+        assert_eq!(row.continuation_epoch, Some(42));
+        assert_eq!(list_pending(&conn).unwrap()[0].continuation_epoch, Some(42));
         assert!(row.claimed_at.is_none());
         assert!(row.decided_at.is_none());
         assert!(load_ask_statements(&conn, &request_id).unwrap().is_empty());

@@ -494,6 +494,7 @@ pub struct NewAsk {
     /// ask cannot be executed on approval and its caller must retry —
     /// `docs/gate-shape-b.md`.
     pub exec_source: Option<String>,
+    pub continuation_epoch: Option<i64>,
     /// The value every free variable in `statements` held at ask time —
     /// `kj::env_snapshot::free_variable_values`'s output, ready to insert.
     /// Empty for an ask whose statements have no free variables, or whose
@@ -544,6 +545,7 @@ pub struct ApprovalRow {
     /// when it fills. `None` when no pair is linked, or for a row written
     /// before this column existed.
     pub pair_owner: Option<PairOwner>,
+    pub continuation_epoch: Option<i64>,
 }
 
 /// One `approval_options` row.

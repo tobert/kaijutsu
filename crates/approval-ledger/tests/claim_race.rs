@@ -34,6 +34,7 @@ fn minimal_ask() -> NewAsk {
         signals: vec![],
         cwd: None,
         exec_source: None,
+        continuation_epoch: None,
         env: vec![],
     }
 }

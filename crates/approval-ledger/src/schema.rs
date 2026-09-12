@@ -350,7 +350,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     -- execution on approval fills it: 'turn' (a model turn's own pair, its
     -- turn ended at the gate) or 'session' (a connected session watching its
     -- own blocks, told nothing). NULL when no pair is linked.
-    pair_owner       TEXT
+    pair_owner       TEXT,
+    continuation_epoch INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status_created
     ON approvals(status, created_at);
@@ -854,17 +855,18 @@ fn add_approvals_columns_if_missing(conn: &Connection) -> SqliteResult<()> {
         .prepare("PRAGMA table_info(approvals)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<SqliteResult<Vec<String>>>()?;
-    for column in [
-        "actor_id",
-        "reviewer_id",
-        "cwd",
-        "exec_source",
-        "command_block_id",
-        "output_block_id",
-        "pair_owner",
+    for (column, ty) in [
+        ("actor_id", "BLOB"),
+        ("reviewer_id", "BLOB"),
+        ("cwd", "TEXT"),
+        ("exec_source", "TEXT"),
+        ("command_block_id", "TEXT"),
+        ("output_block_id", "TEXT"),
+        ("pair_owner", "TEXT"),
+        ("continuation_epoch", "INTEGER"),
     ] {
         if !existing.iter().any(|name| name == column) {
-            conn.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {column} TEXT"))?;
+            conn.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {column} {ty}"))?;
         }
     }
     Ok(())
@@ -1012,11 +1014,12 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
             exec_source      TEXT,
             command_block_id TEXT,
             output_block_id  TEXT,
-            pair_owner       TEXT",
+            pair_owner       TEXT,
+            continuation_epoch INTEGER",
         columns: "request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id, description, \
             authorized_label, rc_run_id, status, created_at, expires_at, claimed_at, claimed_by, \
             decided_at, decided_by, decided_option, remember_scope, auto_reason, cwd, exec_source, \
-            command_block_id, output_block_id, pair_owner",
+            command_block_id, output_block_id, pair_owner, continuation_epoch",
     },
     ValueEnumRebuildSpec {
         table: "approval_signals",
