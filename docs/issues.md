@@ -275,6 +275,22 @@ message that knew where the player was looking"). Left:
 - Shell operation inspection currently uses bounded result/block output.
   Integrate kaish job streams and spill references for live, complete output
   retrieval without invalidating pagination offsets.
+## The approval sheet and ribbon have no dim behind them (2026-09-12)
+
+The ask sheet and ledger ribbon float over the conversation or room at full
+surrounding brightness, so they compete with the transcript instead of
+reading as a popup. A first attempt at a full-frame scrim node (a childless
+`Node` with a translucent `BackgroundColor` at a `GlobalZIndex` just under
+the panel) did not render: the entity existed at full viewport size with the
+right color, but its `ViewVisibility` stayed 0 while every content panel at a
+`GlobalZIndex` drew normally. A childless background-only UI node behaves
+differently here; the working panels all carry a child surface. Reproduce
+with `world.get_components` on the scrim entity (Visibility Inherited,
+InheritedVisibility true, ViewVisibility 0). Removed rather than shipped
+non-functional. When revisited, either give the scrim a drawn child or use
+the same surface machinery the panels use; the conversation-walls work may
+restructure this layer anyway.
+
 ## The app runs as Amy, so she cannot answer her own gated asks (2026-09-12)
 
 Verified live. A `shell_write` in the app that trips the `lfm2d-advisory`

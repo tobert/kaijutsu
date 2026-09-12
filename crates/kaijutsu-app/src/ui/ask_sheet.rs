@@ -300,6 +300,10 @@ fn who(name: &Option<String>, id: &Option<PrincipalId>) -> String {
 
 /// The fixed rows above the plan: what the ask is, who it is between, and
 /// what it says it will do.
+/// How many wrapped lines of the escalation "why" the sheet shows before
+/// it caps with a "+n more" marker (the full text is in `kj ledger show`).
+const DESCRIPTION_MAX_ROWS: usize = 4;
+
 pub fn sheet_head(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: usize) -> Vec<PanelLine> {
     let mut rows = Vec::new();
 
@@ -372,13 +376,6 @@ pub fn sheet_head(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: u
         }
     }
 
-    for text in wrap(&format!("\"{}\"", ask.description), cols, 1) {
-        rows.push(PanelLine {
-            text,
-            tone: LineTone::Row,
-        });
-    }
-
     rows
 }
 
@@ -436,6 +433,30 @@ pub fn sheet_body(ask: &AskDetail, cols: usize) -> Vec<PanelLine> {
             text: truncate(&format!("source {source}"), cols),
             tone: LineTone::Dim,
         });
+    }
+
+    // Why the gate escalated, capped: the classifier's note is useful but
+    // secondary to the plan, so it sits below it and never crowds the
+    // statement off the top. It scrolls with the rest of the body.
+    if !ask.description.is_empty() {
+        rows.push(PanelLine {
+            text: "why".to_string(),
+            tone: LineTone::Head,
+        });
+        let wrapped = wrap(&ask.description, cols, 2);
+        let shown = wrapped.len().min(DESCRIPTION_MAX_ROWS);
+        for text in wrapped.iter().take(shown) {
+            rows.push(PanelLine {
+                text: text.clone(),
+                tone: LineTone::Dim,
+            });
+        }
+        if wrapped.len() > shown {
+            rows.push(PanelLine {
+                text: format!("  \u{2026}+{} more", wrapped.len() - shown),
+                tone: LineTone::Dim,
+            });
+        }
     }
 
     rows
