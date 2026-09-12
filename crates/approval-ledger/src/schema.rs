@@ -340,6 +340,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     -- human to read. NULL means this ask cannot be executed on approval and
     -- its caller must retry instead. docs/gate-shape-b.md.
     exec_source      TEXT,
+    -- The separately supplied stdin replayed with exec_source.
+    exec_stdin       TEXT,
     -- The block pair this ask's call already authored, which an execution on
     -- approval fills in rather than authoring a second pair beside them.
     -- `BlockId::to_key()` form. NULL when the calling path had no blocks to
@@ -860,6 +862,7 @@ fn add_approvals_columns_if_missing(conn: &Connection) -> SqliteResult<()> {
         ("reviewer_id", "BLOB"),
         ("cwd", "TEXT"),
         ("exec_source", "TEXT"),
+        ("exec_stdin", "TEXT"),
         ("command_block_id", "TEXT"),
         ("output_block_id", "TEXT"),
         ("pair_owner", "TEXT"),
@@ -1012,13 +1015,14 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
             auto_reason      TEXT,
             cwd              TEXT,
             exec_source      TEXT,
+            exec_stdin       TEXT,
             command_block_id TEXT,
             output_block_id  TEXT,
             pair_owner       TEXT,
             continuation_epoch INTEGER",
         columns: "request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id, description, \
             authorized_label, rc_run_id, status, created_at, expires_at, claimed_at, claimed_by, \
-            decided_at, decided_by, decided_option, remember_scope, auto_reason, cwd, exec_source, \
+            decided_at, decided_by, decided_option, remember_scope, auto_reason, cwd, exec_source, exec_stdin, \
             command_block_id, output_block_id, pair_owner, continuation_epoch",
     },
     ValueEnumRebuildSpec {

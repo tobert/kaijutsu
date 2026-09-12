@@ -494,6 +494,8 @@ pub struct NewAsk {
     /// ask cannot be executed on approval and its caller must retry —
     /// `docs/gate-shape-b.md`.
     pub exec_source: Option<String>,
+    /// The separately supplied standard input replayed with `exec_source`.
+    pub exec_stdin: Option<String>,
     pub continuation_epoch: Option<i64>,
     /// The value every free variable in `statements` held at ask time —
     /// `kj::env_snapshot::free_variable_values`'s output, ready to insert.
@@ -538,6 +540,7 @@ pub struct ApprovalRow {
     pub auto_reason: Option<String>,
     pub cwd: Option<String>,
     pub exec_source: Option<String>,
+    pub exec_stdin: Option<String>,
     /// The block pair the call already authored, `BlockId::to_key()` form.
     pub command_block_id: Option<String>,
     pub output_block_id: Option<String>,

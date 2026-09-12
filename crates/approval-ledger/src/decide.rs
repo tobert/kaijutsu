@@ -28,7 +28,7 @@ use crate::types::{ApprovalRow, ApprovalStatus, EventKind};
 const APPROVAL_COLUMNS: &str = "request_id, context_id, actor_id, reviewer_id, principal_id, origin, instance, tool, hook_id, \
      description, authorized_label, rc_run_id, status, created_at, \
      expires_at, claimed_at, claimed_by, decided_at, decided_by, decided_option, \
-     remember_scope, auto_reason, cwd, exec_source, command_block_id, output_block_id, pair_owner, continuation_epoch";
+     remember_scope, auto_reason, cwd, exec_source, exec_stdin, command_block_id, output_block_id, pair_owner, continuation_epoch";
 
 /// Who is answering. Context is retained for the refusal audit; eligibility
 /// comes from the actor and reviewer snapshots on the ask.
