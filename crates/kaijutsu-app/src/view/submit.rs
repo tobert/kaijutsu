@@ -9,9 +9,8 @@ use crate::cell::{
 };
 use crate::view::shell_dock::ShellDockMarker;
 
-/// Restore a failed submission only when nothing newer has been typed.
-/// Returning false preserves the newer text while the global error still
-/// names the failed submission.
+/// Restore a failed submission only into an empty overlay. A newer draft
+/// keeps the failed text queued for its original principal and context.
 fn restore_failed_submission(overlay: &mut InputOverlay, text: &str) -> bool {
     if !overlay.text.is_empty() {
         return false;

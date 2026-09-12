@@ -88,6 +88,9 @@ pub struct RpcActor {
 pub struct RpcConnectionState {
     pub connected: bool,
     pub identity: Option<Identity>,
+    /// Transport that supplied `identity`. A later transport must discover
+    /// its own identity before it can author or restore local drafts.
+    identity_source: Option<IdentitySource>,
     pub current_kernel: Option<KernelInfo>,
     /// SSH config (for display and respawn)
     pub ssh_config: SshConfig,
@@ -101,6 +104,12 @@ pub struct RpcConnectionState {
     /// Survives across Reconnecting events so the dock can surface the
     /// underlying cause (e.g. SSH agent missing) instead of just spinning.
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IdentitySource {
+    generation: u64,
+    connection_epoch: u64,
 }
 
 fn set_session_principal(
@@ -122,6 +131,32 @@ fn accepts_identity_connection(
         && actor_connected
         && active_generation == Some(generation)
         && active_connection_epoch == Some(connection_epoch)
+}
+
+fn connection_status_message(
+    actor: &RpcActor,
+    status: kaijutsu_client::ConnectionStatus,
+) -> ConnectionStatusMessage {
+    ConnectionStatusMessage {
+        status,
+        source: IdentitySource {
+            generation: actor.generation,
+            connection_epoch: actor.handle.connection_epoch(),
+        },
+    }
+}
+
+fn clear_authenticated_identity(
+    state: &mut RpcConnectionState,
+    session_principal: &mut crate::cell::SessionPrincipal,
+    identity_transition: &mut crate::cell::PendingIdentityTransition,
+) {
+    if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
+        identity_transition.0 = Some((previous, None));
+    }
+    state.identity = None;
+    state.identity_source = None;
+    set_session_principal(session_principal, None);
 }
 
 /// Channel for async tasks to send results back to Bevy systems.
@@ -225,7 +260,10 @@ pub struct ServerEventMessage(pub kaijutsu_client::ServerEvent);
 
 /// Connection lifecycle events.
 #[derive(Message, Clone, Debug)]
-pub struct ConnectionStatusMessage(pub kaijutsu_client::ConnectionStatus);
+pub struct ConnectionStatusMessage {
+    status: kaijutsu_client::ConnectionStatus,
+    source: IdentitySource,
+}
 
 /// Results from state-changing async operations.
 ///
@@ -714,6 +752,54 @@ mod reconnect_config_refetch_tests {
         assert!(!accepts_identity_connection(Some(3), Some(8), true, false, 3, 8));
     }
 
+    #[test]
+    fn replacement_connected_actor_clears_identity_until_its_whoami_arrives() {
+        let amy = kaijutsu_types::PrincipalId::new();
+        let mut app = App::new();
+        app.add_message::<ConnectionStatusMessage>()
+            .add_message::<RpcResultMessage>()
+            .add_message::<crate::cell::SubmitFailed>()
+            .insert_resource(RpcConnectionState {
+                connected: true,
+                identity: Some(Identity {
+                    username: "amy".into(),
+                    display_name: "Amy".into(),
+                    principal_id: amy,
+                }),
+                identity_source: Some(IdentitySource {
+                    generation: 1,
+                    connection_epoch: 1,
+                }),
+                ..Default::default()
+            })
+            .insert_resource(crate::cell::SessionPrincipal(Some(amy)))
+            .init_resource::<crate::cell::PendingIdentityTransition>()
+            .init_resource::<crate::view::components::GlobalErrorQueue>()
+            .init_resource::<Time>()
+            .add_systems(Update, update_connection_state);
+
+        app.world_mut().write_message(ConnectionStatusMessage {
+            status: kaijutsu_client::ConnectionStatus::Connected {
+                kernel_id: kaijutsu_types::KernelId::new(),
+                context_id: None,
+                since_ms: 0,
+            },
+            source: IdentitySource {
+                generation: 2,
+                connection_epoch: 1,
+            },
+        });
+        app.update();
+
+        assert!(app.world().resource::<RpcConnectionState>().connected);
+        assert!(app.world().resource::<RpcConnectionState>().identity.is_none());
+        assert_eq!(app.world().resource::<crate::cell::SessionPrincipal>().0, None);
+        assert_eq!(
+            app.world().resource::<crate::cell::PendingIdentityTransition>().0,
+            Some((amy, None)),
+        );
+    }
+
     /// Drain every message currently buffered on an unbounded receiver
     /// without blocking — the tests below await the fetch future to
     /// completion first, so everything it sent is already queued.
@@ -1122,8 +1208,28 @@ fn poll_bootstrap_results(
                                 Some(id)
                             }
                             Err(e) => {
-                                log::warn!("Initial whoami failed: {e}");
-                                return;
+                                log::warn!("Initial whoami failed; retrying once: {e}");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                let retry_connection_epoch = h.connection_epoch();
+                                match h.whoami().await {
+                                    Ok(id) => {
+                                        let _ = tx.send(RpcResultMessage::IdentityReceived {
+                                            generation,
+                                            connection_epoch: retry_connection_epoch,
+                                            identity: id.clone(),
+                                        });
+                                        Some(id)
+                                    }
+                                    Err(retry) => {
+                                        let _ = tx.send(RpcResultMessage::RpcError {
+                                            operation: "initial identity discovery".into(),
+                                            error: format!(
+                                                "whoami failed, then retry failed: {e}; {retry}"
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                }
                             }
                         };
 
@@ -1347,7 +1453,7 @@ fn poll_connection_status(
     // Connected actor would leave the indicator stuck on its prior value.
     if actor.is_changed() {
         *receiver = Some(actor.handle.subscribe_status());
-        events.write(ConnectionStatusMessage(actor.handle.current_status()));
+        events.write(connection_status_message(&actor, actor.handle.current_status()));
         received_any = true;
     }
 
@@ -1362,10 +1468,12 @@ fn poll_connection_status(
         match rx.try_recv() {
             Ok(status) => {
                 received_any = true;
-                events.write(ConnectionStatusMessage(status));
+                events.write(connection_status_message(&actor, status));
             }
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
                 log::warn!("Connection status broadcast lagged by {n}");
+                events.write(connection_status_message(&actor, actor.handle.current_status()));
+                received_any = true;
             }
             Err(broadcast::error::TryRecvError::Empty) => {
                 break;
@@ -1376,6 +1484,11 @@ fn poll_connection_status(
                     "Actor status channel closed, removing RpcActor resource (gen {})",
                     actor.generation
                 );
+                events.write(connection_status_message(
+                    &actor,
+                    kaijutsu_client::ConnectionStatus::Idle,
+                ));
+                received_any = true;
                 commands.remove_resource::<RpcActor>();
                 *receiver = None;
                 break;
@@ -1419,23 +1532,22 @@ fn update_connection_state(
     mut error_queue: ResMut<crate::view::components::GlobalErrorQueue>,
     time: Res<Time>,
 ) {
-    for ConnectionStatusMessage(status) in status_events.read() {
+    for ConnectionStatusMessage { status, source } in status_events.read() {
         match status {
             kaijutsu_client::ConnectionStatus::Idle => {
-                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
-                    identity_transition.0 = Some((previous, None));
-                }
                 state.connected = false;
                 state.reconnect_attempt = 0;
                 state.last_error = None;
-                state.identity = None;
-                set_session_principal(&mut session_principal, None);
+                clear_authenticated_identity(&mut state, &mut session_principal, &mut identity_transition);
             }
             kaijutsu_client::ConnectionStatus::Connected {
                 kernel_id,
                 context_id,
                 since_ms: _,
             } => {
+                if state.identity.is_some() && state.identity_source != Some(*source) {
+                    clear_authenticated_identity(&mut state, &mut session_principal, &mut identity_transition);
+                }
                 state.connected = true;
                 state.reconnect_attempt = 0;
                 state.kernel_id = Some(*kernel_id);
@@ -1443,48 +1555,32 @@ fn update_connection_state(
                 state.last_error = None;
             }
             kaijutsu_client::ConnectionStatus::Connecting { attempt } => {
-                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
-                    identity_transition.0 = Some((previous, None));
-                }
                 state.connected = false;
                 state.reconnect_attempt = *attempt;
-                state.identity = None;
-                set_session_principal(&mut session_principal, None);
+                clear_authenticated_identity(&mut state, &mut session_principal, &mut identity_transition);
                 // Intentionally leave last_error in place — the cause from
                 // the previous cycle is what drives this Connecting.
             }
             kaijutsu_client::ConnectionStatus::Closing { cause } => {
-                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
-                    identity_transition.0 = Some((previous, None));
-                }
                 state.connected = false;
                 state.last_error = Some(cause.clone());
-                state.identity = None;
-                set_session_principal(&mut session_principal, None);
+                clear_authenticated_identity(&mut state, &mut session_principal, &mut identity_transition);
             }
             kaijutsu_client::ConnectionStatus::Cooldown {
                 next_attempt,
                 last_error,
                 ..
             } => {
-                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
-                    identity_transition.0 = Some((previous, None));
-                }
                 state.connected = false;
                 state.reconnect_attempt = *next_attempt;
                 state.last_error = Some(last_error.clone());
-                state.identity = None;
-                set_session_principal(&mut session_principal, None);
+                clear_authenticated_identity(&mut state, &mut session_principal, &mut identity_transition);
             }
             kaijutsu_client::ConnectionStatus::Terminal { reason } => {
-                if let Some(previous) = state.identity.as_ref().map(|identity| identity.principal_id) {
-                    identity_transition.0 = Some((previous, None));
-                }
                 state.connected = false;
                 state.last_error = Some(reason.clone());
-                state.identity = None;
                 state.current_kernel = None;
-                set_session_principal(&mut session_principal, None);
+                clear_authenticated_identity(&mut state, &mut session_principal, &mut identity_transition);
             }
         }
     }
@@ -1529,6 +1625,10 @@ fn update_connection_state(
                     );
                 }
                 state.identity = Some(identity.clone());
+                state.identity_source = Some(IdentitySource {
+                    generation: *generation,
+                    connection_epoch: *connection_epoch,
+                });
                 set_session_principal(&mut session_principal, Some(identity));
                 // If we got identity, the connection succeeded — mark connected.
                 // This was the original workaround for the deferred-subscription
