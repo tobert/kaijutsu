@@ -6,6 +6,25 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Three tests were already failing at HEAD before the summary lane (2026-09-12)
+
+Reported by the summary lane, checked against history, not re-run at a
+clean HEAD:
+
+- `crates/kaijutsu-kernel/tests/broker_e2e.rs` does not compile: two
+  `ContextRow` initializers lack `director_id`. The field landed in
+  dcb5fc8b; the test file was last touched in 6c4e5da2, before it. A
+  `cargo test -p kaijutsu-kernel` that includes integration tests fails at
+  compile; `--lib` hides it. Fix: add the field to both initializers.
+- `compose_draft_wire::chat_submit_promotes_the_draft_rather_than_copying_it`
+  fails with "default reviewer 'amy' has no character sheet". The fixture
+  predates dcb5fc8b's Amy-as-default-reviewer; it needs the sheet seeded.
+- `rpc_integration::test_context_last_activity_at_populated_after_block_op`
+  fails on a timestamp-ordering assertion, consistently off by about a
+  quarter second across three reruns under load. Likely the once-a-second
+  activity-stamp throttle from this morning (see the daily); the test
+  assumes the stamp moves on every block op.
+
 ## Thinking folds to a summary line once the player has moved on (Amy, 2026-09-12)
 
 Amy: *"I'm watching y'all work, and you're thinking, I often read/scan it
