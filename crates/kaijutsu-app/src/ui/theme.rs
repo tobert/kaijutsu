@@ -571,8 +571,8 @@ impl Default for Theme {
             // flash between boot and the theme RPC)
             bg: Color::srgb(0.075, 0.063, 0.125), // #131020
             panel_bg: Color::srgba(0.075, 0.063, 0.125, 0.95), // #131020 semi-transparent
-            fg: Color::srgb(0.847, 0.824, 0.933), // #d8d2ee
-            fg_dim: Color::srgb(0.435, 0.396, 0.573), // #6f6592
+            fg: Color::srgb(0.925, 0.910, 0.968), // #ece8f7 — lifted for text contrast (2026-09-12)
+            fg_dim: Color::srgb(0.604, 0.565, 0.741), // #9a90bd — legible secondary text (2026-09-12)
             accent: Color::srgb(0.643, 0.529, 1.000), // #a487ff
             accent2: Color::srgb(1.000, 0.812, 0.490), // #ffcf7d
             border: Color::srgb(0.239, 0.196, 0.376), // #3d3260
@@ -686,7 +686,7 @@ impl Default for Theme {
 
             // Shader effect parameters
             effect_glow_radius: 4.0,
-            effect_glow_intensity: 0.3,
+            effect_glow_intensity: 0.15,
             effect_glow_falloff: 2.0,
             effect_sheen_speed: 0.5,
             effect_sheen_sparkle_threshold: 0.95,
@@ -781,10 +781,10 @@ impl Default for Theme {
             block_border_drift: Color::srgba(0.769, 0.463, 0.882, 0.5),  // #c476e1 violet-thread
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
-            block_border_glow_radius: 10.0,
-            block_border_glow_intensity: 0.5,
+            block_border_glow_radius: 6.0,
+            block_border_glow_intensity: 0.12,
             text_glow_radius: 2.5,
-            text_glow_color: Color::srgba(0.796, 0.722, 1.000, 0.35), // #cbb8ff violet-white
+            text_glow_color: Color::srgba(0.796, 0.722, 1.000, 0.18), // #cbb8ff violet-white, thinned halo (2026-09-12)
             block_border_padding: 0.6,
             block_spacing: 12.0,
 
