@@ -860,15 +860,16 @@ failure before that call also needs a complete bootstrap retry.
 
 ## Bevy approval review has no dedicated UI (2026-09-12)
 
-The app can issue `kj ledger` commands through its shell as the authenticated
-character, but it never subscribes to ledger changes and has no pending-ask
-list or review controls. A waiting block gets a generic status label. Add a
-ledger surface through the shared action table, with the TUI's `Ctrl+A l`
-chord, the shared complete pending snapshot and `AskDetail::can_review`, and
-explicit requester/performer/reviewer detail. Recover on reconnect or stream
-lag; do not issue an RPC each frame. Context creation and review assignment
-also have no app UI: use `kj context create --as` so the performer exists
-before rc. The connected character is the director; reviewer assignment
+`connection::ledger::LedgerMirror` now holds the pending set and the last
+three decided asks, rebuilt on connect, on a stream lag, and on every ledger
+generation bump. Two consumers read it: the switchboard lamp's ask hue and
+the dock's `!n`. What is still missing is the surface: no pending-ask list,
+no review controls, and a waiting block still gets a generic status label.
+Add a ledger surface through the shared action table, with the TUI's
+`Ctrl+A l` chord, the mirror's pending snapshot and `AskDetail::can_review`,
+and explicit requester/performer/reviewer detail. Context creation and
+review assignment also have no app UI: use `kj context create --as` so the
+performer exists before rc. The connected character is the director; reviewer assignment
 follows explicit delegation or the Amy default.
 
 ## The tui and the app disagree on a few chords (2026-09-03)

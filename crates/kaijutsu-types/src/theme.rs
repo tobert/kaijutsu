@@ -420,6 +420,10 @@ pub struct SceneHuesData {
     pub neon: String,
     /// Terrace glyph rings: a paler tint of `neon`.
     pub terrace: String,
+    /// The waiting tier: a context with an approval ask pending
+    /// (`connection::ledger`). Pale cream, and allowed to sustain HDR — a
+    /// question waiting on a player must read from across the room.
+    pub ask: String,
     /// Patch-bay chord wire (normalized; HDR gain in `gains.wire`).
     pub wire: String,
     /// Circuit-board floor trace fabrics, one hue family per fabric.
@@ -456,6 +460,7 @@ impl Default for SceneHuesData {
             violet_thread: "#c476e1".into(),
             neon: "#ad95f3".into(),
             terrace: "#c4b3f9".into(),
+            ask: "#fff5c2".into(),
             wire: "#ff5f73".into(),
             trace_crimson: "#86424b".into(),
             trace_cyan: "#3f737e".into(),
@@ -607,6 +612,7 @@ mod tests {
         assert_eq!(td.font_mono, defaults.font_mono);
         assert_eq!(td.modal_backdrop, defaults.modal_backdrop);
         assert_eq!(td.block_spacing, defaults.block_spacing);
+        assert_eq!(td.scene.hues.ask, defaults.scene.hues.ask);
     }
 
     #[test]

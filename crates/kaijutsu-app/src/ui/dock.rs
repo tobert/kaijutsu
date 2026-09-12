@@ -1164,10 +1164,25 @@ mod tests {
     use super::{
         classify_connection_error, count_block_activity, format_background_activity,
         format_block_activity, format_context_usage, format_elapsed_ms, format_global_error_badge,
-        format_presence, format_token_count, hud_detached, room_slot_label,
+        format_presence, format_token_count, hints_with_asks, hud_detached, room_slot_label,
         BackgroundActivityLevel, PRESENCE_MAX_AGE,
     };
     use crate::ui::theme::Theme;
+
+    /// The hints line carries the waiting-ask count on every screen: a
+    /// player must see that the instrument is waiting on them without
+    /// opening anything.
+    #[test]
+    fn the_hints_line_leads_with_the_pending_ask_count() {
+        assert_eq!(
+            hints_with_asks("i: chat", 2),
+            "!2 \u{2502} i: chat",
+            "the count leads the line, before the keys"
+        );
+        assert_eq!(hints_with_asks("i: chat", 0), "i: chat", "no asks, no marker");
+        assert_eq!(hints_with_asks("", 3), "!3", "no separator with nothing to separate");
+        assert_eq!(hints_with_asks("", 0), "");
+    }
 
     /// The dock's presence summary is allowed to say only what a *current*
     /// feed on a *live* connection supports. Every other condition renders
@@ -1896,21 +1911,45 @@ pub fn update_contexts(
     }
 }
 
+/// The hints line with the waiting-ask marker in front: `!2 \u{2502} i: chat`
+/// for two asks pending anywhere in the kernel, and the line unchanged when
+/// none are (`connection::ledger`).
+///
+/// The marker is plain, not colored: a dock text run takes one brush
+/// (`collect_dock_text_glyphs`), so the count cannot be tinted without
+/// splitting the hints into a widget of its own. `!` is the TUI's own ask
+/// marker (`docs/tui.md`, "Asks").
+pub(crate) fn hints_with_asks(hints: &str, pending_asks: usize) -> String {
+    if pending_asks == 0 {
+        return hints.to_string();
+    }
+    if hints.is_empty() {
+        return format!("!{pending_asks}");
+    }
+    format!("!{pending_asks} \u{2502} {hints}")
+}
+
 /// Update hints widget based on FocusArea and Screen.
 ///
 /// `Screen::Room` shows one of several hint lines depending on
 /// `RoomState::zoomed` — diving never changes `Screen`.
+///
+/// The waiting-ask count rides this line on every screen
+/// ([`hints_with_asks`]), so the mirror is one more resource this system
+/// wakes for.
 pub fn update_hints(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
     room: Res<crate::view::room::RoomState>,
     prefix: Res<crate::input::prefix::PrefixState>,
+    ledger: Res<crate::connection::ledger::LedgerMirror>,
     mut dock: ResMut<DockState>,
 ) {
     if !focus_area.is_changed()
         && !screen.is_changed()
         && !room.is_changed()
         && !prefix.is_changed()
+        && !ledger.is_changed()
     {
         return;
     }
@@ -1924,8 +1963,9 @@ pub fn update_hints(
     if prefix.armed() {
         let hints = "^A: 0-9 seat \u{2502} ^A last \u{2502} q close \u{2502} \
                      w well \u{2502} ' switch \u{2502} A rename \u{2502} d detach \u{2502} h hold";
-        if dock.hints.text != hints {
-            dock.hints.text = hints.to_string();
+        let text = hints_with_asks(hints, ledger.pending_count());
+        if dock.hints.text != text {
+            dock.hints.text = text;
         }
         return;
     }
@@ -1956,8 +1996,9 @@ pub fn update_hints(
         },
     };
 
-    if dock.hints.text != hints {
-        dock.hints.text = hints.to_string();
+    let text = hints_with_asks(hints, ledger.pending_count());
+    if dock.hints.text != text {
+        dock.hints.text = text;
     }
 }
 

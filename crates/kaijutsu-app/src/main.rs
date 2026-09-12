@@ -265,6 +265,11 @@ fn main() {
         .insert_resource(connection::client_id::ClientId(client_id))
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ActorPlugin { ssh_config: ssh_config.clone() })
+        // The approval ledger's pending set, mirrored once for every
+        // renderer that shows an ask. After ActorPlugin: its systems read
+        // `RpcActor`, and the switchboard lamps and dock band both take
+        // `Res<LedgerMirror>`.
+        .add_plugins(connection::ledger::LedgerMirrorPlugin)
         // /r client shares (docs/slash-r.md): dials the kaijutsu-share
         // subsystem on (re)connect and serves any --share directories. A
         // no-op plugin when no --share flag was given.

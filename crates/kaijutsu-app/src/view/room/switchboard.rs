@@ -78,6 +78,13 @@ const FLASH_PEAK_BOOST: f32 = 1.6;
 /// as loud as a fresh one.
 const ERROR_BRIGHTNESS: f32 = 1.35;
 
+/// Steady brightness for a context with an approval ask pending — the
+/// waiting tier, above the HDR line so it blooms softly, below
+/// [`ERROR_BRIGHTNESS`] so a failure still reads louder than a question.
+/// Like the ember, it is not scaled by recency: an ask that has waited an
+/// hour is more urgent than a fresh one, not less.
+const ASK_BRIGHTNESS: f32 = 1.15;
+
 /// `Running`'s breathing modulation — the same sine shape as
 /// `assets/shaders/trace_glow.wgsl`'s mode 1, evaluated on the CPU
 /// ([`breathing_multiplier`]'s own doc has why).
@@ -255,12 +262,14 @@ impl LampSignal {
 // ── Pure: brightness/hue combination ─────────────────────────────────────────
 
 /// The full per-frame brightness combination for one lamp: a sticky error
-/// overrides everything else with a steady bright coal; otherwise recency
-/// sets the base, `Running` breathes on top of it, and an in-flight
-/// completion flash adds an on-top pop.
+/// overrides everything else with a steady bright coal; a pending approval
+/// ask (`connection::ledger`) holds the waiting tier next; otherwise recency
+/// sets the base. `Running` breathes on whichever base is in force, and an
+/// in-flight completion flash adds an on-top pop.
 pub fn lamp_brightness(
     age_secs: f32,
     running: bool,
+    asking: bool,
     sticky_error: bool,
     flash_intensity: f32,
     breath_t: f32,
@@ -269,32 +278,43 @@ pub fn lamp_brightness(
     if sticky_error {
         return ERROR_BRIGHTNESS;
     }
-    let mut b = recency_brightness(age_secs);
+    let mut b = if asking {
+        ASK_BRIGHTNESS
+    } else {
+        recency_brightness(age_secs)
+    };
     if running {
         b *= breathing_multiplier(breath_t, breath_phase);
     }
     b + flash_intensity * FLASH_PEAK_BOOST
 }
 
-/// Lamp hue for this frame: `warm` blended toward `flash_hue` by
+/// Lamp hue for this frame: the base hue blended toward `flash_hue` by
 /// `flash_intensity` (a completion pop turns gold-white, then eases back),
 /// or `error_hue` outright once `sticky_error` — a distinct saturated coal,
 /// not a tint of the warm base, so it reads across the room at a glance.
+///
+/// The base is `ask_hue` while an approval ask waits in that context
+/// (`connection::ledger`) and `warm` otherwise: waiting for a player is a
+/// state of its own, not a shade of how recently the context spoke.
 pub fn lamp_hue(
+    asking: bool,
     sticky_error: bool,
     flash_intensity: f32,
     warm: [f32; 3],
+    ask_hue: [f32; 3],
     flash_hue: [f32; 3],
     error_hue: [f32; 3],
 ) -> [f32; 3] {
     if sticky_error {
         return error_hue;
     }
+    let base = if asking { ask_hue } else { warm };
     let t = flash_intensity.clamp(0.0, 1.0);
     [
-        warm[0] + (flash_hue[0] - warm[0]) * t,
-        warm[1] + (flash_hue[1] - warm[1]) * t,
-        warm[2] + (flash_hue[2] - warm[2]) * t,
+        base[0] + (flash_hue[0] - base[0]) * t,
+        base[1] + (flash_hue[1] - base[1]) * t,
+        base[2] + (flash_hue[2] - base[2]) * t,
     ]
 }
 
@@ -463,6 +483,7 @@ pub(crate) fn ingest_switchboard_events(
 pub(crate) fn sync_switchboard_glow(
     time: Res<Time>,
     palette: Res<ScenePalette>,
+    ledger: Res<crate::connection::ledger::LedgerMirror>,
     mut state: ResMut<SwitchboardState>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     lamps: Query<(&SwitchboardLamp, &MeshMaterial3d<StandardMaterial>)>,
@@ -478,12 +499,15 @@ pub(crate) fn sync_switchboard_glow(
         .unwrap_or(0);
     let t = time.elapsed_secs();
     let warm = ScenePalette::vec3(palette.gold).to_array();
+    let ask_hue = ScenePalette::vec3(palette.ask).to_array();
 
     for (lamp, handle) in lamps.iter() {
         let Some(entry) = state.order.get(lamp.0).copied() else {
             super::set_glow(&mut mats, &handle.0, Vec3::ZERO);
             continue;
         };
+        // Read before the `signals` borrow below, which holds `state` mutably.
+        let asking = ledger.context_is_asking(entry.context_id);
         let sig = state.signals.entry(entry.context_id).or_default();
         let age_secs = now_ms.saturating_sub(entry.effective_activity_ms) as f32 / 1000.0;
         // Per-lamp phase offset so a full wall of `Running` lamps doesn't
@@ -493,12 +517,21 @@ pub(crate) fn sync_switchboard_glow(
         let brightness = super::quantize(lamp_brightness(
             age_secs,
             entry.running,
+            asking,
             sig.sticky_error,
             sig.flash_intensity(),
             t,
             phase,
         ));
-        let hue = lamp_hue(sig.sticky_error, sig.flash_intensity(), warm, FLASH_HUE, ERROR_HUE);
+        let hue = lamp_hue(
+            asking,
+            sig.sticky_error,
+            sig.flash_intensity(),
+            warm,
+            ask_hue,
+            FLASH_HUE,
+            ERROR_HUE,
+        );
         let target = Vec3::new(hue[0], hue[1], hue[2]) * brightness;
         super::set_glow(&mut mats, &handle.0, target);
     }
@@ -778,15 +811,31 @@ mod tests {
     fn sticky_error_overrides_recency_and_breathing() {
         // A very old, non-running context that's nonetheless erroring must
         // still read at the fixed error brightness, not a dim recency value.
-        let b = lamp_brightness(1.0e6, false, true, 0.0, 0.0, 0.0);
+        let b = lamp_brightness(1.0e6, false, false, true, 0.0, 0.0, 0.0);
         assert_eq!(b, ERROR_BRIGHTNESS);
     }
 
     #[test]
     fn flash_adds_on_top_of_the_base_brightness() {
-        let base = lamp_brightness(0.0, false, false, 0.0, 0.0, 0.0);
-        let flashed = lamp_brightness(0.0, false, false, 1.0, 0.0, 0.0);
+        let base = lamp_brightness(0.0, false, false, false, 0.0, 0.0, 0.0);
+        let flashed = lamp_brightness(0.0, false, false, false, 1.0, 0.0, 0.0);
         assert!(flashed > base, "a full-intensity flash must brighten the lamp");
+    }
+
+    #[test]
+    fn a_waiting_ask_sustains_its_own_tier_however_old_the_context_is() {
+        // An ask waiting on a player is not a recency signal: the lamp holds
+        // the waiting tier no matter how long ago the context last spoke.
+        let waiting = lamp_brightness(1.0e6, false, true, false, 0.0, 0.0, 0.0);
+        assert_eq!(waiting, ASK_BRIGHTNESS);
+        assert!(waiting > 1.0, "the waiting tier sustains HDR");
+        assert!(waiting < ERROR_BRIGHTNESS, "an error still reads louder than a question");
+    }
+
+    #[test]
+    fn a_sticky_error_still_outranks_a_waiting_ask() {
+        let b = lamp_brightness(0.0, false, true, true, 0.0, 0.0, 0.0);
+        assert_eq!(b, ERROR_BRIGHTNESS);
     }
 
     #[test]
@@ -797,7 +846,7 @@ mod tests {
         let base = recency_brightness(age);
         for i in 0..40 {
             let t = i as f32 * 0.25;
-            let b = lamp_brightness(age, true, false, 0.0, t, 0.0);
+            let b = lamp_brightness(age, true, false, false, 0.0, t, 0.0);
             assert!(b <= base + 1e-4, "breathing must not exceed the recency base: {b} > {base}");
             assert!(b >= base * BREATH_TROUGH - 1e-4, "breathing must not dip below its trough: {b}");
         }
@@ -806,17 +855,42 @@ mod tests {
     #[test]
     fn error_hue_is_used_regardless_of_flash_intensity() {
         let warm = [1.0, 0.78, 0.34];
-        let hue = lamp_hue(true, 1.0, warm, FLASH_HUE, ERROR_HUE);
+        let hue = lamp_hue(false, true, 1.0, warm, ASK_TEST_HUE, FLASH_HUE, ERROR_HUE);
         assert_eq!(hue, ERROR_HUE);
     }
 
     #[test]
     fn flash_hue_blends_from_warm_toward_flash_at_full_intensity() {
         let warm = [1.0, 0.78, 0.34];
-        let none = lamp_hue(false, 0.0, warm, FLASH_HUE, ERROR_HUE);
-        let full = lamp_hue(false, 1.0, warm, FLASH_HUE, ERROR_HUE);
+        let none = lamp_hue(false, false, 0.0, warm, ASK_TEST_HUE, FLASH_HUE, ERROR_HUE);
+        let full = lamp_hue(false, false, 1.0, warm, ASK_TEST_HUE, FLASH_HUE, ERROR_HUE);
         assert_eq!(none, warm, "no flash — pure warm base");
         assert_eq!(full, FLASH_HUE, "full flash — pure flash hue");
+    }
+
+    /// Stands in for `ScenePalette::ask` — the theme's pale cream, kept out
+    /// of these pure tests so they need no Bevy resource.
+    const ASK_TEST_HUE: [f32; 3] = [1.0, 0.913, 0.540];
+
+    #[test]
+    fn a_waiting_ask_replaces_the_warm_base_hue() {
+        let warm = [1.0, 0.78, 0.34];
+        let hue = lamp_hue(true, false, 0.0, warm, ASK_TEST_HUE, FLASH_HUE, ERROR_HUE);
+        assert_eq!(hue, ASK_TEST_HUE);
+    }
+
+    #[test]
+    fn a_waiting_ask_still_lets_a_completion_flash_pop() {
+        let warm = [1.0, 0.78, 0.34];
+        let hue = lamp_hue(true, false, 1.0, warm, ASK_TEST_HUE, FLASH_HUE, ERROR_HUE);
+        assert_eq!(hue, FLASH_HUE, "a flash blends from whichever base is in force");
+    }
+
+    #[test]
+    fn a_sticky_error_outranks_a_waiting_ask_in_hue_too() {
+        let warm = [1.0, 0.78, 0.34];
+        let hue = lamp_hue(true, true, 0.0, warm, ASK_TEST_HUE, FLASH_HUE, ERROR_HUE);
+        assert_eq!(hue, ERROR_HUE);
     }
 
     #[test]

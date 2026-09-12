@@ -8,6 +8,7 @@ pub mod actor_plugin;
 pub mod bootstrap;
 pub mod client_id;
 pub mod drift;
+pub mod ledger;
 pub mod peers;
 pub mod roster;
 pub mod share_dial;

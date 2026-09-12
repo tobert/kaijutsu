@@ -41,6 +41,9 @@ pub struct ScenePalette {
     pub neon: LinearRgba,
     /// Terrace glyph rings: a paler tint of `neon`.
     pub terrace: LinearRgba,
+    /// The waiting tier: a context with an approval ask pending. Pale cream,
+    /// bright enough to sustain HDR (`connection::ledger`).
+    pub ask: LinearRgba,
     /// Circuit-board floor trace fabrics.
     pub trace_crimson: LinearRgba,
     pub trace_cyan: LinearRgba,
@@ -107,6 +110,7 @@ impl ScenePalette {
             violet_thread: hue("violet_thread", &h.violet_thread, d.violet_thread),
             neon: hue("neon", &h.neon, d.neon),
             terrace: hue("terrace", &h.terrace, d.terrace),
+            ask: hue("ask", &h.ask, d.ask),
             trace_crimson: hue("trace_crimson", &h.trace_crimson, d.trace_crimson),
             trace_cyan: hue("trace_cyan", &h.trace_cyan, d.trace_cyan),
             trace_green: hue("trace_green", &h.trace_green, d.trace_green),
@@ -162,6 +166,7 @@ impl Default for ScenePalette {
             violet_thread: lin(0.550, 0.180, 0.750),
             neon: lin(0.42, 0.30, 0.90),
             terrace: lin(0.55, 0.45, 0.95),
+            ask: lin(1.00, 0.913, 0.540),
             trace_crimson: lin(0.24, 0.055, 0.070),
             trace_cyan: lin(0.050, 0.170, 0.210),
             trace_green: lin(0.100, 0.260, 0.150),
@@ -269,6 +274,7 @@ mod tests {
         close(compiled.violet_thread, parsed.violet_thread, "violet_thread");
         close(compiled.neon, parsed.neon, "neon");
         close(compiled.terrace, parsed.terrace, "terrace");
+        close(compiled.ask, parsed.ask, "ask");
         close(compiled.trace_crimson, parsed.trace_crimson, "trace_crimson");
         close(compiled.trace_cyan, parsed.trace_cyan, "trace_cyan");
         close(compiled.trace_green, parsed.trace_green, "trace_green");

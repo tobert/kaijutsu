@@ -95,6 +95,8 @@ Live-signal gains (allowed to sustain HDR because they ARE the activity tell):
 | `chord_selected` | 3.4 | selected chord idle |
 | glyph `HDR_SCALE` | 3.0 (wgsl const) | terrace glyph emissive |
 | card rim gains | 1.6–3.5 (wgsl consts) | well card status rims |
+| `ASK_BRIGHTNESS` | 1.15 (switchboard const) | lamp with an approval ask pending (hue: `scene.hues.ask`) |
+| `ERROR_BRIGHTNESS` | 1.35 (switchboard const) | lamp with a sticky error |
 
 wgsl-const gains stay consts for now (uniform-izing every shader wasn't worth
 it this pass) but they are **members of this ladder** — tune them against it,

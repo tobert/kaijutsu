@@ -188,6 +188,7 @@ violet_glass = "#55386c"   # information-violet: radiator glass
 violet_thread = "#c476e1"  # information-violet: threads/content
 neon = "#ad95f3"           # the well's electric indigo-violet
 terrace = "#c4b3f9"        # terrace glyphs: paler tint of neon
+ask = "#fff5c2"            # a context with an approval ask pending
 wire = "#ff5f73"           # patch-bay chord (HDR gain in [scene.gains])
 trace_crimson = "#86424b"  # floor trace fabrics, one hue per fabric
 trace_cyan = "#3f737e"
