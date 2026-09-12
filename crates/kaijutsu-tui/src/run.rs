@@ -256,6 +256,7 @@ async fn event_loop(
                         if app.picker.is_some() {
                             handle_picker_key(bridge, app, key, &wires.feed_tx).await?;
                         } else {
+                            let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
                             let width = terminal.size()?.width;
                             if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &wires.feed_tx, &wires.term_lock, width)
                                 .await?
@@ -263,6 +264,9 @@ async fn event_loop(
                             {
                                 suspend(terminal, &wires.term_lock)?;
                                 cursor_shape = None;
+                            }
+                            if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
+                                poll_asks = true;
                             }
                         }
                     }
@@ -327,8 +331,11 @@ async fn event_loop(
                 app.connection = Some(connection);
                 dirty = true;
             }
-            Ok(_generation) = ledger_events.recv() => {
-                poll_asks = true;
+            received = ledger_events.recv() => {
+                match received {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => poll_asks = true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                }
             }
             _ = refresh.tick() => {
                 // Single-flight: a round still running is left to finish,
@@ -350,7 +357,11 @@ async fn event_loop(
             joined = async { refresh_task.as_mut().expect("guarded by is_some").await }, if refresh_task.is_some() => {
                 refresh_task = None;
                 let refreshed = joined.context("background refresh round")?;
+                let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
                 refresh::apply(app, refreshed, &mut seen_asks);
+                if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
+                    poll_asks = true;
+                }
                 rearm_beat_wake(app, &mut beat_wake, &mut beat_tempo_bps);
                 dirty = true;
             }

@@ -277,6 +277,43 @@ mod tests {
     }
 
     #[test]
+    fn an_unshown_second_ask_survives_the_first_card_until_it_can_open() {
+        let ctx = ContextId::new();
+        let mut app = App::new("amy");
+        app.current = Some(ctx);
+        app.ask_card = Some(AskCardState { request_id: "a-1".into(), context_id: ctx, detail: detail("a-1", ctx) });
+        let mut seen = HashSet::from(["a-1".to_string()]);
+        let mut first = poll_with(&["a-1", "b-2"], vec![pending("b-2", ctx)], None);
+        first.pending_ids = HashSet::from(["a-1".to_string(), "b-2".to_string()]);
+        apply(&mut app, Refreshed { asks: Some(first), ..Default::default() }, &mut seen);
+        assert!(app.has_pending_ask(ctx));
+        assert!(!seen.contains("b-2"), "the covered ask remains eligible for a later card");
+
+        app.ask_card = None;
+        let second = AskCardState { request_id: "b-2".into(), context_id: ctx, detail: detail("b-2", ctx) };
+        apply(&mut app, Refreshed { asks: Some(poll_with(&["a-1", "b-2"], vec![pending("b-2", ctx)], Some(second))), ..Default::default() }, &mut seen);
+        assert_eq!(app.ask_card.as_ref().map(|card| card.request_id.as_str()), Some("b-2"));
+    }
+
+    #[test]
+    fn a_pending_card_refreshes_its_reviewer() {
+        let ctx = ContextId::new();
+        let before = PrincipalId::new();
+        let after = PrincipalId::new();
+        let mut app = App::new("amy");
+        app.current = Some(ctx);
+        let mut old = detail("a-1", ctx);
+        old.reviewer_id = Some(before);
+        app.ask_card = Some(AskCardState { request_id: "a-1".into(), context_id: ctx, detail: old });
+        let mut refreshed = detail("a-1", ctx);
+        refreshed.reviewer_id = Some(after);
+        let mut poll = poll_with(&["a-1"], vec![], None);
+        poll.card_refresh = Some(AskCardState { request_id: "a-1".into(), context_id: ctx, detail: refreshed });
+        apply(&mut app, Refreshed { asks: Some(poll), ..Default::default() }, &mut HashSet::from(["a-1".to_string()]));
+        assert_eq!(app.ask_card.unwrap().detail.reviewer_id, Some(after));
+    }
+
+    #[test]
     fn a_card_whose_ask_left_pending_comes_down_with_who_decided_it() {
         let ctx = ContextId::new();
         let me = PrincipalId::new();
