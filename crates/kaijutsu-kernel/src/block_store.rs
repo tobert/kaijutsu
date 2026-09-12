@@ -14,7 +14,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -89,6 +89,12 @@ pub type DbHandle = Arc<parking_lot::Mutex<KernelDb>>;
 const COMPACTION_OP_THRESHOLD: u64 = 500;
 const COMPACTION_BYTE_THRESHOLD: u64 = 1_048_576; // 1 MiB
 
+/// How often `journal_op` re-stamps a context's `last_activity_at`. Every
+/// op inside the interval rides on the previous stamp: a streamed turn is
+/// hundreds of ops a second, each stamp dirties the `contexts` page in the
+/// WAL, and the readers measure idle age in minutes.
+const ACTIVITY_STAMP_INTERVAL_MS: i64 = 1_000;
+
 /// Entry for a document in the store.
 pub struct DocumentEntry {
     /// Per-block store (each block owns its content as a plain `String`).
@@ -109,6 +115,9 @@ pub struct DocumentEntry {
     uncompacted_count: AtomicU64,
     /// Bytes appended since last compaction (for trigger check).
     uncompacted_bytes: AtomicU64,
+    /// Unix millis of the last `last_activity_at` stamp this store wrote
+    /// for the context; 0 until the first. See `ACTIVITY_STAMP_INTERVAL_MS`.
+    activity_stamped_at: AtomicI64,
 }
 
 impl DocumentEntry {
@@ -129,6 +138,7 @@ impl DocumentEntry {
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
             uncompacted_bytes: AtomicU64::new(0),
+            activity_stamped_at: AtomicI64::new(0),
         }
     }
 
@@ -155,6 +165,7 @@ impl DocumentEntry {
             next_journal_seq: AtomicU64::new(journal_seq),
             uncompacted_count: AtomicU64::new(uncompacted_count),
             uncompacted_bytes: AtomicU64::new(uncompacted_bytes),
+            activity_stamped_at: AtomicI64::new(0),
         })
     }
 
@@ -734,6 +745,7 @@ impl BlockStore {
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
             uncompacted_bytes: AtomicU64::new(0),
+            activity_stamped_at: AtomicI64::new(0),
         };
         self.documents.insert(new_id, entry);
         self.write_initial_snapshot(new_id)?;
@@ -814,6 +826,7 @@ impl BlockStore {
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
             uncompacted_bytes: AtomicU64::new(0),
+            activity_stamped_at: AtomicI64::new(0),
         };
         self.documents.insert(new_id, entry);
         self.write_initial_snapshot(new_id)?;
@@ -904,6 +917,7 @@ impl BlockStore {
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
             uncompacted_bytes: AtomicU64::new(0),
+            activity_stamped_at: AtomicI64::new(0),
         };
         self.documents.insert(new_id, entry);
         self.write_initial_snapshot(new_id)?;
@@ -1024,7 +1038,16 @@ impl BlockStore {
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
         let payload_len = payload_bytes.len() as u64;
 
-        let (seq, count, bytes) = {
+        // Stage 1 (time-well) kernel truth: this context's last_activity_at,
+        // re-stamped by mutating block ops at most once per
+        // `ACTIVITY_STAMP_INTERVAL_MS`. `now_millis()` is the SAME
+        // Unix-millis clock `created_at` is stamped with
+        // (`kaijutsu_types::now_millis`, mirrored by kernel_db's private
+        // helper of the same name/formula) - the app computes
+        // `now - last_activity_at` directly against it, so the epoch must
+        // match exactly.
+        let now = kaijutsu_types::now_millis() as i64;
+        let (seq, count, bytes, stamp) = {
             let entry = self
                 .get(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1034,7 +1057,12 @@ impl BlockStore {
                 .uncompacted_bytes
                 .fetch_add(payload_len, Ordering::SeqCst)
                 + payload_len;
-            (seq, count, bytes)
+            let stamped_at = entry.activity_stamped_at.load(Ordering::SeqCst);
+            let stamp = now - stamped_at >= ACTIVITY_STAMP_INTERVAL_MS;
+            if stamp {
+                entry.activity_stamped_at.store(now, Ordering::SeqCst);
+            }
+            (seq, count, bytes, stamp)
         };
 
         {
@@ -1045,14 +1073,10 @@ impl BlockStore {
             db_guard
                 .in_transaction(|db| {
                     db.append_op(context_id, seq as i64, &payload_bytes)?;
-                    // Stage 1 (time-well) kernel truth: stamp this context's
-                    // last_activity_at on every mutating block op.
-                    // `now_millis()` is the SAME Unix-millis clock
-                    // `created_at` is stamped with (`kaijutsu_types::now_millis`,
-                    // mirrored by kernel_db's private helper of the same
-                    // name/formula) - the app computes `now - last_activity_at`
-                    // directly against it, so the epoch must match exactly.
-                    db.touch_context_activity(context_id, kaijutsu_types::now_millis() as i64)
+                    if stamp {
+                        db.touch_context_activity(context_id, now)?;
+                    }
+                    Ok(())
                 })
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
@@ -2700,6 +2724,7 @@ impl BlockStore {
                 next_journal_seq: AtomicU64::new(max_seq as u64),
                 uncompacted_count: AtomicU64::new(replayed),
                 uncompacted_bytes: AtomicU64::new(total_bytes),
+                activity_stamped_at: AtomicI64::new(0),
             };
 
             self.documents.insert(context_id, entry);
@@ -2830,6 +2855,7 @@ impl BlockStore {
             next_journal_seq: AtomicU64::new(max_seq as u64),
             uncompacted_count: AtomicU64::new(oplog_entries.len() as u64),
             uncompacted_bytes: AtomicU64::new(total_bytes),
+            activity_stamped_at: AtomicI64::new(0),
         };
 
         vacant.insert(entry);
@@ -5243,16 +5269,38 @@ mod tests {
             "stamp {stamped} should be after created_at {created_at}"
         );
 
-        // A second mutating op (set_status) re-stamps forward.
+        // A second mutating op inside the stamp interval does not re-stamp:
+        // a streamed turn is hundreds of ops a second, and the readers
+        // measure idle age in minutes, so one contexts-page write per
+        // second is the truth they need.
         let block_id = {
             let entry = store.get(ctx).unwrap();
             entry.doc.blocks_ordered().last().unwrap().id
         };
         std::thread::sleep(std::time::Duration::from_millis(2));
+        store.set_status(ctx, &block_id, Status::Running).unwrap();
+        let row2 = db.lock().get_context(ctx).unwrap().unwrap();
+        assert_eq!(
+            row2.last_activity_at.unwrap(),
+            stamped,
+            "an op inside the stamp interval keeps the earlier stamp"
+        );
+
+        // Once the interval has elapsed the next op re-stamps forward. Age
+        // the entry's own record of its last stamp instead of sleeping.
+        store
+            .get(ctx)
+            .unwrap()
+            .activity_stamped_at
+            .fetch_sub(ACTIVITY_STAMP_INTERVAL_MS, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let t1 = kaijutsu_types::now_millis() as i64;
         store.set_status(ctx, &block_id, Status::Done).unwrap();
-        let row2 = db.lock().get_context(ctx).unwrap().unwrap();
-        assert!(row2.last_activity_at.unwrap() >= t1);
+        let row3 = db.lock().get_context(ctx).unwrap().unwrap();
+        assert!(
+            row3.last_activity_at.unwrap() >= t1,
+            "an op after the interval re-stamps forward"
+        );
     }
 
     /// A store that declares persistence (`with_db*`) but reaches a journaling
