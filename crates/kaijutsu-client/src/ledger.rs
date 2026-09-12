@@ -84,30 +84,19 @@ pub enum LedgerError {
         exit_code: i32,
         stderr: String,
     },
+    #[error("kj ledger {verb} returned malformed data: {detail}")]
+    Malformed { verb: &'static str, detail: String },
 }
 
 /// List every pending ask's request id, via `kj ledger list` run in `ctx`
 /// (the ledger is kernel-wide state, so which live context the command runs
 /// in doesn't matter).
 pub async fn list_pending(actor: &ActorHandle, ctx: ContextId) -> Result<Vec<String>, LedgerError> {
-    let result = actor
-        .execute_kj_quiet(ctx, vec!["ledger".to_string(), "list".to_string()])
-        .await?;
-    if result.exit_code != 0 {
-        return Err(LedgerError::Failed {
-            verb: "list",
-            exit_code: result.exit_code,
-            stderr: result.stderr,
-        });
-    }
-    let ids = match result.data {
-        Some(serde_json::Value::Array(items)) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    };
-    Ok(ids)
+    list_ids(actor, ctx, pending_list_args()).await
+}
+
+fn pending_list_args() -> Vec<String> {
+    vec!["--limit".to_string(), u32::MAX.to_string()]
 }
 
 /// Read one ask's context id and description via `kj ledger show`. `None`
@@ -222,7 +211,7 @@ pub async fn poll_new_asks(
 /// TUI's ledger view ANSWERED section (`docs/tui.md`, "The ledger") reads
 /// this the same way [`list_pending`] feeds PENDING.
 pub async fn list_history(actor: &ActorHandle, ctx: ContextId) -> Result<Vec<String>, LedgerError> {
-    list_ids(actor, ctx, &["--history"]).await
+    list_ids(actor, ctx, vec!["--history".to_string()]).await
 }
 
 /// Shared body of [`list_pending`] and [`list_history`]: run `kj ledger
@@ -231,10 +220,10 @@ pub async fn list_history(actor: &ActorHandle, ctx: ContextId) -> Result<Vec<Str
 async fn list_ids(
     actor: &ActorHandle,
     ctx: ContextId,
-    extra_args: &[&str],
+    extra_args: Vec<String>,
 ) -> Result<Vec<String>, LedgerError> {
     let mut argv = vec!["ledger".to_string(), "list".to_string()];
-    argv.extend(extra_args.iter().map(|s| s.to_string()));
+    argv.extend(extra_args);
     let result = actor.execute_kj_quiet(ctx, argv).await?;
     if result.exit_code != 0 {
         return Err(LedgerError::Failed {
@@ -243,14 +232,35 @@ async fn list_ids(
             stderr: result.stderr,
         });
     }
-    let ids = match result.data {
-        Some(serde_json::Value::Array(items)) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
+    decode_list_ids(result.data)
+}
+
+fn decode_list_ids(data: Option<serde_json::Value>) -> Result<Vec<String>, LedgerError> {
+    let items = match data {
+        Some(serde_json::Value::Array(items)) => items,
+        Some(_) => {
+            return Err(LedgerError::Malformed {
+                verb: "list",
+                detail: "expected an array of request ids".to_string(),
+            });
+        }
+        None => {
+            return Err(LedgerError::Malformed {
+                verb: "list",
+                detail: "missing data".to_string(),
+            });
+        }
     };
-    Ok(ids)
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(str::to_string).ok_or_else(|| LedgerError::Malformed {
+                verb: "list",
+                detail: format!("request id at index {index} is not a string"),
+            })
+        })
+        .collect()
 }
 
 /// One free variable's recorded value on an ask (`approval_env`), as `kj
@@ -596,6 +606,32 @@ mod detail_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_list_requests_every_row_explicitly() {
+        assert_eq!(pending_list_args(), vec!["--limit".to_string(), u32::MAX.to_string()]);
+    }
+
+    #[test]
+    fn decode_list_ids_keeps_more_than_the_default_page() {
+        let ids: Vec<String> = (0..25).map(|i| format!("request-{i}")).collect();
+        let data = serde_json::Value::Array(
+            ids.iter().cloned().map(serde_json::Value::String).collect(),
+        );
+
+        assert_eq!(decode_list_ids(Some(data)).expect("valid list"), ids);
+    }
+
+    #[test]
+    fn decode_list_ids_rejects_missing_or_malformed_data() {
+        for data in [
+            None,
+            Some(serde_json::json!({ "request_id": "request-1" })),
+            Some(serde_json::json!(["request-1", 42])),
+        ] {
+            assert!(matches!(decode_list_ids(data), Err(LedgerError::Malformed { .. })));
+        }
+    }
 
     #[test]
     fn diff_new_reports_ids_not_yet_seen() {
