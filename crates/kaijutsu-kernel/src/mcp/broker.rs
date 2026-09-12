@@ -2191,7 +2191,7 @@ impl Broker {
         ctx: &CallContext,
     ) -> DryRunReport {
         let reason = format!(
-            "dry run: hook `{hook_id}` would have asked a human. Nothing ran, \
+            "dry run: hook `{hook_id}` would have asked its reviewer. Nothing ran, \
              nobody was asked, and this row authorizes nothing. {description}"
         );
         let ask = self
@@ -3469,7 +3469,7 @@ enum PhaseOutcome {
     /// from both neighbours because the three answer different questions:
     /// somebody said no, the control is broken, the question is open.
     /// LLM-visible via `McpError::gate_pending`, carrying `reason` and the
-    /// `ask` naming the durable row a human answers.
+    /// `ask` naming the durable row its reviewer answers.
     GatePending {
         hook_id: HookId,
         reason: String,

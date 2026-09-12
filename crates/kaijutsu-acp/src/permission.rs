@@ -34,8 +34,8 @@
 //! there is no kernel-side one either: the gate records an ask and returns,
 //! and an unanswered ask stays answerable indefinitely
 //! (`docs/gate-resume.md`). An ask this pump offers and nobody answers is
-//! not a leak — it is the open question it looks like, cleared by a human
-//! marking it abandoned. [`REQUEST_PERMISSION_TIMEOUT`] below bounds only
+//! not a leak — it is the open question it looks like until its reviewer
+//! decides or it is explicitly abandoned. [`REQUEST_PERMISSION_TIMEOUT`] below bounds only
 //! the outgoing `session/request_permission` call, so a wedged ACP client
 //! (stdio never reads the request) cannot leave one of this pump's spawned
 //! tasks parked forever. Answering late still works; there is no deadline
@@ -43,7 +43,7 @@
 //!
 //! # Racing is fine and expected
 //!
-//! A human can answer the same ask with `kj ledger allow` from a shell
+//! A reviewer can answer the same ask with `kj ledger allow` from a shell
 //! while this pump's `session/request_permission` prompt is still on the
 //! client's screen — the ledger's `claim`+`decide` transaction makes
 //! exactly one answerer win (`approval-ledger`'s guarantee 5). The loser's
@@ -66,7 +66,6 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use kaijutsu_client::ledger::{self, AskInfo, PendingAsk};
-use kaijutsu_types::PrincipalId;
 use tokio::sync::broadcast;
 
 use crate::bridge::KernelBridge;
@@ -79,7 +78,7 @@ fn decision_failure_message(request_id: &str, verb: &str, reason: &str) -> Strin
 }
 
 fn permission_prompt_failure_message(request_id: &str, reason: &str) -> String {
-    format!("Approval prompt for {request_id} failed: {reason}; denying")
+    format!("Approval prompt for {request_id} failed: {reason}; ask remains pending")
 }
 
 fn notify_decision_failure(cx: &ConnectionTo<Client>, session_id: &SessionId, message: String) {
@@ -93,12 +92,6 @@ fn notify_decision_failure(cx: &ConnectionTo<Client>, session_id: &SessionId, me
 /// for the ledger ask itself (see module docs, "The kernel is the authority
 /// and the timeout").
 pub const REQUEST_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Whether the ask's durable reviewer assignment belongs to this connection.
-/// Missing provenance is not authority.
-fn is_assigned_reviewer(reviewer_id: Option<PrincipalId>, me: PrincipalId) -> bool {
-    reviewer_id == Some(me)
-}
 
 /// Subscribe to the kernel-wide ledger-change stream and drive the pump for
 /// the life of the connection — the `.with_spawned` task
@@ -154,13 +147,14 @@ async fn poll_ledger(
         return;
     };
 
-    let new_asks = match ledger::poll_new_asks(kernel.actor(), admin_ctx, seen).await {
-        Ok(asks) => asks,
+    let poll = match ledger::poll_new_asks(kernel.actor(), admin_ctx, seen).await {
+        Ok(poll) => poll,
         Err(e) => {
             tracing::warn!(error = %e, "kj ledger list failed; skipping this poll");
             return;
         }
     };
+    seen.retain(|id| poll.pending_ids.contains(id));
     let me = match kernel.actor().whoami().await {
         Ok(identity) => identity.principal_id,
         Err(error) => {
@@ -169,7 +163,7 @@ async fn poll_ledger(
         }
     };
 
-    for PendingAsk { request_id: id, info: ask } in new_asks {
+    for PendingAsk { request_id: id, info: ask } in poll.new_asks {
         let detail = match ledger::show_ask_detail(kernel.actor(), admin_ctx, &id).await {
             Ok(Some(detail)) => detail,
             Ok(None) => {
@@ -181,7 +175,7 @@ async fn poll_ledger(
                 continue;
             }
         };
-        if !is_assigned_reviewer(detail.reviewer_id, me) {
+        if !detail.can_review(me) {
             tracing::debug!(
                 request = %id,
                 reviewer = ?detail.reviewer_id,
@@ -234,7 +228,7 @@ async fn answer_ask(
     };
     let request = permission_request(session_id.clone(), request_id.clone(), title, options);
 
-    let allow = match tokio::time::timeout(
+    let decision = match tokio::time::timeout(
         REQUEST_PERMISSION_TIMEOUT,
         cx.send_request(request).block_task(),
     )
@@ -242,19 +236,23 @@ async fn answer_ask(
     {
         Ok(Ok(response)) => map_response(&response, &kinds),
         Ok(Err(e)) => {
-            tracing::warn!(request = %request_id, error = %e, "permission ask errored answering the client; denying");
+            tracing::warn!(request = %request_id, error = %e, "permission ask errored answering the client; leaving pending");
             notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, &e.to_string()));
-            false
+            None
         }
         Err(_) => {
             tracing::warn!(
                 request = %request_id,
                 timeout = ?REQUEST_PERMISSION_TIMEOUT,
-                "permission ask timed out waiting on the client; denying"
+                "permission ask timed out waiting on the client; leaving pending"
             );
             notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, "timed out waiting for the client"));
-            false
+            None
         }
+    };
+
+    let Some(allow) = decision else {
+        return;
     };
 
     let verb = if allow { "allow" } else { "deny" };
@@ -321,23 +319,22 @@ fn permission_request(
 /// Read a client's answer against the id→kind map [`build_options`] built
 /// for this ask. Anything this cannot place — a cancelled prompt, an
 /// unrecognised option id, or a future `PermissionOptionKind` variant the
-/// `#[non_exhaustive]` wire type gains later — is a **deny**. A permission
-/// prompt is the one place where failing open on an unparsed answer would
-/// be indefensible.
+/// `#[non_exhaustive]` wire type gains later — leaves the durable ask
+/// pending. Only an option this bridge explicitly offered records a verdict.
 fn map_response(
     response: &RequestPermissionResponse,
     kinds: &[(&'static str, PermissionOptionKind); 2],
-) -> bool {
+) -> Option<bool> {
     let RequestPermissionOutcome::Selected(selected) = &response.outcome else {
-        return false;
+        return None;
     };
     let id = selected.option_id.0.as_ref();
     match kinds.iter().find(|(k, _)| *k == id).map(|(_, kind)| kind) {
-        Some(PermissionOptionKind::AllowOnce) | Some(PermissionOptionKind::AllowAlways) => true,
+        Some(PermissionOptionKind::AllowOnce) | Some(PermissionOptionKind::AllowAlways) => Some(true),
         Some(PermissionOptionKind::RejectOnce) | Some(PermissionOptionKind::RejectAlways) => {
-            false
+            Some(false)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -376,21 +373,13 @@ mod tests {
     #[test]
     fn selecting_allow_maps_to_true() {
         let (_, kinds) = build_options();
-        assert!(map_response(&selected(OPT_ALLOW), &kinds));
+        assert_eq!(map_response(&selected(OPT_ALLOW), &kinds), Some(true));
     }
 
     #[test]
     fn selecting_deny_maps_to_false() {
         let (_, kinds) = build_options();
-        assert!(!map_response(&selected(OPT_DENY), &kinds));
-    }
-
-    #[test]
-    fn only_the_assigned_reviewer_is_offered_an_ask() {
-        let reviewer = PrincipalId::new();
-        assert!(is_assigned_reviewer(Some(reviewer), reviewer));
-        assert!(!is_assigned_reviewer(None, reviewer));
-        assert!(!is_assigned_reviewer(Some(PrincipalId::new()), reviewer));
+        assert_eq!(map_response(&selected(OPT_DENY), &kinds), Some(false));
     }
 
     #[test]
@@ -402,23 +391,23 @@ mod tests {
     }
 
     #[test]
-    fn prompt_failures_tell_the_client_that_a_deny_follows() {
+    fn prompt_failures_tell_the_client_that_the_ask_remains_pending() {
         assert_eq!(
             permission_prompt_failure_message("req-1", "timed out waiting for the client"),
-            "Approval prompt for req-1 failed: timed out waiting for the client; denying"
+            "Approval prompt for req-1 failed: timed out waiting for the client; ask remains pending"
         );
     }
 
     #[test]
-    fn a_cancelled_prompt_denies() {
+    fn a_cancelled_prompt_leaves_the_ask_pending() {
         let r = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
         let (_, kinds) = build_options();
-        assert!(!map_response(&r, &kinds));
+        assert_eq!(map_response(&r, &kinds), None);
     }
 
     #[test]
-    fn an_option_id_we_never_offered_denies_rather_than_running_it() {
+    fn an_option_id_we_never_offered_leaves_the_ask_pending() {
         let (_, kinds) = build_options();
-        assert!(!map_response(&selected("some-future-option"), &kinds));
+        assert_eq!(map_response(&selected("some-future-option"), &kinds), None);
     }
 }

@@ -143,7 +143,7 @@ impl KjDispatcher {
         };
         // Both reads fail loudly. An operator reads this line during an
         // incident, which is exactly when the database is most likely to be
-        // unhappy — and "asks waiting on a human: 0" from a failed read is
+        // unhappy — and "asks waiting on reviewers: 0" from a failed read is
         // the answer that gets someone to stop looking.
         let pending = match pending {
             Ok(p) => p,
@@ -156,7 +156,7 @@ impl KjDispatcher {
 
         // Turns and asks are counted separately, never summed: a turn is
         // bounded by machine time and will end on its own, an ask is
-        // bounded by human time and will not.
+        // bounded by reviewer action and will not.
         // The flag leads, because it changes what every other number means:
         // turns in flight on a quiesced kernel are the ones finishing, not
         // the ones starting.

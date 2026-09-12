@@ -289,7 +289,7 @@ impl McpError {
             format!("gate for {subject}")
         };
         let headline = match kind {
-            RefusalKind::Pending => format!("{who} is waiting on a human"),
+            RefusalKind::Pending => format!("{who} is waiting on its reviewer"),
             RefusalKind::GateUnavailable => format!("{who} had nothing to answer it"),
             _ if subject.is_empty() => "the approval gate refused this".to_string(),
             _ if subject == GATE_POLICY_SUBJECT => "denied by the gate policy".to_string(),
