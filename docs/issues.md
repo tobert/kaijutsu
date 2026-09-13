@@ -184,6 +184,14 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
+## The tui moves to the alternate screen (2026-09-13)
+
+Decided; slices and the mouse contract in `docs/tui.md`, "The owned
+screen". Slice 2 (the owned transcript) is the next tui work; the
+picker-on-alt-screen idea from the same morning is moot. When slice 2
+lands, delete the resize-refusal fallback, the scrollback probes and the
+harness's cursor-query answering, and rewrite "Surfaces" and "Copy mode".
+
 ## A paste into the tui's vi screen is refused (2026-09-13)
 
 Bracketed paste reaches the draft and the `:` bar (`docs/tui.md`,

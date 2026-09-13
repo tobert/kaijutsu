@@ -1327,3 +1327,26 @@ and asserts the exact rendered line is what proved `jq`, `cut`, and `kj
 block read` behave. And a `case` pattern in kaish never expands a variable,
 so the script compares with `test`.
 
+
+## The tui takes the alternate screen (2026-09-13)
+
+Two weeks on the inline viewport settled the buffer question. Amy: "I
+think I'm going to change my mind about the terminal history, and let it
+be trashed. We can build up what I want from scrolling even better." The
+costs that decided it were all one root: nothing printed into scrollback
+can be redrawn, and the terminal cannot say what it kept. A shrink left
+blank rows under the band; a slow ssh hop stalled two seconds on the
+cursor query every grow; contexts interleaved in one history; copy mode
+was a snapshot. Decision, mouse contract, buffer model, slices and the
+terminal features it unlocks are in `docs/tui.md`, "The owned screen".
+
+Lesson from the research: the mouse question is settled by not asking.
+With mouse reporting off, wezterm and vim both turn the wheel into arrow
+keys on the alternate screen, and the terminal keeps select, autocopy
+and paste with no modifier. Crush captures the mouse every frame and
+rebuilds selection inside its widgets; that is the model to avoid.
+Reports in `~/exomemory/kaijutsu/terminal-research-2026-09-13.md`.
+
+The morning's smaller fixes (picker follows the kernel, every exit
+restores the terminal, bracketed paste, the cursor-query fallback) stay:
+the first two survive the move, the last is deleted with the viewport.

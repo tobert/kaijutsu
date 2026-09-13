@@ -20,11 +20,14 @@ kaijutsu-server / kernel
 
 ## Guidance (Amy, 2026-08-30)
 
-1. **Inline viewport.** *"I tend not to like the fullscreen modes."* The
-   transcript flows into the terminal's own scrollback; the live UI is a
-   viewport at the bottom, the codex-rs / Claude Code shape. The viewport
-   grows for a dashboard and shrinks back. Only the vi editor and the diff
-   viewer take the alternate screen, the way `vim` itself does.
+1. **Inline viewport** — superseded 2026-09-13 by "The owned screen".
+   The first cut followed *"I tend not to like the fullscreen modes"*: the
+   transcript flowed into the terminal's own scrollback and the live UI
+   was a viewport at the bottom, the codex-rs / Claude Code shape, growing
+   for a dashboard and shrinking back. Two weeks of use found the costs
+   (a shrink leaves blank rows, a slow hop stalls on the cursor query,
+   nothing printed can be redrawn, contexts interleave in one history)
+   and the tui now takes the alternate screen for the whole session.
 2. **One process is the mux.** *"What if I don't really need the mux anymore
    and I can just connect on ssh and run the tui and explore contexts and even
    have some dashboard views ala the app."* Contexts are windows; the GNU
@@ -64,11 +67,159 @@ kaijutsu-server / kernel
    is read, the way `less` would be. Two things differ from tmux, named:
    the buffer is the tui's own (the context mirror, so it holds the whole
    context and search crosses all of it, not only what was printed), and
-   the mouse wheel stays the terminal's — scrollback is still where the
-   transcript lives. The tui is not run under tmux; the targets are
+   the mouse wheel stays the terminal's — since 2026-09-13 it arrives as
+   arrow keys and scrolls the tui's own transcript ("The owned screen"). The tui is not run under tmux; the targets are
    iTerm2 and the Linux terminals (Amy: *"my loyalty to wezterm is the
    scrolling with mux + claude code is so damn good, otherwise I like
    trying new terms"*), which is also the OSC 52 clipboard's target set.
+
+## The owned screen (Amy, 2026-09-13)
+
+The buffer question ("Open", below) is decided: the tui **is the mux** and
+takes the alternate screen for the whole session, owning its transcript,
+scroll and search the way vim and tmux do. Amy: *"I think I'm going to
+change my mind about the terminal history, and let it be trashed. We can
+build up what I want from scrolling even better I think. Like, some
+minimal mouse integration to grab scroll wheel and go into copy mode
+automatically, and so on."* And on timing: *"We're still pretty fresh so
+let's try to do the big moves now."* This supersedes guidance 1's inline
+viewport and the "exactly one viewport claim" rule under "Surfaces"; both
+are annotated below and their sections are rewritten as the slices land.
+
+What this buys, in the order it was felt: no cursor-position query, so no
+two-second stall on a slow hop; no band grow and shrink, so no blank rows
+after `Esc`; the transcript re-wraps on resize; a thinking fold, an
+exclusion or an edit redraws in place; copy mode stops being a snapshot;
+one transcript per context, so switching seats switches buffers (the
+per-context copy mode shelved on 2026-09-08 falls out for free); search
+and jump over the whole conversation. What it costs: after `:q` the
+conversation is not in the terminal's history. The kernel holds every
+block, so nothing is lost, but "scroll up after quitting" is gone.
+
+### The mouse stays the terminal's
+
+The tui **never enables mouse reporting** (no DECSET 1000/1002/1003).
+Amy: *"I use select with autocopy, xterm/x style, all the time in
+wezterm."* With reporting off, the terminal keeps every mouse gesture:
+select, autocopy to clipboard and PRIMARY, right-click and middle-click
+paste (which arrive as a bracketed paste), OSC 8 link clicks. None of it
+needs a modifier. With reporting on, all of that would need `Shift`
+(`bypass_mouse_reporting_modifiers`), which is Crush's model: it captures
+the mouse every frame, drag-selects inside its own widgets and copies over
+OSC 52 plus a native clipboard library (`~/src/research/crush`,
+`internal/ui/model/chat.go`, `internal/ui/common/common.go`), with no
+PRIMARY selection at all. Vim with `mouse=` off is the precedent we follow
+instead (`~/src/research/vim/src/os_unix.c`, `mch_setmouse`).
+
+**The wheel arrives as arrow keys.** On the alternate screen with
+reporting off, wezterm turns each wheel tick into arrow-key presses
+(`alternate_buffer_wheel_scroll_speed`, default 3, automatic; xterm needs
+DECSET 1007, which the tui sends; kitty and foot do it by default). Vim
+cannot tell such an `Up` from a typed one and neither can the tui, so one
+rule covers both: **`Up` at the top edge of the draft scrolls the
+transcript, `Down` at the live tail does nothing.** A one-line draft is
+the common case, so every `Up` scrolls. Inside a taller draft `Up` moves
+the cursor first, as vim does, and scrolls once it is on the first line.
+The `:` bar keeps `Up`/`Down` for its history. `Ctrl+A [` still enters
+copy mode outright, and `PageUp`/`PageDown` scroll by a screen.
+
+A later opt-in mouse mode, tmux's `mouse on`, could add click-to-select-
+block and drag-select over OSC 52. It is never the default, because it
+takes the terminal's own selection away.
+
+### Scrolling is copy mode
+
+Leaving the live tail is entering copy mode; reaching it again is leaving.
+The transcript area follows new blocks while the view is at the tail
+(Crush calls this `follow`), and stops following the moment it is
+scrolled. While scrolled, the transcript owns the keys under the existing
+copy-mode contract (vi motions, `/` and `?`, `Space` and `Enter`, `v` and
+`y`), the draft is parked and drawn dim, and `q`, `Esc`, `G` or scrolling
+past the bottom return to the tail and give the draft the keys back.
+There is no frozen snapshot: a still-streaming block grows under the
+reader, and the view keeps its place by block and line, not by row.
+
+### The buffer
+
+Amy: *"whole context, lazy seems smart, though we may have a lot of
+candidates so it should probably only keep the top ring / hot set
+loaded."* One transcript per context, rendered from that context's block
+mirror, wrapped at the current width on demand and re-wrapped on resize.
+The ACTIVE ring's contexts stay resident; the current context is always
+resident; a context outside the ring is hydrated on switch and released
+when it leaves the ring and the screen. A resident transcript holds the
+whole context, so search crosses all of it; nothing is paged from the
+kernel by scroll position in the first cut, and a cap on rendered lines
+per transcript is the first thing to add if memory says so.
+
+### What owning the screen lets us use
+
+Each of these is a terminal feature the inline design could not touch.
+None is a commitment; the ones marked *now* ride the first slice.
+
+- *now* **Alternate screen for the session** (`?1049`), taken after the
+  connection is up so a failure is a plain line, left by every exit path
+  (`restore_terminal`). Suspend leaves it and resume retakes it, vim's
+  `stoptermcap`/`starttermcap` order.
+- *now* **Alternate scroll** (`?1007`) for terminals that need it.
+- *now* **Synchronized output** (`?2026`): one `BSU`…`ESU` around each
+  frame so a full redraw never tears. Vim probes support with `DECRQM`
+  and remembers the answer; wezterm, kitty, foot and iTerm2 support it.
+- **Focus reporting** (`?1004`): pause the pulse and the spinner while
+  unfocused, and know when an ask arrived unseen. Vim maps it to
+  `FocusGained`/`FocusLost`. Wezterm's docs do not list it; verify.
+- **Window title** (OSC 0/2): the current context's label, so a wezterm
+  tab reads like a tmux window.
+- **Desktop notification** (OSC 9 / OSC 777) when an ask lands unfocused.
+- **OSC 8 hyperlinks** on paths and URLs: the terminal opens them on a
+  plain click because the mouse is still its own.
+- **Kitty keyboard protocol** (`CSI = 1;1 u`), opt-in: `Shift+Enter` for a
+  newline in insert mode, `Ctrl+I` apart from `Tab`. Wezterm ships it off
+  (`enable_kitty_keyboard`); vim requests it through `'keyprotocol'`.
+- **Images** per terminal: iTerm2 inline images in wezterm and iTerm2,
+  the kitty protocol in kitty; sixel is preliminary in wezterm. "Images"
+  below stays additive.
+- **In-band resize** (`?2048`) instead of `SIGWINCH`, where offered.
+
+### What goes
+
+`run::set_viewport_height`, `enter_terminal`'s inline viewport,
+`render::print_scrollback` and `take_settled_prints`, the `insert_before`
+path, the `printed` set on `ContextView`, the resize-refusal fallback, the
+scrollback probes in `tests/terminal_fit.rs` and the harness's cursor-
+query answering. Copy mode's freeze is promoted to the main view rather
+than deleted. The pty harness stays: it already parses the alternate
+screen.
+
+### Slices
+
+1. **Docs.** This chapter; guidance 1, the viewport claim and the buffer
+   question annotated. (This commit.)
+2. **The owned transcript.** Alternate screen for the session,
+   synchronized frames, the transcript as a scrolling view over the
+   current context's mirror with the band below it, every surface an
+   overlay, no viewport rebuilds, no cursor queries. Probes: exit
+   restores the main screen; a completed block appears above the band;
+   a resize re-wraps.
+3. **Scroll is copy mode.** `Up` at the draft's edge, `PageUp`, and
+   `Ctrl+A [` all enter it; the tail returns on `q`/`Esc`/`G`. `?1007`
+   sent. Probe: wheel-as-arrows scrolls and a typed key at the tail still
+   edits the draft.
+4. **Per-context buffers and the hot set.** Switching seats switches
+   transcripts; the ACTIVE ring stays resident.
+5. **Terminal features** from the list above, one at a time, focus and
+   title first.
+
+### Open
+
+- Whether the draft stays live while scrolled (typing snaps to the tail)
+  or is parked until `q`. Parked is the tmux answer and the first cut.
+- A wheel tick is three `Up`s: inside a tall draft the first moves the
+  cursor and the next two scroll. A burst heuristic could fix it; not
+  built until it is felt.
+- Whether `:q` should print the last screen, or a tail of the transcript,
+  onto the primary screen for the shell's history. Nothing, for now.
+- Kitty keyboard protocol: on by request or on by probe.
 
 ## Shape: the ACP bridge minus the protocol
 
@@ -114,7 +265,10 @@ grammar, and a new surface arrives in the same shape:
 - **The machinery, named** — the wire or `kj` path behind the surface
   (`shell_execute`, `subscribeLedgerEvents`, `edit_input`). A surface that
   cannot name its kernel path is not designed yet.
-- **Exactly one viewport claim**, from a closed set of three: *flows to
+- **Exactly one viewport claim** — being retired by "The owned screen":
+  every surface becomes an overlay on a screen the tui owns, and the
+  three claims below describe the inline design until slice 2 lands.
+  From a closed set of three: *flows to
   scrollback* (conversation), *grows the viewport* and shrinks on dismiss
   (picker, ledger, asks, the thinking pane), or *takes the alternate
   screen* (vi and diff only, guidance 1). There is no fourth mode. A grow
@@ -1045,4 +1199,5 @@ subsystem.
   context's alone; or (b) the tui **is the mux** and goes alternate-screen
   all the way, owning its buffer, scroll and search the way vim and tmux
   do, "but all modern like in rust". The switch path itself is one
-  function now (`switch_seat`) whichever shape wins.
+  function now (`switch_seat`) whichever shape wins. **Decided
+  2026-09-13: (b).** See "The owned screen".
