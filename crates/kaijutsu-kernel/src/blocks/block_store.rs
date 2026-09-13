@@ -1437,6 +1437,30 @@ impl BlockDocument {
     // Fork
     // =========================================================================
 
+    /// Remap a forked block's edge (see
+    /// [`kaijutsu_types::BlockSnapshot::edge_block`]) into the child context.
+    /// `edge_target_copied` says whether the block `edge_block` names was
+    /// itself copied into the fork. When it was not — excluded by a filter,
+    /// excluded by the version cutoff, deleted, or naming a block that was
+    /// never in the parent at all (the kernel does not validate
+    /// `edge_block`) — the edge is cleared rather than carried forward
+    /// pointing at nothing in the new context, and `edge_shown` is cleared
+    /// alongside it since it is meaningless without a target.
+    fn remap_edge(
+        edge_block: Option<BlockId>,
+        edge_shown: Option<u64>,
+        new_context_id: ContextId,
+        edge_target_copied: bool,
+    ) -> (Option<BlockId>, Option<u64>) {
+        match edge_block.filter(|_| edge_target_copied) {
+            Some(id) => (
+                Some(BlockId::new(new_context_id, id.principal_id, id.seq)),
+                edge_shown,
+            ),
+            None => (None, None),
+        }
+    }
+
     /// Fork the store, creating a copy with a new context ID.
     ///
     /// Each block gets a fresh copy of its current text. This is
@@ -1459,6 +1483,11 @@ impl BlockDocument {
             let new_tool_call_id = snap
                 .tool_call_id
                 .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
+            let edge_target_copied = snap
+                .edge_block
+                .is_some_and(|id| self.blocks.get(&id).is_some_and(|b| !b.is_deleted()));
+            let (new_edge_block, new_edge_shown) =
+                Self::remap_edge(snap.edge_block, snap.edge_shown, new_context_id, edge_target_copied);
 
             // Seed the forked store's seq lane for EVERY copied block's principal
             // (not just the fork principal) and advance next_tick past the copied
@@ -1474,6 +1503,8 @@ impl BlockDocument {
             remapped.id = new_id;
             remapped.parent_id = new_parent_id;
             remapped.tool_call_id = new_tool_call_id;
+            remapped.edge_block = new_edge_block;
+            remapped.edge_shown = new_edge_shown;
 
             let order_key = block.order_key().to_string();
             let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
@@ -1512,6 +1543,13 @@ impl BlockDocument {
             let new_tool_call_id = snap
                 .tool_call_id
                 .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
+            let edge_target_copied = snap.edge_block.is_some_and(|id| {
+                self.blocks
+                    .get(&id)
+                    .is_some_and(|b| !b.is_deleted() && b.header().created_at <= before_timestamp)
+            });
+            let (new_edge_block, new_edge_shown) =
+                Self::remap_edge(snap.edge_block, snap.edge_shown, new_context_id, edge_target_copied);
 
             // Seed the forked store's seq lane for EVERY copied block's principal
             // (not just the fork principal) and advance next_tick past the copied
@@ -1527,6 +1565,8 @@ impl BlockDocument {
             remapped.id = new_id;
             remapped.parent_id = new_parent_id;
             remapped.tool_call_id = new_tool_call_id;
+            remapped.edge_block = new_edge_block;
+            remapped.edge_shown = new_edge_shown;
 
             let order_key = block.order_key().to_string();
             let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
@@ -1592,6 +1632,9 @@ impl BlockDocument {
                 .tool_call_id
                 .filter(|tool_call_id| passing_ids.contains(tool_call_id))
                 .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
+            let edge_target_copied = snap.edge_block.is_some_and(|id| passing_ids.contains(&id));
+            let (new_edge_block, new_edge_shown) =
+                Self::remap_edge(snap.edge_block, snap.edge_shown, new_context_id, edge_target_copied);
 
             // Seed the forked store's seq lane for EVERY copied block's principal
             // (not just the fork principal) and advance next_tick past the copied
@@ -1607,6 +1650,8 @@ impl BlockDocument {
             remapped.id = new_id;
             remapped.parent_id = new_parent_id;
             remapped.tool_call_id = new_tool_call_id;
+            remapped.edge_block = new_edge_block;
+            remapped.edge_shown = new_edge_shown;
 
             let order_key = block.order_key().to_string();
             let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
@@ -2732,6 +2777,86 @@ mod tests {
         assert_eq!(blocks[1].id.context_id, fork_ctx);
         // Authorship preserved
         assert_eq!(blocks[0].id.principal_id, original_agent);
+    }
+
+    #[test]
+    fn fork_remaps_edge_to_forked_copy() {
+        let mut original = test_store();
+
+        let user_msg = original
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello Claude!",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let model_response = original
+            .insert_block(
+                Some(&user_msg),
+                Some(&user_msg),
+                Role::Model,
+                BlockKind::Text,
+                "Hi Amy!",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        original
+            .set_edge(
+                &model_response,
+                Some(InputEdge { block: user_msg, shown: Some(5) }),
+            )
+            .unwrap();
+
+        let fork_ctx = ContextId::new();
+        let forked = original.fork(fork_ctx, PrincipalId::new());
+        let remapped = |id: BlockId| BlockId::new(fork_ctx, id.principal_id, id.seq);
+
+        let snap = forked.get_block_snapshot(&remapped(model_response)).unwrap();
+        assert_eq!(
+            snap.edge_block,
+            Some(remapped(user_msg)),
+            "a copied edge target must remap into the forked context"
+        );
+        assert_eq!(snap.edge_shown, Some(5), "edge_shown stays meaningful under the remap");
+    }
+
+    #[test]
+    fn fork_clears_an_edge_naming_a_block_never_in_the_parent() {
+        let mut original = test_store();
+
+        let user_msg = original
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello Claude!",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        // The kernel does not validate `edge_block` (see `set_edge`); point it at
+        // a block id that was never inserted anywhere in the parent.
+        let phantom = BlockId::new(original.context_id(), PrincipalId::new(), 99);
+        original
+            .set_edge(&user_msg, Some(InputEdge { block: phantom, shown: Some(2) }))
+            .unwrap();
+
+        let fork_ctx = ContextId::new();
+        let forked = original.fork(fork_ctx, PrincipalId::new());
+        let remapped = BlockId::new(fork_ctx, user_msg.principal_id, user_msg.seq);
+
+        let snap = forked.get_block_snapshot(&remapped).unwrap();
+        assert_eq!(
+            snap.edge_block, None,
+            "an edge naming nothing in the parent must not survive a fork"
+        );
+        assert_eq!(snap.edge_shown, None, "edge_shown is meaningless once the edge is cleared");
     }
 
     #[test]
@@ -4040,6 +4165,96 @@ mod tests {
         let live_result = forked.get_block_snapshot(&remapped(retained_result)).unwrap();
         assert_eq!(live_result.parent_id, Some(remapped(retained_call)));
         assert_eq!(live_result.tool_call_id, Some(remapped(retained_call)));
+    }
+
+    #[test]
+    fn fork_filtered_remaps_surviving_edge_and_clears_omitted_edge() {
+        let mut store = test_store();
+        let root = store
+            .insert_block(None, None, Role::User, BlockKind::Text, "root", Status::Done, ContentType::Plain)
+            .unwrap();
+        let dropped = store
+            .insert_block(
+                Some(&root),
+                Some(&root),
+                Role::Model,
+                BlockKind::Text,
+                "dropped",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let retained = store
+            .insert_block(
+                Some(&root),
+                Some(&root),
+                Role::User,
+                BlockKind::Text,
+                "retained",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let with_surviving_edge = store
+            .insert_block(
+                Some(&retained),
+                Some(&retained),
+                Role::Model,
+                BlockKind::Text,
+                "surviving edge",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let with_omitted_edge = store
+            .insert_block(
+                Some(&retained),
+                Some(&with_surviving_edge),
+                Role::Model,
+                BlockKind::Text,
+                "omitted edge",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        store
+            .set_edge(
+                &with_surviving_edge,
+                Some(InputEdge { block: retained, shown: Some(4) }),
+            )
+            .unwrap();
+        store
+            .set_edge(
+                &with_omitted_edge,
+                Some(InputEdge { block: dropped, shown: Some(9) }),
+            )
+            .unwrap();
+
+        let mut filter = ForkBlockFilter::default();
+        filter.exclude_block_ids.insert(dropped.to_key());
+
+        let new_ctx = ContextId::new();
+        let forked = store.fork_filtered(new_ctx, PrincipalId::new(), u64::MAX, &filter);
+        let remapped = |id: BlockId| BlockId::new(new_ctx, id.principal_id, id.seq);
+
+        let surviving = forked.get_block_snapshot(&remapped(with_surviving_edge)).unwrap();
+        assert_eq!(
+            surviving.edge_block,
+            Some(remapped(retained)),
+            "a surviving edge target remaps into the child"
+        );
+        assert_eq!(surviving.edge_shown, Some(4), "edge_shown stays meaningful under the remap");
+
+        let omitted = forked.get_block_snapshot(&remapped(with_omitted_edge)).unwrap();
+        assert_eq!(
+            omitted.edge_block, None,
+            "an edge naming an omitted block must not survive fork_filtered"
+        );
+        assert_eq!(
+            omitted.edge_shown, None,
+            "edge_shown is cleared alongside the omitted edge"
+        );
     }
 
     #[test]
