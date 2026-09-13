@@ -100,6 +100,19 @@ message that knew where the player was looking"). Left:
   it refetches. Nothing reads a stored edge from a mirror yet. From the
   kaibo review (deepseek, 2026-09-13).
 
+## `kj context create --model` did not land on the row (2026-09-13)
+
+Observed live: `kj context create edge-probe --type default --as banto
+--model deepseek/deepseek-v4-flash`, executed through an allowed approval
+ask (the ledger's `exec_source` carries the full flag), produced a context
+with `provider`/`model` null and `resolved_model` at the default; a later
+`kj context set edge-probe --model deepseek/deepseek-v4-flash` stored it.
+`context_create` does call `apply_context_config` with the resolved model
+(`kj/context.rs`), so the loss is somewhere between the approval-executed
+argv and that call, or in the `--as` path. Reproduce in a kernel unit test
+with `--as` plus `--model` before fixing; the existing create tests never
+combine the two.
+
 ## Async completion recovery follow-ups
 
 - Completion during a model's final inference can reach the durable mailbox
