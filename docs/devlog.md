@@ -1350,3 +1350,12 @@ Reports in `~/exomemory/kaijutsu/terminal-research-2026-09-13.md`.
 The morning's smaller fixes (picker follows the kernel, every exit
 restores the terminal, bracketed paste, the cursor-query fallback) stay:
 the first two survive the move, the last is deleted with the viewport.
+
+All five slices landed the same day (998cd3c8, f5cd5dae, 56101212,
+66dea65c), each as an Opus lane with no git authority, a Sonnet docs
+pass, and a kaibo review whose findings went red-first into the same
+commit. Two lessons. A guard the harness can count beats a guard it
+cannot see: the zero-cursor-query probe caught `Terminal::clear` asking
+on every resume, which no reading found. And the crusoe cast timed out
+on transport twice mid-afternoon; the deepseek cast carried the last
+three reviews without a miss.
