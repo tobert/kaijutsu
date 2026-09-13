@@ -605,7 +605,10 @@ impl McpServerLike for BlockToolsServer {
                                 continue;
                             }
 
-                            let summary = if snapshot.content.chars().count() > 100 {
+                            // `preview` is a content truncation; `summary` is
+                            // the kernel-derived line a settled Thinking
+                            // block carries, null when there is none.
+                            let preview = if snapshot.content.chars().count() > 100 {
                                 let truncated: String = snapshot.content.chars().take(100).collect();
                                 format!("{}... ({} lines)", truncated, line_count(&snapshot.content))
                             } else {
@@ -618,7 +621,8 @@ impl McpServerLike for BlockToolsServer {
                                 "role": format!("{:?}", snapshot.role).to_lowercase(),
                                 "kind": format!("{:?}", snapshot.kind).to_lowercase(),
                                 "status": format!("{:?}", snapshot.status).to_lowercase(),
-                                "summary": summary,
+                                "preview": preview,
+                                "summary": snapshot.summary,
                                 "version": entry.version(),
                             }));
                         }
@@ -1427,21 +1431,29 @@ mod tests {
         assert_eq!(matches.len(), 2); // apple and apricot
     }
 
+    /// `summary` is the kernel-derived line a settled Thinking block carries
+    /// (`BlockSnapshot::summary`), or null before one exists; the content
+    /// truncation is `preview`. The two must not share a name: a model that
+    /// reads `summary` should get the same line every other surface shows.
     #[tokio::test]
     async fn test_block_list() {
         let (broker, ctx, _db, store) = setup().await;
 
-        store
+        let long = "The first sentence carries the point. ".repeat(6);
+        let block_id = store
             .insert_block(
                 ctx.context_id,
                 None,
                 None,
                 Role::Model,
                 BlockKind::Thinking,
-                "thinking...",
+                &long,
                 Status::Done,
                 ContentType::Plain,
             )
+            .unwrap();
+        store
+            .set_summary(ctx.context_id, &block_id, "The first sentence carries the point.".into())
             .unwrap();
 
         let res = call(
@@ -1456,6 +1468,38 @@ mod tests {
         assert!(!res.is_error);
         let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
         assert_eq!(response["count"], 1);
+        let block = &response["blocks"][0];
+        assert_eq!(block["summary"], "The first sentence carries the point.");
+        let preview = block["preview"].as_str().expect("preview is the content truncation");
+        assert!(preview.starts_with("The first sentence carries the point. The first"));
+        assert!(preview.ends_with("... (1 lines)"), "preview: {preview}");
+    }
+
+    /// A block with no kernel summary lists `summary` as null, never as a
+    /// truncation standing in for one.
+    #[tokio::test]
+    async fn block_list_summary_is_null_without_a_kernel_summary() {
+        let (broker, ctx, _db, store) = setup().await;
+
+        store
+            .insert_block(
+                ctx.context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let res = call(&broker, &ctx, "block_list", serde_json::json!({ "kind": "text" })).await;
+        assert!(!res.is_error);
+        let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        assert_eq!(response["count"], 1);
+        assert!(response["blocks"][0]["summary"].is_null());
+        assert_eq!(response["blocks"][0]["preview"], "hello");
     }
 
     /// A filter this tool cannot parse must fail the call, never widen the

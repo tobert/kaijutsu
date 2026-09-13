@@ -6,20 +6,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Two tests were already failing at HEAD before the summary lane (2026-09-12)
-
-Reported by the summary lane, checked against history, not re-run at a
-clean HEAD:
-
-- `compose_draft_wire::chat_submit_promotes_the_draft_rather_than_copying_it`
-  fails with "default reviewer 'amy' has no character sheet". The fixture
-  predates dcb5fc8b's Amy-as-default-reviewer; it needs the sheet seeded.
-- `rpc_integration::test_context_last_activity_at_populated_after_block_op`
-  fails on a timestamp-ordering assertion, consistently off by about a
-  quarter second across three reruns under load. Likely the once-a-second
-  activity-stamp throttle from this morning (see the daily); the test
-  assumes the stamp moves on every block op.
-
 ## Thinking folds to a summary line once the player has moved on (Amy, 2026-09-12)
 
 Amy: *"I'm watching y'all work, and you're thinking, I often read/scan it
@@ -28,12 +14,6 @@ it but keep *something* visible. so I want it to collapse in the app on
 hydrate or a second or two after the thinking ends and I've likely moved on.
 I think in the tui, the thinking preview thing would collapse to the
 summarized line on the terminal history."*
-
-**Nit from the kaibo review (deepseek, 2026-09-12):** the MCP `block_list`
-tool emits a `"summary"` key that is a truncation of the block's content
-(`crates/kaijutsu-kernel/src/mcp/servers/block.rs`), not this field. A
-model reading it never sees the kernel summary, and the name now collides.
-Rename that key to `preview` or carry the real summary; not done yet.
 
 **Shipped 2026-09-12, kernel/wire/tui half.** `kaijutsu_types::summarize_thinking`
 (sentence boundary needs trailing whitespace, 120-char cap, markdown
@@ -146,9 +126,11 @@ is rc, so every experiment is a script edit and no kernel change.
   we?"*). A number the model can cite needs the hydrated conversation to
   carry visible ordinals, a prompt-composition change with its own costs:
   ordinals shift when history is edited or excluded, and every shift moves
-  the cache breakpoints. Lean: start with the excerpt, which costs nothing on
-  the prompt side and is enough to locate the spot; add ordinals only if
-  excerpts prove ambiguous (two blocks sharing a first line).
+  the cache breakpoints. **Decided** (Amy, 2026-09-13): *"agreed on the
+  ordinals, it would be difficult to do well. the block id you suggest
+  should be sufficient, an rc script can decide what to do with it (make up
+  an ordinal that's good enough, give a rough %, etc.)"* The kernel carries
+  the block id only; no visible ordinals in hydration.
 - Enter or compose-start. Amy said Enter. A long draft typed across a minute
   of streaming may want the earlier point, and the client knows both. Start
   with Enter; record compose-start only if it turns out to matter.
