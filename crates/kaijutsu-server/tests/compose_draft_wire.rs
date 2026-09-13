@@ -24,7 +24,7 @@ use kaijutsu_client::{
     ContextMirror, FeedEvent, KernelHandle, RpcClient, context_feed_channel,
 };
 use kaijutsu_types::ContextId;
-use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, Status};
+use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, ContentType, InputEdge, Role, Status};
 
 /// Every block in the context, in document order.
 async fn blocks(kernel: &KernelHandle, context_id: ContextId) -> Vec<BlockSnapshot> {
@@ -174,6 +174,95 @@ fn chat_submit_stores_the_players_edge_on_the_promoted_block() {
             submitted.edge_shown,
             Some(12),
             "the edge carries how much of that block was shown"
+        );
+    });
+}
+
+/// **The submit rc verb.** After the draft is promoted, the kernel fires
+/// `submit` for the context's type with the submit facts as `KJ_*`
+/// variables, awaited inline: whatever the script writes is durable in the
+/// log, after the user block, before `submitInput` returns.
+#[test]
+fn chat_submit_fires_the_submit_verb_with_the_edge_facts() {
+    run_local(async {
+        use kaijutsu_kernel::VfsOps;
+
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        // The script is planted before the context exists; the lifecycle
+        // reads the directory when it fires, not when the context is made.
+        live_kernel
+            .kernel
+            .vfs()
+            .write_all(
+                std::path::Path::new("/config/rc/default/submit/S10-facts.kai"),
+                b"set -e\nkj block create --role system --kind notification --content \"input=$KJ_INPUT_BLOCK edge=$KJ_EDGE_BLOCK shown=$KJ_EDGE_SHOWN tail=$KJ_LOG_TAIL live=$KJ_TURN_LIVE\"\n",
+            )
+            .await
+            .expect("plant the submit script");
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-submit-verb").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        // Two settled blocks, inserted directly so no mock turn runs and
+        // moves the tail: the player's edge is the older one, the log tail
+        // is the newer one.
+        let settled = |content: &str| {
+            live_kernel
+                .documents
+                .insert_block(
+                    context_id,
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    content,
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .expect("insert a settled block")
+        };
+        let first = settled("first");
+        let second = settled("second");
+
+        kernel.edit_input(context_id, 0, "third", 0).await.unwrap();
+        let edge = InputEdge { block: first, shown: Some(3) };
+        let third = kernel
+            .submit_input_with_edge(context_id, false, Some(edge))
+            .await
+            .unwrap()
+            .block_id;
+
+        // Read synchronously after the call returns: the script's block must
+        // already be durable, and it must sit after the user block.
+        let all = blocks(&kernel, context_id).await;
+        let expected = format!(
+            "input={} edge={} shown=3 tail={} live=",
+            third.to_key(),
+            first.to_key(),
+            second.to_key(),
+        );
+        let facts = all
+            .iter()
+            .position(|b| b.kind == BlockKind::Notification && b.content.starts_with(&expected))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no notification starting with {expected:?}; notifications: {:?}",
+                    all.iter()
+                        .filter(|b| b.kind == BlockKind::Notification)
+                        .map(|b| b.content.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        let user = all
+            .iter()
+            .position(|b| b.id == third)
+            .expect("the submitted block is in the log");
+        assert!(facts > user, "the script's block lands after the user block");
+        let live = all[facts].content.rsplit("live=").next().unwrap();
+        assert!(
+            live == "true" || live == "false",
+            "KJ_TURN_LIVE is a bool, got {live:?}"
         );
     });
 }

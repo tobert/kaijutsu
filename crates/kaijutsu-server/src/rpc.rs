@@ -7619,9 +7619,55 @@ impl kernel::Server for KernelImpl {
                         .submit_draft(context_id, user_principal_id, edge)
                         .map_err(|e| capnp::Error::failed(format!("submit: {}", e)))?;
 
+                    let session_id = connection.borrow().session_id;
+
+                    // Fire the `submit` rc verb with the submit facts, awaited
+                    // inline so whatever a script writes is durable before
+                    // the reply and before the turn below hydrates. Turn
+                    // liveness is read here, before `spawn_llm_for_prompt`
+                    // marks this submit's own turn. A script failure is an
+                    // Error block in the context, not a refused submit.
+                    let submit_info = kaijutsu_kernel::kj::lifecycle::SubmitInfo {
+                        input_block: user_block_id,
+                        edge_block: edge.map(|e| e.block),
+                        edge_shown: edge.and_then(|e| e.shown),
+                        log_tail: documents
+                            .block_snapshots(context_id)
+                            .map_err(|e| capnp::Error::failed(format!("submit: {}", e)))?
+                            .iter()
+                            .rev()
+                            .find(|b| b.id != user_block_id && !b.ephemeral)
+                            .map(|b| b.id),
+                        turn_live: kernel.kernel.turn_in_flight(context_id),
+                    };
+                    let rc_caller = kaijutsu_kernel::KjCaller {
+                        principal_id: user_principal_id,
+                        actor_id: user_principal_id,
+                        reviewer_id: None,
+                        context_id: Some(context_id),
+                        session_id,
+                        confirmed: false,
+                        rc_depth: 0,
+                        privileged: false,
+                    };
+                    if let Err(e) = kernel
+                        .kj_dispatcher
+                        .run_rc_lifecycle_with_vars(
+                            kaijutsu_kernel::kj::lifecycle::VERB_SUBMIT,
+                            context_id,
+                            None,
+                            None,
+                            None,
+                            &submit_info.vars(),
+                            &rc_caller,
+                        )
+                        .await
+                    {
+                        log::warn!("rc submit lifecycle for {}: {e}", context_id.short());
+                    }
+
                     // Build ToolContext from connection state; cwd is durable
                     // context-scoped state (L1).
-                    let session_id = connection.borrow().session_id;
                     let tool_ctx = match context_cwd(&kernel, context_id) {
                         Some(cwd) => kaijutsu_kernel::ExecContext::new(
                             user_principal_id,
