@@ -74,7 +74,8 @@ pub struct DriftInfo {
     pub source_model: Option<String>,
 }
 
-/// The facts a chat submit hands its rc scripts. See docs/prompts.md, /// "The submit verb".
+/// The facts a chat submit hands its rc scripts. See docs/prompts.md,
+/// "The submit verb".
 #[derive(Clone, Debug)]
 pub struct SubmitInfo {
     /// The user block the draft became.

@@ -257,7 +257,8 @@ impl KernelBridge {
 
     /// Submit the draft as a chat turn. The kernel snapshots it into a block
     /// and clears the draft. `edge` is the newest block the player had shown
-    /// when they pressed Enter (`ContextView::edge`, `docs/prompts.md`, /// "The submit verb"); `None`
+    /// when they pressed Enter (`ContextView::edge`, `docs/prompts.md`,
+    /// "The submit verb"); `None`
     /// when the caller cannot say.
     pub async fn submit_input(&self, context_id: ContextId, edge: Option<InputEdge>) -> Result<BlockId> {
         let result = self

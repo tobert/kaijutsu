@@ -242,7 +242,8 @@ struct BlockSnapshot {
   # contentType/taskStatus. Display only: never fed back into hydration.
   summary @45 :Text;
 
-  # The player's edge at submit time (docs/prompts.md, "The submit verb"): the newest block a client had
+  # The player's edge at submit time (docs/prompts.md, "The submit verb"):
+  # the newest block a client had
   # shown, and how much of it if it was still streaming. Set on a user block
   # promoted from a draft that carried an edge; absent otherwise.
   edgeBlockId @46 :BlockId;
