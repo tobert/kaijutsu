@@ -199,8 +199,8 @@ pub struct StatusModel {
     /// Pending asks across every context. Rendered `!n`.
     pub pending_asks: usize,
     pub connection: Option<ConnectionStatus>,
-    /// A notice replaces the seat list until the next keystroke — the
-    /// scrollback-staleness channel (`docs/tui.md`, "Conversation").
+    /// A notice replaces the seat list until the next keystroke — where a
+    /// surface says what it could not do (`docs/tui.md`, "Status line").
     pub notice: Option<String>,
     /// `bar.beat` + pulse for the playing track (`docs/tui.md`, "TRACKS +
     /// beat" / "Status line"). `None` when nothing is playing.

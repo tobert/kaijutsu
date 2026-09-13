@@ -1,40 +1,39 @@
 //! The renderer, generic over `ratatui::Backend`.
 //!
-//! The transcript is `insert_before` output: a block that completes is
-//! printed into the terminal's own scrollback as styled lines and never
-//! touched again. The viewport holds what is live — streaming blocks, the
-//! compose line, the status line. Scrolling, search and copy are the
-//! terminal's (`docs/tui.md`, "Conversation").
+//! The tui owns the screen for the session (`docs/tui.md`, "The owned
+//! screen"). One frame is the transcript — a view over the current
+//! context's blocks, wrapped at the current width and redrawn every frame —
+//! the band under it, and an overlay between the two while one is open.
 //!
 //! Nothing here reaches the kernel, and the only clock it reads is the one a
 //! caller passes in as `now_millis`. That is what lets a `TestBackend` render
 //! the same frames a real terminal gets.
 
 use chrono::{Local, TimeZone};
-use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Status};
+use kaijutsu_types::{BlockKind, BlockSnapshot, Status};
 use ratatui::backend::Backend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{Frame, Terminal};
+use ratatui::widgets::Paragraph;
+use ratatui::{Terminal};
 
 use crate::app::App;
 use crate::status::{legend_line, status_line};
 
-/// Lines the live region always holds: the compose line and the status line.
-pub const LIVE_CHROME_LINES: u16 = 2;
+/// Rows the band always takes: the in-flight strip, the blank row over the
+/// draft, one draft row and the status line. A wrapped draft takes more,
+/// up to [`compose_rows_cap`] — [`band_rows`] is the real height.
+pub const BAND_ROWS: u16 = 4;
 
-/// Rows the inline viewport occupies.
-///
-/// Small on purpose: the viewport is what the terminal gives up, and the
-/// transcript is in scrollback where the terminal's own scrolling, search
-/// and copy reach it. A grown view (the picker, an ask card, the ledger)
-/// changes this — [`viewport_lines`] is where.
-pub const VIEWPORT_LINES: u16 = 8;
+/// Rows the band takes at `width` right now: the strip, the blank row, the
+/// draft's own rows (capped at a third of the screen) and the status line.
+pub fn band_rows(app: &App, width: u16) -> u16 {
+    let draft = crate::compose::input_lines(app, width, &app.palette)
+        .len()
+        .clamp(1, compose_rows_cap(app).max(1));
+    BAND_ROWS.saturating_sub(1).saturating_add(u16::try_from(draft).unwrap_or(u16::MAX))
+}
 
-/// Rows of the thinking band: the tail of the turn's latest reasoning,
-/// drawn above the stream while the thinking pane is open (`docs/tui.md`,
-/// "The thinking pane").
 /// A grown region's ceiling: a third of the screen. The compose region
 /// grows toward it a row at a time; the thinking band takes it whole,
 /// once, when a turn's reasoning starts (`docs/tui.md`, "The thinking
@@ -43,21 +42,15 @@ pub fn third_of_screen(app: &App) -> u16 {
     (app.screen_rows / 3).max(1)
 }
 
-/// Rows the thinking band takes above the stream while the pane is open.
+/// Rows the thinking pane takes above the band while it is open.
 pub fn thinking_band_lines(app: &App) -> u16 {
     third_of_screen(app)
-}
-
-/// The band's height with the thinking pane open: the ordinary rows, the
-/// thinking band, and one blank row between them.
-pub fn thinking_pane_lines(app: &App) -> u16 {
-    VIEWPORT_LINES + thinking_band_lines(app) + 1
 }
 
 /// Whether the thinking pane is open: the current context's turn is running
 /// and has shown a `Thinking` block (`App::thinking_pane_latched`). The
 /// turn-liveness half is what keeps a block left `Running` by a lost turn
-/// from holding the band open forever (`App::forget_turn_liveness`).
+/// from holding the pane open forever (`App::forget_turn_liveness`).
 pub fn thinking_pane_open(app: &App) -> bool {
     app.current.is_some_and(|context_id| app.thinking_pane_latched(context_id))
 }
@@ -65,12 +58,14 @@ pub fn thinking_pane_open(app: &App) -> bool {
 /// Whether the in-flight strip has a running entry to animate — the event
 /// loop redraws on `inflight::PHASE_MILLIS` only while it does.
 pub fn strip_animating(app: &App) -> bool {
-    let plan = live_plan(app);
-    crate::inflight::animating(&crate::inflight::entries(plan.iter().map(|(b, _)| b), 0))
+    let Some(view) = app.current_view() else {
+        return false;
+    };
+    crate::inflight::animating(&crate::inflight::entries(view.mirror.blocks().iter(), 0))
 }
 
 /// The turn's latest `Thinking` block, in document order, whatever its
-/// status — the band shows the newest reasoning until the turn ends.
+/// status — the pane shows the newest reasoning until the turn ends.
 fn latest_thinking(app: &App) -> Option<BlockSnapshot> {
     let context_id = app.current?;
     let view = app.views.get(&context_id)?;
@@ -95,47 +90,46 @@ pub fn wallclock(millis: u64) -> String {
     }
 }
 
-/// Whether a block has finished and can leave the viewport for scrollback.
+/// Whether a block has finished.
 ///
 /// `Waiting` is deliberately not settled: a gate's ask has stopped the block
-/// but an answer still moves it, and a block printed to scrollback can never
-/// be redrawn.
+/// but an answer still moves it, and the in-flight strip is where a held
+/// call belongs until then.
 pub fn is_settled(block: &BlockSnapshot) -> bool {
     matches!(block.status, Status::Done | Status::Error)
 }
 
-/// The most body rows a tool result prints into scrollback before it is cut
+/// The most body rows a tool result takes in the transcript before it is cut
 /// to a head plus a footer: one screenful, the transcript rows a reader can
-/// see at once (`app.screen_rows` less the live band).
+/// see at once (`app.screen_rows` less the band at `width`, which grows with
+/// a wrapped draft).
 ///
 /// A coder turn is mostly tool output, and a `cargo build` or a wide `grep`
-/// runs to thousands of lines. Scrollback is never redrawn, so an uncut
-/// result cannot be collapsed after the fact — it has already pushed the
-/// turn that produced it out of view. Cutting at print time is the only
-/// moment the choice exists.
+/// runs to thousands of lines. An uncut result pushes the turn that produced
+/// it off the screen, and the footer names where the rest is read.
 ///
 /// The floor keeps the cut sane on a tiny terminal: below it the footer
 /// would cost more than it saves.
 const TOOL_RESULT_FLOOR: u16 = 6;
 
-pub fn tool_result_budget(app: &App) -> usize {
+pub fn tool_result_budget(app: &App, width: u16) -> usize {
     usize::from(
         app.screen_rows
-            .saturating_sub(VIEWPORT_LINES)
+            .saturating_sub(band_rows(app, width))
             .max(TOOL_RESULT_FLOOR),
     )
 }
 
 /// Cut an over-long tool result to its head and say what was dropped.
 ///
-/// Only `ToolResult`, and only on the scrollback path: `copy_buffer_lines`
+/// Only `ToolResult`, and only in the transcript: `copy_buffer_lines`
 /// renders the same block through `render_block` untouched, which is what
 /// makes the footer's promise true. Capping inside `render_block` would cut
 /// copy mode too and leave the rest reachable nowhere.
 ///
 /// The divider is kept — it names the caller and the command, which is what
 /// makes a cut result identifiable at all — and the footer replaces the last
-/// row of the budget, so the whole print is exactly one screenful.
+/// row of the budget, so the whole render is exactly one screenful.
 fn cap_tool_result(
     block: &BlockSnapshot,
     lines: Vec<Line<'static>>,
@@ -161,98 +155,15 @@ fn cap_tool_result(
     out
 }
 
-/// One block's lines, ready for `insert_before`.
-pub struct Print {
-    pub context_id: ContextId,
-    pub block_id: kaijutsu_types::BlockId,
-    pub lines: Vec<Line<'static>>,
-}
-
-/// Every block of the current context that has completed since the last
-/// frame, rendered once and marked printed.
-///
-/// The mark is what makes this idempotent: a block is printed exactly once,
-/// and a later change to it is the status line's business, not a redraw
-/// (`App::observe_change`).
-pub fn take_settled_prints(app: &mut App, width: u16) -> Vec<Print> {
-    let Some(context_id) = app.current else {
-        return Vec::new();
-    };
-    let Some(view) = app.views.get(&context_id) else {
-        return Vec::new();
-    };
-    let info = app.info(context_id).cloned();
-    let pending: Vec<BlockSnapshot> = view
-        .mirror
-        .blocks()
-        .iter()
-        .filter(|b| is_settled(b) && !view.printed.contains(&b.id) && b.status != Status::Draft)
-        .cloned()
-        .collect();
-
-    let budget = tool_result_budget(app);
-    let mut prints = Vec::new();
-    let mut last_speaker = view.last_printed_speaker.clone();
-    let mut last_printed = view.last_printed;
-    for block in pending {
-        let speaker = app.speaker_for(&block, info.as_ref());
-        // A result directly after its call shares the call's header: no
-        // divider, no gap (`docs/tui.md`, "Conversation").
-        let pair = crate::present::continues_pair(last_printed, &block);
-        let show_divider = !pair && last_speaker.as_deref() != Some(speaker.as_str());
-        let gap = !pair && speaker_gap(show_divider, last_speaker.as_deref());
-        let stamp = wallclock(block.created_at);
-        let mut lines = Vec::new();
-        if gap {
-            lines.push(Line::default());
-        }
-        {
-            let mut view = app.block_view(&block, &speaker, &stamp, show_divider);
-            // A completed `Thinking` block leaves one `▸` stub in scrollback,
-            // whatever its collapse state: the reasoning was read as it
-            // streamed in the thinking pane, and the whole text stays in
-            // copy mode and `kj block read` (`docs/tui.md`, "The thinking
-            // pane").
-            if block.kind == BlockKind::Thinking {
-                view.collapsed = true;
-            }
-            let rendered = crate::present::render_block(&block, &view, width, &app.palette);
-            lines.extend(cap_tool_result(
-                &block,
-                rendered,
-                show_divider,
-                budget,
-                &app.palette,
-            ));
-        }
-        app.mark_printed(context_id, block.id, block.kind, &speaker);
-        last_printed = Some((block.id, block.kind));
-        last_speaker = Some(speaker);
-        prints.push(Print {
-            context_id,
-            block_id: block.id,
-            lines,
-        });
+/// The rows a block takes in the transcript once [`cap_tool_result`] has
+/// had its say — counted without rendering, so the window pass can skip
+/// blocks it will not draw.
+fn capped_rows(block: &BlockSnapshot, rows: usize, budget: usize) -> usize {
+    if block.kind == BlockKind::ToolResult && rows > budget {
+        budget
+    } else {
+        rows
     }
-    prints
-}
-
-/// Whether `context_id` has anything the next [`take_settled_prints`] will
-/// put into scrollback.
-///
-/// A switch to a context whose blocks have all been printed once prints
-/// nothing at all — `ContextView::printed` is per context and is never
-/// reset, so only the first visit prints a transcript whole. What stands
-/// above the band is then the context we left, and the switch says so
-/// rather than letting the old transcript pass for the new one
-/// (`docs/tui.md`, "Conversation": scrollback is never redrawn).
-pub fn has_unprinted(app: &App, context_id: ContextId) -> bool {
-    app.views.get(&context_id).is_some_and(|view| {
-        view.mirror
-            .blocks()
-            .iter()
-            .any(|b| is_settled(b) && !view.printed.contains(&b.id) && b.status != Status::Draft)
-    })
 }
 
 /// Whether a blank row goes above a block's divider: one row of air between
@@ -263,8 +174,8 @@ pub fn speaker_gap(show_divider: bool, last_speaker: Option<&str>) -> bool {
     show_divider && last_speaker.is_some()
 }
 
-/// What one live block needs to render, resolved before the wrap cache is
-/// borrowed mutably.
+/// What one transcript block needs to render, resolved before the wrap cache
+/// is borrowed mutably.
 struct BlockPlan {
     speaker: String,
     stamp: String,
@@ -273,21 +184,31 @@ struct BlockPlan {
     collapsed: bool,
 }
 
-/// Every block of the current context still in the viewport, with its
-/// speaker, stamp, divider decision and collapse resolved.
-fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
+/// Every block of the current context that belongs in the transcript, with
+/// its speaker, stamp, divider decision and collapse resolved.
+///
+/// The draft is not one of them — it is the compose line. Neither is a block
+/// the in-flight strip has taken (`inflight::takes_from_stream`) or the one
+/// the thinking pane is holding: a block is on screen once. A hidden block
+/// still moves the divider decision along, so a call in the strip and its
+/// result still read as one unit when the pair lands.
+fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
     let Some(context_id) = app.current else {
         return Vec::new();
     };
     let Some(view) = app.views.get(&context_id) else {
         return Vec::new();
     };
+    let pane_block = thinking_pane_open(app)
+        .then(|| latest_thinking(app))
+        .flatten()
+        .map(|b| b.id);
     let info = app.info(context_id);
     let mut out = Vec::new();
-    let mut last_speaker = view.last_printed_speaker.clone();
-    let mut last_block = view.last_printed;
+    let mut last_speaker: Option<String> = None;
+    let mut last_block = None;
     for block in view.mirror.blocks() {
-        if view.printed.contains(&block.id) || block.status == Status::Draft {
+        if block.status == Status::Draft {
             continue;
         }
         let speaker = app.speaker_for(block, info);
@@ -296,6 +217,9 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
         let gap = !pair && speaker_gap(show_divider, last_speaker.as_deref());
         last_speaker = Some(speaker.clone());
         last_block = Some((block.id, block.kind));
+        if crate::inflight::takes_from_stream(block) || Some(block.id) == pane_block {
+            continue;
+        }
         out.push((
             block.clone(),
             BlockPlan {
@@ -303,187 +227,194 @@ fn live_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
                 stamp: wallclock(block.created_at),
                 show_divider,
                 gap,
-                collapsed: view.is_collapsed(block),
+                // A `Thinking` block is one `▸` stub in the transcript
+                // whatever its collapse state: the reasoning was read as it
+                // streamed in the pane, and copy mode and `kj block read`
+                // keep the whole text (`docs/tui.md`, "The thinking pane").
+                collapsed: view.is_collapsed(block) || block.kind == BlockKind::Thinking,
             },
         ));
     }
     out
 }
 
-/// One frame of the live region: its rows, and where the terminal's cursor
-/// sits among them as `(row, col)` indexed into `lines`. `None` while
-/// nothing is being typed — the picker, an ask card, the ledger and the
-/// armed legend have no cursor, and the terminal hides it.
-pub struct LiveFrame {
+/// The context type the current context's blocks render under.
+fn context_type_of(app: &App) -> String {
+    app.current
+        .and_then(|id| app.info(id))
+        .map(|c| c.context_type.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// The transcript's visible rows: `height` rows of the current context's
+/// blocks, wrapped at `width`, ending at the newest row while the view
+/// follows the tail (`App::transcript`).
+///
+/// Two passes over the plan. The first counts each block's rows through the
+/// wrap cache; the second renders only the blocks the window touches, so a
+/// frame costs a screenful of work rather than a context's.
+pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'static>> {
+    let plan = transcript_plan(app);
+    let height = usize::from(height);
+    if height == 0 || plan.is_empty() {
+        return Vec::new();
+    }
+    let budget = tool_result_budget(app, width);
+    let palette = app.palette;
+    let context_type = context_type_of(app);
+
+    let mut rows: Vec<usize> = Vec::with_capacity(plan.len());
+    for (block, item) in &plan {
+        let view = block_view(item, &context_type, block);
+        let lineage = app.lineage_for(block);
+        let view = crate::present::BlockView { lineage, ..view };
+        let counted = capped_rows(block, app.wrap.lines(block, &view, width, &palette).len(), budget);
+        rows.push(usize::from(item.gap) + counted);
+    }
+    let total: usize = rows.iter().sum();
+    let last_top = total.saturating_sub(height);
+    let start = if app.transcript.follow {
+        last_top
+    } else {
+        app.transcript.top.min(last_top)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height.min(total));
+    let mut row = 0usize;
+    let mut edge = None;
+    for ((block, item), block_rows) in plan.iter().zip(rows) {
+        if row + block_rows <= start {
+            row += block_rows;
+            continue;
+        }
+        let view = block_view(item, &context_type, block);
+        let lineage = app.lineage_for(block);
+        let view = crate::present::BlockView { lineage, ..view };
+        let rendered = app.wrap.lines(block, &view, width, &palette).to_vec();
+        let cut = capped_rows(block, rendered.len(), budget) != rendered.len();
+        let mut block_lines = cap_tool_result(block, rendered, item.show_divider, budget, &palette);
+        if item.gap {
+            block_lines.insert(0, Line::default());
+        }
+        let skip = start.saturating_sub(row);
+        let mut drawn: Vec<Line<'static>> = block_lines.into_iter().skip(skip).collect();
+        let room = height - lines.len();
+        // The head may be above the window without hiding anything the
+        // player is reading; a tail the window could not fit is a different
+        // matter, and so is one the cap took.
+        let cropped = drawn.len() > room;
+        drawn.truncate(room);
+        if !drawn.is_empty() {
+            edge = Some((
+                block.id,
+                (!cut && !cropped).then(|| block.content.chars().count() as u64),
+            ));
+        }
+        lines.extend(drawn);
+        row += block_rows;
+        if lines.len() >= height {
+            break;
+        }
+    }
+    if let Some((block, shown)) = edge {
+        record_edge(app, block, shown);
+    }
+    lines
+}
+
+/// The view a planned block renders through, lineage left empty for the
+/// caller to fill — it needs `app` immutably, and the wrap cache is a
+/// mutable borrow that cannot overlap it.
+fn block_view<'a>(
+    item: &'a BlockPlan,
+    context_type: &'a str,
+    block: &'a BlockSnapshot,
+) -> crate::present::BlockView<'a> {
+    let (tool, arg) = crate::app::tool_header(block);
+    crate::present::BlockView {
+        speaker: &item.speaker,
+        context_type,
+        stamp: &item.stamp,
+        show_divider: item.show_divider,
+        tool,
+        arg,
+        lineage: Vec::new(),
+        collapsed: item.collapsed,
+        local_ctx: Some(block.id.context_id),
+    }
+}
+
+/// Record the player's edge of context: the block that ended the window,
+/// and how many of its characters were actually drawn — `None` when a cap or
+/// a crop hid its tail, because the kernel never guesses one
+/// (`ContextView::edge`, `docs/prompts.md`, "The submit verb").
+///
+/// A frame that drew no transcript row records nothing: what the player last
+/// saw is still what they last saw.
+fn record_edge(app: &mut App, block: kaijutsu_types::BlockId, shown: Option<u64>) {
+    let Some(context_id) = app.current else {
+        return;
+    };
+    if let Some(view) = app.views.get_mut(&context_id) {
+        view.shown_tail = Some((block, shown));
+    }
+}
+
+/// One frame of the band: its rows, and where the terminal's cursor sits
+/// among them as `(row, col)` indexed into `lines`. `None` while nothing is
+/// being typed — the armed legend and every overlay that owns the keyboard
+/// have no cursor, and the terminal hides it.
+pub struct BandFrame {
     pub lines: Vec<Line<'static>>,
     pub cursor: Option<(u16, u16)>,
 }
 
-/// The live region's rows alone — [`live_frame`] without the cursor.
-pub fn live_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Vec<Line<'static>> {
-    live_frame(app, width, now_millis, armed).lines
+/// The band's rows alone — [`band_frame`] without the cursor. The frame
+/// path wants the cursor with them, so this is the tests' way in.
+#[cfg(test)]
+fn band_lines(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Vec<Line<'static>> {
+    band_frame(app, width, now_millis, armed).lines
 }
 
-/// The live region: still-streaming blocks, the compose line, the status
-/// line (or the armed-prefix legend in its place).
-pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> LiveFrame {
-    // The picker grows the viewport and replaces the live region entirely
-    // while open — its own key line is the view's key line, the same
-    // contract every grown view (`docs/tui.md`, "The picker") follows.
-    if let Some(picker) = &app.picker {
-        return LiveFrame { lines: crate::picker::render(picker, width, &app.palette), cursor: None };
-    }
-
+/// The band: the in-flight strip, a blank row, the draft (or the `:` bar, or
+/// the armed prefix legend) and the status line.
+pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> BandFrame {
     let palette = app.palette;
-
-    // The ask card and the ledger view replace the block stream and compose
-    // line entirely while open — `docs/tui.md`'s "grows the viewport"
-    // treatment. The full render is returned untruncated: `viewport_lines`
-    // sizes the real viewport to hold it before this ever draws, so there is
-    // nothing to budget here in the common case. A terminal too short to
-    // hold what it asked for is `draw_live`'s problem, not this fn's — it
-    // is the one place that actually knows the terminal's real height.
-    if let Some(mut lines) = crate::asks::active_view_lines(app, width) {
-        lines.push(if armed {
-            legend_line(width, &palette)
-        } else {
-            status_line(&app.status_model(now_millis), width, &palette)
-        });
-        return LiveFrame { lines, cursor: None };
-    }
-
     let mut lines = Vec::new();
-    // The band this frame is drawn into — [`VIEWPORT_LINES`], or the
-    // thinking pane's height while one is open.
-    let band = viewport_lines(app, width);
-    let pane_open = thinking_pane_open(app);
 
-    // Resolve everything the wrap needs while `app` is only borrowed
-    // immutably; the cache itself is a mutable borrow and cannot overlap.
-    let plan: Vec<(BlockSnapshot, BlockPlan)> = live_plan(app);
+    // The in-flight strip: one row, always, so the band never resizes for a
+    // tool call coming or going — only the row's text changes.
+    let strip = match app.current_view() {
+        Some(view) => crate::inflight::entries(view.mirror.blocks().iter(), now_millis),
+        None => Vec::new(),
+    };
+    lines.push(crate::inflight::strip_line(
+        &strip,
+        width,
+        &palette,
+        crate::inflight::phase(now_millis),
+    ));
 
-    // Record what the live band drew this frame — the player's edge on
-    // submit when it is set (`ContextView::edge`, `docs/issues.md`, "Async
-    // input should carry the player's edge of context"). `None` when the
-    // band drew nothing, which lets `edge()` fall back to `last_printed`.
-    if let Some(context_id) = app.current {
-        let tail = plan
-            .last()
-            .map(|(block, _)| (block.id, block.content.chars().count() as u64));
-        if let Some(view) = app.views.get_mut(&context_id) {
-            view.live_tail = tail;
-        }
-    }
+    // One blank row separates what is being read from what is being typed
+    // (`docs/tui.md`, "Conversation").
+    lines.push(Line::default());
 
-    let context_type = app
-        .current
-        .and_then(|id| app.info(id))
-        .map(|c| c.context_type.clone())
-        .unwrap_or_else(|| "default".to_string());
-
-    // The thinking band: the tail of the turn's latest reasoning, its own
-    // rows above the stream so the answer streaming in never scrolls it
-    // away, then one blank row. Thinking blocks leave the stream while the
-    // pane holds them.
-    let mut thinking = Vec::new();
-    if pane_open && let Some(block) = latest_thinking(app) {
-        let stamp = wallclock(block.created_at);
-        let block_view = crate::present::BlockView {
-            speaker: "",
-            context_type: &context_type,
-            stamp: &stamp,
-            show_divider: false,
-            tool: None,
-            arg: None,
-            lineage: Vec::new(),
-            collapsed: false,
-            local_ctx: Some(block.id.context_id),
-        };
-        let band_rows = usize::from(thinking_band_lines(app));
-        let rendered = app.wrap.lines(&block, &block_view, width, &palette);
-        let keep = band_rows.min(rendered.len());
-        thinking.extend(rendered[rendered.len() - keep..].iter().cloned());
-        thinking.push(Line::default());
-    }
-
-    for (block, item) in &plan {
-        if pane_open && block.kind == BlockKind::Thinking {
-            continue;
-        }
-        // Unsettled calls and gate-held results are the strip's, not the
-        // stream's: their bodies would otherwise resize the stream every
-        // time one arrived or wrapped (`docs/tui.md`, "The in-flight strip").
-        if crate::inflight::takes_from_stream(block) {
-            continue;
-        }
-        let (tool, arg) = crate::app::tool_header(block);
-        let block_view = crate::present::BlockView {
-            speaker: &item.speaker,
-            context_type: &context_type,
-            stamp: &item.stamp,
-            show_divider: item.show_divider,
-            tool,
-            arg,
-            lineage: app.lineage_for(block),
-            collapsed: item.collapsed,
-            local_ctx: Some(block.id.context_id),
-        };
-        if item.gap {
-            lines.push(Line::default());
-        }
-        lines.extend(
-            app.wrap
-                .lines(block, &block_view, width, &palette)
-                .iter()
-                .cloned(),
-        );
-    }
-
-    // The input region is drawn first because it sizes the transcript. A
-    // draft longer than the cap (a third of the screen) shows the rows
-    // around the cursor, the way vim scrolls a long command line.
+    // The draft wraps and takes up to a third of the screen. Past the cap it
+    // shows the rows around the cursor, the way vim scrolls a long command
+    // line.
     let mut input = crate::compose::input_lines(app, width, &palette);
     let (mut cursor_row, cursor_col) = app.compose.cursor_cell(width);
     let cap = compose_rows_cap(app);
+    debug_assert_eq!(
+        usize::from(band_rows(app, width)),
+        input.len().min(cap.max(1)).max(1) + 3,
+        "the band's counted height and its drawn rows must agree"
+    );
     if input.len() > cap {
         let start = usize::from(cursor_row).saturating_sub(cap - 1).min(input.len() - cap);
         input = input[start..start + cap].to_vec();
         cursor_row = u16::try_from(usize::from(cursor_row) - start).unwrap_or(0);
     }
-
-    // Keep the tail: a long stream shows its newest lines, not its oldest.
-    // The budget is the viewport's own height, so a line this function emits
-    // is a line the terminal actually shows.
-    // One status line, one blank row above the input region, the in-flight
-    // strip's row, plus however many rows the input region takes.
-    let chrome = 3 + u16::try_from(input.len()).unwrap_or(u16::MAX);
-    let budget = usize::from(band.saturating_sub(chrome)).saturating_sub(thinking.len());
-    if lines.len() > budget {
-        lines.drain(..lines.len() - budget);
-    }
-    if !thinking.is_empty() {
-        thinking.append(&mut lines);
-        lines = thinking;
-    }
-
-    // The `:kj ` completion popup rides above the compose line, only while
-    // the bar is actually mid-`:kj ` — a stale popup left over from an
-    // earlier `Tab` press does not reappear once the bar has moved past it
-    // (`completion.rs`).
-    if let Some(completion) = &app.completion
-        && app.compose.kj_typed().is_some()
-    {
-        lines.extend(crate::completion::render_popup(completion, width, &palette));
-    }
-
-    // The in-flight strip: one row, always, so the band never resizes for
-    // a tool call coming or going — only the row's text changes.
-    let strip = crate::inflight::entries(plan.iter().map(|(b, _)| b), now_millis);
-    lines.push(crate::inflight::strip_line(&strip, width, &palette, crate::inflight::phase(now_millis)));
-
-    // One blank row separates what is being read from what is being typed
-    // (`docs/tui.md`, "Conversation").
-    lines.push(Line::default());
 
     // While `Ctrl+A` is pending the legend takes the compose row, not the
     // status line: the status line's seat digits are what the player is
@@ -493,100 +424,155 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
         None
     } else {
         // The terminal's own cursor, on the draft's vi cursor: the row is
-        // the compose region's first line plus the draft row it is on.
+        // the compose region's first line plus the draft row it is on. An
+        // overlay that owns the keyboard hides it — the keys go there, not
+        // to the draft.
         let first = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         lines.extend(input);
-        Some((first.saturating_add(cursor_row), cursor_col))
+        (!overlay_holds_keys(app)).then_some((first.saturating_add(cursor_row), cursor_col))
     };
     lines.push(status_line(&app.status_model(now_millis), width, &palette));
-    LiveFrame { lines, cursor }
+    BandFrame { lines, cursor }
 }
 
-/// Print completed blocks into the terminal's scrollback, above the inline
-/// viewport.
-pub fn print_scrollback<B: Backend>(
-    terminal: &mut Terminal<B>,
-    prints: &[Print],
-) -> Result<(), B::Error> {
-    for print in prints {
-        let height = u16::try_from(print.lines.len()).unwrap_or(u16::MAX);
-        if height == 0 {
-            continue;
-        }
-        let lines = print.lines.clone();
-        terminal.insert_before(height, move |buf| {
-            Paragraph::new(lines).render(buf.area, buf);
-        })?;
+/// Whether an overlay owns the keyboard. The picker, an ask card and the
+/// ledger take every key while they are up, so the draft shows no cursor.
+fn overlay_holds_keys(app: &App) -> bool {
+    app.picker.is_some() || app.ask_card.is_some() || app.ledger_view.is_some()
+}
+
+/// The overlay's rows: the picker, an ask card, the ledger view or the
+/// thinking pane, whichever is open, and empty when none is. One overlay at
+/// a time, drawn between the transcript and the band (`docs/tui.md`, "The
+/// owned screen").
+pub fn overlay_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
+    if let Some(picker) = &app.picker {
+        return crate::picker::render(picker, width, &app.palette);
     }
-    Ok(())
+    if let Some(lines) = crate::asks::active_view_lines(app, width) {
+        return lines;
+    }
+    thinking_pane(app, width)
 }
 
-/// Redraw the live region, bottom-aligned in the viewport: the status line
-/// is the viewport's last row and the band's unused rows are the gap above
-/// compose, never a gap under the status line (`docs/tui.md`, ruling 1: "a
-/// viewport at the bottom"). A grown view that fills its band is unmoved.
-pub fn draw_live<B: Backend>(
+/// The thinking pane: the tail of the turn's latest reasoning, dim and
+/// italic, a third of the screen at most, so the answer streaming in never
+/// scrolls the reasoning out of it (`docs/tui.md`, "The thinking pane").
+fn thinking_pane(app: &mut App, width: u16) -> Vec<Line<'static>> {
+    if !thinking_pane_open(app) {
+        return Vec::new();
+    }
+    let Some(block) = latest_thinking(app) else {
+        return Vec::new();
+    };
+    let palette = app.palette;
+    let context_type = context_type_of(app);
+    let stamp = wallclock(block.created_at);
+    let view = crate::present::BlockView {
+        speaker: "",
+        context_type: &context_type,
+        stamp: &stamp,
+        show_divider: false,
+        tool: None,
+        arg: None,
+        lineage: Vec::new(),
+        collapsed: false,
+        local_ctx: Some(block.id.context_id),
+    };
+    let rows = usize::from(thinking_band_lines(app));
+    let rendered = app.wrap.lines(&block, &view, width, &palette);
+    let keep = rows.min(rendered.len());
+    rendered[rendered.len() - keep..].to_vec()
+}
+
+/// One frame of the owned screen: the transcript on top, the band at the
+/// bottom, and an overlay between them while one is open.
+///
+/// Every region keeps its tail when the screen is too short for it: the
+/// status line is the last row, an overlay's key-hints line is the last row
+/// it has, and the transcript shows its newest lines. Showing everything but
+/// the way to answer is the bug that cropping from the front closes.
+pub fn draw_screen<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     now_millis: u64,
     armed: bool,
 ) -> Result<(), B::Error> {
-    let width = terminal.size()?.width;
-    let LiveFrame { lines, cursor } = live_frame(app, width, now_millis, armed);
+    let size = terminal.size()?;
+    let (width, height) = (size.width, size.height);
+    let band = band_frame(app, width, now_millis, armed);
+    let band_rows = u16::try_from(band.lines.len()).unwrap_or(u16::MAX).min(height);
+    let overlay = overlay_lines(app, width);
+    let overlay_rows = u16::try_from(overlay.len())
+        .unwrap_or(u16::MAX)
+        .min(height.saturating_sub(band_rows));
+    let transcript_rows = height.saturating_sub(band_rows).saturating_sub(overlay_rows);
+    let transcript = transcript_window(app, width, transcript_rows);
+
     terminal.draw(|frame| {
         let area = frame.area();
-        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX).min(area.height);
-        let bottom = Rect {
-            y: area.y + area.height - height,
-            height,
+        // The transcript is bottom-aligned in its own rows: a conversation
+        // shorter than the screen sits on the band the way a shell's output
+        // sits on its prompt.
+        let drawn = u16::try_from(transcript.len()).unwrap_or(u16::MAX).min(transcript_rows);
+        if drawn > 0 {
+            let rect = Rect {
+                y: area.y + transcript_rows - drawn,
+                height: drawn,
+                ..area
+            };
+            frame.render_widget(Paragraph::new(transcript), rect);
+        }
+        if overlay_rows > 0 {
+            let start = overlay.len() - usize::from(overlay_rows);
+            let rect = Rect {
+                y: area.y + transcript_rows,
+                height: overlay_rows,
+                ..area
+            };
+            frame.render_widget(Paragraph::new(overlay[start..].to_vec()), rect);
+        }
+        let start = band.lines.len() - usize::from(band_rows);
+        let rect = Rect {
+            y: area.y + height - band_rows,
+            height: band_rows,
             ..area
         };
-        // The common case never reaches the crop below: `viewport_lines`
-        // already grew the real viewport to hold every line, so `height`
-        // equals `lines.len()`. When the terminal itself is shorter than
-        // that (too small a window, or a resize still catching up), crop
-        // from the FRONT and keep the tail — the tail is where a grown
-        // view's key-hints line lives (`asks.rs`'s ask card and ledger),
-        // and showing everything but the way to answer is the bug this
-        // closes.
-        let start = lines.len().saturating_sub(usize::from(height));
-        frame.render_widget(Paragraph::new(lines[start..].to_vec()), bottom);
+        frame.render_widget(Paragraph::new(band.lines[start..].to_vec()), rect);
         // A cursor on a row the crop dropped stays hidden with the row.
-        if let Some((row, col)) = cursor
+        if let Some((row, col)) = band.cursor
             && let Some(y) = usize::from(row).checked_sub(start)
         {
             let y = u16::try_from(y).unwrap_or(u16::MAX);
-            frame.set_cursor_position((bottom.x + col, bottom.y + y));
+            frame.set_cursor_position((rect.x + col, rect.y + y));
         }
     })?;
     Ok(())
 }
 
-/// Draw the transcript and the live region into one frame.
-///
-/// A real terminal never does this — the transcript lives in scrollback and
-/// only the live region is drawn — but it is the same content in one buffer,
-/// which is what a `TestBackend` can observe.
-pub fn draw_full<B: Backend>(
+/// One full-screen surface — the editor, the diff viewer, copy mode — drawn
+/// over the whole owned screen. `cursor` places the terminal's cursor;
+/// `None` hides it, which is what a surface with no insertion point wants.
+pub fn draw_surface<B: Backend>(
     terminal: &mut Terminal<B>,
-    transcript: &[Line<'static>],
-    live: &[Line<'static>],
+    lines: Vec<Line<'static>>,
+    cursor: Option<(u16, u16)>,
 ) -> Result<(), B::Error> {
-    terminal.draw(|frame: &mut Frame| {
-        let live_height = u16::try_from(live.len()).unwrap_or(u16::MAX);
-        let [top, bottom] = Layout::vertical([Constraint::Min(0), Constraint::Length(live_height)])
-            .areas::<2>(frame.area());
-        frame.render_widget(Paragraph::new(transcript.to_vec()), top);
-        frame.render_widget(Paragraph::new(live.to_vec()), bottom);
+    terminal.draw(|frame| {
+        let area = frame.area();
+        frame.render_widget(Paragraph::new(lines), area);
+        if let Some(position) = cursor {
+            frame.set_cursor_position(position);
+        }
     })?;
     Ok(())
 }
 
 /// Build copy mode's buffer for the context on screen: every block in
-/// document order, rendered exactly as the transcript printer would
-/// ([`crate::present::render_block`]) — the whole context, not only what
-/// scrollback has already shown (`docs/tui.md`, "Copy mode"). The draft is
-/// excluded — it is the compose line, not the transcript.
+/// document order, rendered exactly as the transcript would
+/// ([`crate::present::render_block`]) but whole — no cut tool result, no
+/// thinking stub (`docs/tui.md`, "Copy mode"). The draft is excluded — it is
+/// the compose line, not the transcript.
 ///
 /// Frozen at the moment `Ctrl+A [` is pressed, the same "freeze on open"
 /// contract the diff screen keeps (`diff.rs`): a still-streaming block's
@@ -635,34 +621,6 @@ pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'sta
         last_speaker = Some(speaker);
     }
     Some((label, lines))
-}
-
-/// Rows the inline viewport should occupy right now — [`VIEWPORT_LINES`]
-/// ordinarily, or a grown view's own height while one is open: the picker's
-/// (width-independent), the ask card's (wraps by width, so counted at
-/// `width` — the same width `draw_live` will render at), or the ledger's
-/// (width-independent, same as the picker). The one place viewport growth
-/// lands (`docs/tui.md`, "grows the viewport and shrinks on dismiss"): a
-/// future grown view adds its own arm here rather than each surface picking
-/// its own resize path.
-pub fn viewport_lines(app: &App, width: u16) -> u16 {
-    if let Some(picker) = &app.picker {
-        return VIEWPORT_LINES.max(crate::picker::viewport_lines(picker));
-    }
-    if let Some(active) = crate::asks::active_view_viewport_lines(app, width) {
-        return VIEWPORT_LINES.max(active);
-    }
-    let mut want = VIEWPORT_LINES;
-    if thinking_pane_open(app) {
-        want = want.max(thinking_pane_lines(app));
-    }
-    // A draft past one row grows the band a row per wrapped row, up to a
-    // third of the screen, so the stream keeps its rows while a long
-    // prompt is typed; the band shrinks once, when the draft is submitted
-    // (`docs/tui.md`, "Compose").
-    let rows = crate::compose::input_lines(app, width, &app.palette).len();
-    let extra = rows.min(compose_rows_cap(app)).saturating_sub(1);
-    want.saturating_add(u16::try_from(extra).unwrap_or(u16::MAX))
 }
 
 /// The most rows the compose region may take: [`third_of_screen`].
@@ -734,7 +692,7 @@ mod tests {
             .build()
     }
 
-    /// Two settled blocks and a status line, rendered into a `TestBackend`.
+    /// Two settled blocks, a status line and a 24-row screen.
     fn fixture() -> (App, ContextId) {
         let id = ContextId::new();
         let mut app = App::new("amy");
@@ -761,6 +719,14 @@ mod tests {
         (app, id)
     }
 
+    /// Replace the current context's blocks.
+    fn snapshot(app: &mut App, id: ContextId, blocks: Vec<BlockSnapshot>) {
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(blocks, 1).expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        app.switch_to(id);
+    }
+
     fn rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buf = terminal.backend().buffer();
         (0..buf.area.height)
@@ -774,16 +740,21 @@ mod tests {
             .collect()
     }
 
-    /// A revisited context prints nothing: `printed` is per context and is
-    /// never reset, so only the first visit puts a transcript into
-    /// scrollback. `switch_seat` reads this to decide whether the switch
-    /// has a word to say about the transcript standing above the band.
-    #[test]
-    fn a_context_whose_blocks_have_all_printed_has_nothing_left_to_print() {
-        let (mut app, id) = fixture();
-        assert!(has_unprinted(&app, id), "a fresh view holds its whole transcript");
-        let _ = take_settled_prints(&mut app, 80);
-        assert!(!has_unprinted(&app, id), "a second visit prints nothing");
+    fn text_of(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// The whole transcript at `width`, as plain text: a window taller than
+    /// any fixture crops nothing.
+    fn transcript_text(app: &mut App, width: u16) -> Vec<String> {
+        text_of(&transcript_window(app, width, u16::MAX))
+    }
+
+    fn band_text(app: &mut App, width: u16) -> Vec<String> {
+        text_of(&band_lines(app, width, 0, false))
     }
 
     /// A context this client is not watching renders nothing at all — no
@@ -791,85 +762,158 @@ mod tests {
     /// `watch_context` reached, and the state a feed that ended leaves
     /// behind (`run.rs`'s `apply_feed`, `FeedEvent::Terminated`).
     #[test]
-    fn an_unwatched_context_prints_nothing_and_streams_nothing() {
+    fn an_unwatched_context_renders_no_transcript() {
         let (mut app, _) = fixture();
         let unwatched = ContextId::new();
         app.switch_to(unwatched);
-        assert!(!has_unprinted(&app, unwatched));
-        assert!(take_settled_prints(&mut app, 80).is_empty());
-        assert!(live_plan(&app).is_empty(), "the stream band is empty too");
+        assert!(transcript_text(&mut app, 80).is_empty());
     }
 
+    /// The transcript is the whole context, redrawn every frame: a block
+    /// does not leave it, and a second frame renders the same rows.
     #[test]
-    fn a_settled_block_is_printed_once_and_never_again() {
+    fn the_transcript_holds_every_block_on_every_frame() {
         let (mut app, _) = fixture();
-        let first = take_settled_prints(&mut app, 80);
-        assert_eq!(first.len(), 2);
-        let second = take_settled_prints(&mut app, 80);
-        assert!(second.is_empty(), "a printed block is never re-offered");
+        let first = transcript_text(&mut app, 80);
+        assert_eq!(first.len(), 5, "divider, text, blank, divider, text: {first:?}");
+        assert_eq!(transcript_text(&mut app, 80), first, "the same frame twice");
     }
 
-    /// A run of blocks by one speaker carries one divider, even when they
-    /// print on separate frames — the streamed reply that follows a
-    /// `Thinking` block is the case that showed this.
+    /// A run of blocks by one speaker carries one divider.
     #[test]
-    fn a_second_frame_by_the_same_speaker_repeats_no_divider() {
+    fn a_run_by_one_speaker_repeats_no_divider() {
         let id = ContextId::new();
         let mut app = App::new("amy");
         app.set_contexts(vec![ctx(id, "kaijutsu")]);
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(id, 1, BlockKind::Thinking, Role::Model, Status::Done, "hmm")],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-        app.switch_to(id);
-        let first = take_settled_prints(&mut app, 80);
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].lines.len(), 2, "divider plus the thinking stub");
-
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(id, 2, BlockKind::Text, Role::Model, Status::Done, "ok")],
-                1,
-            )
-            .expect("snapshot applies");
-        let view = app.views.get_mut(&id).expect("a view");
-        view.mirror = mirror;
-        let second = take_settled_prints(&mut app, 80);
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].lines.len(), 1, "no second divider for one speaker");
+        snapshot(
+            &mut app,
+            id,
+            vec![
+                block(id, 1, BlockKind::Thinking, Role::Model, Status::Done, "hmm"),
+                block(id, 2, BlockKind::Text, Role::Model, Status::Done, "ok"),
+            ],
+        );
+        let rows = transcript_text(&mut app, 80);
+        assert_eq!(
+            rows.iter().filter(|r| r.starts_with('─')).count(),
+            1,
+            "one divider for one speaker: {rows:?}"
+        );
     }
 
+    /// A streaming block is in the transcript like any other, and its newest
+    /// text is what a following view shows.
     #[test]
-    fn a_streaming_block_stays_in_the_live_region() {
+    fn a_streaming_block_is_in_the_transcript() {
         let (mut app, id) = fixture();
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(
-                    id,
-                    3,
-                    BlockKind::Text,
-                    Role::Model,
-                    Status::Running,
-                    "still going",
-                )],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-
-        assert!(take_settled_prints(&mut app, 80).is_empty());
-        let live = live_lines(&mut app, 80, 0, false);
-        let text: Vec<String> = live
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 3, BlockKind::Text, Role::Model, Status::Running, "still going")],
+        );
+        let text = transcript_text(&mut app, 80);
         assert!(text.iter().any(|l| l.contains("still going")), "got {text:?}");
+    }
+
+    /// The wrap follows the width: the same block takes more rows at half
+    /// the columns, with no cached line surviving the change
+    /// (`docs/tui.md`, "The buffer").
+    #[test]
+    fn a_narrower_width_rewraps_the_transcript() {
+        let (mut app, id) = fixture();
+        let long = "wrapme ".repeat(20);
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 3, BlockKind::Text, Role::Model, Status::Done, &long)],
+        );
+        let wide = transcript_text(&mut app, 80).len();
+        let narrow = transcript_text(&mut app, 40).len();
+        assert!(narrow > wide, "40 columns takes more rows than 80: {narrow} vs {wide}");
+        assert_eq!(transcript_text(&mut app, 80).len(), wide, "and back again");
+    }
+
+    /// Following shows the newest rows; a view that is not following shows
+    /// the rows from where it stopped (`docs/tui.md`, "Scrolling is copy
+    /// mode"; the keys are the next slice).
+    #[test]
+    fn the_view_follows_the_tail_until_it_is_scrolled() {
+        let (mut app, id) = fixture();
+        let body = (0..60).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
+        );
+        let tail = text_of(&transcript_window(&mut app, 80, 5));
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail.last().map(String::as_str), Some("line 59"), "the tail: {tail:?}");
+
+        app.transcript.follow = false;
+        app.transcript.top = 1;
+        let scrolled = text_of(&transcript_window(&mut app, 80, 5));
+        assert_eq!(scrolled.first().map(String::as_str), Some("line 0"), "got {scrolled:?}");
+        assert_eq!(scrolled.len(), 5);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // The player's edge (docs/prompts.md, "The submit verb")
+    // ────────────────────────────────────────────────────────────────────
+
+    /// The edge is the block that ended the window, with the count of
+    /// characters actually rendered for it.
+    #[test]
+    fn the_edge_is_the_last_block_the_window_drew() {
+        let (mut app, id) = fixture();
+        let _ = transcript_window(&mut app, 80, u16::MAX);
+        let edge = app.views[&id].edge().expect("two settled blocks were drawn");
+        let last = app.views[&id].mirror.blocks().last().expect("a last block").clone();
+        assert_eq!(edge.block, last.id);
+        assert_eq!(edge.shown, Some(last.content.chars().count() as u64));
+    }
+
+    /// A cut tail is a count the client cannot make: the cap hid the end of
+    /// the block, so the edge names the block and no count rather than
+    /// claiming the player saw it whole.
+    #[test]
+    fn a_capped_result_at_the_tail_sends_no_count() {
+        let (mut app, id) = fixture();
+        app.screen_rows = 24;
+        snapshot(&mut app, id, long_result(id, 300));
+        let _ = transcript_window(&mut app, 80, u16::MAX);
+        let edge = app.views[&id].edge().expect("the result was drawn");
+        let result = app.views[&id].mirror.blocks().last().expect("the result").clone();
+        assert_eq!(edge.block, result.id);
+        assert_eq!(edge.shown, None, "the cap hid the tail");
+    }
+
+    /// A scrolled view crops the last block's tail the same way.
+    #[test]
+    fn a_cropped_tail_sends_no_count() {
+        let (mut app, id) = fixture();
+        let body = (0..60).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
+        );
+        app.transcript.follow = false;
+        app.transcript.top = 0;
+        let _ = transcript_window(&mut app, 80, 5);
+        let edge = app.views[&id].edge().expect("the block was drawn");
+        assert_eq!(edge.shown, None, "the window cropped the tail");
+    }
+
+    /// A frame with no transcript rows records no edge: a screen full of
+    /// overlay leaves the last one the player actually saw standing.
+    #[test]
+    fn a_window_with_no_rows_records_nothing() {
+        let (mut app, id) = fixture();
+        let _ = transcript_window(&mut app, 80, u16::MAX);
+        let before = app.views[&id].edge();
+        assert!(before.is_some());
+        let _ = transcript_window(&mut app, 80, 0);
+        assert_eq!(app.views[&id].edge(), before, "an empty window leaves the edge alone");
     }
 
     /// The terminal's own cursor rests on the compose row, past the prompt
@@ -882,8 +926,8 @@ mod tests {
         for c in ['i', 'h', 'i'] {
             app.compose.press(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        let mut terminal = Terminal::new(TestBackend::new(80, 7)).expect("test terminal");
-        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        draw_screen(&mut terminal, &mut app, 0, false).expect("draw");
         let compose_row = rows(&terminal)
             .iter()
             .position(|r| r.starts_with("❯ hi"))
@@ -891,11 +935,11 @@ mod tests {
         let at = terminal.get_cursor_position().expect("cursor position");
         assert_eq!((at.x, at.y), (4, compose_row as u16), "past `❯ hi`");
 
-        let armed = live_frame(&mut app, 80, 0, true);
+        let armed = band_frame(&mut app, 80, 0, true);
         assert_eq!(armed.cursor, None, "the legend row has no cursor");
     }
 
-    /// Build a settled tool-result block whose body is `rows` lines.
+    /// Build a settled tool call and its result, whose body is `rows` lines.
     fn long_result(id: ContextId, rows: usize) -> Vec<BlockSnapshot> {
         let call = BlockSnapshotBuilder::new(
             BlockId::new(id, PrincipalId::new(), 9),
@@ -924,33 +968,18 @@ mod tests {
         vec![call, result]
     }
 
-    fn printed_rows(app: &mut App, width: u16) -> Vec<String> {
-        take_settled_prints(app, width)
-            .into_iter()
-            .flat_map(|p| p.lines)
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-            .collect()
-    }
-
     /// A `cargo build`'s worth of output is cut to one screenful with a
-    /// footer that counts what was dropped. Scrollback is never redrawn, so
-    /// an uncut result has already pushed the turn that produced it out of
-    /// view by the time anyone could collapse it.
+    /// footer that counts what was dropped, so the turn that produced it is
+    /// still on the screen with it.
     #[test]
     fn a_long_tool_result_is_cut_to_a_head_and_a_footer() {
         let (mut app, id) = fixture();
         app.screen_rows = 30;
-        let _ = printed_rows(&mut app, 80); // drain the fixture's blocks
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(long_result(id, 500), 1)
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-        app.switch_to(id);
+        snapshot(&mut app, id, long_result(id, 500));
 
-        let rows = printed_rows(&mut app, 80);
-        let budget = tool_result_budget(&app);
-        assert_eq!(budget, 22, "30 rows less the 8-row band");
+        let rows = transcript_text(&mut app, 80);
+        let budget = tool_result_budget(&app, 80);
+        assert_eq!(budget, 26, "30 rows less the band");
 
         let footer = rows.last().expect("a footer");
         assert!(
@@ -975,27 +1004,18 @@ mod tests {
         );
     }
 
-    /// The whole print is one screenful — the point of the cut. A print that
-    /// merely got shorter would still push the turn off the screen.
+    /// The whole render is one screenful — the point of the cut. A render
+    /// that merely got shorter would still push the turn off the screen.
     #[test]
-    fn a_cut_result_prints_exactly_one_screenful() {
+    fn a_cut_result_takes_exactly_one_screenful() {
         for screen_rows in [24u16, 30, 50, 120] {
             let (mut app, id) = fixture();
             app.screen_rows = screen_rows;
-            let _ = printed_rows(&mut app, 80);
-            let mut mirror = ContextMirror::new(id);
-            mirror
-                .apply_snapshot(long_result(id, 4_000), 1)
-                .expect("snapshot applies");
-            app.views.insert(id, ContextView::new(mirror));
-            app.switch_to(id);
+            snapshot(&mut app, id, long_result(id, 4_000));
 
-            let rows = printed_rows(&mut app, 80);
-            let budget = tool_result_budget(&app);
-            // The call block prints its own row(s) too; the result's own
-            // print is what the budget governs.
-            let result_rows = take_settled_prints(&mut app, 80);
-            assert!(result_rows.is_empty(), "everything printed once");
+            let rows = transcript_text(&mut app, 80);
+            let budget = tool_result_budget(&app, 80);
+            // The call's own header rides above the result's budget.
             assert!(
                 rows.len() <= budget + 4,
                 "screen_rows={screen_rows}: {} rows for a budget of {budget}",
@@ -1009,15 +1029,9 @@ mod tests {
     fn a_short_tool_result_keeps_every_line_and_gains_no_footer() {
         let (mut app, id) = fixture();
         app.screen_rows = 40;
-        let _ = printed_rows(&mut app, 80);
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(long_result(id, 3), 1)
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-        app.switch_to(id);
+        snapshot(&mut app, id, long_result(id, 3));
 
-        let rows = printed_rows(&mut app, 80);
+        let rows = transcript_text(&mut app, 80);
         for n in 0..3 {
             assert!(
                 rows.iter().any(|r| r.contains(&format!("line {n}"))),
@@ -1037,25 +1051,16 @@ mod tests {
     fn copy_mode_still_holds_the_lines_the_footer_promised() {
         let (mut app, id) = fixture();
         app.screen_rows = 24;
-        let _ = printed_rows(&mut app, 80);
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(long_result(id, 300), 1)
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-        app.switch_to(id);
+        snapshot(&mut app, id, long_result(id, 300));
 
-        let printed = printed_rows(&mut app, 80);
+        let shown = transcript_text(&mut app, 80);
         assert!(
-            !printed.iter().any(|r| r.contains("line 299")),
-            "scrollback is cut: {printed:?}"
+            !shown.iter().any(|r| r.contains("line 299")),
+            "the transcript is cut: {shown:?}"
         );
 
         let (_, copy) = copy_buffer_lines(&app, 80).expect("copy mode builds");
-        let copy_rows: Vec<String> = copy
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let copy_rows = text_of(&copy);
         assert!(
             copy_rows.iter().any(|r| r.contains("line 299")),
             "copy mode keeps the tail the footer pointed at"
@@ -1066,6 +1071,30 @@ mod tests {
         );
     }
 
+    /// The budget is one screenful less the band as it stands: a draft that
+    /// wrapped to a second row takes that row from the screenful too.
+    #[test]
+    fn the_budget_follows_the_bands_real_height() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = fixture();
+        app.screen_rows = 30;
+        let one_row = tool_result_budget(&app, 80);
+        assert_eq!(one_row, 26, "30 rows less a four-row band");
+        for code in [
+            KeyCode::Char('i'),
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Char('b'),
+        ] {
+            app.compose.press(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            tool_result_budget(&app, 80),
+            one_row - 1,
+            "a second draft row takes a row from the screenful"
+        );
+    }
+
     /// A tiny terminal still gets a usable head rather than a footer alone.
     #[test]
     fn the_budget_never_falls_below_the_floor() {
@@ -1073,25 +1102,23 @@ mod tests {
         for screen_rows in [0u16, 1, 8, 9, 12] {
             app.screen_rows = screen_rows;
             assert!(
-                tool_result_budget(&app) >= usize::from(TOOL_RESULT_FLOOR),
+                tool_result_budget(&app, 80) >= usize::from(TOOL_RESULT_FLOOR),
                 "screen_rows={screen_rows} fell below the floor"
             );
         }
     }
 
+    /// One frame: the transcript on top, the band under it, the status line
+    /// last.
     #[test]
     fn the_frame_carries_the_transcript_and_the_status_line() {
         let (mut app, _) = fixture();
-        // Five transcript rows, then the live region's four: the strip, the
-        // blank row, the prompt, the status line.
+        // Five transcript rows, then the band's four: the strip, the blank
+        // row, the prompt, the status line.
         let mut terminal =
             Terminal::new(TestBackend::new(96, 9)).expect("test backend builds");
-
-        let prints = take_settled_prints(&mut app, 96);
-        let transcript: Vec<Line<'static>> =
-            prints.into_iter().flat_map(|p| p.lines).collect();
-        let live = live_lines(&mut app, 96, 60_000, false);
-        draw_full(&mut terminal, &transcript, &live).expect("draw");
+        app.screen_rows = 9;
+        draw_screen(&mut terminal, &mut app, 60_000, false).expect("draw");
 
         let rows = rows(&terminal);
         assert!(
@@ -1105,6 +1132,7 @@ mod tests {
             "the model's divider follows: {rows:?}"
         );
         assert_eq!(rows[4], "rename and getattr share the cause.");
+        assert!(rows[7].starts_with('❯'), "the draft is the band's third row: {rows:?}");
 
         let status = rows.last().expect("a status line");
         assert!(status.starts_with("0 kaijutsu*"), "got {status:?}");
@@ -1123,17 +1151,11 @@ mod tests {
     /// about to press.
     fn the_armed_prefix_legend_takes_the_compose_row_and_the_status_line_stays() {
         let (mut app, _) = fixture();
-        let idle: Vec<String> = live_lines(&mut app, 96, 0, false)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let idle = band_text(&mut app, 96);
         let status = idle.last().expect("a status line").clone();
         assert!(idle.iter().any(|l| l.starts_with(crate::compose::PROMPT)), "idle draws the compose row");
 
-        let armed: Vec<String> = live_lines(&mut app, 96, 0, true)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let armed = text_of(&band_lines(&mut app, 96, 0, true));
         assert_eq!(armed.last(), Some(&status), "the status line is untouched");
         assert!(armed.iter().any(|l| l.starts_with("Ctrl+A:")), "the legend is drawn: {armed:?}");
         assert!(!armed.iter().any(|l| l.starts_with(crate::compose::PROMPT)), "the compose row is hidden: {armed:?}");
@@ -1144,25 +1166,21 @@ mod tests {
     #[test]
     fn the_transcript_has_no_border_glyphs() {
         let (mut app, _) = fixture();
-        let prints = take_settled_prints(&mut app, 96);
-        for print in prints {
-            for line in print.lines {
-                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                for glyph in ['│', '╭', '╮', '╰', '╯', '┌', '└'] {
-                    assert!(!text.contains(glyph), "{text:?} carries {glyph}");
-                }
+        for text in transcript_text(&mut app, 96) {
+            for glyph in ['│', '╭', '╮', '╰', '╯', '┌', '└'] {
+                assert!(!text.contains(glyph), "{text:?} carries {glyph}");
             }
         }
     }
 
-    /// The strip takes a tool call's body out of the band and names it on
-    /// one row instead; a running result's output still streams in the
-    /// stream; and the band is the same height with or without either
+    /// The strip takes a tool call's body out of the transcript and names it
+    /// on one row instead; a running result's output still streams in the
+    /// transcript; and the band is the same height with or without either
     /// (`docs/tui.md`, "The in-flight strip").
     #[test]
     fn an_unsettled_tool_call_is_a_strip_entry_and_the_band_does_not_grow() {
         let (mut app, id) = fixture();
-        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES);
+        assert_eq!(band_lines(&mut app, 80, 0, false).len(), usize::from(BAND_ROWS));
 
         let call = BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 9), BlockKind::ToolCall)
             .role(Role::Model)
@@ -1179,28 +1197,22 @@ mod tests {
             .content("test vfs::unlink_symlink ... ok")
             .created_at(2_000)
             .build();
-        let mut mirror = ContextMirror::new(id);
-        mirror.apply_snapshot(vec![call, result], 1).expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        snapshot(&mut app, id, vec![call, result]);
 
-        let live = live_lines(&mut app, 80, 5_000, false);
-        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "a tool call never grows the band");
-        assert!(live.len() <= usize::from(VIEWPORT_LINES), "{}", live.len());
-        let text: Vec<String> = live
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let band = text_of(&band_lines(&mut app, 80, 5_000, false));
+        assert_eq!(band.len(), usize::from(BAND_ROWS), "a tool call never grows the band");
         assert!(
-            text.iter().any(|l| l.contains("◐ shell cargo test -p kaijutsu-kernel · 4s")),
-            "the strip names the running call: {text:?}"
+            band.iter().any(|l| l.contains("◐ shell cargo test -p kaijutsu-kernel · 4s")),
+            "the strip names the running call: {band:?}"
+        );
+        let transcript = transcript_text(&mut app, 80);
+        assert!(
+            !transcript.iter().any(|l| l.contains(r#"{"command""#)),
+            "the call's body left the transcript: {transcript:?}"
         );
         assert!(
-            !text.iter().any(|l| l.contains(r#"{"command""#)),
-            "the call's body left the band: {text:?}"
-        );
-        assert!(
-            text.iter().any(|l| l.contains("unlink_symlink ... ok")),
-            "the running result's output still streams: {text:?}"
+            transcript.iter().any(|l| l.contains("unlink_symlink ... ok")),
+            "the running result's output still streams: {transcript:?}"
         );
     }
 
@@ -1210,24 +1222,23 @@ mod tests {
     #[test]
     fn the_strip_row_is_present_when_empty() {
         let (mut app, _) = fixture();
-        let live = live_lines(&mut app, 40, 0, false);
-        let prompt = live.iter().position(|l| l.spans.iter().any(|s| s.content.contains('❯'))).expect("prompt row");
-        let blank: String = live[prompt - 1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let band = band_lines(&mut app, 40, 0, false);
+        let prompt = band.iter().position(|l| l.spans.iter().any(|s| s.content.contains('❯'))).expect("prompt row");
+        let blank: String = band[prompt - 1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(blank.trim().is_empty());
-        let strip = &live[prompt - 2];
+        let strip = &band[prompt - 2];
         let text: String = strip.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, " ".repeat(40), "an empty strip is a full-width row of ground");
         assert!(strip.spans.iter().all(|s| s.style.bg.is_some()), "the strip's ground is painted");
     }
 
-    /// A tool call and its result print as one unit: the pair header
+    /// A tool call and its result render as one unit: the pair header
     /// (`─ caller · tool ─ arg ─… stamp`), then the result's body with no
     /// second divider and no gap; the model's next words get their own
     /// divider again (`docs/tui.md`, "Conversation").
     #[test]
-    fn a_tool_pair_prints_under_one_header() {
+    fn a_tool_pair_renders_under_one_header() {
         let (mut app, id) = fixture();
-        let _ = take_settled_prints(&mut app, 96);
         let principal = PrincipalId::new();
         let call = BlockSnapshotBuilder::new(BlockId::new(id, principal, 9), BlockKind::ToolCall)
             .role(Role::Model)
@@ -1245,16 +1256,9 @@ mod tests {
             .created_at(2_000)
             .build();
         let after = block(id, 11, BlockKind::Text, Role::Model, Status::Done, "Nothing pending.");
-        let mut mirror = ContextMirror::new(id);
-        mirror.apply_snapshot(vec![call, result, after], 1).expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        snapshot(&mut app, id, vec![call, result, after]);
 
-        let prints = take_settled_prints(&mut app, 96);
-        let rows: Vec<String> = prints
-            .iter()
-            .flat_map(|p| p.lines.iter())
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-            .collect();
+        let rows = transcript_text(&mut app, 96);
         let header = rows.iter().position(|r| r.starts_with("─ deepseek-v4 · shell ─ kj ledger list ─")).expect("the pair header");
         assert_eq!(rows[header + 1], "(no pending approvals)", "the result follows the header directly: {rows:?}");
         assert_eq!(rows.iter().filter(|r| r.contains("· shell")).count(), 1, "one header for the pair: {rows:?}");
@@ -1263,45 +1267,28 @@ mod tests {
         assert!(rows[next - 1].starts_with("─ deepseek-v4 · coder ─"), "the model's words get their divider back: {rows:?}");
     }
 
-    #[test]
-    fn a_long_stream_keeps_its_newest_lines() {
-        let (mut app, id) = fixture();
-        let body = (0..60).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-
-        let live = live_lines(&mut app, 80, 0, false);
-        assert!(live.len() <= usize::from(VIEWPORT_LINES));
-        let text: Vec<String> = live
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert!(text.iter().any(|l| l == "line 59"), "got {text:?}");
-        assert!(!text.iter().any(|l| l == "line 0"), "got {text:?}");
-    }
-
-    /// A multi-line draft grows the compose region inside the viewport, and
-    /// the transcript gives up the rows.
+    /// A draft past one row grows the band, and the transcript gives up the
+    /// rows — one screen, shared.
     #[test]
     fn a_multi_line_draft_takes_rows_from_the_transcript() {
         let (mut app, id) = fixture();
         let body = (0..20).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
+        );
+        let one_line = band_lines(&mut app, 80, 0, false).len();
+        assert_eq!(one_line, usize::from(BAND_ROWS));
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test backend builds");
+        app.screen_rows = 12;
+        draw_screen(&mut terminal, &mut app, 0, false).expect("draw");
+        let before = rows(&terminal);
+        let newest = before
+            .iter()
+            .position(|r| r == "line 19")
+            .unwrap_or_else(|| panic!("the newest line: {before:?}"));
 
-        let one_line = live_lines(&mut app, 80, 0, false).len();
         // `i` first: a fresh draft rests in normal mode.
         for code in [
             ratatui::crossterm::event::KeyCode::Char('i'),
@@ -1316,12 +1303,21 @@ mod tests {
                 ),
             );
         }
-        let grown = live_lines(&mut app, 80, 0, false);
-        // The band grows one row for the second draft row (a third of a
-        // 24-row screen is the cap, far above two), so the stream keeps its
-        // rows and the frame is one line taller.
-        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES + 1, "the band grew one row for the draft");
-        assert_eq!(grown.len(), one_line + 1, "the frame is one row taller");
+        assert_eq!(
+            band_lines(&mut app, 80, 0, false).len(),
+            one_line + 1,
+            "the band grew one row for the draft"
+        );
+        draw_screen(&mut terminal, &mut app, 0, false).expect("draw");
+        let after = rows(&terminal);
+        assert!(after.iter().any(|l| l.starts_with("❯ a")), "got {after:?}");
+        assert!(after.iter().any(|l| l.trim() == "b"), "the second draft row: {after:?}");
+        assert_eq!(
+            after.iter().position(|r| r == "line 19"),
+            Some(newest - 1),
+            "the transcript gave up a row: {after:?}"
+        );
+
         // Past the cap the band stops growing and the draft scrolls instead.
         app.screen_rows = 6; // cap = 2 rows
         for _ in 0..3 {
@@ -1330,14 +1326,11 @@ mod tests {
                 ratatui::crossterm::event::KeyModifiers::NONE,
             ));
         }
-        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES + 1, "capped at a third of the screen");
-        app.screen_rows = 24;
-        let text: Vec<String> = grown
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert!(text.iter().any(|l| l.starts_with("❯ a")), "got {text:?}");
-        assert!(text.iter().any(|l| l.trim() == "b"), "the second draft row: {text:?}");
+        assert_eq!(
+            band_lines(&mut app, 80, 0, false).len(),
+            one_line + 1,
+            "capped at a third of the screen"
+        );
     }
 
     /// `:` swaps the compose row for the `:` bar, and the prompt glyph
@@ -1355,11 +1348,7 @@ mod tests {
             press(&mut app, KeyCode::Char(c));
         }
 
-        let live = live_lines(&mut app, 96, 0, false);
-        let text: Vec<String> = live
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let text = band_text(&mut app, 96);
         assert!(text.iter().any(|l| l.starts_with(":kj con")), "got {text:?}");
         assert!(!text.iter().any(|l| l.contains("❯")), "the draft prompt left with the draft: {text:?}");
     }
@@ -1367,18 +1356,15 @@ mod tests {
     #[test]
     fn a_waiting_block_is_not_settled() {
         let id = ContextId::new();
-        let waiting = block(id, 1, BlockKind::ToolCall, Role::Model, Status::Waiting, "rm -rf");
+        let waiting = block(id, 1, BlockKind::ToolCall, Role::Model, Status::Waiting, "danger");
         assert!(!is_settled(&waiting), "an unanswered ask can still move");
         let done = block(id, 2, BlockKind::ToolCall, Role::Model, Status::Done, "ls");
         assert!(is_settled(&done));
     }
 
-    /// An open ask card replaces the block stream and compose line entirely
-    /// — the status line still renders beneath it (`docs/tui.md`, "Asks").
-    #[test]
-    fn an_ask_card_replaces_the_live_region_and_keeps_the_status_line() {
-        let (mut app, id) = fixture();
-        app.ask_card = Some(crate::asks::AskCardState {
+    /// An ask card, ready to put on `App::ask_card`.
+    fn ask_card(id: ContextId, statement: &str) -> crate::asks::AskCardState {
+        crate::asks::AskCardState {
             request_id: "01a04eb6".to_string(),
             context_id: id,
             detail: kaijutsu_client::AskDetail {
@@ -1395,9 +1381,9 @@ mod tests {
                 tool: Some("shell_write".to_string()),
                 hook_id: None,
                 instance: None,
-                description: "rm -rf ~/src/wt/kaish-arith".to_string(),
+                description: statement.to_string(),
                 authorized_label: None,
-                statements: vec!["rm -rf ~/src/wt/kaish-arith".to_string()],
+                statements: vec![statement.to_string()],
                 exec_source: None,
                 cwd: None,
                 env: Vec::new(),
@@ -1409,255 +1395,138 @@ mod tests {
                 remember_scope: None,
                 redeemed_at: None,
             },
-        });
-        let mut terminal = Terminal::new(TestBackend::new(96, 4)).expect("test backend builds");
-        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
+        }
+    }
+
+    /// A ledger view of `n` pending rows.
+    fn ledger_view(n: usize) -> crate::asks::LedgerViewState {
+        crate::asks::LedgerViewState {
+            rows: (0..n)
+                .map(|i| {
+                    crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
+                        request_id: format!("p{i}"),
+                        age: Some("1s".to_string()),
+                        context_label: "kaijutsu".to_string(),
+                        context_type: "coder".to_string(),
+                        hook: "shell_write".to_string(),
+                        asker: None,
+                        reviewer: None,
+                        reviewable: true,
+                        statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
+                    })
+                })
+                .collect(),
+            filter: String::new(),
+            selected: 0,
+            filtering: false,
+            detail: None,
+        }
+    }
+
+    /// An open ask card is an overlay between the transcript and the band:
+    /// the band's own rows — the draft and the status line — stay
+    /// (`docs/tui.md`, "Asks").
+    #[test]
+    fn an_ask_card_is_an_overlay_over_the_transcript() {
+        let (mut app, id) = fixture();
+        app.ask_card = Some(ask_card(id, "git worktree remove --force"));
+        let mut terminal = Terminal::new(TestBackend::new(96, 12)).expect("test backend builds");
+        app.screen_rows = 12;
+        draw_screen(&mut terminal, &mut app, 0, false).expect("draw");
         let text = rows(&terminal);
-        assert!(text[0].contains("⚠ ask 01a04eb6"), "got {text:?}");
-        assert!(text[0].contains("shell_write"), "got {text:?}");
-        assert!(text.iter().any(|l| l.contains("rm -rf ~/src/wt/kaish-arith")), "got {text:?}");
+        let card = text
+            .iter()
+            .position(|l| l.contains("⚠ ask 01a04eb6"))
+            .unwrap_or_else(|| panic!("the card is drawn: {text:?}"));
+        assert!(text[card].contains("shell_write"), "got {text:?}");
+        assert!(text.iter().any(|l| l.contains("git worktree remove --force")), "got {text:?}");
+        let compose = text
+            .iter()
+            .position(|l| l.starts_with('❯'))
+            .unwrap_or_else(|| panic!("the draft stays: {text:?}"));
+        assert!(card < compose, "the card is above the band: {text:?}");
         assert!(text.last().unwrap().starts_with("0 kaijutsu*"), "status line still renders: {text:?}");
     }
 
-    /// A long ask statement at a narrow width wraps past the old fixed
-    /// `VIEWPORT_LINES - 1` budget; the key-hints line — the only way to
-    /// answer the ask — must be the last content line, not the header or a
-    /// middle row of the wrapped statement (kaibo review, 2026-09-03).
+    /// The overlay keeps its tail when the screen cannot hold it: the
+    /// key-hints line — the only way to answer a pending ask — is the last
+    /// row it has, never the one that drops (kaibo review, 2026-09-03).
     #[test]
     fn a_long_ask_statement_keeps_the_key_hints_line_last() {
         let (mut app, id) = fixture();
-        let statement =
-            "one two three four five six seven eight nine ten eleven twelve thirteen".to_string();
-        app.ask_card = Some(crate::asks::AskCardState {
-            request_id: "01a04eb6".to_string(),
-            context_id: id,
-            detail: kaijutsu_client::AskDetail {
-                request_id: "01a04eb6".to_string(),
-                context_id: Some(id),
-                principal_id: None,
-                principal_name: None,
-                actor_id: None,
-                actor_name: None,
-                reviewer_id: None,
-                reviewer_name: None,
-                status: "pending".to_string(),
-                origin: "shell_gate".to_string(),
-                tool: Some("shell_write".to_string()),
-                hook_id: None,
-                instance: None,
-                description: statement.clone(),
-                authorized_label: None,
-                statements: vec![statement],
-                exec_source: None,
-                cwd: None,
-                env: Vec::new(),
-                created_at: None,
-                decided_at: None,
-                decided_by: None,
-                decided_by_name: None,
-                decided_option: None,
-                remember_scope: None,
-                redeemed_at: None,
-            },
-        });
-        let live = live_lines(&mut app, 16, 0, false);
-        let last_content: String = live[live.len() - 2].spans.iter().map(|s| s.content.as_ref()).collect();
+        app.ask_card = Some(ask_card(
+            id,
+            "one two three four five six seven eight nine ten eleven twelve thirteen",
+        ));
+        let overlay = text_of(&overlay_lines(&mut app, 16));
         assert!(
-            last_content.contains("Esc aside"),
-            "key hints must be the last content line before the status line, got {last_content:?} in {live:?}"
+            overlay.last().is_some_and(|l| l.contains("Esc aside")),
+            "key hints must be the overlay's last row, got {overlay:?}"
         );
     }
 
-    /// A ledger with more rows than the old fixed budget loses the same
-    /// key-hints line the same way — `a allow once ... Esc back` must stay
-    /// visible.
+    /// A ledger with more rows than the screen loses the same key-hints
+    /// line the same way — `a allow once ... Esc back` must stay visible.
     #[test]
     fn a_long_ledger_keeps_the_key_hints_line_last() {
         let (mut app, _id) = fixture();
-        let ledger_rows = (0..10)
-            .map(|i| {
-                crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
-                    request_id: format!("p{i}"),
-                    age: Some("1s".to_string()),
-                    context_label: "kaijutsu".to_string(),
-                    context_type: "coder".to_string(),
-                    hook: "shell_write".to_string(),
-                    asker: None,
-                    reviewer: None,
-                    reviewable: true,
-                    statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
-                })
-            })
-            .collect();
-        app.ledger_view = Some(crate::asks::LedgerViewState {
-            rows: ledger_rows,
-            filter: String::new(),
-            selected: 0,
-            filtering: false,
-            detail: None,
-        });
-        let live = live_lines(&mut app, 96, 0, false);
-        let last_content: String = live[live.len() - 2].spans.iter().map(|s| s.content.as_ref()).collect();
+        app.ledger_view = Some(ledger_view(10));
+        let overlay = text_of(&overlay_lines(&mut app, 96));
         assert!(
-            last_content.starts_with("a allow once"),
-            "key hints must be the last content line before the status line, got {last_content:?}"
+            overlay.last().is_some_and(|l| l.starts_with("a allow once")),
+            "key hints must be the overlay's last row, got {overlay:?}"
         );
     }
 
-    /// [`viewport_lines`] must grow to fit an open ask card's full render,
-    /// the same treatment the picker already gets — a long statement at a
-    /// narrow width needs more than [`VIEWPORT_LINES`].
+    /// A screen too short for the overlay crops it from the FRONT, so the
+    /// key-hints line is what survives, directly above the band.
     #[test]
-    fn viewport_lines_grows_for_an_open_ask_card() {
-        let (mut app, id) = fixture();
-        let statement =
-            "one two three four five six seven eight nine ten eleven twelve thirteen".to_string();
-        app.ask_card = Some(crate::asks::AskCardState {
-            request_id: "01a04eb6".to_string(),
-            context_id: id,
-            detail: kaijutsu_client::AskDetail {
-                request_id: "01a04eb6".to_string(),
-                context_id: Some(id),
-                principal_id: None,
-                principal_name: None,
-                actor_id: None,
-                actor_name: None,
-                reviewer_id: None,
-                reviewer_name: None,
-                status: "pending".to_string(),
-                origin: "shell_gate".to_string(),
-                tool: Some("shell_write".to_string()),
-                hook_id: None,
-                instance: None,
-                description: statement.clone(),
-                authorized_label: None,
-                statements: vec![statement],
-                exec_source: None,
-                cwd: None,
-                env: Vec::new(),
-                created_at: None,
-                decided_at: None,
-                decided_by: None,
-                decided_by_name: None,
-                decided_option: None,
-                remember_scope: None,
-                redeemed_at: None,
-            },
-        });
-        assert!(viewport_lines(&app, 12) > VIEWPORT_LINES);
-    }
-
-    /// Same for the ledger, and its growth must not depend on width — its
-    /// rows never wrap, they truncate (`ledger_viewport_lines`).
-    #[test]
-    fn viewport_lines_grows_for_an_open_ledger() {
+    fn a_screen_shorter_than_the_overlay_keeps_its_tail() {
         let (mut app, _id) = fixture();
-        let ledger_rows = (0..10)
-            .map(|i| {
-                crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
-                    request_id: format!("p{i}"),
-                    age: Some("1s".to_string()),
-                    context_label: "kaijutsu".to_string(),
-                    context_type: "coder".to_string(),
-                    hook: "shell_write".to_string(),
-                    asker: None,
-                    reviewer: None,
-                    reviewable: true,
-                    statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
-                })
-            })
-            .collect();
-        app.ledger_view = Some(crate::asks::LedgerViewState {
-            rows: ledger_rows,
-            filter: String::new(),
-            selected: 0,
-            filtering: false,
-            detail: None,
-        });
-        assert!(viewport_lines(&app, 96) > VIEWPORT_LINES);
-    }
-
-    /// A terminal shorter than the grown view crops from the FRONT, keeping
-    /// the tail — the key-hints line is the last thing an ask card or the
-    /// ledger renders, so it is the last thing that should disappear, not
-    /// the first (`docs/tui.md`, "The picker").
-    #[test]
-    fn a_terminal_shorter_than_the_grown_view_keeps_the_tail() {
-        let (mut app, _id) = fixture();
-        let ledger_rows = (0..10)
-            .map(|i| {
-                crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
-                    request_id: format!("p{i}"),
-                    age: Some("1s".to_string()),
-                    context_label: "kaijutsu".to_string(),
-                    context_type: "coder".to_string(),
-                    hook: "shell_write".to_string(),
-                    asker: None,
-                    reviewer: None,
-                    reviewable: true,
-                    statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
-                })
-            })
-            .collect();
-        app.ledger_view = Some(crate::asks::LedgerViewState {
-            rows: ledger_rows,
-            filter: String::new(),
-            selected: 0,
-            filtering: false,
-            detail: None,
-        });
-        // The full view needs more than 4 rows; hand draw_live a terminal
-        // that only has 4.
-        let mut terminal = Terminal::new(TestBackend::new(96, 4)).expect("test backend builds");
-        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
+        app.ledger_view = Some(ledger_view(10));
+        let mut terminal = Terminal::new(TestBackend::new(96, 6)).expect("test backend builds");
+        app.screen_rows = 6;
+        draw_screen(&mut terminal, &mut app, 0, false).expect("draw");
         let text = rows(&terminal);
         assert!(
             text.last().unwrap().starts_with("0 kaijutsu*"),
             "status line still last: {text:?}"
         );
         assert!(
-            text[text.len() - 2].starts_with("a allow once"),
-            "key hints must be the row above status when the terminal is short: {text:?}"
+            text.iter().any(|l| l.starts_with("a allow once")),
+            "the key hints survive the crop: {text:?}"
         );
     }
 
-    /// Copy mode's buffer holds the whole context — including a block
-    /// already printed to scrollback, which `live_plan`/`take_settled_prints`
-    /// deliberately exclude — and excludes the draft, which is compose's
-    /// line, not the transcript.
+    /// Copy mode's buffer holds the whole context and excludes the draft,
+    /// which is compose's line, not the transcript.
     #[test]
     fn copy_buffer_lines_covers_the_whole_context_but_not_the_draft() {
         let (mut app, id) = fixture();
-        // `fixture` already settled two blocks; print them so they would be
-        // invisible to `live_plan`.
-        let _ = take_settled_prints(&mut app, 80);
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![
-                    block(id, 1, BlockKind::Text, Role::User, Status::Done, "and getattr?"),
-                    block(
-                        id,
-                        2,
-                        BlockKind::Text,
-                        Role::Model,
-                        Status::Done,
-                        "rename and getattr share the cause.",
-                    ),
-                    BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 3), BlockKind::Text)
-                        .role(Role::User)
-                        .status(Status::Draft)
-                        .content("still typing")
-                        .build(),
-                ],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.get_mut(&id).expect("a view").mirror = mirror;
+        snapshot(
+            &mut app,
+            id,
+            vec![
+                block(id, 1, BlockKind::Text, Role::User, Status::Done, "and getattr?"),
+                block(
+                    id,
+                    2,
+                    BlockKind::Text,
+                    Role::Model,
+                    Status::Done,
+                    "rename and getattr share the cause.",
+                ),
+                BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 3), BlockKind::Text)
+                    .role(Role::User)
+                    .status(Status::Draft)
+                    .content("still typing")
+                    .build(),
+            ],
+        );
 
         let (label, lines) = copy_buffer_lines(&app, 80).expect("a context is on screen");
         assert_eq!(label, "kaijutsu");
-        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        let text = text_of(&lines);
         assert!(text.iter().any(|l| l.contains("and getattr?")), "got {text:?}");
         assert!(text.iter().any(|l| l.contains("rename and getattr")), "got {text:?}");
         assert!(!text.iter().any(|l| l.contains("still typing")), "the draft is not the transcript: {text:?}");
@@ -1669,73 +1538,39 @@ mod tests {
         assert!(copy_buffer_lines(&app, 80).is_none());
     }
 
-    /// The ledger view replaces the live region the same way, both sections
-    /// visible (`docs/tui.md`, "The ledger").
+    /// The ledger view is an overlay too, both sections visible
+    /// (`docs/tui.md`, "The ledger").
     #[test]
-    fn the_ledger_view_replaces_the_live_region() {
+    fn the_ledger_view_draws_over_the_transcript() {
         let (mut app, _id) = fixture();
-        app.ledger_view = Some(crate::asks::LedgerViewState {
-            rows: vec![crate::asks::LedgerRow::Pending(crate::asks::PendingRow {
-                request_id: "p1".to_string(),
-                age: Some("12s".to_string()),
-                context_label: "kaijutsu".to_string(),
-                context_type: "coder".to_string(),
-                hook: "shell_write".to_string(),
-                asker: None,
-                reviewer: None,
-                reviewable: true,
-                statement: "git worktree remove --force".to_string(),
-            })],
-            filter: String::new(),
-            selected: 0,
-            filtering: false,
-            detail: None,
-        });
-        // LEDGER header + PENDING + one row + key line + status: 5 lines,
-        // the full render `viewport_lines` would grow the real viewport to
-        // hold (`a_terminal_shorter_than_the_grown_view_keeps_the_tail`
-        // covers the undersized case on purpose; this test wants the
-        // ordinary one).
-        let mut terminal = Terminal::new(TestBackend::new(96, 5)).expect("test backend builds");
-        draw_live(&mut terminal, &mut app, 0, false).expect("draw");
-        let text = rows(&terminal);
-        assert!(text[0].starts_with("LEDGER"), "got {text:?}");
-        assert!(text.iter().any(|l| l.contains("p1") && l.contains("shell_write")), "got {text:?}");
+        app.ledger_view = Some(ledger_view(1));
+        let overlay = text_of(&overlay_lines(&mut app, 96));
+        assert!(overlay[0].starts_with("LEDGER"), "got {overlay:?}");
+        assert!(overlay.iter().any(|l| l.contains("p0") && l.contains("shell_write")), "got {overlay:?}");
     }
 
     // ────────────────────────────────────────────────────────────────────
     // The thinking pane (docs/tui.md, "The thinking pane")
     // ────────────────────────────────────────────────────────────────────
 
-    fn text_of(lines: &[Line<'static>]) -> Vec<String> {
-        lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect()
-    }
-
-    /// A completed `Thinking` block prints as one `▸` stub naming its size
-    /// and first line, whatever its collapse state.
+    /// A completed `Thinking` block is one `▸` stub in the transcript,
+    /// naming its size and first line, whatever its collapse state.
     #[test]
-    fn a_completed_thinking_block_prints_as_a_stub() {
+    fn a_completed_thinking_block_renders_as_a_stub() {
         let (mut app, id) = fixture();
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(
-                    id,
-                    9,
-                    BlockKind::Thinking,
-                    Role::Model,
-                    Status::Done,
-                    "first the unlink path\nthen rename\nthen getattr",
-                )],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
-        let prints = take_settled_prints(&mut app, 80);
-        let rows = text_of(&prints.last().expect("a print").lines);
+        snapshot(
+            &mut app,
+            id,
+            vec![block(
+                id,
+                9,
+                BlockKind::Thinking,
+                Role::Model,
+                Status::Done,
+                "first the unlink path\nthen rename\nthen getattr",
+            )],
+        );
+        let rows = transcript_text(&mut app, 80);
         let stub = rows.last().expect("a stub row");
         assert!(stub.starts_with("▸ thinking · 3 lines · first the unlink path"), "got {stub:?}");
         assert!(!rows.iter().any(|r| r.contains("then rename")), "the body stays out: {rows:?}");
@@ -1771,34 +1606,32 @@ mod tests {
         assert!(!rows.iter().any(|r| r.starts_with("▸ thinking")), "no stub here: {rows:?}");
     }
 
-    fn streaming_thinking(app: &mut App, id: ContextId, lines: usize) {
+    /// A turn whose reasoning is still streaming. Returns the thinking
+    /// block's id — what a delivery names as touched.
+    fn streaming_thinking(app: &mut App, id: ContextId, lines: usize) -> BlockId {
         let body = (0..lines).map(|n| format!("thought {n}")).collect::<Vec<_>>().join("\n");
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![block(id, 9, BlockKind::Thinking, Role::Model, Status::Running, &body)],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        let thinking = block(id, 9, BlockKind::Thinking, Role::Model, Status::Running, &body);
+        let block_id = thinking.id;
+        snapshot(app, id, vec![thinking]);
+        block_id
     }
 
     /// A turn whose reasoning already completed and whose answer is now
     /// streaming: a `Done` Thinking block of `lines` rows, then a `Running`
     /// Text block.
-    fn thinking_then_answer(app: &mut App, id: ContextId, lines: usize) {
+    fn thinking_then_answer(app: &mut App, id: ContextId, lines: usize) -> BlockId {
         let body = (0..lines).map(|n| format!("thought {n}")).collect::<Vec<_>>().join("\n");
-        let mut mirror = ContextMirror::new(id);
-        mirror
-            .apply_snapshot(
-                vec![
-                    block(id, 9, BlockKind::Thinking, Role::Model, Status::Done, &body),
-                    block(id, 10, BlockKind::Text, Role::Model, Status::Running, "The unlink bug"),
-                ],
-                1,
-            )
-            .expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        let thinking = block(id, 9, BlockKind::Thinking, Role::Model, Status::Done, &body);
+        let block_id = thinking.id;
+        snapshot(
+            app,
+            id,
+            vec![
+                thinking,
+                block(id, 10, BlockKind::Text, Role::Model, Status::Running, "The unlink bug"),
+            ],
+        );
+        block_id
     }
 
     /// The pane opens at a running turn's first `Thinking` block and holds
@@ -1808,51 +1641,62 @@ mod tests {
     #[test]
     fn the_pane_latches_at_the_turns_first_thinking_and_holds_to_its_end() {
         let (mut app, id) = fixture();
-        streaming_thinking(&mut app, id, 3);
-        assert!(!app.observe_thinking(id), "no known turn: nothing to latch");
-        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "no known turn: no pane");
+        let thinking = streaming_thinking(&mut app, id, 3);
+        assert!(!app.observe_thinking(id, &[thinking]), "no known turn: nothing to latch");
+        assert!(overlay_lines(&mut app, 80).is_empty(), "no known turn: no pane");
         app.mark_turn_running(id);
-        assert!(app.observe_thinking(id));
-        assert_eq!(viewport_lines(&app, 80), thinking_pane_lines(&app));
+        assert!(app.observe_thinking(id, &[thinking]));
+        assert!(!overlay_lines(&mut app, 80).is_empty());
 
-        thinking_then_answer(&mut app, id, 3);
-        assert_eq!(viewport_lines(&app, 80), thinking_pane_lines(&app), "the block completing is not the dismiss");
+        let done = thinking_then_answer(&mut app, id, 3);
+        assert!(!overlay_lines(&mut app, 80).is_empty(), "the block completing is not the dismiss");
+        assert_eq!(done.seq, thinking.seq, "the same block, now settled");
         app.mark_turn_ended(id);
-        assert_eq!(viewport_lines(&app, 80), VIEWPORT_LINES, "the turn's end closes it");
+        assert!(overlay_lines(&mut app, 80).is_empty(), "the turn's end closes it");
+    }
+
+    /// Reasoning an earlier turn left in the mirror does not open the pane:
+    /// the latch is on a block this delivery touched.
+    #[test]
+    fn stale_reasoning_does_not_latch_a_new_turn() {
+        let (mut app, id) = fixture();
+        let _stale = streaming_thinking(&mut app, id, 3);
+        app.mark_turn_running(id);
+        assert!(!app.observe_thinking(id, &[]), "a delivery that touched no thinking block");
+        assert!(overlay_lines(&mut app, 80).is_empty(), "no pane for reasoning nobody sent");
     }
 
     /// A completed thinking block seen only after it completed — one
-    /// delivery carried the whole thing — still opens the pane, as long as
-    /// its stub has not printed yet.
+    /// delivery carried the whole thing — still opens the pane.
     #[test]
     fn a_thinking_block_that_completed_inside_one_delivery_still_latches() {
         let (mut app, id) = fixture();
         app.mark_turn_running(id);
-        thinking_then_answer(&mut app, id, 3);
-        assert!(app.observe_thinking(id));
+        let thinking = thinking_then_answer(&mut app, id, 3);
+        assert!(app.observe_thinking(id, &[thinking]));
     }
 
-    /// The band above the stream keeps the reasoning's tail while the
-    /// answer streams below it, so the answer never scrolls the reasoning
-    /// out of the pane.
+    /// The pane holds the reasoning's tail, a third of the screen, and the
+    /// block it is showing is not repeated in the transcript below it.
     #[test]
-    fn the_band_holds_the_latest_reasoning_above_the_streaming_answer() {
+    fn the_pane_holds_the_latest_reasoning_and_the_transcript_drops_it() {
         let (mut app, id) = fixture();
         app.mark_turn_running(id);
-        thinking_then_answer(&mut app, id, 30);
-        assert!(app.observe_thinking(id));
-        let live = live_lines(&mut app, 80, 0, false);
-        // A short answer leaves the frame under the viewport's height;
-        // `draw_live` bottom-aligns it. What must hold is the band's shape.
-        assert!(live.len() <= usize::from(thinking_pane_lines(&app)), "{}", live.len());
-        let rows = text_of(&live);
-        let newest = rows.iter().position(|r| r == "thought 29").expect("the newest line");
-        // A 24-row screen gives the band a third: eight rows of tail.
+        let thinking = thinking_then_answer(&mut app, id, 30);
+        assert!(app.observe_thinking(id, &[thinking]));
+
+        // A 24-row screen gives the pane a third: eight rows of tail.
         assert_eq!(thinking_band_lines(&app), 8);
-        let oldest = rows.iter().position(|r| r == "thought 22").expect("eight rows of tail");
-        assert!(!rows.iter().any(|r| r == "thought 21"), "the band is a third of the screen: {rows:?}");
-        let answer = rows.iter().position(|r| r.contains("The unlink bug")).expect("the answer streams");
-        assert!(oldest < newest && newest < answer, "band above the stream: {rows:?}");
-        assert_eq!(rows[newest + 1], "", "one blank row between them: {rows:?}");
+        let pane = text_of(&overlay_lines(&mut app, 80));
+        assert_eq!(pane.len(), 8, "got {pane:?}");
+        assert_eq!(pane.first().map(String::as_str), Some("thought 22"), "got {pane:?}");
+        assert_eq!(pane.last().map(String::as_str), Some("thought 29"), "got {pane:?}");
+
+        let transcript = transcript_text(&mut app, 80);
+        assert!(transcript.iter().any(|r| r.contains("The unlink bug")), "the answer streams: {transcript:?}");
+        assert!(
+            !transcript.iter().any(|r| r.starts_with("▸ thinking")),
+            "the pane's block is not repeated as a stub: {transcript:?}"
+        );
     }
 }

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Terminal client for the kaijutsu kernel: ratatui over an inline viewport, kernel over SSH"
+description = "Terminal client for the kaijutsu kernel: ratatui over the alternate screen, kernel over SSH"
 
 [[bin]]
 name = "kaijutsu-tui"
@@ -55,7 +55,7 @@ serde_json = { workspace = true }
 # a timezone.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
-# `SIGTSTP` for `Ctrl+Z Ctrl+Z`. The inline viewport suspends the process the
+# `SIGTSTP` for `Ctrl+Z`. The client suspends the process the
 # way a shell job does, so the raise is a real signal, not an emulation.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

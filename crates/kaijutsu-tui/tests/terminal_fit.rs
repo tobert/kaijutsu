@@ -1,10 +1,10 @@
 //! Terminal-fit integration probes: the real `kaijutsu-tui` binary, in a
 //! pty, against an in-process ephemeral kernel (`support::EphemeralServer`).
 //!
-//! The crate's 207 unit tests render pure functions onto a
-//! `ratatui::TestBackend`; nothing there exercises the inline viewport
-//! itself — `insert_before` into scrollback, viewport regrow, resize, or
-//! terminal restore. That is what these probes cover.
+//! The crate's unit tests render pure functions onto a
+//! `ratatui::TestBackend`; nothing there exercises the terminal itself —
+//! taking and giving back the alternate screen, a real resize, the cursor
+//! the client never asks for, or suspend. That is what these probes cover.
 //!
 //! Each probe gets its own server (its own kernel, its own tempdir) and its
 //! own pty, and the probes run one at a time (`support::serial`). Slow
@@ -15,21 +15,15 @@
 //! cargo test -p kaijutsu-tui --test terminal_fit
 //! ```
 //!
-//! A first pass of these probes assumed a freshly created context draws a
-//! blank scrollback above the viewport. That is false: a `coder` context's
-//! create-time rc lifecycle (`assets/defaults/rc/coder/create/`) prints its
-//! own trace/tool blocks into scrollback before the live view ever draws,
-//! same as any other completed block (`docs/tui.md`, the transcript flows
-//! into the terminal's own scrollback). So "fits" here means the live
-//! region renders exactly once, inside its reserved band, and never leaks
-//! into — or is contaminated by — the scrollback area above it, not that
-//! the scrollback is empty.
+//! The transcript area is never blank at startup: a `coder` context's
+//! create-time rc lifecycle (`assets/defaults/rc/coder/create/`) authors
+//! trace and tool blocks, and the transcript renders every block the
+//! context has.
 
 mod support;
 
 use std::time::Duration;
 
-use kaijutsu_tui::render::VIEWPORT_LINES;
 use support::{EphemeralServer, TuiSession, serial, write_ephemeral_key};
 
 /// How long to wait for the client to connect and render its first frame.
@@ -43,6 +37,20 @@ fn spawn_session(rows: u16, cols: u16) -> (EphemeralServer, tempfile::TempDir, T
     let key_path = write_ephemeral_key(key_dir.path());
     let session = TuiSession::spawn(server.addr, &key_path, rows, cols);
     (server, key_dir, session)
+}
+
+/// Type `:q` and wait for the client to exit.
+///
+/// `Esc` goes on its own: crossterm reads `ESC` followed by another byte in
+/// the same buffer as `Alt+<byte>`, so a client that happens to be mid-frame
+/// when the bytes land never sees the `:`.
+fn quit(session: &mut TuiSession) {
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(":q\r");
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    let status = status.unwrap_or_else(|| panic!("process did not exit: {}", session.dump("still running")));
+    assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after :q"));
 }
 
 /// Wait for the compose prompt (`crate::compose::PROMPT`, `❯ `) to appear
@@ -75,46 +83,44 @@ fn picker_row(rows: &[String]) -> Option<usize> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// a. Startup fits inside the viewport at 80x24
+// a. Startup draws the transcript and the band at 80x24
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The owned screen is the transcript on top and the band at the bottom:
+/// the in-flight strip, a blank row, the draft and the status line
+/// (`docs/tui.md`, "The owned screen"). A `coder` context's create-time rc
+/// lifecycle prints real blocks, so the transcript above the band has
+/// content from the first frame.
 #[test]
-fn startup_fits_inside_the_viewport_at_80x24() {
+fn startup_draws_the_transcript_and_the_band() {
     let _serial = serial();
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
+    let settled = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, 80).collect();
+        compose_row(&rows) == Some(22)
+    });
+    assert!(settled, "{}", session.dump("startup"));
+
     let rows = session.screen_text();
     assert_eq!(rows.len(), 24, "{}", session.dump("startup"));
+    assert!(!rows[23].trim().is_empty(), "expected the status line on the last row:\n{}", session.dump("startup"));
+    assert!(rows[21].trim().is_empty(), "expected the blank row over the draft:\n{}", session.dump("startup"));
 
-    // With nothing streaming, the live region is just compose + status: two
-    // lines, bottom-aligned inside the reserved `VIEWPORT_LINES`-row band so
-    // the status line is the terminal's last row (`docs/tui.md`, ruling 1:
-    // "a viewport at the bottom"). The band's unused rows are the blank gap
-    // above compose, never a gap under the status line.
-    let band_start = 24 - usize::from(VIEWPORT_LINES);
-    let band = &rows[band_start..];
+    // The draft is on screen exactly once, and the transcript above it
+    // carries the lifecycle's own blocks.
     assert_eq!(
-        compose_row(&rows),
-        Some(22),
-        "expected compose on the second-to-last row, directly above the status line:\n{}",
+        rows.iter().filter(|l| l.contains('\u{276f}')).count(),
+        1,
+        "the band renders once:\n{}",
         session.dump("startup")
     );
-    assert!(!rows[23].trim().is_empty(), "expected the status line on the last row:\n{}", session.dump("startup"));
-    for (offset, line) in band.iter().enumerate().take(band.len() - 2) {
-        assert!(
-            line.trim().is_empty(),
-            "row {} in the live band was unexpectedly non-blank: {line:?}\n{}",
-            band_start + offset,
-            session.dump("startup")
-        );
-    }
-
-    // The live region renders exactly once: it must never leak into the
-    // scrollback area above its reserved band.
-    for (i, line) in rows.iter().enumerate().take(band_start) {
-        assert!(!line.contains('❯'), "the compose prompt leaked into scrollback at row {i}: {line:?}\n{}", session.dump("startup"));
-    }
+    assert!(
+        rows[..20].iter().any(|l| !l.trim().is_empty()),
+        "the transcript area is empty:\n{}",
+        session.dump("startup")
+    );
 
     // No row's rendered content is wider than the terminal.
     for line in &rows {
@@ -141,41 +147,27 @@ fn typing_lands_on_the_compose_row() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// c. Picker grows and shrinks cleanly
+// c. The picker is an overlay and leaves the transcript intact
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The picker draws over the foot of the transcript area, above the band;
+/// dismissing it redraws the transcript exactly where it was
+/// (`docs/tui.md`, "The owned screen": every surface is an overlay).
 #[test]
-fn the_picker_grows_and_shrinks_the_viewport_cleanly() {
+fn the_picker_opens_as_an_overlay_and_leaves_the_transcript_intact() {
     let _serial = serial();
-    // Start with the band at the screen bottom, the way a session that has
-    // printed a transcript sits: only there does a grow have to scroll, and
-    // a resize anchored on the wrong row scrolls by a whole band.
-    let server = EphemeralServer::start();
-    let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
-    let key_path = write_ephemeral_key(key_dir.path());
-    let session = TuiSession::spawn_after_newlines(server.addr, &key_path, 24, 80, 20);
+    let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
-    let at_bottom = session.wait_until(Duration::from_secs(5), |screen| {
-        let rows: Vec<String> = screen.rows(0, 80).collect();
-        compose_row(&rows) == Some(22)
-    });
-    assert!(at_bottom, "the band never reached the bottom: {}", session.dump("startup"));
-    // Put a row worth losing right above the band: blank rows above it
-    // would make a wrong scroll invisible.
+
+    // A row worth watching right above the band: blank rows would make a
+    // lost redraw invisible.
     session.send(":!echo marker-row\r");
-    let marked = session.wait_until(Duration::from_secs(10), |screen| {
+    let marked = session.wait_until(Duration::from_secs(20), |screen| {
         let rows: Vec<String> = screen.rows(0, 80).collect();
-        compose_row(&rows) == Some(22) && rows[24 - usize::from(VIEWPORT_LINES) - 1].contains("marker-row")
+        compose_row(&rows) == Some(22) && rows[19].contains("marker-row")
     });
     assert!(marked, "no transcript row landed above the band: {}", session.dump("marker"));
-
-    let baseline_rows = session.screen_text();
-    let baseline_top = compose_row(&baseline_rows).expect("compose row is drawn at startup");
-    // The transcript's last row sits right above the 7-row viewport: the
-    // compose row is the band's second-to-last row, so five rows above it
-    // is the band's top and the row above that is the transcript's.
-    let above_viewport = baseline_top.checked_sub(6).expect("the viewport is not at the screen top");
-    let last_transcript_row = baseline_rows[above_viewport].clone();
+    let before = session.screen_text();
 
     // Ctrl+A, then `"` — opens the picker (`crates/kaijutsu-tui/src/keys.rs`
     // `ctrl_a_quote_opens_the_picker`).
@@ -183,67 +175,36 @@ fn the_picker_grows_and_shrinks_the_viewport_cleanly() {
     let opened = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "ACTIVE"));
     assert!(opened, "picker never opened: {}", session.dump("picker open"));
 
-    let grown_rows = session.screen_text();
-    let grown_top = picker_row(&grown_rows).expect("picker's ACTIVE header is drawn");
+    let open_rows = session.screen_text();
+    let picker_top = picker_row(&open_rows).expect("picker's ACTIVE header is drawn");
+    let compose = compose_row(&open_rows).expect("the band keeps the draft under the overlay");
+    assert!(picker_top < compose, "the picker draws above the band: {}", session.dump("picker open"));
     assert!(
-        grown_top <= baseline_top,
-        "the picker's reserved band starts lower than the base viewport's, i.e. it did not grow \
-         (grown_top={grown_top}, baseline_top={baseline_top}):\n{}",
+        !open_rows[23].trim().is_empty(),
+        "the status line is still the last row: {}",
         session.dump("picker open")
     );
 
     // Esc closes it (`picker.rs`: `KeyCode::Esc => Outcome::Dismiss`).
     session.send("\x1b");
     let closed = session.wait_until(Duration::from_secs(5), |screen| {
-        !screen_contains_str(screen, "ACTIVE") && screen_contains(screen, '❯')
+        !screen_contains_str(screen, "ACTIVE") && screen_contains(screen, '\u{276f}')
     });
     assert!(closed, "picker never closed: {}", session.dump("picker close"));
 
-    let closed_rows = session.screen_text();
-    let closed_top = compose_row(&closed_rows).expect("compose row is drawn again after closing");
-    // The grow scrolled the transcript up by exactly the rows it added and
-    // the shrink anchored at the grown band's top, so the transcript's
-    // last row still sits right above the 7-row band — no gap, nothing
-    // lost. The band itself is not back at the screen bottom yet: its
-    // freed rows stay blank below it until the next print sinks it.
-    let closed_above = closed_top.checked_sub(6).expect("the viewport is not at the screen top");
+    let after = session.screen_text();
     assert_eq!(
-        closed_rows[closed_above], last_transcript_row,
-        "the transcript's last row is no longer right above the band:\n{}",
+        after[19].trim_end(),
+        before[19].trim_end(),
+        "the transcript row above the band did not come back:\n{}",
         session.dump("after closing picker")
     );
-    assert!(
-        closed_top <= baseline_top,
-        "the band moved down after the picker closed (closed_top={closed_top}, baseline_top={baseline_top}):\n{}",
-        session.dump("after closing picker")
-    );
-
-    // Nothing of the picker's own UI is left on screen once it is closed.
-    //
-    // This probe originally tried to diff the *entire* printed transcript
-    // above the viewport before and after — it does not hold up. Two
-    // sources of noise land there independent of the picker: connection-time
-    // stderr diagnostics (`--insecure`'s key-acceptance warning; `tracing`
-    // writes straight to the shared pty stream, not through `insert_before`,
-    // so it is not cursor-tracked the way ratatui's own content is) and the
-    // app's own housekeeping (the ledger poll on `REFRESH`, `run.rs`, which
-    // settles and prints a real block in the wall-clock gap this probe's
-    // waits leave). Both can shift or displace already-printed lines by the
-    // time a second snapshot is taken, for reasons that have nothing to do
-    // with the picker. A marker check on the picker's own vocabulary is what
-    // survives that noise.
+    assert_eq!(compose_row(&after), Some(22), "the band is where it was: {}", session.dump("after closing picker"));
     for marker in ["ACTIVE", "RECENT", "TRACKS"] {
         assert!(
-            !closed_rows.iter().any(|l| l.contains(marker)),
+            !after.iter().any(|l| l.contains(marker)),
             "the picker's own UI (\"{marker}\") is still on screen after closing it:\n{}",
             session.dump("after closing picker")
-        );
-    }
-    let closed_scrollback = session.scrollback_text();
-    for marker in ["ACTIVE", "RECENT", "TRACKS"] {
-        assert!(
-            !closed_scrollback.iter().any(|l| l.contains(marker)),
-            "the picker's own UI (\"{marker}\") leaked into scrollback: {closed_scrollback:?}"
         );
     }
 }
@@ -285,15 +246,14 @@ fn the_ledger_view_keeps_its_key_hints_line_on_screen() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// c3. Copy mode (`Ctrl+A [`) opens on the alternate screen and `q` restores
-// the inline viewport without touching scrollback
+// c3. Copy mode (`Ctrl+A [`) takes the screen and `q` gives it back
 // ────────────────────────────────────────────────────────────────────────────
 
-/// `Ctrl+A [` — tmux's own copy-mode chord — freezes the transcript onto the
-/// alternate screen; `q` gives the inline viewport back exactly the way the
-/// diff viewer does (`docs/tui.md`, "Copy mode").
+/// `Ctrl+A [` — tmux's own copy-mode chord — draws the frozen transcript
+/// full-screen; `q` brings the conversation back, redrawn from the context's
+/// blocks (`docs/tui.md`, "Copy mode").
 #[test]
-fn copy_mode_opens_and_q_restores_the_inline_viewport() {
+fn copy_mode_opens_and_q_gives_the_conversation_back() {
     let _serial = serial();
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
@@ -312,161 +272,144 @@ fn copy_mode_opens_and_q_restores_the_inline_viewport() {
         "the position figure is not on screen:\n{}",
         session.dump("copy mode open")
     );
+    assert!(
+        !rows.iter().any(|l| l.contains('\u{276f}')),
+        "copy mode takes the whole screen, band included:\n{}",
+        session.dump("copy mode open")
+    );
 
     // `q` closes it, the same as the diff viewer (`diff::DiffKey::Close`).
     session.send("q");
     let closed = session.wait_until(Duration::from_secs(5), |screen| {
-        !screen_contains_str(screen, "q leave") && screen_contains(screen, '❯')
+        !screen_contains_str(screen, "q leave") && screen_contains(screen, '\u{276f}')
     });
     assert!(closed, "copy mode never closed: {}", session.dump("copy mode close"));
-
-    // Leaving copy mode must not have printed its own UI into scrollback —
-    // the frozen buffer is read-only, and `q`/`Esc` restore the inline
-    // viewport with a redraw, never a new transcript line. (Byte-identical
-    // scrollback before/after is not asserted — background housekeeping, the
-    // ledger poll on `REFRESH`, can land a real block in the same wall-clock
-    // gap, same caveat as the picker probe above.)
-    let scrollback = session.scrollback_text();
-    assert!(
-        !scrollback.iter().any(|l| l.contains("q leave")),
-        "copy mode's own hint line leaked into scrollback: {scrollback:?}"
-    );
+    let rows = session.screen_text();
+    assert_eq!(compose_row(&rows), Some(22), "the band is back: {}", session.dump("copy mode close"));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// d. Resize keeps the live region intact and on screen
+// d. Resize keeps the band on screen and at the bottom
 // ────────────────────────────────────────────────────────────────────────────
 
-/// An inline viewport is not pinned to the bottom: like a shell prompt it
-/// sits right after the transcript, and growing the terminal adds blank
-/// rows below it rather than moving it down. What a resize must preserve
-/// is the live region itself — drawn exactly once, at the new width, fully
-/// on screen — and a shrink must pull it up rather than let it fall off the
-/// bottom.
+/// The band is the screen's last rows at any size: the status line is the
+/// last row, the draft is above it, and neither is drawn twice.
 #[test]
-fn resize_keeps_the_live_region_intact_and_on_screen() {
+fn resize_keeps_the_band_at_the_bottom() {
     let _serial = serial();
     let (_server, _key_dir, mut session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
     for (rows, cols) in [(30u16, 100u16), (20u16, 60u16)] {
         session.resize(rows, cols);
-        // The parser's size changes immediately and `❯` is already on
-        // screen, so wait for the app's own redraw at the new width: the
-        // status line is the widest live row and is padded to `cols`.
         let settled = session.wait_until(Duration::from_secs(5), |screen| {
-            screen.size() == (rows, cols)
-                && screen.rows(0, cols).any(|line| line.contains('❯'))
+            let text: Vec<String> = screen.rows(0, cols).collect();
+            text.len() == rows as usize
+                && compose_row(&text) == Some(rows as usize - 2)
+                && !text[rows as usize - 1].trim().is_empty()
         });
-        assert!(settled, "never settled at {rows}x{cols}: {}", session.dump(&format!("after resize to {rows}x{cols}")));
-        std::thread::sleep(Duration::from_millis(250));
-
-        let (scrollback, text) = session.history_snapshot();
         let label = format!("after resize to {rows}x{cols}");
-        assert_eq!(text.len(), rows as usize);
+        assert!(settled, "never settled at {rows}x{cols}: {}", session.dump(&label));
 
-        let compose_rows: Vec<usize> = text
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.contains('❯'))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(compose_rows.len(), 1, "the live region must be on screen exactly once:\n{}", session.dump(&label));
-        let top = compose_rows[0];
-        assert!(
-            top + 1 < rows as usize,
-            "the status line fell off the bottom of a {rows}-row terminal:\n{}",
+        let text = session.screen_text();
+        assert_eq!(
+            text.iter().filter(|l| l.contains('\u{276f}')).count(),
+            1,
+            "the band must be on screen exactly once:\n{}",
             session.dump(&label)
         );
-        assert!(
-            !text[top + 1].trim().is_empty(),
-            "expected the status line directly under compose:\n{}",
-            session.dump(&label)
-        );
-        // A grow leaves the viewport where it was, like a shell prompt. Where
-        // a shrink lands it is not asserted: `vt100` drops rows from the
-        // bottom on a shrink, where a real terminal scrolls the top rows into
-        // scrollback, so the re-anchor here does not match a terminal's.
         for line in &text {
             assert!(line.chars().count() <= cols as usize, "row spilled past {cols} cols: {line:?}");
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// d2. A resize re-wraps the transcript
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The transcript is a view over the context's blocks, wrapped at the
+/// current width: the same line takes more rows at 40 columns than at 80
+/// (`docs/tui.md`, "The buffer"). Nothing is printed once and left behind.
+#[test]
+fn a_resize_rewraps_the_transcript() {
+    let _serial = serial();
+    const MARKER: &str = "wrapme";
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    // Twenty six-letter words, one line.
+    let line = vec![MARKER; 20].join(" ");
+    session.send(&format!(":!echo {line}\r"));
+    let landed = session.wait_until(Duration::from_secs(20), |screen| {
+        screen.rows(0, screen.size().1).filter(|l| l.contains(MARKER)).count() >= 2
+    });
+    assert!(landed, "the long result never landed: {}", session.dump("after :!echo"));
+    let wide = session
+        .screen_text()
+        .iter()
+        .filter(|l| l.contains(MARKER))
+        .count();
+
+    session.resize(24, 40);
+    // Twenty words of six characters wrap five to a row at 40 columns: five
+    // rows for the statement the shell echoed (its `$ echo` prefix takes
+    // four words on the first row, then three full rows and a last word)
+    // and four for the result's own body.
+    const NARROW_ROWS: usize = 9;
+    let rewrapped = session.wait_until(Duration::from_secs(10), |screen| {
+        screen.size() == (24, 40)
+            && screen.rows(0, 40).filter(|l| l.contains(MARKER)).count() == NARROW_ROWS
+    });
+    let narrow_rows: Vec<String> = session
+        .screen_text()
+        .into_iter()
+        .filter(|l| l.contains(MARKER))
+        .collect();
+    assert!(
+        rewrapped,
+        "the transcript did not re-wrap to {NARROW_ROWS} rows at 40 columns (was {wide} rows, \
+         now {narrow_rows:?}): {}",
+        session.dump("after narrowing")
+    );
+    assert!(wide < NARROW_ROWS, "the 80-column wrap already took {wide} rows");
+    for row in &narrow_rows {
+        assert!(row.chars().count() <= 40, "a row spilled past 40 columns: {row:?}");
         assert!(
-            !scrollback.iter().any(|l| l.contains('❯')),
-            "a stale copy of the live region was left in scrollback by the resize: {scrollback:?}"
+            row.trim_end().ends_with(MARKER),
+            "the row broke mid-word, so the terminal wrapped it and the tui did not: {row:?}"
         );
     }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// e. Quit restores the terminal
+// e. Quit restores the terminal, quietly
 // ────────────────────────────────────────────────────────────────────────────
 
-/// `Ctrl+C Ctrl+C` no longer quits (`docs/tui.md`, "Ctrl+C reclaimed" —
-/// `:q` is the only quit); `:q` is what this probe now exercises for the
-/// `leave_terminal` contract this probe is actually about.
+/// `:q` gives the alternate screen back and prints nothing onto the screen
+/// the shell had (`docs/tui.md`, "The owned screen": *":q can be quiet"*).
+/// The conversation is not in the terminal's history afterwards — the kernel
+/// holds every block, and that is the price the owned screen pays.
 #[test]
-fn colon_q_exits_cleanly_and_leaves_the_last_frame() {
+fn colon_q_is_quiet_on_the_main_screen() {
     let _serial = serial();
     let (_server, _key_dir, mut session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
-    session.send("\x1b:q\r");
-    let status = session.wait_for_exit(Duration::from_secs(5));
-    let status = status.unwrap_or_else(|| panic!("process did not exit: {}", session.dump("still running")));
-    assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after :q"));
+    // A block whose text only the tui's own screen ever held.
+    session.send(":!echo quiet-exit-marker\r");
+    let landed = session.wait_until(Duration::from_secs(20), |screen| {
+        screen_contains_str(screen, "quiet-exit-marker")
+    });
+    assert!(landed, "{}", session.dump("before quit"));
+
+    quit(&mut session);
     assert_terminal_restored(&session, "after :q");
 
-    // `leave_terminal` (`crates/kaijutsu-tui/src/run.rs`) does not clear the
-    // viewport on the way out — its last frame is left exactly where it was
-    // drawn. A background refresh (the ledger poll on `REFRESH`, `run.rs`)
-    // can settle one more block between our last observation before
-    // quitting and the actual exit, so this checks the documented contract
-    // (something real is left on screen) rather than a byte-identical
-    // pre/post snapshot, which would race that poll.
-    let after = session.screen_text();
-    let non_blank = after.iter().filter(|l| !l.trim().is_empty()).count();
+    let (scrollback, visible) = session.history_snapshot();
     assert!(
-        non_blank > 0,
-        "the screen was fully cleared on exit; leave_terminal's contract is to leave the last frame:\n{}",
-        session.dump("after exit")
-    );
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// f. Starting from a prompt mid-screen still reaches the bottom
-// ────────────────────────────────────────────────────────────────────────────
-
-/// A terminal whose shell prompt sat mid-screen when the binary started:
-/// the viewport anchors at that row, and the create-lifecycle's trace
-/// blocks — more lines than the rows left below it — must push it down to
-/// the bottom band through `insert_before`'s not-yet-at-the-bottom path
-/// (`ratatui-core`'s `insert_before_scrolling_regions`). A viewport that
-/// stalls partway up the screen is the bug this probe is for.
-#[test]
-fn starting_from_a_prompt_mid_screen_reaches_the_bottom_band() {
-    let _serial = serial();
-    let server = EphemeralServer::start();
-    let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
-    let key_path = write_ephemeral_key(key_dir.path());
-    let session = TuiSession::spawn_after_newlines(server.addr, &key_path, 24, 80, 10);
-    wait_for_attach(&session);
-
-    // The rc trace blocks print as they settle; give the last one a moment.
-    let reached = session.wait_until(Duration::from_secs(5), |screen| {
-        let rows: Vec<String> = screen.rows(0, 80).collect();
-        compose_row(&rows) == Some(22)
-    });
-    assert!(
-        reached,
-        "the viewport never reached the bottom (compose on row 22) after starting mid-screen:\n{}",
-        session.dump("mid-screen start")
-    );
-
-    let (scrollback, text) = session.history_snapshot();
-    assert_eq!(text.iter().filter(|l| l.contains('❯')).count(), 1, "{}", session.dump("mid-screen start"));
-    assert!(
-        !scrollback.iter().any(|l| l.contains('❯')),
-        "a copy of the live region was left behind on the way down: {scrollback:?}"
+        !scrollback.iter().chain(visible.iter()).any(|l| l.contains("quiet-exit-marker")),
+        "the transcript was printed onto the main screen: {visible:?}"
     );
 }
 
@@ -474,9 +417,9 @@ fn starting_from_a_prompt_mid_screen_reaches_the_bottom_band() {
 // g. A partial `:` line never repeats into the transcript
 // ────────────────────────────────────────────────────────────────────────────
 
-/// The `:` bar is live-region content and nothing else: a line being typed
-/// there must appear exactly once, on the compose row, no matter how many
-/// blocks land in the transcript while it is being typed. `docs/tui.md`,
+/// The `:` bar is band content and nothing else: a line being typed there
+/// must appear exactly once, on the compose row, no matter how many blocks
+/// land in the transcript while it is being typed. `docs/tui.md`,
 /// "The `:` line": the `Ctrl+Z` shell surface this probe used to cover
 /// retired in favor of `:!`.
 #[test]
@@ -498,7 +441,7 @@ fn a_partial_colon_line_never_repeats_into_the_transcript() {
     assert!(landed, "{}", session.dump("after opening the bar with a partial line"));
     std::thread::sleep(Duration::from_millis(500));
 
-    let (scrollback, text) = session.history_snapshot();
+    let text = session.screen_text();
     let bar_rows: Vec<&String> = text.iter().filter(|l| l.contains(PARTIAL)).collect();
     assert_eq!(
         bar_rows.len(),
@@ -506,8 +449,6 @@ fn a_partial_colon_line_never_repeats_into_the_transcript() {
         "the `:` bar must be on screen exactly once:\n{}",
         session.dump("after the command's blocks landed")
     );
-    let ghosts: Vec<&String> = scrollback.iter().filter(|l| l.contains(PARTIAL)).collect();
-    assert!(ghosts.is_empty(), "the partial `:` line leaked into scrollback: {ghosts:?}");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -563,22 +504,12 @@ fn colon_kj_runs_the_command_and_lands_its_output() {
     wait_for_attach(&session);
 
     session.send("\x1b:kj context list\r");
-    let landed_on_screen = session.wait_until(Duration::from_secs(10), |screen| {
+    let landed = session.wait_until(Duration::from_secs(10), |screen| {
         screen
             .rows(0, screen.size().1)
             .any(|l| l.contains("context") && l.contains("list"))
     });
-    if !landed_on_screen {
-        // The block may have already scrolled into scrollback by the time
-        // the predicate above caught it — check both halves so a fast
-        // scroll doesn't turn a real landing into a false failure.
-        let (scrollback, text) = session.history_snapshot();
-        assert!(
-            scrollback.iter().chain(text.iter()).any(|l| l.contains("context") && l.contains("list")),
-            "no block carrying the kj argv landed anywhere: {}",
-            session.dump("after :kj context list")
-        );
-    }
+    assert!(landed, "no block carrying the kj argv landed: {}", session.dump("after :kj context list"));
 }
 
 /// `:` after a second `Esc` — the keystroke a player reaching for normal
@@ -604,19 +535,12 @@ fn colon_kj_runs_after_a_second_esc() {
     );
 
     session.send(":kj context list\r");
-    let landed_on_screen = session.wait_until(Duration::from_secs(10), |screen| {
+    let landed = session.wait_until(Duration::from_secs(10), |screen| {
         screen
             .rows(0, screen.size().1)
             .any(|l| l.contains("context") && l.contains("list"))
     });
-    if !landed_on_screen {
-        let (scrollback, text) = session.history_snapshot();
-        assert!(
-            scrollback.iter().chain(text.iter()).any(|l| l.contains("context") && l.contains("list")),
-            "no block carrying the kj argv landed after Esc Esc: {}",
-            session.dump("after :kj context list after Esc Esc")
-        );
-    }
+    assert!(landed, "no block carrying the kj argv landed after Esc Esc: {}", session.dump("after Esc Esc"));
 }
 
 #[test]
@@ -626,9 +550,12 @@ fn colon_bang_runs_one_kaish_statement_and_lands_its_output() {
     wait_for_attach(&session);
 
     session.send("\x1b:!echo hi\r");
+    // The result lands in the transcript, above the band — not on the
+    // compose row, where the line was typed.
     let landed = session.wait_until(Duration::from_secs(10), |screen| {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
-        rows.iter().any(|l| l.trim() == "hi" || l.contains("hi"))
+        let Some(draft) = compose_row(&rows) else { return false };
+        rows[..draft].iter().any(|l| l.trim() == "hi")
     });
     assert!(landed, "{}", session.dump("after :!echo hi"));
 }
@@ -761,11 +688,48 @@ fn a_panic_restores_the_terminal_from_the_alternate_screen() {
     let status = status.unwrap_or_else(|| panic!("process did not exit on the probe panic: {}", session.dump("still running")));
     assert!(!status.success(), "the probe panic must not look like a clean exit: {}", session.dump("after panic"));
     assert_terminal_restored(&session, "after the panic");
+    // A panic inside a frame unwinds past the frame's own
+    // `EndSynchronizedUpdate`; the restore path has to end it, or the
+    // terminal paints nothing ever again (`run::restore_terminal`).
+    assert_eq!(
+        session.sync_updates_open(),
+        0,
+        "the terminal was left inside a synchronized update: {}",
+        session.dump("after panic")
+    );
     let (scrollback, visible) = session.history_snapshot();
     assert!(
         scrollback.iter().chain(visible.iter()).any(|l| l.contains("KAIJUTSU_TUI_PROBE_PANIC")),
         "the panic message is not on a readable screen: {}",
         session.dump("after panic")
+    );
+}
+
+/// A panic *inside* a frame unwinds past that frame's
+/// `EndSynchronizedUpdate`. The restore path ends the update itself, or the
+/// terminal the player is handed back paints nothing at all
+/// (`run::restore_terminal`). `KAIJUTSU_TUI_PROBE_PANIC=frame` makes `F12`
+/// panic there rather than in the key path.
+#[cfg(unix)]
+#[test]
+fn a_panic_inside_a_frame_ends_the_synchronized_update() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("key tempdir");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let mut session =
+        TuiSession::spawn_with_env(server.addr, &key_path, 24, 80, &[("KAIJUTSU_TUI_PROBE_PANIC", "frame")]);
+    wait_for_attach(&session);
+
+    session.send("\x1b[24~"); // F12
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    assert!(status.is_some(), "process did not exit: {}", session.dump("still running"));
+    assert_terminal_restored(&session, "after the frame panic");
+    assert_eq!(
+        session.sync_updates_open(),
+        0,
+        "the terminal was left inside a synchronized update: {}",
+        session.dump("after the frame panic")
     );
 }
 
@@ -779,6 +743,15 @@ fn in_active(rows: &[String], label: &str) -> Option<bool> {
     let row = picker_row_for(rows, label)?;
     let recent = rows.iter().position(|l| l.trim() == "RECENT")?;
     Some(row < recent)
+}
+
+/// Wait until the picker's cursor (`›`) is on `label`'s row.
+fn wait_for_cursor_on(session: &TuiSession, label: &str) {
+    let landed = session.wait_until(Duration::from_secs(10), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        picker_row_for(&rows, label).is_some_and(|i| rows[i].trim_start().starts_with('\u{203a}'))
+    });
+    assert!(landed, "the picker's cursor never reached {label}: {}", session.dump("cursor"));
 }
 
 /// `p` on a RECENT row moves it into ACTIVE without closing the picker,
@@ -809,11 +782,18 @@ fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
     for _ in 0..tabs_to_section(&session.screen_text(), "seatme") {
         session.send("\t");
     }
+    // The open picker rebuilds on every refresh round, and a rebuild puts
+    // the cursor back on its own section's first row. Press the verb only
+    // once the cursor is seen on the fork's row, or the verb acts on
+    // whatever the rebuild selected — an empty section, under this filter.
+    wait_for_cursor_on(&session, "seatme");
 
     // Whichever section the fork starts in, the verb that moves it out.
     let started_active = in_active(&session.screen_text(), "seatme").expect("the fork is listed");
     session.send(if started_active { "d" } else { "p" });
-    let moved = session.wait_until(Duration::from_secs(10), |screen| {
+    // Two refresh rounds: the picker follows the kernel on the 5 s timer,
+    // and a cold run can spend one of them building.
+    let moved = session.wait_until(Duration::from_secs(20), |screen| {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
         screen_contains_str(screen, "ACTIVE") && in_active(&rows, "seatme") == Some(!started_active)
     });
@@ -825,8 +805,9 @@ fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
     );
 
     // The cursor followed the row, so the opposite verb acts on it again.
+    wait_for_cursor_on(&session, "seatme");
     session.send(if started_active { "p" } else { "d" });
-    let back = session.wait_until(Duration::from_secs(10), |screen| {
+    let back = session.wait_until(Duration::from_secs(20), |screen| {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
         screen_contains_str(screen, "ACTIVE") && in_active(&rows, "seatme") == Some(started_active)
     });
@@ -858,18 +839,21 @@ fn a_bracketed_paste_lands_in_the_draft_without_submitting() {
     });
     assert!(landed, "the paste did not land as two draft rows: {}", session.dump("after paste"));
 
-    // Nothing was submitted: the draft is still there a moment later and
-    // no user block carrying the first line reached scrollback.
+    // Nothing was submitted: the draft is still there a moment later, and
+    // the transcript above the band holds no user block carrying the first
+    // line.
     std::thread::sleep(Duration::from_secs(2));
-    let (scrollback, visible) = session.history_snapshot();
+    let visible = session.screen_text();
+    let draft = compose_row(&visible).expect("the draft is on screen");
     assert!(
-        visible.iter().any(|l| l.contains("xp pasted two")),
+        visible[draft].contains("dd pasted one"),
         "the draft was cleared, so something submitted: {}",
         session.dump("after paste")
     );
     assert!(
-        !scrollback.iter().any(|l| l.contains("dd pasted one")),
-        "the first pasted line was submitted as a turn: {scrollback:?}"
+        !visible[..draft].iter().any(|l| l.contains("dd pasted one")),
+        "the first pasted line was submitted as a turn: {}",
+        session.dump("after paste")
     );
 
     // The `:` bar takes a paste flattened onto its one line.
@@ -880,47 +864,68 @@ fn a_bracketed_paste_lands_in_the_draft_without_submitting() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// n. A terminal that never answers the cursor query does not end the client
+// n. The client never asks the terminal where the cursor is
 // ────────────────────────────────────────────────────────────────────────────
 
-/// The inline viewport asks the terminal where the cursor is on every
-/// resize, with a two-second wait. A terminal that never answers — a
-/// stalled ssh hop — used to end the loop through `?`. Now the band keeps
-/// its height, the player is told, and keys still work.
+/// The tui owns the alternate screen for the session, so no frame is
+/// anchored to the cursor and no path asks for it (`docs/tui.md`, "The
+/// owned screen"): a whole session — attach, type, open the picker, resize,
+/// quit — sends zero `ESC [ 6 n`. The query is what stalled a slow ssh hop
+/// for two seconds a frame.
 #[test]
-fn an_unanswered_cursor_query_keeps_the_client_alive() {
+fn the_client_never_asks_where_the_cursor_is() {
     let _serial = serial();
-    let (_server, _key_dir, session) = spawn_session(24, 80);
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
-    session.mute_cursor_queries();
-    // A draft past one row grows the band, which is a viewport rebuild and
-    // a query (the picker with two contexts fits the base band and asks
-    // nothing).
-    session.send("i");
-    session.send("\x1b[200~aaa\nbbb\nccc\x1b[201~");
-    let told = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "cursor query"));
-    assert!(told, "no notice about the unanswered query: {}", session.dump("after the grow"));
-
-    // `a` appends after the last pasted line, a continuation row with no
-    // prompt on it. Keys working is what proves the loop survived: the
-    // old exit came ~2 s after the query, so a liveness poll proves less.
-    session.send("\x1b");
-    session.send("ax");
-    let responsive = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "cccx"));
-    assert!(responsive, "keys stopped working after the failed resize: {}", session.dump("after Esc, ax"));
-
-    // A block completing after the refusal still prints into scrollback
-    // above the band: the leftover cursor anchor from the failed rebuild
-    // must not misplace `insert_before`.
-    session.send("\x1b:!echo refused-anchor-ok\r");
-    let printed = session.wait_until(Duration::from_secs(20), |screen| {
-        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
-        let hit = rows.iter().position(|l| l.contains("refused-anchor-ok") && !l.contains(":!"));
-        let compose = compose_row(&rows);
-        matches!((hit, compose), (Some(h), Some(c)) if h < c)
+    session.send("ihello\x1b");
+    let typed = session.wait_until(Duration::from_secs(5), |screen| {
+        screen_contains_str(screen, "hello")
     });
-    assert!(printed, "the shell result did not land above the band after the refusal: {}", session.dump("after :!"));
+    assert!(typed, "the draft never showed: {}", session.dump("typing"));
+
+    session.send("\x01\"");
+    let opened = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "ACTIVE"));
+    assert!(opened, "picker never opened: {}", session.dump("picker"));
+    session.send("\x1b");
+
+    session.resize(30, 100);
+    // The status line is the screen's last row once the client has redrawn
+    // at the new size. Waiting on the parser's own size proves nothing: the
+    // harness sets it the moment the pty resizes.
+    let resized = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, 100).collect();
+        rows.len() == 30 && !rows[29].trim().is_empty() && compose_row(&rows) == Some(28)
+    });
+    assert!(resized, "never redrew at the new size: {}", session.dump("resize"));
+
+    // A full-screen surface and a suspend go through the same one terminal,
+    // and neither anchors a frame to the cursor either.
+    session.send("\x01[");
+    let copy_mode = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "q leave"));
+    assert!(copy_mode, "copy mode never opened: {}", session.dump("copy mode"));
+    session.send("q");
+    let back = session.wait_until(Duration::from_secs(5), |screen| !screen_contains_str(screen, "q leave"));
+    assert!(back, "copy mode never closed: {}", session.dump("copy mode close"));
+
+    #[cfg(unix)]
+    {
+        let pid = session.pid().expect("pid available on unix");
+        session.send("\x1a"); // Ctrl+Z
+        std::thread::sleep(Duration::from_millis(300));
+        unsafe {
+            libc::kill(pid as i32, libc::SIGCONT);
+        }
+        let alive = session.wait_until(Duration::from_secs(5), |screen| screen_contains(screen, '\u{276f}'));
+        assert!(alive, "the client did not come back from the suspend: {}", session.dump("after SIGCONT"));
+    }
+
+    quit(&mut session);
+    assert_eq!(
+        session.cursor_queries(),
+        0,
+        "the client asked the terminal where the cursor is; a full-screen viewport never does"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -998,6 +1003,13 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
         screen.rows(0, screen.size().1).any(|line| line.contains('❯') && line.contains('x'))
     });
     assert!(responsive, "client did not respond after SIGCONT: {}", session.dump("after SIGCONT"));
+    // The screen is taken again on the way back — vim's
+    // `stoptermcap`/`starttermcap` order (`run::suspend`).
+    assert!(
+        session.on_alternate_screen(),
+        "the client did not take the screen again after SIGCONT: {}",
+        session.dump("after SIGCONT")
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1005,8 +1017,8 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Row index of a picker row naming `label` — a row below the `ACTIVE`
-/// header, never the `kj fork` output that named the same label in
-/// scrollback above it.
+/// header, never the `kj fork` output that named the same label in the
+/// transcript above it.
 fn picker_row_for(rows: &[String], label: &str) -> Option<usize> {
     let active = picker_row(rows)?;
     rows.iter().enumerate().position(|(i, l)| i > active && l.contains(label))

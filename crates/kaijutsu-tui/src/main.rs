@@ -1,4 +1,4 @@
-//! `kaijutsu-tui` binary — an inline ratatui viewport over the kernel.
+//! `kaijutsu-tui` binary — a ratatui client over the kernel.
 //!
 //! ```bash
 //! # against a kaijutsu-server on localhost:2222
@@ -8,7 +8,7 @@
 //! kaijutsu-tui --host zorak --context kaijutsu
 //! ```
 //!
-//! **stdout is the viewport.** Diagnostics go to a log file under the
+//! **stdout is the screen.** Diagnostics go to a log file under the
 //! state directory when stderr is the terminal, since a line landing
 //! mid-frame is a corrupted screen; a redirected stderr (`2>tui.log`) is
 //! used as given, and `--log` names the file outright. The level is `warn`
@@ -68,7 +68,7 @@ struct Cli {
     /// terminal (a redirect or a pipe) is used as given, and a stderr that
     /// is the terminal sends them to `kaijutsu-tui/tui.log` under the state
     /// directory ($XDG_STATE_HOME or ~/.local/state), because stdout is the
-    /// viewport and a log line landing on it corrupts the screen.
+    /// screen and a log line landing on it corrupts the frame.
     #[arg(long, value_name = "PATH")]
     log: Option<PathBuf>,
 
@@ -114,7 +114,7 @@ fn log_file(chosen: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// Quiet by default: `warn` unless `RUST_LOG` says otherwise. A log file
-/// that cannot be opened is an error before the viewport, not a silent
+/// that cannot be opened is an error before the screen is taken, not a silent
 /// fall back onto the screen.
 fn init_tracing(file: Option<PathBuf>) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()

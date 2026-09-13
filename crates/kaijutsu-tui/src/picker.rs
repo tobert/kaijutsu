@@ -1,5 +1,5 @@
 //! The picker (`Ctrl+A "`) — the well flattened into ACTIVE / RECENT /
-//! TRACKS sections, in a viewport that grows to hold it and shrinks on
+//! TRACKS sections, drawn as an overlay over the transcript and gone on
 //! dismiss. `docs/tui.md`, "The picker (`Ctrl+A \"`)".
 //!
 //! [`PickerModel`] is pure: [`PickerModel::build`] takes a `list_contexts`
@@ -799,13 +799,6 @@ pub fn render(model: &PickerModel, width: u16, palette: &Palette) -> Vec<Line<'s
     lines
 }
 
-/// Rows the picker's grown viewport needs to hold the whole current view —
-/// what `render::viewport_lines` asks for when this picker is open.
-pub fn viewport_lines(model: &PickerModel) -> u16 {
-    let body = render(model, u16::MAX, &Palette::builtin()).len();
-    u16::try_from(body).unwrap_or(u16::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,12 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn viewport_lines_grows_with_the_row_count() {
+    fn the_render_grows_with_the_row_count() {
+        let palette = Palette::builtin();
         let empty = PickerModel::build(&[], &[], &no_activity(), &empty_tails(), 0);
         let mut a = ctx("kaijutsu");
         a.promoted_at = Some(1_000);
         let one = PickerModel::build(&[a], &[], &no_activity(), &empty_tails(), 0);
-        assert!(viewport_lines(&one) > viewport_lines(&empty));
+        assert!(render(&one, 80, &palette).len() > render(&empty, 80, &palette).len());
     }
 
     #[test]

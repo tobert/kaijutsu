@@ -6,9 +6,10 @@
 //! current-thread runtime and `LocalSet` (Cap'n Proto RPC is `!Send`, so it
 //! cannot share the test's own runtime the way an in-process kernel test
 //! does — this one talks real SSH over a real socket to a real subprocess).
-//! `TuiSession` spawns the binary into a pty and answers the one terminal
-//! query ratatui's inline viewport cannot proceed without: the cursor
-//! position request (`ESC [ 6 n`).
+//! `TuiSession` spawns the binary into a pty, answers any cursor-position
+//! request (`ESC [ 6 n`) and counts them: the client owns the alternate
+//! screen for the session and must never send one
+//! (`the_client_never_asks_where_the_cursor_is`).
 
 #![allow(dead_code)]
 
@@ -16,7 +17,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -127,9 +128,13 @@ pub struct TuiSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     reader: Option<std::thread::JoinHandle<()>>,
-    /// Whether the read loop answers `ESC [ 6 n`; off, it plays a terminal
-    /// that never replies, the shape of a stalled ssh hop.
-    answer_cursor_queries: Arc<AtomicBool>,
+    /// Cursor-position requests seen since the session started. The client
+    /// sends none; the count is the probe's receipt.
+    cursor_queries: Arc<AtomicUsize>,
+    /// Synchronized updates begun (`ESC [ ? 2026 h`) less those ended
+    /// (`ESC [ ? 2026 l`). Zero whenever the client is between frames — a
+    /// terminal left inside an update shows nothing at all.
+    sync_depth: Arc<Mutex<i64>>,
     rows: u16,
     cols: u16,
 }
@@ -224,11 +229,15 @@ impl TuiSession {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
 
-        let answer_cursor_queries = Arc::new(AtomicBool::new(true));
+        let cursor_queries = Arc::new(AtomicUsize::new(0));
+        let sync_depth = Arc::new(Mutex::new(0i64));
         let reader_parser = parser.clone();
         let reader_writer = writer.clone();
-        let reader_answers = answer_cursor_queries.clone();
-        let reader = std::thread::spawn(move || read_loop(reader, reader_parser, reader_writer, reader_answers));
+        let reader_count = cursor_queries.clone();
+        let reader_sync = sync_depth.clone();
+        let reader = std::thread::spawn(move || {
+            read_loop(reader, reader_parser, reader_writer, reader_count, reader_sync)
+        });
 
         Self {
             child,
@@ -236,7 +245,8 @@ impl TuiSession {
             writer,
             parser,
             reader: Some(reader),
-            answer_cursor_queries,
+            cursor_queries,
+            sync_depth,
             rows,
             cols,
         }
@@ -267,22 +277,13 @@ impl TuiSession {
         p.screen().rows(0, self.cols).collect()
     }
 
-    /// Every scrollback line the parser has buffered, oldest first. Walks
-    /// the parser's scrollback offset from its maximum down to 1, reading
-    /// the row that becomes visible at row 0 on each step — `vt100`
-    /// exposes no direct "give me the whole buffer" call.
-    pub fn scrollback_text(&self) -> Vec<String> {
-        self.history_snapshot().0
-    }
-
     /// `(scrollback, visible)` captured under a single lock acquisition, so
-    /// the two agree on exactly the same moment. Calling `screen_text()` and
-    /// `scrollback_text()` back to back does not: the reader thread can feed
-    /// the parser more bytes — and more content can scroll off the visible
-    /// area into scrollback — in the gap between two separate lock
-    /// acquisitions, which showed up as lines vanishing from both halves at
-    /// once in an early version of the picker probe. Take this whenever a
-    /// caller needs both halves to describe one instant.
+    /// the two agree on exactly the same moment.
+    ///
+    /// The client owns the alternate screen, whose scrollback a terminal
+    /// does not keep, so the scrollback half describes the screen the shell
+    /// had: what a probe reads after the client has exited, or what it
+    /// printed before taking the screen.
     pub fn history_snapshot(&self) -> (Vec<String>, Vec<String>) {
         let mut p = self.parser.lock().expect("parser lock");
         let cols = self.cols;
@@ -324,9 +325,15 @@ impl TuiSession {
         }
     }
 
-    /// Stop answering the client's cursor-position queries from here on.
-    pub fn mute_cursor_queries(&self) {
-        self.answer_cursor_queries.store(false, Ordering::SeqCst);
+    /// Cursor-position requests (`ESC [ 6 n`) the client has sent so far.
+    pub fn cursor_queries(&self) -> usize {
+        self.cursor_queries.load(Ordering::SeqCst)
+    }
+
+    /// Synchronized updates the client began and has not ended. Any value
+    /// but zero at rest means a frame left the terminal holding its paint.
+    pub fn sync_updates_open(&self) -> i64 {
+        *self.sync_depth.lock().expect("sync depth lock")
     }
 
     /// Whether the client has turned bracketed paste on (DECSET 2004).
@@ -398,14 +405,15 @@ impl Drop for TuiSession {
     }
 }
 
-/// Feed pty output into the parser, answering every cursor-position query
-/// (`ESC [ 6 n`, CSI DSR) as it arrives — the gotcha this harness exists to
-/// solve. `ratatui`'s inline viewport issues this query on creation and on
-/// every resize (`Terminal::with_options`, and `set_viewport_height` in
-/// `crates/kaijutsu-tui/src/run.rs`) and blocks until it is answered; a bare
-/// `vt100::Parser` never answers one, so an unanswered query hangs the
-/// child until crossterm's own timeout fails the run with "the cursor
-/// position could not be read within a normal duration".
+/// Feed pty output into the parser, counting and answering every
+/// cursor-position query (`ESC [ 6 n`, CSI DSR) as it arrives.
+///
+/// The client sends none: a full-screen viewport never asks where the
+/// cursor is, which is what `the_client_never_asks_where_the_cursor_is`
+/// proves. The answer stays so that a query from anywhere is a counted
+/// fact rather than a hang — crossterm fails a blocked read after two
+/// seconds with "the cursor position could not be read within a normal
+/// duration", which would read as a timeout rather than as the query it is.
 ///
 /// Bytes are fed to the parser incrementally, up to and including each
 /// query, so the reported position reflects the screen state at the moment
@@ -416,7 +424,8 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    answer: Arc<AtomicBool>,
+    queries: Arc<AtomicUsize>,
+    sync_depth: Arc<Mutex<i64>>,
 ) {
     const DSR_CURSOR: &[u8] = b"\x1b[6n";
     let mut buf = [0u8; 4096];
@@ -428,6 +437,7 @@ fn read_loop(
             Ok(n) => n,
         };
         carry.extend_from_slice(&buf[..n]);
+        count_sync_updates(&buf[..n], &sync_depth);
 
         loop {
             let Some(pos) = find_subslice(&carry, DSR_CURSOR) else { break };
@@ -438,10 +448,8 @@ fn read_loop(
                 p.process(&head);
                 p.screen().cursor_position()
             };
+            queries.fetch_add(1, Ordering::SeqCst);
             let reply = format!("\x1b[{};{}R", row + 1, col + 1);
-            if !answer.load(Ordering::SeqCst) {
-                continue;
-            }
             if let Ok(mut w) = writer.lock() {
                 let _ = w.write_all(reply.as_bytes());
                 let _ = w.flush();
@@ -459,6 +467,29 @@ fn read_loop(
 
     if !carry.is_empty() {
         parser.lock().expect("parser lock").process(&carry);
+    }
+}
+
+/// Fold one read's synchronized-update brackets into the running depth.
+///
+/// Counted on the raw stream rather than through `vt100`, which models
+/// neither sequence. A read boundary inside a bracket would miscount; the
+/// client writes each one in a single `execute!`, so the bytes arrive whole.
+fn count_sync_updates(bytes: &[u8], depth: &Mutex<i64>) {
+    const BEGIN: &[u8] = b"\x1b[?2026h";
+    const END: &[u8] = b"\x1b[?2026l";
+    let count = |needle: &[u8]| {
+        bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count() as i64
+    };
+    let delta = count(BEGIN) - count(END);
+    if delta != 0 {
+        let mut depth = depth.lock().expect("sync depth lock");
+        // Ending an update the terminal never began is a no-op for the
+        // terminal, so it is one here: the depth floors at zero.
+        *depth = (*depth + delta).max(0);
     }
 }
 

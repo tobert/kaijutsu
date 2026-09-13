@@ -408,11 +408,11 @@ impl Compose {
 
 }
 
-/// The input region of the live viewport: the `❯` compose line, or the `:`
+/// The input region of the band: the `❯` compose line, or the `:`
 /// bar while it holds the keyboard.
 ///
-/// Multi-line drafts grow this region — the caller gives the transcript
-/// whatever rows are left (`crate::render::live_lines`).
+/// Multi-line drafts grow this region — the band takes the rows and the
+/// transcript gives them up (`crate::render::band_frame`).
 pub fn input_lines(app: &App, width: u16, palette: &Palette) -> Vec<Line<'static>> {
     compose_lines(&app.compose, width, palette)
 }

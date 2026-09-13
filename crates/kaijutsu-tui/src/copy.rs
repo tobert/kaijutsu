@@ -364,7 +364,7 @@ fn overlay(line: &Line<'static>, style: Style) -> Line<'static> {
 /// What one key did to the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyOutcome {
-    /// `q`, or `Esc` with no selection active — give the inline viewport
+    /// `q`, or `Esc` with no selection active — give the conversation
     /// back.
     Close,
     /// The cursor or the viewport moved.

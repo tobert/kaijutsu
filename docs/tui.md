@@ -185,23 +185,24 @@ None is a commitment; the ones marked *now* ride the first slice.
   below stays additive.
 - **In-band resize** (`?2048`) instead of `SIGWINCH`, where offered.
 
-### What goes
+### What went
 
-`run::set_viewport_height`, `enter_terminal`'s inline viewport,
-`render::print_scrollback` and `take_settled_prints`, the `insert_before`
-path, the `printed` set on `ContextView`, the resize-refusal fallback, the
-scrollback probes in `tests/terminal_fit.rs` and the harness's cursor-
-query answering. Copy mode's freeze is promoted to the main view rather
-than deleted. The pty harness stays: it already parses the alternate
-screen.
+Slice 2 deleted `run::set_viewport_height`, `enter_terminal`'s inline
+viewport, `render::insert_before`, `print_scrollback` and
+`take_settled_prints`, `ContextView::printed` and `last_printed`, the
+resize-refusal fallback, `AltScreen` as a second `Terminal`, and the
+harness's `mute_cursor_queries`. Copy mode's freeze was promoted to the
+main view rather than deleted. The pty harness stays: it already parses
+the alternate screen, and it now counts `ESC [ 6 n` instead of answering
+it, so a probe can assert the client sends none.
 
 ### Slices
 
 1. **Docs.** This chapter; guidance 1, the viewport claim and the buffer
    question annotated. (This commit.)
-2. **The owned transcript.** Alternate screen for the session,
-   synchronized frames, the transcript as a scrolling view over the
-   current context's mirror with the band below it, every surface an
+2. **The owned transcript.** Landed 2026-09-13. Alternate screen for the
+   session, synchronized frames, the transcript as a scrolling view over
+   the current context's mirror with the band below it, every surface an
    overlay, no viewport rebuilds, no cursor queries. Probes: exit
    restores the main screen; a completed block appears above the band;
    a resize re-wraps.
@@ -262,28 +263,24 @@ grammar, and a new surface arrives in the same shape:
 - **Entry gesture in the heading** (`Ctrl+Z`, `Ctrl+A "`). Ambient surfaces
   (conversation, status line) have none.
 - **One figure, and the figure is the spec** — "the example is the rule"
-  applied to UI. Because every grown view renders its own key line ("Keys"),
+  applied to UI. Because every overlay renders its own key line ("Keys"),
   the figure's last line documents the surface's keys for free.
 - **"Rules the figure carries"** — bullets for the semantics the picture
   cannot show.
 - **The machinery, named** — the wire or `kj` path behind the surface
   (`shell_execute`, `subscribeLedgerEvents`, `edit_input`). A surface that
   cannot name its kernel path is not designed yet.
-- **Exactly one viewport claim** — being retired by "The owned screen":
-  every surface becomes an overlay on a screen the tui owns, and the
-  three claims below describe the inline design until slice 2 lands.
-  From a closed set of three: *flows to
-  scrollback* (conversation), *grows the viewport* and shrinks on dismiss
-  (picker, ledger, asks, the thinking pane), or *takes the alternate
-  screen* (vi and diff only, guidance 1). There is no fourth mode. A grow
-  or shrink rebuilds the inline viewport anchored at the old band's top
-  row (`run::set_viewport_height`): a grow scrolls the transcript up by
-  exactly the rows it adds, and a shrink leaves its freed rows blank below
-  the band until the next print sinks the band back to the screen bottom —
-  never a gap in the transcript, never a whole-band jump.
+- **Every surface is drawn on the owned screen.** The conversation is the
+  transcript area: a scrolling view over the current context's mirror,
+  bottom-aligned above the band. An overlay (picker, ledger, an ask card,
+  the thinking pane) takes rows at the transcript area's foot, between the
+  transcript and the band, and gives them back on dismiss. A full-screen
+  surface (vi, diff, copy mode) takes the whole screen. The band —
+  the in-flight strip, a blank row, the draft, the status line — is always
+  drawn; only a full-screen surface replaces it.
 
 Three sanctioned deviations: compose's figure is the `❯` line inside the
-conversation figure — it is part of that frame, not a grown view; the
+conversation figure — it is part of that frame, not an overlay; the
 in-flight strip is one fixed row of that same frame ("The in-flight
 strip"); and editor/diff has no figure because its look is vim's,
 specified by `EditorState` rather than by this document. Cache health and Images are
@@ -291,10 +288,11 @@ rendering concerns that ride other surfaces, not surfaces of their own.
 
 ### Conversation
 
-The transcript is `insert_before` output: a block that completes is printed
-into scrollback as styled lines and never touched again. The viewport holds
-what is live — streaming blocks, the compose line, the status line. Scrolling
-is the terminal's; search, copy and split are the terminal's.
+The transcript is redrawn every frame from the current context's block
+mirror (`render::transcript_window`): every block, wrapped at the current
+width, re-wrapped whenever the width changes. Nothing is printed once and
+left; a fold, an exclude or an edit shows on the next frame the way any
+other change does.
 
 ```text
   ╭ claude · coder ─────────────────────────────────────────────── 14:02:11 ╮
@@ -352,11 +350,6 @@ Rules the figure carries:
   kernel state (`CollapsedChanged`), so a sibling's expand is yours too. A
   completed `Thinking` block is the one block that prints as a `▸` stub
   regardless ("The thinking pane").
-- A block that completes leaves the viewport for scrollback. A late edit,
-  exclude or collapse of a block already in scrollback **cannot redraw it**;
-  the change is real in the kernel and the next hydrate, and the TUI says so
-  in the status line rather than pretending. This is the price of guidance 1,
-  paid knowingly.
 - `Thinking` streams dim and italic in the thinking pane and leaves a
   `▸ thinking · N lines · …` stub in scrollback when it completes; the
   whole text stays in copy mode and `kj block read` ("The thinking pane").
@@ -380,9 +373,9 @@ Compose is a modalkit `VimMachine` over the kernel-owned input block
 (`edit_input` / `submit_input`), as the app's compose overlay is. The draft is
 a shared block: a sibling's typing shows. `Enter` in normal mode submits;
 A second `Esc` is harmless: compose always holds the keyboard. On `Enter` the
-tui sends the newest block it had shown as the player's edge — the character
-count when that block was still streaming, `last_printed` alone when it was
-not (`ContextView::edge`, `docs/prompts.md`, "The submit verb").
+tui sends the newest block the transcript showed as the player's edge, with
+its character count as rendered (`ContextView::edge`, `docs/prompts.md`,
+"The submit verb"). A context that has shown nothing at all sends no edge.
 
 Rules the figure carries:
 
@@ -410,17 +403,16 @@ Rules the figure carries:
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
   indent under the prompt; Enter in insert mode is a newline. Every row
-  past the first grows the band by one, up to a third of the screen
-  (`render::third_of_screen`, the same ceiling the thinking band takes):
-  the stream keeps its rows while a long prompt is typed, and a grow tied
-  to a keystroke reads as the line editor growing, not as a jump. Past the
-  cap the draft scrolls around the cursor, as vim's command line does.
-  The band shrinks once, when the draft is submitted or cleared — never
-  gradually: each step of a gradual shrink is a viewport rebuild that
-  shifts the transcript, which is exactly the jitter the static band
-  exists to avoid (Amy, 2026-09-04: *"the next turn or tool that scrolls
-  would have it shrink back maybe gradually or would that get jittery?"*
-  — it would).
+  past the first grows the band by one, taking that row from the
+  transcript area, up to a third of the screen (`render::third_of_screen`,
+  the same ceiling the thinking band takes): the transcript is redrawn one
+  row shorter, never rebuilt or scrolled to make room, and a grow tied to
+  a keystroke reads as the line editor growing, not as a jump. Past the
+  cap the draft scrolls around the cursor, as vim's command line does. The
+  band shrinks once, when the draft is submitted or cleared — never
+  gradually — and the transcript simply gets its rows back on the next
+  frame (Amy, 2026-09-04: *"the next turn or tool that scrolls would have
+  it shrink back maybe gradually or would that get jittery?"* — it would).
 - **The cursor is the terminal's own.** The tui puts the real cursor on the
   draft's vi cursor — past the `❯` prompt, past the matching indent on a
   continuation row — or after the `:` bar's text, and shapes it by mode as
@@ -441,17 +433,6 @@ Rules the figure carries:
   `<`, so a paste into vi is still open (`docs/issues.md`). Line endings
   are normalized, since terminals differ on what a pasted newline is.
   Probe: `a_bracketed_paste_lands_in_the_draft_without_submitting`.
-- **A terminal that never answers the cursor query does not end the
-  client.** Every band grow rebuilds the inline viewport, which asks the
-  terminal where the cursor is and waits two seconds. A stalled hop used
-  to end the loop through `?`. Now the band keeps its height, the status
-  line says so, the same height is not asked for again until a resize or
-  a different height, and `draw_live` crops from the front so the draft's
-  tail and the status line stay. Each different height is a fresh
-  two-second wait on a hop that never answers, and a hop that starts
-  answering again is not noticed until a resize or a new height. Probe:
-  `an_unanswered_cursor_query_keeps_the_client_alive`, which mutes the
-  harness's DSR answer.
 - There is no state past normal mode. The app's `Esc Esc` hands the
   keyboard to its block list; the tui prints its transcript into scrollback
   and never redraws it, so a block cursor would have nothing to act on, and
@@ -463,13 +444,13 @@ Rules the figure carries:
 ### The thinking pane
 
 ```text
+  ─ claude · coder ─────────────────────────────────────────────── 14:02:11
+  The unlink bug was in resolve(): it canonicalized the final ▍
+
   The unlink bug: resolve() canonicalizes the final component, so the
   symlink's target is what gets removed. Check resolve_nofollow first,
   then whether rename and getattr share the cause. The test that would
   show it is vfs::unlink_symlink; run that before touching rename.
-
-  ─ claude · coder ─────────────────────────────────────────────── 14:02:11
-  The unlink bug was in resolve(): it canonicalized the final ▍
 
   ❯                                                                -- NORMAL --
   0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
@@ -494,17 +475,19 @@ Rules the figure carries:
   `Thinking` block of a turn this client knows is running (`turns_running`,
   the partial signal under "The `:` line") and holds until that turn ends.
   A fast model thinks for 400 ms; a pane that closed with the block was a
-  flap that rebuilt the viewport twice per block, measured on
+  flap that redrew the whole screen twice per block, measured on
   deepseek-v4-flash (`App::observe_thinking` is the latch, cleared by
   `mark_turn_ended`; a block that completed inside one delivery latches
   too, as long as its stub has not printed).
-- **The band is its own rows, a third of the screen.** The viewport grows
-  to `thinking_pane_lines` (the ordinary 8 + `thinking_band_lines` + one
-  blank row, where the band is `third_of_screen`: 8 rows on a 24-row
-  terminal, 20 on a 60-row one) and the latest reasoning's tail takes
-  those top rows, dim and italic, above the stream — so the answer streaming in never scrolls the reasoning out
-  of the pane, and a later thinking block in the same turn replaces the
-  earlier one in place. One size, taken once and given back once.
+- **The pane is an overlay of its own rows, a third of the screen at most**
+  (`render::thinking_pane`, `render::thinking_band_lines`,
+  `render::third_of_screen`: 8 rows on a 24-row terminal, 20 on a 60-row
+  one). It sits at the foot of the transcript area, below the streaming
+  answer and above the band, and the latest reasoning's tail fills it, dim
+  and italic. Because the pane is its own region rather than part of the
+  transcript, the answer streaming in above it never scrolls the reasoning
+  away, and a later thinking block in the same turn replaces the earlier
+  one in place. One size, taken once and given back once.
 - The turn-liveness half is what closes a pane a lost turn would otherwise
   hold open: a block left `Running` by a dropped stream shows in the
   ordinary band, never in a stuck pane (`forget_turn_liveness` clears the
@@ -545,14 +528,16 @@ and yellow for waiting, so its extent is visible.
 
 Rules the figure carries:
 
-- **The band is a static height.** `VIEWPORT_LINES` is 8: the strip's
-  row, the blank row, the compose rows, the status line, and what is left
-  for the stream. A tool call coming or going changes the strip's text and
-  nothing else — never the band's height, so the transcript never shifts
-  for it. The thinking pane is the one deliberate grow, once per turn.
-  (Amy, 2026-09-04: *"the screen seems to be jumpy with the tool call
-  pinning like that"* — every unsettled body used to sit in the band with
-  its divider, and wrapped or completed at its own pace.)
+- **The band is a static height.** `render::BAND_ROWS` is 4: the strip's
+  row, the blank row, one draft row, the status line — a wrapped draft
+  takes more, up to a third of the screen ("Compose"). A tool call coming
+  or going changes the strip's text and nothing else — never the band's
+  height, so the transcript never shifts for it. The thinking pane is the
+  one overlay that takes rows from the transcript area for its own reason,
+  once per turn (`render::band_frame` builds the band; `render::overlay_lines`
+  is separate). (Amy, 2026-09-04: *"the screen seems to be jumpy with the
+  tool call pinning like that"* — every unsettled body used to sit in the
+  band with its divider, and wrapped or completed at its own pace.)
 - **What leaves the stream:** an unsettled `ToolCall`, and a `ToolResult`
   a gate holds (`waiting`/`pending`). A `Running` result stays in the
   stream, because that is the tool's output streaming in and Amy wants to
@@ -570,7 +555,7 @@ Rules the figure carries:
   a running entry exists — a held entry is still, and an empty strip costs
   no redraws at all.
 - The machinery: `inflight::entries` over the mirror's unprinted blocks,
-  `inflight::strip_line` for the row, `render::live_frame` places it.
+  `inflight::strip_line` for the row, `render::band_frame` places it.
 
 ### The `:` line and the `Ctrl+C` ladder
 
@@ -673,13 +658,14 @@ instrument back. Over `ssh -t zorak kaijutsu-tui` that puts zorak's login
 shell one keystroke and one `fg` away.
 
 **Every way out restores the terminal.** `run::restore_terminal` is the one
-place the exit sequences are written: give the alternate screen back if this
-process took it (`editor::abandon`, guarded by a flag `enter` sets and the
-`AltScreen` drop clears, because xterm restores a saved cursor on `?1049l`
-even when the alternate buffer was never in use), reset the cursor shape,
-turn bracketed paste off, leave raw mode. `:q` reaches it through `leave_terminal`; a panic reaches
-it through the hook `run` installs before the viewport, so the message
-prints on a cooked main screen; `SIGTERM` and `SIGHUP` reach it by ending
+place the exit sequences are written: give the session screen back if the
+session took it (`editor::abandon`, guarded by the `ENTERED` flag
+`editor::take_screen` sets, because xterm restores a saved cursor on
+`?1049l` even when the alternate buffer was never in use), reset the
+cursor shape, turn bracketed paste off, leave raw mode. `:q` reaches it
+through `leave_terminal`; a panic reaches it through the hook `run`
+installs before the screen is taken, so the message prints on a cooked
+main screen; `SIGTERM` and `SIGHUP` reach it by ending
 the loop the way `:q` does. The key reader thread stops before raw mode
 goes, so keys typed at the prompt while the connection tears down reach
 the shell. Diagnostics never touch the screen: when stderr is the terminal
@@ -706,10 +692,13 @@ doc comment says why).
 
 tmux's own copy-mode chord (`.tmux.conf`'s `mode-keys vi`, `bind [
 copy-mode`), and it means the same thing here: the current context's
-transcript becomes a buffer on the alternate screen, under vi motions —
-how a long tool result is read whole now that tool output no longer
-collapses by default (`present::collapses_by_default`), and how the
-conversation is scrolled from the keyboard.
+transcript becomes a buffer drawn full-screen on the owned screen, under
+vi motions — how a long tool result is read whole now that tool output no
+longer collapses by default (`present::collapses_by_default`), and how the
+conversation is scrolled from the keyboard. Slice 3 ("The owned screen",
+"Slices") makes scrolling itself enter copy mode — `Up` at the draft's
+edge, `PageUp`, and the wheel arriving as arrow keys all reach it the same
+way `Ctrl+A [` does now.
 
 ```text
   ─ claude · coder ──────────────────────────────────────────────  14:02:11
@@ -747,10 +736,9 @@ Rules the figure carries:
   substring is enough. `Enter` commits and jumps to the nearest match in
   that direction; `n`/`N` step to the next/previous match, wrapping around
   the whole buffer once it runs out. The active match's line is highlighted.
-- `q` and `Esc` leave copy mode and restore the inline viewport with a
-  redraw. Leaving never prints into scrollback — the buffer is read-only, and
-  closing it is a screen change, not a transcript event
-  (`tests/terminal_fit.rs`'s `copy_mode_opens_and_q_restores_the_inline_viewport`).
+- `q` and `Esc` leave copy mode and restore the ordinary screen with a
+  redraw. Leaving never prints anything — the buffer is read-only, and
+  closing it is a screen change, not a transcript event.
 - **`Ctrl+A ]` pastes the last yank into the draft** at the cursor, as
   one edit, in whatever mode the draft is in — tmux's `paste-buffer`. The
   buffer is the tui's own, so it never needs aligning with vim's registers
@@ -770,14 +758,16 @@ Rules the figure carries:
   the selection instead of leaving — a second `Esc` is what leaves.
 - **The machinery, named.** Nothing on the wire opens copy mode: it is a
   local decision over the `ContextMirror` this client already holds, the
-  same source `render::live_lines`/`take_settled_prints` read — there is no
-  RPC round trip to enter it.
-- **Viewport claim: takes the alternate screen** (ruling 1), the same as the
-  editor and the diff viewer — `ScreenMode::Copy`.
+  same source `render::transcript_window` reads — there is no RPC round
+  trip to enter it. `render::copy_buffer_lines` builds the frozen buffer;
+  `ScreenMode::Copy` draws it full-screen, the same as the editor and the
+  diff viewer.
 
 ### The picker (`Ctrl+A "`)
 
-The well, flattened. The viewport grows to hold it and shrinks on dismiss.
+The well, flattened. An overlay at the foot of the transcript area, taking
+the rows it needs and giving them back on dismiss — no viewport growth,
+the transcript simply gets fewer or more rows on the next frame.
 
 ```text
   ACTIVE
@@ -814,10 +804,12 @@ Rules the figure carries:
 ### Asks
 
 An ask arrives through `subscribeLedgerEvents` and is answered through
-`kj ledger allow|deny`. It renders in the viewport, never as a modal that
-steals the transcript. Same grown-viewport treatment as the picker: the
-viewport grows to hold the whole card, key line included, so a long
-statement never pushes `[a]llow once ...` off the bottom.
+`kj ledger allow|deny`. It renders as an overlay, never as a modal that
+steals the transcript. Same overlay treatment as the picker: it takes the
+rows it needs at the transcript area's foot, key line included, so a long
+statement never pushes `[a]llow once ...` off the bottom — the key-hints
+line is always on screen because the overlay takes exactly the rows it
+needs rather than being cropped into a fixed region.
 
 ```text
   ⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)  asker coder  reviewer amy
@@ -856,7 +848,7 @@ statement wraps by width, so a wider count would say fewer lines than a
 narrower terminal actually needs. The ledger's row count does not need
 this: its rows truncate rather than wrap, so it is measured once at
 `u16::MAX`, the picker's own pattern. Only a terminal shorter than the
-grown view — smaller than the whole card or ledger needs — falls back to
+overlay — smaller than the whole card or ledger needs — falls back to
 cropping, and it crops from the top: the key line is the last thing
 either view renders, so it is the last thing to disappear.
 
@@ -864,9 +856,9 @@ either view renders, so it is the last thing to disappear.
 
 The ask above is one row of a view you work from between sessions: every
 pending ask across every context, then the recent decisions with their
-redemption. Same grown-viewport treatment as the picker, same single-key
-answers, backed by `kj ledger list` / `show` / `allow` / `deny` and the
-`redeemed:` field.
+redemption. Same overlay treatment as the picker and the ask card, same
+single-key answers, backed by `kj ledger list` / `show` / `allow` / `deny`
+and the `redeemed:` field.
 
 ```text
   LEDGER                                                    pending 2   answered today 7
@@ -1027,19 +1019,17 @@ lane; nothing new rides the wire.
   fields in pty-req and window-change), with a `CSI 16 t` query as the
   fallback; protocol support is probed with terminal queries at startup. When
   no protocol answers, half-blocks render.
-- **Write-once emission, riding guidance 1.** An image renders when its block
-  completes and prints into scrollback: reserve N lines in the
-  `insert_before`, emit the image sized in cell units (so N is exact), and
-  never touch it again. Both target terminals keep inline images in
-  scrollback and scroll them with the text. A late edit of a printed image
-  block gets the scrollback-staleness treatment: status-line notice, no
-  redraw. There are no streaming images — a still-streaming block renders as
-  text until it completes.
+- **An image redraws like any other block.** The transcript is rebuilt every
+  frame from the mirror ("The owned screen"), so an image is emitted sized
+  in cell units wherever the block sits in that frame's window — no
+  write-once reservation, and a late edit or a resize redraws it exactly as
+  it would redraw text. There are no streaming images — a still-streaming
+  block renders as text until it completes.
 - **The presentation crate stays pure text.** Rasterization and protocol
   emission live in the ratatui edge, beside the transcript printer. The
   `ratatui-image` crate covers detection and encoding for every rung and is
   worth an evaluation pass for those parts; emission stays in our printer
-  either way, because the printer owns `insert_before`.
+  either way, because the printer owns the terminal writes.
 
 `Abc` blocks reach the staff through the same rasterizer, and need no new
 emitter: `engrave::engrave_to_svg` (`engrave/svg.rs`) already renders a tune
@@ -1062,7 +1052,7 @@ interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
 brings it back), not a toggle. `:q` (warns first if a turn is known
 running) and `:q!` (quits regardless) are the only quits. Amy, on the
 mockup: *"the legend in the status line is awesome, that'll help me a lot, I
-tend to forget keys outside the core stuff I use."* Every grown view (picker,
+tend to forget keys outside the core stuff I use."* Every overlay (picker,
 ledger) ends with its own key line for the same reason.
 
 **A key never waits on the kernel.** The rank, the pending asks and the

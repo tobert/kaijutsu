@@ -7,38 +7,35 @@
 //! detection, and no quit detection: `ZZ`/`ZQ`/`:q` are ordinary keys, and the
 //! kernel answers them with an `EditorClosed` push.
 //!
-//! The screen **takes the alternate screen** and returns the inline viewport
-//! untouched when the session ends (`docs/tui.md`, ruling 1). The transcript in
-//! the terminal's scrollback is never redrawn, so it cannot be disturbed.
+//! The editor is one of the full-screen surfaces drawn on the screen the
+//! session already owns (`docs/tui.md`, "The owned screen"); the conversation
+//! comes back when the session ends, redrawn from the context's blocks.
 //!
 //! Pure but for the terminal handle in [`enter`]/[`leave`]: the frame builder
 //! takes a state and a width and returns lines, so a `TestBackend` renders the
 //! same frames a real terminal gets.
 
-use std::io::{self, Stdout};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kaijutsu_client::EditorState;
-use ratatui::backend::CrosstermBackend;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::present::Palette;
 
-/// What has displaced the inline viewport.
+/// What the owned screen is showing.
 ///
-/// The closed set is ruling 1's: the conversation flows to scrollback, a grown
-/// view grows the viewport, and the editor, the diff viewer and copy mode take
-/// the alternate screen. A fourth *kind* of surface — one that is neither a
-/// grown view nor a vim-shaped fullscreen occupant — is a design
-/// conversation, not a patch.
+/// The closed set: the conversation — the transcript, the band and whatever
+/// overlay is open — or one of the three vim-shaped surfaces that take the
+/// whole screen. A fourth *kind* of surface is a design conversation, not a
+/// patch.
 #[derive(Default)]
 pub enum ScreenMode {
-    /// The inline viewport (`docs/tui.md`, "Conversation").
+    /// The transcript, the band and any overlay (`docs/tui.md`,
+    /// "Conversation").
     #[default]
-    Inline,
+    Conversation,
     /// A kernel-owned vi session.
     Editor(EditorScreen),
     /// A frozen diff.
@@ -49,11 +46,11 @@ pub enum ScreenMode {
 }
 
 impl ScreenMode {
-    /// Whether the alternate screen is up. The key path early-returns on this,
-    /// which is what bypasses the `Ctrl+A` prefix and `Ctrl+C` while a vi
-    /// surface is live.
-    pub fn is_alternate(&self) -> bool {
-        !matches!(self, ScreenMode::Inline)
+    /// Whether a full-screen surface has the screen. The key path
+    /// early-returns on this, which is what bypasses the `Ctrl+A` prefix and
+    /// `Ctrl+C` while a vi surface is live.
+    pub fn is_full_screen(&self) -> bool {
+        !matches!(self, ScreenMode::Conversation)
     }
 
     /// The live editor session, when one is on screen.
@@ -326,7 +323,7 @@ pub fn parse_open_signal(params: &[u8]) -> Result<EditorOpen, String> {
 // Screen-mode transitions
 // ────────────────────────────────────────────────────────────────────────────
 //
-// Every transition into and out of the alternate screen is a pure function on
+// Every transition into and out of a full-screen surface is a pure function on
 // [`App`](crate::app::App) so the whole lifecycle — open, close, session lost,
 // connection lost — is testable without a kernel and without a terminal. The
 // event loop calls these; the terminal follows the state on the next frame.
@@ -334,19 +331,19 @@ pub fn parse_open_signal(params: &[u8]) -> Result<EditorOpen, String> {
 /// Where a key goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRoute {
-    /// The surface holding the alternate screen takes it, whole. The `Ctrl+A`
-    /// prefix and the `Ctrl+C` double-tap never see it — the editor is the
-    /// sanctioned raw key reader (`docs/input.md`), so `Ctrl+A` there is vim's
-    /// increment and `Ctrl+C` is vim's interrupt.
-    AlternateScreen,
+    /// The full-screen surface takes it, whole. The `Ctrl+A` prefix and the
+    /// `Ctrl+C` double-tap never see it — the editor is the sanctioned raw
+    /// key reader (`docs/input.md`), so `Ctrl+A` there is vim's increment
+    /// and `Ctrl+C` is vim's interrupt.
+    FullScreen,
     /// The prefix machine and the compose line.
     Prefix,
 }
 
 /// Which way this client's next key goes.
 pub fn route_key(app: &crate::app::App) -> KeyRoute {
-    if app.screen.is_alternate() {
-        KeyRoute::AlternateScreen
+    if app.screen.is_full_screen() {
+        KeyRoute::FullScreen
     } else {
         KeyRoute::Prefix
     }
@@ -364,7 +361,7 @@ pub fn enter_editor(app: &mut crate::app::App, open: EditorOpen) {
 /// Apply an editor push. Returns whether the frame changed.
 ///
 /// `EditorClosed` is what `:q`, `ZZ` and `ZQ` produce: the kernel alone knows
-/// the mode, so it alone decides a quit, and this is where the inline viewport
+/// the mode, so it alone decides a quit, and this is where the conversation
 /// comes back. A push for another session is not ours — several sessions can be
 /// open at once and the channel is kernel-wide.
 pub fn apply_push(app: &mut crate::app::App, event: &kaijutsu_client::ServerEvent) -> bool {
@@ -388,7 +385,7 @@ pub fn apply_push(app: &mut crate::app::App, event: &kaijutsu_client::ServerEven
             {
                 return false;
             }
-            app.screen = ScreenMode::Inline;
+            app.screen = ScreenMode::Conversation;
             true
         }
         _ => false,
@@ -396,18 +393,18 @@ pub fn apply_push(app: &mut crate::app::App, event: &kaijutsu_client::ServerEven
 }
 
 /// A connection that will not come back cannot carry an editor session's
-/// keystrokes. Give the inline viewport back with a notice rather than leaving
+/// keystrokes. Give the conversation back with a notice rather than leaving
 /// a buffer that echoes nothing. Returns whether the screen changed.
 pub fn leave_on_disconnect(
     app: &mut crate::app::App,
     status: &kaijutsu_client::ConnectionStatus,
 ) -> bool {
     if !matches!(status, kaijutsu_client::ConnectionStatus::Terminal { .. })
-        || !app.screen.is_alternate()
+        || !app.screen.is_full_screen()
     {
         return false;
     }
-    app.screen = ScreenMode::Inline;
+    app.screen = ScreenMode::Conversation;
     app.note("kernel connection ended; left the editor");
     true
 }
@@ -418,10 +415,10 @@ pub fn leave_on_disconnect(
 /// unchanged, so the reconnect looks ordinary and only the next `editor_keys`
 /// call reports it. Returns whether the screen changed.
 pub fn leave_on_session_lost(app: &mut crate::app::App, notice: &str) -> bool {
-    if !app.screen.is_alternate() {
+    if !app.screen.is_full_screen() {
         return false;
     }
-    app.screen = ScreenMode::Inline;
+    app.screen = ScreenMode::Conversation;
     app.note(notice.to_string());
     true
 }
@@ -437,82 +434,30 @@ pub fn is_session_lost(error: &str) -> bool {
     error.contains("no such session")
 }
 
-/// The alternate screen, with a full-screen terminal over it.
-///
-/// A second `Terminal` rather than a mode switch on the inline one: the inline
-/// viewport's height and its remembered cursor row are what put the transcript
-/// in scrollback, and rebuilding them after every `:q` is how that gets lost.
-/// This one is dropped in [`leave`] and the inline terminal draws its next
-/// frame over a screen the terminal itself restored.
-pub struct AltScreen {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl AltScreen {
-    /// Draw `lines` full-screen. `cursor` places the terminal's cursor; `None`
-    /// hides it, which is what a surface with no insertion point wants.
-    pub fn draw(
-        &mut self,
-        lines: Vec<Line<'static>>,
-        cursor: Option<(u16, u16)>,
-    ) -> io::Result<()> {
-        self.terminal.draw(|frame| {
-            let area = frame.area();
-            frame.render_widget(Paragraph::new(lines), area);
-            if let Some(position) = cursor {
-                frame.set_cursor_position(position);
-            }
-        })?;
-        Ok(())
-    }
-
-    /// The screen's size, so a caller can build a frame that fits.
-    pub fn size(&self) -> io::Result<ratatui::layout::Size> {
-        self.terminal.size()
-    }
-}
-
-/// Whether this process holds the alternate screen. [`enter`] sets it and
-/// the [`AltScreen`] drop clears it, so [`abandon`] can give the screen back
-/// from a place that cannot reach the handle: the panic hook.
+/// Whether this process holds the alternate screen. [`take_screen`] sets it
+/// and [`abandon`] clears it, so the panic hook can give the screen back
+/// from a place that has no handle to it.
 static ENTERED: AtomicBool = AtomicBool::new(false);
 
-/// Take the alternate screen. Raw mode is already on.
-pub fn enter() -> io::Result<AltScreen> {
+/// Take the alternate screen for the session. Raw mode is already on.
+///
+/// The tui owns the screen from here to the exit: every surface is drawn on
+/// it, and only [`abandon`] gives it back (`docs/tui.md`, "The owned
+/// screen").
+pub fn take_screen() -> io::Result<()> {
     crossterm::execute!(
         io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
         crossterm::cursor::Show
     )?;
     ENTERED.store(true, Ordering::SeqCst);
-    let terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Fullscreen,
-        },
-    )?;
-    Ok(AltScreen { terminal })
+    Ok(())
 }
 
-/// Give the alternate screen back. The drop does the work, so an error
-/// that unwinds the event loop while a screen is up leaves the same way
-/// `q` does. Best-effort: a failure here must not mask the error that
-/// ended the session.
-pub fn leave(screen: AltScreen) {
-    drop(screen);
-}
-
-impl Drop for AltScreen {
-    fn drop(&mut self) {
-        abandon();
-    }
-}
-
-/// Give the alternate screen back without the handle, if this process
-/// holds it; a no-op otherwise. `LeaveAlternateScreen` is not sent blind:
-/// xterm restores the saved cursor on `?1049l` whether or not the
-/// alternate buffer was in use, which would move the inline viewport's
-/// exit prompt to a stale row.
+/// Give the alternate screen back, if this process holds it; a no-op
+/// otherwise. `LeaveAlternateScreen` is not sent blind: xterm restores the
+/// saved cursor on `?1049l` whether or not the alternate buffer was in use,
+/// which would move the shell's prompt to a stale row.
 pub fn abandon() {
     if ENTERED.swap(false, Ordering::SeqCst) {
         let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
@@ -522,7 +467,9 @@ pub fn abandon() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
 
     fn state(text: &str, cursor: u64) -> EditorState {
         EditorState {
@@ -754,9 +701,9 @@ mod tests {
     // ── screen mode ─────────────────────────────────────────────────────────
 
     #[test]
-    fn the_inline_viewport_is_not_the_alternate_screen() {
-        assert!(!ScreenMode::Inline.is_alternate());
-        assert!(ScreenMode::Editor(screen("x", 0)).is_alternate());
+    fn the_conversation_is_not_a_full_screen_surface() {
+        assert!(!ScreenMode::Conversation.is_full_screen());
+        assert!(ScreenMode::Editor(screen("x", 0)).is_full_screen());
     }
 
     // ── transitions ─────────────────────────────────────────────────────────
@@ -778,7 +725,7 @@ mod tests {
     #[test]
     fn an_open_signal_takes_the_alternate_screen() {
         let app = app_with_editor();
-        assert!(app.screen.is_alternate());
+        assert!(app.screen.is_full_screen());
         let live = app.screen.editor().expect("an editor screen");
         assert_eq!(live.session, 7);
         assert_eq!(live.path, "notes.kai");
@@ -810,19 +757,19 @@ mod tests {
     }
 
     /// `:q` / `ZZ` / `ZQ` are ordinary keys; the kernel answers them with a
-    /// close push, and that is what gives the inline viewport back.
+    /// close push, and that is what gives the conversation back.
     #[test]
-    fn a_close_push_gives_the_inline_viewport_back() {
+    fn a_close_push_gives_the_conversation_back() {
         let mut app = app_with_editor();
         assert!(apply_push(&mut app, &ServerEvent::EditorClosed { session_id: 7 }));
-        assert!(!app.screen.is_alternate());
+        assert!(!app.screen.is_full_screen());
     }
 
     #[test]
     fn a_close_push_for_another_session_leaves_ours_up() {
         let mut app = app_with_editor();
         assert!(!apply_push(&mut app, &ServerEvent::EditorClosed { session_id: 99 }));
-        assert!(app.screen.is_alternate());
+        assert!(app.screen.is_full_screen());
     }
 
     #[test]
@@ -834,7 +781,7 @@ mod tests {
                 reason: "kernel gone".to_string()
             }
         ));
-        assert!(!app.screen.is_alternate());
+        assert!(!app.screen.is_full_screen());
         assert_eq!(app.notice(), Some("kernel connection ended; left the editor"));
     }
 
@@ -844,27 +791,27 @@ mod tests {
     fn a_transient_connection_state_keeps_the_editor_up() {
         let mut app = app_with_editor();
         assert!(!leave_on_disconnect(&mut app, &ConnectionStatus::Connecting { attempt: 2 }));
-        assert!(app.screen.is_alternate());
+        assert!(app.screen.is_full_screen());
     }
 
     #[test]
-    fn a_lost_session_drops_back_to_the_inline_viewport() {
+    fn a_lost_session_drops_back_to_the_conversation() {
         let mut app = app_with_editor();
         assert!(leave_on_session_lost(&mut app, "editor session lost"));
-        assert!(!app.screen.is_alternate());
+        assert!(!app.screen.is_full_screen());
         assert_eq!(app.notice(), Some("editor session lost"));
     }
 
     // ── the key bypass ──────────────────────────────────────────────────────
 
     #[test]
-    fn the_alternate_screen_takes_every_key_before_the_prefix() {
+    fn a_full_screen_surface_takes_every_key_before_the_prefix() {
         let app = app_with_editor();
-        assert_eq!(route_key(&app), KeyRoute::AlternateScreen);
-        let mut inline = crate::app::App::new("amy");
-        assert_eq!(route_key(&inline), KeyRoute::Prefix);
-        inline.screen = ScreenMode::Editor(screen("x", 0));
-        assert_eq!(route_key(&inline), KeyRoute::AlternateScreen);
+        assert_eq!(route_key(&app), KeyRoute::FullScreen);
+        let mut conversation = crate::app::App::new("amy");
+        assert_eq!(route_key(&conversation), KeyRoute::Prefix);
+        conversation.screen = ScreenMode::Editor(screen("x", 0));
+        assert_eq!(route_key(&conversation), KeyRoute::FullScreen);
     }
 
     /// `Ctrl+A` in the editor is vim's increment, not the screen prefix, and
@@ -873,7 +820,7 @@ mod tests {
     #[test]
     fn ctrl_a_and_ctrl_c_reach_the_kernel_while_the_editor_is_live() {
         let app = app_with_editor();
-        assert_eq!(route_key(&app), KeyRoute::AlternateScreen);
+        assert_eq!(route_key(&app), KeyRoute::FullScreen);
         for (c, want) in [('a', "<C-a>"), ('c', "<C-c>")] {
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
             assert_eq!(key_notation(&key).as_deref(), Some(want));

@@ -1,5 +1,5 @@
-//! Client state: which contexts are watched, what has already been printed,
-//! the rank, the pending-ask count, and what the status line says.
+//! Client state: which contexts are watched and how each is shown, the
+//! rank, the pending-ask count, and what the status line says.
 //!
 //! Pure. Nothing here opens a connection, reads a clock, or draws a cell —
 //! every value a decision needs is handed in, so the whole module is
@@ -23,45 +23,30 @@ use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 /// `Ctrl+A Ctrl+A` (`docs/input.md`, the app's `Esc Esc` pattern).
 pub const DOUBLE_TAP: Duration = Duration::from_millis(500);
 
-/// One watched context: its mirror, and what this client has already printed
-/// into the terminal's scrollback.
+/// One watched context: its mirror, and how this client is showing it.
 pub struct ContextView {
     pub mirror: ContextMirror,
-    /// Blocks already printed to scrollback. They cannot be redrawn — that
-    /// is the price of the inline viewport (`docs/tui.md`, ruling 1).
-    pub printed: HashSet<BlockId>,
     /// Per-block collapse, seeded from [`collapses_by_default`] on first
     /// arrival and then carried forward, so a later expand is not wiped by
     /// the next redraw.
     pub collapsed: HashMap<BlockId, bool>,
     /// Activity since this context was last on screen — screen's `@` flag.
     pub activity: bool,
-    /// Who the last block printed to scrollback was from, so a run of blocks
-    /// by one speaker carries one divider even when they print on separate
-    /// frames.
-    pub last_printed_speaker: Option<String>,
-    /// The last block printed, so a tool result printed on a later frame
-    /// than its call still joins the pair under one header
-    /// (`present::continues_pair`).
-    pub last_printed: Option<(BlockId, BlockKind)>,
-    /// The last block the live band drew on the last frame, with its
-    /// content's character count as drawn then — `None` when the band drew
-    /// nothing (`render::live_frame`). This is newer than `last_printed`
-    /// while a block is still streaming, and is the player's edge on submit
-    /// when it is set (`docs/prompts.md`, "The submit verb").
-    pub live_tail: Option<(BlockId, u64)>,
+    /// The block that ended the last transcript frame, and how many of its
+    /// characters that frame drew — the inner `None` when a cap or a crop
+    /// hid its tail (`render::transcript_window`). It is the player's edge
+    /// on submit (`docs/prompts.md`, "The submit verb"); the outer `None`
+    /// means this context has shown nothing at all.
+    pub shown_tail: Option<(BlockId, Option<u64>)>,
 }
 
 impl ContextView {
     pub fn new(mirror: ContextMirror) -> Self {
         let mut view = Self {
             mirror,
-            printed: HashSet::new(),
             collapsed: HashMap::new(),
             activity: false,
-            last_printed_speaker: None,
-            last_printed: None,
-            live_tail: None,
+            shown_tail: None,
         };
         view.seed_collapse();
         view
@@ -86,21 +71,28 @@ impl ContextView {
     }
 
     /// The player's edge of context, as of the last frame this view drew:
-    /// the newest block it had shown, and how much of it if it was still
-    /// streaming. `live_tail` wins when set — it is newer than
-    /// `last_printed` by construction, since a block only leaves the live
-    /// band once it settles and prints. `None` when this context has shown
-    /// nothing at all, so the caller sends no edge rather than guess
-    /// (`docs/prompts.md`, "The submit verb").
+    /// the newest block it had shown, and how much of it. `None` when this
+    /// context has shown nothing at all, so the caller sends no edge rather
+    /// than guess (`docs/prompts.md`, "The submit verb").
     pub fn edge(&self) -> Option<InputEdge> {
-        if let Some((block, shown)) = self.live_tail {
-            Some(InputEdge {
-                block,
-                shown: Some(shown),
-            })
-        } else {
-            self.last_printed.map(|(block, _kind)| InputEdge { block, shown: None })
-        }
+        self.shown_tail.map(|(block, shown)| InputEdge { block, shown })
+    }
+}
+
+/// Where the transcript view sits over the current context's blocks.
+///
+/// Following is the live tail: new blocks and streaming text move the view.
+/// Scrolling stops it (`docs/tui.md`, "Scrolling is copy mode"), and the
+/// keys that do the scrolling are the next slice.
+pub struct TranscriptView {
+    pub follow: bool,
+    /// The first transcript row drawn while the view is not following.
+    pub top: usize,
+}
+
+impl Default for TranscriptView {
+    fn default() -> Self {
+        Self { follow: true, top: 0 }
     }
 }
 
@@ -127,6 +119,8 @@ pub struct App {
     /// The terminal's row count, from the last size the event loop read.
     /// Sizes what may grow with the screen (the compose cap).
     pub screen_rows: u16,
+    /// Where the transcript view sits over the context's blocks.
+    pub transcript: TranscriptView,
     pub wrap: WrapCache,
     pub quit: bool,
     /// This client's own principal, from `whoami`. It selects which draft
@@ -160,9 +154,10 @@ pub struct App {
     /// clipboard (the yank also goes to the clipboard over OSC 52, but that
     /// is a one-way emission the tui cannot read back).
     pub paste_buffer: Option<String>,
-    /// What has displaced the inline viewport, when anything has. Only the
-    /// editor and the diff viewer take the alternate screen (`docs/tui.md`,
-    /// ruling 1), and the key path early-returns on it, which is what makes
+    /// What the owned screen is showing. A full-screen surface — the
+    /// editor, the diff viewer, copy mode — takes the whole screen
+    /// (`docs/tui.md`, "The owned screen"), and the key path early-returns
+    /// on it, which is what makes
     /// the editor the sanctioned raw key reader.
     pub screen: crate::editor::ScreenMode,
     /// Which context each pending ask belongs to
@@ -173,7 +168,7 @@ pub struct App {
     /// it from the ledger on every frame.
     pub ask_owners: HashMap<String, ContextId>,
     /// The ask card showing in the live region, when one is — never more
-    /// than one at a time (`docs/tui.md`, "Asks": it grows the viewport, it
+    /// than one at a time (`docs/tui.md`, "Asks": it draws as an overlay, it
     /// is not a queue of modals).
     pub ask_card: Option<crate::asks::AskCardState>,
     /// The ledger view (`Ctrl+A l`), when open.
@@ -195,8 +190,8 @@ pub struct App {
     /// The picker's single-line tail buffer, fed from the same kernel-wide
     /// stream, independent of which context is watched.
     pub tails: crate::picker::PickerTails,
-    /// The picker, when `Ctrl+A "` has it open — `render::viewport_lines`
-    /// and `render::live_lines` both read this.
+    /// The picker, when `Ctrl+A "` has it open — `render::overlay_lines`
+    /// draws it and the key path routes to it.
     pub picker: Option<crate::picker::PickerModel>,
     /// A kj verb this client ran may have changed the roster: a placement
     /// from the picker or any `:kj` line. The loop takes it and starts a
@@ -223,6 +218,7 @@ impl App {
             compose: Compose::new(),
             palette: Palette::builtin(),
             screen_rows: 24,
+            transcript: TranscriptView::default(),
             wrap: WrapCache::new(),
             quit: false,
             principal: None,
@@ -231,7 +227,7 @@ impl App {
             thinking_turns: HashSet::new(),
             submitted_draft: None,
             paste_buffer: None,
-            screen: crate::editor::ScreenMode::Inline,
+            screen: crate::editor::ScreenMode::Conversation,
             ask_owners: HashMap::new(),
             ask_card: None,
             ledger_view: None,
@@ -426,37 +422,6 @@ impl App {
         self.notice = None;
     }
 
-    /// Record that a block has been printed into scrollback and can never be
-    /// redrawn, and remember who spoke it.
-    pub fn mark_printed(&mut self, context_id: ContextId, block_id: BlockId, kind: BlockKind, speaker: &str) {
-        if let Some(view) = self.views.get_mut(&context_id) {
-            view.printed.insert(block_id);
-            view.last_printed_speaker = Some(speaker.to_string());
-            view.last_printed = Some((block_id, kind));
-        }
-        self.wrap.forget(&block_id);
-    }
-
-    /// Late-change honesty: a change to a block already in scrollback cannot
-    /// redraw it, so say so instead of pretending. The change is real in the
-    /// kernel and in the next hydrate (`docs/tui.md`, "Conversation").
-    ///
-    /// Returns `true` when a notice was posted.
-    pub fn observe_change(&mut self, context_id: ContextId, change: &ContextChange) -> bool {
-        let Some(block_id) = changed_block(change) else {
-            return false;
-        };
-        let printed = self
-            .views
-            .get(&context_id)
-            .is_some_and(|v| v.printed.contains(&block_id));
-        if !printed {
-            return false;
-        }
-        self.note(format!("block #{} changed after print", block_id.seq));
-        true
-    }
-
     /// Mark `context_id` as having a turn running. Returns whether the set
     /// changed, so a caller only redraws when it must.
     pub fn mark_turn_running(&mut self, context_id: ContextId) -> bool {
@@ -471,11 +436,12 @@ impl App {
     }
 
     /// Latch the thinking pane for `context_id` when its turn is running and
-    /// its mirror holds a `Thinking` block not yet printed — a block that
-    /// completed inside one delivery counts, so a fast model's reasoning
-    /// opens the pane as surely as a slow one's. Returns whether it latched
-    /// now.
-    pub fn observe_thinking(&mut self, context_id: ContextId) -> bool {
+    /// one of the blocks `touched` by this delivery is `Thinking` — a block
+    /// that completed inside one delivery counts, so a fast model's
+    /// reasoning opens the pane as surely as a slow one's. Reasoning left in
+    /// the mirror by an earlier turn does not: the pane is the turn's.
+    /// Returns whether it latched now.
+    pub fn observe_thinking(&mut self, context_id: ContextId, touched: &[BlockId]) -> bool {
         if !self.turn_running(context_id) || self.thinking_turns.contains(&context_id) {
             return false;
         }
@@ -483,7 +449,7 @@ impl App {
             view.mirror
                 .blocks()
                 .iter()
-                .any(|b| b.kind == BlockKind::Thinking && !view.printed.contains(&b.id))
+                .any(|b| b.kind == BlockKind::Thinking && touched.contains(&b.id))
         });
         if seen {
             self.thinking_turns.insert(context_id);
@@ -602,9 +568,7 @@ impl App {
     /// kernel state (`docs/tui.md`, "Conversation": "a sibling's expand is
     /// yours too") — this is what makes `ContextChange::CollapsedChanged`
     /// actually reach [`ContextView::collapsed`] for a sibling's manual
-    /// toggle. A block already printed to scrollback cannot be redrawn either
-    /// way (`App::observe_change` posts that notice); updating the map here
-    /// is harmless in that case because nothing reads it again.
+    /// toggle; the transcript redraws from the map on the next frame.
     pub fn apply_collapse_change(&mut self, context_id: ContextId, change: &ContextChange) {
         if let ContextChange::CollapsedChanged { block_id, collapsed } = change
             && let Some(view) = self.views.get_mut(&context_id)
@@ -672,10 +636,10 @@ impl App {
     }
 }
 
-/// The block a change names, or `None` for a change that adds one.
-fn changed_block(change: &ContextChange) -> Option<BlockId> {
+/// The block a change touches, whether it adds, moves, edits or removes it.
+pub fn touched_block(change: &ContextChange) -> BlockId {
     match change {
-        ContextChange::BlockInserted { .. } => None,
+        ContextChange::BlockInserted { block, .. } => block.id,
         ContextChange::BlockDeleted { block_id }
         | ContextChange::BlockMoved { block_id, .. }
         | ContextChange::TextAppended { block_id, .. }
@@ -685,7 +649,7 @@ fn changed_block(change: &ContextChange) -> Option<BlockId> {
         | ContextChange::ExcludedChanged { block_id, .. }
         | ContextChange::MetadataChanged { block_id, .. }
         | ContextChange::OutputChanged { block_id, .. }
-        | ContextChange::SpansChanged { block_id, .. } => Some(*block_id),
+        | ContextChange::SpansChanged { block_id, .. } => *block_id,
     }
 }
 
@@ -836,78 +800,6 @@ mod tests {
         assert!(!model.seats[0].current);
         assert!(model.seats[1].current);
         assert_eq!(model.mode, "-- NORMAL --", "the vi mode is the status line's figure, not the model");
-    }
-
-    /// A change to a block already printed to scrollback cannot redraw it.
-    /// The TUI says so in the status line rather than pretending — this is
-    /// the price of the inline viewport, paid knowingly.
-    #[test]
-    fn a_change_to_a_printed_block_posts_a_notice() {
-        let (mut app, aid, _) = app_with_two();
-        app.views
-            .insert(aid, ContextView::new(ContextMirror::new(aid)));
-        let b = block(aid, 12, BlockKind::Text, Role::Model);
-        app.mark_printed(aid, b.id, b.kind, "model");
-
-        let posted = app.observe_change(
-            aid,
-            &ContextChange::ExcludedChanged {
-                block_id: b.id,
-                excluded: true,
-            },
-        );
-        assert!(posted);
-        assert_eq!(app.notice(), Some("block #12 changed after print"));
-    }
-
-    #[test]
-    fn a_change_to_a_block_still_in_the_viewport_posts_nothing() {
-        let (mut app, aid, _) = app_with_two();
-        app.views
-            .insert(aid, ContextView::new(ContextMirror::new(aid)));
-        let b = block(aid, 7, BlockKind::Text, Role::Model);
-
-        let posted = app.observe_change(
-            aid,
-            &ContextChange::TextAppended {
-                block_id: b.id,
-                suffix: " more".to_string(),
-            },
-        );
-        assert!(!posted);
-        assert_eq!(app.notice(), None);
-    }
-
-    #[test]
-    fn a_late_collapse_of_a_printed_block_also_posts() {
-        let (mut app, aid, _) = app_with_two();
-        app.views
-            .insert(aid, ContextView::new(ContextMirror::new(aid)));
-        let b = block(aid, 3, BlockKind::ToolResult, Role::Tool);
-        app.mark_printed(aid, b.id, b.kind, "shell");
-        assert!(app.observe_change(
-            aid,
-            &ContextChange::CollapsedChanged {
-                block_id: b.id,
-                collapsed: false,
-            }
-        ));
-        assert_eq!(app.notice(), Some("block #3 changed after print"));
-    }
-
-    #[test]
-    fn a_new_block_is_never_a_late_change() {
-        let (mut app, aid, _) = app_with_two();
-        app.views
-            .insert(aid, ContextView::new(ContextMirror::new(aid)));
-        let b = block(aid, 1, BlockKind::Text, Role::Model);
-        assert!(!app.observe_change(
-            aid,
-            &ContextChange::BlockInserted {
-                block: Box::new(b),
-                after_id: None,
-            }
-        ));
     }
 
     /// `Ctrl+C`'s own escalation is `interrupt::Ladder`'s job now
@@ -1157,35 +1049,22 @@ mod tests {
         assert!(app.ask_card.is_none(), "the card belongs to a, not to the seat on screen");
     }
 
-    /// The player's edge on submit: a live-band tail beats a printed block,
-    /// since the tail is always newer when both are set
-    /// (`docs/prompts.md`, "The submit verb").
+    /// The player's edge on submit: the newest block the transcript showed,
+    /// and how much of it was rendered (`docs/prompts.md`, "The submit
+    /// verb"). A block whose tail was cut carries the block alone.
     #[test]
-    fn a_live_tail_wins_over_last_printed_for_the_edge() {
+    fn the_shown_tail_is_the_edge() {
         let aid = ContextId::new();
         let mut view = ContextView::new(ContextMirror::new(aid));
-        let printed = block(aid, 1, BlockKind::Text, Role::Model);
         let streaming = block(aid, 2, BlockKind::Text, Role::Model);
-        view.last_printed = Some((printed.id, printed.kind));
-        view.live_tail = Some((streaming.id, 7));
+        view.shown_tail = Some((streaming.id, Some(7)));
 
-        let edge = view.edge().expect("a live tail gives an edge");
+        let edge = view.edge().expect("a shown tail gives an edge");
         assert_eq!(edge.block, streaming.id);
         assert_eq!(edge.shown, Some(7));
-    }
 
-    /// With no live band tail, the edge falls back to the last printed
-    /// block, unqualified: it was read whole, not mid-stream.
-    #[test]
-    fn last_printed_alone_gives_an_edge_with_no_shown_count() {
-        let aid = ContextId::new();
-        let mut view = ContextView::new(ContextMirror::new(aid));
-        let printed = block(aid, 1, BlockKind::Text, Role::Model);
-        view.last_printed = Some((printed.id, printed.kind));
-
-        let edge = view.edge().expect("a printed block gives an edge");
-        assert_eq!(edge.block, printed.id);
-        assert_eq!(edge.shown, None);
+        view.shown_tail = Some((streaming.id, None));
+        assert_eq!(view.edge().expect("still an edge").shown, None, "a cut tail carries no count");
     }
 
     /// A context that has shown nothing at all sends no edge — the kernel

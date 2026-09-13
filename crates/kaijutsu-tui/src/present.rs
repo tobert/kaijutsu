@@ -160,7 +160,7 @@ impl Palette {
         }
     }
 
-    // ── the alternate screen: editor and diff (docs/tui.md, ruling 1) ───────
+    // ── the full-screen surfaces: editor and diff (docs/tui.md) ─────────────
 
     /// Buffer text in the editor.
     pub fn editor_text(&self) -> Style {
@@ -279,10 +279,8 @@ pub struct BlockView<'a> {
 
 /// Whether a block of this kind renders collapsed the first time it is seen.
 ///
-/// Only `Error`. Tool calls and results print whole: the transcript lives
-/// in scrollback and is never redrawn, so a collapsed result is one nobody
-/// can open — reading a long one is copy mode's job (`docs/tui.md`,
-/// guidance 7). The kernel's `collapsed` field has no per-kind default, so
+/// Only `Error`. Tool calls and results render whole: reading a long one
+/// is copy mode's job (`docs/tui.md`, guidance 7). The kernel's `collapsed` field has no per-kind default, so
 /// the default is the client's to apply — once, on first arrival, then
 /// carried forward per block id so a later change is not wiped by the next
 /// redraw.
@@ -710,7 +708,7 @@ fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-/// Wrapped lines per block, keyed `(block id, version, width)`.
+/// Wrapped lines per block, keyed by everything the render reads.
 ///
 /// A streaming block is re-wrapped on every append; a settled one is wrapped
 /// once and then handed back. `docs/tui.md`, "What is reused, what is new".
@@ -721,9 +719,46 @@ pub struct WrapCache {
 
 #[derive(Debug)]
 struct Entry {
-    version: u64,
+    key: u64,
     width: u16,
     lines: Vec<Line<'static>>,
+}
+
+/// Everything [`render_block`] reads about a block and its view, folded into
+/// one key.
+///
+/// The block's own version is not enough: the divider carries the speaker,
+/// the context type, the stamp and a tool call's argument, an `Error` block's
+/// provenance line reads the lineage, and a result's body reads `output`,
+/// `stderr` and `style_spans`. A cast rename or a rehydrate moves those with
+/// the block's own fields untouched, and a key that missed them would serve
+/// the stale render for the life of the block.
+///
+/// The three bodies are keyed by length rather than by content: they arrive
+/// whole with the block's own `updated_at`, which the version already
+/// carries, so the length is what distinguishes one arrival from the next.
+fn render_key(block: &BlockSnapshot, view: &BlockView<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    block_version(block, view.collapsed).hash(&mut hasher);
+    (block.kind as u64).hash(&mut hasher);
+    (block.role as u64).hash(&mut hasher);
+    block.output.is_some().hash(&mut hasher);
+    block.stderr.as_deref().map(str::len).hash(&mut hasher);
+    block.style_spans.len().hash(&mut hasher);
+    view.speaker.hash(&mut hasher);
+    view.context_type.hash(&mut hasher);
+    view.stamp.hash(&mut hasher);
+    view.show_divider.hash(&mut hasher);
+    view.tool.hash(&mut hasher);
+    view.arg.hash(&mut hasher);
+    view.local_ctx.hash(&mut hasher);
+    for parent in &view.lineage {
+        parent.id.hash(&mut hasher);
+        parent.updated_at.hash(&mut hasher);
+        parent.content.len().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl WrapCache {
@@ -731,7 +766,7 @@ impl WrapCache {
         Self::default()
     }
 
-    /// The block's wrapped lines, re-wrapping only when the version or the
+    /// The block's wrapped lines, re-wrapping only when the render key or the
     /// width moved.
     pub fn lines(
         &mut self,
@@ -740,24 +775,29 @@ impl WrapCache {
         width: u16,
         palette: &Palette,
     ) -> &[Line<'static>] {
-        let version = block_version(block, view.collapsed);
+        let key = render_key(block, view);
         let entry = self.entries.entry(block.id).or_insert_with(|| Entry {
-            version,
+            key,
             width,
             lines: render_block(block, view, width, palette),
         });
-        if entry.version != version || entry.width != width {
-            entry.version = version;
+        if entry.key != key || entry.width != width {
+            entry.key = key;
             entry.width = width;
             entry.lines = render_block(block, view, width, palette);
         }
         &entry.lines
     }
 
-    /// Drop one block's wrap — a deleted block, or one that has left the
-    /// live region for scrollback and will never be redrawn.
+    /// Drop one block's wrap — a block the kernel deleted.
     pub fn forget(&mut self, id: &BlockId) {
         self.entries.remove(id);
+    }
+
+    /// Drop every entry belonging to `context_id` — a context whose feed
+    /// ended and whose view is gone.
+    pub fn forget_context(&mut self, context_id: ContextId) {
+        self.entries.retain(|id, _| id.context_id != context_id);
     }
 
     pub fn len(&self) -> usize {
@@ -970,9 +1010,7 @@ mod tests {
         assert!(!text.contains("14:02:11"), "got {text:?}");
     }
 
-    /// Tool output prints whole: scrollback can never be redrawn, so a
-    /// collapsed result is one nobody can open. Only `Error` keeps its
-    /// one-line stub.
+    /// Tool output renders whole; only `Error` keeps its one-line stub.
     #[test]
     fn only_errors_collapse_by_default() {
         assert!(!collapses_by_default(BlockKind::ToolCall));
@@ -1325,6 +1363,61 @@ mod tests {
         let narrow = cache.lines(&b, &v, 12, &palette).len();
         assert_eq!(wide, 1);
         assert!(narrow > 1, "a narrower width wraps to more lines");
+    }
+
+    /// The key covers everything [`render_block`] reads, not the block's own
+    /// fields alone: a cast change renames the speaker with the block
+    /// untouched, and a rehydrate can flip the divider and the lineage the
+    /// same way. A cache that missed those served a stale render forever.
+    #[test]
+    fn the_wrap_cache_rewraps_when_the_view_changes() {
+        let palette = Palette::builtin();
+        let mut cache = WrapCache::new();
+        let b = block(BlockKind::Text, Role::Model, "alpha beta");
+        let mut v = view();
+        v.show_divider = true;
+
+        let first = cache.lines(&b, &v, 40, &palette).to_vec();
+        v.speaker = "deepseek-v4";
+        let renamed = cache.lines(&b, &v, 40, &palette).to_vec();
+        assert_ne!(renamed, first, "a renamed speaker re-wraps the divider");
+
+        let mut v = view();
+        v.show_divider = true;
+        let divided = cache.lines(&b, &v, 40, &palette).len();
+        v.show_divider = false;
+        let bare = cache.lines(&b, &v, 40, &palette).len();
+        assert_eq!(bare + 1, divided, "dropping the divider drops its row");
+    }
+
+    /// An output-carrying tool result renders from `output`, which the
+    /// block's own version never named.
+    #[test]
+    fn the_wrap_cache_rewraps_when_a_tool_results_output_changes() {
+        let palette = Palette::builtin();
+        let mut cache = WrapCache::new();
+        let mut b = block(BlockKind::ToolResult, Role::Tool, "one");
+        b.status = Status::Done;
+        let v = view();
+        let first = cache.lines(&b, &v, 40, &palette).to_vec();
+        b.stderr = Some("warning: nothing built".to_string());
+        let with_stderr = cache.lines(&b, &v, 40, &palette).to_vec();
+        assert_ne!(with_stderr, first, "stderr arriving re-wraps the result");
+    }
+
+    /// A context that left the screen takes its wraps with it.
+    #[test]
+    fn forgetting_a_context_drops_only_its_own_entries() {
+        let palette = Palette::builtin();
+        let mut cache = WrapCache::new();
+        let mine = block(BlockKind::Text, Role::Model, "alpha");
+        let other = block(BlockKind::Text, Role::Model, "beta");
+        let v = view();
+        let _ = cache.lines(&mine, &v, 40, &palette);
+        let _ = cache.lines(&other, &v, 40, &palette);
+        assert_eq!(cache.len(), 2);
+        cache.forget_context(mine.id.context_id);
+        assert_eq!(cache.len(), 1, "only the named context's entries go");
     }
 
     #[test]

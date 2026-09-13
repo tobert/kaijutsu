@@ -1,15 +1,15 @@
 //! `kaijutsu-tui` — the terminal client.
 //!
 //! A standalone binary that dials the kernel over the existing SSH RPC
-//! subsystem and renders an inline ratatui viewport: the transcript flows
-//! into the terminal's own scrollback, the live UI sits at the bottom.
+//! subsystem and takes the alternate screen for the session: the transcript
+//! is a view over the current context's blocks, the band sits under it.
 //! It is not a kernel subsystem and not a Bevy frontend
 //! (`docs/tui.md`, "Roads not taken").
 //!
 //! ```text
 //! terminal
 //!    │  keys + cells
-//! kaijutsu-tui            ratatui inline viewport
+//! kaijutsu-tui            ratatui over the alternate screen
 //!    │  kaijutsu-client   ActorHandle, ContextMirror, ServerEvent
 //! kaijutsu-server / kernel
 //! ```
@@ -25,7 +25,7 @@
 //! | [`layout`] | structured tool output (`OutputData`) → width-aware lines: tables, `ls -C` columns, trees |
 //! | [`app`] | contexts, mirrors, rank, asks, cache health, notices |
 //! | [`status`] | the status line's figures and its layout |
-//! | [`render`] | the `Backend`-generic renderer and the inline viewport |
+//! | [`render`] | the `Backend`-generic renderer: the transcript, the band, the overlays |
 //! | [`keys`] | key events → intents, including the `Ctrl+A` prefix |
 //! | [`run`] | the event loop |
 //! | [`compose`] | the vi surface over the context's kernel-owned draft, and the `:` bar |
@@ -34,8 +34,8 @@
 //! | [`asks`] | the ask card, the ledger view (`Ctrl+A l`) |
 //! | [`inflight`] | the in-flight strip: one fixed row naming unsettled tool calls |
 //! | [`completion`] | `:kj ` completion over the `kj` command catalog |
-//! | [`picker`] | later lane |
-//! | [`editor`], [`diff`], [`copy`] | the three alternate-screen surfaces |
+//! | [`picker`] | the seat picker (`Ctrl+A "`), drawn as an overlay |
+//! | [`editor`], [`diff`], [`copy`] | the three full-screen surfaces |
 
 pub mod app;
 pub mod asks;

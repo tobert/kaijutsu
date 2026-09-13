@@ -1,4 +1,4 @@
-//! The diff screen — the alternate screen's other occupant.
+//! The diff screen — the second full-screen surface.
 //!
 //! **Nothing on the wire opens a diff view.** `kj diff` authors a block whose
 //! `ContentType` is `Diff`, and a client decides for itself to open on it; the
@@ -145,7 +145,7 @@ const DEFAULT_BODY_LINES: usize = 20;
 /// What a key did to the diff screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffKey {
-    /// `q` / `Esc` — give the inline viewport back.
+    /// `q` / `Esc` — give the conversation back.
     Close,
     /// The viewport moved.
     Scrolled,

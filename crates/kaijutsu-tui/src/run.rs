@@ -14,13 +14,15 @@ use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::Event;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, disable_raw_mode, enable_raw_mode,
+};
 use kaijutsu_audio::RefDisposition;
 use kaijutsu_client::{ContextInfo, FeedEvent, ServerEvent};
 use parking_lot::Mutex;
 use kaijutsu_types::ContextId;
 use ratatui::backend::CrosstermBackend;
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::app::{App, ContextView};
@@ -41,7 +43,7 @@ use kaijutsu_client::{PeerConfig, PeerInvocation};
 
 use crate::copy::{self, CopyOutcome};
 use crate::diff::{self, DiffKey};
-use crate::editor::{self, AltScreen, EditorOpen, ScreenMode};
+use crate::editor::{self, EditorOpen, ScreenMode};
 
 /// How often the rank, the cache figures and the pending-ask count are
 /// refreshed. Slow on purpose: none of them is an interaction-rate fact.
@@ -55,25 +57,44 @@ const TICK: Duration = Duration::from_millis(80);
 /// lock. It bounds how long a redraw waits for the lock, so it is short.
 const KEY_POLL: Duration = Duration::from_millis(20);
 
+/// `KAIJUTSU_TUI_PROBE_PANIC`: unset, or `frame` to panic inside the frame
+/// — where a synchronized update is open and the restore path has to end it
+/// — or any other value to panic on the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePanic {
+    Off,
+    OnKey,
+    InFrame,
+}
+
+impl ProbePanic {
+    fn from_env() -> Self {
+        match std::env::var("KAIJUTSU_TUI_PROBE_PANIC").ok().as_deref() {
+            None => Self::Off,
+            Some("frame") => Self::InFrame,
+            Some(_) => Self::OnKey,
+        }
+    }
+}
+
 /// One feed delivery, tagged with the context it belongs to — several
 /// contexts are watched at once and they share one loop.
 type TaggedFeed = (ContextId, FeedEvent);
 
 /// crossterm's internal event reader is one shared resource, and a blocking
-/// read holds it. `Terminal`'s cursor-position query — the inline viewport's
-/// resize path — needs the same reader, and a query issued while a read is
-/// blocked times out with "the cursor position could not be read within a
-/// normal duration". One mutex arbitrates: the key reader takes it for the
-/// length of one [`KEY_POLL`], and every terminal operation takes it too.
+/// read holds it. A reader mid-poll while raw mode goes away reads a cooked
+/// terminal, and the keys typed at the shell prompt are lost. One mutex
+/// arbitrates: the key reader takes it for the length of one [`KEY_POLL`],
+/// and every terminal operation takes it too.
 type TermLock = Arc<Mutex<()>>;
 
 /// The loop's wake sources, bundled so the event loop takes one handle
 /// instead of a parameter per channel.
 struct Wires {
     term_lock: TermLock,
-    /// `KAIJUTSU_TUI_PROBE_PANIC` was set: `F12` panics, so the terminal-fit
-    /// probes can see what the panic hook leaves behind.
-    probe_panic: bool,
+    /// What `F12` does, so the terminal-fit probes can see what the panic
+    /// hook leaves behind.
+    probe_panic: ProbePanic,
     key_rx: mpsc::Receiver<Event>,
     feed_rx: mpsc::Receiver<TaggedFeed>,
     /// Kept alongside the receiver: a context switch watches a new context,
@@ -133,7 +154,7 @@ pub async fn run(
     app.principal = Some(identity.principal_id);
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
 
-    // A panic past this point unwinds through the viewport without reaching
+    // A panic past this point unwinds through the screen without reaching
     // `leave_terminal`. The hook restores the terminal first, so the panic
     // message prints on a cooked main screen and the shell that follows
     // reads keys. No terminal lock here: the panicking thread may hold it.
@@ -143,9 +164,9 @@ pub async fn run(
         default_panic(info);
     }));
 
-    // The inline viewport's first cursor query runs before the key reader
-    // exists, so nothing is holding the reader it needs.
-    let mut terminal = enter_terminal().context("enter the inline viewport")?;
+    // The screen is taken after the connection is up, so a failure to
+    // connect is a plain line on the shell's own screen.
+    let mut terminal = enter_terminal().context("take the alternate screen")?;
     let term_lock: TermLock = Arc::new(Mutex::new(()));
     let (key_tx, key_rx) = mpsc::channel::<Event>(64);
     // Stopped on the way out, before raw mode goes, so keys typed at the
@@ -154,7 +175,7 @@ pub async fn run(
 
     let mut wires = Wires {
         term_lock: term_lock.clone(),
-        probe_panic: std::env::var_os("KAIJUTSU_TUI_PROBE_PANIC").is_some(),
+        probe_panic: ProbePanic::from_env(),
         key_rx,
         feed_rx,
         feed_tx,
@@ -170,7 +191,7 @@ pub async fn run(
 ///
 /// A dedicated thread rather than `crossterm::event::EventStream`: the stream
 /// polls with no timeout, which holds crossterm's internal reader forever and
-/// starves the cursor-position query the inline viewport makes on resize.
+/// leaves no window for the exit path to stop it.
 fn spawn_key_reader(term_lock: TermLock, tx: mpsc::Sender<Event>) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
@@ -264,20 +285,16 @@ async fn event_loop(
     let mut tick = tokio::time::interval(TICK);
     let mut dirty = true;
     let mut last_strip_frame = Instant::now();
-    // The alternate screen, when one is up. `draw` owns the transition: the
-    // screen mode is state on `App`, and the terminal follows it.
-    let mut alt: Option<AltScreen> = None;
-    // The inline viewport's current height (`Viewport::Inline` has no public
-    // runtime resize — see `set_viewport_height`) and the beat-driven redraw
-    // wake, both `None`/base until a track is found playing.
-    let mut viewport_height = render::VIEWPORT_LINES;
-    // A band height the terminal refused (no cursor-query answer). Cleared
-    // by a resize event or by the wanted height changing.
-    let mut resize_refused: Option<u16> = None;
     // The cursor shape last sent to the terminal; `None` until the first
     // frame and again after a suspend, since the host shell may have set
     // its own.
     let mut cursor_shape: Option<CursorShape> = None;
+    // The screen mode the last frame drew, so crossing between the
+    // conversation and a full-screen surface can say the cursor shape again.
+    let mut was_full_screen = false;
+    // `KAIJUTSU_TUI_PROBE_PANIC=frame` armed by `F12`: the next frame panics
+    // with a synchronized update open.
+    let mut panic_in_frame = false;
     let mut beat_wake: Option<Instant> = None;
     let mut beat_tempo_bps: f64 = 0.0;
 
@@ -289,8 +306,12 @@ async fn event_loop(
                 match event {
                     Event::Key(key) => {
                         dirty = true;
-                        if wires.probe_panic && key.code == crossterm::event::KeyCode::F(12) {
-                            panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed");
+                        if key.code == crossterm::event::KeyCode::F(12) {
+                            match wires.probe_panic {
+                                ProbePanic::OnKey => panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed"),
+                                ProbePanic::InFrame => panic_in_frame = true,
+                                ProbePanic::Off => {}
+                            }
                         }
                         let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
                         if app.picker.is_some() {
@@ -317,10 +338,9 @@ async fn event_loop(
                         dirty = true;
                         paste_text(bridge, app, text).await;
                     }
-                    Event::Resize(..) => {
-                        dirty = true;
-                        resize_refused = None;
-                    }
+                    // The frame is rebuilt at the new size on the next tick:
+                    // the transcript re-wraps and the band follows.
+                    Event::Resize(..) => dirty = true,
                     _ => {}
                 }
             }
@@ -450,33 +470,15 @@ async fn event_loop(
                     last_strip_frame = Instant::now();
                     dirty = true;
                 }
-                let size = terminal.size()?;
-                app.screen_rows = size.height;
-                let want = render::viewport_lines(app, size.width);
-                if want != viewport_height && resize_refused != Some(want) {
-                    tracing::debug!(from = viewport_height, to = want, "viewport resized");
-                    match set_viewport_height(&wires.term_lock, terminal, want) {
-                        Ok(()) => viewport_height = want,
-                        Err(error) => {
-                            // The terminal did not answer the cursor query
-                            // (`Terminal::with_options` waits two seconds).
-                            // The band keeps its height rather than the
-                            // loop ending; the same height is not asked
-                            // for again until something else changes.
-                            tracing::warn!(%error, from = viewport_height, to = want, "viewport resize refused");
-                            app.note("the terminal did not answer the cursor query; the band keeps its height");
-                            resize_refused = Some(want);
-                        }
-                    }
-                }
+                app.screen_rows = terminal.size()?.height;
                 if dirty {
                     dirty = false;
-                    let was_alternate = alt.is_some();
-                    draw(terminal, &mut alt, &wires.term_lock, app, keys.armed())?;
-                    // A terminal may keep a cursor shape per screen buffer, so
-                    // crossing into or out of the alternate screen forgets
-                    // what was sent and the next frame says it again.
-                    if alt.is_some() != was_alternate {
+                    draw(terminal, &wires.term_lock, app, keys.armed(), panic_in_frame)?;
+                    // A terminal may keep a cursor shape per screen buffer,
+                    // and a full-screen surface owns its own, so crossing
+                    // either way forgets what was sent.
+                    if app.screen.is_full_screen() != was_full_screen {
+                        was_full_screen = app.screen.is_full_screen();
                         cursor_shape = None;
                     }
                     let _guard = wires.term_lock.lock();
@@ -485,11 +487,24 @@ async fn event_loop(
             }
         }
     }
-    if let Some(screen) = alt.take() {
-        let _guard = wires.term_lock.lock();
-        editor::leave(screen);
-    }
     Ok(())
+}
+
+/// The `Thinking` blocks of `context_id` that are still streaming — what a
+/// rehydrated mirror offers the thinking pane's latch in place of the
+/// changed blocks a delivery names.
+fn streaming_thinking(app: &App, context_id: ContextId) -> Vec<kaijutsu_types::BlockId> {
+    let Some(view) = app.views.get(&context_id) else {
+        return Vec::new();
+    };
+    view.mirror
+        .blocks()
+        .iter()
+        .filter(|b| {
+            b.kind == kaijutsu_types::BlockKind::Thinking && !render::is_settled(b)
+        })
+        .map(|b| b.id)
+        .collect()
 }
 
 /// Fold one `ServerEvent::BeatSync` into `app.beats`, the same
@@ -532,46 +547,6 @@ fn rearm_beat_wake(app: &App, beat_wake: &mut Option<Instant>, beat_tempo_bps: &
     *beat_wake = Some(picker::next_onset(position, *beat_tempo_bps, now));
 }
 
-/// Recreate the inline viewport at a new height. `Viewport::Inline`'s height
-/// is fixed at construction (`ratatui-core` exposes no runtime setter — see
-/// `terminal/resize.rs`'s `resize()`, which only recomputes the ORIGIN from
-/// the height already stored on `Terminal::with_options`), so a grown/shrunk
-/// view re-enters the inline viewport at the new height, anchored to the
-/// cursor's current row exactly as the first `enter_terminal` call was.
-fn set_viewport_height(
-    term_lock: &TermLock,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    height: u16,
-) -> Result<()> {
-    let _guard = term_lock.lock();
-    let top = terminal.get_frame().area().y;
-    // A freshly constructed `Terminal` has no memory of what the OLD one
-    // painted, so it diffs against an empty buffer and never emits the
-    // blanks needed to erase what is still on screen. Blank the current
-    // viewport through the OLD terminal (which still has last frame's
-    // buffer to diff against) before swapping it out, or a shrink/regrow
-    // leaves stale rows behind.
-    terminal
-        .draw(|frame| frame.render_widget(ratatui::widgets::Clear, frame.area()))
-        .context("clear the viewport before resizing it")?;
-    let _ = terminal.flush();
-    // An inline viewport anchors at the cursor row and reserves its rows
-    // below that. The clear leaves the cursor on the OLD viewport's last
-    // row, so anchoring there scrolls the transcript up by a whole band on
-    // every resize. Anchor at the old top instead: a grow scrolls by
-    // exactly the rows added, and a shrink leaves its freed rows blank
-    // below the band, where the next `insert_before` sinks the viewport
-    // back down into them (`docs/tui.md`, "Conversation").
-    crossterm::execute!(io::stdout(), crossterm::cursor::MoveTo(0, top))
-        .context("anchor the resized viewport")?;
-    *terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions { viewport: Viewport::Inline(height) },
-    )
-    .context("resize inline viewport")?;
-    Ok(())
-}
-
 /// Route one key to the open picker, then act on its [`PickerOutcome`].
 /// A placement verb that ran marks the roster changed (`App::roster_changed`)
 /// so the loop starts a refresh round now rather than on the next tick;
@@ -609,53 +584,74 @@ async fn handle_picker_key(
     Ok(())
 }
 
-/// One frame: print what completed into scrollback, then redraw the live
-/// region.
+/// One frame of the owned screen, inside one synchronized update.
+///
+/// `?2026` brackets the frame so a terminal that supports it shows the whole
+/// redraw at once; one that does not ignores the two sequences.
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    alt: &mut Option<AltScreen>,
     term_lock: &TermLock,
     app: &mut App,
     armed: bool,
+    probe_panic: bool,
 ) -> Result<()> {
-    // The alternate screen is a mode of the whole client, and this is the one
-    // place the terminal follows it. Taking and giving it back here — rather
-    // than at every site that opens or closes a surface — is what keeps the
-    // inline viewport's transcript in scrollback untouched (`docs/tui.md`,
-    // ruling 1).
-    if app.screen.is_alternate() {
-        let _guard = term_lock.lock();
-        if alt.is_none() {
-            *alt = Some(editor::enter().context("take the alternate screen")?);
-        }
-        let screen = alt.as_mut().expect("just entered");
-        return draw_alternate(screen, app);
-    }
-    if let Some(screen) = alt.take() {
-        let _guard = term_lock.lock();
-        editor::leave(screen);
-    }
-
-    let width = terminal.size()?.width;
-    let prints = render::take_settled_prints(app, width);
-    let _guard = term_lock.lock();
-    render::print_scrollback(terminal, &prints)?;
     // The status line's live pulse dot — the one place this crate samples
     // the phasor's envelope against a real clock; `App::track_figure` only
     // projects the value stamped here.
     app.track_pulse = app
         .playing_track()
         .is_some_and(|t| app.beats.envelope(&t.score_context_id, Instant::now()) > 0.5);
-    render::draw_live(terminal, app, kaijutsu_types::now_millis(), armed)?;
+
+    let _guard = term_lock.lock();
+    crossterm::execute!(io::stdout(), BeginSynchronizedUpdate).context("begin a frame")?;
+    let drawn = draw_frame(terminal, app, armed, probe_panic);
+    // The update is ended whatever the frame did: a terminal left inside a
+    // synchronized update shows nothing at all. A panic unwinds past this
+    // one, which is why `restore_terminal` ends it too.
+    let ended = crossterm::execute!(io::stdout(), EndSynchronizedUpdate).context("end a frame");
+    // The frame's own error is the one that says what went wrong.
+    drawn?;
+    ended
+}
+
+/// The frame itself: a full-screen surface when one has the screen, the
+/// conversation otherwise.
+fn draw_frame(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    armed: bool,
+    probe_panic: bool,
+) -> Result<()> {
+    assert!(!probe_panic, "KAIJUTSU_TUI_PROBE_PANIC: panicking inside a frame");
+    let size = terminal.size()?;
+    let palette = app.palette;
+    match &mut app.screen {
+        ScreenMode::Conversation => {
+            render::draw_screen(terminal, app, kaijutsu_types::now_millis(), armed)?;
+        }
+        ScreenMode::Editor(screen) => {
+            let frame = editor::editor_frame(screen, size.width, size.height, &palette);
+            render::draw_surface(terminal, frame.lines, Some(frame.cursor))?;
+        }
+        ScreenMode::Diff(screen) => {
+            let lines = screen.frame(size.height, &palette);
+            render::draw_surface(terminal, lines, None)?;
+        }
+        ScreenMode::Copy(screen) => {
+            let lines = screen.frame(size.height, size.width, &palette);
+            let cursor = screen.frame_cursor(size.height);
+            render::draw_surface(terminal, lines, cursor)?;
+        }
+    }
     Ok(())
 }
 
-/// The cursor shape a frame of `app` wants: the draft's mode on the inline
-/// surface, the buffer's mode in the editor, and a block on the screens
+/// The cursor shape a frame of `app` wants: the draft's mode in the
+/// conversation, the buffer's mode in the editor, and a block on the screens
 /// that read rather than type (`docs/tui.md`, "Compose").
 fn wanted_cursor_shape(app: &App) -> CursorShape {
     match &app.screen {
-        ScreenMode::Inline => app.compose.cursor_shape(),
+        ScreenMode::Conversation => app.compose.cursor_shape(),
         ScreenMode::Editor(screen) => CursorShape::for_mode(screen.state.mode.as_deref()),
         ScreenMode::Diff(_) | ScreenMode::Copy(_) => CursorShape::Block,
     }
@@ -678,31 +674,6 @@ fn set_cursor_shape(sent: &mut Option<CursorShape>, want: CursorShape) -> Result
     Ok(())
 }
 
-/// One frame of whichever surface holds the alternate screen.
-fn draw_alternate(alt: &mut AltScreen, app: &mut App) -> Result<()> {
-    let size = alt.size()?;
-    let palette = app.palette;
-    match &mut app.screen {
-        ScreenMode::Editor(screen) => {
-            let frame = editor::editor_frame(screen, size.width, size.height, &palette);
-            alt.draw(frame.lines, Some(frame.cursor))?;
-        }
-        ScreenMode::Diff(screen) => {
-            let lines = screen.frame(size.height, &palette);
-            alt.draw(lines, None)?;
-        }
-        ScreenMode::Copy(screen) => {
-            let lines = screen.frame(size.height, size.width, &palette);
-            let cursor = screen.frame_cursor(size.height);
-            alt.draw(lines, cursor)?;
-        }
-        // Unreachable: the caller checked. Drawing nothing beats a panic in a
-        // frame path.
-        ScreenMode::Inline => {}
-    }
-    Ok(())
-}
-
 /// Whether a key asked the loop to hand the terminal back to the host shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Acted {
@@ -722,11 +693,11 @@ async fn act(
     width: u16,
 ) -> Result<Acted> {
     // The editor is the sanctioned raw key reader (`docs/input.md`): while a
-    // vi surface — including copy mode — holds the alternate screen every
-    // key belongs to it, so the `Ctrl+A` prefix and the `Ctrl+C` double-tap
-    // are bypassed here rather than being taught to stand aside.
-    if editor::route_key(app) == editor::KeyRoute::AlternateScreen {
-        act_alternate(bridge, app, key, term_lock).await?;
+    // vi surface — including copy mode — has the screen every key belongs to
+    // it, so the `Ctrl+A` prefix and the `Ctrl+C` double-tap are bypassed
+    // here rather than being taught to stand aside.
+    if editor::route_key(app) == editor::KeyRoute::FullScreen {
+        act_full_screen(bridge, app, key, term_lock).await?;
         return Ok(Acted::Continue);
     }
     // The ledger view captures every key while open — its j/k/Esc keys are
@@ -841,7 +812,7 @@ enum PasteTarget {
 /// picker's and the ledger's filters and an ask card are not wired for
 /// one.
 fn paste_target(app: &App) -> PasteTarget {
-    if editor::route_key(app) == editor::KeyRoute::AlternateScreen {
+    if editor::route_key(app) == editor::KeyRoute::FullScreen {
         return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
     }
     if app.ledger_view.is_some() || app.picker.is_some() || app.ask_card.is_some() {
@@ -902,15 +873,8 @@ async fn switch_seat(
     app.compose.load_draft(draft.as_deref().unwrap_or(""));
     match draft {
         Err(e) => app.note(format!("draft of {} unread: {e}", app.label_for(id))),
-        // A context with nothing left to print has had nothing happen since
-        // it was last on screen, so the switch changes only the band: what
-        // stands above it is still the context we just left. Scrollback is
-        // never redrawn, so name where we are instead of letting the old
-        // transcript pass for the new one (`docs/tui.md`, ruling 1).
-        Ok(_) if !render::has_unprinted(app, id) => {
-            let label = app.label_for(id);
-            app.note(format!("{label}: nothing new since you left — Ctrl+A [ reads it"));
-        }
+        // The transcript is the new context's own from the next frame, so
+        // the switch has nothing to say about what is on screen.
         Ok(_) => app.clear_notice(),
     }
 }
@@ -1084,7 +1048,16 @@ fn apply_kj_completion(app: &mut App) {
 /// submit) and cleared on `TurnCompleted`/`TurnFailed`.
 fn mark_turn_liveness(app: &mut App, event: &ServerEvent) -> bool {
     match event {
-        ServerEvent::TurnStarted { context_id, .. } => app.mark_turn_running(*context_id),
+        ServerEvent::TurnStarted { context_id, .. } => {
+            let started = app.mark_turn_running(*context_id);
+            // The start rides the kernel-wide event stream and the reasoning
+            // rides the context feed, so the reasoning can land first — when
+            // `observe_thinking` has no live turn to latch on and drops it.
+            // Latch here on the reasoning the mirror already holds.
+            let streaming = streaming_thinking(app, *context_id);
+            let latched = app.observe_thinking(*context_id, &streaming);
+            started || latched
+        }
         ServerEvent::TurnCompleted { context_id, .. } | ServerEvent::TurnFailed { context_id, .. } => {
             app.mark_turn_ended(*context_id)
         }
@@ -1130,29 +1103,34 @@ impl StopSignals {
     }
 }
 
-/// Hand the terminal back to the host shell: leave raw mode, stop ourselves
-/// the way a shell job does, and re-anchor the inline viewport when `SIGCONT`
-/// brings us back. The transcript stays in scrollback either way, so nothing
-/// else needs restoring (`docs/tui.md`, "The `:` line": `Ctrl+Z` is a single
-/// suspend now, not a toggle).
+/// Hand the terminal back to the host shell: give the screen back, leave raw
+/// mode, stop ourselves the way a shell job does, and take the screen again
+/// when `SIGCONT` brings us back — vim's `stoptermcap`/`starttermcap` order
+/// (`docs/tui.md`, "The `:` line": `Ctrl+Z` is a single suspend, not a
+/// toggle).
 fn suspend(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     term_lock: &TermLock,
 ) -> Result<()> {
-    // Held across the stop so the key reader cannot read in cooked mode, and
-    // so the cursor query on the way back has crossterm's reader to itself.
+    // Held across the stop so the key reader cannot read in cooked mode.
     let _guard = term_lock.lock();
     let _ = terminal.flush();
     let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape, DisableBracketedPaste);
+    editor::abandon();
     let _ = disable_raw_mode();
-    println!();
 
     raise_stop();
 
-    // Back from SIGCONT. The host shell moved the cursor, so the viewport is
-    // re-anchored where the cursor is now rather than where it used to be.
+    // Back from SIGCONT, onto a fresh alternate screen: the terminal cleared
+    // it on the way out, so the next frame has to paint every cell rather
+    // than diff against what ratatui last drew.
     enable_raw_mode()?;
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
+    editor::take_screen()?;
+    // A resize at the current size, not `Terminal::clear`: clear asks the
+    // terminal where the cursor is, and this client never does. Both clear
+    // the screen and reset the back buffer, which is what a freshly retaken
+    // screen needs before the next frame diffs against it.
     let size = terminal.size()?;
     terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
     Ok(())
@@ -1396,8 +1374,8 @@ fn report_decision(
     }
 }
 
-/// Apply one feed event to its mirror, and say so when it touches a block
-/// already printed to scrollback.
+/// Apply one feed event to its mirror: the transcript redraws from the
+/// mirror, so nothing here has to say what a change could not reach.
 async fn apply_feed(
     bridge: &KernelBridge,
     app: &mut App,
@@ -1406,8 +1384,14 @@ async fn apply_feed(
 ) {
     match event {
         FeedEvent::Changed(delivery) => {
+            let touched: Vec<kaijutsu_types::BlockId> =
+                delivery.changes().map(crate::app::touched_block).collect();
             for change in delivery.changes() {
-                app.observe_change(context_id, change);
+                // A block the kernel dropped will never render again, so its
+                // wrapped lines go with it.
+                if let kaijutsu_client::ContextChange::BlockDeleted { block_id } = change {
+                    app.wrap.forget(block_id);
+                }
                 app.apply_collapse_change(context_id, change);
             }
             if let Some(view) = app.views.get_mut(&context_id) {
@@ -1417,7 +1401,7 @@ async fn apply_feed(
                 view.seed_collapse();
             }
             reconcile_draft(app, context_id);
-            app.observe_thinking(context_id);
+            app.observe_thinking(context_id, &touched);
         }
         FeedEvent::Resubscribed => {
             // The actor already re-subscribed on this receiver's behalf;
@@ -1430,8 +1414,19 @@ async fn apply_feed(
                         view.seed_collapse();
                     }
                     reconcile_draft(app, context_id);
-                    app.observe_thinking(context_id);
-                    app.note("reconnected; context rehydrated");
+                    // The feed only says `Resubscribed` on a new connection,
+                    // so the stream that clears a turn flag was broken. The
+                    // status watch coalesces, so a fast reconnect can leave
+                    // this the only sign: forget what this client believed
+                    // was running rather than carry a flag nothing clears
+                    // (`docs/tui.md`, "Turn liveness is a partial signal").
+                    app.forget_turn_liveness();
+                    // A fresh mirror names no changed blocks, so the pane
+                    // latches on reasoning that is still streaming — once a
+                    // `TurnStarted` says a turn is running again.
+                    let streaming = streaming_thinking(app, context_id);
+                    app.observe_thinking(context_id, &streaming);
+                    app.note("reconnected; context rehydrated; turn liveness reset");
                 }
                 Err(e) => app.note(format!("rehydrate failed: {e}")),
             }
@@ -1439,8 +1434,9 @@ async fn apply_feed(
         FeedEvent::Terminated { reason, .. } => {
             // The subscriber fell behind and this receiver is dead. The
             // forwarder task ends with it; drop the view so the next switch
-            // re-subscribes from scratch.
+            // re-subscribes from scratch, and the wraps with it.
             app.views.remove(&context_id);
+            app.wrap.forget_context(context_id);
             // A context with no view renders nothing — no transcript, no
             // stream — so name the gesture that re-subscribes rather than
             // the prefix alone. Any switch does it, including a switch to
@@ -1488,26 +1484,27 @@ fn mark_activity(app: &mut App, event: &ServerEvent) -> bool {
     }
 }
 
+/// Take the screen for the session: raw mode, bracketed paste, the alternate
+/// screen, and one full-screen `Terminal` over it.
+///
+/// One terminal for the whole session. A full-screen viewport is anchored to
+/// nothing, so no frame asks the terminal where the cursor is and a slow hop
+/// never stalls a redraw (`docs/tui.md`, "The owned screen").
 fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     // A paste arrives as one `Event::Paste` — text, not keystrokes — so a
     // newline inside it is a newline in the draft, not an Enter.
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
-    Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(render::VIEWPORT_LINES),
-        },
-    )
+    editor::take_screen()?;
+    Terminal::new(CrosstermBackend::new(io::stdout()))
 }
 
 /// Leave the terminal the way we found it. Best-effort on every step: a
 /// failure here must not mask the error that ended the loop.
 ///
-/// The viewport is not cleared — `Terminal::clear` queries the cursor, and
-/// leaving the last frame in place is what the inline viewport is for
-/// anyway: the transcript stays in scrollback and the host shell's prompt
-/// appears under it.
+/// Nothing is printed on the way out: leaving the alternate screen restores
+/// the shell's own screen, and `:q` is quiet (`docs/tui.md`, "The owned
+/// screen").
 fn leave_terminal(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     term_lock: &TermLock,
@@ -1519,21 +1516,25 @@ fn leave_terminal(
     let _guard = term_lock.lock();
     let _ = terminal.flush();
     restore_terminal();
-    println!();
 }
 
 /// Put the terminal back the way the host shell had it: the main screen if
-/// the alternate one was taken, the shell's own cursor shape, cooked input.
+/// this process took the alternate one, the shell's own cursor shape, cooked
+/// input.
 /// Idempotent and best-effort. The normal exit, the panic hook, and the
 /// signal path all come through here, so every way out agrees.
 pub fn restore_terminal() {
+    // A panic inside a frame unwinds past that frame's own
+    // `EndSynchronizedUpdate`, and a terminal left inside an update paints
+    // nothing. Ending one that was never begun is a no-op.
+    let _ = crossterm::execute!(io::stdout(), EndSynchronizedUpdate);
     editor::abandon();
     let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape, DisableBracketedPaste);
     let _ = disable_raw_mode();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// The alternate screen: editor and diff (docs/tui.md, "Editor and diff")
+// The full-screen surfaces: editor and diff (docs/tui.md, "Editor and diff")
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The nick this client attaches to the kernel's peer registry under.
@@ -1606,7 +1607,7 @@ fn serve_invocations(rx: std::sync::mpsc::Receiver<PeerInvocation>, tx: mpsc::Se
 /// Apply an editor push to the screen. Returns whether the frame changed.
 ///
 /// `EditorClosed` is what `:q`/`ZZ`/`ZQ` produce — the kernel alone knows the
-/// mode, so it alone decides a quit — and it is what gives the inline viewport
+/// mode, so it alone decides a quit — and it is what gives the conversation
 /// back. A `Reconnected` probes the session with an empty key batch, because a
 /// kernel restart leaves the id unknown while the connection looks ordinary.
 async fn observe_editor_event(bridge: &KernelBridge, app: &mut App, event: &ServerEvent) -> bool {
@@ -1636,8 +1637,8 @@ async fn observe_editor_event(bridge: &KernelBridge, app: &mut App, event: &Serv
     }
 }
 
-/// A key while the alternate screen is up.
-async fn act_alternate(
+/// A key while a full-screen surface has the screen.
+async fn act_full_screen(
     bridge: &KernelBridge,
     app: &mut App,
     key: KeyEvent,
@@ -1667,7 +1668,7 @@ async fn act_alternate(
                     // A kernel restart: the sessions are in memory and the
                     // persisted kernel id is unchanged, so the buffer on
                     // screen is dead and typing echoes nothing. Give the
-                    // inline viewport back instead of freezing.
+                    // conversation back instead of freezing.
                     editor::leave_on_session_lost(
                         app,
                         "editor session lost (kernel restarted?); reopen with vi",
@@ -1683,16 +1684,16 @@ async fn act_alternate(
     if let ScreenMode::Diff(screen) = &mut app.screen {
         let body_h = screen.body_h();
         if diff::handle_key(screen, &key, body_h) == DiffKey::Close {
-            app.screen = ScreenMode::Inline;
+            app.screen = ScreenMode::Conversation;
         }
     }
 
     if let ScreenMode::Copy(screen) = &mut app.screen {
         let body_h = screen.body_h();
         match copy::handle_key(screen, &key, body_h) {
-            CopyOutcome::Close => app.screen = ScreenMode::Inline,
+            CopyOutcome::Close => app.screen = ScreenMode::Conversation,
             CopyOutcome::Yanked(text) => {
-                app.screen = ScreenMode::Inline;
+                app.screen = ScreenMode::Conversation;
                 match write_osc52(term_lock, &text) {
                     Ok(()) => app.note(format!("yanked {} lines — Ctrl+A ] pastes", text.lines().count())),
                     Err(e) => app.note(format!("clipboard write failed: {e}")),
@@ -1790,6 +1791,42 @@ mod tests {
         let event = ServerEvent::TurnStarted { context_id: id, principal_id: PrincipalId::new() };
         assert!(mark_turn_liveness(&mut app, &event));
         assert!(app.turn_running(id));
+    }
+
+    /// The turn's start and its reasoning ride different channels — the
+    /// kernel-wide event stream and the context feed — so the reasoning can
+    /// land first, when `observe_thinking` has no live turn to latch on.
+    /// `TurnStarted` latches on what the mirror already holds.
+    #[test]
+    fn a_turn_that_starts_after_its_reasoning_still_opens_the_pane() {
+        use kaijutsu_client::ContextMirror;
+        use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, Role, Status};
+
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        let mut mirror = ContextMirror::new(id);
+        mirror
+            .apply_snapshot(
+                vec![
+                    BlockSnapshotBuilder::new(BlockId::new(id, PrincipalId::new(), 1), BlockKind::Thinking)
+                        .role(Role::Model)
+                        .status(Status::Running)
+                        .content("the unlink path first")
+                        .build(),
+                ],
+                1,
+            )
+            .expect("snapshot applies");
+        app.views.insert(id, ContextView::new(mirror));
+        app.switch_to(id);
+        assert!(!app.thinking_pane_latched(id), "no turn is known running yet");
+
+        let event = ServerEvent::TurnStarted { context_id: id, principal_id: PrincipalId::new() };
+        assert!(mark_turn_liveness(&mut app, &event));
+        assert!(
+            app.thinking_pane_latched(id),
+            "the feed won the race and the pane never opened"
+        );
     }
 
     #[test]

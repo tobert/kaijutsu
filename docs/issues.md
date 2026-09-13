@@ -184,13 +184,30 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
-## The tui moves to the alternate screen (2026-09-13)
+## The open picker's cursor moved under a refresh in a probe (2026-09-13)
 
-Decided; slices and the mouse contract in `docs/tui.md`, "The owned
-screen". Slice 2 (the owned transcript) is the next tui work; the
-picker-on-alt-screen idea from the same morning is moot. When slice 2
-lands, delete the resize-refusal fallback, the scrollback probes and the
-harness's cursor-query answering, and rewrite "Surfaces" and "Copy mode".
+`a_placement_verb_moves_the_row_while_the_picker_stays_open` failed in 3
+of 8 full-suite runs during slice 2 and never alone. The captured screen
+showed the verb landing on the filtered, empty ACTIVE section instead of
+the fork's row in RECENT, so no placement ran. The probe now waits for
+the `›` cursor to sit on the fork's row before each verb and has been
+clean since. The cause is not proven: `PickerModel::refreshed` is meant
+to keep the cursor on its context across a rebuild (`follow`), so either
+the Tab count computed from an earlier screen was stale by the time the
+keys landed, or `follow` loses the row when the filtered section it is
+in becomes empty for one round. Reproduce under load with the wait
+removed before touching `follow`.
+
+## crossterm reads ESC followed by more bytes as Alt+char (2026-09-13)
+
+A pty probe that sends `\x1b:q\r` in one write never opens the `:` bar
+when the client happens to be mid-frame: crossterm parses `ESC :` landing
+in the same read as `Alt+:`, not as `Esc` then `:`. The pty probes send
+`Esc` alone first and wait a beat before the rest (`quit()` in
+`tests/terminal_fit.rs`). A real terminal never sends `Esc` and a key in
+one burst except on a paste, and bracketed paste already lands as its own
+event (`docs/tui.md`, "Compose"). Nothing to fix in the tui; recorded so
+nobody chases it as a bug again.
 
 ## A paste into the tui's vi screen is refused (2026-09-13)
 
