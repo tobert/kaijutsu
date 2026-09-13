@@ -57,7 +57,14 @@ pub fn thinking_pane_open(app: &App) -> bool {
 
 /// Whether the in-flight strip has a running entry to animate — the event
 /// loop redraws on `inflight::PHASE_MILLIS` only while it does.
+///
+/// Never while the terminal is unfocused: a spinner nobody is looking at is
+/// a redraw per phase step over ssh for no one (`docs/tui.md`, "What owning
+/// the screen lets us use").
 pub fn strip_animating(app: &App) -> bool {
+    if !app.focused {
+        return false;
+    }
     let Some(view) = app.current_view() else {
         return false;
     };
@@ -1824,5 +1831,21 @@ mod tests {
             !transcript.iter().any(|r| r.starts_with("▸ thinking")),
             "the pane's block is not repeated as a stub: {transcript:?}"
         );
+    }
+
+    /// An unfocused terminal shows nobody the spinner, so the loop stops
+    /// redrawing for it (`docs/tui.md`, "What owning the screen lets us
+    /// use": focus reporting pauses the pulse and the spinner).
+    #[test]
+    fn the_strip_stops_animating_while_the_terminal_is_unfocused() {
+        let (mut app, id) = fixture();
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 5, BlockKind::ToolCall, Role::Model, Status::Running, "kj ledger list")],
+        );
+        assert!(strip_animating(&app), "a running tool call animates while focused");
+        app.focused = false;
+        assert!(!strip_animating(&app), "nothing animates for a terminal nobody is looking at");
     }
 }

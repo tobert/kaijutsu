@@ -139,6 +139,18 @@ pub struct TuiSession {
     /// that order — the client turns it on with the screen and off again on
     /// the way out.
     alt_scroll: Arc<Mutex<(usize, usize)>>,
+    /// Focus reporting (DECSET 1004) enables and disables seen so far, the
+    /// same shape as `alt_scroll` and sent in the same places.
+    focus_reporting: Arc<Mutex<(usize, usize)>>,
+    /// The text of every window-title write (OSC 0 and OSC 2), in order.
+    titles: Arc<Mutex<Vec<String>>>,
+    /// `(pushes, pops)` of xterm's title stack (`CSI 22 ; 0 t` /
+    /// `CSI 23 ; 0 t`) — the client pushes with the screen and pops on the
+    /// way out, so the shell's own title comes back.
+    title_stack: Arc<Mutex<(usize, usize)>>,
+    /// Desktop notifications written: `(OSC 777, OSC 9)`. An ask that lands
+    /// while the terminal is unfocused writes one of each.
+    notifications: Arc<Mutex<(usize, usize)>>,
     /// The decoded text of every clipboard write (`ESC ] 52 ; c ; <base64>
     /// BEL`) seen so far. A yank is the only caller, so this is exactly what
     /// went to the clipboard.
@@ -248,6 +260,10 @@ impl TuiSession {
         let cursor_queries = Arc::new(AtomicUsize::new(0));
         let sync_depth = Arc::new(Mutex::new(0i64));
         let alt_scroll = Arc::new(Mutex::new((0usize, 0usize)));
+        let focus_reporting = Arc::new(Mutex::new((0usize, 0usize)));
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let title_stack = Arc::new(Mutex::new((0usize, 0usize)));
+        let notifications = Arc::new(Mutex::new((0usize, 0usize)));
         let clipboard = Arc::new(Mutex::new(Vec::new()));
         let reader_parser = parser.clone();
         let reader_writer = writer.clone();
@@ -255,6 +271,10 @@ impl TuiSession {
         let counts = Counts {
             sync_depth: sync_depth.clone(),
             alt_scroll: alt_scroll.clone(),
+            focus_reporting: focus_reporting.clone(),
+            titles: titles.clone(),
+            title_stack: title_stack.clone(),
+            notifications: notifications.clone(),
             clipboard: clipboard.clone(),
         };
         let reader = std::thread::spawn(move || {
@@ -270,6 +290,10 @@ impl TuiSession {
             cursor_queries,
             sync_depth,
             alt_scroll,
+            focus_reporting,
+            titles,
+            title_stack,
+            notifications,
             clipboard,
             rows,
             cols,
@@ -363,6 +387,26 @@ impl TuiSession {
     /// `(enables, disables)` of alternate scroll (DECSET 1007) seen so far.
     pub fn alternate_scroll(&self) -> (usize, usize) {
         *self.alt_scroll.lock().expect("alt scroll lock")
+    }
+
+    /// `(enables, disables)` of focus reporting (DECSET 1004) seen so far.
+    pub fn focus_reporting(&self) -> (usize, usize) {
+        *self.focus_reporting.lock().expect("focus reporting lock")
+    }
+
+    /// Every window title the client has set so far, in order.
+    pub fn titles(&self) -> Vec<String> {
+        self.titles.lock().expect("titles lock").clone()
+    }
+
+    /// `(pushes, pops)` of the xterm title stack seen so far.
+    pub fn title_stack(&self) -> (usize, usize) {
+        *self.title_stack.lock().expect("title stack lock")
+    }
+
+    /// `(OSC 777, OSC 9)` desktop notifications written so far.
+    pub fn notifications(&self) -> (usize, usize) {
+        *self.notifications.lock().expect("notifications lock")
     }
 
     /// Every clipboard write (OSC 52) the client has made so far, decoded.
@@ -527,6 +571,10 @@ fn read_loop(
 struct Counts {
     sync_depth: Arc<Mutex<i64>>,
     alt_scroll: Arc<Mutex<(usize, usize)>>,
+    focus_reporting: Arc<Mutex<(usize, usize)>>,
+    titles: Arc<Mutex<Vec<String>>>,
+    title_stack: Arc<Mutex<(usize, usize)>>,
+    notifications: Arc<Mutex<(usize, usize)>>,
     clipboard: Arc<Mutex<Vec<String>>>,
 }
 
@@ -549,7 +597,54 @@ impl Counts {
             seen.1 += off;
         }
 
+        let (on, off) = (count(b"\x1b[?1004h"), count(b"\x1b[?1004l"));
+        if on + off > 0 {
+            let mut seen = self.focus_reporting.lock().expect("focus reporting lock");
+            seen.0 += on;
+            seen.1 += off;
+        }
+
+        let (push, pop) = (count(b"\x1b[22;0t"), count(b"\x1b[23;0t"));
+        if push + pop > 0 {
+            let mut seen = self.title_stack.lock().expect("title stack lock");
+            seen.0 += push;
+            seen.1 += pop;
+        }
+
+        let (osc777, osc9) = (count(b"\x1b]777;notify;"), count(b"\x1b]9;"));
+        if osc777 + osc9 > 0 {
+            let mut seen = self.notifications.lock().expect("notifications lock");
+            seen.0 += osc777;
+            seen.1 += osc9;
+        }
+
+        self.fold_titles(bytes);
         self.fold_clipboard(bytes);
+    }
+
+    /// Decode every window-title write in `bytes`: OSC 0 (icon and title)
+    /// and OSC 2 (title), terminated by BEL or ST.
+    ///
+    /// OSC 9 shares the `ESC ]` introducer and not the number, so a
+    /// notification never counts as a title.
+    fn fold_titles(&self, bytes: &[u8]) {
+        for introducer in [b"\x1b]0;".as_slice(), b"\x1b]2;".as_slice()] {
+            let mut rest = bytes;
+            while let Some(at) = find_subslice(rest, introducer) {
+                let body = &rest[at + introducer.len()..];
+                let Some(end) = body
+                    .iter()
+                    .position(|b| *b == 0x07)
+                    .or_else(|| find_subslice(body, b"\x1b\\"))
+                else {
+                    break;
+                };
+                if let Ok(text) = std::str::from_utf8(&body[..end]) {
+                    self.titles.lock().expect("titles lock").push(text.to_string());
+                }
+                rest = &body[end..];
+            }
+        }
     }
 
     /// Decode every complete OSC 52 write in `bytes`: the base64 between

@@ -190,14 +190,30 @@ None is a commitment; the ones marked *now* ride the first slice.
 - *now* **Synchronized output** (`?2026`): one `BSU`…`ESU` around each
   frame so a full redraw never tears. Vim probes support with `DECRQM`
   and remembers the answer; wezterm, kitty, foot and iTerm2 support it.
-- **Focus reporting** (`?1004`): pause the pulse and the spinner while
-  unfocused, and know when an ask arrived unseen. Vim maps it to
-  `FocusGained`/`FocusLost`. Wezterm's docs do not list it; verify.
-- **Window title** (OSC 0/2): the current context's label, so a wezterm
-  tab reads like a tmux window.
-- **Desktop notification** (OSC 9 / OSC 777) when an ask lands unfocused.
-- **OSC 8 hyperlinks** on paths and URLs: the terminal opens them on a
-  plain click because the mouse is still its own.
+- *landed 2026-09-13* **Focus reporting** (`?1004`): enabled with
+  `EnableFocusChange` when the screen is taken and disabled with
+  `DisableFocusChange` on every exit path (`enter_terminal`,
+  `restore_terminal`, and around a suspend). `App::focused` defaults to
+  `true` and follows `Event::FocusGained`/`FocusLost`; while unfocused
+  `render::strip_animating` holds the in-flight strip's spinner still and
+  the beat wake is disarmed (`run.rs`'s `FocusLost` arm sets `beat_wake =
+  None`), so the track pulse stops too. Gaining focus re-arms the beat
+  timer (`rearm_beat_wake`) and marks the frame dirty for a redraw.
+- *landed 2026-09-13* **Window title** (OSC 0): `<label> — kaijutsu` for
+  the context on screen (`run::wanted_title`), sent once per change under
+  the terminal lock (`run::title_to_send`/`set_title`). xterm's title
+  stack is pushed (`CSI 22;0t`, `run::TITLE_PUSH`) when the screen is
+  taken and popped (`CSI 23;0t`, `run::TITLE_POP`) on every exit path and
+  around a suspend, so the shell's own title comes back as found.
+- *landed 2026-09-13* **Desktop notification** (OSC 9 / OSC 777) when an
+  ask lands unfocused: `asks::ask_notification` fires once, from the
+  refresh round's first new ask, only while `!app.focused` — an ask that
+  lands in front of the player is already the card on screen, not a toast.
+- **OSC 8 hyperlinks**: detection landed (`present::links` — absolute
+  paths with at least two segments at word boundaries, `http(s)` URLs,
+  trailing sentence punctuation trimmed, `file://<host>/<path>` targets);
+  emission is blocked because ratatui 0.30 has no hyperlink attribute on
+  spans or styles and the backend diffs cells (`docs/issues.md`).
 - **Kitty keyboard protocol** (`CSI = 1;1 u`), opt-in: `Shift+Enter` for a
   newline in insert mode, `Ctrl+I` apart from `Tab`. Wezterm ships it off
   (`enable_kitty_keyboard`); vim requests it through `'keyprotocol'`.
@@ -243,7 +259,10 @@ view for both, a long result renders whole and the transcript scrolls
 4. **Per-context buffers and the hot set.** Landed 2026-09-13. Switching
    seats switches transcripts; the ACTIVE ring stays resident.
 5. **Terminal features** from the list above, one at a time, focus and
-   title first.
+   title first. Focus reporting, the window title and the desktop
+   notification landed 2026-09-13; OSC 8 link detection landed the same
+   day (emission still blocked on ratatui). Kitty keyboard, images and
+   in-band resize are open.
 
 ### Open
 
@@ -703,8 +722,13 @@ shell one keystroke and one `fg` away.
 place the exit sequences are written: give the session screen back if the
 session took it (`editor::abandon`, guarded by the `ENTERED` flag
 `editor::take_screen` sets, because xterm restores a saved cursor on
-`?1049l` even when the alternate buffer was never in use), reset the
-cursor shape, turn bracketed paste off, leave raw mode. `:q` reaches it
+`?1049l` even when the alternate buffer was never in use), turn focus
+reporting off (`DisableFocusChange`), pop the xterm title stack (`CSI
+23;0t`), reset the cursor shape, turn bracketed paste off, leave raw mode.
+`suspend` does the same pair — `DisableFocusChange` and the title-stack pop
+— around the `SIGTSTP`, then re-enables focus reporting and pushes the
+title stack again on the way back, vim's `stoptermcap`/`starttermcap`
+order. `:q` reaches it
 through `leave_terminal`; a panic reaches it through the hook `run`
 installs before the screen is taken, so the message prints on a cooked
 main screen; `SIGTERM` and `SIGHUP` reach it by ending
@@ -728,7 +752,10 @@ a partial `:` line never repeats into scrollback; one `Ctrl+C` posts
 `nothing to interrupt` and does not quit, two within the window still do
 not quit; `Ctrl+Z` suspends and `SIGCONT` leaves a responsive client (the
 stopped state itself is not observable in every sandbox — the probe's own
-doc comment says why).
+doc comment says why). Slice 5's own probes name the same file:
+`focus_reporting_is_taken_with_the_screen_and_its_reports_are_not_keys`,
+`the_window_title_follows_the_context_and_is_given_back`, and
+`an_ask_notifies_the_desktop_only_while_unfocused`.
 
 ### Copy mode (scroll, or `Ctrl+A [`)
 
@@ -906,6 +933,14 @@ by its first id segment, the one `kj ledger list` keys on. A key
 pressed on an already-answered ask reports the lost race on the status
 line and nothing else happens.
 
+- An ask landing while the terminal is unfocused notifies the desktop
+  once — OSC 777 and OSC 9 (`asks::ask_notification`); one already on
+  screen notifies nothing. Testing note: the ephemeral kernel this
+  probes against starts with no reviewer character sheet, so raising an
+  ask needs `arrange_a_reviewer` first — `kj binding allow config-write`
+  from ROOT, then `kj character create amy` — before any ask can be
+  raised at all.
+
 **The assigned reviewer answers in the context on screen.** An ask records
 its requester, actor, and reviewer. The actor cannot approve it from any
 context. The reviewer can approve it in the work context, including the
@@ -977,6 +1012,10 @@ while it is not `Connected` — a healthy connection says nothing,
 that's not super useful"*). No icons on the right half (Amy, 2026-09-04:
 *"let's try without for now"*); the `▮ 42%` occupancy figure is gone,
 the token count says the same thing in the units we think in.
+
+- The pulse and the spinner stop while the terminal is unfocused
+  (`render::strip_animating`, `docs/tui.md`, "What owning the screen lets
+  us use").
 
 ### Cache health
 

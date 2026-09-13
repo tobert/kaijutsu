@@ -14,9 +14,11 @@ use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::style::Print;
 use crossterm::event::Event;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+};
 use crossterm::terminal::{
-    BeginSynchronizedUpdate, EndSynchronizedUpdate, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use kaijutsu_audio::RefDisposition;
 use kaijutsu_client::{ContextInfo, FeedEvent, ServerEvent};
@@ -457,6 +459,12 @@ async fn event_loop(
     let mut ledger_open = true;
     let mut seen_asks = std::collections::HashSet::new();
     let mut poll_asks = true;
+    // The session's first ledger poll is a baseline: it reports every ask
+    // already pending as new, including asks raised before this client
+    // attached. Taken by the round that polls; `round_baseline` carries it
+    // to that round's answer (`asks::NotifySeen::baseline`).
+    let mut first_poll = true;
+    let mut round_baseline = false;
     let mut stop_signals = StopSignals::listen().context("listen for SIGTERM and SIGHUP")?;
     let mut refresh = tokio::time::interval(REFRESH);
     // The round in flight, if one is. Its result lands through the join arm
@@ -473,6 +481,10 @@ async fn event_loop(
     // frame and again after a suspend, since the host shell may have set
     // its own.
     let mut cursor_shape: Option<CursorShape> = None;
+    // The window title last sent; `None` until the first context is on
+    // screen and again after a suspend, since the host shell titled the
+    // window while it had it.
+    let mut title: Option<String> = None;
     // The screen mode the last frame drew, so crossing between the
     // conversation and a full-screen surface can say the cursor shape again.
     let mut was_full_screen = false;
@@ -490,6 +502,9 @@ async fn event_loop(
                 match event {
                     Event::Key(key) => {
                         dirty = true;
+                        // Input only reaches a focused terminal, whatever
+                        // the last focus report said (`App::saw_input`).
+                        app.saw_input();
                         if key.code == crossterm::event::KeyCode::F(12) {
                             match wires.probe_panic {
                                 ProbePanic::OnKey => panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed"),
@@ -508,6 +523,10 @@ async fn event_loop(
                             {
                                 suspend(terminal, &wires.term_lock)?;
                                 cursor_shape = None;
+                                title = None;
+                                // `fg` put this terminal back in front of
+                                // the player; a report may never say so.
+                                app.saw_input();
                             }
                         }
                         if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
@@ -520,11 +539,31 @@ async fn event_loop(
                     }
                     Event::Paste(text) => {
                         dirty = true;
+                        app.saw_input();
                         paste_text(bridge, app, text).await;
                     }
                     // The frame is rebuilt at the new size on the next tick:
                     // the transcript re-wraps and the band follows.
                     Event::Resize(..) => dirty = true,
+                    // Focus reporting (DECSET 1004). Coming back draws a
+                    // frame, so what is on screen is current rather than
+                    // whatever was there when focus left; leaving disarms
+                    // the beat timer, and `render::strip_animating` stops
+                    // the spinner (`docs/tui.md`, "What owning the screen
+                    // lets us use").
+                    Event::FocusGained => {
+                        app.focused = true;
+                        rearm_beat_wake(app, &mut beat_wake, &mut beat_tempo_bps);
+                        dirty = true;
+                    }
+                    // The timer is disarmed rather than left armed and
+                    // ignored: a missed onset is missed, never replayed, and
+                    // `rearm_beat_wake` above re-anchors on the live phasor
+                    // (`docs/midi.md`, "The one timebase").
+                    Event::FocusLost => {
+                        app.focused = false;
+                        beat_wake = None;
+                    }
                     _ => {}
                 }
             }
@@ -609,6 +648,7 @@ async fn event_loop(
                     if poll {
                         poll_asks = false;
                     }
+                    round_baseline = poll && std::mem::take(&mut first_poll);
                     let request = refresh::Request {
                         current: app.current,
                         poll_asks: poll,
@@ -622,7 +662,29 @@ async fn event_loop(
                 refresh_task = None;
                 let refreshed = joined.context("background refresh round")?;
                 let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
+                // Read before the fold, which consumes the round: the ask
+                // whose arrival may be worth a desktop notification.
+                let raised_in = refreshed
+                    .asks
+                    .as_ref()
+                    .and_then(|poll| poll.new_asks.first())
+                    .map(|ask| ask.info.context_id);
+                let baseline = std::mem::take(&mut round_baseline);
                 refresh::apply(app, refreshed, &mut seen_asks);
+                // An ask that landed while nobody was looking says so to the
+                // desktop; one that landed in front of the player is already
+                // the card on screen (`docs/tui.md`, "Asks"). Decided after
+                // the fold, so `current` is the seat a switch may have moved
+                // to while the round was in flight and the label is the one
+                // this round listed.
+                let seen = asks::NotifySeen { focused: app.focused, baseline, raised_in, current: app.current };
+                if let Some(context_id) = asks::notify_target(seen)
+                    && let Some(notification) = asks::ask_notification(app.focused, &app.label_for(context_id))
+                {
+                    let _guard = wires.term_lock.lock();
+                    crossterm::execute!(io::stdout(), Print(notification))
+                        .context("raise a desktop notification")?;
+                }
                 // The rank the hot set reads was just recomputed, so this is
                 // where a promote makes a context resident and a demote lets
                 // one go. Releasing is local; the hydrate rides its own task.
@@ -710,6 +772,7 @@ async fn event_loop(
                     }
                     let _guard = wires.term_lock.lock();
                     set_cursor_shape(&mut cursor_shape, wanted_cursor_shape(app))?;
+                    set_title(&mut title, wanted_title(app))?;
                 }
             }
         }
@@ -756,11 +819,23 @@ fn observe_beat_sync(
     }
 }
 
+/// Whether the beat timer should be armed at all: a track is playing and
+/// someone is looking. Every [`rearm_beat_wake`] goes through it, so the
+/// refresh round cannot re-arm what a `FocusLost` disarmed
+/// (`docs/tui.md`, "What owning the screen lets us use").
+fn beat_wake_armed(app: &App) -> bool {
+    app.focused && app.playing_track().is_some()
+}
+
 /// Re-arm the beat timer from the playing track's live phasor position and
 /// its last-polled tempo. `None` while nothing is playing or its phasor
 /// hasn't anchored yet — the timer arm's `if beat_wake.is_some()` guard then
 /// simply stays off until the next refresh finds one.
 fn rearm_beat_wake(app: &App, beat_wake: &mut Option<Instant>, beat_tempo_bps: &mut f64) {
+    if !beat_wake_armed(app) {
+        *beat_wake = None;
+        return;
+    }
     let Some(track) = app.playing_track() else {
         *beat_wake = None;
         return;
@@ -877,6 +952,36 @@ fn wanted_cursor_shape(app: &App) -> CursorShape {
         ScreenMode::Editor(screen) => CursorShape::for_mode(screen.state.mode.as_deref()),
         ScreenMode::Diff(_) => CursorShape::Block,
     }
+}
+
+/// The window title a frame of `app` wants: the context on screen, named
+/// the way the status line names it (`docs/tui.md`, "What owning the screen
+/// lets us use"). `None` before a context is attached — the shell's own
+/// title stands until there is something to say.
+fn wanted_title(app: &App) -> Option<String> {
+    app.current.map(|id| format!("{} — kaijutsu", app.label_for(id)))
+}
+
+/// The title to write, and `sent` updated — `None` when the terminal
+/// already carries it, or when there is nothing to name. Pure, so the rule
+/// is tested without a terminal; [`set_title`] is the write.
+fn title_to_send(sent: &mut Option<String>, want: Option<String>) -> Option<String> {
+    let want = want?;
+    if sent.as_deref() == Some(want.as_str()) {
+        return None;
+    }
+    *sent = Some(want.clone());
+    Some(want)
+}
+
+/// Set the window title when it differs from what was last sent (OSC 0).
+/// The title the shell had is on xterm's title stack, pushed when the
+/// screen was taken and popped by [`restore_terminal`].
+fn set_title(sent: &mut Option<String>, want: Option<String>) -> Result<()> {
+    let Some(title) = title_to_send(sent, want) else {
+        return Ok(());
+    };
+    crossterm::execute!(io::stdout(), SetTitle(title)).context("set the window title")
 }
 
 /// Send `want` to the terminal when it differs from what was last sent —
@@ -1514,9 +1619,11 @@ fn suspend(
     // Held across the stop so the key reader cannot read in cooked mode.
     let _guard = term_lock.lock();
     let _ = terminal.flush();
+    pop_title();
     let _ = crossterm::execute!(
         io::stdout(),
         Print(ALTERNATE_SCROLL_OFF),
+        DisableFocusChange,
         SetCursorStyle::DefaultUserShape,
         DisableBracketedPaste
     );
@@ -1531,7 +1638,8 @@ fn suspend(
     enable_raw_mode()?;
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     editor::take_screen()?;
-    crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON))?;
+    crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON), EnableFocusChange)?;
+    push_title();
     // A resize at the current size, not `Terminal::clear`: clear asks the
     // terminal where the cursor is, and this client never does. Both clear
     // the screen and reset the back buffer, which is what a freshly retaken
@@ -1940,7 +2048,8 @@ fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     // newline inside it is a newline in the draft, not an Enter.
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     editor::take_screen()?;
-    crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON))?;
+    crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON), EnableFocusChange)?;
+    push_title();
     Terminal::new(CrosstermBackend::new(io::stdout()))
 }
 
@@ -1952,6 +2061,41 @@ fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// constant for it, so the bytes go out as they are.
 const ALTERNATE_SCROLL_ON: &str = "\x1b[?1007h";
 const ALTERNATE_SCROLL_OFF: &str = "\x1b[?1007l";
+
+/// xterm's title stack: push the shell's own title before the first
+/// [`set_title`], pop it back on the way out. The stack is how the title is
+/// given back exactly as it was found — an empty title on exit would leave
+/// a wezterm tab blank instead. crossterm has no constant for either, so
+/// the bytes go out as they are.
+const TITLE_PUSH: &str = "\x1b[22;0t";
+const TITLE_POP: &str = "\x1b[23;0t";
+
+/// Whether this process has a title on the terminal's stack, the same shape
+/// as `editor::ENTERED` and for the same reason: [`restore_terminal`] is
+/// idempotent and runs from the exit path, the panic hook and the signal
+/// path, while a pop that answers no push takes the *shell's* own saved
+/// title off the stack.
+static TITLE_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// Claim a one-way flag: true when this call is the one that changed it.
+/// The push and the pop are each done once, whoever gets there first.
+fn claim(flag: &AtomicBool, want: bool) -> bool {
+    flag.swap(want, Ordering::SeqCst) != want
+}
+
+/// Push the shell's own window title, once.
+fn push_title() {
+    if claim(&TITLE_PUSHED, true) {
+        let _ = crossterm::execute!(io::stdout(), Print(TITLE_PUSH));
+    }
+}
+
+/// Pop the title this process pushed, if it pushed one; a no-op otherwise.
+fn pop_title() {
+    if claim(&TITLE_PUSHED, false) {
+        let _ = crossterm::execute!(io::stdout(), Print(TITLE_POP));
+    }
+}
 
 /// Leave the terminal the way we found it. Best-effort on every step: a
 /// failure here must not mask the error that ended the loop.
@@ -1983,9 +2127,14 @@ pub fn restore_terminal() {
     // nothing. Ending one that was never begun is a no-op.
     let _ = crossterm::execute!(io::stdout(), EndSynchronizedUpdate);
     editor::abandon();
+    pop_title();
+    // `?1004l` and `?1007l` go out blind: resetting a mode the terminal
+    // never had on is a no-op, unlike a title pop, which would take the
+    // shell's own saved title off the stack.
     let _ = crossterm::execute!(
         io::stdout(),
         Print(ALTERNATE_SCROLL_OFF),
+        DisableFocusChange,
         SetCursorStyle::DefaultUserShape,
         DisableBracketedPaste
     );
@@ -2367,6 +2516,105 @@ mod tests {
             arm.contains("switch_seat("),
             "the LastContext arm does not route through `switch_seat`: {arm}"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // The window title (docs/tui.md, "What owning the screen lets us use")
+    // ────────────────────────────────────────────────────────────────────
+
+    /// The title names the context on screen, so a wezterm tab reads like a
+    /// tmux window. Nothing is named before a context is attached.
+    #[test]
+    fn the_window_title_names_the_context_on_screen() {
+        let mut app = App::new("amy");
+        assert_eq!(wanted_title(&app), None, "no context, nothing to name");
+
+        let id = ContextId::new();
+        watched(&mut app, id);
+        app.switch_to(id);
+        assert_eq!(
+            wanted_title(&app),
+            Some(format!("{} — kaijutsu", id.short())),
+            "an unlabeled context is named by its short id, as the status line names it"
+        );
+    }
+
+    /// The one place the title is sent: a repeat is not written again, and a
+    /// switch to another context is.
+    #[test]
+    fn a_title_is_sent_once_per_change() {
+        let mut sent: Option<String> = None;
+        let mut written: Vec<String> = Vec::new();
+        let mut send = |sent: &mut Option<String>, want: Option<String>| {
+            if let Some(title) = title_to_send(sent, want) {
+                written.push(title);
+            }
+        };
+        send(&mut sent, Some("probe — kaijutsu".to_string()));
+        send(&mut sent, Some("probe — kaijutsu".to_string()));
+        send(&mut sent, Some("other — kaijutsu".to_string()));
+        send(&mut sent, None);
+        assert_eq!(written, vec!["probe — kaijutsu".to_string(), "other — kaijutsu".to_string()]);
+    }
+
+    /// The title stack is popped exactly as often as it is pushed.
+    ///
+    /// [`restore_terminal`] is idempotent and runs from the exit path, the
+    /// panic hook and the signal path — `leave_terminal` then the hook is
+    /// two calls — while a panic before the screen is taken runs it with no
+    /// push behind it. A pop that answers no push takes the *shell's* own
+    /// saved title off the stack.
+    #[test]
+    fn a_title_is_popped_once_and_only_after_a_push() {
+        let flag = AtomicBool::new(false);
+        assert!(!claim(&flag, false), "nothing to pop before a push");
+        assert!(claim(&flag, true), "the first push is the one that writes");
+        assert!(!claim(&flag, true), "a second push writes nothing");
+        assert!(claim(&flag, false), "the first pop is the one that writes");
+        assert!(!claim(&flag, false), "a second pop writes nothing");
+    }
+
+    /// Input implies focus, at every arm input arrives on. A terminal that
+    /// reports `FocusLost` and never reports again would otherwise leave the
+    /// client believing nobody is looking for the rest of the session
+    /// (`App::saw_input`).
+    #[test]
+    fn every_input_arm_says_the_terminal_is_focused() {
+        let source = include_str!("run.rs");
+        let source = source.split_once("\n#[cfg(test)]").expect("run.rs has tests").0;
+        for arm in ["Event::Key(key) => {", "Event::Paste(text) => {"] {
+            let body = source.split_once(arm).unwrap_or_else(|| panic!("run.rs has a `{arm}` arm")).1;
+            let body = &body[..body.find("\n                    }").expect("the arm ends")];
+            assert!(
+                body.contains("saw_input()"),
+                "the `{arm}` arm does not say the terminal is focused: {body}"
+            );
+        }
+    }
+
+    /// The beat timer is armed only while someone is looking: the refresh
+    /// round re-arms it on its own cadence, and an unfocused client that
+    /// re-armed there would animate the pulse again a round after the
+    /// `FocusLost` that stopped it.
+    #[test]
+    fn the_beat_timer_stays_disarmed_while_unfocused() {
+        let mut app = App::new("amy");
+        app.tracks = vec![crate::picker::TrackRow {
+            id: "t1".to_string(),
+            score_context_id: ContextId::new(),
+            playing: true,
+            bpm: 120,
+            bar: 1,
+            beat: 1,
+        }];
+        assert!(beat_wake_armed(&app), "a playing track arms the timer while focused");
+        app.focused = false;
+        assert!(!beat_wake_armed(&app), "nothing animates for a terminal nobody is looking at");
+
+        let mut beat_wake = Some(Instant::now());
+        let mut tempo = 2.0;
+        rearm_beat_wake(&app, &mut beat_wake, &mut tempo);
+        assert_eq!(beat_wake, None, "an unfocused re-arm disarms instead");
     }
 
     /// The name of a `fn` declared at the top level of a module — the

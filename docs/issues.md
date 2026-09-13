@@ -184,6 +184,30 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
+## The panic hook restores the terminal under a still-running loop (2026-09-13)
+
+`run::restore_terminal` is installed as a process-wide panic hook so a
+panic on the loop thread leaves a cooked main screen. A panic on a task
+whose JoinHandle is never joined — a hydrate round, the peer thread —
+runs the same hook while the loop keeps drawing: the alternate screen,
+raw mode, focus reporting and the title stack are torn out from under a
+live client, which then paints onto the shell's screen. The fix is to
+scope the restore to the loop thread (a thread id check in the hook) and
+let an unjoined task's panic surface as an error the loop ends on.
+
+## OSC 8 hyperlinks wait on a ratatui span attribute (2026-09-13)
+
+`present::links` detects the paths and URLs a hyperlink would target, with
+tests, but nothing emits one: ratatui 0.30.2 and ratatui-core 0.1.2 carry
+no hyperlink attribute on a `Style` or a `Span`, and the backend diffs
+cells — escape bytes smuggled into a cell's symbol would be miscounted as
+width and overwritten by the next diff. The exit is a ratatui feature that
+adds the attribute, or a custom backend that writes OSC 8 around a cell's
+own bytes; neither is built. Separately, the ephemeral kernel a probe runs
+against needs `arrange_a_reviewer` (`tests/terminal_fit.rs`) before it can
+raise an ask at all — the default reviewer has no character sheet — which
+is worth a harness helper in `support/mod.rs` if a second probe needs it.
+
 ## The event loop still awaits the kernel on two feed paths (2026-09-13)
 
 `run.rs`'s Resubscribed arm awaits `rehydrate_context` inside the loop,

@@ -521,6 +521,190 @@ fn alternate_scroll_is_taken_with_the_screen_and_given_back() {
     );
 }
 
+/// Focus reporting (DECSET 1004) goes on with the screen and off on the way
+/// out, the same two places alternate scroll is handled, and the reports
+/// themselves are events rather than keys: `ESC [ O` and `ESC [ I` reach
+/// crossterm as `FocusLost`/`FocusGained` and nothing of them lands in the
+/// draft (`docs/tui.md`, "What owning the screen lets us use").
+#[test]
+fn focus_reporting_is_taken_with_the_screen_and_its_reports_are_not_keys() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    assert_eq!(
+        session.focus_reporting(),
+        (1, 0),
+        "focus reporting was not enabled after taking the screen: {}",
+        session.dump("attached")
+    );
+
+    // Insert mode, so a report mistaken for a key would be typed text.
+    session.send("ihello");
+    let typed = session.wait_until(Duration::from_secs(5), |screen| {
+        screen.rows(0, 80).any(|line| line.contains('❯') && line.contains("hello"))
+    });
+    assert!(typed, "{}", session.dump("after typing hello"));
+
+    session.send("\x1b[O"); // focus out
+    std::thread::sleep(Duration::from_millis(200));
+    session.send("\x1b[I"); // focus in
+    std::thread::sleep(Duration::from_millis(200));
+    session.send("x");
+
+    let still_typing = session.wait_until(Duration::from_secs(5), |screen| {
+        screen.rows(0, 80).any(|line| line.contains('❯') && line.contains("hellox"))
+    });
+    assert!(
+        still_typing,
+        "the draft did not take the next key after two focus reports: {}",
+        session.dump("after focus reports")
+    );
+    let rows = session.screen_text();
+    let draft = rows.iter().find(|l| l.contains('❯')).expect("a draft row").clone();
+    assert!(
+        !draft.contains("helloO") && !draft.contains("hellI") && !draft.contains("hellOx"),
+        "a focus report landed in the draft: {draft:?}\n{}",
+        session.dump("after focus reports")
+    );
+
+    quit(&mut session);
+    assert_eq!(
+        session.focus_reporting(),
+        (1, 1),
+        "focus reporting was not disabled on the way out: {}",
+        session.dump("after :q")
+    );
+}
+
+/// The window title names the context on screen, follows a switch to name
+/// the context switched to, and the shell's own title comes back on the way
+/// out through xterm's title stack (`docs/tui.md`, "What owning the screen
+/// lets us use"). One title per change: the attach and the switch, no more.
+#[test]
+fn the_window_title_follows_the_context_and_is_given_back() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    let titled = session.wait_until(Duration::from_secs(5), |_| {
+        session.titles().last().is_some_and(|t| t == "probe — kaijutsu")
+    });
+    assert!(titled, "the title does not name the attached context: {:?}", session.titles());
+    assert_eq!(
+        session.title_stack(),
+        (1, 0),
+        "the shell's title was not pushed before the first title was set"
+    );
+
+    // A second context with a label of its own, then a switch to its seat.
+    colon_line(&session, ":kj context create second");
+    clear_status_notice(&session);
+    let digit = seat_of(&session, "second");
+    session.send(&format!("\x01{digit}")); // Ctrl+A <digit>
+
+    let switched = session.wait_until(Duration::from_secs(10), |_| {
+        session.titles().last().is_some_and(|t| t == "second — kaijutsu")
+    });
+    assert!(
+        switched,
+        "the title does not name the context switched to: {:?}\n{}",
+        session.titles(),
+        session.dump("after the switch")
+    );
+    assert_eq!(
+        session.titles(),
+        vec!["probe — kaijutsu".to_string(), "second — kaijutsu".to_string()],
+        "one title per change, and only on a change: {}",
+        session.dump("after the switch")
+    );
+
+    quit(&mut session);
+    assert_eq!(
+        session.title_stack(),
+        (1, 1),
+        "the shell's own title was not restored on the way out"
+    );
+}
+
+/// Type a `:` line and give the client a moment to run it. `Esc` goes on
+/// its own, as [`quit`] explains, and it also takes down an ask card.
+fn colon_line(session: &TuiSession, line: &str) {
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(&format!("{line}\r"));
+    std::thread::sleep(Duration::from_millis(2000));
+}
+
+/// Make this kernel able to raise an ask at all, and return the client to
+/// the `probe` seat.
+///
+/// Two facts the ephemeral kernel starts without: the default approval
+/// reviewer (`amy`) has no character sheet, so the gate cannot resolve a
+/// reviewer and records nothing at all; and `kj character create` needs
+/// `config-write`, which a `coder` context does not carry. ROOT is seat 1
+/// and is the binding-admin context, so the grant is made from there.
+fn arrange_a_reviewer(session: &TuiSession) {
+    session.send("\x011"); // Ctrl+A 1 — the ROOT seat
+    std::thread::sleep(Duration::from_millis(1500));
+    colon_line(session, ":kj binding allow config-write probe");
+    session.send("\x010"); // Ctrl+A 0 — back to the probe seat
+    std::thread::sleep(Duration::from_millis(1500));
+    colon_line(session, ":kj character create amy");
+    let created = session.wait_until(Duration::from_secs(10), |screen| {
+        screen_contains_str(screen, "\"name\": \"amy\"")
+    });
+    assert!(created, "no reviewer character: {}", session.dump("arranging a reviewer"));
+}
+
+/// An ask that lands while the terminal is unfocused says so to the desktop
+/// — one OSC 777 and one OSC 9, written once — and an ask that lands in
+/// front of the player says nothing, because it is already the card on
+/// screen (`docs/tui.md`, "What owning the screen lets us use", "Asks").
+#[test]
+fn an_ask_notifies_the_desktop_only_while_unfocused() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+    arrange_a_reviewer(&session);
+    assert_eq!(session.notifications(), (0, 0), "nothing has been asked yet");
+
+    // The focus report goes out *after* the line, and the pty delivers them
+    // in order: typing is itself input, and input implies focus
+    // (`App::saw_input`), so a focus-out sent first would be undone by the
+    // very keys that raise the ask.
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(":kj cc send foo hi\r");
+    session.send("\x1b[O"); // focus out, before the poll round lands
+    let notified = session.wait_until(Duration::from_secs(15), |_| session.notifications() == (1, 1));
+    assert!(
+        notified,
+        "an ask raised out of focus did not notify: {:?}\n{}",
+        session.notifications(),
+        session.dump("unfocused ask")
+    );
+
+    // Nothing is sent to regain focus: typing the next line is what says
+    // the player is here, which is the rule this half pins.
+    colon_line(&session, ":kj cc send bar hi");
+    // The card's own hint line is the receipt that the poll round saw this
+    // ask as newly pending — the same round a notification would ride
+    // (`docs/tui.md`, "Asks").
+    let carded = session.wait_until(Duration::from_secs(20), |screen| {
+        screen_contains_str(screen, "[v]iew ledger") && screen_contains_str(screen, "Esc aside")
+    });
+    assert!(carded, "the second ask never raised a card: {}", session.dump("focused ask"));
+    // And a round more, so a notification this round would have made has
+    // been made before the count below is read.
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(
+        session.notifications(),
+        (1, 1),
+        "an ask raised in front of the player notified anyway: {}",
+        session.dump("focused ask")
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // d. Resize keeps the band on screen and at the bottom
 // ────────────────────────────────────────────────────────────────────────────
@@ -930,6 +1114,12 @@ fn a_panic_restores_the_terminal_from_the_alternate_screen() {
         "the terminal was left inside a synchronized update: {}",
         session.dump("after panic")
     );
+    // `leave_terminal` and the panic hook both reach `restore_terminal`,
+    // which is idempotent: the title stack is popped exactly as often as it
+    // was pushed, never once more — a pop with no push behind it takes the
+    // shell's own saved title off the stack (`run::pop_title`).
+    let (pushes, pops) = session.title_stack();
+    assert_eq!(pushes, pops, "the title stack is unbalanced after the panic: {pushes} pushed, {pops} popped");
     let (scrollback, visible) = session.history_snapshot();
     assert!(
         scrollback.iter().chain(visible.iter()).any(|l| l.contains("KAIJUTSU_TUI_PROBE_PANIC")),
@@ -1249,6 +1439,23 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
         session.alternate_scroll(),
         (2, 1),
         "alternate scroll did not follow the screen across the suspend: {}",
+        session.dump("after SIGCONT")
+    );
+    // Focus reporting rides with it, the same three writes: a terminal left
+    // reporting focus to a stopped job would send its reports into a pty
+    // nobody is reading (`run::suspend`).
+    assert_eq!(
+        session.focus_reporting(),
+        (2, 1),
+        "focus reporting did not follow the screen across the suspend: {}",
+        session.dump("after SIGCONT")
+    );
+    // The title stack balances across the suspend too: popped on the way
+    // down, pushed again on the way back.
+    assert_eq!(
+        session.title_stack(),
+        (2, 1),
+        "the title stack did not follow the screen across the suspend: {}",
         session.dump("after SIGCONT")
     );
 }

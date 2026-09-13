@@ -817,6 +817,251 @@ impl WrapCache {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Links (docs/tui.md, "What owning the screen lets us use")
+// ────────────────────────────────────────────────────────────────────────────
+
+/// One link found in rendered text: the byte range that names it, and the
+/// URI a terminal would open for it.
+///
+/// **Detection only.** OSC 8 is an attribute of a span, and ratatui 0.30
+/// carries no hyperlink attribute on `Style` or `Span` (verified against
+/// `ratatui-0.30.2` and `ratatui-core-0.1.2`): the backend diffs cells and
+/// writes each one itself, so escape bytes smuggled into a cell's symbol
+/// would be miscounted as width and overwritten by the next diff. Until
+/// ratatui carries the attribute, this says where the links are and nothing
+/// emits them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// Byte range into the text handed to [`links`].
+    pub range: std::ops::Range<usize>,
+    /// What a click opens: the URL itself, or `file://<host>/<path>`.
+    pub uri: String,
+}
+
+/// The absolute paths and `http(s)` URLs in `text`.
+///
+/// `host` is this machine's name — `whoami::fallible::hostname()` at the
+/// call site — so a path opened from a terminal on the other end of an ssh
+/// session opens the file on the machine the path belongs to, not on the
+/// one holding the terminal.
+///
+/// A path needs at least two segments: `/tmp` is a directory the player
+/// already knows, `/tmp/a` is a thing to open. A slash that is not at a word
+/// boundary is not a path at all, which is what keeps `src/run.rs`, `a/b`
+/// and `2026/09/13` out. A `:line` or `:line:col` suffix — what a compiler
+/// or a grep prints — names a place in the file, not a file, and is left
+/// out of both the range and the URI.
+///
+/// Unix paths only. A Windows path (`C:\…`) is out of scope: this client
+/// runs against a kernel on a unix host, and drive letters would collide
+/// with the `:line` rule.
+pub fn links(text: &str, host: &str) -> Vec<Link> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let rest = &text[at..];
+        let scheme = SCHEMES.into_iter().find(|s| rest.starts_with(s));
+        if let Some(scheme) = scheme
+            && at_a_boundary(text, at)
+        {
+            let end = at + trimmed_token_len(rest);
+            if end > at + scheme.len() {
+                out.push(Link { range: at..end, uri: text[at..end].to_string() });
+                at = end;
+                continue;
+            }
+        }
+        if bytes[at] == b'/'
+            && at_a_boundary(text, at)
+            && let Some(end) = absolute_path_end(text, at)
+        {
+            out.push(Link {
+                range: at..end,
+                uri: format!("file://{host}{}", &text[at..end]),
+            });
+            at = end;
+            continue;
+        }
+        at += next_char_len(text, at);
+    }
+    out
+}
+
+/// The schemes a terminal opens as they stand. `file://` is here rather
+/// than on the path branch: it is already a URI, and rewriting it would
+/// double the host.
+const SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
+
+/// Whether a token may start at `at`: the start of the text, or after a
+/// character that cannot be part of one. A slash after a letter, a digit, a
+/// dot or another slash belongs to something else — a relative path, a
+/// date, a fraction.
+fn at_a_boundary(text: &str, at: usize) -> bool {
+    let Some(before) = text[..at].chars().next_back() else {
+        return true;
+    };
+    !(before.is_alphanumeric() || matches!(before, '/' | '.' | '-' | '_' | ':' | '~'))
+}
+
+/// The end of the absolute path starting at `at`, or `None` when what
+/// follows is not one: every segment must be non-empty and there must be at
+/// least two of them.
+fn absolute_path_end(text: &str, at: usize) -> Option<usize> {
+    let mut end = at + trimmed_token_len(&text[at..]);
+    // `:12` and `:12:3` name a line and a column in the file, twice at
+    // most; a terminal opens the file, not the place.
+    for _ in 0..2 {
+        end -= line_suffix_len(&text[at..end]);
+    }
+    let token = &text[at..end];
+    let segments: Vec<&str> = token.trim_end_matches('/').split('/').skip(1).collect();
+    (segments.len() >= 2 && segments.iter().all(|s| !s.is_empty())).then_some(end)
+}
+
+/// The length of a trailing `:<digits>`, or zero when there is none.
+fn line_suffix_len(token: &str) -> usize {
+    let digits = token.len() - token.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 || !token[..token.len() - digits].ends_with(':') {
+        return 0;
+    }
+    digits + 1
+}
+
+/// The length of the token at the front of `rest`: up to the next
+/// whitespace, less the punctuation a sentence ends with. A closing bracket
+/// or quote goes with the sentence, not with the link — except a `)` the
+/// link itself opened, as a wikipedia disambiguation suffix does.
+fn trimmed_token_len(rest: &str) -> usize {
+    let token = rest.split_whitespace().next().unwrap_or("");
+    let mut end = token.len();
+    while let Some(last) = token[..end].chars().next_back() {
+        if !matches!(last, ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>' | '`') {
+            break;
+        }
+        let kept = &token[..end - last.len_utf8()];
+        if last == ')' && kept.matches('(').count() > kept.matches(')').count() {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    end
+}
+
+/// The byte length of the character at `at` — how far the scan steps when
+/// nothing starts there. Never zero, so the scan always advances.
+fn next_char_len(text: &str, at: usize) -> usize {
+    text[at..].chars().next().map(char::len_utf8).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn uris(text: &str) -> Vec<String> {
+        links(text, "zorak").into_iter().map(|l| l.uri).collect()
+    }
+
+    fn texts(text: &str) -> Vec<&str> {
+        links(text, "zorak").into_iter().map(|l| &text[l.range]).collect()
+    }
+
+    #[test]
+    fn an_absolute_path_carries_the_host_it_lives_on() {
+        assert_eq!(
+            uris("see /home/atobey/src/kaijutsu/docs/tui.md for the rule"),
+            vec!["file://zorak/home/atobey/src/kaijutsu/docs/tui.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_url_is_its_own_target() {
+        assert_eq!(
+            uris("https://docs.rs/ratatui/0.30.2/ratatui/ and http://localhost:8080/x"),
+            vec![
+                "https://docs.rs/ratatui/0.30.2/ratatui/".to_string(),
+                "http://localhost:8080/x".to_string(),
+            ]
+        );
+    }
+
+    /// A sentence's own punctuation is not part of what it names.
+    #[test]
+    fn trailing_punctuation_is_not_part_of_a_link() {
+        assert_eq!(texts("it is in /etc/hosts."), vec!["/etc/hosts"]);
+        assert_eq!(texts("(see /var/log/kaijutsu.log),"), vec!["/var/log/kaijutsu.log"]);
+        assert_eq!(texts("read https://example.com/a?b=1!"), vec!["https://example.com/a?b=1"]);
+    }
+
+    /// One segment is a root directory, not a file worth opening, and a
+    /// path this module cannot resolve is not one either.
+    #[test]
+    fn a_relative_fragment_or_a_bare_root_is_not_a_link() {
+        assert!(links("src/present.rs and a/b", "zorak").is_empty());
+        assert!(links("/tmp", "zorak").is_empty());
+        assert!(links("and/or, either/or", "zorak").is_empty());
+        assert!(links("//", "zorak").is_empty());
+    }
+
+    /// The false positive a naive scanner makes: a version, a ratio, a
+    /// date. None of them carries a leading slash at a word boundary.
+    #[test]
+    fn versions_and_ratios_are_not_links() {
+        assert!(links("ratatui 0.30.2, crossterm 0.29.0", "zorak").is_empty());
+        assert!(links("3/4 of 2026/09/13 done", "zorak").is_empty());
+        assert!(links("kaijutsu-tui/src/run.rs", "zorak").is_empty());
+    }
+
+    /// A compiler or a grep names the line, and the file is what a click
+    /// should open — no terminal opens `…/run.rs:12:3`.
+    #[test]
+    fn a_line_and_column_suffix_is_not_part_of_the_path() {
+        assert_eq!(texts("crates/../src/run.rs:12:3"), Vec::<&str>::new());
+        assert_eq!(texts("at /home/a/b.rs:12:3 it panics"), vec!["/home/a/b.rs"]);
+        assert_eq!(texts("see /home/a/b.rs:12"), vec!["/home/a/b.rs"]);
+        assert_eq!(
+            uris("see /home/a/b.rs:12"),
+            vec!["file://zorak/home/a/b.rs".to_string()]
+        );
+    }
+
+    /// Markdown backticks are quotes around a path, never part of it.
+    #[test]
+    fn backticks_are_not_part_of_a_link() {
+        assert_eq!(texts("in `/etc/kaijutsu/mounts.toml` today"), vec!["/etc/kaijutsu/mounts.toml"]);
+        assert_eq!(texts("`https://example.com/a`"), vec!["https://example.com/a"]);
+    }
+
+    /// A closing paren belongs to the link when the link opened it —
+    /// wikipedia's disambiguation suffix is the everyday case.
+    #[test]
+    fn a_paren_the_link_opened_stays_with_it() {
+        assert_eq!(
+            texts("see https://en.wikipedia.org/wiki/Foo_(bar) now"),
+            vec!["https://en.wikipedia.org/wiki/Foo_(bar)"]
+        );
+        assert_eq!(texts("(see https://example.com/a)"), vec!["https://example.com/a"]);
+    }
+
+    /// `file://` is a URI a terminal opens as it stands; it is not a path
+    /// to be rewritten into one.
+    #[test]
+    fn a_file_url_is_its_own_target() {
+        assert_eq!(uris("open file:///tmp/a/b now"), vec!["file:///tmp/a/b".to_string()]);
+    }
+
+    /// A path inside a sentence keeps its own bounds: the range is what
+    /// would carry the attribute, and it is the path and nothing else.
+    #[test]
+    fn the_range_names_exactly_the_path() {
+        let text = "wrote /tmp/a/b.txt ok";
+        let found = links(text, "zorak");
+        assert_eq!(found.len(), 1);
+        assert_eq!(&text[found[0].range.clone()], "/tmp/a/b.txt");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

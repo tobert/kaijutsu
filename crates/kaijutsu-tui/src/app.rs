@@ -218,6 +218,12 @@ pub struct App {
     /// from the picker or any `:kj` line. The loop takes it and starts a
     /// refresh round now.
     pub roster_changed: bool,
+    /// Whether the terminal reports itself focused (DECSET 1004,
+    /// `Event::FocusGained`/`FocusLost`). `true` until told otherwise: a
+    /// terminal that never reports focus never sends `FocusLost`, and a
+    /// client that assumed the worst would stop animating everywhere it is
+    /// not supported (`docs/tui.md`, "What owning the screen lets us use").
+    pub focused: bool,
     /// The playing track's beat envelope, sampled against `Instant::now()`
     /// once per redraw tick in [`crate::run`] — the only place this module
     /// reads a live clock. [`Self::track_figure`] projects it; nothing here
@@ -258,6 +264,7 @@ impl App {
             tails: crate::picker::PickerTails::new(),
             picker: None,
             track_pulse: false,
+            focused: true,
             roster_changed: false,
         }
     }
@@ -694,6 +701,19 @@ impl App {
             notice: self.notice.clone(),
             track: self.track_figure(),
         }
+    }
+
+    /// A key or a paste arrived, so this terminal has focus whatever its
+    /// last report said.
+    ///
+    /// Focus reporting is one-sided on some terminals — a `FocusLost` with
+    /// no `FocusGained` after it, or a report at startup and never again —
+    /// and a client that believed a stuck `false` would never animate
+    /// again. Input is the ground truth nobody can fake: it only reaches a
+    /// focused window (`docs/tui.md`, "What owning the screen lets us
+    /// use").
+    pub fn saw_input(&mut self) {
+        self.focused = true;
     }
 
     /// Sync a still-live block's collapse state from the feed. Collapse is
@@ -1278,6 +1298,17 @@ mod tests {
     /// An ask answered from another surface leaves the pending set on the
     /// next poll; the card showing it must come down with it, or every key
     /// stays swallowed by a card nobody can answer.
+    /// A terminal that reports `FocusLost` and never reports again must not
+    /// leave the client believing nobody is looking for the rest of the
+    /// session: the next key says otherwise.
+    #[test]
+    fn a_key_says_the_terminal_is_focused_whatever_it_last_reported() {
+        let mut app = App::new("amy");
+        app.focused = false;
+        app.saw_input();
+        assert!(app.focused, "input only reaches a focused terminal");
+    }
+
     #[test]
     fn an_ask_card_comes_down_when_its_ask_leaves_the_pending_set() {
         let (mut app, a, _b) = app_with_two();
