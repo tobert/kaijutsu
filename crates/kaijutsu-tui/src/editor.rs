@@ -27,9 +27,11 @@ use crate::present::Palette;
 /// What the owned screen is showing.
 ///
 /// The closed set: the conversation — the transcript, the band and whatever
-/// overlay is open — or one of the three vim-shaped surfaces that take the
-/// whole screen. A fourth *kind* of surface is a design conversation, not a
-/// patch.
+/// overlay is open — or one of the two vim-shaped surfaces that take the
+/// whole screen. Scrolling the transcript is not one of them: it is the
+/// conversation with the view off its tail (`docs/tui.md`, "Scrolling is
+/// copy mode"). A third *kind* of full-screen surface is a design
+/// conversation, not a patch.
 #[derive(Default)]
 pub enum ScreenMode {
     /// The transcript, the band and any overlay (`docs/tui.md`,
@@ -40,9 +42,6 @@ pub enum ScreenMode {
     Editor(EditorScreen),
     /// A frozen diff.
     Diff(crate::diff::DiffScreen),
-    /// `Ctrl+A [` — the frozen transcript under vi motions
-    /// (`docs/tui.md`, "Copy mode").
-    Copy(crate::copy::CopyScreen),
 }
 
 impl ScreenMode {

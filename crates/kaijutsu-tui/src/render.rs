@@ -13,7 +13,7 @@ use chrono::{Local, TimeZone};
 use kaijutsu_types::{BlockKind, BlockSnapshot, Status};
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Terminal};
 
@@ -99,73 +99,6 @@ pub fn is_settled(block: &BlockSnapshot) -> bool {
     matches!(block.status, Status::Done | Status::Error)
 }
 
-/// The most body rows a tool result takes in the transcript before it is cut
-/// to a head plus a footer: one screenful, the transcript rows a reader can
-/// see at once (`app.screen_rows` less the band at `width`, which grows with
-/// a wrapped draft).
-///
-/// A coder turn is mostly tool output, and a `cargo build` or a wide `grep`
-/// runs to thousands of lines. An uncut result pushes the turn that produced
-/// it off the screen, and the footer names where the rest is read.
-///
-/// The floor keeps the cut sane on a tiny terminal: below it the footer
-/// would cost more than it saves.
-const TOOL_RESULT_FLOOR: u16 = 6;
-
-pub fn tool_result_budget(app: &App, width: u16) -> usize {
-    usize::from(
-        app.screen_rows
-            .saturating_sub(band_rows(app, width))
-            .max(TOOL_RESULT_FLOOR),
-    )
-}
-
-/// Cut an over-long tool result to its head and say what was dropped.
-///
-/// Only `ToolResult`, and only in the transcript: `copy_buffer_lines`
-/// renders the same block through `render_block` untouched, which is what
-/// makes the footer's promise true. Capping inside `render_block` would cut
-/// copy mode too and leave the rest reachable nowhere.
-///
-/// The divider is kept — it names the caller and the command, which is what
-/// makes a cut result identifiable at all — and the footer replaces the last
-/// row of the budget, so the whole render is exactly one screenful.
-fn cap_tool_result(
-    block: &BlockSnapshot,
-    lines: Vec<Line<'static>>,
-    has_divider: bool,
-    budget: usize,
-    palette: &crate::present::Palette,
-) -> Vec<Line<'static>> {
-    if block.kind != BlockKind::ToolResult || lines.len() <= budget {
-        return lines;
-    }
-    let head_rows = usize::from(has_divider);
-    // `budget` covers the divider and the footer as well as the body, and
-    // `budget >= TOOL_RESULT_FLOOR` keeps this from going negative.
-    let keep = budget.saturating_sub(1);
-    let dropped = lines.len() - keep;
-    let mut out: Vec<Line<'static>> = lines.into_iter().take(keep).collect();
-    let plural = if dropped == 1 { "" } else { "s" };
-    out.push(Line::from(Span::styled(
-        format!("… {dropped} more line{plural} — Ctrl+A [ for copy mode"),
-        palette.divider(),
-    )));
-    debug_assert!(out.len() >= head_rows, "the divider is inside the budget");
-    out
-}
-
-/// The rows a block takes in the transcript once [`cap_tool_result`] has
-/// had its say — counted without rendering, so the window pass can skip
-/// blocks it will not draw.
-fn capped_rows(block: &BlockSnapshot, rows: usize, budget: usize) -> usize {
-    if block.kind == BlockKind::ToolResult && rows > budget {
-        budget
-    } else {
-        rows
-    }
-}
-
 /// Whether a blank row goes above a block's divider: one row of air between
 /// speakers, and none above the first speaker of a transcript or a copy
 /// buffer, where there is nothing to separate from (`docs/tui.md`,
@@ -229,8 +162,8 @@ fn transcript_plan(app: &App) -> Vec<(BlockSnapshot, BlockPlan)> {
                 gap,
                 // A `Thinking` block is one `▸` stub in the transcript
                 // whatever its collapse state: the reasoning was read as it
-                // streamed in the pane, and copy mode and `kj block read`
-                // keep the whole text (`docs/tui.md`, "The thinking pane").
+                // streamed in the pane, and `kj block read` keeps the whole
+                // text (`docs/tui.md`, "The thinking pane").
                 collapsed: view.is_collapsed(block) || block.kind == BlockKind::Thinking,
             },
         ));
@@ -254,35 +187,31 @@ fn context_type_of(app: &App) -> String {
 /// wrap cache; the second renders only the blocks the window touches, so a
 /// frame costs a screenful of work rather than a context's.
 pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'static>> {
-    let plan = transcript_plan(app);
+    let Some(frame) = plan_rows(app, width) else {
+        return Vec::new();
+    };
+    let PlannedRows { plan, rows, context_type } = frame;
     let height = usize::from(height);
-    if height == 0 || plan.is_empty() {
+    if height == 0 {
         return Vec::new();
     }
-    let budget = tool_result_budget(app, width);
     let palette = app.palette;
-    let context_type = context_type_of(app);
 
-    let mut rows: Vec<usize> = Vec::with_capacity(plan.len());
-    for (block, item) in &plan {
-        let view = block_view(item, &context_type, block);
-        let lineage = app.lineage_for(block);
-        let view = crate::present::BlockView { lineage, ..view };
-        let counted = capped_rows(block, app.wrap.lines(block, &view, width, &palette).len(), budget);
-        rows.push(usize::from(item.gap) + counted);
-    }
-    let total: usize = rows.iter().sum();
+    let index = crate::copy::RowIndex::new(rows.clone());
+    let total = index.total();
     let last_top = total.saturating_sub(height);
-    let start = if app.transcript.follow {
-        last_top
-    } else {
-        app.transcript.top.min(last_top)
+    // Off the tail the top row is the reader's anchor, settled against this
+    // frame's counts; on it, the newest rows.
+    let start = match app.transcript.scrolled.as_mut() {
+        Some(scrolled) => scrolled.settle(&index, height),
+        None => last_top,
     };
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height.min(total));
     let mut row = 0usize;
     let mut edge = None;
-    for ((block, item), block_rows) in plan.iter().zip(rows) {
+    for ((block, item), entry) in plan.iter().zip(&rows) {
+        let block_rows = entry.rows;
         if row + block_rows <= start {
             row += block_rows;
             continue;
@@ -290,9 +219,7 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
         let view = block_view(item, &context_type, block);
         let lineage = app.lineage_for(block);
         let view = crate::present::BlockView { lineage, ..view };
-        let rendered = app.wrap.lines(block, &view, width, &palette).to_vec();
-        let cut = capped_rows(block, rendered.len(), budget) != rendered.len();
-        let mut block_lines = cap_tool_result(block, rendered, item.show_divider, budget, &palette);
+        let mut block_lines = app.wrap.lines(block, &view, width, &palette).to_vec();
         if item.gap {
             block_lines.insert(0, Line::default());
         }
@@ -301,14 +228,11 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
         let room = height - lines.len();
         // The head may be above the window without hiding anything the
         // player is reading; a tail the window could not fit is a different
-        // matter, and so is one the cap took.
+        // matter.
         let cropped = drawn.len() > room;
         drawn.truncate(room);
         if !drawn.is_empty() {
-            edge = Some((
-                block.id,
-                (!cut && !cropped).then(|| block.content.chars().count() as u64),
-            ));
+            edge = Some((block.id, (!cropped).then(|| block.content.chars().count() as u64)));
         }
         lines.extend(drawn);
         row += block_rows;
@@ -319,7 +243,128 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
     if let Some((block, shown)) = edge {
         record_edge(app, block, shown);
     }
+    // The reader's line, the marked range and the search matches are painted
+    // onto the rows the window drew: the terminal's own cursor is hidden
+    // while the view is off the tail.
+    if let Some(scrolled) = &app.transcript.scrolled {
+        scrolled.decorate(start, &mut lines, &palette);
+    }
     lines
+}
+
+/// Every planned block of the transcript with the rows it takes at `width`
+/// — the first of `transcript_window`'s two passes, shared with the
+/// whole-transcript render the scrolled view's search and yank read.
+struct PlannedRows {
+    plan: Vec<(BlockSnapshot, BlockPlan)>,
+    /// Where each block sits: its leading rows (the blank row and the
+    /// divider) and its rows in all. The anchor counts from the first
+    /// content row, so a divider appearing above a block — which a block
+    /// inserted above it, or a tool call settling out of the in-flight
+    /// strip, can do — leaves the reader on the same text.
+    rows: Vec<crate::copy::RowBlock>,
+    context_type: String,
+}
+
+/// `None` when the current context has nothing to draw.
+fn plan_rows(app: &mut App, width: u16) -> Option<PlannedRows> {
+    let plan = transcript_plan(app);
+    if plan.is_empty() {
+        return None;
+    }
+    let palette = app.palette;
+    let context_type = context_type_of(app);
+    let mut rows: Vec<crate::copy::RowBlock> = Vec::with_capacity(plan.len());
+    for (block, item) in &plan {
+        let view = block_view(item, &context_type, block);
+        let lineage = app.lineage_for(block);
+        let view = crate::present::BlockView { lineage, ..view };
+        let counted = app.wrap.lines(block, &view, width, &palette).len();
+        // `render_block` puts the divider first when there is one, and the
+        // gap row goes above that.
+        let leading = usize::from(item.gap) + usize::from(item.show_divider);
+        rows.push(crate::copy::RowBlock {
+            block: block.id,
+            leading: leading.min(usize::from(item.gap) + counted),
+            rows: usize::from(item.gap) + counted,
+        });
+    }
+    Some(PlannedRows { plan, rows, context_type })
+}
+
+/// Where every block of the transcript sits at `width`, so a key path that
+/// runs between frames can settle the scrolled view against the same counts
+/// the next frame will use. Pass one of [`transcript_window`]'s two passes,
+/// which the wrap cache makes cheap; no block is rendered.
+pub fn row_index(app: &mut App, width: u16) -> crate::copy::RowIndex {
+    match plan_rows(app, width) {
+        Some(PlannedRows { rows, .. }) => crate::copy::RowIndex::new(rows),
+        None => crate::copy::RowIndex::default(),
+    }
+}
+
+/// The whole transcript, row for row as [`transcript_window`] draws it —
+/// what the scrolled view searches and what a yank copies out. Rendering
+/// every block is a keystroke's worth of work, not a frame's, so only `/`,
+/// `n`, `N` and `y` ask for it.
+pub fn transcript_all_lines(app: &mut App, width: u16) -> Vec<Line<'static>> {
+    let Some(PlannedRows { plan, rows, context_type }) = plan_rows(app, width) else {
+        return Vec::new();
+    };
+    let palette = app.palette;
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.iter().map(|r| r.rows).sum());
+    for (block, item) in &plan {
+        let view = block_view(item, &context_type, block);
+        let lineage = app.lineage_for(block);
+        let view = crate::present::BlockView { lineage, ..view };
+        let mut block_lines = app.wrap.lines(block, &view, width, &palette).to_vec();
+        if item.gap {
+            block_lines.insert(0, Line::default());
+        }
+        out.extend(block_lines);
+    }
+    debug_assert_eq!(
+        out.len(),
+        rows.iter().map(|r| r.rows).sum::<usize>(),
+        "the row index and the rendered rows must agree"
+    );
+    out
+}
+
+/// The plain text of an inclusive range of transcript rows, newline-joined —
+/// what `y` puts on the clipboard and in the paste buffer.
+pub fn transcript_rows_text(app: &mut App, width: u16, start: usize, end: usize) -> String {
+    let lines = transcript_all_lines(app, width);
+    if lines.is_empty() {
+        return String::new();
+    }
+    let start = start.min(lines.len() - 1);
+    let end = end.min(lines.len() - 1);
+    lines[start..=end].iter().map(crate::copy::line_text).collect::<Vec<_>>().join("\n")
+}
+
+/// How a screen `height` rows tall is divided: the transcript's rows, the
+/// overlay's, and the band's. The band takes what it needs from the bottom,
+/// an overlay takes what is left of `overlay` rows, and the transcript has
+/// the rest.
+///
+/// One answer for the frame and for the key path, so a page step and the
+/// reader's own offset agree with what was drawn. An overlay opening while
+/// the view is scrolled shortens the transcript, and a key measured against
+/// the taller screen would overshoot.
+fn split_rows(height: u16, band: u16, overlay: usize) -> (u16, u16, u16) {
+    let band = band.min(height);
+    let overlay = u16::try_from(overlay).unwrap_or(u16::MAX).min(height.saturating_sub(band));
+    (height.saturating_sub(band).saturating_sub(overlay), overlay, band)
+}
+
+/// The rows the transcript area has at `width` right now — the screen less
+/// the band and whatever overlay is open ([`split_rows`]). What the key path
+/// sizes a page step and the scrolled view's own settle with.
+pub fn transcript_height(app: &mut App, width: u16) -> usize {
+    let band = band_rows(app, width);
+    let overlay = overlay_lines(app, width).len();
+    usize::from(split_rows(app.screen_rows, band, overlay).0).max(1)
 }
 
 /// The view a planned block renders through, lineage left empty for the
@@ -345,8 +390,8 @@ fn block_view<'a>(
 }
 
 /// Record the player's edge of context: the block that ended the window,
-/// and how many of its characters were actually drawn — `None` when a cap or
-/// a crop hid its tail, because the kernel never guesses one
+/// and how many of its characters were actually drawn — `None` when the
+/// window cropped its tail, because the kernel never guesses one
 /// (`ContextView::edge`, `docs/prompts.md`, "The submit verb").
 ///
 /// A frame that drew no transcript row records nothing: what the player last
@@ -429,9 +474,19 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
         // to the draft.
         let first = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         lines.extend(input);
-        (!overlay_holds_keys(app)).then_some((first.saturating_add(cursor_row), cursor_col))
+        // The draft stays drawn and live while the transcript is scrolled —
+        // typing snaps, so it never changes there — but the terminal's
+        // cursor is hidden, because the keys are the transcript's.
+        (!overlay_holds_keys(app) && app.transcript.follow())
+            .then_some((first.saturating_add(cursor_row), cursor_col))
     };
-    lines.push(status_line(&app.status_model(now_millis), width, &palette));
+    // Off the tail the status row is the scrolled view's own: the position,
+    // the keys, and the search prompt while one is being typed. One row
+    // changes; the rest of the band is what it always was.
+    lines.push(match &app.transcript.scrolled {
+        Some(scrolled) => scrolled.hint_line(width, &palette),
+        None => status_line(&app.status_model(now_millis), width, &palette),
+    });
     BandFrame { lines, cursor }
 }
 
@@ -500,14 +555,14 @@ pub fn draw_screen<B: Backend>(
 ) -> Result<(), B::Error> {
     let size = terminal.size()?;
     let (width, height) = (size.width, size.height);
+    let overlay = overlay_lines(app, width);
+    let (transcript_rows, overlay_rows, _) = split_rows(height, band_rows(app, width), overlay.len());
+    // The transcript is rendered first: it is what settles the scrolled
+    // view, and the band's status row reads the settled position. Built the
+    // other way round, the readout showed the frame before.
+    let transcript = transcript_window(app, width, transcript_rows);
     let band = band_frame(app, width, now_millis, armed);
     let band_rows = u16::try_from(band.lines.len()).unwrap_or(u16::MAX).min(height);
-    let overlay = overlay_lines(app, width);
-    let overlay_rows = u16::try_from(overlay.len())
-        .unwrap_or(u16::MAX)
-        .min(height.saturating_sub(band_rows));
-    let transcript_rows = height.saturating_sub(band_rows).saturating_sub(overlay_rows);
-    let transcript = transcript_window(app, width, transcript_rows);
 
     terminal.draw(|frame| {
         let area = frame.area();
@@ -550,7 +605,7 @@ pub fn draw_screen<B: Backend>(
     Ok(())
 }
 
-/// One full-screen surface — the editor, the diff viewer, copy mode — drawn
+/// One full-screen surface — the editor, the diff viewer — drawn
 /// over the whole owned screen. `cursor` places the terminal's cursor;
 /// `None` hides it, which is what a surface with no insertion point wants.
 pub fn draw_surface<B: Backend>(
@@ -566,61 +621,6 @@ pub fn draw_surface<B: Backend>(
         }
     })?;
     Ok(())
-}
-
-/// Build copy mode's buffer for the context on screen: every block in
-/// document order, rendered exactly as the transcript would
-/// ([`crate::present::render_block`]) but whole — no cut tool result, no
-/// thinking stub (`docs/tui.md`, "Copy mode"). The draft is excluded — it is
-/// the compose line, not the transcript.
-///
-/// Frozen at the moment `Ctrl+A [` is pressed, the same "freeze on open"
-/// contract the diff screen keeps (`diff.rs`): a still-streaming block's
-/// later growth does not move the reader's place inside a buffer already
-/// open. `None` with no context on screen.
-pub fn copy_buffer_lines(app: &App, width: u16) -> Option<(String, Vec<Line<'static>>)> {
-    let context_id = app.current?;
-    let view = app.views.get(&context_id)?;
-    let info = app.info(context_id);
-    let context_type = info
-        .map(|c| c.context_type.clone())
-        .unwrap_or_else(|| "default".to_string());
-    let label = info
-        .map(|c| c.label.clone())
-        .filter(|l| !l.is_empty())
-        .unwrap_or_else(|| context_id.short());
-
-    let mut lines = Vec::new();
-    let mut last_speaker: Option<String> = None;
-    for block in view.mirror.blocks() {
-        if block.status == Status::Draft {
-            continue;
-        }
-        let speaker = app.speaker_for(block, info);
-        let show_divider = last_speaker.as_deref() != Some(speaker.as_str());
-        let stamp = wallclock(block.created_at);
-        let (tool, arg) = crate::app::tool_header(block);
-        let block_view = crate::present::BlockView {
-            speaker: &speaker,
-            context_type: &context_type,
-            stamp: &stamp,
-            show_divider,
-            tool,
-            arg,
-            lineage: app.lineage_for(block),
-            // Copy mode is where reasoning stays findable, so a `Thinking`
-            // block renders whole here even when a sibling collapsed it
-            // (`docs/tui.md`, "The thinking pane").
-            collapsed: view.is_collapsed(block) && block.kind != BlockKind::Thinking,
-            local_ctx: Some(context_id),
-        };
-        if speaker_gap(show_divider, last_speaker.as_deref()) {
-            lines.push(Line::default());
-        }
-        lines.extend(crate::present::render_block(block, &block_view, width, &app.palette));
-        last_speaker = Some(speaker);
-    }
-    Some((label, lines))
 }
 
 /// The most rows the compose region may take: [`third_of_screen`].
@@ -833,9 +833,9 @@ mod tests {
         assert_eq!(transcript_text(&mut app, 80).len(), wide, "and back again");
     }
 
-    /// Following shows the newest rows; a view that is not following shows
-    /// the rows from where it stopped (`docs/tui.md`, "Scrolling is copy
-    /// mode"; the keys are the next slice).
+    /// Following shows the newest rows; leaving the tail holds the view
+    /// where the reader put it while the block keeps streaming
+    /// (`docs/tui.md`, "Scrolling is copy mode").
     #[test]
     fn the_view_follows_the_tail_until_it_is_scrolled() {
         let (mut app, id) = fixture();
@@ -849,11 +849,118 @@ mod tests {
         assert_eq!(tail.len(), 5);
         assert_eq!(tail.last().map(String::as_str), Some("line 59"), "the tail: {tail:?}");
 
-        app.transcript.follow = false;
-        app.transcript.top = 1;
-        let scrolled = text_of(&transcript_window(&mut app, 80, 5));
-        assert_eq!(scrolled.first().map(String::as_str), Some("line 0"), "got {scrolled:?}");
-        assert_eq!(scrolled.len(), 5);
+        let mut scrolled = crate::copy::Scrolled::entering(5);
+        scrolled.scroll(-4);
+        app.transcript.scrolled = Some(scrolled);
+        let window = text_of(&transcript_window(&mut app, 80, 5));
+        assert_eq!(window.last().map(String::as_str), Some("line 55"), "got {window:?}");
+
+        // The block streams on; the anchored view does not move.
+        let body = (0..70).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
+        );
+        let held = text_of(&transcript_window(&mut app, 80, 5));
+        assert_eq!(held, window, "the anchor held the view still: {held:?}");
+    }
+
+    /// The text on the reader's own line: the one row `decorate` painted in
+    /// reverse, since the terminal's cursor is hidden while scrolled.
+    fn reader_line(window: &[Line<'static>]) -> String {
+        let painted: Vec<&Line<'static>> = window
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(ratatui::style::Modifier::REVERSED))
+            })
+            .collect();
+        assert_eq!(painted.len(), 1, "exactly one row is the reader's: {:?}", text_of(window));
+        crate::copy::line_text(painted[0])
+    }
+
+    /// A block arriving above the anchored one by a different speaker gives
+    /// that block a divider and a blank row, moving every one of its rows
+    /// down two. The anchor counts from the block's first *content* row, so
+    /// the reader keeps the same text — a row index would have slid.
+    #[test]
+    fn a_divider_arriving_above_the_anchor_leaves_the_reader_on_the_same_text() {
+        let (mut app, id) = fixture();
+        let body = |tag: &str| (0..30).map(|n| format!("{tag}-{n}")).collect::<Vec<_>>().join("\n");
+        let m0 = block(id, 1, BlockKind::Text, Role::Model, Status::Done, &body("m0"));
+        let m1 = block(id, 2, BlockKind::Text, Role::Model, Status::Done, &body("m1"));
+        let interjection = block(id, 3, BlockKind::Text, Role::User, Status::Done, "wait");
+
+        // Two model blocks in a row: the second carries no divider.
+        snapshot(&mut app, id, vec![m0.clone(), m1.clone()]);
+        let mut scrolled = crate::copy::Scrolled::entering(10);
+        scrolled.scroll(-20);
+        app.transcript.scrolled = Some(scrolled);
+        let before = reader_line(&transcript_window(&mut app, 80, 10));
+        assert!(before.starts_with("m1-"), "the reader is inside the second block: {before:?}");
+
+        // A different speaker lands between them: the second block gains a
+        // blank row and a divider.
+        snapshot(&mut app, id, vec![m0, interjection, m1]);
+        let after = reader_line(&transcript_window(&mut app, 80, 10));
+        assert_eq!(after, before, "the reader's own text moved");
+    }
+
+    /// The very first frame off the tail already says where the reader is.
+    /// The band's status row carries the readout and the transcript is what
+    /// settles the view, so the transcript is rendered first; built the
+    /// other way round the first frame read `line 0/0`.
+    #[test]
+    fn the_first_frame_off_the_tail_reads_the_position() {
+        let (mut app, id) = fixture();
+        app.screen_rows = 12;
+        let body = (0..60).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 9, BlockKind::Text, Role::Model, Status::Done, &body)],
+        );
+        // Entered but never settled — what `Ctrl+A [` leaves for the frame.
+        app.transcript.scrolled = Some(crate::copy::Scrolled::entering(8));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        draw_screen(&mut terminal, &mut app, 0, false).expect("draw");
+        let status = rows(&terminal).last().expect("a status row").clone();
+        let at = status.find("line ").unwrap_or_else(|| panic!("no readout: {status:?}")) + 5;
+        let figure = status[at..].split_whitespace().next().expect("a figure");
+        let (n, m) = figure.split_once('/').unwrap_or_else(|| panic!("not N/M: {figure:?}"));
+        let (n, m): (usize, usize) = (n.parse().expect("N"), m.parse().expect("M"));
+        assert!(n >= 1 && m >= 1, "the first frame read {n}/{m}");
+        assert_eq!(m, 61, "sixty body rows under the block's divider");
+        assert_eq!(n, 61, "entered on the newest row");
+    }
+
+    /// The reader's line is painted, since the terminal's own cursor is
+    /// hidden while the view is off the tail.
+    #[test]
+    fn the_scrolled_view_paints_the_readers_line() {
+        let (mut app, id) = fixture();
+        let body = (0..60).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        snapshot(
+            &mut app,
+            id,
+            vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
+        );
+        app.transcript.scrolled = Some(crate::copy::Scrolled::entering(5));
+        let window = transcript_window(&mut app, 80, 5);
+        let reversed: Vec<usize> = window
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                l.spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(ratatui::style::Modifier::REVERSED))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(reversed, vec![4], "the reader entered on the last row: {reversed:?}");
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -872,21 +979,6 @@ mod tests {
         assert_eq!(edge.shown, Some(last.content.chars().count() as u64));
     }
 
-    /// A cut tail is a count the client cannot make: the cap hid the end of
-    /// the block, so the edge names the block and no count rather than
-    /// claiming the player saw it whole.
-    #[test]
-    fn a_capped_result_at_the_tail_sends_no_count() {
-        let (mut app, id) = fixture();
-        app.screen_rows = 24;
-        snapshot(&mut app, id, long_result(id, 300));
-        let _ = transcript_window(&mut app, 80, u16::MAX);
-        let edge = app.views[&id].edge().expect("the result was drawn");
-        let result = app.views[&id].mirror.blocks().last().expect("the result").clone();
-        assert_eq!(edge.block, result.id);
-        assert_eq!(edge.shown, None, "the cap hid the tail");
-    }
-
     /// A scrolled view crops the last block's tail the same way.
     #[test]
     fn a_cropped_tail_sends_no_count() {
@@ -897,8 +989,9 @@ mod tests {
             id,
             vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
         );
-        app.transcript.follow = false;
-        app.transcript.top = 0;
+        let mut scrolled = crate::copy::Scrolled::entering(5);
+        scrolled.scroll(-60);
+        app.transcript.scrolled = Some(scrolled);
         let _ = transcript_window(&mut app, 80, 5);
         let edge = app.views[&id].edge().expect("the block was drawn");
         assert_eq!(edge.shown, None, "the window cropped the tail");
@@ -939,7 +1032,7 @@ mod tests {
         assert_eq!(armed.cursor, None, "the legend row has no cursor");
     }
 
-    /// Build a settled tool call and its result, whose body is `rows` lines.
+    /// A settled tool call and its result, whose body is `rows` lines.
     fn long_result(id: ContextId, rows: usize) -> Vec<BlockSnapshot> {
         let call = BlockSnapshotBuilder::new(
             BlockId::new(id, PrincipalId::new(), 9),
@@ -968,65 +1061,37 @@ mod tests {
         vec![call, result]
     }
 
-    /// A `cargo build`'s worth of output is cut to one screenful with a
-    /// footer that counts what was dropped, so the turn that produced it is
-    /// still on the screen with it.
+    /// Tool output is never collapsed in the tui; a block is read whole
+    /// (`docs/tui.md`, guidance 7). The cap that cut a long result to one
+    /// screenful only existed because scrollback could not be read again;
+    /// the transcript scrolls now, so a `cargo build`'s worth of output
+    /// renders every line and gains no footer.
     #[test]
-    fn a_long_tool_result_is_cut_to_a_head_and_a_footer() {
+    fn a_long_tool_result_renders_whole() {
         let (mut app, id) = fixture();
         app.screen_rows = 30;
         snapshot(&mut app, id, long_result(id, 500));
 
-        let rows = transcript_text(&mut app, 80);
-        let budget = tool_result_budget(&app, 80);
-        assert_eq!(budget, 26, "30 rows less the band");
+        // Off the tail, at the top: the first line is on screen.
+        let mut scrolled = crate::copy::Scrolled::entering(26);
+        scrolled.jump_to(0);
+        app.transcript.scrolled = Some(scrolled);
+        let head = text_of(&transcript_window(&mut app, 80, 26));
+        assert!(head.iter().any(|r| r.contains("cargo build")), "the call's divider: {head:?}");
+        assert!(head.iter().any(|r| r.contains("line 0")), "got {head:?}");
 
-        let footer = rows.last().expect("a footer");
-        assert!(
-            footer.starts_with("… ") && footer.contains("more lines"),
-            "the footer counts what was dropped: {footer:?}"
-        );
-        assert!(
-            footer.contains("Ctrl+A ["),
-            "the footer names where the rest is: {footer:?}"
-        );
-        // The head is real output, and the divider naming the command
-        // survives the cut — a result you cannot attribute is worse than a
-        // long one.
-        assert!(
-            rows.iter().any(|r| r.contains("cargo build")),
-            "the call's divider survives: {rows:?}"
-        );
-        assert!(rows.iter().any(|r| r.contains("line 0")), "{rows:?}");
-        assert!(
-            !rows.iter().any(|r| r.contains("line 499")),
-            "the tail is cut: {rows:?}"
-        );
-    }
-
-    /// The whole render is one screenful — the point of the cut. A render
-    /// that merely got shorter would still push the turn off the screen.
-    #[test]
-    fn a_cut_result_takes_exactly_one_screenful() {
-        for screen_rows in [24u16, 30, 50, 120] {
-            let (mut app, id) = fixture();
-            app.screen_rows = screen_rows;
-            snapshot(&mut app, id, long_result(id, 4_000));
-
-            let rows = transcript_text(&mut app, 80);
-            let budget = tool_result_budget(&app, 80);
-            // The call's own header rides above the result's budget.
-            assert!(
-                rows.len() <= budget + 4,
-                "screen_rows={screen_rows}: {} rows for a budget of {budget}",
-                rows.len()
-            );
+        // Every one of the five hundred lines is in the transcript, and no
+        // footer stands in for any of them.
+        let whole = text_of(&transcript_all_lines(&mut app, 80));
+        for n in [0usize, 1, 250, 498, 499] {
+            assert!(whole.iter().any(|r| r == &format!("line {n}")), "line {n} is missing");
         }
+        assert!(!whole.iter().any(|r| r.contains("more lines")), "no footer: {whole:?}");
     }
 
-    /// A short result is untouched — the cut must not tax ordinary output.
+    /// A short result is untouched, as it always was.
     #[test]
-    fn a_short_tool_result_keeps_every_line_and_gains_no_footer() {
+    fn a_short_tool_result_keeps_every_line() {
         let (mut app, id) = fixture();
         app.screen_rows = 40;
         snapshot(&mut app, id, long_result(id, 3));
@@ -1038,75 +1103,8 @@ mod tests {
                 "line {n} must survive: {rows:?}"
             );
         }
-        assert!(
-            !rows.iter().any(|r| r.contains("more lines")),
-            "no footer on a short result: {rows:?}"
-        );
     }
 
-    /// The footer's promise has to be true: copy mode renders the same
-    /// block through `render_block` with no cut, so the dropped tail is
-    /// reachable exactly where the footer says it is.
-    #[test]
-    fn copy_mode_still_holds_the_lines_the_footer_promised() {
-        let (mut app, id) = fixture();
-        app.screen_rows = 24;
-        snapshot(&mut app, id, long_result(id, 300));
-
-        let shown = transcript_text(&mut app, 80);
-        assert!(
-            !shown.iter().any(|r| r.contains("line 299")),
-            "the transcript is cut: {shown:?}"
-        );
-
-        let (_, copy) = copy_buffer_lines(&app, 80).expect("copy mode builds");
-        let copy_rows = text_of(&copy);
-        assert!(
-            copy_rows.iter().any(|r| r.contains("line 299")),
-            "copy mode keeps the tail the footer pointed at"
-        );
-        assert!(
-            !copy_rows.iter().any(|r| r.contains("more lines")),
-            "copy mode carries no footer: it was never cut"
-        );
-    }
-
-    /// The budget is one screenful less the band as it stands: a draft that
-    /// wrapped to a second row takes that row from the screenful too.
-    #[test]
-    fn the_budget_follows_the_bands_real_height() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let (mut app, _) = fixture();
-        app.screen_rows = 30;
-        let one_row = tool_result_budget(&app, 80);
-        assert_eq!(one_row, 26, "30 rows less a four-row band");
-        for code in [
-            KeyCode::Char('i'),
-            KeyCode::Char('a'),
-            KeyCode::Enter,
-            KeyCode::Char('b'),
-        ] {
-            app.compose.press(KeyEvent::new(code, KeyModifiers::NONE));
-        }
-        assert_eq!(
-            tool_result_budget(&app, 80),
-            one_row - 1,
-            "a second draft row takes a row from the screenful"
-        );
-    }
-
-    /// A tiny terminal still gets a usable head rather than a footer alone.
-    #[test]
-    fn the_budget_never_falls_below_the_floor() {
-        let (mut app, _) = fixture();
-        for screen_rows in [0u16, 1, 8, 9, 12] {
-            app.screen_rows = screen_rows;
-            assert!(
-                tool_result_budget(&app, 80) >= usize::from(TOOL_RESULT_FLOOR),
-                "screen_rows={screen_rows} fell below the floor"
-            );
-        }
-    }
 
     /// One frame: the transcript on top, the band under it, the status line
     /// last.
@@ -1498,10 +1496,11 @@ mod tests {
         );
     }
 
-    /// Copy mode's buffer holds the whole context and excludes the draft,
-    /// which is compose's line, not the transcript.
+    /// The whole-transcript render the scrolled view searches and yanks
+    /// holds every block and excludes the draft, which is compose's line,
+    /// not the transcript.
     #[test]
-    fn copy_buffer_lines_covers_the_whole_context_but_not_the_draft() {
+    fn transcript_all_lines_covers_the_whole_context_but_not_the_draft() {
         let (mut app, id) = fixture();
         snapshot(
             &mut app,
@@ -1524,18 +1523,20 @@ mod tests {
             ],
         );
 
-        let (label, lines) = copy_buffer_lines(&app, 80).expect("a context is on screen");
-        assert_eq!(label, "kaijutsu");
-        let text = text_of(&lines);
+        let text = text_of(&transcript_all_lines(&mut app, 80));
         assert!(text.iter().any(|l| l.contains("and getattr?")), "got {text:?}");
         assert!(text.iter().any(|l| l.contains("rename and getattr")), "got {text:?}");
         assert!(!text.iter().any(|l| l.contains("still typing")), "the draft is not the transcript: {text:?}");
+
+        // Row for row, it is what a full-height window draws — the yank and
+        // the search address the same rows the reader is looking at.
+        assert_eq!(text, text_of(&transcript_window(&mut app, 80, u16::MAX)));
     }
 
     #[test]
-    fn copy_buffer_lines_is_none_with_no_context_on_screen() {
-        let app = App::new("amy");
-        assert!(copy_buffer_lines(&app, 80).is_none());
+    fn transcript_all_lines_is_empty_with_no_context_on_screen() {
+        let mut app = App::new("amy");
+        assert!(transcript_all_lines(&mut app, 80).is_empty());
     }
 
     /// The ledger view is an overlay too, both sections visible
@@ -1576,10 +1577,12 @@ mod tests {
         assert!(!rows.iter().any(|r| r.contains("then rename")), "the body stays out: {rows:?}");
     }
 
-    /// Copy mode is where the whole reasoning stays findable: the copy
-    /// buffer renders the same block expanded.
+    /// A `Thinking` block is one stub wherever the transcript is read: the
+    /// scrolled view is that same transcript, so the whole reasoning is
+    /// `kj block read`'s now, not a second buffer's
+    /// (`docs/tui.md`, "The thinking pane").
     #[test]
-    fn the_copy_buffer_keeps_thinking_whole() {
+    fn thinking_stays_a_stub_in_the_whole_transcript() {
         let (mut app, id) = fixture();
         let mut mirror = ContextMirror::new(id);
         mirror
@@ -1595,15 +1598,10 @@ mod tests {
                 1,
             )
             .expect("snapshot applies");
-        let thinking_id = mirror.blocks()[0].id;
-        let mut view = ContextView::new(mirror);
-        // Even a collapse a sibling sent for it does not hide it here.
-        view.collapsed.insert(thinking_id, true);
-        app.views.insert(id, view);
-        let (_, lines) = copy_buffer_lines(&app, 80).expect("a buffer");
-        let rows = text_of(&lines);
-        assert!(rows.iter().any(|r| r == "then rename"), "got {rows:?}");
-        assert!(!rows.iter().any(|r| r.starts_with("▸ thinking")), "no stub here: {rows:?}");
+        app.views.insert(id, ContextView::new(mirror));
+        let rows = text_of(&transcript_all_lines(&mut app, 80));
+        assert!(rows.iter().any(|r| r.starts_with("▸ thinking")), "got {rows:?}");
+        assert!(!rows.iter().any(|r| r == "then rename"), "the body stays out: {rows:?}");
     }
 
     /// A turn whose reasoning is still streaming. Returns the thinking
@@ -1657,6 +1655,29 @@ mod tests {
 
     /// Reasoning an earlier turn left in the mirror does not open the pane:
     /// the latch is on a block this delivery touched.
+    /// The key path and the frame divide the screen with one function, so an
+    /// overlay's rows come out of the transcript's for both. Measured
+    /// against the taller screen a page step overshoots, and the reader's
+    /// offset slides the moment the pane opens.
+    #[test]
+    fn an_open_overlay_shortens_the_transcript_for_the_key_path_too() {
+        let (mut app, id) = fixture();
+        app.screen_rows = 24;
+        let bare = transcript_height(&mut app, 80);
+        assert_eq!(bare, 24 - usize::from(band_rows(&app, 80)));
+
+        let thinking = streaming_thinking(&mut app, id, 6);
+        app.mark_turn_running(id);
+        assert!(app.observe_thinking(id, &[thinking]));
+        let overlay = overlay_lines(&mut app, 80).len();
+        assert!(overlay > 0, "the thinking pane is open");
+        assert_eq!(
+            transcript_height(&mut app, 80),
+            bare - overlay,
+            "the pane's rows come out of the transcript's"
+        );
+    }
+
     #[test]
     fn stale_reasoning_does_not_latch_a_new_turn() {
         let (mut app, id) = fixture();

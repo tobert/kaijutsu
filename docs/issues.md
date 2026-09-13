@@ -184,6 +184,18 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
+## Arrows cannot scroll from inside a wrapped one-line draft (2026-09-13)
+
+`Up` leaves the tail only from the draft's first visual row and `Down`
+is inert only on its last (`run::tail_key`, `Compose::cursor_visual_row`),
+so inside a long wrapped draft the arrows belong to the draft. But
+modalkit's `Up` is a logical-line motion with nowhere to go on a
+one-line draft, so on a long wrapped draft the arrows cannot scroll the
+transcript at all; `PageUp` and `Ctrl+A [` still can. The fix is vim's
+`gk`/`gj` display-line motion for `Up`/`Down` in the draft, which
+`kaijutsu-editor` does not expose yet. Pinned by
+`run::a_wrapped_one_line_draft_keeps_its_own_arrows`.
+
 ## The open picker's cursor moved under a refresh in a probe (2026-09-13)
 
 `a_placement_verb_moves_the_row_while_the_picker_stays_open` failed in 3

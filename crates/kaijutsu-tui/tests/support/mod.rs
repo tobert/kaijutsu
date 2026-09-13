@@ -135,6 +135,14 @@ pub struct TuiSession {
     /// (`ESC [ ? 2026 l`). Zero whenever the client is between frames — a
     /// terminal left inside an update shows nothing at all.
     sync_depth: Arc<Mutex<i64>>,
+    /// Alternate scroll (DECSET 1007) enables and disables seen so far, in
+    /// that order — the client turns it on with the screen and off again on
+    /// the way out.
+    alt_scroll: Arc<Mutex<(usize, usize)>>,
+    /// The decoded text of every clipboard write (`ESC ] 52 ; c ; <base64>
+    /// BEL`) seen so far. A yank is the only caller, so this is exactly what
+    /// went to the clipboard.
+    clipboard: Arc<Mutex<Vec<String>>>,
     rows: u16,
     cols: u16,
 }
@@ -231,12 +239,18 @@ impl TuiSession {
 
         let cursor_queries = Arc::new(AtomicUsize::new(0));
         let sync_depth = Arc::new(Mutex::new(0i64));
+        let alt_scroll = Arc::new(Mutex::new((0usize, 0usize)));
+        let clipboard = Arc::new(Mutex::new(Vec::new()));
         let reader_parser = parser.clone();
         let reader_writer = writer.clone();
         let reader_count = cursor_queries.clone();
-        let reader_sync = sync_depth.clone();
+        let counts = Counts {
+            sync_depth: sync_depth.clone(),
+            alt_scroll: alt_scroll.clone(),
+            clipboard: clipboard.clone(),
+        };
         let reader = std::thread::spawn(move || {
-            read_loop(reader, reader_parser, reader_writer, reader_count, reader_sync)
+            read_loop(reader, reader_parser, reader_writer, reader_count, counts)
         });
 
         Self {
@@ -247,6 +261,8 @@ impl TuiSession {
             reader: Some(reader),
             cursor_queries,
             sync_depth,
+            alt_scroll,
+            clipboard,
             rows,
             cols,
         }
@@ -334,6 +350,30 @@ impl TuiSession {
     /// but zero at rest means a frame left the terminal holding its paint.
     pub fn sync_updates_open(&self) -> i64 {
         *self.sync_depth.lock().expect("sync depth lock")
+    }
+
+    /// `(enables, disables)` of alternate scroll (DECSET 1007) seen so far.
+    pub fn alternate_scroll(&self) -> (usize, usize) {
+        *self.alt_scroll.lock().expect("alt scroll lock")
+    }
+
+    /// Every clipboard write (OSC 52) the client has made so far, decoded.
+    pub fn clipboard(&self) -> Vec<String> {
+        self.clipboard.lock().expect("clipboard lock").clone()
+    }
+
+    /// Rows of the transcript area painted in reverse — the reader's own
+    /// line while the view is off the tail.
+    pub fn reader_rows(&self, transcript_rows: usize) -> Vec<usize> {
+        let p = self.parser.lock().expect("parser lock");
+        reader_rows(p.screen(), transcript_rows)
+    }
+
+    /// Rows of the transcript area carrying a background — the `v` mark's
+    /// paint, which nothing else above the band uses.
+    pub fn marked_rows(&self, transcript_rows: usize) -> Vec<usize> {
+        let p = self.parser.lock().expect("parser lock");
+        marked_rows(p.screen(), transcript_rows)
     }
 
     /// Whether the client has turned bracketed paste on (DECSET 2004).
@@ -425,7 +465,7 @@ fn read_loop(
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     queries: Arc<AtomicUsize>,
-    sync_depth: Arc<Mutex<i64>>,
+    counts: Counts,
 ) {
     const DSR_CURSOR: &[u8] = b"\x1b[6n";
     let mut buf = [0u8; 4096];
@@ -437,7 +477,7 @@ fn read_loop(
             Ok(n) => n,
         };
         carry.extend_from_slice(&buf[..n]);
-        count_sync_updates(&buf[..n], &sync_depth);
+        counts.fold(&buf[..n]);
 
         loop {
             let Some(pos) = find_subslice(&carry, DSR_CURSOR) else { break };
@@ -470,27 +510,117 @@ fn read_loop(
     }
 }
 
-/// Fold one read's synchronized-update brackets into the running depth.
+/// The tallies the read loop keeps over the raw byte stream, for the
+/// sequences `vt100` does not model.
 ///
-/// Counted on the raw stream rather than through `vt100`, which models
-/// neither sequence. A read boundary inside a bracket would miscount; the
-/// client writes each one in a single `execute!`, so the bytes arrive whole.
-fn count_sync_updates(bytes: &[u8], depth: &Mutex<i64>) {
-    const BEGIN: &[u8] = b"\x1b[?2026h";
-    const END: &[u8] = b"\x1b[?2026l";
-    let count = |needle: &[u8]| {
-        bytes
-            .windows(needle.len())
-            .filter(|w| *w == needle)
-            .count() as i64
-    };
-    let delta = count(BEGIN) - count(END);
-    if delta != 0 {
-        let mut depth = depth.lock().expect("sync depth lock");
-        // Ending an update the terminal never began is a no-op for the
-        // terminal, so it is one here: the depth floors at zero.
-        *depth = (*depth + delta).max(0);
+/// Counted on the raw stream rather than through the parser. A read boundary
+/// inside a sequence would miscount; the client writes each one in a single
+/// `execute!` or a single `write_all`, so the bytes arrive whole.
+struct Counts {
+    sync_depth: Arc<Mutex<i64>>,
+    alt_scroll: Arc<Mutex<(usize, usize)>>,
+    clipboard: Arc<Mutex<Vec<String>>>,
+}
+
+impl Counts {
+    fn fold(&self, bytes: &[u8]) {
+        let count = |needle: &[u8]| occurrences(bytes, needle);
+
+        let delta = count(b"\x1b[?2026h") as i64 - count(b"\x1b[?2026l") as i64;
+        if delta != 0 {
+            let mut depth = self.sync_depth.lock().expect("sync depth lock");
+            // Ending an update the terminal never began is a no-op for the
+            // terminal, so it is one here: the depth floors at zero.
+            *depth = (*depth + delta).max(0);
+        }
+
+        let (on, off) = (count(b"\x1b[?1007h"), count(b"\x1b[?1007l"));
+        if on + off > 0 {
+            let mut seen = self.alt_scroll.lock().expect("alt scroll lock");
+            seen.0 += on;
+            seen.1 += off;
+        }
+
+        self.fold_clipboard(bytes);
     }
+
+    /// Decode every complete OSC 52 write in `bytes`: the base64 between
+    /// `ESC ] 52 ; c ;` and the BEL the client terminates it with.
+    fn fold_clipboard(&self, bytes: &[u8]) {
+        const OSC52: &[u8] = b"\x1b]52;c;";
+        let mut rest = bytes;
+        while let Some(at) = find_subslice(rest, OSC52) {
+            let body = &rest[at + OSC52.len()..];
+            let Some(end) = body.iter().position(|b| *b == 0x07) else { break };
+            if let Some(text) = base64_decode(&body[..end]) {
+                self.clipboard.lock().expect("clipboard lock").push(text);
+            }
+            rest = &body[end..];
+        }
+    }
+}
+
+/// Rows of the transcript area painted in reverse — the reader's own line.
+///
+/// Free rather than a method, because a `wait_until` predicate is handed the
+/// screen with the parser already locked and that lock is not reentrant.
+pub fn reader_rows(screen: &vt100::Screen, transcript_rows: usize) -> Vec<usize> {
+    painted_rows(screen, transcript_rows, |cell| cell.inverse())
+}
+
+/// Rows of the transcript area carrying a background — the `v` mark's paint.
+pub fn marked_rows(screen: &vt100::Screen, transcript_rows: usize) -> Vec<usize> {
+    painted_rows(screen, transcript_rows, |cell| {
+        !cell.inverse() && cell.bgcolor() != vt100::Color::Default
+    })
+}
+
+fn painted_rows<F: Fn(&vt100::Cell) -> bool>(
+    screen: &vt100::Screen,
+    transcript_rows: usize,
+    paint: F,
+) -> Vec<usize> {
+    let (rows, cols) = screen.size();
+    (0..transcript_rows.min(usize::from(rows)))
+        .filter(|&row| {
+            (0..cols).any(|col| {
+                screen
+                    .cell(u16::try_from(row).unwrap_or(u16::MAX), col)
+                    .is_some_and(&paint)
+            })
+        })
+        .collect()
+}
+
+/// Standard padded base64, the alphabet `copy::osc52_sequence` writes.
+/// `None` on anything that is not one — a probe should say "that was not
+/// base64" rather than compare against a silently emptied string.
+fn base64_decode(data: &[u8]) -> Option<String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if data.is_empty() || !data.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3);
+    for chunk in data.chunks(4) {
+        let pad = chunk.iter().filter(|b| **b == b'=').count();
+        let mut n = 0u32;
+        for (i, byte) in chunk.iter().enumerate() {
+            let six = if *byte == b'=' { 0 } else { ALPHABET.iter().position(|a| a == byte)? as u32 };
+            n |= six << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

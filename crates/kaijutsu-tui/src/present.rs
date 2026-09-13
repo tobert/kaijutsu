@@ -231,14 +231,22 @@ impl Palette {
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     }
 
-    /// Copy mode's search: the line the cursor sits on when it holds the
-    /// active match. Layered over the line's own styled spans (`patch`), so
-    /// the text keeps its color and only gains the reverse.
-    pub fn copy_match(&self) -> Style {
+    /// The reader's line in the scrolled transcript. The terminal's own
+    /// cursor is hidden there, so this stands in for it — a reversed row is
+    /// what a block cursor looks like. Layered over the line's own styled
+    /// spans (`patch`), so the text keeps its color and only gains the
+    /// reverse.
+    pub fn copy_cursor(&self) -> Style {
         Style::new().add_modifier(Modifier::REVERSED)
     }
 
-    /// Copy mode's `v` linewise selection, before `y` yanks it.
+    /// A line holding the scrolled transcript's search pattern. Quieter than
+    /// the reader's own line, which may be one of them.
+    pub fn copy_search(&self) -> Style {
+        Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
+
+    /// The scrolled transcript's `v` linewise mark, before `y` copies it.
     pub fn copy_selection(&self) -> Style {
         Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
     }
@@ -280,7 +288,7 @@ pub struct BlockView<'a> {
 /// Whether a block of this kind renders collapsed the first time it is seen.
 ///
 /// Only `Error`. Tool calls and results render whole: reading a long one
-/// is copy mode's job (`docs/tui.md`, guidance 7). The kernel's `collapsed` field has no per-kind default, so
+/// is `kj block read`'s job (`docs/tui.md`, "The thinking pane"). The kernel's `collapsed` field has no per-kind default, so
 /// the default is the client's to apply — once, on first arrival, then
 /// carried forward per block id so a later change is not wiped by the next
 /// redraw.

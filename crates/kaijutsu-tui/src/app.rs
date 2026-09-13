@@ -33,8 +33,8 @@ pub struct ContextView {
     /// Activity since this context was last on screen — screen's `@` flag.
     pub activity: bool,
     /// The block that ended the last transcript frame, and how many of its
-    /// characters that frame drew — the inner `None` when a cap or a crop
-    /// hid its tail (`render::transcript_window`). It is the player's edge
+    /// characters that frame drew — the inner `None` when the window cropped
+    /// its tail (`render::transcript_window`). It is the player's edge
     /// on submit (`docs/prompts.md`, "The submit verb"); the outer `None`
     /// means this context has shown nothing at all.
     pub shown_tail: Option<(BlockId, Option<u64>)>,
@@ -82,17 +82,27 @@ impl ContextView {
 /// Where the transcript view sits over the current context's blocks.
 ///
 /// Following is the live tail: new blocks and streaming text move the view.
-/// Scrolling stops it (`docs/tui.md`, "Scrolling is copy mode"), and the
-/// keys that do the scrolling are the next slice.
+/// Scrolling stops it, and scrolling *is* copy mode — off the tail the
+/// transcript owns vi motions, `v`, `y` and a search, and every other key
+/// snaps it back (`docs/tui.md`, "Scrolling is copy mode"). Off the tail the
+/// place is kept by block and line rather than by row, so a block streaming
+/// above or below the reader does not move what they are reading.
+#[derive(Default)]
 pub struct TranscriptView {
-    pub follow: bool,
-    /// The first transcript row drawn while the view is not following.
-    pub top: usize,
+    /// Where the reader is, while they are off the tail.
+    pub scrolled: Option<crate::copy::Scrolled>,
 }
 
-impl Default for TranscriptView {
-    fn default() -> Self {
-        Self { follow: true, top: 0 }
+impl TranscriptView {
+    /// Whether the view is on the live tail, where new blocks move it.
+    pub fn follow(&self) -> bool {
+        self.scrolled.is_none()
+    }
+
+    /// Back to the live tail — `q`, `Esc`, `G`, a yank, a context switch, or
+    /// any key the scrolled view does not claim.
+    pub fn snap(&mut self) {
+        self.scrolled = None;
     }
 }
 
@@ -149,13 +159,14 @@ pub struct App {
     /// draft again it would refill the compose line the reset just cleared,
     /// so [`Self::current_draft`] skips this one block by id.
     submitted_draft: Option<BlockId>,
-    /// The last copy-mode yank, for `Ctrl+A ]` — tmux's paste buffer. The
+    /// The last yank from the scrolled transcript, for `Ctrl+A ]` — tmux's
+    /// paste buffer. The
     /// tui's own, so it never needs aligning with vim's registers or the OS
     /// clipboard (the yank also goes to the clipboard over OSC 52, but that
     /// is a one-way emission the tui cannot read back).
     pub paste_buffer: Option<String>,
     /// What the owned screen is showing. A full-screen surface — the
-    /// editor, the diff viewer, copy mode — takes the whole screen
+    /// editor, the diff viewer — takes the whole screen
     /// (`docs/tui.md`, "The owned screen"), and the key path early-returns
     /// on it, which is what makes
     /// the editor the sanctioned raw key reader.
@@ -288,8 +299,7 @@ impl App {
     }
 
     /// What a status-line notice calls a context: its label, or its short id
-    /// when it has none — the same name the status line's seat cells and
-    /// copy mode's header use.
+    /// when it has none — the same name the status line's seat cells use.
     pub fn label_for(&self, id: ContextId) -> String {
         self.info(id)
             .map(|c| c.label.clone())
@@ -336,6 +346,9 @@ impl App {
         if let Some(view) = self.views.get_mut(&id) {
             view.activity = false;
         }
+        // The scrolled place is anchored to blocks of the context being
+        // left, so the new context's transcript opens on its own live tail.
+        self.transcript.snap();
         // The card is the current context's ask; leaving that context sets
         // it aside. The ask stays pending and the refresh raises the card
         // again on return.

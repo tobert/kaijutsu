@@ -58,8 +58,11 @@ kaijutsu-server / kernel
    motions (`j`/`k`, `Ctrl+U`/`Ctrl+D`, `gg`/`G`, `/` and `?` search),
    `Space` marks and `Enter` copies to the clipboard (OSC 52 over ssh; `v`
    and `y` are the vim spelling of the same two acts), `q` or `Esc`
-   leaves. Fullscreen exists only where vim and tmux themselves go
-   fullscreen: the editor, the diff, copy mode. Amy: *"I almost hit ctrl-a
+   leaves. (Decision record: since slice 3, `Space` snaps the view to the
+   tail instead of marking, and `v` is the one key that marks — "Scrolling
+   is copy mode".) Fullscreen exists only where vim and tmux themselves go
+   fullscreen: the editor, the diff, copy mode (since 2026-09-13 copy mode is
+   the scrolled transcript itself, not a screen of its own). Amy: *"I almost hit ctrl-a
    [ to start scrolling up in this window so what if we put that in?"*
    Tool output is never collapsed in the tui; a block is read whole, and
    reading it better is a print-time problem (a formatter over kaish
@@ -191,10 +194,19 @@ Slice 2 deleted `run::set_viewport_height`, `enter_terminal`'s inline
 viewport, `render::insert_before`, `print_scrollback` and
 `take_settled_prints`, `ContextView::printed` and `last_printed`, the
 resize-refusal fallback, `AltScreen` as a second `Terminal`, and the
-harness's `mute_cursor_queries`. Copy mode's freeze was promoted to the
-main view rather than deleted. The pty harness stays: it already parses
+harness's `mute_cursor_queries`. The pty harness stays: it already parses
 the alternate screen, and it now counts `ESC [ 6 n` instead of answering
 it, so a probe can assert the client sends none.
+
+Slice 3 deleted the frozen `CopyScreen` and `render::copy_buffer_lines`
+that built it, and `ScreenMode::Copy`, the full-screen mode that drew it:
+copy mode is now the transcript itself, scrolled, addressed by block and
+line (`copy::Anchor`) rather than snapshotted at open. The tool-result cap
+went with it — the scrollback-only cut (`render::cap_tool_result`) that
+kept a live-tail print to one screenful and relied on copy mode's separate,
+uncapped render of the same block to make the rest reachable; with one
+view for both, a long result renders whole and the transcript scrolls
+("Conversation").
 
 ### Slices
 
@@ -206,10 +218,10 @@ it, so a probe can assert the client sends none.
    overlay, no viewport rebuilds, no cursor queries. Probes: exit
    restores the main screen; a completed block appears above the band;
    a resize re-wraps.
-3. **Scroll is copy mode.** `Up` at the draft's edge, `PageUp`, and
-   `Ctrl+A [` all enter it; the tail returns on `q`/`Esc`/`G`. `?1007`
-   sent. Probe: wheel-as-arrows scrolls and a typed key at the tail still
-   edits the draft.
+3. **Scroll is copy mode.** Landed 2026-09-13. `Up` at the draft's edge,
+   `PageUp`, and `Ctrl+A [` all enter it; the tail returns on `q`/`Esc`/`G`.
+   `?1007` sent. Probe: wheel-as-arrows scrolls and a typed key at the tail
+   still edits the draft.
 4. **Per-context buffers and the hot set.** Switching seats switches
    transcripts; the ACTIVE ring stays resident.
 5. **Terminal features** from the list above, one at a time, focus and
@@ -217,9 +229,6 @@ it, so a probe can assert the client sends none.
 
 ### Open
 
-- A wheel tick is three `Up`s: inside a tall draft the first moves the
-  cursor and the next two scroll. A burst heuristic could fix it; not
-  built until it is felt.
 - Kitty keyboard protocol: on by request or on by probe.
 
 Decided 2026-09-13: the draft stays live while scrolled and typing snaps
@@ -275,9 +284,11 @@ grammar, and a new surface arrives in the same shape:
   bottom-aligned above the band. An overlay (picker, ledger, an ask card,
   the thinking pane) takes rows at the transcript area's foot, between the
   transcript and the band, and gives them back on dismiss. A full-screen
-  surface (vi, diff, copy mode) takes the whole screen. The band —
-  the in-flight strip, a blank row, the draft, the status line — is always
-  drawn; only a full-screen surface replaces it.
+  surface (vi, diff) takes the whole screen. The band — the in-flight
+  strip, a blank row, the draft, the status line — is always drawn; only a
+  full-screen surface replaces it. Copy mode is neither: it is the
+  transcript area itself, scrolled, with the band's status row swapped for
+  its own hint line ("Copy mode (scroll, or `Ctrl+A [`)").
 
 Three sanctioned deviations: compose's figure is the `❯` line inside the
 conversation figure — it is part of that frame, not an overlay; the
@@ -330,20 +341,14 @@ Rules the figure carries:
   (Amy, 2026-09-04: *"could `tool` be the actual tool name? maybe
   principal name far left … possibly some args inline?"* — option 2 of
   three.)
-- **A tool result prints its head and says what it dropped past one
-  screenful:** `… 1,847 more lines — Ctrl+A [ for copy mode`. A coder turn
-  is mostly tool output and a `cargo build` runs to thousands of lines;
-  scrollback is never redrawn, so an uncut result has already pushed the
-  turn that produced it out of view by the time anyone could collapse it.
-  Print time is the only moment the choice exists. The budget is
-  `app.screen_rows` less the live band, floored so a small terminal still
-  gets a usable head, and the whole print is exactly one screenful. The
-  divider survives the cut — a result you cannot attribute is worse than a
-  long one. **The cut is on the scrollback path only**
-  (`render::cap_tool_result`); copy mode renders the same block through
-  `render_block` untouched, which is what makes the footer's promise true.
-  Capping inside `render_block` would cut copy mode too and leave the tail
-  reachable nowhere.
+- **A long tool result renders whole, and the transcript scrolls.** A
+  coder turn is mostly tool output and a `cargo build` runs to thousands of
+  lines; there is no print-time cap and no cut — the tool-result cap that
+  once capped a result to one screenful on the live tail is deleted
+  ("What went"). Scrolling up (`Up`, `PageUp`, or `Ctrl+A [`) is how the
+  rest of a long result is read, the way `less` would. The divider still
+  survives however far the result runs — a result you cannot attribute is
+  worse than a long one.
 - `▸` is a collapsed block; only `Error` collapses by default (tool output
   prints whole, guidance 7) and
   `Error` is a one-line stub, per the app's error-render policy. Collapse is
@@ -351,8 +356,9 @@ Rules the figure carries:
   completed `Thinking` block is the one block that prints as a `▸` stub
   regardless ("The thinking pane").
 - `Thinking` streams dim and italic in the thinking pane and leaves a
-  `▸ thinking · N lines · …` stub in scrollback when it completes; the
-  whole text stays in copy mode and `kj block read` ("The thinking pane").
+  `▸ thinking · N lines · …` stub in the transcript when it completes, a
+  stub whether the view is scrolled or not; `kj block read` is what reads
+  the whole text once the pane has closed ("The thinking pane").
 - A `ToolResult` with structured output (`OutputData` — headers, a flat list,
   a tree, `rich_json`) lays out at the terminal's real width in the tui: a
   table, `ls -C` columns, or an indented tree (`layout::layout_output`).
@@ -423,6 +429,19 @@ Rules the figure carries:
   color applies. The armed legend, the picker, an ask card and the ledger
   hide it. The shape goes back to the terminal's default on `:q` and on
   `Ctrl+Z`.
+- **The terminal cursor hides while scrolled.** The draft keeps drawing
+  live off the tail — typing snaps back, so it never changes underneath —
+  but the keys belong to the transcript there, not the draft, so the real
+  cursor is hidden for as long as the view is scrolled ("Copy mode (scroll,
+  or `Ctrl+A [`)").
+- **`Up` at the draft's top line leaves the tail; `Down` at the live tail
+  does nothing.** A one-line draft is the common case, so every `Up`
+  scrolls the transcript one line; inside a taller draft `Up` moves the
+  draft's own cursor first, as vim does, and only scrolls once the cursor
+  is on the first line. `PageUp` always leaves and scrolls a screen; the
+  `:` bar keeps `Up`/`Down` for its own history throughout. One rule covers
+  both a typed arrow and the mouse wheel, which the terminal sends as
+  arrow-key presses (`docs/tui.md`, "The mouse stays the terminal's").
 - **A paste is text, not keystrokes.** Bracketed paste is on while the
   viewport is up, so the terminal delivers a paste as one event: the draft
   takes it as one edit at the cursor, the way `Ctrl+A ]` does, and a
@@ -434,11 +453,13 @@ Rules the figure carries:
   are normalized, since terminals differ on what a pasted newline is.
   Probe: `a_bracketed_paste_lands_in_the_draft_without_submitting`.
 - There is no state past normal mode. The app's `Esc Esc` hands the
-  keyboard to its block list; the tui prints its transcript into scrollback
-  and never redraws it, so a block cursor would have nothing to act on, and
-  the unfocused state that reserved room for one was deleted (Amy: *"I
-  don't think we need the unfocused mode at all"*). Vi motions in normal
-  mode act on the draft. `:` opens the bar from normal mode, and the bar
+  keyboard to its block list; the tui redraws its transcript every frame
+  from the mirror rather than printing it once into scrollback, and
+  reading it from the keyboard is scrolling, which is copy mode, not a
+  block cursor — the unfocused state that reserved room for one was
+  deleted (Amy: *"I don't think we need the unfocused mode at all"*). Vi
+  motions in normal mode act on the draft. `:` opens the bar from normal
+  mode, and the bar
   closes into normal mode.
 
 ### The thinking pane
@@ -500,9 +521,12 @@ Rules the figure carries:
   settles), with the block's own first line as the fallback when no
   summary exists. Thinking blocks leave the stream while the pane holds
   them, so nothing draws twice.
-- **Copy mode renders the block whole**, collapse state ignored for
-  `Thinking`, so the reasoning stays findable after the pane closes; so
-  does `kj block read`.
+- **The reasoning is not readable in a copy buffer.** There is no second
+  buffer to render it whole into: the scrolled view is the same transcript
+  the live tail draws, and a completed `Thinking` block is one `▸` stub
+  there regardless of scroll position, collapse state ignored for
+  `Thinking`. `kj block read` is the way to read the settled reasoning
+  whole once the pane closes.
 - No tui-side truncation, no kernel budget: what prints is what the
   provider sent (Claude's adaptive summarized thinking is the API's own
   summary; DeepSeek gets `reasoning_effort`).
@@ -688,17 +712,19 @@ not quit; `Ctrl+Z` suspends and `SIGCONT` leaves a responsive client (the
 stopped state itself is not observable in every sandbox — the probe's own
 doc comment says why).
 
-### Copy mode (`Ctrl+A [`)
+### Copy mode (scroll, or `Ctrl+A [`)
 
 tmux's own copy-mode chord (`.tmux.conf`'s `mode-keys vi`, `bind [
-copy-mode`), and it means the same thing here: the current context's
-transcript becomes a buffer drawn full-screen on the owned screen, under
-vi motions — how a long tool result is read whole now that tool output no
-longer collapses by default (`present::collapses_by_default`), and how the
-conversation is scrolled from the keyboard. Slice 3 ("The owned screen",
-"Slices") makes scrolling itself enter copy mode — `Up` at the draft's
-edge, `PageUp`, and the wheel arriving as arrow keys all reach it the same
-way `Ctrl+A [` does now.
+copy-mode`), and it means the same thing here: leaving the live tail is
+entering copy mode, and reaching the tail again is leaving it
+(`docs/tui.md`, "Scrolling is copy mode"). `Ctrl+A [` leaves without
+moving; `Up` at the draft's edge, `PageUp`, and the wheel arriving as
+arrow keys leave and scroll the same way. The transcript is not frozen and
+not full-screen: it is the same scrolling view over `ContextView`'s mirror
+that the live tail draws, now under vi motions — how a long tool result is
+read whole now that tool output no longer collapses by default
+(`present::collapses_by_default`), and how the conversation is scrolled
+from the keyboard.
 
 ```text
   ─ claude · coder ──────────────────────────────────────────────  14:02:11
@@ -706,62 +732,80 @@ way `Ctrl+A [` does now.
   so the symlink's target was removed instead of the link. resolve_nofollow
   fixes unlink; rename and getattr share the cause and are deliberately ▍
   ▸ shell  cargo test -p kaijutsu-kernel vfs::                     running 4s
-  line 1204/1207   kaijutsu   j/k  ^D/^U  gg/G  / search  Space mark  Enter copy  q leave
+
+  ❯ and getattr? _                                                  -- INSERT --
+  line 1204/1207   j/k  ^D/^U  gg/G  / search  v mark  y copy  q leave
 ```
+
+The reader's line and a marked range paint over the transcript rows
+(`copy_cursor`, `copy_selection` in the palette); the position and the key
+hint take the band's own status row, in place of the ordinary status line,
+and a `/` or `?` prompt takes that same row while it is being typed
+(`copy_search` highlights a match). The draft stays drawn live above it —
+typing snaps the view back to the tail, so it never changes underneath —
+but the terminal's own cursor is hidden while scrolled, because the keys
+belong to the transcript, not the draft.
 
 Rules the figure carries:
 
-- **Entry position is the bottom** — the newest block — the way tmux enters
-  copy mode at the current screen.
-- **The terminal cursor rides the reader's line**, at column 0, as tmux
-  keeps its real cursor on the copy cursor; the search prompt row takes it
-  while `/` is being typed. The shape is a block: copy mode reads.
-- **The buffer is the whole context, frozen on open.** It is built from
-  `ContextView`'s mirror, the same source the transcript printer reads, run
-  through `render_block` (`present.rs`) so copy mode shows exactly what
-  scrollback showed — dividers and stamps included, wrapped at the width the
-  screen opened at (`render::copy_buffer_lines`). "Freeze on open" is the
-  same contract the diff viewer keeps (`diff.rs`): a block still streaming
-  when `Ctrl+A [` is pressed does not grow under the reader while they
-  scroll. The buffer being the tui's own — holding the whole context, so
-  search crosses all of it, not only what was printed since attach — is one
-  of the two things guidance 7 names as different from tmux; the other is
-  that the mouse wheel stays the terminal's, since scrollback is still where
-  the transcript lives.
-- **Motions are vi's, and linewise only** — there is no column cursor.
-  `j`/`k`/`Down`/`Up` move one line; `Ctrl+D`/`Ctrl+U` move half a page;
-  `Ctrl+F`/`Ctrl+B`/`PageDown`/`PageUp` move a full page; `gg` goes to the
-  top, `G` to the bottom.
-- `/` and `?` open a search prompt on the bottom line — case-insensitive
-  substring is enough. `Enter` commits and jumps to the nearest match in
-  that direction; `n`/`N` step to the next/previous match, wrapping around
-  the whole buffer once it runs out. The active match's line is highlighted.
-- `q` and `Esc` leave copy mode and restore the ordinary screen with a
-  redraw. Leaving never prints anything — the buffer is read-only, and
-  closing it is a screen change, not a transcript event.
-- **`Ctrl+A ]` pastes the last yank into the draft** at the cursor, as
-  one edit, in whatever mode the draft is in — tmux's `paste-buffer`. The
+- **Entry position is the bottom** — the newest block, the reader on its
+  last row — the way tmux enters copy mode at the current screen. Leaving
+  the tail never prints anything and never moves the view: `Ctrl+A [`
+  anchors exactly where the following view already sat; `Up` and `PageUp`
+  anchor there too and then scroll one line or one screen.
+- **There is no frozen snapshot.** A block still streaming grows under the
+  reader while they scroll, and the view keeps its place by block and line
+  rather than by row (`copy::Anchor`), so growth above or below never moves
+  what is being read. The buffer being the tui's own — holding the whole
+  context, so search crosses all of it, not only what was printed since
+  attach — is one of the two things guidance 7 names as different from
+  tmux; the other is that the mouse wheel stays the terminal's, arriving as
+  arrow keys under alternate scroll (`?1007`) rather than a reported wheel
+  event.
+- **`Up`/`Down` scroll the view one line, the reader's line pinned to its
+  screen row** — one wheel tick is three of them, and moves the screen
+  three lines. At an edge the view cannot move, so the reader's line moves
+  instead: the first and the last row stay reachable with the arrows
+  alone. `j`/`k` are vim's cursor motions instead: they walk the reader
+  and scroll only once it is on the top or bottom row.
+  `Ctrl+U`/`Ctrl+D` move half a screen, `Ctrl+F`/`Ctrl+B`/`PageUp`/
+  `PageDown` a full screen; `gg`/`Home` go to the top; `G`/`End`, or any
+  downward move past the last row, return to the live tail.
+- `/` and `?` open a search prompt on the band's status row —
+  case-insensitive substring is enough, and it takes every key while open.
+  `Enter` commits and jumps to the nearest match in that direction; `n`/`N`
+  step to the next/previous match, wrapping around the whole transcript
+  once it runs out. Every row holding a match is highlighted; the reader's
+  own row is painted as the reader's row first.
+- `q` and `Esc` leave copy mode and return to the live tail with a redraw.
+  Leaving never prints anything — the transcript is read-only there, and
+  returning to the tail is a view change, not a transcript event.
+- `v` marks the reader's line, the vim spelling copy mode carries; a second
+  `v` clears it. `y` or `Enter` yanks the marked range — or the reader's
+  own line when nothing is marked — to the clipboard over OSC 52
+  (`ESC ] 52 ; c ; <base64> BEL`, written straight to stdout under the same
+  `term_lock` every other terminal write takes) and into `app.paste_buffer`
+  for `Ctrl+A ]`, then returns to the tail. `Esc` leaves whether or not a
+  mark is active; a second `v` is what clears a mark.
+- **Every other key snaps the view to the tail and is handled as if typed
+  there** — `Space` most of all (Amy: *"I often hit space just to do
+  that"*, the habit wezterm calls `scroll_to_bottom_on_input`); `v` marks
+  now, so `Space` no longer does. See "Scrolling is copy mode" for the
+  decision.
+- **`Ctrl+A ]` pastes the last yank into the draft** at the cursor, as one
+  edit, in whatever mode the draft is in — tmux's `paste-buffer`. The
   buffer is the tui's own, so it never needs aligning with vim's registers
   or the OS clipboard (Amy: *"I always disliked trying to align copy
   buffers between vim/tmux/os"*). The same yank also goes out over OSC 52,
   one way; the tui never reads the OS clipboard back.
-- `Space` starts a linewise selection and `Enter` copies it and leaves —
-  GNU screen's copy mode and tmux's vi mode agree, and those are the hands
-  this answers (Amy: *"spacebar to start a grab, then enter to get it into
-  the buffer"*; her `.screenrc` and `.tmux.conf` carry no custom copy
-  bindings, so these are the defaults she learned). `Enter` with nothing
-  marked leaves. `v` and `y` are the vim spelling of the same two acts:
-  `v` starts a linewise selection; `y` yanks the selected lines to the
-  clipboard over OSC 52 (`ESC ] 52 ; c ; <base64> BEL`, written straight to
-  stdout under the same `term_lock` every other terminal write takes) and
-  leaves copy mode, the way tmux does. `Esc` with a selection active cancels
-  the selection instead of leaving — a second `Esc` is what leaves.
 - **The machinery, named.** Nothing on the wire opens copy mode: it is a
   local decision over the `ContextMirror` this client already holds, the
   same source `render::transcript_window` reads — there is no RPC round
-  trip to enter it. `render::copy_buffer_lines` builds the frozen buffer;
-  `ScreenMode::Copy` draws it full-screen, the same as the editor and the
-  diff viewer.
+  trip to enter it. `copy::Scrolled` holds the reader's place, the mark and
+  the search state; `render::row_index` maps a rendered row to the block
+  and line it belongs to (`copy::RowIndex`) and back; OSC 52 is the
+  clipboard write, and `app.paste_buffer` is where the last yank lives for
+  `Ctrl+A ]`.
 
 ### The picker (`Ctrl+A "`)
 
@@ -1042,9 +1086,9 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
 `Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a`, `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`,
-`h`, and the armed-prefix legend line; `Ctrl+A [` is copy mode ("Copy mode",
-guidance 7). The legend takes the compose row
-while a prefix is pending — never the status line, whose seat digits are
+`h`, and the armed-prefix legend line; `Ctrl+A [` leaves the live tail
+without moving ("Copy mode (scroll, or `Ctrl+A [`)"). The legend takes the
+compose row while a prefix is pending — never the status line, whose seat digits are
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the
 interrupt ladder ("The `:` line and the `Ctrl+C` ladder"); it never quits.
@@ -1054,6 +1098,22 @@ running) and `:q!` (quits regardless) are the only quits. Amy, on the
 mockup: *"the legend in the status line is awesome, that'll help me a lot, I
 tend to forget keys outside the core stuff I use."* Every overlay (picker,
 ledger) ends with its own key line for the same reason.
+
+**Off the live tail, the transcript owns its own keys** ("Copy mode
+(scroll, or `Ctrl+A [`)"):
+
+| Key | Does |
+|---|---|
+| `Up`/`Down`, `j`/`k` | scroll or move the reader a line |
+| `Ctrl+U`/`Ctrl+D` | half a screen |
+| `Ctrl+F`/`Ctrl+B`, `PageUp`/`PageDown` | a full screen |
+| `gg`/`Home` | top |
+| `G`/`End`, or a downward move past the last row | back to the live tail |
+| `/`, `?`, `n`/`N` | search, step to the next/previous match |
+| `v` | mark the reader's line |
+| `y`, `Enter` | copy the marked range (or the reader's line), then the tail |
+| `q`, `Esc` | back to the live tail |
+| any other key | snap to the tail and handle it there |
 
 **A key never waits on the kernel.** The rank, the pending asks and the
 tracks are fetched on their own task (`refresh.rs`) and folded into the

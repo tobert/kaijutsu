@@ -24,7 +24,9 @@ mod support;
 
 use std::time::Duration;
 
-use support::{EphemeralServer, TuiSession, serial, write_ephemeral_key};
+use support::{
+    EphemeralServer, TuiSession, marked_rows, reader_rows, serial, write_ephemeral_key,
+};
 
 /// How long to wait for the client to connect and render its first frame.
 /// The ephemeral server boots in well under a second; this is generous for
@@ -246,46 +248,271 @@ fn the_ledger_view_keeps_its_key_hints_line_on_screen() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// c3. Copy mode (`Ctrl+A [`) takes the screen and `q` gives it back
+// c3. Scrolling the transcript is copy mode
 // ────────────────────────────────────────────────────────────────────────────
 
-/// `Ctrl+A [` — tmux's own copy-mode chord — draws the frozen transcript
-/// full-screen; `q` brings the conversation back, redrawn from the context's
-/// blocks (`docs/tui.md`, "Copy mode").
+/// A word the filler repeats, so a probe can tell transcript rows from the
+/// band at a glance.
+const FILLER: &str = "scrollme";
+
+/// Fill the transcript past one screenful, so there is something to scroll.
+///
+/// Three `:!echo` statements of forty short words: each one lands a wrapped
+/// statement block and a wrapped result, which is a dozen rows a round at
+/// eighty columns.
+fn fill_transcript(session: &TuiSession) {
+    let half = vec![FILLER; 20].join(" ");
+    for round in 0..3 {
+        session.send("\x1b");
+        std::thread::sleep(Duration::from_millis(150));
+        // The round's own word sits in the middle, far enough in that the
+        // divider's truncated command line cannot carry it: a probe that
+        // searches for it lands on a wrapped body row with more rows under
+        // it, never on a divider.
+        session.send(&format!(":!echo {half} mid{round} {half}\r"));
+        let landed = session.wait_until(Duration::from_secs(20), |screen| {
+            screen.rows(0, screen.size().1).filter(|l| l.contains(&format!("mid{round}"))).count() >= 2
+        });
+        assert!(landed, "filler round {round} never landed: {}", session.dump("fill_transcript"));
+    }
+    // The band settles once the last result stops streaming; a probe that
+    // read the rows mid-stream would call a stream a scroll.
+    std::thread::sleep(Duration::from_millis(700));
+}
+
+/// The transcript rows, trailing blanks trimmed: a repaint leaves the cells
+/// a highlighted row cleared, and that is not a scroll.
+fn transcript_rows(session: &TuiSession) -> Vec<String> {
+    session.screen_text()[..20].iter().map(|l| l.trim_end().to_string()).collect()
+}
+
+/// How many lines the transcript moved up between two readings: the offset
+/// `k` where the new rows are the old ones shifted down by `k`. `None` when
+/// the two do not overlap that way at all.
+fn rows_shifted_up(before: &[String], after: &[String]) -> Option<usize> {
+    (0..before.len()).find(|&k| after[k..] == before[..before.len() - k])
+}
+
+/// Rows of the transcript area — everything above the band at 24x80.
+const TRANSCRIPT_ROWS: usize = 20;
+
+/// The `line N/M` readout on the band's status row, parsed.
+fn readout(session: &TuiSession) -> Option<(usize, usize)> {
+    let rows = session.screen_text();
+    let at = rows[23].find("line ")? + "line ".len();
+    let figure = rows[23][at..].split_whitespace().next()?;
+    let (n, m) = figure.split_once('/')?;
+    Some((n.parse().ok()?, m.parse().ok()?))
+}
+
+/// Wait for the scrolled hint to take the band's status row, and assert the
+/// readout names a real position rather than the frame before's `line 0/0`.
+fn wait_for_scrolled(session: &TuiSession, label: &str) {
+    let scrolled = session.wait_until(Duration::from_secs(5), |screen| {
+        screen.rows(0, screen.size().1).any(|l| l.contains("q leave"))
+    });
+    assert!(scrolled, "the transcript never left the tail: {}", session.dump(label));
+    let (n, m) = readout(session)
+        .unwrap_or_else(|| panic!("no line N/M readout: {}", session.dump(label)));
+    assert!(n >= 1 && m >= 1, "the readout says {n}/{m}: {}", session.dump(label));
+    assert!(n <= m, "the reader is past the end at {n}/{m}: {}", session.dump(label));
+}
+
+/// Leave the tail the way the wheel does.
+///
+/// On the alternate screen with mouse reporting off, wezterm turns each
+/// wheel tick into arrow-key presses (three, by default), and the tui cannot
+/// tell such an `Up` from a typed one — one rule covers both (`docs/tui.md`,
+/// "The mouse stays the terminal's").
+fn wheel_up(session: &TuiSession) {
+    session.send("\x1b[A\x1b[A\x1b[A");
+}
+
+/// Three `Up`s — one wheel tick — leave the live tail: the hint takes the
+/// band's status row, the transcript rows move, and the draft stays drawn.
+/// `q` returns to the tail (`docs/tui.md`, "Scrolling is copy mode").
 #[test]
-fn copy_mode_opens_and_q_gives_the_conversation_back() {
+fn the_wheel_as_arrows_leaves_the_tail_and_q_returns() {
     let _serial = serial();
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
+    fill_transcript(&session);
 
-    // Ctrl+A, then `[` — opens copy mode
-    // (`crates/kaijutsu-tui/src/keys.rs`, `ctrl_a_bracket_opens_copy_mode`).
-    session.send("\x01[");
-    let opened = session.wait_until(Duration::from_secs(5), |screen| {
-        screen_contains_str(screen, "q leave") && screen_contains_str(screen, "line ")
-    });
-    assert!(opened, "copy mode never opened: {}", session.dump("copy mode open"));
+    let before = transcript_rows(&session);
+    wheel_up(&session);
+    wait_for_scrolled(&session, "after three Up");
 
-    let rows = session.screen_text();
-    assert!(
-        rows.iter().any(|l| l.contains("line ") && l.contains('/')),
-        "the position figure is not on screen:\n{}",
-        session.dump("copy mode open")
+    let after = session.screen_text();
+    // One wheel tick is three `Up` presses and moves the screen three lines:
+    // the arrows scroll the view, they do not walk a cursor up it.
+    assert_eq!(
+        rows_shifted_up(&before, &transcript_rows(&session)),
+        Some(3),
+        "the transcript did not scroll three lines: {}",
+        session.dump("scrolled")
     );
     assert!(
-        !rows.iter().any(|l| l.contains('\u{276f}')),
-        "copy mode takes the whole screen, band included:\n{}",
-        session.dump("copy mode open")
+        compose_row(&after).is_some(),
+        "the draft is drawn live while scrolled: {}",
+        session.dump("scrolled")
+    );
+    assert!(
+        after[23].contains("q leave") && after[23].contains("line "),
+        "the hint is not on the band's status row: {}",
+        session.dump("scrolled")
     );
 
-    // `q` closes it, the same as the diff viewer (`diff::DiffKey::Close`).
     session.send("q");
-    let closed = session.wait_until(Duration::from_secs(5), |screen| {
-        !screen_contains_str(screen, "q leave") && screen_contains(screen, '\u{276f}')
+    let back = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen_contains_str(screen, "q leave")
     });
-    assert!(closed, "copy mode never closed: {}", session.dump("copy mode close"));
+    assert!(back, "q did not return to the tail: {}", session.dump("after q"));
+}
+
+/// Amy: *"live typing should snap back to the tail, I often hit space just
+/// to do that"*. `Space` snaps and never marks, and the keys after it type
+/// at the tail.
+#[test]
+fn space_snaps_to_the_tail_and_typing_lands_in_the_draft() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    fill_transcript(&session);
+
+    let tail = transcript_rows(&session);
+    wheel_up(&session);
+    wait_for_scrolled(&session, "after three Up");
+
+    // `v` paints the marked line, so "Space did not mark" is something the
+    // screen can actually be asked. `j` moves off it, since the reader's own
+    // row is painted as the reader's rather than as marked.
+    session.send("vj");
+    let marked = session.wait_until(Duration::from_secs(5), |screen| {
+        !marked_rows(screen, TRANSCRIPT_ROWS).is_empty()
+    });
+    assert!(marked, "`v` painted no row: {}", session.dump("after v"));
+    session.send("\x1b");
+    let unmarked = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen.rows(0, screen.size().1).any(|l| l.contains("q leave"))
+    });
+    assert!(unmarked, "Esc did not return to the tail: {}", session.dump("after Esc"));
+
+    wheel_up(&session);
+    wait_for_scrolled(&session, "after the second tick");
+    session.send(" ");
+    let snapped = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen.rows(0, screen.size().1).any(|l| l.contains("q leave"))
+    });
+    assert!(snapped, "Space did not snap to the tail: {}", session.dump("after Space"));
+    assert_eq!(
+        tail,
+        transcript_rows(&session),
+        "the snap did not put the transcript back on the tail: {}",
+        session.dump("after Space")
+    );
+
+    // Back off the tail: nothing is marked, so Space marked nothing.
+    session.send("\x01[");
+    wait_for_scrolled(&session, "after re-entry");
+    assert_eq!(
+        session.marked_rows(TRANSCRIPT_ROWS),
+        Vec::<usize>::new(),
+        "Space started a mark instead of snapping: {}",
+        session.dump("after re-entry")
+    );
+    session.send("q");
+    let back = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen.rows(0, screen.size().1).any(|l| l.contains("q leave"))
+    });
+    assert!(back, "q did not return to the tail: {}", session.dump("after q"));
+
+    session.send("ihello");
+    let typed = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        compose_row(&rows).is_some_and(|i| rows[i].contains("hello"))
+    });
+    assert!(typed, "typing after the snap never reached the draft: {}", session.dump("after typing"));
+}
+
+/// `v` marks, `j` extends the range by a line, and `y` copies both lines out
+/// over OSC 52 and into the tui's own paste buffer, which `Ctrl+A ]` pastes
+/// into the draft (`docs/tui.md`, "Scrolling is copy mode").
+#[test]
+fn v_then_j_then_y_copies_two_lines_over_osc52_and_into_the_paste_buffer() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    fill_transcript(&session);
+    assert!(session.clipboard().is_empty(), "nothing has been yanked yet");
+
+    wheel_up(&session);
+    wait_for_scrolled(&session, "before the yank");
+
+    // `/` searches the whole transcript, not only what is on screen, and it
+    // moves the reader onto a row that holds the needle.
+    session.send("/mid0\r");
+    let found = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        reader_rows(screen, TRANSCRIPT_ROWS)
+            .first()
+            .is_some_and(|&row| rows[row].contains("mid0"))
+    });
+    assert!(found, "the search did not put the reader on a matching row: {}", session.dump("after /"));
+
+    // The two rows the mark covers, read off the screen before the yank.
     let rows = session.screen_text();
-    assert_eq!(compose_row(&rows), Some(22), "the band is back: {}", session.dump("copy mode close"));
+    let reader = session.reader_rows(TRANSCRIPT_ROWS)[0];
+    let want = [rows[reader].trim_end().to_string(), rows[reader + 1].trim_end().to_string()];
+
+    session.send("vjy");
+    let left = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen.rows(0, screen.size().1).any(|l| l.contains("q leave"))
+    });
+    assert!(left, "the yank did not return to the tail: {}", session.dump("after y"));
+    assert_eq!(
+        session.clipboard(),
+        vec![want.join("\n")],
+        "the clipboard does not hold the two marked rows: {}",
+        session.dump("after y")
+    );
+
+    session.send("\x01]");
+    let pasted = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        compose_row(&rows).is_some_and(|i| {
+            rows[i].contains(want[0].trim()) && rows.get(i + 1).is_some_and(|l| l.contains(want[1].trim()))
+        })
+    });
+    assert!(
+        pasted,
+        "the two yanked lines are not both in the draft: {}",
+        session.dump("after Ctrl+A ]")
+    );
+}
+
+/// Alternate scroll (DECSET 1007) is what makes xterm send the wheel as
+/// arrow keys on the alternate screen; kitty and foot do it by default and
+/// wezterm has its own setting (`docs/tui.md`, "The mouse stays the
+/// terminal's"). It goes on with the screen and off on the way out.
+#[test]
+fn alternate_scroll_is_taken_with_the_screen_and_given_back() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    assert_eq!(
+        session.alternate_scroll(),
+        (1, 0),
+        "alternate scroll was not enabled after taking the screen: {}",
+        session.dump("attached")
+    );
+
+    quit(&mut session);
+    assert_eq!(
+        session.alternate_scroll(),
+        (1, 1),
+        "alternate scroll was not disabled on the way out: {}",
+        session.dump("after :q")
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -640,13 +867,13 @@ fn assert_terminal_restored(session: &TuiSession, label: &str) {
     assert_eq!(session.cooked(), Some(true), "raw mode left on {label}: {}", session.dump(label));
 }
 
-/// Take copy mode, the alternate-screen surface that needs no kernel editor
-/// session, so an exit from there has both the screen and raw mode to undo.
+/// Scroll off the tail with `Ctrl+A [`, so an exit has the screen, raw mode
+/// and a scrolled transcript to undo.
 fn open_copy_mode(session: &TuiSession) {
     session.send("\x01[");
     let opened = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "q leave"));
-    assert!(opened, "copy mode never opened: {}", session.dump("copy mode open"));
-    assert!(session.on_alternate_screen(), "copy mode is not on the alternate screen: {}", session.dump("copy mode"));
+    assert!(opened, "the transcript never left the tail: {}", session.dump("copy mode open"));
+    assert!(session.on_alternate_screen(), "the session is not on the alternate screen: {}", session.dump("copy mode"));
 }
 
 /// `SIGTERM` — a runner's kill — ends the loop the way `:q` does, from the
@@ -1008,6 +1235,14 @@ fn ctrl_z_suspends_and_sigcont_resumes_a_responsive_client() {
     assert!(
         session.on_alternate_screen(),
         "the client did not take the screen again after SIGCONT: {}",
+        session.dump("after SIGCONT")
+    );
+    // Alternate scroll rides with the screen: on at attach, off before the
+    // stop, on again on the way back.
+    assert_eq!(
+        session.alternate_scroll(),
+        (2, 1),
+        "alternate scroll did not follow the screen across the suspend: {}",
         session.dump("after SIGCONT")
     );
 }

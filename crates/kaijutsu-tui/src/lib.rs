@@ -35,7 +35,8 @@
 //! | [`inflight`] | the in-flight strip: one fixed row naming unsettled tool calls |
 //! | [`completion`] | `:kj ` completion over the `kj` command catalog |
 //! | [`picker`] | the seat picker (`Ctrl+A "`), drawn as an overlay |
-//! | [`editor`], [`diff`], [`copy`] | the three full-screen surfaces |
+//! | [`editor`], [`diff`] | the two full-screen surfaces |
+//! | [`copy`] | the transcript off its live tail: motions, mark, search, yank |
 
 pub mod app;
 pub mod asks;

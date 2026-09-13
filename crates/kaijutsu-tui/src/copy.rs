@@ -1,71 +1,175 @@
-//! Copy mode — the alternate screen's third occupant: `Ctrl+A [`, tmux's own
-//! copy-mode chord (`.tmux.conf`'s `mode-keys vi`, `bind [ copy-mode`), and it
-//! means the same thing here (`docs/tui.md`, guidance 7). The current
-//! context's transcript becomes a buffer under vi motions — how a long tool
-//! result is read whole, and how the conversation is scrolled from the
-//! keyboard, since tool output no longer collapses by default
-//! (`present::collapses_by_default`).
+//! The scrolled transcript — scrolling is copy mode (`docs/tui.md`,
+//! "Scrolling is copy mode"). Leaving the live tail enters it; reaching the
+//! tail again leaves it.
 //!
-//! **Freeze on open**, the same contract `diff.rs` keeps: the buffer is a
-//! snapshot of `render_block` output taken the moment `Ctrl+A [` is pressed,
-//! not a live view. A still-streaming block growing under the reader while
-//! they scroll would move their place without saying so; the block-to-line
-//! rendering that builds the snapshot lives at the edge
-//! ([`crate::render::copy_buffer_lines`]), the same split diff keeps between
-//! its screen and `kaijutsu-diff`'s model.
+//! There is no frozen snapshot. The transcript view the render pass already
+//! produces *is* the buffer: a block still streaming grows under the reader,
+//! and the view keeps its place by block and line rather than by row
+//! ([`Anchor`]), so growth above or below does not move what is being read.
 //!
-//! Pure: a `Vec<Line<'static>>` in, cursor/scroll/search state out. No
+//! While scrolled the transcript owns copy mode's keys — vi motions, `/` and
+//! `?` with `n`/`N`, `v` marks a line range, `y` or `Enter` copies it, `q`
+//! and `Esc` return to the tail. **Every other key snaps the view to the
+//! tail and is handled as if typed there** ([`Outcome::Snap`]), which is
+//! what makes `Space` the snap key and the draft always reachable.
+//!
+//! Pure: row counts and plain text in, cursor/anchor/search state out. No
 //! terminal, no clock, no kernel — the way `picker.rs` and `compose.rs` stay
-//! pure.
+//! pure. The render pass owns the conversion between an [`Anchor`] and a row
+//! ([`RowIndex`]); the caller owns the clipboard write and the full-text
+//! search ([`find`]).
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use kaijutsu_types::BlockId;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::present::Palette;
 
-/// Body height assumed until the first frame is drawn, so a key that arrives
-/// before one still steps a sane amount (`diff.rs`'s same convention).
-const DEFAULT_BODY_LINES: usize = 20;
+// ────────────────────────────────────────────────────────────────────────────
+// Anchoring
+// ────────────────────────────────────────────────────────────────────────────
 
-/// Rows the screen reserves for its own hint/search line.
-const CHROME_LINES: u16 = 1;
-
-/// One frozen transcript, and where the reader is inside it.
-pub struct CopyScreen {
-    /// The context's label, for the hint line.
-    context_label: String,
-    lines: Vec<Line<'static>>,
-    /// The line the reader is on. Copy mode's motions are linewise only —
-    /// there is no column cursor (`docs/tui.md`, guidance 7) — so a row index
-    /// is the whole position.
-    cursor: usize,
-    /// First rendered row on screen.
-    top: usize,
-    /// Body height of the last frame drawn — a page step and both bottom
-    /// stops are measured in it, and the key path has no terminal to ask.
-    body_h: usize,
-    /// `g` pressed once, waiting for a second `g` (vi's `gg`). Any other key
-    /// cancels it.
-    pending_g: bool,
-    /// `v`'s linewise selection anchor — the other end is always the cursor.
-    selection: Option<usize>,
-    search: SearchState,
+/// A place in the transcript that survives a re-wrap, a block growing above
+/// or below it, and the block itself going away.
+///
+/// The line is counted from the block's **first content row**, so a divider
+/// or a blank row appearing above it — which a block inserted above, or a
+/// tool call settling back out of the in-flight strip, can do — leaves the
+/// reader on the same text. A negative line is one of those leading rows
+/// itself.
+///
+/// The neighbours are what the anchor falls to when its own block is
+/// excluded or edited away: the next block's first content row, or failing
+/// that the previous block's last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub block: BlockId,
+    pub line: isize,
+    prev: Option<BlockId>,
+    next: Option<BlockId>,
 }
 
+/// One block's place in the transcript: where its rows start, how many of
+/// them are the divider and the blank row above it, and how many there are
+/// in all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowBlock {
+    pub block: BlockId,
+    /// The blank row and the divider row drawn above the block's own text.
+    pub leading: usize,
+    /// Every row the block takes, the leading ones included.
+    pub rows: usize,
+}
+
+/// Every transcript block in document order with the rows it occupies — the
+/// map between an absolute transcript row and an [`Anchor`].
+///
+/// Built by the render pass, the only side that knows how a block wraps at
+/// the current width (`render::transcript_window`).
+#[derive(Debug, Default, Clone)]
+pub struct RowIndex {
+    blocks: Vec<RowBlock>,
+    total: usize,
+}
+
+impl RowIndex {
+    pub fn new(blocks: Vec<RowBlock>) -> Self {
+        let total = blocks.iter().map(|b| b.rows).sum();
+        Self { blocks, total }
+    }
+
+    /// Rows the whole transcript takes.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Where a block's rows start, and the block itself.
+    fn find(&self, block: BlockId) -> Option<(usize, RowBlock)> {
+        let mut base = 0usize;
+        for entry in &self.blocks {
+            if entry.block == block {
+                return Some((base, *entry));
+            }
+            base += entry.rows;
+        }
+        None
+    }
+
+    /// The anchor for an absolute row: the block it falls in, the line
+    /// counted from that block's first content row, and the neighbours the
+    /// anchor falls to if the block goes away. `None` past the last row.
+    pub fn anchor_at(&self, row: usize) -> Option<Anchor> {
+        let mut base = 0usize;
+        for (i, entry) in self.blocks.iter().enumerate() {
+            if row < base + entry.rows {
+                return Some(Anchor {
+                    block: entry.block,
+                    line: row as isize - (base + entry.leading) as isize,
+                    prev: i.checked_sub(1).map(|j| self.blocks[j].block),
+                    next: self.blocks.get(i + 1).map(|b| b.block),
+                });
+            }
+            base += entry.rows;
+        }
+        None
+    }
+
+    /// The absolute row an anchor names now, its own block only. The line
+    /// clamps into the block's rows, which is what a re-wrap at a narrower
+    /// width needs; `None` when the block is gone.
+    pub fn row_of(&self, anchor: &Anchor) -> Option<usize> {
+        let (base, entry) = self.find(anchor.block)?;
+        let row = (base + entry.leading) as isize + anchor.line;
+        let last = (base + entry.rows.saturating_sub(1)) as isize;
+        Some(row.clamp(base as isize, last.max(base as isize)) as usize)
+    }
+
+    /// The row an anchor names, falling to its neighbours when its own block
+    /// has been excluded or edited away: the next block's first content row,
+    /// else the previous block's last row. `None` when none of the three
+    /// survives, and the caller falls back to the row it last drew.
+    pub fn row_of_or_neighbour(&self, anchor: &Anchor) -> Option<usize> {
+        if let Some(row) = self.row_of(anchor) {
+            return Some(row);
+        }
+        if let Some((base, entry)) = anchor.next.and_then(|b| self.find(b)) {
+            return Some(base + entry.leading.min(entry.rows.saturating_sub(1)));
+        }
+        let (base, entry) = anchor.prev.and_then(|b| self.find(b))?;
+        Some(base + entry.rows.saturating_sub(1))
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// The scrolled view
+// ────────────────────────────────────────────────────────────────────────────
+
+/// What the key path asked the next frame to do. The key path has no row
+/// counts of its own — those are the render pass's — so a move is recorded
+/// here and applied against fresh counts in [`Scrolled::settle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// Scroll the view by rows, the reader's line riding at its screen row.
+    Rows(isize),
+    /// Put the reader on this absolute row, scrolling the least that shows it.
+    Row(usize),
+}
+
+impl Default for Pending {
+    fn default() -> Self {
+        Pending::Rows(0)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum SearchDirection {
+    #[default]
     Forward,
     Backward,
 }
 
 impl SearchDirection {
-    fn opposite(self) -> Self {
-        match self {
-            SearchDirection::Forward => SearchDirection::Backward,
-            SearchDirection::Backward => SearchDirection::Forward,
-        }
-    }
-
     fn glyph(self) -> char {
         match self {
             SearchDirection::Forward => '/',
@@ -75,277 +179,304 @@ impl SearchDirection {
 }
 
 /// The `/` or `?` bar, live while it is being typed.
+#[derive(Debug, Clone)]
 struct SearchPrompt {
     direction: SearchDirection,
     text: String,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone)]
 struct SearchState {
     prompt: Option<SearchPrompt>,
-    /// Every matching line, ascending — rebuilt on each committed search
-    /// (case-insensitive substring is enough, `docs/tui.md`, guidance 7).
-    matches: Vec<usize>,
+    /// The committed pattern, case-insensitive substring — what the visible
+    /// rows are highlighted against and what `n`/`N` step through.
+    needle: Option<String>,
     direction: SearchDirection,
 }
 
-impl Default for SearchDirection {
-    fn default() -> Self {
-        SearchDirection::Forward
-    }
+/// Where the reader is while the transcript is off the live tail.
+#[derive(Debug, Clone)]
+pub struct Scrolled {
+    /// The top row, anchored by block and line. `None` until the first frame
+    /// resolves one.
+    top: Option<Anchor>,
+    /// The top row of the last frame — the fallback when the anchored block
+    /// is gone. `usize::MAX` means the tail, which the first frame clamps.
+    top_row: usize,
+    pending: Pending,
+    /// The reader's line, counted from the top row. `usize::MAX` means the
+    /// bottom row, which the first frame clamps.
+    reader_offset: usize,
+    /// `v`'s mark — the other end of the line range, the reader's line being
+    /// the one end — anchored the same way the top is.
+    mark: Option<Anchor>,
+    mark_row: Option<usize>,
+    /// Rows the transcript had and rows the view drew, last frame.
+    total_rows: usize,
+    body_h: usize,
+    /// `g` pressed once, waiting for a second `g` (vi's `gg`).
+    pending_g: bool,
+    search: SearchState,
 }
 
-impl CopyScreen {
-    /// Open on `lines`, entering at the bottom — the newest block — the way
+impl Scrolled {
+    /// Leave the tail without moving: the view sits exactly where the
+    /// following view left it, and the reader is on its last row — the way
     /// tmux enters copy mode at the current screen.
-    pub fn new(context_label: impl Into<String>, lines: Vec<Line<'static>>) -> Self {
-        let cursor = lines.len().saturating_sub(1);
-        let mut screen = Self {
-            context_label: context_label.into(),
-            lines,
-            cursor,
-            top: 0,
-            body_h: DEFAULT_BODY_LINES,
+    ///
+    /// `body_h` is the transcript's current height, so a page step taken
+    /// before the first scrolled frame is the right size.
+    pub fn entering(body_h: usize) -> Self {
+        Self {
+            top: None,
+            top_row: usize::MAX,
+            pending: Pending::default(),
+            reader_offset: usize::MAX,
+            mark: None,
+            mark_row: None,
+            total_rows: 0,
+            body_h: body_h.max(1),
             pending_g: false,
-            selection: None,
             search: SearchState::default(),
+        }
+    }
+
+    /// Ask the next frame to scroll by `rows` — how `Up` and `PageUp` leave
+    /// the tail, one line and one screen.
+    pub fn scroll(&mut self, rows: isize) {
+        self.pending = match self.pending {
+            Pending::Rows(d) => Pending::Rows(d.saturating_add(rows)),
+            Pending::Row(_) => Pending::Rows(rows),
         };
-        screen.follow_cursor();
-        screen
     }
 
-    pub fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    /// The body height of the last frame drawn.
-    pub fn body_h(&self) -> usize {
+    /// A screen's worth of rows, as the last frame drew it.
+    pub fn page(&self) -> usize {
         self.body_h
     }
 
-    /// 0-indexed line the reader is on — exposed for tests; the hint line is
-    /// what a player actually sees (`Self::frame`).
-    pub fn cursor(&self) -> usize {
-        self.cursor
+    /// Put the reader on an absolute row — what a committed search or a
+    /// stepped match asks for once the caller has found it ([`find`]).
+    pub fn jump_to(&mut self, row: usize) {
+        self.pending = Pending::Row(row);
     }
 
-    fn last_index(&self) -> usize {
-        self.lines.len().saturating_sub(1)
+    /// The reader's absolute row, as the last frame settled it.
+    pub fn reader_row(&self) -> usize {
+        self.top_row.saturating_add(self.reader_offset)
     }
 
-    fn set_cursor(&mut self, target: usize) {
-        self.cursor = target.min(self.last_index());
-        self.follow_cursor();
-    }
-
-    /// Move the window only when the cursor leaves it, the same rule
-    /// `editor.rs`'s `editor_frame` follows for its own buffer.
-    fn follow_cursor(&mut self) {
-        if self.lines.is_empty() {
-            self.top = 0;
-            return;
+    /// The inclusive row range `y` copies: the marked range, or the reader's
+    /// own line when nothing is marked.
+    pub fn range(&self) -> (usize, usize) {
+        let cursor = self.reader_row();
+        match self.mark_row {
+            Some(mark) => (mark.min(cursor), mark.max(cursor)),
+            None => (cursor, cursor),
         }
-        if self.cursor < self.top {
-            self.top = self.cursor;
-        } else if self.cursor >= self.top + self.body_h {
-            self.top = self.cursor + 1 - self.body_h;
-        }
-        self.top = self.top.min(self.lines.len().saturating_sub(self.body_h.min(self.lines.len())));
     }
+
+    /// Settle the view against this frame's row counts and return the
+    /// absolute row it starts at.
+    ///
+    /// The anchor is resolved first, so a block that grew above the reader
+    /// moves the row number without moving the screen; the key path's
+    /// pending move is applied to that fresh position, and the anchor and
+    /// the mark are re-taken from where the view landed.
+    pub fn settle(&mut self, index: &RowIndex, body_h: usize) -> usize {
+        let total = index.total();
+        let body_h = body_h.max(1);
+        let last_top = total.saturating_sub(body_h);
+        let base = self
+            .top
+            .as_ref()
+            .and_then(|anchor| index.row_of_or_neighbour(anchor))
+            .unwrap_or(self.top_row)
+            .min(last_top);
+
+        let (start, reader_offset) = match std::mem::take(&mut self.pending) {
+            Pending::Rows(delta) => (base.saturating_add_signed(delta).min(last_top), self.reader_offset),
+            Pending::Row(target) => {
+                let target = target.min(total.saturating_sub(1));
+                let start = if target < base {
+                    target
+                } else if target >= base + body_h {
+                    target + 1 - body_h
+                } else {
+                    base
+                }
+                .min(last_top);
+                (start, target - start)
+            }
+        };
+
+        self.top_row = start;
+        self.total_rows = total;
+        self.body_h = body_h;
+        self.reader_offset = reader_offset
+            .min(body_h - 1)
+            .min(total.saturating_sub(start).saturating_sub(1));
+        self.top = index.anchor_at(start);
+        // A mark whose block is gone is gone with it: there is no line left
+        // to copy, and a range that silently slid onto a neighbour would
+        // yank text nobody marked.
+        match (self.mark, self.mark_row) {
+            (Some(anchor), _) => {
+                self.mark_row = index.row_of(&anchor);
+                if self.mark_row.is_none() {
+                    self.mark = None;
+                }
+            }
+            (None, Some(row)) => self.mark = index.anchor_at(row),
+            (None, None) => {}
+        }
+        start
+    }
+
+    /// Layer the reader's line, the marked range and the search matches over
+    /// a window of transcript rows beginning at absolute row `start`.
+    ///
+    /// The terminal's cursor is hidden while scrolled, so the reader's line
+    /// is painted rather than pointed at.
+    pub fn decorate(&self, start: usize, lines: &mut [Line<'static>], palette: &Palette) {
+        let reader = self.reader_row();
+        let (mark_start, mark_end) = self.range();
+        let marked = self.mark_row.is_some();
+        let needle = self.search.needle.as_deref().map(str::to_lowercase);
+        for (offset, line) in lines.iter_mut().enumerate() {
+            let row = start + offset;
+            let style = if row == reader {
+                palette.copy_cursor()
+            } else if marked && (mark_start..=mark_end).contains(&row) {
+                palette.copy_selection()
+            } else if needle
+                .as_deref()
+                .is_some_and(|n| line_text(line).to_lowercase().contains(n))
+            {
+                palette.copy_search()
+            } else {
+                continue;
+            };
+            *line = overlay(line, style);
+        }
+    }
+
+    /// The band's bottom row while scrolled: the search prompt while one is
+    /// being typed, the position and the keys otherwise — the same "every
+    /// grown view renders its own keys" rule the picker and the ledger
+    /// follow (`docs/tui.md`, "Keys").
+    ///
+    /// The key list shortens to fit `width` so `q leave` is never the part
+    /// that falls off the right edge, the way `status::legend_line` shortens.
+    pub fn hint_line(&self, width: u16, palette: &Palette) -> Line<'static> {
+        if let Some(prompt) = &self.search.prompt {
+            return Line::from(Span::styled(
+                format!("{}{}", prompt.direction.glyph(), prompt.text),
+                palette.status(),
+            ));
+        }
+        let position = if self.total_rows == 0 {
+            "line 0/0".to_string()
+        } else {
+            format!("line {}/{}", self.reader_row() + 1, self.total_rows)
+        };
+        let lead = format!("{position}   ");
+        let full = "j/k  ^D/^U  gg/G  / search  v mark  y copy  q leave";
+        let short = "v mark  y copy  q leave";
+        let room = usize::from(width).saturating_sub(lead.chars().count());
+        let keys = if full.chars().count() <= room { full } else { short };
+        Line::from(Span::styled(format!("{lead}{keys}"), palette.status()))
+    }
+
+    // ── the keys' own edits ─────────────────────────────────────────────
 
     fn move_by(&mut self, delta: isize) {
-        let next = (self.cursor as isize + delta).clamp(0, self.last_index() as isize) as usize;
-        self.set_cursor(next);
-    }
-
-    fn move_to_top(&mut self) {
-        self.set_cursor(0);
-    }
-
-    fn move_to_bottom(&mut self) {
-        self.set_cursor(self.last_index());
-    }
-
-    // ── selection / yank (stretch) ──────────────────────────────────────
-
-    fn toggle_selection(&mut self) {
-        self.selection = if self.selection.is_some() {
-            None
+        let room = self.body_h.saturating_sub(1);
+        let want = (self.reader_offset as isize) + delta;
+        if want < 0 {
+            self.reader_offset = 0;
+            self.scroll(want);
+        } else if want as usize > room {
+            let over = want as usize - room;
+            self.reader_offset = room;
+            self.scroll(over as isize);
         } else {
-            Some(self.cursor)
-        };
+            self.reader_offset = want as usize;
+        }
     }
 
-    fn selection_range(&self) -> Option<(usize, usize)> {
-        self.selection.map(|anchor| (anchor.min(self.cursor), anchor.max(self.cursor)))
+    /// `Up` and `Down`, and the scroll that leaves the tail: move the view a
+    /// line with the reader's line pinned to its screen row.
+    ///
+    /// That is what the wheel means — the terminal sends a tick as three
+    /// `Up` presses, and a tick moves the screen three lines, the way tmux
+    /// copy mode scrolls. `j` and `k` are vim's cursor motions instead, and
+    /// scroll only at the edge.
+    ///
+    /// At an edge the view cannot move, so the reader's line does: the first
+    /// and the last row stay reachable with the arrows alone.
+    fn scroll_view(&mut self, delta: isize) {
+        let at_top = self.top_row == 0;
+        let at_end = self.top_row >= self.total_rows.saturating_sub(self.body_h);
+        if (delta < 0 && at_top) || (delta > 0 && at_end) {
+            self.move_by(delta);
+        } else {
+            self.scroll(delta);
+        }
     }
 
-    /// `y` — the selected lines' plain text, newline-joined, clearing the
-    /// selection. `None` with no selection active: `y` alone does nothing,
-    /// only `v` then `y` yanks (`docs/tui.md`, guidance 7 stretch).
-    fn yank(&mut self) -> Option<String> {
-        let (start, end) = self.selection_range()?;
-        let text = (start..=end).map(|i| line_text(&self.lines[i])).collect::<Vec<_>>().join("\n");
-        self.selection = None;
-        Some(text)
+    /// Whether the reader is already on the transcript's last row, which is
+    /// where a downward move returns to the live tail.
+    fn at_bottom(&self) -> bool {
+        self.total_rows > 0 && self.reader_row() + 1 >= self.total_rows
     }
 
-    // ── search ───────────────────────────────────────────────────────────
+    fn toggle_mark(&mut self) {
+        if self.mark_row.is_some() {
+            self.mark = None;
+            self.mark_row = None;
+        } else {
+            self.mark = None;
+            self.mark_row = Some(self.reader_row());
+        }
+    }
 
     fn open_prompt(&mut self, direction: SearchDirection) {
         self.search.prompt = Some(SearchPrompt { direction, text: String::new() });
     }
 
-    fn commit_search(&mut self) {
-        let Some(prompt) = self.search.prompt.take() else { return };
+    /// Commit the typed prompt and say what to look for. An empty pattern
+    /// closes the prompt and searches for nothing.
+    fn commit_search(&mut self) -> Outcome {
+        let Some(prompt) = self.search.prompt.take() else {
+            return Outcome::Moved;
+        };
         if prompt.text.is_empty() {
-            return;
+            return Outcome::Moved;
         }
-        let needle = prompt.text.to_lowercase();
-        self.search.matches = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| line_text(l).to_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect();
         self.search.direction = prompt.direction;
-        self.jump_to_nearest_match();
-    }
-
-    fn jump_to_nearest_match(&mut self) {
-        let Some(target) = (match self.search.direction {
-            SearchDirection::Forward => self
-                .search
-                .matches
-                .iter()
-                .copied()
-                .find(|&i| i >= self.cursor)
-                .or_else(|| self.search.matches.first().copied()),
-            SearchDirection::Backward => self
-                .search
-                .matches
-                .iter()
-                .rev()
-                .copied()
-                .find(|&i| i <= self.cursor)
-                .or_else(|| self.search.matches.last().copied()),
-        }) else {
-            return;
-        };
-        self.set_cursor(target);
-    }
-
-    /// `n` (`same_direction = true`) or `N` (`false`) — step to the next
-    /// match, wrapping around the whole buffer once it runs out. `false`
-    /// when there is nothing to search for, so the caller can say "ignored"
-    /// rather than "moved."
-    fn step_match(&mut self, same_direction: bool) -> bool {
-        if self.search.matches.is_empty() {
-            return false;
+        self.search.needle = Some(prompt.text.clone());
+        Outcome::Find {
+            needle: prompt.text,
+            from: self.reader_row(),
+            forward: self.search.direction == SearchDirection::Forward,
+            skip_current: false,
         }
-        let direction = if same_direction {
-            self.search.direction
-        } else {
-            self.search.direction.opposite()
-        };
-        let target = match direction {
-            SearchDirection::Forward => self
-                .search
-                .matches
-                .iter()
-                .copied()
-                .find(|&i| i > self.cursor)
-                .unwrap_or_else(|| self.search.matches[0]),
-            SearchDirection::Backward => self
-                .search
-                .matches
-                .iter()
-                .rev()
-                .copied()
-                .find(|&i| i < self.cursor)
-                .unwrap_or_else(|| *self.search.matches.last().expect("checked non-empty")),
-        };
-        self.set_cursor(target);
-        true
     }
 
-    // ── rendering ────────────────────────────────────────────────────────
-
-    /// The rows to draw into a screen `height` tall: the body, and the hint
-    /// line (or the search prompt, while one is being typed) — the same
-    /// "every grown view renders its own keys" rule the picker and the
-    /// ledger follow (`docs/tui.md`, "Keys").
-    pub fn frame(&mut self, height: u16, width: u16, palette: &Palette) -> Vec<Line<'static>> {
-        let body_h = height.saturating_sub(CHROME_LINES).max(1) as usize;
-        self.body_h = body_h;
-        self.follow_cursor();
-
-        let selection = self.selection_range();
-        let mut out = Vec::with_capacity(height as usize);
-        for i in 0..body_h {
-            let idx = self.top + i;
-            out.push(match self.lines.get(idx) {
-                Some(line) if selection.is_some_and(|(s, e)| (s..=e).contains(&idx)) => {
-                    overlay(line, palette.copy_selection())
-                }
-                Some(line) if idx == self.cursor && self.search.matches.binary_search(&idx).is_ok() => {
-                    overlay(line, palette.copy_match())
-                }
-                Some(line) => line.clone(),
-                None => Line::from(String::new()),
-            });
-        }
-
-        out.push(match &self.search.prompt {
-            Some(prompt) => Line::from(Span::styled(
-                format!("{}{}", prompt.direction.glyph(), prompt.text),
-                palette.status(),
-            )),
-            None => self.hint_line(width, palette),
-        });
-        out
-    }
-
-    /// Where the terminal's cursor goes: after the typed text on the search
-    /// prompt row while `/` is being typed, otherwise on the reader's line —
-    /// tmux keeps the real cursor on the copy cursor, so the terminal draws
-    /// it in its own shape. Call after [`Self::frame`], which settles `top`.
-    pub fn frame_cursor(&self, height: u16) -> Option<(u16, u16)> {
-        if let Some(prompt) = &self.search.prompt {
-            let col = 1 + prompt.text.chars().count() as u16;
-            return Some((col, height.saturating_sub(1)));
-        }
-        if self.lines.is_empty() {
-            return None;
-        }
-        let row = self.cursor.saturating_sub(self.top);
-        Some((0, u16::try_from(row).unwrap_or(u16::MAX)))
-    }
-
-    /// The bottom line: position, context label, keys. The key list
-    /// shortens to fit `width` so `q leave` is never the part that falls
-    /// off the right edge, the way `status::legend_line` shortens.
-    fn hint_line(&self, width: u16, palette: &Palette) -> Line<'static> {
-        let position = if self.lines.is_empty() {
-            "line 0/0".to_string()
-        } else {
-            format!("line {}/{}", self.cursor + 1, self.lines.len())
+    /// `n` (`same_direction`) or `N` — step to the next match, wrapping
+    /// around the whole transcript once it runs out.
+    fn step_match(&self, same_direction: bool) -> Outcome {
+        let Some(needle) = self.search.needle.clone() else {
+            return Outcome::Moved;
         };
-        let lead = format!("{position}   {}   ", self.context_label);
-        let full = "j/k  ^D/^U  gg/G  / search  Space mark  Enter copy  q leave";
-        let short = "Space mark  Enter copy  q leave";
-        let room = usize::from(width).saturating_sub(lead.chars().count());
-        let keys = if full.chars().count() <= room { full } else { short };
-        Line::from(Span::styled(format!("{lead}{keys}"), palette.status()))
+        let forward = (self.search.direction == SearchDirection::Forward) == same_direction;
+        Outcome::Find { needle, from: self.reader_row(), forward, skip_current: true }
     }
 }
 
-fn line_text(line: &Line<'_>) -> String {
+/// The plain text of one rendered line — what the search and the yank read.
+pub fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
@@ -361,167 +492,180 @@ fn overlay(line: &Line<'static>, style: Style) -> Line<'static> {
     )
 }
 
-/// What one key did to the screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CopyOutcome {
-    /// `q`, or `Esc` with no selection active — give the conversation
-    /// back.
-    Close,
-    /// The cursor or the viewport moved.
-    Moved,
-    /// `/` or `?` opened the search prompt.
-    PromptOpened,
-    /// A character was typed or erased in the search prompt.
-    PromptChanged,
-    /// `Enter` committed the search prompt.
-    SearchCommitted,
-    /// `Esc` closed the search prompt without moving the cursor.
-    SearchCancelled,
-    /// `y` yanked the selected lines — the caller emits `.0` over OSC 52
-    /// ([`osc52_sequence`]) and leaves copy mode, the way tmux does
-    /// (`docs/tui.md`, guidance 7 stretch).
-    Yanked(String),
-    /// Nothing this screen answers.
-    Ignored,
+/// The row a search lands on: case-insensitive substring, wrapping around
+/// the whole transcript once. `skip_current` is what separates `n` from the
+/// `Enter` that committed the pattern — one steps off the reader's line, the
+/// other accepts it.
+pub fn find(
+    rows: &[String],
+    needle: &str,
+    from: usize,
+    forward: bool,
+    skip_current: bool,
+) -> Option<usize> {
+    if rows.is_empty() || needle.is_empty() {
+        return None;
+    }
+    let needle = needle.to_lowercase();
+    let hit = |row: usize| rows[row].to_lowercase().contains(&needle);
+    let len = rows.len();
+    let from = from.min(len - 1);
+    let first = usize::from(skip_current);
+    (first..=len)
+        .map(|step| {
+            if forward {
+                (from + step) % len
+            } else {
+                (from + len - (step % len)) % len
+            }
+        })
+        .find(|&row| hit(row))
 }
 
-/// Interpret one key against the screen. `body_h` is the drawn body height,
-/// the same convention `diff::handle_key` follows.
-pub fn handle_key(
-    screen: &mut CopyScreen,
-    key: &crossterm::event::KeyEvent,
-    body_h: usize,
-) -> CopyOutcome {
-    use crossterm::event::{KeyCode, KeyModifiers};
+// ────────────────────────────────────────────────────────────────────────────
+// Keys
+// ────────────────────────────────────────────────────────────────────────────
 
-    // The search prompt takes every key while it is open — the same
-    // "the alternate screen takes it whole" rule the editor's own `:`-line
-    // follows, one level down.
-    if screen.search.prompt.is_some() {
+/// What one key did to the scrolled view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The scrolled view took it; redraw.
+    Moved,
+    /// `q`, `Esc`, `G`, or a move past the bottom — back to the live tail.
+    Leave,
+    /// A search wants a row: the caller renders the whole transcript, calls
+    /// [`find`], and hands the answer to [`Scrolled::jump_to`].
+    Find {
+        needle: String,
+        from: usize,
+        forward: bool,
+        skip_current: bool,
+    },
+    /// `y` or `Enter` — the caller assembles this inclusive row range's
+    /// text, writes it over OSC 52, keeps it in the paste buffer, and
+    /// returns to the tail.
+    Yank(usize, usize),
+    /// Every other key: snap the view to the tail and handle the key there
+    /// (`docs/tui.md`, "Scrolling is copy mode").
+    Snap,
+}
+
+/// Interpret one key against the scrolled view.
+pub fn handle_key(view: &mut Scrolled, key: &KeyEvent) -> Outcome {
+    // The search prompt takes every key while it is open — the same "one
+    // surface at a time holds the keyboard" rule the rest of the client
+    // follows. Nothing snaps out from under a half-typed pattern.
+    if view.search.prompt.is_some() {
         return match key.code {
             KeyCode::Esc => {
-                screen.search.prompt = None;
-                CopyOutcome::SearchCancelled
+                view.search.prompt = None;
+                Outcome::Moved
             }
-            KeyCode::Enter => {
-                screen.commit_search();
-                CopyOutcome::SearchCommitted
-            }
+            KeyCode::Enter => view.commit_search(),
             KeyCode::Backspace => {
-                screen.search.prompt.as_mut().expect("checked Some above").text.pop();
-                CopyOutcome::PromptChanged
+                view.search.prompt.as_mut().expect("checked Some above").text.pop();
+                Outcome::Moved
             }
             KeyCode::Char(c) => {
-                screen.search.prompt.as_mut().expect("checked Some above").text.push(c);
-                CopyOutcome::PromptChanged
+                view.search.prompt.as_mut().expect("checked Some above").text.push(c);
+                Outcome::Moved
             }
-            _ => CopyOutcome::Ignored,
+            _ => Outcome::Moved,
         };
     }
 
     if !matches!(key.code, KeyCode::Char('g')) {
-        screen.pending_g = false;
+        view.pending_g = false;
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let half_page = (body_h / 2).max(1) as isize;
-    let full_page = body_h as isize;
+    let page = view.body_h.max(1) as isize;
+    let half_page = (view.body_h / 2).max(1) as isize;
+
+    // A downward move from the last row is what tmux's "scroll past the
+    // bottom" is here: the live tail, and the transcript follows again.
+    let down = |view: &mut Scrolled, delta: isize| {
+        if view.at_bottom() {
+            Outcome::Leave
+        } else {
+            view.move_by(delta);
+            Outcome::Moved
+        }
+    };
 
     match key.code {
-        KeyCode::Char('q') => CopyOutcome::Close,
-        KeyCode::Esc if screen.selection.is_some() => {
-            screen.selection = None;
-            CopyOutcome::Moved
+        KeyCode::Char('q') | KeyCode::Esc => Outcome::Leave,
+        KeyCode::Char('j') => down(view, 1),
+        KeyCode::Char('k') => {
+            view.move_by(-1);
+            Outcome::Moved
         }
-        KeyCode::Esc => CopyOutcome::Close,
-        KeyCode::Char('j') | KeyCode::Down => {
-            screen.move_by(1);
-            CopyOutcome::Moved
+        KeyCode::Down => {
+            if view.at_bottom() {
+                Outcome::Leave
+            } else {
+                view.scroll_view(1);
+                Outcome::Moved
+            }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            screen.move_by(-1);
-            CopyOutcome::Moved
+        KeyCode::Up => {
+            view.scroll_view(-1);
+            Outcome::Moved
         }
-        KeyCode::Char('d') if ctrl => {
-            screen.move_by(half_page);
-            CopyOutcome::Moved
-        }
+        KeyCode::Char('d') if ctrl => down(view, half_page),
         KeyCode::Char('u') if ctrl => {
-            screen.move_by(-half_page);
-            CopyOutcome::Moved
+            view.move_by(-half_page);
+            Outcome::Moved
         }
-        KeyCode::Char('f') if ctrl => {
-            screen.move_by(full_page);
-            CopyOutcome::Moved
-        }
+        KeyCode::Char('f') if ctrl => down(view, page),
         KeyCode::Char('b') if ctrl => {
-            screen.move_by(-full_page);
-            CopyOutcome::Moved
+            view.move_by(-page);
+            Outcome::Moved
         }
-        KeyCode::PageDown => {
-            screen.move_by(full_page);
-            CopyOutcome::Moved
-        }
+        KeyCode::PageDown => down(view, page),
         KeyCode::PageUp => {
-            screen.move_by(-full_page);
-            CopyOutcome::Moved
+            view.move_by(-page);
+            Outcome::Moved
         }
         KeyCode::Char('g') => {
-            if screen.pending_g {
-                screen.pending_g = false;
-                screen.move_to_top();
-                CopyOutcome::Moved
+            if view.pending_g {
+                view.pending_g = false;
+                view.jump_to(0);
+                Outcome::Moved
             } else {
-                screen.pending_g = true;
-                CopyOutcome::Ignored
+                view.pending_g = true;
+                Outcome::Moved
             }
-        }
-        KeyCode::Char('G') | KeyCode::End => {
-            screen.move_to_bottom();
-            CopyOutcome::Moved
         }
         KeyCode::Home => {
-            screen.move_to_top();
-            CopyOutcome::Moved
+            view.jump_to(0);
+            Outcome::Moved
         }
+        // `G` is the bottom, and the bottom is the live tail.
+        KeyCode::Char('G') | KeyCode::End => Outcome::Leave,
         KeyCode::Char('/') => {
-            screen.open_prompt(SearchDirection::Forward);
-            CopyOutcome::PromptOpened
+            view.open_prompt(SearchDirection::Forward);
+            Outcome::Moved
         }
         KeyCode::Char('?') => {
-            screen.open_prompt(SearchDirection::Backward);
-            CopyOutcome::PromptOpened
+            view.open_prompt(SearchDirection::Backward);
+            Outcome::Moved
         }
-        KeyCode::Char('n') => {
-            if screen.step_match(true) {
-                CopyOutcome::Moved
-            } else {
-                CopyOutcome::Ignored
-            }
+        KeyCode::Char('n') => view.step_match(true),
+        KeyCode::Char('N') => view.step_match(false),
+        // `v` marks, the vim spelling. `Space` no longer marks: it snaps,
+        // the habit wezterm calls `scroll_to_bottom_on_input` (Amy: *"live
+        // typing should snap back to the tail, I often hit space just to do
+        // that"*).
+        KeyCode::Char('v') => {
+            view.toggle_mark();
+            Outcome::Moved
         }
-        KeyCode::Char('N') => {
-            if screen.step_match(false) {
-                CopyOutcome::Moved
-            } else {
-                CopyOutcome::Ignored
-            }
+        KeyCode::Char('y') | KeyCode::Enter => {
+            let (start, end) = view.range();
+            Outcome::Yank(start, end)
         }
-        // `Space` marks and `Enter` copies: GNU screen's copy mode and
-        // tmux's vi mode agree, and those are the hands this answers.
-        // `v`/`y` are the vim spelling of the same two acts.
-        KeyCode::Char('v') | KeyCode::Char(' ') => {
-            screen.toggle_selection();
-            CopyOutcome::Moved
-        }
-        KeyCode::Char('y') => match screen.yank() {
-            Some(text) => CopyOutcome::Yanked(text),
-            None => CopyOutcome::Ignored,
-        },
-        KeyCode::Enter => match screen.yank() {
-            Some(text) => CopyOutcome::Yanked(text),
-            None => CopyOutcome::Close,
-        },
-        _ => CopyOutcome::Ignored,
+        _ => Outcome::Snap,
     }
 }
 
@@ -555,7 +699,45 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use kaijutsu_types::{ContextId, PrincipalId};
+
+    fn block(seq: u64) -> BlockId {
+        // One context and one principal: the seq is what tells the fixture's
+        // blocks apart.
+        static IDS: std::sync::OnceLock<(ContextId, PrincipalId)> = std::sync::OnceLock::new();
+        let (ctx, principal) = *IDS.get_or_init(|| (ContextId::new(), PrincipalId::new()));
+        BlockId::new(ctx, principal, seq)
+    }
+
+    /// Blocks of `rows` rows each with no divider and no gap — the shape
+    /// the motion tests start from, where a row is a row.
+    fn rows_index(rows: &[usize]) -> RowIndex {
+        RowIndex::new(
+            rows.iter()
+                .enumerate()
+                .map(|(i, r)| RowBlock { block: block(i as u64), leading: 0, rows: *r })
+                .collect(),
+        )
+    }
+
+    /// Blocks of `(leading, rows)` — a divider or a blank row above the
+    /// block's own text, which is what the anchor counts from.
+    fn led_index(blocks: &[(usize, usize)]) -> RowIndex {
+        RowIndex::new(
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, &(leading, rows))| RowBlock { block: block(i as u64), leading, rows })
+                .collect(),
+        )
+    }
+
+    /// The anchor a settled view holds, for a test that names the block and
+    /// the line and does not care which neighbours came with it.
+    fn placed(view: &Scrolled) -> (BlockId, isize) {
+        let anchor = view.top.expect("the frame took an anchor");
+        (anchor.block, anchor.line)
+    }
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -565,346 +747,450 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    fn lines(n: usize) -> Vec<Line<'static>> {
-        (0..n).map(|i| Line::from(format!("line {i}"))).collect()
+    /// A view settled once over `rows`-shaped blocks with a ten-row screen.
+    fn settled(rows: &[usize]) -> (Scrolled, RowIndex) {
+        let index = rows_index(rows);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        (view, index)
     }
 
-    fn fixture(n: usize) -> CopyScreen {
-        CopyScreen::new("kaijutsu", lines(n))
+    // ── entering ────────────────────────────────────────────────────────
+
+    #[test]
+    fn entering_lands_on_the_tail_with_the_reader_on_the_last_row() {
+        let (view, _) = settled(&[10, 10, 10]);
+        assert_eq!(view.top_row, 20, "the last screenful of thirty rows");
+        assert_eq!(view.reader_row(), 29, "the newest row, the way tmux enters at the current screen");
     }
 
-    fn plain(lines: &[Line<'static>]) -> Vec<String> {
-        lines.iter().map(line_text).collect()
+    #[test]
+    fn entering_a_transcript_shorter_than_the_screen_starts_at_the_top() {
+        let (view, _) = settled(&[4]);
+        assert_eq!(view.top_row, 0);
+        assert_eq!(view.reader_row(), 3, "the last row there is");
     }
 
-    /// Typed keystrokes for one search: the glyph, the pattern, then Enter.
-    fn search(screen: &mut CopyScreen, glyph: char, pattern: &str) {
-        assert_eq!(handle_key(screen, &press(KeyCode::Char(glyph)), 10), CopyOutcome::PromptOpened);
-        for c in pattern.chars() {
-            handle_key(screen, &press(KeyCode::Char(c)), 10);
+    /// `Up` at the draft's first line leaves the tail and scrolls one line;
+    /// the reader rides at the same screen row.
+    #[test]
+    fn the_entry_scroll_moves_the_view_by_one_line() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-1);
+        let start = view.settle(&index, 10);
+        assert_eq!(start, 19);
+        assert_eq!(view.reader_row(), 28);
+    }
+
+    // ── anchoring ───────────────────────────────────────────────────────
+
+    /// Rows appended *below* the reader do not move what they are looking
+    /// at: the anchored block and line are the same, and so is the top row.
+    #[test]
+    fn the_anchor_keeps_its_place_when_rows_are_appended_below() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-12);
+        let start = view.settle(&index, 10);
+        assert_eq!(start, 8);
+        let anchor = view.top.expect("the frame took an anchor");
+        assert_eq!(placed(&view), (block(0), 8));
+
+        // The last block streams in twenty more rows.
+        let grown = rows_index(&[10, 10, 30]);
+        assert_eq!(view.settle(&grown, 10), 8, "the top row is unchanged");
+        assert_eq!(view.top, Some(anchor), "and so is the anchor");
+    }
+
+    /// A block growing *above* the reader moves the row number and not the
+    /// screen — the anchor is the whole point.
+    #[test]
+    fn the_anchor_keeps_its_block_and_line_when_rows_are_inserted_above() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-5);
+        assert_eq!(view.settle(&index, 10), 15);
+        let anchor = view.top.expect("anchored");
+        assert_eq!(placed(&view), (block(1), 5));
+
+        // The first block grows by seven rows.
+        let grown = rows_index(&[17, 10, 10]);
+        assert_eq!(view.settle(&grown, 10), 22, "the same block and line, seven rows further down");
+        assert_eq!(view.top, Some(anchor), "the anchor did not move");
+    }
+
+    /// A narrower width wraps a block into fewer rows than the anchor names;
+    /// the line clamps into the block rather than sliding into the next one.
+    #[test]
+    fn a_rewrap_clamps_the_anchor_line_into_its_own_block() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-3);
+        assert_eq!(view.settle(&index, 10), 17);
+        assert_eq!(placed(&view), (block(1), 7));
+
+        let narrow = rows_index(&[10, 4, 10]);
+        assert_eq!(view.settle(&narrow, 10), 13, "the last row of the shrunken block");
+        assert_eq!(placed(&view), (block(1), 3));
+    }
+
+    /// An excluded or edited-away block leaves no anchor to resolve, so the
+    /// view falls to a *neighbour* — the next block's first content row —
+    /// rather than to an absolute row, which a block inserted above in the
+    /// same settle would have moved out from under it.
+    #[test]
+    fn a_deleted_anchor_block_falls_to_its_neighbour() {
+        let index = led_index(&[(0, 10), (2, 10), (2, 10)]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-8);
+        assert_eq!(view.settle(&index, 10), 12);
+        assert_eq!(view.top.map(|a| a.block), Some(block(1)));
+
+        // Block 1 is gone and a block of six rows arrives above everything
+        // in the same settle: the old row 12 is now somewhere in block 0.
+        let without = RowIndex::new(vec![
+            RowBlock { block: block(9), leading: 0, rows: 6 },
+            RowBlock { block: block(0), leading: 0, rows: 10 },
+            RowBlock { block: block(2), leading: 2, rows: 10 },
+        ]);
+        assert_eq!(view.settle(&without, 10), 16, "block 2's first content row, not row 12");
+        assert_eq!(view.top.map(|a| a.block), Some(block(2)));
+    }
+
+    /// With no next block the anchor falls back to the previous block's
+    /// last row.
+    #[test]
+    fn a_deleted_last_block_falls_to_the_one_before_it() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        assert_eq!(view.top.map(|a| a.block), Some(block(2)));
+
+        let without = rows_index(&[10, 10]);
+        view.settle(&without, 10);
+        assert_eq!(view.top.map(|a| a.block), Some(block(1)), "the block before it");
+    }
+
+    /// A divider appearing above the anchored block — a block inserted above
+    /// it by a different speaker, or a tool call settling back out of the
+    /// in-flight strip — must not shift the text on the reader's row. The
+    /// anchor counts from the block's first *content* row, so it does not.
+    #[test]
+    fn a_divider_appearing_above_the_anchor_leaves_the_text_put() {
+        // Block 1 has no divider yet: it continues its predecessor's pair.
+        let before = led_index(&[(0, 10), (0, 10), (0, 10)]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-8);
+        assert_eq!(view.settle(&before, 10), 12);
+        assert_eq!(placed(&view), (block(1), 2), "the third content row of block 1");
+
+        // A different speaker lands above it: block 1 gains a blank row and
+        // a divider, so every one of its rows moves down two.
+        let after = led_index(&[(0, 10), (2, 12), (0, 10)]);
+        assert_eq!(view.settle(&after, 10), 14, "the same content row, two rows further down");
+        assert_eq!(placed(&view), (block(1), 2));
+    }
+
+    /// A mark whose block is excluded is gone with it: nothing slides onto
+    /// a neighbour and gets yanked in its place.
+    #[test]
+    fn a_deleted_marked_block_clears_the_mark() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-15);
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char('v')));
+        view.settle(&index, 10);
+        assert!(view.mark_row.is_some() && view.mark.is_some());
+
+        let without = RowIndex::new(vec![
+            RowBlock { block: block(0), leading: 0, rows: 10 },
+            RowBlock { block: block(2), leading: 0, rows: 10 },
+        ]);
+        view.settle(&without, 10);
+        assert_eq!(view.mark_row, None, "the marked block is gone");
+        assert_eq!(view.mark, None, "and so is the mark");
+        // `y` now copies the reader's own line, not a stale range.
+        let reader = view.reader_row();
+        assert_eq!(view.range(), (reader, reader));
+    }
+
+    // ── motions ─────────────────────────────────────────────────────────
+
+    /// `k` is vim's cursor motion: it walks the reader up the screen and
+    /// scrolls only once it is on the top row.
+    #[test]
+    fn k_walks_the_reader_up_the_screen_before_it_scrolls() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        for expected in [28, 27, 26] {
+            assert_eq!(handle_key(&mut view, &press(KeyCode::Char('k'))), Outcome::Moved);
+            view.settle(&index, 10);
+            assert_eq!(view.reader_row(), expected);
+            assert_eq!(view.top_row, 20, "the view has not scrolled yet");
         }
-        assert_eq!(handle_key(screen, &press(KeyCode::Enter), 10), CopyOutcome::SearchCommitted);
+        for _ in 0..6 {
+            handle_key(&mut view, &press(KeyCode::Char('k')));
+            view.settle(&index, 10);
+        }
+        assert_eq!(view.reader_row(), 20, "the reader is on the top row now");
+        handle_key(&mut view, &press(KeyCode::Char('k')));
+        view.settle(&index, 10);
+        assert_eq!(view.top_row, 19, "past the top row the view scrolls");
+        assert_eq!(view.reader_row(), 19);
     }
 
-    // ── entry position ──────────────────────────────────────────────────
-
+    /// `Up` scrolls the view a line with the reader pinned to its screen
+    /// row: one wheel tick is three of them and moves the screen three
+    /// lines, never a cursor two rows and the screen one.
     #[test]
-    fn it_enters_at_the_bottom_of_the_buffer() {
-        let screen = fixture(50);
-        assert_eq!(screen.cursor(), 49, "the newest block, the way tmux enters at the current screen");
+    fn up_scrolls_the_view_with_the_reader_pinned_to_its_screen_row() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.scroll(-1);
+        view.settle(&index, 10);
+        assert_eq!((view.top_row, view.reader_row()), (19, 28), "the entry scroll is a view scroll");
+        for expected in [18, 17, 16] {
+            assert_eq!(handle_key(&mut view, &press(KeyCode::Up)), Outcome::Moved);
+            view.settle(&index, 10);
+            assert_eq!(view.top_row, expected);
+            assert_eq!(view.reader_row(), expected + 9, "pinned to the last screen row");
+        }
+        assert_eq!(view.top_row, 16, "three presses moved the screen three lines");
     }
 
+    /// At the top the view cannot scroll, so the arrow moves the reader
+    /// instead and line 0 stays reachable without `gg`.
     #[test]
-    fn an_empty_buffer_has_no_cursor_to_move() {
-        let screen = fixture(0);
-        assert_eq!(screen.cursor(), 0);
-        assert!(screen.is_empty());
-    }
-
-    // ── motions ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn j_and_k_move_one_line() {
-        let mut screen = fixture(10);
-        screen.set_cursor(5);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('j')), 10), CopyOutcome::Moved);
-        assert_eq!(screen.cursor(), 6);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Up), 10), CopyOutcome::Moved);
-        assert_eq!(screen.cursor(), 5);
-    }
-
-    #[test]
-    fn j_stops_at_the_last_line_rather_than_overflowing() {
-        let mut screen = fixture(3);
-        screen.set_cursor(2);
-        handle_key(&mut screen, &press(KeyCode::Char('j')), 10);
-        assert_eq!(screen.cursor(), 2, "no line past the end to move to");
-    }
-
-    #[test]
-    fn k_stops_at_the_first_line_rather_than_underflowing() {
-        let mut screen = fixture(3);
-        screen.set_cursor(0);
-        handle_key(&mut screen, &press(KeyCode::Char('k')), 10);
-        assert_eq!(screen.cursor(), 0);
-    }
-
-    #[test]
-    fn ctrl_d_and_ctrl_u_move_half_a_page() {
-        let mut screen = fixture(100);
-        screen.set_cursor(0);
-        handle_key(&mut screen, &ctrl('d'), 20);
-        assert_eq!(screen.cursor(), 10, "half of a 20-row body");
-        handle_key(&mut screen, &ctrl('u'), 20);
-        assert_eq!(screen.cursor(), 0);
+    fn up_at_the_top_moves_the_reader_rather_than_stalling() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.jump_to(0);
+        view.settle(&index, 10);
+        assert_eq!((view.top_row, view.reader_row()), (0, 0));
+        // The reader at the bottom of a view already at the top.
+        for _ in 0..9 {
+            handle_key(&mut view, &press(KeyCode::Char('j')));
+            view.settle(&index, 10);
+        }
+        assert_eq!(view.reader_row(), 9);
+        handle_key(&mut view, &press(KeyCode::Up));
+        view.settle(&index, 10);
+        assert_eq!((view.top_row, view.reader_row()), (0, 8), "the reader moved, the view could not");
     }
 
     #[test]
-    fn ctrl_f_and_ctrl_b_and_the_page_keys_move_a_full_page() {
-        let mut screen = fixture(100);
-        screen.set_cursor(0);
-        handle_key(&mut screen, &ctrl('f'), 20);
-        assert_eq!(screen.cursor(), 20);
-        handle_key(&mut screen, &ctrl('b'), 20);
-        assert_eq!(screen.cursor(), 0);
-        handle_key(&mut screen, &press(KeyCode::PageDown), 20);
-        assert_eq!(screen.cursor(), 20);
-        handle_key(&mut screen, &press(KeyCode::PageUp), 20);
-        assert_eq!(screen.cursor(), 0);
+    fn a_downward_move_from_the_last_row_returns_to_the_tail() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char('j'))), Outcome::Leave);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Down)), Outcome::Leave);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::PageDown)), Outcome::Leave);
     }
 
     #[test]
-    fn a_half_page_step_is_never_less_than_one_line() {
-        // A one-row body: `body_h / 2 == 0`, and a page step that moved
-        // nothing would strand the reader.
-        let mut screen = fixture(10);
-        screen.set_cursor(0);
-        handle_key(&mut screen, &ctrl('d'), 1);
-        assert_eq!(screen.cursor(), 1, "the page step floors at one line");
-    }
+    fn capital_g_returns_to_the_tail_and_gg_goes_to_the_top() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char('G'))), Outcome::Leave);
 
-    // ── gg / G ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn gg_jumps_to_the_top() {
-        let mut screen = fixture(50);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('g')), 10), CopyOutcome::Ignored, "the first g waits for a second");
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('g')), 10), CopyOutcome::Moved);
-        assert_eq!(screen.cursor(), 0);
+        handle_key(&mut view, &press(KeyCode::Char('g')));
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char('g'))), Outcome::Moved);
+        view.settle(&index, 10);
+        assert_eq!(view.top_row, 0);
+        assert_eq!(view.reader_row(), 0);
     }
 
     #[test]
     fn a_single_g_is_cancelled_by_any_other_key() {
-        let mut screen = fixture(50);
-        handle_key(&mut screen, &press(KeyCode::Char('g')), 10);
-        handle_key(&mut screen, &press(KeyCode::Char('j')), 10);
-        // The cancelled `g` must not fire on a later lone `g`.
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('g')), 10), CopyOutcome::Ignored);
-        assert_ne!(screen.cursor(), 0);
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char('g')));
+        handle_key(&mut view, &press(KeyCode::Char('k')));
+        handle_key(&mut view, &press(KeyCode::Char('g')));
+        view.settle(&index, 10);
+        assert_ne!(view.top_row, 0, "the cancelled g must not fire on a later lone g");
     }
 
     #[test]
-    fn capital_g_jumps_to_the_bottom() {
-        let mut screen = fixture(50);
-        screen.set_cursor(0);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('G')), 10), CopyOutcome::Moved);
-        assert_eq!(screen.cursor(), 49);
+    fn ctrl_u_and_page_up_step_by_half_a_screen_and_a_screen() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        handle_key(&mut view, &ctrl('u'));
+        view.settle(&index, 10);
+        assert_eq!(view.reader_row(), 24, "half of a ten-row screen");
+        handle_key(&mut view, &press(KeyCode::PageUp));
+        view.settle(&index, 10);
+        assert_eq!(view.reader_row(), 14);
     }
 
-    // ── search ───────────────────────────────────────────────────────────
+    // ── the snap rule ───────────────────────────────────────────────────
+
+    /// Every key the scrolled view does not claim snaps to the tail and is
+    /// handled there — `Space` most of all (Amy: *"I often hit space just to
+    /// do that"*).
+    #[test]
+    fn an_unclaimed_key_snaps_to_the_tail() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        for code in [KeyCode::Char(' '), KeyCode::Char('i'), KeyCode::Char(':'), KeyCode::Tab] {
+            assert_eq!(handle_key(&mut view, &press(code)), Outcome::Snap, "{code:?}");
+        }
+        assert_eq!(handle_key(&mut view, &ctrl('a')), Outcome::Snap, "a Ctrl+A chord snaps and arms");
+    }
+
+    /// `Space` snaps, and `v` is the one key that marks.
+    #[test]
+    fn space_no_longer_marks() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char(' ')));
+        assert_eq!(view.mark_row, None, "Space left no mark behind");
+        handle_key(&mut view, &press(KeyCode::Char('v')));
+        assert_eq!(view.mark_row, Some(29), "v marks the reader's line");
+    }
+
+    // ── mark and yank ───────────────────────────────────────────────────
 
     #[test]
-    fn search_is_a_case_insensitive_substring() {
-        let mut screen = CopyScreen::new(
-            "kaijutsu",
-            vec![Line::from("one"), Line::from("Contains ALPHA here"), Line::from("three")],
+    fn v_then_k_then_y_yanks_two_lines() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char('v')));
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char('k')));
+        view.settle(&index, 10);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char('y'))), Outcome::Yank(28, 29));
+    }
+
+    /// `y` or `Enter` with nothing marked copies the reader's own line.
+    #[test]
+    fn y_with_no_mark_copies_the_readers_line() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char('y'))), Outcome::Yank(29, 29));
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Enter)), Outcome::Yank(29, 29));
+    }
+
+    /// The mark is anchored, so a block growing above it keeps the range on
+    /// the same two lines.
+    #[test]
+    fn the_mark_rides_its_block_when_rows_are_inserted_above() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char('v')));
+        view.settle(&index, 10);
+        assert_eq!(view.mark_row, Some(29));
+
+        let grown = rows_index(&[14, 10, 10]);
+        view.settle(&grown, 10);
+        assert_eq!(view.mark_row, Some(33), "the same line of the same block");
+    }
+
+    // ── search ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_committed_search_asks_the_caller_for_a_row() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char('/'))), Outcome::Moved);
+        for c in "alpha".chars() {
+            handle_key(&mut view, &press(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            handle_key(&mut view, &press(KeyCode::Enter)),
+            Outcome::Find { needle: "alpha".to_string(), from: 29, forward: true, skip_current: false }
         );
-        screen.set_cursor(0);
-        search(&mut screen, '/', "alpha");
-        assert_eq!(screen.cursor(), 1);
-    }
-
-    #[test]
-    fn n_wraps_around_to_the_first_match_past_the_last() {
-        let mut screen = CopyScreen::new(
-            "kaijutsu",
-            vec![
-                Line::from("alpha one"),
-                Line::from("nope"),
-                Line::from("alpha two"),
-                Line::from("nope"),
-                Line::from("nope"),
-            ],
+        assert_eq!(
+            handle_key(&mut view, &press(KeyCode::Char('n'))),
+            Outcome::Find { needle: "alpha".to_string(), from: 29, forward: true, skip_current: true }
         );
-        screen.set_cursor(0);
-        search(&mut screen, '/', "alpha");
-        assert_eq!(screen.cursor(), 0);
-        assert!(handle_key(&mut screen, &press(KeyCode::Char('n')), 10) == CopyOutcome::Moved);
-        assert_eq!(screen.cursor(), 2, "the second match");
-        assert!(handle_key(&mut screen, &press(KeyCode::Char('n')), 10) == CopyOutcome::Moved);
-        assert_eq!(screen.cursor(), 0, "n past the last match wraps to the first");
-    }
-
-    #[test]
-    fn capital_n_wraps_backward_to_the_last_match_before_the_first() {
-        let mut screen = CopyScreen::new(
-            "kaijutsu",
-            vec![Line::from("alpha one"), Line::from("nope"), Line::from("alpha two"), Line::from("nope")],
+        assert_eq!(
+            handle_key(&mut view, &press(KeyCode::Char('N'))),
+            Outcome::Find { needle: "alpha".to_string(), from: 29, forward: false, skip_current: true }
         );
-        screen.set_cursor(0);
-        search(&mut screen, '/', "alpha");
-        assert_eq!(screen.cursor(), 0);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('N')), 10), CopyOutcome::Moved);
-        assert_eq!(screen.cursor(), 2, "N before the first match wraps to the last");
+    }
+
+    /// While the prompt is open every key belongs to it: `q` types a literal
+    /// `q` into the pattern rather than leaving, and `Space` does not snap.
+    #[test]
+    fn the_open_prompt_takes_every_key() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char('/')));
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char('q'))), Outcome::Moved);
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Char(' '))), Outcome::Moved);
+        assert_eq!(view.search.prompt.as_ref().expect("open").text, "q ");
+        assert_eq!(handle_key(&mut view, &press(KeyCode::Esc)), Outcome::Moved);
+        assert!(view.search.prompt.is_none(), "Esc closed the prompt without leaving");
     }
 
     #[test]
-    fn a_search_prompt_with_no_matches_leaves_the_cursor_put() {
-        let mut screen = fixture(10);
-        screen.set_cursor(4);
-        search(&mut screen, '/', "nowhere to be found");
-        assert_eq!(screen.cursor(), 4);
+    fn find_is_a_case_insensitive_substring_that_wraps_once() {
+        let rows: Vec<String> = ["one", "Contains ALPHA here", "three", "alpha again"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(find(&rows, "alpha", 0, true, false), Some(1));
+        assert_eq!(find(&rows, "alpha", 1, true, true), Some(3), "n steps off the current line");
+        assert_eq!(find(&rows, "alpha", 3, true, true), Some(1), "and wraps");
+        assert_eq!(find(&rows, "alpha", 2, false, true), Some(1));
+        assert_eq!(find(&rows, "alpha", 1, false, true), Some(3), "N wraps backward");
+        assert_eq!(find(&rows, "nowhere", 0, true, false), None);
     }
 
-    #[test]
-    fn n_and_capital_n_with_no_active_search_are_ignored() {
-        let mut screen = fixture(10);
-        screen.set_cursor(4);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('n')), 10), CopyOutcome::Ignored);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('N')), 10), CopyOutcome::Ignored);
-        assert_eq!(screen.cursor(), 4);
-    }
+    // ── the hint line ───────────────────────────────────────────────────
 
     #[test]
-    fn esc_cancels_the_prompt_and_backspace_edits_it() {
-        let mut screen = fixture(10);
-        handle_key(&mut screen, &press(KeyCode::Char('/')), 10);
-        handle_key(&mut screen, &press(KeyCode::Char('a')), 10);
-        handle_key(&mut screen, &press(KeyCode::Char('b')), 10);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Backspace), 10), CopyOutcome::PromptChanged);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Esc), 10), CopyOutcome::SearchCancelled);
-        assert!(screen.search.prompt.is_none());
-    }
-
-    /// While the prompt is open every key belongs to it — `q` types a
-    /// literal `q` into the pattern rather than closing copy mode.
-    #[test]
-    fn q_types_into_an_open_search_prompt_rather_than_closing() {
-        let mut screen = fixture(10);
-        handle_key(&mut screen, &press(KeyCode::Char('/')), 10);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('q')), 10), CopyOutcome::PromptChanged);
-        assert_eq!(screen.search.prompt.as_ref().unwrap().text, "q");
-    }
-
-    // ── leaving ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn q_and_esc_close_without_mutating_the_frozen_buffer() {
-        let mut screen = fixture(20);
-        let before = plain(&screen.lines);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('q')), 10), CopyOutcome::Close);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Esc), 10), CopyOutcome::Close);
-        assert_eq!(plain(&screen.lines), before, "closing must not touch the frozen buffer");
-    }
-
-    #[test]
-    fn esc_with_a_selection_active_cancels_the_selection_instead_of_closing() {
-        let mut screen = fixture(10);
-        handle_key(&mut screen, &press(KeyCode::Char('v')), 10);
-        assert!(screen.selection.is_some());
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Esc), 10), CopyOutcome::Moved);
-        assert!(screen.selection.is_none(), "the selection cleared");
-        // Copy mode itself is still open — a second Esc is what leaves it.
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Esc), 10), CopyOutcome::Close);
-    }
-
-    // ── selection / yank (stretch) ──────────────────────────────────────
-
-    #[test]
-    fn v_then_y_yanks_the_selected_lines() {
-        let mut screen = fixture(10);
-        screen.set_cursor(2);
-        handle_key(&mut screen, &press(KeyCode::Char('v')), 10);
-        handle_key(&mut screen, &press(KeyCode::Char('j')), 10);
-        handle_key(&mut screen, &press(KeyCode::Char('j')), 10);
-        assert_eq!(screen.cursor(), 4);
-        let outcome = handle_key(&mut screen, &press(KeyCode::Char('y')), 10);
-        assert_eq!(outcome, CopyOutcome::Yanked("line 2\nline 3\nline 4".to_string()));
-        assert!(screen.selection.is_none(), "yanking clears the selection");
-    }
-
-    /// GNU screen and tmux's vi mode both mark with `Space` and copy with
-    /// `Enter` — the keys Amy's hands know. `v`/`y` stay as the vim
-    /// spelling of the same two acts.
-    #[test]
-    fn space_marks_and_enter_copies_and_leaves() {
-        let mut screen = fixture(10);
-        screen.set_cursor(2);
-        handle_key(&mut screen, &press(KeyCode::Char(' ')), 10);
-        assert!(screen.selection.is_some(), "Space starts the selection");
-        handle_key(&mut screen, &press(KeyCode::Char('j')), 10);
-        let outcome = handle_key(&mut screen, &press(KeyCode::Enter), 10);
-        assert_eq!(outcome, CopyOutcome::Yanked("line 2\nline 3".to_string()));
-    }
-
-    /// `Enter` with nothing marked leaves copy mode, as tmux's
-    /// copy-selection-and-cancel does with an empty selection.
-    #[test]
-    fn enter_with_no_selection_leaves() {
-        let mut screen = fixture(10);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Enter), 10), CopyOutcome::Close);
-    }
-
-    #[test]
-    fn y_with_no_selection_is_ignored() {
-        let mut screen = fixture(10);
-        assert_eq!(handle_key(&mut screen, &press(KeyCode::Char('y')), 10), CopyOutcome::Ignored);
-    }
-
-    // ── the hint line ────────────────────────────────────────────────────
-
-    #[test]
-    fn the_hint_line_carries_the_position_and_the_label() {
-        let mut screen = fixture(50);
-        screen.set_cursor(10);
-        let frame = screen.frame(6, 80, &Palette::builtin());
-        let hint: String = frame.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(hint.contains("line 11/50"), "got {hint:?}");
-        assert!(hint.contains("kaijutsu"), "got {hint:?}");
-        assert!(hint.contains("q leave"), "got {hint:?}");
-    }
-
-    /// A narrow screen or a long position shortens the key list rather
-    /// than clipping it: `q leave` is always the last thing on the line.
-    #[test]
-    fn the_hint_line_shortens_to_keep_q_leave_on_screen() {
+    fn the_hint_line_carries_the_position_and_keeps_q_leave_on_screen() {
+        let index = rows_index(&[10, 10, 10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
         let palette = Palette::builtin();
-        let mut screen = fixture(1207);
         for width in [40u16, 60, 80, 120] {
-            let frame = screen.frame(10, width, &palette);
-            let hint: String = frame.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
+            let hint = line_text(&view.hint_line(width, &palette));
+            assert!(hint.contains("line 30/30"), "width {width}: {hint:?}");
             assert!(hint.ends_with("q leave"), "width {width}: {hint:?}");
             assert!(
-                hint.chars().count() <= usize::from(width) || width < 50,
-                "width {width}: hint is {} wide: {hint:?}",
+                hint.chars().count() <= usize::from(width) || width < 40,
+                "width {width}: the hint is {} wide: {hint:?}",
                 hint.chars().count()
             );
         }
     }
 
     #[test]
-    fn the_search_prompt_replaces_the_hint_line_while_typing() {
-        let mut screen = fixture(10);
-        handle_key(&mut screen, &press(KeyCode::Char('/')), 10);
-        handle_key(&mut screen, &press(KeyCode::Char('a')), 10);
-        let frame = screen.frame(6, 80, &Palette::builtin());
-        let bottom: String = frame.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(bottom, "/a");
+    fn the_search_prompt_replaces_the_hint_while_it_is_typed() {
+        let index = rows_index(&[10]);
+        let mut view = Scrolled::entering(10);
+        view.settle(&index, 10);
+        handle_key(&mut view, &press(KeyCode::Char('?')));
+        handle_key(&mut view, &press(KeyCode::Char('a')));
+        assert_eq!(line_text(&view.hint_line(80, &Palette::builtin())), "?a");
     }
 
-    // ── osc 52 ───────────────────────────────────────────────────────────
+    // ── osc 52 ──────────────────────────────────────────────────────────
 
+    /// One byte short of a group, two short, and an exact group: the
+    /// padding branches and the one sextet that needs none.
     #[test]
-    fn osc52_encodes_the_known_base64_of_a_short_string() {
-        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
-    }
-
-    /// The terminal cursor rides the reader's line: the bottom row of the
-    /// body on entry, one row up after `k`, and the search prompt row while
-    /// `/` is being typed.
-    #[test]
-    fn the_terminal_cursor_rides_the_reader_line() {
-        let mut screen = fixture(20);
-        let palette = Palette::builtin();
-        let _ = screen.frame(10, 80, &palette);
-        let body = screen.body_h() as u16;
-        assert_eq!(screen.frame_cursor(10), Some((0, body - 1)), "entered at the bottom");
-        handle_key(&mut screen, &press(KeyCode::Char('k')), 10);
-        let _ = screen.frame(10, 80, &palette);
-        assert_eq!(screen.frame_cursor(10), Some((0, body - 2)));
-        handle_key(&mut screen, &press(KeyCode::Char('/')), 10);
-        handle_key(&mut screen, &press(KeyCode::Char('a')), 10);
-        let _ = screen.frame(10, 80, &palette);
-        assert_eq!(screen.frame_cursor(10), Some((2, 9)), "after `/a` on the bottom row");
+    fn osc52_encodes_the_known_base64_of_short_strings() {
+        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07", "one pad byte");
+        assert_eq!(osc52_sequence("abc"), "\x1b]52;c;YWJj\x07", "an exact group, no padding");
+        assert_eq!(osc52_sequence("abcd"), "\x1b]52;c;YWJjZA==\x07", "two pad bytes");
+        assert_eq!(osc52_sequence("a"), "\x1b]52;c;YQ==\x07");
     }
 }

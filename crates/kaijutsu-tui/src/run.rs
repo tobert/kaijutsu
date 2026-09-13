@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
+use crossterm::style::Print;
 use crossterm::event::Event;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{
@@ -41,7 +42,7 @@ use crate::render;
 use crossterm::event::KeyEvent;
 use kaijutsu_client::{PeerConfig, PeerInvocation};
 
-use crate::copy::{self, CopyOutcome};
+use crate::copy;
 use crate::diff::{self, DiffKey};
 use crate::editor::{self, EditorOpen, ScreenMode};
 
@@ -637,11 +638,6 @@ fn draw_frame(
             let lines = screen.frame(size.height, &palette);
             render::draw_surface(terminal, lines, None)?;
         }
-        ScreenMode::Copy(screen) => {
-            let lines = screen.frame(size.height, size.width, &palette);
-            let cursor = screen.frame_cursor(size.height);
-            render::draw_surface(terminal, lines, cursor)?;
-        }
     }
     Ok(())
 }
@@ -653,7 +649,7 @@ fn wanted_cursor_shape(app: &App) -> CursorShape {
     match &app.screen {
         ScreenMode::Conversation => app.compose.cursor_shape(),
         ScreenMode::Editor(screen) => CursorShape::for_mode(screen.state.mode.as_deref()),
-        ScreenMode::Diff(_) | ScreenMode::Copy(_) => CursorShape::Block,
+        ScreenMode::Diff(_) => CursorShape::Block,
     }
 }
 
@@ -693,11 +689,11 @@ async fn act(
     width: u16,
 ) -> Result<Acted> {
     // The editor is the sanctioned raw key reader (`docs/input.md`): while a
-    // vi surface — including copy mode — has the screen every key belongs to
-    // it, so the `Ctrl+A` prefix and the `Ctrl+C` double-tap are bypassed
-    // here rather than being taught to stand aside.
+    // vi surface has the screen every key belongs to it, so the `Ctrl+A`
+    // prefix and the `Ctrl+C` double-tap are bypassed here rather than being
+    // taught to stand aside.
     if editor::route_key(app) == editor::KeyRoute::FullScreen {
-        act_full_screen(bridge, app, key, term_lock).await?;
+        act_full_screen(bridge, app, key).await?;
         return Ok(Acted::Continue);
     }
     // The ledger view captures every key while open — its j/k/Esc keys are
@@ -706,6 +702,18 @@ async fn act(
         handle_ledger_key(bridge, app, key).await;
         return Ok(Acted::Continue);
     }
+    // Off the live tail the transcript owns copy mode's keys, and every
+    // other key snaps it back and is then handled here as if it had been
+    // typed at the tail (`docs/tui.md`, "Scrolling is copy mode"). An ask
+    // card keeps its own a/A/d/v/Esc: the card is the more urgent surface,
+    // and the scrolled view waits under it.
+    if app.transcript.scrolled.is_some() && app.ask_card.is_none() {
+        if scrolled_key(app, &key, term_lock, width) == ScrolledKey::Handled {
+            return Ok(Acted::Continue);
+        }
+        app.transcript.snap();
+    }
+
     // The ask card owns a/A/d/v/Esc and holds compose text; a `Ctrl+A`
     // chord, `Ctrl+C` and `Ctrl+Z` act under it as they would under no card
     // (`docs/tui.md`, "Asks").
@@ -733,9 +741,12 @@ async fn act(
         Intent::Interrupt => {
             interrupt_ctrl_c(bridge, app, interrupt_ladder).await;
         }
-        Intent::InputKey(key) => {
-            compose_key(bridge, app, key).await?;
-        }
+        Intent::InputKey(key) => match tail_key(app, &key, width) {
+            TailKey::Draft => compose_key(bridge, app, key).await?,
+            // The tail is already on screen; there is nothing below it.
+            TailKey::Nothing => {}
+            TailKey::LeaveTail(step) => leave_tail(app, width, step),
+        },
         Intent::Suspend => {
             return Ok(Acted::Suspend);
         }
@@ -753,7 +764,7 @@ async fn act(
                 mirror_ops(bridge, app, ctx, &ops).await;
             }
             (None, _) => app.note("no context attached"),
-            (_, None) => app.note("paste buffer empty — Ctrl+A [ then Space, Enter to fill it"),
+            (_, None) => app.note("paste buffer empty — scroll up, then v and y to fill it"),
         },
         // `switch_seat` re-watches, which is what makes the toggle work
         // after a feed ended and dropped the context's view: a context with
@@ -769,9 +780,9 @@ async fn act(
             }
             None => app.note("no diff block in this context"),
         },
-        Intent::CopyMode => match render::copy_buffer_lines(app, width) {
-            Some((label, lines)) => {
-                app.screen = ScreenMode::Copy(copy::CopyScreen::new(label, lines));
+        Intent::CopyMode => match app.current {
+            Some(_) => {
+                leave_tail(app, width, Step::Still);
                 app.clear_notice();
             }
             None => app.note("no context to read"),
@@ -789,6 +800,140 @@ async fn act(
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
     }
     Ok(Acted::Continue)
+}
+
+/// Whether the scrolled transcript took a key, or handed it back to the tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrolledKey {
+    Handled,
+    Snap,
+}
+
+/// Act on one key while the transcript is off the live tail
+/// (`docs/tui.md`, "Scrolling is copy mode").
+///
+/// The motions, the mark and the prompt are `copy.rs`'s; the two acts that
+/// need more than the view are this side's — a search reads the whole
+/// transcript to find its row, and a yank renders the marked rows, writes
+/// them over OSC 52 and keeps them in the paste buffer.
+fn scrolled_key(
+    app: &mut App,
+    key: &crossterm::event::KeyEvent,
+    term_lock: &TermLock,
+    width: u16,
+) -> ScrolledKey {
+    // Release events arrive only where the terminal negotiated the enhanced
+    // keyboard protocol; acting on both edges would scroll twice a press,
+    // the same reason `Keys::interpret` drops them.
+    if key.kind == crossterm::event::KeyEventKind::Release {
+        return ScrolledKey::Handled;
+    }
+    // Keys arrive faster than frames — a wheel tick is three of them, and a
+    // committed search is followed straight away by `v` — so the view is
+    // settled against the current row counts before it reads one. Without
+    // this a key would act on the rows the last frame drew.
+    let index = render::row_index(app, width);
+    let height = render::transcript_height(app, width);
+    let outcome = {
+        let Some(view) = app.transcript.scrolled.as_mut() else {
+            return ScrolledKey::Snap;
+        };
+        view.settle(&index, height);
+        copy::handle_key(view, key)
+    };
+    match outcome {
+        copy::Outcome::Snap => ScrolledKey::Snap,
+        copy::Outcome::Moved => ScrolledKey::Handled,
+        copy::Outcome::Leave => {
+            app.transcript.snap();
+            ScrolledKey::Handled
+        }
+        copy::Outcome::Find { needle, from, forward, skip_current } => {
+            let rows: Vec<String> = render::transcript_all_lines(app, width)
+                .iter()
+                .map(copy::line_text)
+                .collect();
+            if let Some(target) = copy::find(&rows, &needle, from, forward, skip_current)
+                && let Some(view) = app.transcript.scrolled.as_mut()
+            {
+                view.jump_to(target);
+            }
+            ScrolledKey::Handled
+        }
+        copy::Outcome::Yank(start, end) => {
+            let text = render::transcript_rows_text(app, width, start, end);
+            app.transcript.snap();
+            match write_osc52(term_lock, &text) {
+                Ok(()) => app.note(format!("yanked {} lines — Ctrl+A ] pastes", text.lines().count())),
+                Err(e) => app.note(format!("clipboard write failed: {e}")),
+            }
+            app.paste_buffer = Some(text);
+            ScrolledKey::Handled
+        }
+    }
+}
+
+/// How far leaving the live tail scrolls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// `Ctrl+A [`: the same rows, now under copy mode's keys.
+    Still,
+    /// `Up`, which is also one third of a wheel tick.
+    Line,
+    /// `PageUp`.
+    Page,
+}
+
+/// What a key means while the transcript is on the live tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailKey {
+    /// The draft's, as ever.
+    Draft,
+    /// Nothing to do: the tail is already what is on screen.
+    Nothing,
+    /// Leave the tail and scroll.
+    LeaveTail(Step),
+}
+
+/// `Up` at the top edge of the draft scrolls the transcript and `Down` at
+/// the live tail does nothing — one rule for a typed arrow and for the wheel,
+/// which the terminal sends as arrow keys and neither vim nor this client can
+/// tell apart (`docs/tui.md`, "The mouse stays the terminal's").
+fn tail_key(app: &mut App, key: &crossterm::event::KeyEvent, width: u16) -> TailKey {
+    use crossterm::event::KeyCode;
+    // The `:` bar keeps `Up` and `Down` for its own history.
+    if app.compose.command_line().is_some() {
+        return TailKey::Draft;
+    }
+    match key.code {
+        // Measured in the draft's *drawn* rows, not its logical lines: a
+        // one-line draft wider than the screen has rows above and below the
+        // cursor, and an `Up` from one of them belongs to the draft. A
+        // one-row draft is the common case, so every `Up` scrolls.
+        KeyCode::Up if app.compose.cursor_on_first_row(width) => TailKey::LeaveTail(Step::Line),
+        KeyCode::PageUp => TailKey::LeaveTail(Step::Page),
+        KeyCode::Down if app.compose.cursor_on_last_row(width) => TailKey::Nothing,
+        KeyCode::PageDown => TailKey::Nothing,
+        _ => TailKey::Draft,
+    }
+}
+
+/// Leave the live tail: the view is anchored where it already sits, so the
+/// screen does not move, and then it scrolls by `step`. The reader lands on
+/// the view's last row, the way tmux enters copy mode at the current screen.
+fn leave_tail(app: &mut App, width: u16, step: Step) {
+    let page = render::transcript_height(app, width);
+    let mut view = copy::Scrolled::entering(page);
+    match step {
+        Step::Still => {}
+        Step::Line => view.scroll(-1),
+        Step::Page => view.scroll(-(page as isize)),
+    }
+    // Settled here rather than on the first frame, so the readout the band
+    // draws next says where the reader is instead of `line 0/0`.
+    let index = render::row_index(app, width);
+    view.settle(&index, page);
+    app.transcript.scrolled = Some(view);
 }
 
 /// A pasted newline as `\n`, whatever the terminal sent: xterm sends
@@ -1115,7 +1260,12 @@ fn suspend(
     // Held across the stop so the key reader cannot read in cooked mode.
     let _guard = term_lock.lock();
     let _ = terminal.flush();
-    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape, DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        io::stdout(),
+        Print(ALTERNATE_SCROLL_OFF),
+        SetCursorStyle::DefaultUserShape,
+        DisableBracketedPaste
+    );
     editor::abandon();
     let _ = disable_raw_mode();
 
@@ -1127,6 +1277,7 @@ fn suspend(
     enable_raw_mode()?;
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     editor::take_screen()?;
+    crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON))?;
     // A resize at the current size, not `Terminal::clear`: clear asks the
     // terminal where the cursor is, and this client never does. Both clear
     // the screen and reset the back buffer, which is what a freshly retaken
@@ -1496,8 +1647,18 @@ fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     // newline inside it is a newline in the draft, not an Enter.
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     editor::take_screen()?;
+    crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON))?;
     Terminal::new(CrosstermBackend::new(io::stdout()))
 }
+
+/// Alternate scroll, DECSET 1007. With mouse reporting off — which this
+/// client never turns on — a terminal holding the alternate screen turns
+/// each wheel tick into arrow-key presses, which is how the wheel scrolls
+/// the transcript (`docs/tui.md`, "The mouse stays the terminal's"). xterm
+/// needs the mode; kitty and foot do it by default. crossterm has no
+/// constant for it, so the bytes go out as they are.
+const ALTERNATE_SCROLL_ON: &str = "\x1b[?1007h";
+const ALTERNATE_SCROLL_OFF: &str = "\x1b[?1007l";
 
 /// Leave the terminal the way we found it. Best-effort on every step: a
 /// failure here must not mask the error that ended the loop.
@@ -1529,7 +1690,12 @@ pub fn restore_terminal() {
     // nothing. Ending one that was never begun is a no-op.
     let _ = crossterm::execute!(io::stdout(), EndSynchronizedUpdate);
     editor::abandon();
-    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape, DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        io::stdout(),
+        Print(ALTERNATE_SCROLL_OFF),
+        SetCursorStyle::DefaultUserShape,
+        DisableBracketedPaste
+    );
     let _ = disable_raw_mode();
 }
 
@@ -1638,12 +1804,7 @@ async fn observe_editor_event(bridge: &KernelBridge, app: &mut App, event: &Serv
 }
 
 /// A key while a full-screen surface has the screen.
-async fn act_full_screen(
-    bridge: &KernelBridge,
-    app: &mut App,
-    key: KeyEvent,
-    term_lock: &TermLock,
-) -> Result<()> {
+async fn act_full_screen(bridge: &KernelBridge, app: &mut App, key: KeyEvent) -> Result<()> {
     if let Some(session) = app.screen.editor().map(|s| s.session) {
         // A key with no notation is refused rather than sent: the kernel's
         // `parse_keys` drops an unknown `<...>` token silently, so forwarding
@@ -1688,28 +1849,13 @@ async fn act_full_screen(
         }
     }
 
-    if let ScreenMode::Copy(screen) = &mut app.screen {
-        let body_h = screen.body_h();
-        match copy::handle_key(screen, &key, body_h) {
-            CopyOutcome::Close => app.screen = ScreenMode::Conversation,
-            CopyOutcome::Yanked(text) => {
-                app.screen = ScreenMode::Conversation;
-                match write_osc52(term_lock, &text) {
-                    Ok(()) => app.note(format!("yanked {} lines — Ctrl+A ] pastes", text.lines().count())),
-                    Err(e) => app.note(format!("clipboard write failed: {e}")),
-                }
-                app.paste_buffer = Some(text);
-            }
-            _ => {}
-        }
-    }
     Ok(())
 }
 
-/// Write copy mode's OSC 52 clipboard sequence (`copy::osc52_sequence`)
-/// directly to stdout, under the same lock every other terminal write takes
-/// — `y` after a `v` selection is the only caller (`docs/tui.md`, "Copy
-/// mode").
+/// Write the OSC 52 clipboard sequence (`copy::osc52_sequence`) directly to
+/// stdout, under the same lock every other terminal write takes — a yank in
+/// the scrolled transcript is the only caller (`docs/tui.md`, "Scrolling is
+/// copy mode").
 fn write_osc52(term_lock: &TermLock, text: &str) -> io::Result<()> {
     use std::io::Write as _;
     let _guard = term_lock.lock();
@@ -1935,6 +2081,100 @@ mod tests {
         Some(&rest[..rest.find('(')?])
     }
 
+    /// `Up` at the top edge of the draft scrolls the transcript and `Down`
+    /// at the live tail does nothing — one rule for a typed arrow and for
+    /// the wheel (`docs/tui.md`, "The mouse stays the terminal's").
+    #[test]
+    fn up_scrolls_only_once_the_drafts_cursor_is_on_its_first_line() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let mut app = App::new("amy");
+
+        // A one-row draft is the common case, so every `Up` scrolls.
+        assert_eq!(tail_key(&mut app, &up, 80), TailKey::LeaveTail(Step::Line));
+        assert_eq!(tail_key(&mut app, &down, 80), TailKey::Nothing, "the tail is already on screen");
+
+        // Inside a taller draft `Up` moves the draft's cursor first, as vim
+        // does, and scrolls once it is on the first row.
+        app.compose.load_draft("one\ntwo");
+        assert_eq!(tail_key(&mut app, &up, 80), TailKey::Draft);
+        assert_eq!(tail_key(&mut app, &down, 80), TailKey::Nothing, "the cursor is on the last row");
+        app.compose.press(up);
+        assert!(app.compose.cursor_on_first_row(80), "the draft's own cursor moved up");
+        assert_eq!(tail_key(&mut app, &up, 80), TailKey::LeaveTail(Step::Line));
+        assert_eq!(tail_key(&mut app, &down, 80), TailKey::Draft, "there is a draft row below");
+    }
+
+    /// The rows are the drawn ones, not the logical lines: one long line
+    /// wraps, and an `Up` from a continuation row belongs to the draft.
+    #[test]
+    fn a_wrapped_one_line_draft_keeps_its_own_arrows() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let mut app = App::new("amy");
+        // One logical line, three rows at twenty columns; `load_draft` rests
+        // the cursor on the last character.
+        app.compose.load_draft(&"x".repeat(50));
+        assert_eq!(app.compose.cursor_visual_row(20).1, 3, "three drawn rows");
+        assert_eq!(tail_key(&mut app, &up, 20), TailKey::Draft, "a continuation row is the draft's");
+        assert_eq!(tail_key(&mut app, &down, 20), TailKey::Nothing, "the last row");
+
+        // `0` is what reaches the first drawn row: the draft's own `Up` is
+        // modalkit's logical-line motion, which has nowhere to go inside one
+        // wrapped line — vim's `k` behaves the same, and `gk` is the motion
+        // that would not (`docs/issues.md`).
+        app.compose.press(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert!(app.compose.cursor_on_first_row(20), "on the first drawn row now");
+        assert_eq!(tail_key(&mut app, &up, 20), TailKey::LeaveTail(Step::Line));
+        assert_eq!(tail_key(&mut app, &down, 20), TailKey::Draft, "rows below it in the draft");
+    }
+
+    #[test]
+    fn the_page_keys_leave_the_tail_upward_and_do_nothing_downward() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("amy");
+        let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        let page_down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(tail_key(&mut app, &page_up, 80), TailKey::LeaveTail(Step::Page));
+        assert_eq!(tail_key(&mut app, &page_down, 80), TailKey::Nothing);
+    }
+
+    /// The `:` bar keeps `Up` and `Down` for its own history.
+    #[test]
+    fn the_colon_bar_keeps_the_arrow_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("amy");
+        app.compose.press(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert_eq!(tail_key(&mut app, &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 80), TailKey::Draft);
+        assert_eq!(tail_key(&mut app, &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 80), TailKey::Draft);
+    }
+
+    /// Leaving the tail anchors the view where it already is, so the screen
+    /// does not move, and a page step is the transcript's own height.
+    #[test]
+    fn leaving_the_tail_takes_the_transcripts_height_for_a_page() {
+        let mut app = App::new("amy");
+        app.screen_rows = 24;
+        leave_tail(&mut app, 80, Step::Page);
+        let view = app.transcript.scrolled.as_ref().expect("off the tail");
+        assert_eq!(view.page(), 20, "24 rows less the band's four");
+        assert!(!app.transcript.follow());
+    }
+
+    /// A context switch opens on the new context's own live tail: the
+    /// scrolled place is anchored to blocks of the context being left.
+    #[test]
+    fn a_context_switch_snaps_the_transcript_to_the_tail() {
+        let mut app = App::new("amy");
+        app.current = Some(ContextId::new());
+        leave_tail(&mut app, 80, Step::Line);
+        assert!(!app.transcript.follow());
+        app.switch_to(ContextId::new());
+        assert!(app.transcript.follow(), "the new context opens on its tail");
+    }
+
     #[test]
     fn a_paste_goes_to_the_draft_or_the_colon_bar_and_nowhere_else() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1949,7 +2189,12 @@ mod tests {
         assert!(matches!(paste_target(&app), PasteTarget::Refused(_)), "the picker has no text field");
         app.picker = None;
 
-        app.screen = ScreenMode::Copy(crate::copy::CopyScreen::new("probe", Vec::new()));
+        app.screen = ScreenMode::Diff(crate::diff::DiffScreen::unparsed(
+            "probe",
+            "not a diff",
+            "one\ntwo",
+            &app.palette,
+        ));
         assert!(matches!(paste_target(&app), PasteTarget::Refused(_)), "the alternate screen refuses");
     }
 

@@ -206,6 +206,35 @@ impl Compose {
         self.editor.cursor()
     }
 
+    /// The draft's **visual** row the cursor is on at `width`, and how many
+    /// visual rows the draft has — what `Up` and `Down` are measured
+    /// against, since the draft wraps and the arrows move by drawn row the
+    /// way vim's `gj`/`gk` do (`docs/tui.md`, "The mouse stays the
+    /// terminal's"). A logical line is the wrong unit: a one-line draft
+    /// wider than the screen has rows above and below the cursor.
+    pub fn cursor_visual_row(&mut self, width: u16) -> (usize, usize) {
+        let (row, _) = self.cursor_cell(width);
+        let avail = wrap_width(width);
+        let text = self.text();
+        let total: usize = text.split('\n').map(|line| wrapped_rows(line, avail)).sum();
+        (usize::from(row), total.max(1))
+    }
+
+    /// Whether the draft's cursor is on its first visual row — where `Up`
+    /// stops belonging to the draft and starts scrolling the transcript. A
+    /// one-row draft is the common case, so every `Up` scrolls.
+    pub fn cursor_on_first_row(&mut self, width: u16) -> bool {
+        self.cursor_visual_row(width).0 == 0
+    }
+
+    /// Whether the draft's cursor is on its last visual row — where `Down`
+    /// stops belonging to the draft and does nothing, because the tail is
+    /// already on screen.
+    pub fn cursor_on_last_row(&mut self, width: u16) -> bool {
+        let (row, total) = self.cursor_visual_row(width);
+        row + 1 >= total
+    }
+
     /// The mode banner drawn at the right of the `❯` line: `-- INSERT --`,
     /// `-- VISUAL --`, `-- NORMAL --`. Vim leaves normal mode blank; this
     /// names it, because a blank was the one mode a player could not tell
@@ -970,6 +999,27 @@ mod tests {
         compose.press(press(KeyCode::Enter));
         typed(&mut compose, "c");
         assert_eq!(compose.cursor_cell(80), (1, cells(PROMPT.width() + 1)));
+    }
+
+    /// The drawn row, not the logical line: one long line wraps, and the
+    /// cursor on a continuation row is neither the first row nor, from the
+    /// middle, the last (`run::tail_key` reads this).
+    #[test]
+    fn the_visual_row_counts_the_drawn_rows_of_a_wrapped_line() {
+        let mut compose = Compose::over(&"x".repeat(50));
+        // Twenty columns less the prompt: three rows for fifty characters.
+        assert_eq!(compose.cursor_visual_row(20), (2, 3));
+        assert!(!compose.cursor_on_first_row(20));
+        assert!(compose.cursor_on_last_row(20));
+
+        compose.press(press(KeyCode::Char('0')));
+        assert_eq!(compose.cursor_visual_row(20).0, 0);
+        assert!(compose.cursor_on_first_row(20));
+        assert!(!compose.cursor_on_last_row(20));
+
+        // The same draft at a width that fits it is one row, both ends.
+        assert_eq!(compose.cursor_visual_row(120), (0, 1));
+        assert!(compose.cursor_on_first_row(120) && compose.cursor_on_last_row(120));
     }
 
     /// One mapping serves both the compose line and the editor screen.
