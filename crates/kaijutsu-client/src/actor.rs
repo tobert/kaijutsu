@@ -1671,8 +1671,8 @@ impl ActorHandle {
     }
 
     /// Submit the input document, attaching the player's edge of context at
-    /// submit time (docs/issues.md, "Async input should carry the player's
-    /// edge of context"). `None` when the caller cannot say.
+    /// submit time (docs/prompts.md, "The submit verb"). `None` when the
+    /// caller cannot say.
     #[tracing::instrument(skip(self))]
     pub async fn submit_input_with_edge(
         &self,

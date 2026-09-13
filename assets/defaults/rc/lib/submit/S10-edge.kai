@@ -3,7 +3,7 @@
 # notices when the player's edge — the newest block their client had shown
 # at Enter — sits behind the log tail: the model's next turn would otherwise
 # read the submit as an in-order reply to output the player never saw.
-# docs/issues.md, "Async input should carry the player's edge of context".
+# docs/prompts.md, "The submit verb".
 #
 # NOTIFICATION, never (Role::System, BlockKind::Text): this content differs
 # on every submit, and the System+Text slot folds into the CACHED system
@@ -27,7 +27,12 @@ if test "$KJ_EDGE_BLOCK" = "$KJ_LOG_TAIL"; then
   exit 0
 fi
 
-info="$(kj block inspect --json "$KJ_EDGE_BLOCK")"
+# The kernel never validates an edge, so a client with a stale mirror can
+# name a block this context no longer holds; that is silence, not an error.
+info="$(kj block inspect --json "$KJ_EDGE_BLOCK" || true)"
+if test -z "$info"; then
+  exit 0
+fi
 role="$(echo "$info" | jq -r '.role')"
 kind="$(echo "$info" | jq -r '.kind')"
 

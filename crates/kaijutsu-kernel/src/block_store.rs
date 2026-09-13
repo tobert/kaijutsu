@@ -939,6 +939,31 @@ impl BlockStore {
         entry.doc.block_ids_ordered().last().copied()
     }
 
+    /// The newest block in `context_id` other than `exclude` that is not a
+    /// draft: the log tail a submit hands its rc scripts (`SubmitInfo`).
+    /// Ephemeral blocks count. An interrupt marker or a staging notice is
+    /// shown to the player, so a script comparing the player's edge to the
+    /// tail must see the same block on both sides; only an unsent draft,
+    /// which no other player sees, is excluded. Walks ids newest first and
+    /// builds a snapshot only for the candidates it inspects, usually one,
+    /// rather than materializing every block's text.
+    pub fn log_tail(&self, context_id: ContextId, exclude: &BlockId) -> Option<BlockId> {
+        let entry = self.get(context_id)?;
+        entry
+            .doc
+            .block_ids_ordered()
+            .iter()
+            .rev()
+            .filter(|id| *id != exclude)
+            .find(|id| {
+                entry
+                    .doc
+                    .get_block_snapshot(id)
+                    .is_some_and(|b| b.status != Status::Draft)
+            })
+            .copied()
+    }
+
     /// Reserve a fresh `BlockId` under `principal` without inserting — the
     /// materialization path mints its id this way (`cell.played_by` becomes the
     /// principal), then inserts via `insert_from_snapshot_as`. Reserve and insert
@@ -2256,17 +2281,14 @@ impl BlockStore {
         if text.is_empty() {
             return Err(BlockStoreError::EmptyDraft(context_id));
         }
-        // Order matters on a crash: `Draft` is the status hydration refuses, so
-        // clearing `ephemeral` before the status means an interrupted submit
-        // leaves a block that is still hidden from the model rather than one
-        // that is visible to it but unfinished. All three land in the SAME
-        // mutation lock and journal as ONE op: `status`/`ephemeral` live on
+        // All three changes land under one lock and journal as ONE op, so a
+        // crash cannot promote the block without its edge or leave the edge
+        // on a block still marked Draft. `status`/`ephemeral` live on
         // `BlockHeader`, but `edge_block`/`edge_shown` do not, so the full
-        // post-mutation snapshot is journaled instead (mirrors
-        // `set_summary`/`set_stderr`) — a header-only payload can't carry
-        // the edge through oplog replay. Splitting this into separate calls
-        // would let a crash between them promote the block without its
-        // edge, or leave the edge stored on a block still marked Draft.
+        // post-mutation snapshot is journaled (mirrors `set_summary`/
+        // `set_stderr`): a header-only payload cannot carry the edge through
+        // oplog replay. The events follow: `StatusChanged` then
+        // `MetadataChanged`, batched into one change-feed delivery.
         let (ops, version) = {
             let mut entry = self
                 .get_mut(context_id)
@@ -2303,6 +2325,15 @@ impl BlockStore {
             version,
             source: OpSource::Local,
         });
+
+        // The same Done hook `set_status` runs, so a promotion is not a
+        // second path around rich-content validation.
+        if matches!(
+            draft.content_type,
+            ContentType::Abc | ContentType::Svg | ContentType::Diff
+        ) {
+            let _ = self.validate_content_and_attach_errors(context_id, &draft.id);
+        }
 
         Ok((draft.id, text))
     }
@@ -5213,6 +5244,29 @@ mod tests {
             Some("Let me think about this some more"),
             "summary set before the next compaction must survive a restart replay"
         );
+    }
+
+    /// The log tail counts ephemeral blocks the player saw and skips
+    /// drafts and the excluded id.
+    #[test]
+    fn log_tail_skips_drafts_and_the_excluded_id_but_not_ephemeral_blocks() {
+        let (store, _bus, _db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let older = store
+            .insert_block(ctx, None, None, Role::Model, BlockKind::Text, "older", Status::Done, ContentType::Plain)
+            .unwrap();
+        let marker = store
+            .insert_block(ctx, None, None, Role::System, BlockKind::Text, "marker", Status::Done, ContentType::Plain)
+            .unwrap();
+        store.set_ephemeral(ctx, &marker, true).unwrap();
+        let draft = store.get_or_create_draft(ctx, PrincipalId::new()).unwrap();
+
+        assert_eq!(store.log_tail(ctx, &draft), Some(marker));
+        assert_eq!(store.log_tail(ctx, &marker), Some(older));
+        assert_eq!(store.log_tail(ContextId::new(), &draft), None);
     }
 
     /// `edge_block`/`edge_shown` are snapshot-only fields like `summary`

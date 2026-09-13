@@ -48,8 +48,7 @@ pub struct ContextView {
     /// content's character count as drawn then — `None` when the band drew
     /// nothing (`render::live_frame`). This is newer than `last_printed`
     /// while a block is still streaming, and is the player's edge on submit
-    /// when it is set (`docs/issues.md`, "Async input should carry the
-    /// player's edge of context").
+    /// when it is set (`docs/prompts.md`, "The submit verb").
     pub live_tail: Option<(BlockId, u64)>,
 }
 
@@ -92,8 +91,7 @@ impl ContextView {
     /// `last_printed` by construction, since a block only leaves the live
     /// band once it settles and prints. `None` when this context has shown
     /// nothing at all, so the caller sends no edge rather than guess
-    /// (`docs/issues.md`, "Async input should carry the player's edge of
-    /// context").
+    /// (`docs/prompts.md`, "The submit verb").
     pub fn edge(&self) -> Option<InputEdge> {
         if let Some((block, shown)) = self.live_tail {
             Some(InputEdge {
@@ -1129,8 +1127,7 @@ mod tests {
 
     /// The player's edge on submit: a live-band tail beats a printed block,
     /// since the tail is always newer when both are set
-    /// (`docs/issues.md`, "Async input should carry the player's edge of
-    /// context").
+    /// (`docs/prompts.md`, "The submit verb").
     #[test]
     fn a_live_tail_wins_over_last_printed_for_the_edge() {
         let aid = ContextId::new();

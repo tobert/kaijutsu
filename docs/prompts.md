@@ -240,16 +240,15 @@ set, empty rather than absent when the fact does not apply:
 |---|---|
 | `KJ_INPUT_BLOCK` | The user block the draft became (a block key) |
 | `KJ_EDGE_BLOCK` | The newest block the client had shown when the player submitted (a block key), empty when the client said none |
-| `KJ_EDGE_SHOWN` | Characters of `KJ_EDGE_BLOCK` shown, empty unless that block was still streaming |
-| `KJ_LOG_TAIL` | The newest durable block in the log before `KJ_INPUT_BLOCK` (a block key), empty when there is none |
+| `KJ_EDGE_SHOWN` | Characters of `KJ_EDGE_BLOCK` the client held when the player submitted, empty unless that block was still streaming |
+| `KJ_LOG_TAIL` | The newest block in the log other than `KJ_INPUT_BLOCK` and any unsent draft (a block key), ephemeral or not, empty when there is none |
 | `KJ_TURN_LIVE` | `true` or `false` — whether a model turn was running when the submit arrived |
 
 No context type links a `submit` script by default; a type opts in by
 symlink, the way any rc verb does. `assets/defaults/rc/lib/submit/S10-edge.kai`
 is the shipped example: it emits a `(System, Notification)` excerpt of the
 edge block, but only when the player was looking at an older point in the
-conversation than the log tail. See `docs/issues.md`, "Async input should
-carry the player's edge of context" for the design this verb implements.
+conversation than the log tail. See `docs/prompts.md`, "The submit verb" for the design this verb implements.
 
 ## Migration and comparison
 

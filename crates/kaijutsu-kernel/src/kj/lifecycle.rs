@@ -74,8 +74,7 @@ pub struct DriftInfo {
     pub source_model: Option<String>,
 }
 
-/// The facts a chat submit hands its rc scripts. See docs/issues.md,
-/// "Async input should carry the player's edge of context".
+/// The facts a chat submit hands its rc scripts. See docs/prompts.md, /// "The submit verb".
 #[derive(Clone, Debug)]
 pub struct SubmitInfo {
     /// The user block the draft became.
@@ -3417,8 +3416,7 @@ esac
         assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Ok));
     }
 
-    // ── submit verb (docs/issues.md, "Async input should carry the
-    // player's edge of context") ────────────────────────────────────────
+    // ── submit verb (docs/prompts.md, "The submit verb") ─────────────────
 
     #[test]
     fn submit_info_vars_sets_all_names_with_optional_facts() {

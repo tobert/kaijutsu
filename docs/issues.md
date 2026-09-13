@@ -89,6 +89,16 @@ message that knew where the player was looking"). Left:
   message, then "the player wrote the message above while looking at…".
   If a model reads the reference late, move the script's block before the
   input block with `--after`; the facts already carry both ids.
+- **Every chat submit writes a ledger run row**, even for a type with no
+  `submit/` directory: `start_run` fires before the script list is loaded
+  (`kj/lifecycle.rs`). Consistent with the other verbs, but submit is a
+  hotter path than create or fork. Skip the row when no script exists, or
+  accept it once measured.
+- **The edge never rides the change feed.** The promotion emits
+  `StatusChanged` and `MetadataChanged`, and `BlockMetadata` has no edge
+  fields, so a live replica's copy of a promoted block reads no edge until
+  it refetches. Nothing reads a stored edge from a mirror yet. From the
+  kaibo review (deepseek, 2026-09-13).
 
 ## Async completion recovery follow-ups
 

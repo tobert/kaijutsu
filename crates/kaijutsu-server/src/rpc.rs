@@ -7631,13 +7631,7 @@ impl kernel::Server for KernelImpl {
                         input_block: user_block_id,
                         edge_block: edge.map(|e| e.block),
                         edge_shown: edge.and_then(|e| e.shown),
-                        log_tail: documents
-                            .block_snapshots(context_id)
-                            .map_err(|e| capnp::Error::failed(format!("submit: {}", e)))?
-                            .iter()
-                            .rev()
-                            .find(|b| b.id != user_block_id && !b.ephemeral)
-                            .map(|b| b.id),
+                        log_tail: documents.log_tail(context_id, &user_block_id),
                         turn_live: kernel.kernel.turn_in_flight(context_id),
                     };
                     let rc_caller = kaijutsu_kernel::KjCaller {
@@ -11041,8 +11035,8 @@ pub(crate) fn set_block_snapshot(
         builder.set_summary(summary);
     }
 
-    // Set the player's edge (docs/issues.md, "Async input should carry the
-    // player's edge of context") if present — a user block promoted from a
+    // Set the player's edge (docs/prompts.md, "The submit verb") if
+    // present — a user block promoted from a
     // draft that carried one.
     if let Some(ref edge_block) = block.edge_block {
         builder.set_has_edge_block_id(true);

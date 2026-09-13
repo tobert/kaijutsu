@@ -23,7 +23,7 @@ use common::{
 use kaijutsu_client::{
     ContextMirror, FeedEvent, KernelHandle, RpcClient, context_feed_channel,
 };
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{BlockId, ContextId};
 use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, ContentType, InputEdge, Role, Status};
 
 /// Every block in the context, in document order.
@@ -128,8 +128,7 @@ fn chat_submit_promotes_the_draft_rather_than_copying_it() {
 
 /// **The player's edge.** `submitInput` can carry the newest block a client
 /// had shown and how much of it, and the kernel stores both on the promoted
-/// user block (docs/issues.md, "Async input should carry the player's edge
-/// of context").
+/// user block (docs/prompts.md, "The submit verb").
 #[test]
 fn chat_submit_stores_the_players_edge_on_the_promoted_block() {
     run_local(async {
@@ -260,9 +259,169 @@ fn chat_submit_fires_the_submit_verb_with_the_edge_facts() {
             .expect("the submitted block is in the log");
         assert!(facts > user, "the script's block lands after the user block");
         let live = all[facts].content.rsplit("live=").next().unwrap();
+        assert_eq!(live, "false", "no turn was running when the submit arrived");
+    });
+}
+
+/// The facts script, planted into the default type. Returns nothing; the
+/// caller reads the notification it writes.
+async fn plant_facts_script(live_kernel: &kaijutsu_server::SharedKernel) {
+    use kaijutsu_kernel::VfsOps;
+    live_kernel
+        .kernel
+        .vfs()
+        .write_all(
+            std::path::Path::new("/config/rc/default/submit/S10-facts.kai"),
+            b"set -e\nkj block create --role system --kind notification --content \"input=$KJ_INPUT_BLOCK edge=$KJ_EDGE_BLOCK shown=$KJ_EDGE_SHOWN tail=$KJ_LOG_TAIL live=$KJ_TURN_LIVE\"\n",
+        )
+        .await
+        .expect("plant the submit script");
+}
+
+/// The facts notification for `input`, or a panic listing what is there.
+fn facts_for(all: &[BlockSnapshot], input: BlockId) -> String {
+    let prefix = format!("input={} ", input.to_key());
+    all.iter()
+        .find(|b| b.kind == BlockKind::Notification && b.content.starts_with(&prefix))
+        .map(|b| b.content.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "no facts for {prefix:?}; notifications: {:?}",
+                all.iter()
+                    .filter(|b| b.kind == BlockKind::Notification)
+                    .map(|b| b.content.clone())
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+/// `KJ_TURN_LIVE` reports the turn that was running when the submit
+/// arrived, read before this submit's own turn is marked.
+#[test]
+fn chat_submit_reports_a_live_turn() {
+    run_local(async {
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        plant_facts_script(&live_kernel).await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-submit-live").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        // The flag the server reads, set the way a running turn sets it.
+        live_kernel.kernel.mark_turn_begun(context_id);
+        kernel.edit_input(context_id, 0, "while you work", 0).await.unwrap();
+        let input = kernel.submit_input(context_id, false).await.unwrap().block_id;
+
+        let all = blocks(&kernel, context_id).await;
+        let facts = facts_for(&all, input);
+        assert!(facts.ends_with("live=true"), "facts: {facts}");
+    });
+}
+
+/// The log tail is the newest block the player could have seen, whatever
+/// its ephemeral flag: an interrupt marker or a staging notice is shown to
+/// the player, and a script comparing the edge to the tail must see the
+/// same block on both sides. Only another player's draft is excluded.
+#[test]
+fn chat_submit_log_tail_counts_ephemeral_blocks_but_not_drafts() {
+    run_local(async {
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        plant_facts_script(&live_kernel).await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-submit-ephemeral").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        let older = live_kernel
+            .documents
+            .insert_block(
+                context_id,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "older",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let marker = live_kernel
+            .documents
+            .insert_block(
+                context_id,
+                None,
+                None,
+                Role::System,
+                BlockKind::Text,
+                "Interrupted",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        live_kernel
+            .documents
+            .set_ephemeral(context_id, &marker, true)
+            .unwrap();
+        // Another player's unsent draft is never the tail.
+        let other = kaijutsu_types::PrincipalId::new();
+        live_kernel
+            .documents
+            .get_or_create_draft(context_id, other)
+            .expect("another player's draft");
+
+        kernel.edit_input(context_id, 0, "after the marker", 0).await.unwrap();
+        let input = kernel
+            .submit_input_with_edge(context_id, false, Some(InputEdge { block: marker, shown: None }))
+            .await
+            .unwrap()
+            .block_id;
+
+        let all = blocks(&kernel, context_id).await;
+        let facts = facts_for(&all, input);
         assert!(
-            live == "true" || live == "false",
-            "KJ_TURN_LIVE is a bool, got {live:?}"
+            facts.contains(&format!(" tail={} ", marker.to_key())),
+            "the ephemeral marker is the tail, not {}: {facts}",
+            older.to_key()
+        );
+    });
+}
+
+/// A failing submit script leaves an Error block and the submit succeeds:
+/// the message is durable and the turn starts. Rendering is advisory.
+#[test]
+fn chat_submit_survives_a_failing_submit_script() {
+    run_local(async {
+        use kaijutsu_kernel::VfsOps;
+
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        live_kernel
+            .kernel
+            .vfs()
+            .write_all(
+                std::path::Path::new("/config/rc/default/submit/S10-broken.kai"),
+                b"set -e\nexit 3\n",
+            )
+            .await
+            .expect("plant the broken script");
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-submit-broken").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        kernel.edit_input(context_id, 0, "still sent", 0).await.unwrap();
+        let input = kernel
+            .submit_input(context_id, false)
+            .await
+            .expect("a script failure never refuses the submit")
+            .block_id;
+
+        let all = blocks(&kernel, context_id).await;
+        let sent = all.iter().find(|b| b.id == input).expect("the message is durable");
+        assert_eq!(sent.status, Status::Done);
+        assert!(
+            all.iter().any(|b| b.kind == BlockKind::Error && b.content.contains("S10-broken")),
+            "the failure is an Error block naming the script: {:?}",
+            all.iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content.clone()).collect::<Vec<_>>()
         );
     });
 }

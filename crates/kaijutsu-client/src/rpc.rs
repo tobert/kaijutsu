@@ -2753,8 +2753,8 @@ impl KernelHandle {
     }
 
     /// Submit the input document, attaching the player's edge of context at
-    /// submit time (docs/issues.md, "Async input should carry the player's
-    /// edge of context"): the newest block the client had shown, and how
+    /// submit time (docs/prompts.md, "The submit verb"): the newest block
+    /// the client had shown, and how
     /// much of it if it was still streaming. `None` when the client cannot
     /// say — the kernel never guesses one.
     #[tracing::instrument(skip(self), name = "rpc_client.submit_input_with_edge")]
@@ -4202,8 +4202,7 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.summary(s);
     }
 
-    // The player's edge at submit time (docs/issues.md, "Async input should
-    // carry the player's edge of context") — set only on a user block
+    // The player's edge at submit time (docs/prompts.md, "The submit verb") — set only on a user block
     // promoted from a draft that carried one.
     if reader.get_has_edge_block_id() {
         builder = builder.edge_block(parse_block_id(&reader.get_edge_block_id()?)?);
@@ -5571,8 +5570,7 @@ mod tests {
         assert_eq!(roundtrip_snapshot(&plain).summary, None);
     }
 
-    /// The player's edge (docs/issues.md, "Async input should carry the
-    /// player's edge of context") survives Rust→capnp→Rust; absence decodes
+    /// The player's edge (docs/prompts.md, "The submit verb") survives Rust→capnp→Rust; absence decodes
     /// as `None`, not a zeroed `BlockId`.
     #[test]
     fn test_edge_capnp_roundtrip() {
