@@ -83,6 +83,24 @@ impl Keys {
         self.armed
     }
 
+    /// Whether this key belongs to the prefix: the prefix itself, or any
+    /// key while it is armed.
+    ///
+    /// The scrolled transcript asks before it claims a key. Every other key
+    /// snaps it back to the tail (`docs/tui.md`, "Scrolling is copy mode"),
+    /// but a chord that switches seats must not — a context left scrolled is
+    /// still scrolled on return, which is the whole of per-context
+    /// transcripts, and the switch chords are all under the prefix. tmux
+    /// draws the line the same way: copy mode is the pane's, the prefix is
+    /// never the pane's.
+    pub fn claims(&self, key: &KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        self.armed
+            || (key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL))
+    }
+
     /// Interpret one key event.
     pub fn interpret(&mut self, key: KeyEvent) -> Intent {
         // Release events arrive only where the terminal negotiated the
@@ -264,5 +282,30 @@ mod tests {
         let mut ev = press(KeyCode::Char('x'));
         ev.kind = KeyEventKind::Release;
         assert_eq!(keys.interpret(ev), Intent::Ignored);
+    }
+
+    /// The scrolled transcript asks before it claims a key, and the prefix
+    /// is never its. Both halves of the chord are claimed — the `Ctrl+A`
+    /// that arms and the key that follows — so a switch leaves the reader's
+    /// place where it was (`run::act`).
+    #[test]
+    fn the_prefix_is_claimed_from_the_scrolled_transcript_both_halves() {
+        let mut keys = Keys::new();
+        assert!(keys.claims(&ctrl('a')), "the prefix itself");
+        assert!(!keys.claims(&press(KeyCode::Char('j'))), "a vi motion is the transcript's");
+        assert!(!keys.claims(&press(KeyCode::Esc)), "Esc leaves copy mode");
+
+        keys.interpret(ctrl('a'));
+        assert!(keys.claims(&press(KeyCode::Char('1'))), "a seat digit under the armed prefix");
+        assert!(keys.claims(&press(KeyCode::Esc)), "Esc cancels the armed prefix");
+        assert!(keys.claims(&press(KeyCode::Char('j'))), "everything, while armed");
+    }
+
+    #[test]
+    fn a_released_prefix_is_claimed_by_nobody() {
+        let keys = Keys::new();
+        let mut ev = ctrl('a');
+        ev.kind = KeyEventKind::Release;
+        assert!(!keys.claims(&ev));
     }
 }

@@ -159,9 +159,17 @@ impl TuiSession {
     }
 
     /// Like [`spawn`](Self::spawn), with extra environment for the binary —
-    /// the probe hooks `run.rs` reads at startup (`KAIJUTSU_TUI_PROBE_PANIC`).
+    /// the probe hooks `run.rs` reads at startup (`KAIJUTSU_TUI_PROBE_PANIC`)
+    /// and `RUST_LOG`, which raises what reaches [`Self::log_path`].
     pub fn spawn_with_env(server: SocketAddr, key_path: &Path, rows: u16, cols: u16, env: &[(&str, &str)]) -> Self {
         Self::spawn_with(server, key_path, rows, cols, 0, env)
+    }
+
+    /// Where `--log` sends the client's diagnostics: beside the key, so a
+    /// probe can read what the client recorded about itself. The level is
+    /// `warn` unless the probe raised `RUST_LOG`.
+    pub fn log_path(key_path: &Path) -> PathBuf {
+        key_path.with_file_name("tui.log")
     }
 
     /// Like [`spawn`](Self::spawn), but the cursor starts `newlines` rows

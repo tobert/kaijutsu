@@ -296,6 +296,12 @@ fn rows_shifted_up(before: &[String], after: &[String]) -> Option<usize> {
 /// Rows of the transcript area — everything above the band at 24x80.
 const TRANSCRIPT_ROWS: usize = 20;
 
+/// Whether the transcript area holds `needle`. Scoped to the rows above the
+/// band, so the `:` bar and the status row cannot answer for it.
+fn transcript_holds(screen: &vt100::Screen, needle: &str) -> bool {
+    screen.rows(0, screen.size().1).take(TRANSCRIPT_ROWS).any(|l| l.contains(needle))
+}
+
 /// The `line N/M` readout on the band's status row, parsed.
 fn readout(session: &TuiSession) -> Option<(usize, usize)> {
     let rows = session.screen_text();
@@ -1328,5 +1334,235 @@ fn switching_through_the_picker_loads_the_new_contexts_draft() {
         !rows[compose].contains("zzdraftzz"),
         "the previous context's draft is still on the compose line after switching to the fork:\n{}",
         session.dump("after switch")
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// n. Per-context transcripts and the hot set (docs/tui.md, "The buffer")
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The seat digit the status line gives `label` — what `Ctrl+A <digit>`
+/// switches to. The cells read `0 altplace  1 probe*  2 ROOT`
+/// (`status::SeatCell::text`), the flags being `*@!`.
+fn seat_digit(status: &str, label: &str) -> Option<usize> {
+    let tokens: Vec<&str> = status.split_whitespace().collect();
+    tokens.windows(2).find_map(|pair| {
+        let cell = pair[1].trim_end_matches(['*', '@', '!']);
+        (cell == label).then(|| pair[0].parse().ok()).flatten()
+    })
+}
+
+/// A `:kj` line leaves a notice standing where the seat cells go; a shell
+/// statement that runs clears it (`run::handle_colon_line`). The keys queue
+/// behind whatever is still running, so the order holds.
+fn clear_status_notice(session: &TuiSession) {
+    session.send(":!echo seated\r");
+}
+
+/// The seat digit the status line gives `label`, once the row is showing the
+/// seat cells rather than a notice.
+fn seat_of(session: &TuiSession, label: &str) -> usize {
+    let seated = session.wait_until(Duration::from_secs(25), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        rows.last().and_then(|row| seat_digit(row, label)).is_some()
+    });
+    assert!(seated, "{label} never took a seat: {}", session.dump("seat"));
+    let rows = session.screen_text();
+    seat_digit(rows.last().expect("a status row"), label).expect("the seat was just seen")
+}
+
+/// Fork a context named `label` and wait until the status line seats it —
+/// the proof that the kernel made it and this client has ranked it, before
+/// a chord addresses it by seat.
+fn fork_and_seat(session: &TuiSession, label: &str) -> usize {
+    session.send(&format!(":kj fork --name {label}\r"));
+    clear_status_notice(session);
+    seat_of(session, label)
+}
+
+/// One refresh period and then some (`run::REFRESH` is 5 s): long enough
+/// that a round that would have hydrated something has run.
+const REFRESH_DWELL: Duration = Duration::from_secs(7);
+
+/// Assert which side of the picker's `RECENT` divider `label` sits on, then
+/// dismiss the picker. The band is not on the status row, and it is the fact
+/// that decides whether the hot set should have taken the context on.
+fn assert_band(session: &TuiSession, label: &str, active: bool) {
+    session.send("\x01\"");
+    let landed = session.wait_until(Duration::from_secs(25), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        in_active(&rows, label) == Some(active)
+    });
+    assert!(
+        landed,
+        "{label} is not in {}: {}",
+        if active { "ACTIVE" } else { "RECENT" },
+        session.dump("band")
+    );
+    session.send("\x1b");
+    let dismissed = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen_contains_str(screen, "ACTIVE") && screen_contains(screen, '\u{276f}')
+    });
+    assert!(dismissed, "the picker never closed: {}", session.dump("band"));
+}
+
+/// Switch to seat `digit` and wait for the band to be drawn again.
+fn switch_to_seat(session: &TuiSession, digit: usize) {
+    session.send(&format!("\x01{digit}"));
+    let drawn = session.wait_until(Duration::from_secs(10), |screen| screen_contains(screen, '\u{276f}'));
+    assert!(drawn, "the switch to seat {digit} drew nothing: {}", session.dump("switch"));
+}
+
+/// A context's scrolled place is its own: scroll the context on screen,
+/// switch away with `Ctrl+A <digit>`, and come back with `Ctrl+A Ctrl+A` —
+/// the reader is on the same row of the same transcript, and the context
+/// switched to opened on its own live tail (`docs/tui.md`, "The buffer").
+///
+/// The switch chords are under the `Ctrl+A` prefix, which the scrolled
+/// transcript does not claim (`keys::Keys::claims`): a chord that leaves the
+/// context must not snap it to the tail on the way out, or there would be
+/// nothing to come back to.
+#[test]
+fn a_scrolled_context_comes_back_scrolled_after_a_switch() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    fill_transcript(&session);
+    let other = fork_and_seat(&session, "altplace");
+
+    wheel_up(&session);
+    wait_for_scrolled(&session, "after three Up");
+    let place = readout(&session).expect("a readout while scrolled");
+
+    switch_to_seat(&session, other);
+    // A line only the fork has, so "the fork is on screen" is something the
+    // screen can be asked — a blank transcript area is not at its tail, it
+    // is not drawn at all.
+    session.send(":!echo in-fork\r");
+    // In the transcript area, not anywhere on screen: the `:` bar carries
+    // the same words while the line is being typed.
+    let landed = session.wait_until(Duration::from_secs(20), |screen| {
+        transcript_holds(screen, "in-fork")
+    });
+    assert!(landed, "the fork's own transcript never drew: {}", session.dump("altplace"));
+    let at_tail = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen_contains_str(screen, "q leave")
+    });
+    assert!(at_tail, "the fork did not open on its own live tail: {}", session.dump("altplace"));
+
+    session.send("\x01\x01");
+    let back = session.wait_until(Duration::from_secs(10), |screen| {
+        screen.rows(0, screen.size().1).any(|l| l.contains("q leave"))
+    });
+    assert!(back, "the scrolled context did not come back scrolled: {}", session.dump("back"));
+    assert_eq!(
+        readout(&session),
+        Some(place),
+        "the reader landed somewhere else: {}",
+        session.dump("back")
+    );
+
+    // And the fork is still at its tail on return, not carrying the other
+    // context's place.
+    switch_to_seat(&session, other);
+    let still_tail = session.wait_until(Duration::from_secs(5), |screen| {
+        !screen_contains_str(screen, "q leave") && transcript_holds(screen, "in-fork")
+    });
+    assert!(
+        still_tail,
+        "the fork came back scrolled, or without its own transcript: {}",
+        session.dump("altplace again")
+    );
+}
+
+/// One line per context made resident (`run::watch_context`'s
+/// `tracing::debug!`). Counting them tells a hydrate from a redraw, which
+/// nothing on screen can.
+const WATCH_LINE: &str = "watching context feed";
+
+fn watches(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log).map(|text| text.matches(WATCH_LINE).count()).unwrap_or(0)
+}
+
+/// Poll the log until it holds `want` watch lines, and return what it holds
+/// then — `want` on success, fewer on a timeout, so the assertion can say
+/// what it actually found.
+fn wait_for_watches(log: &std::path::Path, want: usize, timeout: Duration) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let seen = watches(log);
+        if seen >= want || std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A context promoted into the ACTIVE ring goes resident on the next
+/// refresh round, with no switch — and a switch to it is then a redraw, not
+/// a hydrate (`docs/tui.md`, "The buffer": *"The ACTIVE ring's contexts stay
+/// resident"*).
+///
+/// The log is what tells the two apart: the screen looks the same either
+/// way, and a timing assertion would measure the box.
+#[test]
+fn a_promoted_context_goes_resident_before_any_switch_to_it() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let session = TuiSession::spawn_with_env(
+        server.addr,
+        &key_path,
+        24,
+        80,
+        &[("RUST_LOG", "warn,kaijutsu_tui=debug")],
+    );
+    let log = TuiSession::log_path(&key_path);
+    wait_for_attach(&session);
+
+    assert_eq!(
+        wait_for_watches(&log, 1, CONNECT),
+        1,
+        "the context on screen is the session's first resident"
+    );
+
+    fork_and_seat(&session, "hotseat");
+    // The band is the fact, not the seat: a fork lands on RECENT, which is
+    // outside the hot set. Read it, then dwell a whole refresh period so a
+    // round that would have hydrated it has had its chance.
+    assert_band(&session, "hotseat", false);
+    std::thread::sleep(REFRESH_DWELL);
+    assert_eq!(
+        watches(&log),
+        1,
+        "a context outside the ring was hydrated:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    session.send(":kj context promote hotseat\r");
+    assert_band(&session, "hotseat", true);
+    // Two refresh rounds: the rank the hot set reads is recomputed on the
+    // 5 s timer, and a cold run can spend one of them building.
+    assert_eq!(
+        wait_for_watches(&log, 2, Duration::from_secs(25)),
+        2,
+        "the promoted context never went resident on its own:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    // A promote moves the seats, so the digit is read again — and the
+    // status row carries the promote's notice until a shell line clears it.
+    clear_status_notice(&session);
+    let hot = seat_of(&session, "hotseat");
+    switch_to_seat(&session, hot);
+    session.send("\x01\x01");
+    switch_to_seat(&session, hot);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        watches(&log),
+        2,
+        "a resident context was hydrated again on a switch:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
     );
 }

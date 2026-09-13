@@ -179,22 +179,46 @@ fn context_type_of(app: &App) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// The one row a context with no view draws.
+///
+/// A context this client is not watching renders nothing at all — no blocks,
+/// no stream — and an empty area reads as an empty conversation. It is two
+/// states, and the status row says which: a background hydrate is still in
+/// flight (`run::hydrating_notice`), or the feed ended and a switch
+/// reattaches (`run::apply_feed`). Either way the transcript is waiting.
+///
+/// `None` for a watched context, whose own blocks are the answer, and for no
+/// context at all.
+fn waiting_line(app: &App) -> Option<Line<'static>> {
+    let id = app.current?;
+    if app.views.contains_key(&id) {
+        return None;
+    }
+    Some(Line::styled(
+        format!("waiting for {}", app.label_for(id)),
+        app.palette.status(),
+    ))
+}
+
 /// The transcript's visible rows: `height` rows of the current context's
 /// blocks, wrapped at `width`, ending at the newest row while the view
-/// follows the tail (`App::transcript`).
+/// follows the tail ([`crate::app::ContextView::transcript`]).
 ///
 /// Two passes over the plan. The first counts each block's rows through the
 /// wrap cache; the second renders only the blocks the window touches, so a
 /// frame costs a screenful of work rather than a context's.
 pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    if let Some(placeholder) = waiting_line(app) {
+        return vec![placeholder];
+    }
     let Some(frame) = plan_rows(app, width) else {
         return Vec::new();
     };
     let PlannedRows { plan, rows, context_type } = frame;
     let height = usize::from(height);
-    if height == 0 {
-        return Vec::new();
-    }
     let palette = app.palette;
 
     let index = crate::copy::RowIndex::new(rows.clone());
@@ -202,7 +226,7 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
     let last_top = total.saturating_sub(height);
     // Off the tail the top row is the reader's anchor, settled against this
     // frame's counts; on it, the newest rows.
-    let start = match app.transcript.scrolled.as_mut() {
+    let start = match app.scrolled_mut() {
         Some(scrolled) => scrolled.settle(&index, height),
         None => last_top,
     };
@@ -246,7 +270,7 @@ pub fn transcript_window(app: &mut App, width: u16, height: u16) -> Vec<Line<'st
     // The reader's line, the marked range and the search matches are painted
     // onto the rows the window drew: the terminal's own cursor is hidden
     // while the view is off the tail.
-    if let Some(scrolled) = &app.transcript.scrolled {
+    if let Some(scrolled) = app.scrolled() {
         scrolled.decorate(start, &mut lines, &palette);
     }
     lines
@@ -477,13 +501,13 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
         // The draft stays drawn and live while the transcript is scrolled —
         // typing snaps, so it never changes there — but the terminal's
         // cursor is hidden, because the keys are the transcript's.
-        (!overlay_holds_keys(app) && app.transcript.follow())
+        (!overlay_holds_keys(app) && app.following())
             .then_some((first.saturating_add(cursor_row), cursor_col))
     };
     // Off the tail the status row is the scrolled view's own: the position,
     // the keys, and the search prompt while one is being typed. One row
     // changes; the rest of the band is what it always was.
-    lines.push(match &app.transcript.scrolled {
+    lines.push(match app.scrolled() {
         Some(scrolled) => scrolled.hint_line(width, &palette),
         None => status_line(&app.status_model(now_millis), width, &palette),
     });
@@ -719,11 +743,21 @@ mod tests {
         (app, id)
     }
 
-    /// Replace the current context's blocks.
+    /// Replace the current context's blocks, the way a rehydrate does:
+    /// the mirror is new, the view — and with it the reader's place in the
+    /// transcript — is the one the context already had.
     fn snapshot(app: &mut App, id: ContextId, blocks: Vec<BlockSnapshot>) {
         let mut mirror = ContextMirror::new(id);
         mirror.apply_snapshot(blocks, 1).expect("snapshot applies");
-        app.views.insert(id, ContextView::new(mirror));
+        match app.views.get_mut(&id) {
+            Some(view) => {
+                view.mirror = mirror;
+                view.seed_collapse();
+            }
+            None => {
+                app.views.insert(id, ContextView::new(mirror));
+            }
+        }
         app.switch_to(id);
     }
 
@@ -757,16 +791,87 @@ mod tests {
         text_of(&band_lines(app, width, 0, false))
     }
 
-    /// A context this client is not watching renders nothing at all — no
-    /// transcript, no stream. It is the state a switch that skipped
-    /// `watch_context` reached, and the state a feed that ended leaves
-    /// behind (`run.rs`'s `apply_feed`, `FeedEvent::Terminated`).
+    /// What a frame over a long context costs — the measurement behind the
+    /// decision not to cap rendered lines (`docs/tui.md`, "The buffer":
+    /// *"a cap on rendered lines per transcript is the first thing to add if
+    /// memory says so"*).
+    ///
+    /// A frame is two passes: [`plan_rows`] touches every block, and the
+    /// window renders only the rows it draws. The plan pass is O(blocks) —
+    /// [`transcript_plan`] clones each block and names its speaker — but the
+    /// wrap cache makes its measurement a render key and a hash lookup, not
+    /// a wrap. Over 5,000 blocks a warm frame is 2.4 ms in release and
+    /// 12.9 ms in debug, against an 80 ms redraw tick that only fires when
+    /// something changed. No cap: it would bound the render pass, which is
+    /// already a screenful, and leave the plan pass — where the cost is —
+    /// exactly as it is.
+    ///
+    /// The bound below is a regression tripwire for a frame that started
+    /// wrapping the whole context again, not the measurement itself.
     #[test]
-    fn an_unwatched_context_renders_no_transcript() {
-        let (mut app, _) = fixture();
-        let unwatched = ContextId::new();
+    fn a_warm_frame_over_five_thousand_blocks_costs_a_screenful_not_a_context() {
+        let (mut app, id) = fixture();
+        let blocks: Vec<BlockSnapshot> = (0..5_000)
+            .map(|n| {
+                block(
+                    id,
+                    n + 1,
+                    BlockKind::Text,
+                    if n % 2 == 0 { Role::User } else { Role::Model },
+                    Status::Done,
+                    &format!("block {n} body text that wraps at eighty columns once or twice over"),
+                )
+            })
+            .collect();
+        snapshot(&mut app, id, blocks);
+        app.screen_rows = 40;
+
+        // The first frame wraps every block; the warm frames that follow are
+        // what a stream of appends actually costs.
+        let _ = transcript_window(&mut app, 80, 40);
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = transcript_window(&mut app, 80, 40);
+        }
+        let per_frame = start.elapsed() / 10;
+        assert!(
+            per_frame < std::time::Duration::from_millis(50),
+            "a warm 5,000-block frame took {per_frame:?}; the plan pass is wrapping again"
+        );
+        eprintln!("warm frame over 5,000 blocks: {per_frame:?}");
+    }
+
+    /// A context this client is not watching has no blocks to draw, so it
+    /// draws one line saying so rather than an empty area that reads as an
+    /// empty conversation. It is the state a switch to a context still being
+    /// hydrated reaches (`run::switch_seat`), and the state a feed that
+    /// ended leaves behind (`run::apply_feed`, `FeedEvent::Terminated`).
+    #[test]
+    fn a_context_with_no_view_draws_one_waiting_row() {
+        let (mut app, watched) = fixture();
+        let mut info = app.contexts.first().cloned().unwrap_or_else(|| {
+            panic!("the fixture seats its context");
+        });
+        info.id = ContextId::new();
+        info.label = "hotseat".to_string();
+        let unwatched = info.id;
+        app.set_contexts(vec![info]);
         app.switch_to(unwatched);
-        assert!(transcript_text(&mut app, 80).is_empty());
+
+        assert_eq!(
+            transcript_text(&mut app, 80),
+            vec!["waiting for hotseat".to_string()],
+            "the area says what it is waiting for"
+        );
+
+        // A watched context answers with its own blocks, never this row.
+        app.switch_to(watched);
+        let rows = transcript_text(&mut app, 80);
+        assert!(!rows.is_empty(), "the fixture has blocks");
+        assert!(
+            !rows.iter().any(|r| r.contains("waiting for")),
+            "a watched context never draws the waiting row: {rows:?}"
+        );
     }
 
     /// The transcript is the whole context, redrawn every frame: a block
@@ -851,7 +956,7 @@ mod tests {
 
         let mut scrolled = crate::copy::Scrolled::entering(5);
         scrolled.scroll(-4);
-        app.transcript.scrolled = Some(scrolled);
+        assert!(app.set_scrolled(scrolled), "the fixture context is watched");
         let window = text_of(&transcript_window(&mut app, 80, 5));
         assert_eq!(window.last().map(String::as_str), Some("line 55"), "got {window:?}");
 
@@ -897,7 +1002,7 @@ mod tests {
         snapshot(&mut app, id, vec![m0.clone(), m1.clone()]);
         let mut scrolled = crate::copy::Scrolled::entering(10);
         scrolled.scroll(-20);
-        app.transcript.scrolled = Some(scrolled);
+        assert!(app.set_scrolled(scrolled), "the fixture context is watched");
         let before = reader_line(&transcript_window(&mut app, 80, 10));
         assert!(before.starts_with("m1-"), "the reader is inside the second block: {before:?}");
 
@@ -923,7 +1028,7 @@ mod tests {
             vec![block(id, 9, BlockKind::Text, Role::Model, Status::Done, &body)],
         );
         // Entered but never settled — what `Ctrl+A [` leaves for the frame.
-        app.transcript.scrolled = Some(crate::copy::Scrolled::entering(8));
+        assert!(app.set_scrolled(crate::copy::Scrolled::entering(8)), "the fixture context is watched");
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
         draw_screen(&mut terminal, &mut app, 0, false).expect("draw");
@@ -948,7 +1053,7 @@ mod tests {
             id,
             vec![block(id, 9, BlockKind::Text, Role::Model, Status::Running, &body)],
         );
-        app.transcript.scrolled = Some(crate::copy::Scrolled::entering(5));
+        assert!(app.set_scrolled(crate::copy::Scrolled::entering(5)), "the fixture context is watched");
         let window = transcript_window(&mut app, 80, 5);
         let reversed: Vec<usize> = window
             .iter()
@@ -991,7 +1096,7 @@ mod tests {
         );
         let mut scrolled = crate::copy::Scrolled::entering(5);
         scrolled.scroll(-60);
-        app.transcript.scrolled = Some(scrolled);
+        assert!(app.set_scrolled(scrolled), "the fixture context is watched");
         let _ = transcript_window(&mut app, 80, 5);
         let edge = app.views[&id].edge().expect("the block was drawn");
         assert_eq!(edge.shown, None, "the window cropped the tail");
@@ -1075,7 +1180,7 @@ mod tests {
         // Off the tail, at the top: the first line is on screen.
         let mut scrolled = crate::copy::Scrolled::entering(26);
         scrolled.jump_to(0);
-        app.transcript.scrolled = Some(scrolled);
+        assert!(app.set_scrolled(scrolled), "the fixture context is watched");
         let head = text_of(&transcript_window(&mut app, 80, 26));
         assert!(head.iter().any(|r| r.contains("cargo build")), "the call's divider: {head:?}");
         assert!(head.iter().any(|r| r.contains("line 0")), "got {head:?}");

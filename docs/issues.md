@@ -184,6 +184,37 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
+## The event loop still awaits the kernel on two feed paths (2026-09-13)
+
+`run.rs`'s Resubscribed arm awaits `rehydrate_context` inside the loop,
+and `switch_seat` awaits `read_input` on the key path (a switch loads
+its draft). The guard test that forbids kernel awaits in `event_loop`
+names neither. Both block keys for one round trip; the switch one is
+deliberate, the rehydrate one should move to a spawned task the way
+`start_hydrate` does. Also: a failed `list_contexts` round leaves the
+rank stale and the hot set frozen, and the app cannot tell "unchanged"
+from "stale".
+
+## ActorHandle has no unsubscribe_context (2026-09-13)
+
+The wire ends a context feed when the observer capability is dropped
+(`kaijutsu_client::rpc::subscribe_context`), and the tui's hot-set
+release drops its receiver so the pump and the observer go. But the
+actor's `context_feeds` map never removes the entry, so a released
+context leaves a dead `Sender` that is re-issued and dies again on
+every reconnect. Bounded and harmless; the fix is an
+`ActorHandle::unsubscribe_context` that removes the entry, in
+`kaijutsu-client`.
+
+## transcript_plan clones every block per frame (2026-09-13)
+
+`render::transcript_plan` clones each block of the current context and
+builds a speaker string on every frame; the wrap cache keeps the wrap
+itself to a hash and a lookup. Measured 2.4 ms per frame in release over
+5,000 blocks (`render::a_warm_frame_over_five_thousand_blocks_costs_a_screenful_not_a_context`,
+50 ms tripwire), so no rendered-lines cap was added. If a long context
+ever feels slow, stop cloning in the plan pass before adding a cap.
+
 ## Arrows cannot scroll from inside a wrapped one-line draft (2026-09-13)
 
 `Up` leaves the tail only from the draft's first visual row and `Down`

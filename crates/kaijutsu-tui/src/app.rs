@@ -14,6 +14,7 @@ use kaijutsu_client::{
 use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId, Role, Status,
 };
+use kaijutsu_viz::layout::Band;
 
 use crate::compose::Compose;
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
@@ -22,6 +23,38 @@ use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 /// The double-tap window, shared by `Ctrl+C Ctrl+C` and the prefix's
 /// `Ctrl+A Ctrl+A` (`docs/input.md`, the app's `Esc Esc` pattern).
 pub const DOUBLE_TAP: Duration = Duration::from_millis(500);
+
+/// Where one context's transcript view sits over its blocks.
+///
+/// One per context, held on its [`ContextView`], so switching seats switches
+/// buffers: a context left scrolled is still scrolled on return and a context
+/// at its tail is still at its tail (`docs/tui.md`, "The buffer").
+///
+/// Following is the live tail: new blocks and streaming text move the view.
+/// Scrolling stops it, and scrolling *is* copy mode — off the tail the
+/// transcript owns vi motions, `v`, `y` and a search, and every other key
+/// snaps it back (`docs/tui.md`, "Scrolling is copy mode"). Off the tail the
+/// place is kept by block and line rather than by row, so a block streaming
+/// above or below the reader does not move what they are reading.
+#[derive(Default)]
+pub struct TranscriptView {
+    /// Where the reader is, while they are off the tail.
+    pub scrolled: Option<crate::copy::Scrolled>,
+}
+
+impl TranscriptView {
+    /// Whether the view is on the live tail, where new blocks move it.
+    pub fn follow(&self) -> bool {
+        self.scrolled.is_none()
+    }
+
+    /// Back to the live tail — `q`, `Esc`, `G`, a yank, or any key the
+    /// scrolled view does not claim. Not a context switch: the place is this
+    /// context's own and waits here for the reader's return.
+    pub fn snap(&mut self) {
+        self.scrolled = None;
+    }
+}
 
 /// One watched context: its mirror, and how this client is showing it.
 pub struct ContextView {
@@ -38,6 +71,11 @@ pub struct ContextView {
     /// on submit (`docs/prompts.md`, "The submit verb"); the outer `None`
     /// means this context has shown nothing at all.
     pub shown_tail: Option<(BlockId, Option<u64>)>,
+    /// Where this context's transcript is: its live tail, or the place the
+    /// reader scrolled to. It is the context's, not the screen's, so it
+    /// survives a switch away and back for as long as the context stays
+    /// resident (`App::hot_set`).
+    pub transcript: TranscriptView,
 }
 
 impl ContextView {
@@ -47,6 +85,7 @@ impl ContextView {
             collapsed: HashMap::new(),
             activity: false,
             shown_tail: None,
+            transcript: TranscriptView::default(),
         };
         view.seed_collapse();
         view
@@ -79,33 +118,6 @@ impl ContextView {
     }
 }
 
-/// Where the transcript view sits over the current context's blocks.
-///
-/// Following is the live tail: new blocks and streaming text move the view.
-/// Scrolling stops it, and scrolling *is* copy mode — off the tail the
-/// transcript owns vi motions, `v`, `y` and a search, and every other key
-/// snaps it back (`docs/tui.md`, "Scrolling is copy mode"). Off the tail the
-/// place is kept by block and line rather than by row, so a block streaming
-/// above or below the reader does not move what they are reading.
-#[derive(Default)]
-pub struct TranscriptView {
-    /// Where the reader is, while they are off the tail.
-    pub scrolled: Option<crate::copy::Scrolled>,
-}
-
-impl TranscriptView {
-    /// Whether the view is on the live tail, where new blocks move it.
-    pub fn follow(&self) -> bool {
-        self.scrolled.is_none()
-    }
-
-    /// Back to the live tail — `q`, `Esc`, `G`, a yank, a context switch, or
-    /// any key the scrolled view does not claim.
-    pub fn snap(&mut self) {
-        self.scrolled = None;
-    }
-}
-
 /// The whole client's state.
 pub struct App {
     /// The local principal's display name, for the role divider.
@@ -129,8 +141,6 @@ pub struct App {
     /// The terminal's row count, from the last size the event loop read.
     /// Sizes what may grow with the screen (the compose cap).
     pub screen_rows: u16,
-    /// Where the transcript view sits over the context's blocks.
-    pub transcript: TranscriptView,
     pub wrap: WrapCache,
     pub quit: bool,
     /// This client's own principal, from `whoami`. It selects which draft
@@ -229,7 +239,6 @@ impl App {
             compose: Compose::new(),
             palette: Palette::builtin(),
             screen_rows: 24,
-            transcript: TranscriptView::default(),
             wrap: WrapCache::new(),
             quit: false,
             principal: None,
@@ -337,6 +346,10 @@ impl App {
     /// Switch to a context, remembering where we came from. Switching to the
     /// context already on screen is a no-op, so `Ctrl+A Ctrl+A` never
     /// collapses onto itself.
+    ///
+    /// The transcript is not touched: each context carries its own
+    /// ([`ContextView::transcript`]), so a context left scrolled comes back
+    /// scrolled and one at its tail comes back at its tail.
     pub fn switch_to(&mut self, id: ContextId) {
         if self.current == Some(id) {
             return;
@@ -346,13 +359,119 @@ impl App {
         if let Some(view) = self.views.get_mut(&id) {
             view.activity = false;
         }
-        // The scrolled place is anchored to blocks of the context being
-        // left, so the new context's transcript opens on its own live tail.
-        self.transcript.snap();
         // The card is the current context's ask; leaving that context sets
         // it aside. The ask stays pending and the refresh raises the card
         // again on return.
         self.ask_card = None;
+    }
+
+    /// The transcript view of the context on screen. `None` when nothing is
+    /// on screen or its feed ended — a context with no [`ContextView`]
+    /// renders nothing at all, so there is no transcript to place a reader
+    /// in.
+    pub fn transcript(&self) -> Option<&TranscriptView> {
+        self.current.and_then(|id| self.views.get(&id)).map(|v| &v.transcript)
+    }
+
+    pub fn transcript_mut(&mut self) -> Option<&mut TranscriptView> {
+        let id = self.current?;
+        self.views.get_mut(&id).map(|v| &mut v.transcript)
+    }
+
+    /// Where the reader is in the transcript on screen, while they are off
+    /// its live tail.
+    pub fn scrolled(&self) -> Option<&crate::copy::Scrolled> {
+        self.transcript().and_then(|t| t.scrolled.as_ref())
+    }
+
+    pub fn scrolled_mut(&mut self) -> Option<&mut crate::copy::Scrolled> {
+        self.transcript_mut().and_then(|t| t.scrolled.as_mut())
+    }
+
+    /// Whether the transcript on screen is on its live tail. A context with
+    /// no view draws nothing, which follows the tail trivially.
+    pub fn following(&self) -> bool {
+        self.transcript().is_none_or(TranscriptView::follow)
+    }
+
+    /// Take the transcript on screen off its live tail. `false` when there is
+    /// no transcript to scroll, so the caller says so rather than dropping
+    /// the reader's place on the floor.
+    pub fn set_scrolled(&mut self, scrolled: crate::copy::Scrolled) -> bool {
+        match self.transcript_mut() {
+            Some(view) => {
+                view.scrolled = Some(scrolled);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Return the transcript on screen to its live tail — `q`, `Esc`, `G`, a
+    /// yank, or any key the scrolled view does not claim.
+    pub fn snap_transcript(&mut self) {
+        if let Some(view) = self.transcript_mut() {
+            view.snap();
+        }
+    }
+
+    /// The hot set: the contexts that stay resident — watched, hydrated, and
+    /// holding their wrapped lines — so that reaching one is a redraw rather
+    /// than a round trip. It is the context on screen, the one `Ctrl+A
+    /// Ctrl+A` goes back to, and every seat on the ACTIVE ring
+    /// (`docs/tui.md`, "The buffer").
+    ///
+    /// Everything else is hydrated on switch and released once it leaves
+    /// both the ring and the screen. The current and previous contexts are
+    /// members by construction, so a release can never take the transcript
+    /// out from under the reader or break `Ctrl+A Ctrl+A`.
+    pub fn hot_set(&self) -> HashSet<ContextId> {
+        let mut hot: HashSet<ContextId> = self
+            .seats
+            .iter()
+            .filter(|seat| seat.band == Band::Active)
+            .map(|seat| seat.context_id)
+            .collect();
+        hot.extend(self.current);
+        hot.extend(self.previous);
+        hot
+    }
+
+    /// Hot contexts this client is not watching yet, current first and then
+    /// in rank order — what the caller hydrates through the same
+    /// `watch_context` path a switch takes.
+    pub fn unwatched_hot(&self) -> Vec<ContextId> {
+        let hot = self.hot_set();
+        let mut out: Vec<ContextId> = Vec::new();
+        let ordered = self
+            .current
+            .into_iter()
+            .chain(self.previous)
+            .chain(self.seats.iter().map(|seat| seat.context_id));
+        for id in ordered {
+            if hot.contains(&id) && !self.views.contains_key(&id) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// The watched contexts that have left the hot set — what a reconcile
+    /// releases. Asking and releasing are separate so the caller can stop a
+    /// context's feed before dropping the view it delivers into
+    /// (`run::release_cold`).
+    pub fn cold_contexts(&self) -> Vec<ContextId> {
+        let hot = self.hot_set();
+        self.views.keys().copied().filter(|id| !hot.contains(id)).collect()
+    }
+
+    /// Drop one context's view — the mirror, the collapse map and the
+    /// transcript's own place — and its wrapped lines. The feed that
+    /// delivers into it belongs to the caller that started it
+    /// (`run::Feeds`), and is stopped first.
+    pub fn release(&mut self, id: ContextId) {
+        self.views.remove(&id);
+        self.wrap.forget_context(id);
     }
 
     /// Who a block's divider names: the local user for their own text, the
@@ -743,6 +862,132 @@ mod tests {
         let mut app = App::new("amy");
         app.set_contexts(vec![a, b]);
         (app, aid, bid)
+    }
+
+    /// Watch a context with an empty mirror, the way `run::watch_context`
+    /// leaves one behind.
+    fn watch(app: &mut App, id: ContextId) {
+        app.views.insert(id, ContextView::new(ContextMirror::new(id)));
+    }
+
+    /// One wrapped block in the cache, belonging to `context`.
+    fn wrap_one(app: &mut App, context: ContextId) {
+        let blk = block(context, 1, BlockKind::Text, Role::Model);
+        let view = BlockView {
+            speaker: "claude",
+            context_type: "coder",
+            stamp: "14:02:11",
+            show_divider: false,
+            tool: None,
+            arg: None,
+            lineage: Vec::new(),
+            collapsed: false,
+            local_ctx: Some(context),
+        };
+        let palette = app.palette;
+        let _ = app.wrap.lines(&blk, &view, 40, &palette);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // The hot set (docs/tui.md, "The buffer")
+    // ────────────────────────────────────────────────────────────────────
+
+    /// The hot set is the ACTIVE ring plus the two contexts a key can reach
+    /// without the rank: the one on screen and the one `Ctrl+A Ctrl+A` goes
+    /// back to. A RECENT seat nobody is looking at is not in it.
+    #[test]
+    fn the_hot_set_is_the_active_ring_plus_the_screen_and_the_toggle() {
+        let mut active_a = ctx("kaijutsu");
+        active_a.promoted_at = Some(1_000);
+        let mut active_b = ctx("kaish");
+        active_b.promoted_at = Some(2_000);
+        let seen = ctx("onscreen");
+        let toggle = ctx("previous");
+        let cold = ctx("recent");
+        let (a, b, seen_id, toggle_id, cold_id) =
+            (active_a.id, active_b.id, seen.id, toggle.id, cold.id);
+
+        let mut app = App::new("amy");
+        app.set_contexts(vec![active_a, active_b, seen, toggle, cold]);
+        app.switch_to(toggle_id);
+        app.switch_to(seen_id);
+
+        assert_eq!(
+            app.hot_set(),
+            HashSet::from([a, b, seen_id, toggle_id]),
+            "the ring, the screen and the toggle — and nothing else"
+        );
+        assert!(!app.hot_set().contains(&cold_id), "a RECENT seat is not resident");
+    }
+
+    /// A context that leaves the ring without being on screen is released:
+    /// its view goes and its wrapped lines go with it.
+    #[test]
+    fn a_context_leaving_the_ring_is_released_with_its_wraps() {
+        let mut active = ctx("kaijutsu");
+        active.promoted_at = Some(1_000);
+        let mut leaving = ctx("demoted");
+        leaving.promoted_at = Some(2_000);
+        let (active_id, leaving_id) = (active.id, leaving.id);
+        let mut app = App::new("amy");
+        app.set_contexts(vec![active.clone(), leaving.clone()]);
+        watch(&mut app, active_id);
+        watch(&mut app, leaving_id);
+        wrap_one(&mut app, active_id);
+        wrap_one(&mut app, leaving_id);
+        app.switch_to(active_id);
+        assert!(app.cold_contexts().is_empty(), "both are on the ring");
+
+        // The demote lands on the next round's rank.
+        leaving.promoted_at = None;
+        leaving.demoted_at = Some(3_000);
+        app.set_contexts(vec![active, leaving]);
+        let cold = app.cold_contexts();
+        assert_eq!(cold, vec![leaving_id]);
+        for id in cold {
+            app.release(id);
+        }
+        assert!(!app.views.contains_key(&leaving_id), "its view went");
+        assert_eq!(app.wrap.len(), 1, "its wrapped lines went with it");
+        assert!(app.views.contains_key(&active_id), "the ring's own seat stayed");
+    }
+
+    /// Releasing never touches the context on screen or the one behind it,
+    /// however the rank moves — neither is ever on a seat here.
+    #[test]
+    fn releasing_never_drops_the_screen_or_the_toggle() {
+        let seen = ctx("onscreen");
+        let toggle = ctx("previous");
+        let (seen_id, toggle_id) = (seen.id, toggle.id);
+        let mut app = App::new("amy");
+        // An empty rank: nothing is on a seat at all.
+        app.set_contexts(vec![]);
+        watch(&mut app, seen_id);
+        watch(&mut app, toggle_id);
+        app.switch_to(toggle_id);
+        app.switch_to(seen_id);
+
+        assert!(app.cold_contexts().is_empty(), "neither is cold");
+        assert!(app.views.contains_key(&seen_id));
+        assert!(app.views.contains_key(&toggle_id));
+    }
+
+    /// A context promoted into the ring is named for the next watch, once
+    /// and not again after it is watched.
+    #[test]
+    fn a_context_entering_the_ring_is_named_for_a_watch() {
+        let mut entering = ctx("promoted");
+        entering.promoted_at = Some(1_000);
+        let seen = ctx("onscreen");
+        let (entering_id, seen_id) = (entering.id, seen.id);
+        let mut app = App::new("amy");
+        app.set_contexts(vec![entering, seen]);
+        watch(&mut app, seen_id);
+        app.switch_to(seen_id);
+
+        assert_eq!(app.unwatched_hot(), vec![entering_id], "the ring's new seat");
+        watch(&mut app, entering_id);
+        assert!(app.unwatched_hot().is_empty(), "watched once, not again");
     }
 
     #[test]

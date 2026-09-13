@@ -138,7 +138,9 @@ The transcript area follows new blocks while the view is at the tail
 scrolled. While scrolled, the transcript owns copy mode's own keys (vi
 motions, `/` and `?`, `n`/`N`, `v` marks and `y` or `Enter` copies, `q`,
 `Esc`, `G`). **Every other key snaps the view back to the tail and goes
-to the draft.** Amy: *"live typing should snap back to the tail, I often
+to the draft.** The `Ctrl+A` prefix and its chord stand aside and do not
+snap, so a seat switch keeps the scrolled place and `Ctrl+A [` while
+scrolled is a no-op (`Keys::claims`). Amy: *"live typing should snap back to the tail, I often
 hit space just to do that"* — the habit is wezterm's
 `scroll_to_bottom_on_input`, so `Space` is the snap key here and no longer
 starts a mark; `v` does, the vim spelling copy mode already carried. The
@@ -158,6 +160,22 @@ when it leaves the ring and the screen. A resident transcript holds the
 whole context, so search crosses all of it; nothing is paged from the
 kernel by scroll position in the first cut, and a cap on rendered lines
 per transcript is the first thing to add if memory says so.
+
+**Landed 2026-09-13.** The scrolled state (`TranscriptView`) lives on each
+`ContextView`, not on the screen, so switching seats keeps each context's
+own place and mark. The hot set — `App::hot_set` — is the current context,
+the previous context (`Ctrl+A Ctrl+A`), and every ACTIVE-ring seat; those
+stay resident (feed watched, mirror hydrated, wrap entries kept). After
+every refresh round the loop releases contexts that left the hot set
+(forwarder aborted, `ContextView` dropped, `WrapCache::forget_context`) and
+hydrates every missing hot context in one spawned task per round, each
+landing through `adopt`; a switch releases too. `Feeds::hydrating` is the
+in-flight guard, so a switch mid-hydrate waits rather than subscribing
+twice. The wire has no unsubscribe — dropping the receiver ends the feed.
+No cap landed on rendered lines: a warm frame over 5,000 blocks measured
+2.4 ms in release, 12.9 ms in debug (`render.rs`'s
+`a_warm_frame_over_five_thousand_blocks_costs_a_screenful_not_a_context`),
+so the plan pass stays cheap enough without one.
 
 ### What owning the screen lets us use
 
@@ -222,8 +240,8 @@ view for both, a long result renders whole and the transcript scrolls
    `PageUp`, and `Ctrl+A [` all enter it; the tail returns on `q`/`Esc`/`G`.
    `?1007` sent. Probe: wheel-as-arrows scrolls and a typed key at the tail
    still edits the draft.
-4. **Per-context buffers and the hot set.** Switching seats switches
-   transcripts; the ACTIVE ring stays resident.
+4. **Per-context buffers and the hot set.** Landed 2026-09-13. Switching
+   seats switches transcripts; the ACTIVE ring stays resident.
 5. **Terminal features** from the list above, one at a time, focus and
    title first.
 
@@ -791,7 +809,13 @@ Rules the figure carries:
   there** — `Space` most of all (Amy: *"I often hit space just to do
   that"*, the habit wezterm calls `scroll_to_bottom_on_input`); `v` marks
   now, so `Space` no longer does. See "Scrolling is copy mode" for the
-  decision.
+  decision. The `Ctrl+A` prefix is the exception: both halves of the chord
+  are claimed away from the scrolled transcript (`Keys::claims`), so a
+  seat switch never snaps.
+- **Each context keeps its own scrolled place across a switch** — the
+  scrolled state lives on that context's `ContextView`, not on the screen,
+  so a context left scrolled is still scrolled on return and one left at
+  its tail is still at its tail (`docs/tui.md`, "The buffer").
 - **`Ctrl+A ]` pastes the last yank into the draft** at the cursor, as one
   edit, in whatever mode the draft is in — tmux's `paste-buffer`. The
   buffer is the tui's own, so it never needs aligning with vim's registers
@@ -832,6 +856,8 @@ Rules the figure carries:
 - `j`/`k` move, `Tab` hops sections, `Enter` switches, `p d z a c` are the
   placement verbs unchanged, `/` filters, `h` opens the horizon as a filtered
   list. Digits address the ACTIVE seats, as in the well.
+- A switch through the picker keeps each context's own scrolled place, like
+  every switch (`docs/tui.md`, "The buffer").
 - The live tail is the context's own last line (`live.rs` tail buffers,
   fed by the kernel-wide `ServerEvent` stream). `●` is chatter now, `@` is
   activity since you last looked — screen's monitor flags.
@@ -1113,7 +1139,7 @@ ledger) ends with its own key line for the same reason.
 | `v` | mark the reader's line |
 | `y`, `Enter` | copy the marked range (or the reader's line), then the tail |
 | `q`, `Esc` | back to the live tail |
-| any other key | snap to the tail and handle it there |
+| any other key | snap to the tail and handle it there (except `Ctrl+A` and its chord, which switch seats without snapping) |
 
 **A key never waits on the kernel.** The rank, the pending asks and the
 tracks are fetched on their own task (`refresh.rs`) and folded into the
