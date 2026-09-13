@@ -124,6 +124,15 @@ pub struct InputSubmitRequest {
     #[serde(default)]
     #[schemars(description = "Input mode: 'chat' (default) or 'shell'.")]
     pub mode: Option<String>,
+    /// The player's edge: the newest block this client had read when it
+    /// submitted, as a block key from block_list. Omit when you cannot say.
+    #[serde(default)]
+    #[schemars(description = "The newest block you had read when you submitted (a block_id from block_list). Stored on the message so the model knows what you were replying to; omit when you cannot say.")]
+    pub edge_block: Option<String>,
+    /// Characters of `edge_block` read, when that block was still streaming.
+    #[serde(default)]
+    #[schemars(description = "Characters of edge_block you had read, only when that block was still streaming.")]
+    pub edge_shown: Option<u64>,
 }
 
 // ============================================================================

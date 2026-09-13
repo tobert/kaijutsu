@@ -2432,6 +2432,19 @@ impl KaijutsuMcp {
             Ok(id) => id,
             Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
         };
+        // A malformed edge is refused, never dropped: the caller said it
+        // could say where it was, so silently sending none would lie.
+        let edge = match req.edge_block.as_deref() {
+            None => None,
+            Some(key) => match kaijutsu_types::BlockId::from_key(key) {
+                Some(block) => Some(kaijutsu_types::InputEdge { block, shown: req.edge_shown }),
+                None => {
+                    return CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Error: edge_block {key:?} is not a block key (use a block_id from block_list)"
+                    ))]);
+                }
+            },
+        };
 
         match &self.backend {
             Backend::Local(_store) => {
@@ -2439,7 +2452,7 @@ impl KaijutsuMcp {
             }
             Backend::Remote(remote) => {
                 let is_shell = req.mode.as_deref() == Some("shell");
-                match remote.actor.submit_input(ctx_id, is_shell).await {
+                match remote.actor.submit_input_with_edge(ctx_id, is_shell, edge).await {
                     Ok(result) => CallToolResult::success(vec![ContentBlock::text(
                         serde_json::json!({
                             "success": true,
@@ -3330,6 +3343,27 @@ mod tests {
     // Input Document Tools (Local mode)
     // =========================================================================
 
+    /// A malformed `edge_block` is refused before any backend is consulted:
+    /// the caller claimed to know where it was, and sending no edge instead
+    /// would silently drop the claim.
+    #[tokio::test]
+    async fn submit_input_refuses_a_malformed_edge_key() {
+        let mcp = KaijutsuMcp::new();
+        let result = mcp
+            .submit_input(Parameters(InputSubmitRequest {
+                context_id: Some(ContextId::new().to_string()),
+                mode: None,
+                edge_block: Some("not-a-block-key".to_string()),
+                edge_shown: Some(3),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            call_result_text(&result).contains("edge_block"),
+            "the refusal names the field: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_input_local_requires_context() {
         let mcp = KaijutsuMcp::new();
@@ -3380,6 +3414,8 @@ mod tests {
             .submit_input(Parameters(InputSubmitRequest {
                 context_id: Some(hex.clone()),
                 mode: None,
+                edge_block: None,
+                edge_shown: None,
             }))
             .await;
 
