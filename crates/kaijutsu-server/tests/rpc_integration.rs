@@ -418,8 +418,11 @@ fn test_context_last_activity_at_populated_after_block_op() {
         // the point of this test is the *advance* past t0, not a bare `None`.
         let before_stamp = found_before.last_activity_at;
 
-        // Guarantee millis-resolution separation from `before_stamp`.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // `journal_op` re-stamps a context at most once a second
+        // (`ACTIVITY_STAMP_INTERVAL_MS` in block_store.rs); the create
+        // lifecycle just stamped it, so wait out the interval or the probe
+        // op rides on that stamp and never moves it.
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
         let t0 = kaijutsu_types::now_millis();
         kernel
             .shell_execute("echo activity-stamp-probe", context_id, true)

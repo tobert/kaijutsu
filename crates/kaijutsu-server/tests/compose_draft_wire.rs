@@ -16,7 +16,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{connect_client, run_local, start_server, start_server_with_mock_llm};
+use common::{
+    connect_client, run_local, seed_turn_identity, start_server,
+    start_server_with_mock_llm_kernel_handle,
+};
 use kaijutsu_client::{
     ContextMirror, FeedEvent, KernelHandle, RpcClient, context_feed_channel,
 };
@@ -81,10 +84,14 @@ fn typing_creates_an_ephemeral_draft_block_at_the_end() {
 #[test]
 fn chat_submit_promotes_the_draft_rather_than_copying_it() {
     run_local(async {
-        let addr = start_server_with_mock_llm().await;
+        // Submit starts a model turn, which needs a performer and a distinct
+        // reviewer; wire creation leaves the performer unset and an ephemeral
+        // kernel has no sheet for the default reviewer.
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;
         let context_id = open_context(&kernel, "draft-submit").await;
+        seed_turn_identity(&live_kernel, context_id);
 
         kernel
             .edit_input(context_id, 0, "what did we ship?", 0)

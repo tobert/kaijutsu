@@ -131,6 +131,34 @@ pub async fn start_server_with_mock_llm_kernel_handle(
     (addr, kernel)
 }
 
+/// Arrange the identity a model turn needs on an ephemeral kernel: a sheet
+/// for the shipped default reviewer (`amy`) and a performer assigned to
+/// `context`. The reviewer is left unset on the context so the turn resolves
+/// it through the default path, the way a fresh context does.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub fn seed_turn_identity(
+    kernel: &kaijutsu_server::SharedKernel,
+    context: kaijutsu_types::ContextId,
+) -> kaijutsu_types::PrincipalId {
+    use kaijutsu_kernel::kernel_db::CharacterRow;
+    let sheet = |name: &str| CharacterRow {
+        principal_id: kaijutsu_types::PrincipalId::new(),
+        name: name.to_string(),
+        created_at: kaijutsu_types::now_millis() as i64,
+        retired_at: None,
+        handoff_ctx: None,
+    };
+    let performer = sheet("mock-performer");
+    let db = kernel.kernel_db.lock();
+    db.insert_character(&sheet("amy"))
+        .expect("seed the default reviewer's character sheet");
+    db.insert_character(&performer)
+        .expect("seed the performer's character sheet");
+    db.update_context_review(context, Some(performer.principal_id), None)
+        .expect("assign the performer");
+    performer.principal_id
+}
+
 /// Like `start_server_with_mock_llm`, but the mock backend's registry-default
 /// model is caller-chosen instead of hardcoded to `"mock-model"`.
 ///
