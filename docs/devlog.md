@@ -1296,3 +1296,34 @@ The source audit also corrected a lifecycle assumption: a pending tool gate
 does not force the model loop to stop. It receives the pending result and can
 write a handoff. A stable receipt and a separate completion record keep that
 original model receipt immutable.
+
+## The message that knew where the player was looking (September 13)
+
+Amy: "the ui knows what the user is seeing when they send an async message.
+we also know wall clock time but that's not what matters; the context at the
+time the user sent it." A message sent while a turn runs lands after every
+block the model produced meanwhile, and the model reads it as a reply to its
+newest output. Wall clock cannot fix that; the reference the model needs is
+a position in the conversation.
+
+The client is the authority on what it showed. `submitInput` takes an
+optional edge, the newest block the client had shown plus a character count
+when that block was still streaming, and the kernel stores it on the user
+block in the same journal op as the draft promotion. The kernel never
+guesses or validates an edge, and an older client sends none. The rendering
+is not kernel code: a `submit` rc verb fires awaited inline after the
+promotion with the input block, the edge, the log tail, and turn liveness
+as variables, so every experiment is a script edit. Amy on turn ordinals:
+"agreed on the ordinals, it would be difficult to do well. the block id you
+suggest should be sufficient, an rc script can decide what to do with it
+(make up an ordinal that's good enough, give a rough %, etc.)". The shipped
+example emits one notification only when the edge sits behind the tail, and
+no type links it by default. The tui sends the live band's tail when it drew
+one, else the last block printed.
+
+Two lessons. A lane that can only test a kaish script against a stub `kj`
+has not tested it; the wire test that links the seeded script into a type
+and asserts the exact rendered line is what proved `jq`, `cut`, and `kj
+block read` behave. And a `case` pattern in kaish never expands a variable,
+so the script compares with `test`.
+

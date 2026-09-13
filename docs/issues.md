@@ -66,76 +66,29 @@ never writes the durable `collapsed` flag; the app's fold delay counts from
 the turn ending, not from the block settling, which also matches the tui
 pane's lifetime.
 
-## Async input should carry the player's edge of context (Amy, 2026-09-12)
+## The player's edge: what is still open (2026-09-13)
 
-Amy: *"the ui knows what the user is seeing when they send an async message.
-we also know wall clock time but that's not what matters; the context at the
-time the user sent it, so what if we look at what blocks are on the screen at
-the time, and share perhaps a summary or the relative turn id if we ever
-provide that (should we?), so when the message lands the model will have a
-reference to the user's edge of context at the time they hit enter."*
+The kernel, wire, `submit` rc verb, shipped example, and the tui landed on
+2026-09-13 (`docs/prompts.md`, "The submit verb"; `docs/devlog.md`, "The
+message that knew where the player was looking"). Left:
 
-**The problem.** A message submitted while a turn is running lands in the
-durable log at arrival and reaches the model through the mailbox on its next
-request, after every block the model produced meanwhile; snapshot repair may
-also move it past a tool pair (`docs/conversation-session.md`). The model
-reads it as a reply to its newest output. The player wrote it against
-whatever their client had shown at the moment they pressed Enter, which can
-be several blocks and a whole thinking pane earlier. Wall clock does not fix
-this: the reference the model needs is a position in the conversation, not a
-time.
-
-**The plan** (Amy, later the same day: *"maybe it can be an rc script
-anyways that fires, then we can defer the experiments, just make it
-possible"*). The kernel carries the fact and fires a script; the rendering
-is rc, so every experiment is a script edit and no kernel change.
-
-- The client attaches the player's **edge** to `submitInput`: the newest
-  block it had shown when the player submitted, as a `BlockId`, plus the
-  character count shown of that block if it was still streaming. The tui
-  already tracks this (`last_printed` in `crates/kaijutsu-tui/src/app.rs`,
-  plus the live band's streaming block); the app reads its viewport tail,
-  which is older than the log tail when the player has scrolled up. A client
-  that cannot say sends nothing; the kernel never guesses an edge.
-- The kernel stores the edge on the user block it creates, as columns, not a
-  JSON blob. It is a durable fact about that block, rides through fork, and
-  shows in `kj block inspect`.
-- A new rc verb, `submit`, fires after the user block is durable, the way
-  `drift` fires after a drift block lands (`kj/drift.rs`, `run_rc_lifecycle`
-  with `DriftInfo`). Its scripts get the facts as variables:
-  `KJ_INPUT_BLOCK` (the user block), `KJ_EDGE_BLOCK` and `KJ_EDGE_SHOWN`
-  (empty when the client sent none), `KJ_LOG_TAIL` (the newest block at
-  arrival, so a script can see the gap without a query), and `KJ_TURN_LIVE`
-  (whether a turn was running). A script renders whatever it likes as a
-  `(System, Notification)` block through `kj block create --kind
-  notification`, as `S25-datetime.kai` does, and the mailbox folds it before
-  the model's next request. No script, no-op.
-- The verb joins `RC_VERBS` in `kj/lifecycle.rs`, which feeds both the
-  firing gate and the path validator; `kj rc list` grows the verb. It runs
-  awaited inline, as `drift` does, so the notification is durable before
-  `submitInput` returns and cannot race the next request; the cost is the
-  script's runtime on the submit path, zero when no script exists.
-- Shipped scripts: one example under `lib/submit/` that emits the excerpt
-  (role, kind, first line of the edge block) only when the edge is older than
-  the log tail. No type links it by default; a type opts in by symlink. The
-  ordinal and summary experiments are further scripts, or edits to this one.
-
-**Open, for Amy.**
-
-- Turn numbering (*"the relative turn id if we ever provide that — should
-  we?"*). A number the model can cite needs the hydrated conversation to
-  carry visible ordinals, a prompt-composition change with its own costs:
-  ordinals shift when history is edited or excluded, and every shift moves
-  the cache breakpoints. **Decided** (Amy, 2026-09-13): *"agreed on the
-  ordinals, it would be difficult to do well. the block id you suggest
-  should be sufficient, an rc script can decide what to do with it (make up
-  an ordinal that's good enough, give a rough %, etc.)"* The kernel carries
-  the block id only; no visible ordinals in hydration.
-- Enter or compose-start. Amy said Enter. A long draft typed across a minute
-  of streaming may want the earlier point, and the client knows both. Start
-  with Enter; record compose-start only if it turns out to matter.
-- The Bevy app is Fable's on moltar. The wire field lands first so both
-  clients can attach it; the tui goes first because its source exists.
+- **The Bevy app sends no edge.** `submit_input` still compiles and sends
+  none. The app's edge is the newest block its viewport had shown at Enter,
+  older than the log tail when scrolled up, with the character count when
+  that block was still streaming. `ActorHandle::submit_input_with_edge` is
+  the call. Handed to the moltar session through the exomemory daily.
+- **No type links the example.** `lib/submit/S10-edge.kai` renders the
+  excerpt; a type opts in by symlink into its `submit/` directory. Decide
+  which shipped types should link it once it has been watched live; the
+  ordinal and percentage experiments Amy named are further scripts against
+  the same variables, not kernel work.
+- **Enter, not compose-start.** A long draft typed across a minute of
+  streaming may want the earlier point; the client knows both. Record
+  compose-start only if it turns out to matter.
+- **The notification lands after the message.** Hydration reads the user
+  message, then "the player wrote the message above while looking at…".
+  If a model reads the reference late, move the script's block before the
+  input block with `--after`; the facts already carry both ids.
 
 ## Async completion recovery follow-ups
 
