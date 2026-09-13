@@ -267,6 +267,127 @@ fn chat_submit_fires_the_submit_verb_with_the_edge_facts() {
     });
 }
 
+/// **The shipped example renders the edge.** `lib/submit/S10-edge.kai`,
+/// linked into a type the way an operator opts in, turns the facts into one
+/// notification naming the edge block's role, kind, first line, key, and
+/// characters shown. Run against the real kernel, not a stub `kj`: it is the
+/// kaish that reads `kj block read` and `jq` output that this pins.
+#[test]
+fn chat_submit_example_script_renders_the_edge_excerpt() {
+    run_local(async {
+        use kaijutsu_kernel::VfsOps;
+
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let vfs = live_kernel.kernel.vfs();
+        let body = vfs
+            .read_all(std::path::Path::new("/config/rc/lib/submit/S10-edge.kai"))
+            .await
+            .expect("the shipped example is seeded");
+        vfs.write_all(std::path::Path::new("/config/rc/default/submit/S10-edge.kai"), &body)
+            .await
+            .expect("link the example into the default type");
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-submit-example").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        let settled = |content: &str| {
+            live_kernel
+                .documents
+                .insert_block(
+                    context_id,
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    content,
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .expect("insert a settled block")
+        };
+        let first = settled("The plan has three steps.\nSecond line never shows.");
+        let _second = settled("second");
+
+        kernel.edit_input(context_id, 0, "wait, which plan?", 0).await.unwrap();
+        let edge = InputEdge { block: first, shown: Some(12) };
+        kernel
+            .submit_input_with_edge(context_id, false, Some(edge))
+            .await
+            .unwrap();
+
+        let all = blocks(&kernel, context_id).await;
+        let rendered = all
+            .iter()
+            .filter(|b| b.kind == BlockKind::Notification)
+            .find(|b| b.content.starts_with("The player wrote the message above"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no rendered edge; blocks: {:?}",
+                    all.iter().map(|b| (b.kind, b.content.clone())).collect::<Vec<_>>()
+                )
+            });
+        let expected = format!(
+            "The player wrote the message above while looking at an earlier point in this context: model text \"The plan has three steps.\" (block {}, 12 characters shown). Blocks after it had not been read.",
+            first.to_key()
+        );
+        assert_eq!(rendered.content, expected);
+    });
+}
+
+/// The example stays silent when the player was looking at the log tail.
+#[test]
+fn chat_submit_example_script_is_silent_at_the_tail() {
+    run_local(async {
+        use kaijutsu_kernel::VfsOps;
+
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let vfs = live_kernel.kernel.vfs();
+        let body = vfs
+            .read_all(std::path::Path::new("/config/rc/lib/submit/S10-edge.kai"))
+            .await
+            .expect("the shipped example is seeded");
+        vfs.write_all(std::path::Path::new("/config/rc/default/submit/S10-edge.kai"), &body)
+            .await
+            .expect("link the example into the default type");
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-submit-tail").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        let tail = live_kernel
+            .documents
+            .insert_block(
+                context_id,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "tail",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .expect("insert a settled block");
+
+        kernel.edit_input(context_id, 0, "ok", 0).await.unwrap();
+        kernel
+            .submit_input_with_edge(context_id, false, Some(InputEdge { block: tail, shown: None }))
+            .await
+            .unwrap();
+
+        let all = blocks(&kernel, context_id).await;
+        assert!(
+            !all.iter().any(|b| b.content.starts_with("The player wrote the message above")),
+            "an edge at the tail renders nothing"
+        );
+        assert!(
+            !all.iter().any(|b| b.kind == BlockKind::Error),
+            "the script exits cleanly: {:?}",
+            all.iter().filter(|b| b.kind == BlockKind::Error).map(|b| b.content.clone()).collect::<Vec<_>>()
+        );
+    });
+}
+
 /// A whitespace-only draft is refused **without being cleared** — a stray Enter
 /// neither sends nothing nor destroys what is there.
 #[test]
