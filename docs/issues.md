@@ -191,12 +191,11 @@ conversations under `docs/conversation-session.md`.
 500+ live contexts it receives every block event, including
 `report_audio_inventory` bumping a revision every 10 s. `run.rs:782`
 (`mirror_ops`) awaits one `edit_input` per vi op with no per-RPC timeout —
-the only timeout is `connect_timeout` (`main.rs:60`) — so under IO stall
-typing blocks rather than timing out, and the tui logs only WARN to
-stderr with no file. Fix is the same as the app's entry above:
-`watch_contexts` for the set the mux shows, and one `edit_input` per
-keystroke batch. Until then, start it with `2>/tmp/tui.log` to keep the
-"kernel events lost" notices.
+the only timeout is `connect_timeout` (`main.rs`) — so under IO stall
+typing blocks rather than timing out. Fix is the same as the app's entry
+above: `watch_contexts` for the set the mux shows, and one `edit_input` per
+keystroke batch. The "kernel events lost" notices are in the tui's log file
+(`docs/tui.md`, "Every way out restores the terminal") since 2026-09-13.
 
 ## kaish children inherit the kernel's priority (2026-09-10)
 

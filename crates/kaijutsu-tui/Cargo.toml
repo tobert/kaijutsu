@@ -34,14 +34,17 @@ crossterm = { workspace = true }
 parking_lot = { workspace = true }
 unicode-width = { workspace = true }
 
-# `time` on top of the workspace set: the connect wait is bounded by a
-# timeout and the redraw tick is a timer, and relying on another crate's
-# feature unification for either would be a build that breaks the day this
-# crate is compiled alone.
-tokio = { workspace = true, features = ["time"] }
+# `time` and `signal` on top of the workspace set: the connect wait is
+# bounded by a timeout, the redraw tick is a timer, and `SIGTERM`/`SIGHUP`
+# end the loop cleanly. Relying on another crate's feature unification for
+# any of these would be a build that breaks the day this crate is compiled
+# alone.
+tokio = { workspace = true, features = ["time", "signal"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
 whoami = { workspace = true }
+# The default log file lives under the state directory (`main.rs`, `--log`).
+dirs = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

@@ -138,7 +138,13 @@ impl TuiSession {
     /// Spawn `kaijutsu-tui` against `server`, authenticating with the key at
     /// `key_path`, inside a `rows`x`cols` pty.
     pub fn spawn(server: SocketAddr, key_path: &Path, rows: u16, cols: u16) -> Self {
-        Self::spawn_after_newlines(server, key_path, rows, cols, 0)
+        Self::spawn_with(server, key_path, rows, cols, 0, &[])
+    }
+
+    /// Like [`spawn`](Self::spawn), with extra environment for the binary —
+    /// the probe hooks `run.rs` reads at startup (`KAIJUTSU_TUI_PROBE_PANIC`).
+    pub fn spawn_with_env(server: SocketAddr, key_path: &Path, rows: u16, cols: u16, env: &[(&str, &str)]) -> Self {
+        Self::spawn_with(server, key_path, rows, cols, 0, env)
     }
 
     /// Like [`spawn`](Self::spawn), but the cursor starts `newlines` rows
@@ -152,6 +158,17 @@ impl TuiSession {
         rows: u16,
         cols: u16,
         newlines: u16,
+    ) -> Self {
+        Self::spawn_with(server, key_path, rows, cols, newlines, &[])
+    }
+
+    fn spawn_with(
+        server: SocketAddr,
+        key_path: &Path,
+        rows: u16,
+        cols: u16,
+        newlines: u16,
+        env: &[(&str, &str)],
     ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -182,12 +199,15 @@ impl TuiSession {
         cmd.arg("probe");
         cmd.arg("--connect-timeout");
         cmd.arg("30");
-        // stdout is the viewport, stderr carries diagnostics — and in a pty
-        // both land on the same stream, so keep the log level quiet enough
-        // that a warn-or-above line is the only thing that could interleave
-        // with a frame (`crates/kaijutsu-tui/src/main.rs` module doc).
+        // The log goes beside the key rather than into the state directory
+        // of whoever runs the suite; a failing probe can read it there.
+        cmd.arg("--log");
+        cmd.arg(key_path.with_file_name("tui.log"));
         cmd.env("RUST_LOG", "warn");
         cmd.env("TERM", "xterm-256color");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
 
         let child = pair.slave.spawn_command(cmd).expect("spawn kaijutsu-tui");
         // Drop the parent's slave-side handle so the master sees EOF when
@@ -295,6 +315,27 @@ impl TuiSession {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Whether the parsed terminal is on the alternate screen buffer.
+    pub fn on_alternate_screen(&self) -> bool {
+        self.parser.lock().expect("parser lock").screen().alternate_screen()
+    }
+
+    /// Whether the pty's line discipline is cooked — `ICANON` and `ECHO`
+    /// both on, the way a shell expects to find it. Read through the master
+    /// side, which on Linux reports the slave's termios, so it can be read
+    /// after the child has exited.
+    #[cfg(unix)]
+    pub fn cooked(&self) -> Option<bool> {
+        use std::os::unix::io::RawFd;
+        let fd: RawFd = self.master.as_raw_fd()?;
+        // SAFETY: `termios` is plain data and `tcgetattr` only writes into it.
+        let mut term: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+            return None;
+        }
+        Some(term.c_lflag & libc::ICANON != 0 && term.c_lflag & libc::ECHO != 0)
     }
 
     /// The child process's pid, for a probe that needs to inspect its OS

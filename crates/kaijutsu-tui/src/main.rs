@@ -8,11 +8,16 @@
 //! kaijutsu-tui --host zorak --context kaijutsu
 //! ```
 //!
-//! **stdout is the viewport** — every diagnostic goes to stderr, and the log
-//! level is `warn` unless `RUST_LOG` says otherwise, because an INFO line
-//! landing mid-frame is a corrupted screen.
+//! **stdout is the viewport.** Diagnostics go to a log file under the
+//! state directory when stderr is the terminal, since a line landing
+//! mid-frame is a corrupted screen; a redirected stderr (`2>tui.log`) is
+//! used as given, and `--log` names the file outright. The level is `warn`
+//! unless `RUST_LOG` says otherwise.
 
-use anyhow::Result;
+use std::io::IsTerminal;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -59,6 +64,14 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     connect_timeout: u64,
 
+    /// Where diagnostics go. Without this, a stderr that is not the
+    /// terminal (a redirect or a pipe) is used as given, and a stderr that
+    /// is the terminal sends them to `kaijutsu-tui/tui.log` under the state
+    /// directory ($XDG_STATE_HOME or ~/.local/state), because stdout is the
+    /// viewport and a log line landing on it corrupts the screen.
+    #[arg(long, value_name = "PATH")]
+    log: Option<PathBuf>,
+
     /// Open the diff viewer on `kj diff <A> [B]` instead of the conversation.
     /// One path diffs disk against the kernel document that owns its text;
     /// two paths diff the two documents.
@@ -67,15 +80,8 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    // stderr only, and quiet: stdout is the viewport.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(tracing::Level::WARN.to_string()));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false))
-        .init();
-
     let cli = Cli::parse();
+    init_tracing(log_file(cli.log.clone()))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -92,6 +98,43 @@ fn main() -> Result<()> {
         drop(local);
         result
     })
+}
+
+/// The log file to write, or `None` for stderr: the `--log` path when
+/// given, else the state-directory file when stderr is the terminal.
+fn log_file(chosen: Option<PathBuf>) -> Option<PathBuf> {
+    if chosen.is_some() {
+        return chosen;
+    }
+    if !std::io::stderr().is_terminal() {
+        return None;
+    }
+    let state = dirs::state_dir().or_else(dirs::cache_dir)?;
+    Some(state.join("kaijutsu-tui").join("tui.log"))
+}
+
+/// Quiet by default: `warn` unless `RUST_LOG` says otherwise. A log file
+/// that cannot be opened is an error before the viewport, not a silent
+/// fall back onto the screen.
+fn init_tracing(file: Option<PathBuf>) -> Result<()> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(tracing::Level::WARN.to_string()));
+    let registry = tracing_subscriber::registry().with(filter);
+    match file {
+        Some(path) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).with_context(|| format!("create the log directory {}", dir.display()))?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("open the log file {}", path.display()))?;
+            registry.with(fmt::layer().with_writer(file).with_ansi(false)).init();
+        }
+        None => registry.with(fmt::layer().with_writer(std::io::stderr).with_ansi(false)).init(),
+    }
+    Ok(())
 }
 
 async fn run(cli: Cli) -> Result<()> {

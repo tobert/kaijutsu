@@ -493,6 +493,24 @@ scrollback and the host shell's prompt appears under it; `fg` brings the
 instrument back. Over `ssh -t zorak kaijutsu-tui` that puts zorak's login
 shell one keystroke and one `fg` away.
 
+**Every way out restores the terminal.** `run::restore_terminal` is the one
+place the exit sequences are written: give the alternate screen back if this
+process took it (`editor::abandon`, guarded by a flag `enter` sets and the
+`AltScreen` drop clears, because xterm restores a saved cursor on `?1049l`
+even when the alternate buffer was never in use), reset the cursor shape,
+leave raw mode. `:q` reaches it through `leave_terminal`; a panic reaches
+it through the hook `run` installs before the viewport, so the message
+prints on a cooked main screen; `SIGTERM` and `SIGHUP` reach it by ending
+the loop the way `:q` does. The key reader thread stops before raw mode
+goes, so keys typed at the prompt while the connection tears down reach
+the shell. Diagnostics never touch the screen: when stderr is the terminal
+they go to `kaijutsu-tui/tui.log` under the state directory, a redirected
+stderr is used as given, and `--log` names the file. Probes:
+`tests/terminal_fit.rs`, "Every way out restores the terminal" — `:q`,
+`SIGTERM` from copy mode, and a panic from copy mode
+(`KAIJUTSU_TUI_PROBE_PANIC` makes `F12` panic) each leave the pty on the
+main screen with a cooked line discipline.
+
 **Probes** (`tests/terminal_fit.rs`): `:` draws the bar visibly while
 typing, and `Esc` discards it without reaching the draft (the receipt for
 the pre-lane "a bar nobody can see and every key after it goes there" bug);
@@ -606,6 +624,13 @@ Rules the figure carries:
   activity since you last looked — screen's monitor flags.
 - TRACKS lists `listTracks` with a bar.beat counter and a pulse glyph driven by
   the per-track phasor.
+- The list follows the kernel while it is open. A placement verb or a
+  `:kj` line that ran (`App::roster_changed`) starts a refresh round now
+  instead of on the next tick, and every round
+  rebuilds an open picker over the new roster (`PickerModel::refreshed`):
+  the filter, the open horizon and the archive confirm latch stay, and the
+  cursor follows the context it was on — after `p` it sits on the same row
+  in ACTIVE. A row that left the roster clamps the cursor into what remains.
 
 ### Asks
 

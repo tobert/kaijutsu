@@ -198,6 +198,10 @@ pub struct App {
     /// The picker, when `Ctrl+A "` has it open — `render::viewport_lines`
     /// and `render::live_lines` both read this.
     pub picker: Option<crate::picker::PickerModel>,
+    /// A kj verb this client ran may have changed the roster: a placement
+    /// from the picker or any `:kj` line. The loop takes it and starts a
+    /// refresh round now.
+    pub roster_changed: bool,
     /// The playing track's beat envelope, sampled against `Instant::now()`
     /// once per redraw tick in [`crate::run`] — the only place this module
     /// reads a live clock. [`Self::track_figure`] projects it; nothing here
@@ -238,6 +242,7 @@ impl App {
             tails: crate::picker::PickerTails::new(),
             picker: None,
             track_pulse: false,
+            roster_changed: false,
         }
     }
 
@@ -245,6 +250,33 @@ impl App {
     pub fn set_contexts(&mut self, contexts: Vec<ContextInfo>) {
         self.seats = ranked_seats(&contexts);
         self.contexts = contexts;
+    }
+
+    /// The contexts carrying the `@` activity flag — the set the picker's
+    /// rows and the status line's rank both read.
+    pub fn activity_set(&self) -> std::collections::HashSet<ContextId> {
+        self.views.iter().filter(|(_, v)| v.activity).map(|(id, _)| *id).collect()
+    }
+
+    /// Open the picker over what the app holds now.
+    pub fn open_picker(&mut self, now_millis: u64) {
+        self.picker = Some(crate::picker::PickerModel::build(
+            &self.contexts,
+            &self.tracks,
+            &self.activity_set(),
+            &self.tails,
+            now_millis,
+        ));
+    }
+
+    /// Rebuild an open picker over what the app holds now, keeping its
+    /// cursor and filter (`PickerModel::refreshed`). No-op when it is
+    /// closed. The refresh calls this after every round so a promote,
+    /// a demote, or an archive from any seat shows without reopening.
+    pub fn refresh_picker(&mut self, now_millis: u64) {
+        if let Some(picker) = self.picker.as_ref() {
+            self.picker = Some(picker.refreshed(&self.contexts, &self.tracks, &self.activity_set(), &self.tails, now_millis));
+        }
     }
 
     pub fn info(&self, id: ContextId) -> Option<&ContextInfo> {

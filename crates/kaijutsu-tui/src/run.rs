@@ -7,6 +7,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -69,6 +70,9 @@ type TermLock = Arc<Mutex<()>>;
 /// instead of a parameter per channel.
 struct Wires {
     term_lock: TermLock,
+    /// `KAIJUTSU_TUI_PROBE_PANIC` was set: `F12` panics, so the terminal-fit
+    /// probes can see what the panic hook leaves behind.
+    probe_panic: bool,
     key_rx: mpsc::Receiver<Event>,
     feed_rx: mpsc::Receiver<TaggedFeed>,
     /// Kept alongside the receiver: a context switch watches a new context,
@@ -128,15 +132,28 @@ pub async fn run(
     app.principal = Some(identity.principal_id);
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
 
+    // A panic past this point unwinds through the viewport without reaching
+    // `leave_terminal`. The hook restores the terminal first, so the panic
+    // message prints on a cooked main screen and the shell that follows
+    // reads keys. No terminal lock here: the panicking thread may hold it.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_panic(info);
+    }));
+
     // The inline viewport's first cursor query runs before the key reader
     // exists, so nothing is holding the reader it needs.
     let mut terminal = enter_terminal().context("enter the inline viewport")?;
     let term_lock: TermLock = Arc::new(Mutex::new(()));
     let (key_tx, key_rx) = mpsc::channel::<Event>(64);
-    spawn_key_reader(term_lock.clone(), key_tx);
+    // Stopped on the way out, before raw mode goes, so keys typed at the
+    // shell prompt while the connection tears down reach the shell.
+    let reader_stop = spawn_key_reader(term_lock.clone(), key_tx);
 
     let mut wires = Wires {
         term_lock: term_lock.clone(),
+        probe_panic: std::env::var_os("KAIJUTSU_TUI_PROBE_PANIC").is_some(),
         key_rx,
         feed_rx,
         feed_tx,
@@ -144,7 +161,7 @@ pub async fn run(
         editor_opens: open_rx,
     };
     let result = event_loop(&bridge, &mut app, &mut terminal, &mut wires).await;
-    leave_terminal(&mut terminal, &term_lock);
+    leave_terminal(&mut terminal, &term_lock, &reader_stop);
     result
 }
 
@@ -153,11 +170,19 @@ pub async fn run(
 /// A dedicated thread rather than `crossterm::event::EventStream`: the stream
 /// polls with no timeout, which holds crossterm's internal reader forever and
 /// starves the cursor-position query the inline viewport makes on resize.
-fn spawn_key_reader(term_lock: TermLock, tx: mpsc::Sender<Event>) {
+fn spawn_key_reader(term_lock: TermLock, tx: mpsc::Sender<Event>) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
     std::thread::spawn(move || {
         loop {
+            // Checked under the lock: `leave_terminal` sets the flag and
+            // then takes the lock, so a reader that was waiting for it sees
+            // the flag before it can poll a cooked terminal.
             let ready = {
                 let _guard = term_lock.lock();
+                if stopped.load(Ordering::SeqCst) {
+                    return;
+                }
                 crossterm::event::poll(KEY_POLL).unwrap_or(false)
             };
             if ready {
@@ -181,6 +206,7 @@ fn spawn_key_reader(term_lock: TermLock, tx: mpsc::Sender<Event>) {
             std::thread::sleep(Duration::from_millis(1));
         }
     });
+    stop
 }
 
 /// Subscribe to a context's feed, hydrate its mirror, and forward its
@@ -225,10 +251,15 @@ async fn event_loop(
     let mut ledger_open = true;
     let mut seen_asks = std::collections::HashSet::new();
     let mut poll_asks = true;
+    let mut stop_signals = StopSignals::listen().context("listen for SIGTERM and SIGHUP")?;
     let mut refresh = tokio::time::interval(REFRESH);
     // The round in flight, if one is. Its result lands through the join arm
     // below; the loop itself never awaits the kernel for a refresh.
     let mut refresh_task: Option<tokio::task::JoinHandle<refresh::Refreshed>> = None;
+    // A round was asked for out of turn (`App::roster_changed`). Stays set
+    // while a round is in flight, because that round started before the
+    // change and its answer is already stale.
+    let mut refresh_wanted = false;
     let mut tick = tokio::time::interval(TICK);
     let mut dirty = true;
     let mut last_strip_frame = Instant::now();
@@ -254,6 +285,9 @@ async fn event_loop(
                 match event {
                     Event::Key(key) => {
                         dirty = true;
+                        if wires.probe_panic && key.code == crossterm::event::KeyCode::F(12) {
+                            panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed");
+                        }
                         let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
                         if app.picker.is_some() {
                             handle_picker_key(bridge, app, key, &wires.feed_tx).await?;
@@ -269,6 +303,10 @@ async fn event_loop(
                         }
                         if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
                             poll_asks = true;
+                        }
+                        if std::mem::take(&mut app.roster_changed) {
+                            refresh_wanted = true;
+                            refresh.reset_immediately();
                         }
                     }
                     Event::Resize(..) => dirty = true,
@@ -341,10 +379,17 @@ async fn event_loop(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => ledger_open = false,
                 }
             }
+            signal = stop_signals.recv() => {
+                // The loop ends as `:q` ends it, so the terminal is
+                // restored on the way out instead of dying in raw mode.
+                tracing::info!(signal, "stopping on signal");
+                app.quit = true;
+            }
             _ = refresh.tick() => {
                 // Single-flight: a round still running is left to finish,
                 // and the next tick starts the next one.
                 if refresh_task.is_none() {
+                    refresh_wanted = false;
                     let poll = poll_asks && app.current.is_some();
                     if poll {
                         poll_asks = false;
@@ -365,6 +410,9 @@ async fn event_loop(
                 refresh::apply(app, refreshed, &mut seen_asks);
                 if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
                     poll_asks = true;
+                }
+                if refresh_wanted {
+                    refresh.reset_immediately();
                 }
                 rearm_beat_wake(app, &mut beat_wake, &mut beat_tempo_bps);
                 dirty = true;
@@ -503,6 +551,9 @@ fn set_viewport_height(
 }
 
 /// Route one key to the open picker, then act on its [`PickerOutcome`].
+/// A placement verb that ran marks the roster changed (`App::roster_changed`)
+/// so the loop starts a refresh round now rather than on the next tick;
+/// the round's `apply` rebuilds the open picker.
 async fn handle_picker_key(
     bridge: &KernelBridge,
     app: &mut App,
@@ -526,7 +577,10 @@ async fn handle_picker_key(
                 let message = result.latch.map(|l| l.message).unwrap_or_default();
                 app.note(message);
             }
-            Ok(result) => app.note(result.stdout.lines().next().unwrap_or("done").to_string()),
+            Ok(result) => {
+                app.note(result.stdout.lines().next().unwrap_or("done").to_string());
+                app.roster_changed = true;
+            }
             Err(e) => app.note(format!("placement failed: {e}")),
         },
     }
@@ -739,16 +793,7 @@ async fn act(
                 compose_key(bridge, app, tab).await?;
             }
         }
-        Intent::TogglePicker => {
-            let tracks = bridge.actor().list_tracks().await.unwrap_or_default();
-            app.picker = Some(crate::picker::PickerModel::build(
-                &app.contexts,
-                &tracks,
-                &app.views.iter().filter(|(_, v)| v.activity).map(|(id, _)| *id).collect(),
-                &app.tails,
-                kaijutsu_types::now_millis(),
-            ));
-        }
+        Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
     }
     Ok(Acted::Continue)
 }
@@ -864,7 +909,12 @@ async fn handle_colon_line(bridge: &KernelBridge, app: &mut App, ctx: ContextId,
             Ok(result) if result.latch.is_some() => {
                 app.note(result.latch.map(|l| l.message).unwrap_or_default());
             }
-            Ok(result) => app.note(result.stdout.lines().next().unwrap_or("done").to_string()),
+            Ok(result) => {
+                app.note(result.stdout.lines().next().unwrap_or("done").to_string());
+                // Any kj verb may have changed the roster (fork, promote,
+                // archive); the picker and the rank should not wait a tick.
+                app.roster_changed = true;
+            }
             Err(e) => app.note(format!(":kj failed: {e:#}")),
         },
         ColonVerb::Shell(statement) => match bridge.shell_execute(ctx, &statement).await {
@@ -963,6 +1013,44 @@ fn mark_turn_liveness(app: &mut App, event: &ServerEvent) -> bool {
             app.mark_turn_ended(*context_id)
         }
         _ => false,
+    }
+}
+
+/// The signals that mean "stop": `SIGTERM` from a runner or `kill`, and
+/// `SIGHUP` when the terminal goes away. Either ends the event loop the way
+/// `:q` does. Off unix there are none, and `recv` never resolves.
+#[cfg(unix)]
+struct StopSignals {
+    term: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    fn listen() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self { term: signal(SignalKind::terminate())?, hup: signal(SignalKind::hangup())? })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.hup.recv() => "SIGHUP",
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StopSignals;
+
+#[cfg(not(unix))]
+impl StopSignals {
+    fn listen() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        std::future::pending().await
     }
 }
 
@@ -1340,12 +1428,28 @@ fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// leaving the last frame in place is what the inline viewport is for
 /// anyway: the transcript stays in scrollback and the host shell's prompt
 /// appears under it.
-fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, term_lock: &TermLock) {
+fn leave_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    term_lock: &TermLock,
+    reader_stop: &AtomicBool,
+) {
+    // The reader finishes the poll it is in, sees the flag, and stops; the
+    // lock below waits out that poll before raw mode goes.
+    reader_stop.store(true, Ordering::SeqCst);
     let _guard = term_lock.lock();
     let _ = terminal.flush();
+    restore_terminal();
+    println!();
+}
+
+/// Put the terminal back the way the host shell had it: the main screen if
+/// the alternate one was taken, the shell's own cursor shape, cooked input.
+/// Idempotent and best-effort. The normal exit, the panic hook, and the
+/// signal path all come through here, so every way out agrees.
+pub fn restore_terminal() {
+    editor::abandon();
     let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
     let _ = disable_raw_mode();
-    println!();
 }
 
 // ────────────────────────────────────────────────────────────────────────────

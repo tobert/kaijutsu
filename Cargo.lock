@@ -6331,6 +6331,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "dirs",
  "kaijutsu-audio",
  "kaijutsu-client",
  "kaijutsu-diff",

@@ -162,6 +162,7 @@ pub fn apply(app: &mut App, refreshed: Refreshed, seen_asks: &mut HashSet<String
     if let Some(tracks) = refreshed.tracks {
         app.tracks = tracks.iter().map(picker::track_row_from).collect();
     }
+    app.refresh_picker(kaijutsu_types::now_millis());
 }
 
 /// The status-line notice for a card whose ask was decided from another

@@ -414,6 +414,7 @@ fn colon_q_exits_cleanly_and_leaves_the_last_frame() {
     let status = session.wait_for_exit(Duration::from_secs(5));
     let status = status.unwrap_or_else(|| panic!("process did not exit: {}", session.dump("still running")));
     assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after :q"));
+    assert_terminal_restored(&session, "after :q");
 
     // `leave_terminal` (`crates/kaijutsu-tui/src/run.rs`) does not clear the
     // viewport on the way out — its last frame is left exactly where it was
@@ -646,6 +647,7 @@ fn colon_q_exits_cleanly() {
     let status = session.wait_for_exit(Duration::from_secs(5));
     let status = status.unwrap_or_else(|| panic!("process did not exit: {}", session.dump("still running")));
     assert!(status.success(), "kaijutsu-tui exited with {status:?}: {}", session.dump("after :q"));
+    assert_terminal_restored(&session, "after :q");
 }
 
 #[test]
@@ -696,6 +698,139 @@ fn ctrl_c_twice_within_the_window_still_does_not_exit() {
         session.wait_for_exit(Duration::from_millis(300)).is_none(),
         "Ctrl+C Ctrl+C must not exit — only `:q`/`:q!` quit"
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// e2. Every way out restores the terminal
+// ────────────────────────────────────────────────────────────────────────────
+
+/// What `run::restore_terminal` leaves behind, from the host shell's point
+/// of view: the main screen buffer and a cooked line discipline. The cursor
+/// shape reset rides the same sequence and `vt100` cannot observe it.
+fn assert_terminal_restored(session: &TuiSession, label: &str) {
+    assert!(!session.on_alternate_screen(), "still on the alternate screen {label}: {}", session.dump(label));
+    #[cfg(unix)]
+    assert_eq!(session.cooked(), Some(true), "raw mode left on {label}: {}", session.dump(label));
+}
+
+/// Take copy mode, the alternate-screen surface that needs no kernel editor
+/// session, so an exit from there has both the screen and raw mode to undo.
+fn open_copy_mode(session: &TuiSession) {
+    session.send("\x01[");
+    let opened = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "q leave"));
+    assert!(opened, "copy mode never opened: {}", session.dump("copy mode open"));
+    assert!(session.on_alternate_screen(), "copy mode is not on the alternate screen: {}", session.dump("copy mode"));
+}
+
+/// `SIGTERM` — a runner's kill — ends the loop the way `:q` does, from the
+/// alternate screen included.
+#[cfg(unix)]
+#[test]
+fn sigterm_restores_the_terminal_from_the_alternate_screen() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    open_copy_mode(&session);
+
+    let pid = session.pid().expect("pid available on unix");
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    let status = status.unwrap_or_else(|| panic!("process did not exit on SIGTERM: {}", session.dump("still running")));
+    assert!(status.success(), "a SIGTERM exit is a clean exit, got {status:?}: {}", session.dump("after SIGTERM"));
+    assert_terminal_restored(&session, "after SIGTERM");
+}
+
+/// A panic unwinds past `leave_terminal`; the panic hook restores the
+/// terminal before the message prints. `KAIJUTSU_TUI_PROBE_PANIC` makes
+/// `F12` panic (`run.rs`, `Wires::probe_panic`).
+#[cfg(unix)]
+#[test]
+fn a_panic_restores_the_terminal_from_the_alternate_screen() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("key tempdir");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let mut session = TuiSession::spawn_with_env(server.addr, &key_path, 24, 80, &[("KAIJUTSU_TUI_PROBE_PANIC", "1")]);
+    wait_for_attach(&session);
+    open_copy_mode(&session);
+
+    session.send("\x1b[24~"); // F12
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    let status = status.unwrap_or_else(|| panic!("process did not exit on the probe panic: {}", session.dump("still running")));
+    assert!(!status.success(), "the probe panic must not look like a clean exit: {}", session.dump("after panic"));
+    assert_terminal_restored(&session, "after the panic");
+    let (scrollback, visible) = session.history_snapshot();
+    assert!(
+        scrollback.iter().chain(visible.iter()).any(|l| l.contains("KAIJUTSU_TUI_PROBE_PANIC")),
+        "the panic message is not on a readable screen: {}",
+        session.dump("after panic")
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// j2. The open picker follows a placement verb
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Which side of the `RECENT` divider `label`'s row is on: `Some(true)`
+/// for ACTIVE, `Some(false)` for RECENT, `None` when it is not listed.
+fn in_active(rows: &[String], label: &str) -> Option<bool> {
+    let row = picker_row_for(rows, label)?;
+    let recent = rows.iter().position(|l| l.trim() == "RECENT")?;
+    Some(row < recent)
+}
+
+/// `p` on a RECENT row moves it into ACTIVE without closing the picker,
+/// and `d` moves it back (`docs/tui.md`, "The picker": the list follows
+/// the kernel while it is open). The fork also has to appear in a picker
+/// that was already open, which is the same rebuild.
+#[test]
+fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    session.send(":kj fork --name seatme\r");
+    session.send("\x01\"");
+    let listed = session.wait_until(Duration::from_secs(20), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        picker_row_for(&rows, "seatme").is_some()
+    });
+    assert!(listed, "the fork never reached the open picker: {}", session.dump("picker"));
+
+    // Filter to the fork alone; the filter survives every rebuild.
+    session.send("/seatme\r");
+    let filtered = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        picker_row_for(&rows, "seatme").is_some() && !screen_contains_str(screen, "ROOT")
+    });
+    assert!(filtered, "the filter never narrowed to the fork: {}", session.dump("filter"));
+    for _ in 0..tabs_to_section(&session.screen_text(), "seatme") {
+        session.send("\t");
+    }
+
+    // Whichever section the fork starts in, the verb that moves it out.
+    let started_active = in_active(&session.screen_text(), "seatme").expect("the fork is listed");
+    session.send(if started_active { "d" } else { "p" });
+    let moved = session.wait_until(Duration::from_secs(10), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        screen_contains_str(screen, "ACTIVE") && in_active(&rows, "seatme") == Some(!started_active)
+    });
+    assert!(
+        moved,
+        "the row did not cross the divider with the picker open (started in {}): {}",
+        if started_active { "ACTIVE" } else { "RECENT" },
+        session.dump("after the verb")
+    );
+
+    // The cursor followed the row, so the opposite verb acts on it again.
+    session.send(if started_active { "p" } else { "d" });
+    let back = session.wait_until(Duration::from_secs(10), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        screen_contains_str(screen, "ACTIVE") && in_active(&rows, "seatme") == Some(started_active)
+    });
+    assert!(back, "the row did not cross back: {}", session.dump("after the second verb"));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -823,24 +958,13 @@ fn switching_through_the_picker_loads_the_new_contexts_draft() {
     });
     assert!(typed, "the draft never reached the compose row: {}", session.dump("typing"));
 
-    // The picker lists what the last `list_contexts` round returned, so the
-    // fork appears one refresh after it is made: open, look, close, retry.
-    let mut listed = false;
-    for _ in 0..8 {
-        session.send("\x01\"");
-        listed = session.wait_until(Duration::from_secs(3), |screen| {
-            let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
-            picker_row_for(&rows, "altseat").is_some()
-        });
-        if listed {
-            break;
-        }
-        session.send("\x1b");
-        let closed = session.wait_until(Duration::from_secs(3), |screen| {
-            !screen_contains_str(screen, "ACTIVE")
-        });
-        assert!(closed, "the picker never closed: {}", session.dump("picker retry"));
-    }
+    // An open picker rebuilds on every refresh round, so the fork appears
+    // in it one round after it is made without closing and reopening.
+    session.send("\x01\"");
+    let listed = session.wait_until(Duration::from_secs(20), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        picker_row_for(&rows, "altseat").is_some()
+    });
     assert!(listed, "the fork never reached the picker: {}", session.dump("picker"));
 
     // Filter to the fork alone, close the filter, hop to its section, and

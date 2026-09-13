@@ -16,6 +16,7 @@
 //! same frames a real terminal gets.
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kaijutsu_client::EditorState;
@@ -471,6 +472,11 @@ impl AltScreen {
     }
 }
 
+/// Whether this process holds the alternate screen. [`enter`] sets it and
+/// the [`AltScreen`] drop clears it, so [`abandon`] can give the screen back
+/// from a place that cannot reach the handle: the panic hook.
+static ENTERED: AtomicBool = AtomicBool::new(false);
+
 /// Take the alternate screen. Raw mode is already on.
 pub fn enter() -> io::Result<AltScreen> {
     crossterm::execute!(
@@ -478,6 +484,7 @@ pub fn enter() -> io::Result<AltScreen> {
         crossterm::terminal::EnterAlternateScreen,
         crossterm::cursor::Show
     )?;
+    ENTERED.store(true, Ordering::SeqCst);
     let terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
@@ -487,11 +494,29 @@ pub fn enter() -> io::Result<AltScreen> {
     Ok(AltScreen { terminal })
 }
 
-/// Give the alternate screen back. Best-effort on every step: a failure here
-/// must not mask the error that ended the session.
+/// Give the alternate screen back. The drop does the work, so an error
+/// that unwinds the event loop while a screen is up leaves the same way
+/// `q` does. Best-effort: a failure here must not mask the error that
+/// ended the session.
 pub fn leave(screen: AltScreen) {
     drop(screen);
-    let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+}
+
+impl Drop for AltScreen {
+    fn drop(&mut self) {
+        abandon();
+    }
+}
+
+/// Give the alternate screen back without the handle, if this process
+/// holds it; a no-op otherwise. `LeaveAlternateScreen` is not sent blind:
+/// xterm restores the saved cursor on `?1049l` whether or not the
+/// alternate buffer was in use, which would move the inline viewport's
+/// exit prompt to a stale row.
+pub fn abandon() {
+    if ENTERED.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    }
 }
 
 #[cfg(test)]

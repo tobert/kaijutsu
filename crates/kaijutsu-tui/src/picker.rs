@@ -309,12 +309,12 @@ pub struct PickerModel {
 
 impl PickerModel {
     /// Build a fresh picker from the state a caller already has: the last
-    /// `list_contexts` / `listTracks` answers, which contexts carry the `@`
-    /// activity flag (the same set the status line's rank reads), the tail
-    /// buffer, and the clock.
+    /// `list_contexts` answer, the track rows the refresh keeps on the app,
+    /// which contexts carry the `@` activity flag (the same set the status
+    /// line's rank reads), the tail buffer, and the clock.
     pub fn build(
         contexts: &[ContextInfo],
-        tracks: &[TrackInfo],
+        tracks: &[TrackRow],
         activity: &std::collections::HashSet<ContextId>,
         tails: &PickerTails,
         now_millis: u64,
@@ -350,7 +350,7 @@ impl PickerModel {
             .collect();
         let horizon: Vec<Row> = placement.horizon.iter().filter_map(|id| row_of(id, None)).collect();
 
-        let tracks: Vec<TrackRow> = tracks.iter().map(track_row_from).collect();
+        let tracks: Vec<TrackRow> = tracks.to_vec();
 
         Self {
             active,
@@ -363,6 +363,74 @@ impl PickerModel {
             horizon_open: false,
             filter_editing: false,
             pending_confirm: None,
+        }
+    }
+
+    /// The context under the cursor: the row's own id in ACTIVE, RECENT and
+    /// the horizon, the score context in TRACKS. `None` on an empty list.
+    pub fn selected_context(&self) -> Option<ContextId> {
+        if self.horizon_open {
+            return self.visible_horizon().get(self.index).map(|r| r.context_id);
+        }
+        match self.section {
+            Section::Active => self.visible_active().get(self.index).map(|r| r.context_id),
+            Section::Recent => self.visible_recent().get(self.index).map(|r| r.context_id),
+            Section::Tracks => self.tracks.get(self.index).map(|t| t.score_context_id),
+        }
+    }
+
+    /// The same picker over a newer roster. The rows are rebuilt the way
+    /// [`Self::build`] builds them; the filter, the open horizon, and the
+    /// confirm latch are this picker's and stay. The cursor follows the
+    /// context it was on — a promote moves the row from RECENT to ACTIVE
+    /// and the cursor goes with it — and clamps into what remains when
+    /// that context left the roster.
+    pub fn refreshed(
+        &self,
+        contexts: &[ContextInfo],
+        tracks: &[TrackRow],
+        activity: &std::collections::HashSet<ContextId>,
+        tails: &PickerTails,
+        now_millis: u64,
+    ) -> Self {
+        let selected = self.selected_context();
+        let mut next = Self::build(contexts, tracks, activity, tails, now_millis);
+        next.filter = self.filter.clone();
+        next.section = self.section;
+        next.index = self.index;
+        next.horizon_open = self.horizon_open;
+        next.filter_editing = self.filter_editing;
+        next.pending_confirm = self.pending_confirm;
+        next.follow(selected);
+        next
+    }
+
+    /// Put the cursor on `target` if it is anywhere on the surface that is
+    /// open: the horizon list when it is, else the section the cursor was
+    /// in first and then the others in order, switching section to reach
+    /// it. A score context is both a TRACKS row and a context row, so the
+    /// current section wins the tie. Otherwise clamp the index.
+    fn follow(&mut self, target: Option<ContextId>) {
+        let found = target.and_then(|id| {
+            if self.horizon_open {
+                return self.visible_horizon().iter().position(|r| r.context_id == id).map(|i| (self.section, i));
+            }
+            let others = [Section::Active, Section::Recent, Section::Tracks].into_iter().filter(|s| *s != self.section);
+            std::iter::once(self.section).chain(others).find_map(|section| {
+                let at = match section {
+                    Section::Active => self.visible_active().iter().position(|r| r.context_id == id),
+                    Section::Recent => self.visible_recent().iter().position(|r| r.context_id == id),
+                    Section::Tracks => self.tracks.iter().position(|t| t.score_context_id == id),
+                };
+                at.map(|i| (section, i))
+            })
+        });
+        match found {
+            Some((section, index)) => {
+                self.section = section;
+                self.index = index;
+            }
+            None => self.index = self.index.min(self.current_len().saturating_sub(1)),
         }
     }
 
@@ -1075,5 +1143,102 @@ mod tests {
         let row1: String = (0..buf.area.width).map(|x| buf[(x, 1)].symbol()).collect();
         assert!(row1.starts_with("› 0 kaijutsu"), "got {row1:?}");
         assert!(row1.trim_end().contains("running"), "got {row1:?}");
+    }
+    // A roster refresh while the picker is up (`refresh::apply`) rebuilds
+    // the rows and keeps the picker's own state: the cursor follows the
+    // context it was on, wherever the new roster seats it.
+
+    #[test]
+    fn a_refresh_follows_the_selected_row_into_active_after_a_promote() {
+        let mut a = ctx("kaijutsu");
+        a.promoted_at = None;
+        let b = ctx("kaish");
+        let mut model = PickerModel::build(&[a.clone(), b.clone()], &[], &no_activity(), &empty_tails(), 0);
+        model.handle_key(press(KeyCode::Tab)); // RECENT
+        model.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(model.selected_context(), Some(b.id), "cursor on b in RECENT");
+
+        // The kernel promoted b: it moves to ACTIVE seat 0.
+        let mut promoted = b.clone();
+        promoted.promoted_at = Some(1_000);
+        let model = model.refreshed(&[a.clone(), promoted], &[], &no_activity(), &empty_tails(), 0);
+        assert_eq!(model.section, Section::Active);
+        assert_eq!(model.selected_context(), Some(b.id), "cursor followed b into ACTIVE");
+        assert_eq!(model.active[model.index].digit, Some(0));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_filter_and_the_confirm_latch() {
+        let mut a = ctx("kaijutsu");
+        a.promoted_at = Some(1_000);
+        let b = ctx("kaish");
+        let mut model = PickerModel::build(&[a.clone(), b.clone()], &[], &no_activity(), &empty_tails(), 0);
+        model.handle_key(press(KeyCode::Char('/')));
+        model.handle_key(press(KeyCode::Char('k')));
+        model.handle_key(press(KeyCode::Enter));
+        // First `a` latches; the refresh must not clear it, or the second
+        // press starts over instead of confirming.
+        assert!(matches!(model.handle_key(press(KeyCode::Char('a'))), Outcome::Placement { .. }));
+
+        let model = model.refreshed(&[a.clone(), b.clone()], &[], &no_activity(), &empty_tails(), 0);
+        assert_eq!(model.filter, "k");
+        assert_eq!(model.pending_confirm, Some(('a', a.id)));
+        let mut model = model;
+        match model.handle_key(press(KeyCode::Char('a'))) {
+            Outcome::Placement { argv, .. } => assert!(argv.contains(&"--confirm".to_string()), "got {argv:?}"),
+            other => panic!("expected a confirmed placement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refresh_clamps_the_cursor_when_its_row_is_gone() {
+        let mut a = ctx("kaijutsu");
+        a.promoted_at = Some(1_000);
+        let mut b = ctx("kaish");
+        b.promoted_at = Some(2_000);
+        let mut model = PickerModel::build(&[a.clone(), b.clone()], &[], &no_activity(), &empty_tails(), 0);
+        model.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(model.index, 1);
+
+        // b was archived elsewhere: it leaves the roster.
+        let mut archived = b.clone();
+        archived.archived = true;
+        let model = model.refreshed(&[a.clone(), archived], &[], &no_activity(), &empty_tails(), 0);
+        assert_eq!(model.section, Section::Active);
+        assert_eq!(model.index, 0, "clamped into the rows that remain");
+        assert_eq!(model.selected_context(), Some(a.id));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_horizon_open_on_its_row() {
+        let mut overflow: Vec<ContextInfo> = (0..12).map(|i| ctx(&format!("old-{i}"))).collect();
+        for (i, c) in overflow.iter_mut().enumerate() {
+            c.created_at = 10 + i as u64;
+            c.last_activity_at = Some(10 + i as u64);
+        }
+        let mut model = PickerModel::build(&overflow, &[], &no_activity(), &empty_tails(), 5_000);
+        assert!(!model.horizon.is_empty(), "fixture must overflow into the horizon");
+        model.handle_key(press(KeyCode::Char('h')));
+        model.handle_key(press(KeyCode::Char('j')));
+        let on = model.selected_context().expect("a horizon row");
+
+        let model = model.refreshed(&overflow, &[], &no_activity(), &empty_tails(), 5_000);
+        assert!(model.horizon_open);
+        assert_eq!(model.selected_context(), Some(on));
+    }
+    #[test]
+    fn a_refresh_keeps_the_cursor_in_tracks_when_the_score_context_is_also_a_row() {
+        let mut score = ctx("bass-score");
+        score.promoted_at = Some(1_000);
+        let track = TrackRow { id: "bass".into(), score_context_id: score.id, playing: true, bpm: 120, bar: 1, beat: 1 };
+        let mut model = PickerModel::build(std::slice::from_ref(&score), std::slice::from_ref(&track), &no_activity(), &empty_tails(), 0);
+        model.handle_key(press(KeyCode::Tab));
+        model.handle_key(press(KeyCode::Tab));
+        assert_eq!(model.section, Section::Tracks);
+        assert_eq!(model.selected_context(), Some(score.id));
+
+        let model = model.refreshed(&[score.clone()], &[track], &no_activity(), &empty_tails(), 0);
+        assert_eq!(model.section, Section::Tracks, "the cursor did not jump to the ACTIVE row of the same id");
+        assert_eq!(model.index, 0);
     }
 }
