@@ -329,6 +329,11 @@ impl TuiSession {
         self.answer_cursor_queries.store(false, Ordering::SeqCst);
     }
 
+    /// Whether the client has turned bracketed paste on (DECSET 2004).
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.lock().expect("parser lock").screen().bracketed_paste()
+    }
+
     /// Whether the parsed terminal is on the alternate screen buffer.
     pub fn on_alternate_screen(&self) -> bool {
         self.parser.lock().expect("parser lock").screen().alternate_screen()

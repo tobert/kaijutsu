@@ -820,6 +820,13 @@ async fn act(
     Ok(Acted::Continue)
 }
 
+/// A pasted newline as `\n`, whatever the terminal sent: xterm sends
+/// `\r`, some send `\r\n`. Order matters — the pair first, or its `\r`
+/// becomes a second newline.
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Where a bracketed paste goes.
 #[derive(Debug, PartialEq, Eq)]
 enum PasteTarget {
@@ -831,13 +838,14 @@ enum PasteTarget {
 /// A paste is text for the draft or the `:` bar. Every other surface
 /// refuses it with a notice rather than reading it as keys: the alternate
 /// screen's `editor_keys` notation cannot carry a literal `<`, and the
-/// picker, the ledger and an ask card have no text field.
+/// picker's and the ledger's filters and an ask card are not wired for
+/// one.
 fn paste_target(app: &App) -> PasteTarget {
     if editor::route_key(app) == editor::KeyRoute::AlternateScreen {
         return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
     }
     if app.ledger_view.is_some() || app.picker.is_some() || app.ask_card.is_some() {
-        return PasteTarget::Refused("nothing to paste into here");
+        return PasteTarget::Refused("paste is not wired into this surface; Esc to the draft first");
     }
     if app.compose.command_line().is_some() { PasteTarget::CommandLine } else { PasteTarget::Draft }
 }
@@ -847,7 +855,7 @@ fn paste_target(app: &App) -> PasteTarget {
 /// takes it as one edit at the cursor, like `Ctrl+A ]`; the `:` bar takes
 /// it flattened onto one line at its end.
 async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = normalize_paste(&text);
     match paste_target(app) {
         PasteTarget::Refused(why) => app.note(why),
         PasteTarget::CommandLine => {
@@ -1906,6 +1914,11 @@ mod tests {
 
         app.screen = ScreenMode::Copy(crate::copy::CopyScreen::new("probe", Vec::new()));
         assert!(matches!(paste_target(&app), PasteTarget::Refused(_)), "the alternate screen refuses");
+    }
+
+    #[test]
+    fn a_pasted_newline_is_one_newline_whatever_the_terminal_sent() {
+        assert_eq!(normalize_paste("a\r\nb\rc\nd"), "a\nb\nc\nd");
     }
 
     /// The refresh's kernel calls live in `refresh::fetch`, on their own

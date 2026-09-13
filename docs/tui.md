@@ -289,7 +289,9 @@ Rules the figure carries:
   to end the loop through `?`. Now the band keeps its height, the status
   line says so, the same height is not asked for again until a resize or
   a different height, and `draw_live` crops from the front so the draft's
-  tail and the status line stay. Probe:
+  tail and the status line stay. Each different height is a fresh
+  two-second wait on a hop that never answers, and a hop that starts
+  answering again is not noticed until a resize or a new height. Probe:
   `an_unanswered_cursor_query_keeps_the_client_alive`, which mutes the
   harness's DSR answer.
 - There is no state past normal mode. The app's `Esc Esc` hands the

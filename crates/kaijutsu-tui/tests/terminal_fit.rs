@@ -839,19 +839,22 @@ fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
 
 /// Two pasted lines land in the draft as one edit: the newline is a
 /// newline in the draft, not an `Enter` that submits the first line
-/// (`docs/tui.md`, "Compose").
+/// (`docs/tui.md`, "Compose"). The paste lands in NORMAL mode, where the
+/// same bytes read as keystrokes would be vi commands (`d`, `x`, `p`…)
+/// and never text — so a client that left bracketed paste off cannot
+/// pass. The terminal's `\r` line endings are what xterm sends.
 #[test]
 fn a_bracketed_paste_lands_in_the_draft_without_submitting() {
     let _serial = serial();
     let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
+    assert!(session.bracketed_paste(), "the client never turned bracketed paste on: {}", session.dump("attached"));
 
-    session.send("i");
-    session.send("\x1b[200~pasted one\npasted two\x1b[201~");
+    session.send("\x1b[200~dd pasted one\rxp pasted two\x1b[201~");
     let landed = session.wait_until(Duration::from_secs(5), |screen| {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
-        let first = rows.iter().position(|l| l.contains('❯') && l.contains("pasted one"));
-        first.is_some_and(|i| rows.get(i + 1).is_some_and(|l| l.contains("pasted two")))
+        let first = rows.iter().position(|l| l.contains('❯') && l.contains("dd pasted one"));
+        first.is_some_and(|i| rows.get(i + 1).is_some_and(|l| l.contains("xp pasted two")))
     });
     assert!(landed, "the paste did not land as two draft rows: {}", session.dump("after paste"));
 
@@ -860,14 +863,20 @@ fn a_bracketed_paste_lands_in_the_draft_without_submitting() {
     std::thread::sleep(Duration::from_secs(2));
     let (scrollback, visible) = session.history_snapshot();
     assert!(
-        visible.iter().any(|l| l.contains("pasted two")),
+        visible.iter().any(|l| l.contains("xp pasted two")),
         "the draft was cleared, so something submitted: {}",
         session.dump("after paste")
     );
     assert!(
-        !scrollback.iter().any(|l| l.contains("pasted one")),
+        !scrollback.iter().any(|l| l.contains("dd pasted one")),
         "the first pasted line was submitted as a turn: {scrollback:?}"
     );
+
+    // The `:` bar takes a paste flattened onto its one line.
+    session.send(":kj ");
+    session.send("\x1b[200~context\rlist\x1b[201~");
+    let flat = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, ":kj context list"));
+    assert!(flat, "the bar paste did not flatten onto the bar: {}", session.dump("bar paste"));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -881,7 +890,7 @@ fn a_bracketed_paste_lands_in_the_draft_without_submitting() {
 #[test]
 fn an_unanswered_cursor_query_keeps_the_client_alive() {
     let _serial = serial();
-    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    let (_server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
 
     session.mute_cursor_queries();
@@ -892,18 +901,26 @@ fn an_unanswered_cursor_query_keeps_the_client_alive() {
     session.send("\x1b[200~aaa\nbbb\nccc\x1b[201~");
     let told = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "cursor query"));
     assert!(told, "no notice about the unanswered query: {}", session.dump("after the grow"));
-    assert!(
-        session.wait_for_exit(Duration::from_millis(500)).is_none(),
-        "the client exited on an unanswered cursor query: {}",
-        session.dump("exited")
-    );
 
     // `a` appends after the last pasted line, a continuation row with no
-    // prompt on it.
+    // prompt on it. Keys working is what proves the loop survived: the
+    // old exit came ~2 s after the query, so a liveness poll proves less.
     session.send("\x1b");
     session.send("ax");
     let responsive = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "cccx"));
     assert!(responsive, "keys stopped working after the failed resize: {}", session.dump("after Esc, ax"));
+
+    // A block completing after the refusal still prints into scrollback
+    // above the band: the leftover cursor anchor from the failed rebuild
+    // must not misplace `insert_before`.
+    session.send("\x1b:!echo refused-anchor-ok\r");
+    let printed = session.wait_until(Duration::from_secs(20), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        let hit = rows.iter().position(|l| l.contains("refused-anchor-ok") && !l.contains(":!"));
+        let compose = compose_row(&rows);
+        matches!((hit, compose), (Some(h), Some(c)) if h < c)
+    });
+    assert!(printed, "the shell result did not land above the band after the refusal: {}", session.dump("after :!"));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
