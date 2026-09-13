@@ -132,12 +132,16 @@ takes the terminal's own selection away.
 Leaving the live tail is entering copy mode; reaching it again is leaving.
 The transcript area follows new blocks while the view is at the tail
 (Crush calls this `follow`), and stops following the moment it is
-scrolled. While scrolled, the transcript owns the keys under the existing
-copy-mode contract (vi motions, `/` and `?`, `Space` and `Enter`, `v` and
-`y`), the draft is parked and drawn dim, and `q`, `Esc`, `G` or scrolling
-past the bottom return to the tail and give the draft the keys back.
-There is no frozen snapshot: a still-streaming block grows under the
-reader, and the view keeps its place by block and line, not by row.
+scrolled. While scrolled, the transcript owns copy mode's own keys (vi
+motions, `/` and `?`, `n`/`N`, `v` marks and `y` or `Enter` copies, `q`,
+`Esc`, `G`). **Every other key snaps the view back to the tail and goes
+to the draft.** Amy: *"live typing should snap back to the tail, I often
+hit space just to do that"* — the habit is wezterm's
+`scroll_to_bottom_on_input`, so `Space` is the snap key here and no longer
+starts a mark; `v` does, the vim spelling copy mode already carried. The
+draft stays live while scrolled, drawn as it is. There is no frozen
+snapshot: a still-streaming block grows under the reader, and the view
+keeps its place by block and line, not by row.
 
 ### The buffer
 
@@ -212,14 +216,14 @@ screen.
 
 ### Open
 
-- Whether the draft stays live while scrolled (typing snaps to the tail)
-  or is parked until `q`. Parked is the tmux answer and the first cut.
 - A wheel tick is three `Up`s: inside a tall draft the first moves the
   cursor and the next two scroll. A burst heuristic could fix it; not
   built until it is felt.
-- Whether `:q` should print the last screen, or a tail of the transcript,
-  onto the primary screen for the shell's history. Nothing, for now.
 - Kitty keyboard protocol: on by request or on by probe.
+
+Decided 2026-09-13: the draft stays live while scrolled and typing snaps
+to the tail (above); `:q` is quiet — nothing is printed onto the primary
+screen (Amy: *":q can be quiet"*).
 
 ## Shape: the ACP bridge minus the protocol
 
