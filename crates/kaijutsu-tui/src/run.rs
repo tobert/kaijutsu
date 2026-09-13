@@ -833,7 +833,12 @@ async fn compose_key(
             return Ok(());
         }
         tracing::debug!(context = %ctx.short(), "submitting the draft");
-        match bridge.submit_input(ctx).await {
+        // The edge as it stood when Enter was pressed — computed before the
+        // submit call, not after `mark_submitted`, which would read the
+        // view after the kernel has already moved it (`docs/issues.md`,
+        // "Async input should carry the player's edge of context").
+        let edge = app.views.get(&ctx).and_then(|view| view.edge());
+        match bridge.submit_input(ctx, edge).await {
             Ok(block_id) => {
                 app.mark_submitted(block_id);
                 app.compose.reset();

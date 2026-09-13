@@ -361,6 +361,20 @@ pub fn live_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Li
     // Resolve everything the wrap needs while `app` is only borrowed
     // immutably; the cache itself is a mutable borrow and cannot overlap.
     let plan: Vec<(BlockSnapshot, BlockPlan)> = live_plan(app);
+
+    // Record what the live band drew this frame — the player's edge on
+    // submit when it is set (`ContextView::edge`, `docs/issues.md`, "Async
+    // input should carry the player's edge of context"). `None` when the
+    // band drew nothing, which lets `edge()` fall back to `last_printed`.
+    if let Some(context_id) = app.current {
+        let tail = plan
+            .last()
+            .map(|(block, _)| (block.id, block.content.chars().count() as u64));
+        if let Some(view) = app.views.get_mut(&context_id) {
+            view.live_tail = tail;
+        }
+    }
+
     let context_type = app
         .current
         .and_then(|id| app.info(id))

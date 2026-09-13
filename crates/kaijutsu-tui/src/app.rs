@@ -11,7 +11,9 @@ use std::time::Duration;
 use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
 };
-use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
+use kaijutsu_types::{
+    BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId, Role, Status,
+};
 
 use crate::compose::Compose;
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
@@ -42,6 +44,13 @@ pub struct ContextView {
     /// than its call still joins the pair under one header
     /// (`present::continues_pair`).
     pub last_printed: Option<(BlockId, BlockKind)>,
+    /// The last block the live band drew on the last frame, with its
+    /// content's character count as drawn then — `None` when the band drew
+    /// nothing (`render::live_frame`). This is newer than `last_printed`
+    /// while a block is still streaming, and is the player's edge on submit
+    /// when it is set (`docs/issues.md`, "Async input should carry the
+    /// player's edge of context").
+    pub live_tail: Option<(BlockId, u64)>,
 }
 
 impl ContextView {
@@ -53,6 +62,7 @@ impl ContextView {
             activity: false,
             last_printed_speaker: None,
             last_printed: None,
+            live_tail: None,
         };
         view.seed_collapse();
         view
@@ -76,6 +86,24 @@ impl ContextView {
             .unwrap_or_else(|| block.collapsed || collapses_by_default(block.kind))
     }
 
+    /// The player's edge of context, as of the last frame this view drew:
+    /// the newest block it had shown, and how much of it if it was still
+    /// streaming. `live_tail` wins when set — it is newer than
+    /// `last_printed` by construction, since a block only leaves the live
+    /// band once it settles and prints. `None` when this context has shown
+    /// nothing at all, so the caller sends no edge rather than guess
+    /// (`docs/issues.md`, "Async input should carry the player's edge of
+    /// context").
+    pub fn edge(&self) -> Option<InputEdge> {
+        if let Some((block, shown)) = self.live_tail {
+            Some(InputEdge {
+                block,
+                shown: Some(shown),
+            })
+        } else {
+            self.last_printed.map(|(block, _kind)| InputEdge { block, shown: None })
+        }
+    }
 }
 
 /// The whole client's state.
@@ -1097,5 +1125,46 @@ mod tests {
         assert!(app.ask_card.is_some(), "a no-op switch keeps the card");
         app.switch_to(b);
         assert!(app.ask_card.is_none(), "the card belongs to a, not to the seat on screen");
+    }
+
+    /// The player's edge on submit: a live-band tail beats a printed block,
+    /// since the tail is always newer when both are set
+    /// (`docs/issues.md`, "Async input should carry the player's edge of
+    /// context").
+    #[test]
+    fn a_live_tail_wins_over_last_printed_for_the_edge() {
+        let aid = ContextId::new();
+        let mut view = ContextView::new(ContextMirror::new(aid));
+        let printed = block(aid, 1, BlockKind::Text, Role::Model);
+        let streaming = block(aid, 2, BlockKind::Text, Role::Model);
+        view.last_printed = Some((printed.id, printed.kind));
+        view.live_tail = Some((streaming.id, 7));
+
+        let edge = view.edge().expect("a live tail gives an edge");
+        assert_eq!(edge.block, streaming.id);
+        assert_eq!(edge.shown, Some(7));
+    }
+
+    /// With no live band tail, the edge falls back to the last printed
+    /// block, unqualified: it was read whole, not mid-stream.
+    #[test]
+    fn last_printed_alone_gives_an_edge_with_no_shown_count() {
+        let aid = ContextId::new();
+        let mut view = ContextView::new(ContextMirror::new(aid));
+        let printed = block(aid, 1, BlockKind::Text, Role::Model);
+        view.last_printed = Some((printed.id, printed.kind));
+
+        let edge = view.edge().expect("a printed block gives an edge");
+        assert_eq!(edge.block, printed.id);
+        assert_eq!(edge.shown, None);
+    }
+
+    /// A context that has shown nothing at all sends no edge — the kernel
+    /// never guesses one.
+    #[test]
+    fn a_context_with_nothing_shown_gives_no_edge() {
+        let aid = ContextId::new();
+        let view = ContextView::new(ContextMirror::new(aid));
+        assert_eq!(view.edge(), None);
     }
 }

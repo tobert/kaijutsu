@@ -12,7 +12,7 @@ use kaijutsu_client::rpc::KjExecutionResult;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
-use kaijutsu_types::{BlockId, BlockQuery, ContextId, PrincipalId};
+use kaijutsu_types::{BlockId, BlockQuery, ContextId, InputEdge, PrincipalId};
 use tokio::sync::mpsc;
 
 /// Per-process subscription identity.
@@ -256,11 +256,14 @@ impl KernelBridge {
     }
 
     /// Submit the draft as a chat turn. The kernel snapshots it into a block
-    /// and clears the draft.
-    pub async fn submit_input(&self, context_id: ContextId) -> Result<BlockId> {
+    /// and clears the draft. `edge` is the newest block the player had shown
+    /// when they pressed Enter (`ContextView::edge`, `docs/issues.md`,
+    /// "Async input should carry the player's edge of context"); `None`
+    /// when the caller cannot say.
+    pub async fn submit_input(&self, context_id: ContextId, edge: Option<InputEdge>) -> Result<BlockId> {
         let result = self
             .actor
-            .submit_input(context_id, false)
+            .submit_input_with_edge(context_id, false, edge)
             .await
             .context("submit input")?;
         Ok(result.block_id)

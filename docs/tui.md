@@ -221,7 +221,11 @@ Rules the figure carries:
 Compose is a modalkit `VimMachine` over the kernel-owned input block
 (`edit_input` / `submit_input`), as the app's compose overlay is. The draft is
 a shared block: a sibling's typing shows. `Enter` in normal mode submits;
-A second `Esc` is harmless: compose always holds the keyboard.
+A second `Esc` is harmless: compose always holds the keyboard. On `Enter` the
+tui sends the newest block it had shown as the player's edge — the character
+count when that block was still streaming, `last_printed` alone when it was
+not (`ContextView::edge`, `docs/issues.md`, "Async input should carry the
+player's edge of context").
 
 Rules the figure carries:
 
