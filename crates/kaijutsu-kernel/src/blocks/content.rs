@@ -7,8 +7,8 @@
 //! `docs/crdt-position-2026-08.md`.
 
 use kaijutsu_types::{
-    BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status, TaskStatus, Tick,
-    now_millis,
+    BlockHeader, BlockId, BlockSnapshot, ContentType, InputEdge, PrincipalId, Status, TaskStatus,
+    Tick, now_millis,
 };
 
 // Test-only instrumentation for `BlockContent::text()` — see
@@ -250,6 +250,15 @@ pub struct BlockContent {
     /// same at-rest-CBOR reason `BlockHeader::task_status` documents — this
     /// in-memory copy has no serde concern of its own.
     summary: Option<String>,
+    /// The newest block the submitting client had shown, set once when a
+    /// draft is promoted with an `InputEdge` (see
+    /// [`set_edge`](Self::set_edge)). `None` on every other block. The
+    /// kernel does not validate that the named block still exists in this
+    /// context — the client is the authority on what it showed.
+    edge_block: Option<BlockId>,
+    /// Characters of `edge_block` the client had shown, when it was still
+    /// streaming at submit time. Meaningless when `edge_block` is `None`.
+    edge_shown: Option<u64>,
     source_context: Option<kaijutsu_types::ContextId>,
     source_model: Option<String>,
     drift_kind: Option<kaijutsu_types::DriftKind>,
@@ -302,6 +311,8 @@ impl BlockContent {
             stderr: None,
             signature: None,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -355,6 +366,8 @@ impl BlockContent {
         block.stderr = snap.stderr.clone();
         block.signature = snap.signature.clone();
         block.summary = snap.summary.clone();
+        block.edge_block = snap.edge_block;
+        block.edge_shown = snap.edge_shown;
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
@@ -670,6 +683,23 @@ impl BlockContent {
         self.summary = Some(summary);
     }
 
+    pub fn edge_block(&self) -> Option<BlockId> {
+        self.edge_block
+    }
+
+    pub fn edge_shown(&self) -> Option<u64> {
+        self.edge_shown
+    }
+
+    /// Set the player's edge (see [`kaijutsu_types::BlockSnapshot::edge_block`]).
+    /// Write-once at draft promotion; `None` clears both fields. A
+    /// snapshot-only field, like `set_summary`/`set_stderr` above — does not
+    /// touch `header.updated_at`.
+    pub fn set_edge(&mut self, edge: Option<InputEdge>) {
+        self.edge_block = edge.map(|e| e.block);
+        self.edge_shown = edge.and_then(|e| e.shown);
+    }
+
     pub fn ephemeral(&self) -> bool {
         self.header.ephemeral
     }
@@ -736,6 +766,8 @@ impl BlockContent {
             track: self.track.clone(),
             updated_at: self.header.updated_at,
             summary: self.summary.clone(),
+            edge_block: self.edge_block,
+            edge_shown: self.edge_shown,
         }
     }
 

@@ -14,7 +14,7 @@ use super::selection::IntervalSet;
 use super::Result;
 use kaijutsu_types::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, ContextId,
-    DriftKind, MAX_DAG_DEPTH, PrincipalId, Role, Status, TaskStatus, Tick, ToolKind,
+    DriftKind, InputEdge, MAX_DAG_DEPTH, PrincipalId, Role, Status, TaskStatus, Tick, ToolKind,
 };
 
 /// Filter criteria for selective block inclusion during fork.
@@ -1165,6 +1165,22 @@ impl BlockDocument {
             .filter(|b| !b.is_deleted())
             .ok_or(BlockDocumentError::BlockNotFound(*id))?;
         block.set_summary(summary);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Set the player's edge on a block (see
+    /// [`kaijutsu_types::BlockSnapshot::edge_block`]). Write-once at draft
+    /// promotion; `None` stores no edge. The kernel does not validate that
+    /// `edge.block` names a real block in this context — the client is the
+    /// authority on what it showed.
+    pub fn set_edge(&mut self, id: &BlockId, edge: Option<InputEdge>) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
+        block.set_edge(edge);
         self.version += 1;
         Ok(())
     }

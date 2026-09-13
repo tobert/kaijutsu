@@ -23,8 +23,8 @@ use crate::blocks::{BlockDocument, ForkBlockFilter, StoreSnapshot, SyncPayload, 
 use kaijutsu_types::codec;
 use kaijutsu_types::{BlockFilter, BlockQuery};
 use kaijutsu_types::{
-    BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, DocKind, PrincipalId, Role, Status,
-    TaskStatus, Tick, ToolKind, WorkspaceId,
+    BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, DocKind, InputEdge, PrincipalId,
+    Role, Status, TaskStatus, Tick, ToolKind, WorkspaceId,
 };
 
 use crate::flows::{BlockFlow, OpSource, SharedBlockFlowBus};
@@ -2230,7 +2230,12 @@ impl BlockStore {
         Ok(id)
     }
 
-    /// Promote this principal's draft into a submitted user message.
+    /// Promote this principal's draft into a submitted user message, storing
+    /// `edge` (the client's edge of context at submit time — see
+    /// [`kaijutsu_types::InputEdge`]) on the same block. `None` when the
+    /// client sent no edge; the kernel never guesses one and never
+    /// validates that `edge.block` names a real block in this context — the
+    /// client is the authority on what it showed.
     ///
     /// Returns the block id and its text. The id is the SAME block they typed
     /// into — nothing is copied, so nothing can be dropped between reading the
@@ -2242,6 +2247,7 @@ impl BlockStore {
         &self,
         context_id: ContextId,
         principal_id: PrincipalId,
+        edge: Option<InputEdge>,
     ) -> BlockStoreResult<(BlockId, String)> {
         let draft = self
             .draft_block(context_id, principal_id)?
@@ -2251,11 +2257,53 @@ impl BlockStore {
             return Err(BlockStoreError::EmptyDraft(context_id));
         }
         // Order matters on a crash: `Draft` is the status hydration refuses, so
-        // clearing `ephemeral` first and the status second means an interrupted
-        // submit leaves a block that is still hidden from the model rather than
-        // one that is visible to it but unfinished.
-        self.set_ephemeral(context_id, &draft.id, false)?;
-        self.set_status(context_id, &draft.id, Status::Done)?;
+        // clearing `ephemeral` before the status means an interrupted submit
+        // leaves a block that is still hidden from the model rather than one
+        // that is visible to it but unfinished. All three land in the SAME
+        // mutation lock and journal as ONE op: `status`/`ephemeral` live on
+        // `BlockHeader`, but `edge_block`/`edge_shown` do not, so the full
+        // post-mutation snapshot is journaled instead (mirrors
+        // `set_summary`/`set_stderr`) — a header-only payload can't carry
+        // the edge through oplog replay. Splitting this into separate calls
+        // would let a crash between them promote the block without its
+        // edge, or leave the edge stored on a block still marked Draft.
+        let (ops, version) = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            entry.doc.set_ephemeral(&draft.id, false)?;
+            entry.doc.set_status(&draft.id, Status::Done)?;
+            entry.doc.set_edge(&draft.id, edge)?;
+            entry.touch(self.principal_id());
+            let version = entry.version();
+            let snapshot = entry.doc.get_block_snapshot(&draft.id).expect(
+                "block must exist: the mutations against it just succeeded under this same guard",
+            );
+            (SyncPayload::from_updated_snapshot(snapshot), version)
+        };
+        self.journal_op(context_id, ops)?;
+
+        self.emit(BlockFlow::StatusChanged {
+            context_id,
+            block_id: draft.id,
+            status: Status::Done,
+            version,
+            source: OpSource::Local,
+        });
+        let metadata = self
+            .get_block_snapshot(context_id, &draft.id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: draft.id,
+            metadata,
+            version,
+            source: OpSource::Local,
+        });
+
         Ok((draft.id, text))
     }
 
@@ -5167,6 +5215,54 @@ mod tests {
         );
     }
 
+    /// `edge_block`/`edge_shown` are snapshot-only fields like `summary`
+    /// above, not part of `BlockHeader` — `submit_draft` must journal the
+    /// full post-mutation snapshot for the promoted block, or a restart
+    /// replaying the real oplog loses the edge.
+    #[tokio::test]
+    async fn test_submit_draft_edge_survives_oplog_replay_without_compaction() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let edge_target = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "earlier reply",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        store.edit_draft(ctx, me, 0, "reply to that", 0).unwrap();
+        let (submitted, _) = store
+            .submit_draft(ctx, me, Some(InputEdge { block: edge_target, shown: Some(7) }))
+            .unwrap();
+
+        let replayed = replay_journal(&db, ctx);
+        let snapshot = replayed
+            .get_block_snapshot(&submitted)
+            .expect("block should exist after replay");
+        assert_eq!(
+            snapshot.edge_block,
+            Some(edge_target),
+            "edge_block set before the next compaction must survive a restart replay"
+        );
+        assert_eq!(
+            snapshot.edge_shown,
+            Some(7),
+            "edge_shown set before the next compaction must survive a restart replay"
+        );
+        assert_eq!(snapshot.status, Status::Done, "the promotion itself must also survive");
+        assert!(!snapshot.ephemeral, "the promotion's ephemeral clear must also survive");
+    }
+
     /// Streaming append (`append_text`) does two independent things per
     /// chunk: publish the classified `TextAppended` flow event (the live
     /// path), and journal a `TextEdit` to the oplog (the durable-recovery
@@ -7005,7 +7101,7 @@ mod tests {
             .unwrap();
 
         let drafted = store.edit_draft(ctx, me, 0, "hello world", 0).unwrap();
-        let (submitted, text) = store.submit_draft(ctx, me).unwrap();
+        let (submitted, text) = store.submit_draft(ctx, me, None).unwrap();
 
         assert_eq!(
             submitted, drafted,
@@ -7018,6 +7114,82 @@ mod tests {
         assert!(!snap.ephemeral, "a submitted message is no longer hidden");
         assert_eq!(snap.content, "hello world");
         assert_eq!(snap.role, Role::User);
+    }
+
+    /// An edge submitted alongside a draft lands on the same block, both
+    /// fields set.
+    #[test]
+    fn submit_draft_stores_the_edge_on_the_promoted_block() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let edge_target = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "earlier reply",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        store.edit_draft(ctx, me, 0, "reply to that", 0).unwrap();
+        let (submitted, _) = store
+            .submit_draft(ctx, me, Some(InputEdge { block: edge_target, shown: Some(12) }))
+            .unwrap();
+
+        let snap = store.get_block_snapshot(ctx, &submitted).unwrap().unwrap();
+        assert_eq!(snap.edge_block, Some(edge_target));
+        assert_eq!(snap.edge_shown, Some(12));
+    }
+
+    /// No edge means both fields stay `None` — the common case, and the only
+    /// one every client older than this feature can produce.
+    #[test]
+    fn submit_draft_without_an_edge_leaves_both_fields_none() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        store.edit_draft(ctx, me, 0, "no edge here", 0).unwrap();
+        let (submitted, _) = store.submit_draft(ctx, me, None).unwrap();
+
+        let snap = store.get_block_snapshot(ctx, &submitted).unwrap().unwrap();
+        assert_eq!(snap.edge_block, None);
+        assert_eq!(snap.edge_shown, None);
+    }
+
+    /// The kernel does not validate an edge: a block id the caller invents,
+    /// naming nothing in this context (or any context), is stored exactly as
+    /// given. The client is the authority on what it showed — the kernel's
+    /// job is to carry the fact, not to referee it.
+    #[test]
+    fn submit_draft_stores_an_edge_naming_an_unknown_block_without_validation() {
+        let (store, _bus) = store_with_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let nowhere = BlockId::new(ContextId::new(), PrincipalId::new(), 999);
+        store.edit_draft(ctx, me, 0, "dangling edge", 0).unwrap();
+        let (submitted, _) = store
+            .submit_draft(ctx, me, Some(InputEdge { block: nowhere, shown: None }))
+            .unwrap();
+
+        let snap = store.get_block_snapshot(ctx, &submitted).unwrap().unwrap();
+        assert_eq!(snap.edge_block, Some(nowhere));
+        assert_eq!(snap.edge_shown, None);
     }
 
     /// A draft is invisible to the model until it is sent — checked on both
@@ -7051,7 +7223,7 @@ mod tests {
 
         let id = store.edit_draft(ctx, me, 0, "   \n  ", 0).unwrap();
         assert!(matches!(
-            store.submit_draft(ctx, me),
+            store.submit_draft(ctx, me, None),
             Err(BlockStoreError::EmptyDraft(_))
         ));
 
@@ -7086,7 +7258,7 @@ mod tests {
         );
 
         // Submitting one leaves the other alone and still a draft.
-        store.submit_draft(ctx, amy).unwrap();
+        store.submit_draft(ctx, amy, None).unwrap();
         assert!(store.draft_block(ctx, amy).unwrap().is_none());
         assert_eq!(
             store.draft_block(ctx, model).unwrap().unwrap().status,

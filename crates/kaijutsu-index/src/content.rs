@@ -115,6 +115,8 @@ mod tests {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 

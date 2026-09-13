@@ -662,6 +662,8 @@ impl KjDispatcher {
             "is_error": snap.is_error,
             "exit_code": snap.exit_code,
             "summary": snap.summary,
+            "edge_block": snap.edge_block.map(|id| id.to_key()),
+            "edge_shown": snap.edge_shown,
         });
 
         if json {
@@ -671,7 +673,7 @@ impl KjDispatcher {
             .parent_id
             .map(|i| i.to_key())
             .unwrap_or_else(|| "-".into());
-        let out = format!(
+        let mut out = format!(
             "id:        {}\nctx:       {}\nctx_count: {}\nrole:      {}\nkind:      {}\nstatus:    {}\nparent:    {}\ncontent:   {} chars\n",
             id_str,
             ctx_id.to_hex(),
@@ -682,6 +684,16 @@ impl KjDispatcher {
             parent,
             snap.content.len(),
         );
+        if let Some(edge_block) = snap.edge_block {
+            out.push_str(&format!(
+                "edge:      {}{}\n",
+                edge_block.to_key(),
+                match snap.edge_shown {
+                    Some(shown) => format!(" ({shown} chars shown)"),
+                    None => String::new(),
+                }
+            ));
+        }
         KjResult::ok_with_data(out, record)
     }
 
@@ -2293,6 +2305,82 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    /// A promoted draft's edge shows in both the JSON record and the
+    /// plain-text format; a block with no edge prints neither the key's
+    /// value nor the `edge:` line.
+    #[tokio::test]
+    async fn block_inspect_shows_the_edge_only_when_present() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let edge_target = insert_text_block(&d, ctx, "earlier reply");
+
+        d.block_store()
+            .edit_draft(ctx, principal, 0, "reply to that", 0)
+            .expect("edit_draft");
+        let (with_edge, _) = d
+            .block_store()
+            .submit_draft(
+                ctx,
+                principal,
+                Some(kaijutsu_types::InputEdge { block: edge_target, shown: Some(9) }),
+            )
+            .expect("submit_draft with edge");
+
+        let short = super::short_key(&with_edge);
+        let result = d
+            .dispatch(&[s("block"), s("inspect"), s(&short), s("--json")], &c)
+            .await;
+        match result {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["edge_block"], edge_target.to_key());
+                assert_eq!(v["edge_shown"], 9);
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+
+        let plain = d.dispatch(&[s("block"), s("inspect"), s(&short)], &c).await;
+        assert!(
+            plain.message().contains(&format!(
+                "edge:      {} (9 chars shown)",
+                edge_target.to_key()
+            )),
+            "expected an edge line naming the target block, got: {}",
+            plain.message()
+        );
+
+        // A block with no edge shows neither.
+        d.block_store()
+            .edit_draft(ctx, principal, 0, "no edge here", 0)
+            .expect("edit_draft");
+        let (no_edge, _) = d
+            .block_store()
+            .submit_draft(ctx, principal, None)
+            .expect("submit_draft without edge");
+        let short_no_edge = super::short_key(&no_edge);
+
+        let result = d
+            .dispatch(&[s("block"), s("inspect"), s(&short_no_edge), s("--json")], &c)
+            .await;
+        match result {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => {
+                assert!(v["edge_block"].is_null());
+                assert!(v["edge_shown"].is_null());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+        let plain = d
+            .dispatch(&[s("block"), s("inspect"), s(&short_no_edge)], &c)
+            .await;
+        assert!(
+            !plain.message().contains("edge:"),
+            "a block with no edge must not print an edge line, got: {}",
+            plain.message()
+        );
     }
 
     /// `kj block list` must populate `KjResult::Ok::data` with a JSON array

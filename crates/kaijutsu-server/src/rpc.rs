@@ -7520,6 +7520,18 @@ impl kernel::Server for KernelImpl {
         );
         let is_shell = pry!(p.get_mode()) == InputMode::Shell;
 
+        // The player's edge of context at submit time — a null pointer when
+        // the client sends none (an older client, or one that cannot say).
+        // The kernel never guesses one.
+        let edge = if p.has_edge() {
+            let e = pry!(p.get_edge());
+            let block = pry!(parse_block_id_from_reader(&pry!(e.get_block_id())));
+            let shown = e.get_has_shown().then(|| e.get_shown());
+            Some(kaijutsu_types::InputEdge { block, shown })
+        } else {
+            None
+        };
+
         log::debug!("submit_input: context={} shell={}", context_id, is_shell);
 
         let kernel = self.kernel.clone();
@@ -7604,7 +7616,7 @@ impl kernel::Server for KernelImpl {
                     // text is never in flight between two homes. Refuses an empty
                     // draft without clearing it.
                     let (user_block_id, _text) = documents
-                        .submit_draft(context_id, user_principal_id)
+                        .submit_draft(context_id, user_principal_id, edge)
                         .map_err(|e| capnp::Error::failed(format!("submit: {}", e)))?;
 
                     // Build ToolContext from connection state; cwd is durable
@@ -10981,6 +10993,19 @@ pub(crate) fn set_block_snapshot(
     // back to none, same convention as content_type/task_status).
     if let Some(ref summary) = block.summary {
         builder.set_summary(summary);
+    }
+
+    // Set the player's edge (docs/issues.md, "Async input should carry the
+    // player's edge of context") if present — a user block promoted from a
+    // draft that carried one.
+    if let Some(ref edge_block) = block.edge_block {
+        builder.set_has_edge_block_id(true);
+        let mut eid = builder.reborrow().init_edge_block_id();
+        set_block_id_builder(&mut eid, edge_block);
+    }
+    if let Some(shown) = block.edge_shown {
+        builder.set_has_edge_shown(true);
+        builder.set_edge_shown(shown);
     }
 
     // Styled spans + ingest provenance (docs/ansi-and-beyond.md). Both are

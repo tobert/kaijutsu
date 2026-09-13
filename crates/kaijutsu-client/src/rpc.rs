@@ -7,8 +7,8 @@ use futures::AsyncReadExt;
 use kaijutsu_types::{ContextId, KernelId};
 use kaijutsu_types::{
     BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType,
-    DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan, PrincipalId, Role, Status,
-    Tick, ToolKind, TrackId,
+    DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan, InputEdge, PrincipalId, Role,
+    Status, Tick, ToolKind, TrackId,
 };
 use russh::ChannelStream;
 use russh::client::Msg;
@@ -2740,11 +2740,29 @@ impl KernelHandle {
     /// Submit the input document: snapshot to conversation block and clear.
     ///
     /// `is_shell` selects the routing mode (shell command vs chat prompt).
+    /// Sends no edge — see [`Self::submit_input_with_edge`] for a client
+    /// that can say what it had shown.
     #[tracing::instrument(skip(self), name = "rpc_client.submit_input")]
     pub async fn submit_input(
         &self,
         context_id: ContextId,
         is_shell: bool,
+    ) -> Result<SubmitResult, RpcError> {
+        self.submit_input_with_edge(context_id, is_shell, None)
+            .await
+    }
+
+    /// Submit the input document, attaching the player's edge of context at
+    /// submit time (docs/issues.md, "Async input should carry the player's
+    /// edge of context"): the newest block the client had shown, and how
+    /// much of it if it was still streaming. `None` when the client cannot
+    /// say — the kernel never guesses one.
+    #[tracing::instrument(skip(self), name = "rpc_client.submit_input_with_edge")]
+    pub async fn submit_input_with_edge(
+        &self,
+        context_id: ContextId,
+        is_shell: bool,
+        edge: Option<InputEdge>,
     ) -> Result<SubmitResult, RpcError> {
         let mut request = self.kernel.submit_input_request();
         request.get().set_context_id(context_id.as_bytes());
@@ -2753,6 +2771,19 @@ impl KernelHandle {
         } else {
             crate::kaijutsu_capnp::InputMode::Chat
         });
+        if let Some(edge) = edge {
+            let mut e = request.get().init_edge();
+            {
+                let mut bid = e.reborrow().init_block_id();
+                bid.set_context_id(edge.block.context_id.as_bytes());
+                bid.set_principal_id(edge.block.principal_id.as_bytes());
+                bid.set_seq(edge.block.seq);
+            }
+            if let Some(shown) = edge.shown {
+                e.set_has_shown(true);
+                e.set_shown(shown);
+            }
+        }
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -4171,6 +4202,16 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.summary(s);
     }
 
+    // The player's edge at submit time (docs/issues.md, "Async input should
+    // carry the player's edge of context") — set only on a user block
+    // promoted from a draft that carried one.
+    if reader.get_has_edge_block_id() {
+        builder = builder.edge_block(parse_block_id(&reader.get_edge_block_id()?)?);
+    }
+    if reader.get_has_edge_shown() {
+        builder = builder.edge_shown(reader.get_edge_shown());
+    }
+
     // Styled spans + ingest provenance (docs/ansi-and-beyond.md). A writer
     // that never set either leaves an absent list and an empty transform,
     // which decode to "no spans" / "no tag" — the builder's own defaults.
@@ -5134,6 +5175,19 @@ mod tests {
             builder.set_summary(summary);
         }
 
+        // The player's edge at submit time.
+        if let Some(ref edge_block) = snap.edge_block {
+            builder.set_has_edge_block_id(true);
+            let mut eid = builder.reborrow().init_edge_block_id();
+            eid.set_context_id(edge_block.context_id.as_bytes());
+            eid.set_principal_id(edge_block.principal_id.as_bytes());
+            eid.set_seq(edge_block.seq);
+        }
+        if let Some(shown) = snap.edge_shown {
+            builder.set_has_edge_shown(true);
+            builder.set_edge_shown(shown);
+        }
+
         // Styled spans + provenance, encoded exactly the way the server's
         // `set_block_snapshot` does (0 = none, 1 = indexed, 2 = packed rgb);
         // a snapshot carrying neither writes neither field.
@@ -5515,6 +5569,39 @@ mod tests {
         // A block that never got a summary must decode as None, not Some("").
         let plain = BlockSnapshotBuilder::new(id, BlockKind::Thinking).build();
         assert_eq!(roundtrip_snapshot(&plain).summary, None);
+    }
+
+    /// The player's edge (docs/issues.md, "Async input should carry the
+    /// player's edge of context") survives Rust→capnp→Rust; absence decodes
+    /// as `None`, not a zeroed `BlockId`.
+    #[test]
+    fn test_edge_capnp_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+        let edge_block = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 7,
+        };
+
+        let snap = kaijutsu_types::BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::User)
+            .content("reply to that")
+            .edge_block(edge_block)
+            .edge_shown(12)
+            .build();
+        let round_tripped = roundtrip_snapshot(&snap);
+        assert_eq!(round_tripped.edge_block, Some(edge_block));
+        assert_eq!(round_tripped.edge_shown, Some(12));
+
+        // A block with no edge must decode both fields as None.
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        let round_tripped_plain = roundtrip_snapshot(&plain);
+        assert_eq!(round_tripped_plain.edge_block, None);
+        assert_eq!(round_tripped_plain.edge_shown, None);
     }
 
     /// Styled spans + provenance survive the wire intact (Stage 2C of the

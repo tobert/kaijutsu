@@ -126,6 +126,58 @@ fn chat_submit_promotes_the_draft_rather_than_copying_it() {
     });
 }
 
+/// **The player's edge.** `submitInput` can carry the newest block a client
+/// had shown and how much of it, and the kernel stores both on the promoted
+/// user block (docs/issues.md, "Async input should carry the player's edge
+/// of context").
+#[test]
+fn chat_submit_stores_the_players_edge_on_the_promoted_block() {
+    run_local(async {
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-edge").await;
+        seed_turn_identity(&live_kernel, context_id);
+
+        // An earlier block in the conversation — the edge the client claims
+        // it had shown when the player hit Enter.
+        kernel
+            .edit_input(context_id, 0, "what did we ship?", 0)
+            .await
+            .unwrap();
+        let earlier = kernel.submit_input(context_id, false).await.unwrap();
+
+        kernel
+            .edit_input(context_id, 0, "and what's next?", 0)
+            .await
+            .unwrap();
+        let edge = kaijutsu_types::InputEdge {
+            block: earlier.block_id,
+            shown: Some(12),
+        };
+        let result = kernel
+            .submit_input_with_edge(context_id, false, Some(edge))
+            .await
+            .unwrap();
+
+        let all = blocks(&kernel, context_id).await;
+        let submitted = all
+            .iter()
+            .find(|b| b.id == result.block_id)
+            .expect("the second submit's block exists");
+        assert_eq!(
+            submitted.edge_block,
+            Some(earlier.block_id),
+            "the edge names the block the client had shown"
+        );
+        assert_eq!(
+            submitted.edge_shown,
+            Some(12),
+            "the edge carries how much of that block was shown"
+        );
+    });
+}
+
 /// A whitespace-only draft is refused **without being cleared** — a stray Enter
 /// neither sends nothing nor destroys what is there.
 #[test]

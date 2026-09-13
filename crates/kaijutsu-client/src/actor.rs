@@ -64,7 +64,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kaijutsu_types::{ContextId, KernelId};
-use kaijutsu_types::{BlockFilter, BlockId, BlockQuery, BlockSnapshot, Status};
+use kaijutsu_types::{BlockFilter, BlockId, BlockQuery, BlockSnapshot, InputEdge, Status};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
@@ -587,6 +587,7 @@ enum RpcCommand {
     SubmitInput {
         context_id: ContextId,
         is_shell: bool,
+        edge: Option<InputEdge>,
         reply: oneshot::Sender<Result<SubmitResult, CallError>>,
     },
     ClearInput {
@@ -1656,15 +1657,33 @@ impl ActorHandle {
             .await
     }
 
+    /// Submit the input document. Sends no edge — see
+    /// [`Self::submit_input_with_edge`] for a caller that can say what it
+    /// had shown.
     #[tracing::instrument(skip(self))]
     pub async fn submit_input(
         &self,
         context_id: ContextId,
         is_shell: bool,
     ) -> Result<SubmitResult, CallError> {
+        self.submit_input_with_edge(context_id, is_shell, None)
+            .await
+    }
+
+    /// Submit the input document, attaching the player's edge of context at
+    /// submit time (docs/issues.md, "Async input should carry the player's
+    /// edge of context"). `None` when the caller cannot say.
+    #[tracing::instrument(skip(self))]
+    pub async fn submit_input_with_edge(
+        &self,
+        context_id: ContextId,
+        is_shell: bool,
+        edge: Option<InputEdge>,
+    ) -> Result<SubmitResult, CallError> {
         self.send(|reply| RpcCommand::SubmitInput {
             context_id,
             is_shell,
+            edge,
             reply,
         })
         .await
@@ -3851,11 +3870,12 @@ async fn dispatch_kernel_command(
         RpcCommand::SubmitInput {
             context_id,
             is_shell,
+            edge,
             reply,
         } => {
             dispatch!(
                 kernel, reply, close_tx, k,
-                k.submit_input(context_id, is_shell)
+                k.submit_input_with_edge(context_id, is_shell, edge)
             );
         }
         RpcCommand::ClearInput { context_id, reply } => {

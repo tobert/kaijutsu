@@ -146,7 +146,7 @@ pub use block::{
     BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockMetadata,
     BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType, DriftKind, ErrorCategory,
     ErrorPayload,
-    ErrorSeverity, ErrorSpan, KIND_NAMES, LogLevel, MAX_DAG_DEPTH, NotificationKind,
+    ErrorSeverity, ErrorSpan, InputEdge, KIND_NAMES, LogLevel, MAX_DAG_DEPTH, NotificationKind,
     NotificationPayload, ROLE_NAMES, STATUS_NAMES,
     ProvenanceTag, ResourcePayload, Role, Status, StyleAttrs, StyleColor, StyleSpan, TaskStatus,
     ToolKind, VfsErrorKind, ERROR_DETAIL_HYDRATION_BUDGET,

@@ -1620,6 +1620,15 @@ pub struct ProvenanceTag {
     pub version: u32,
 }
 
+/// The newest block a client had shown when the player submitted, and how
+/// much of it if it was still streaming. See docs/issues.md, "Async input
+/// should carry the player's edge of context".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputEdge {
+    pub block: BlockId,
+    pub shown: Option<u64>,
+}
+
 /// Serializable snapshot of a block (plain data; no live document behind it).
 ///
 /// All identity fields use typed IDs: `PrincipalId` for the author,
@@ -1847,6 +1856,19 @@ pub struct BlockSnapshot {
     /// rides the at-rest CBOR, and rows written before the field exist.
     #[serde(default)]
     pub summary: Option<String>,
+
+    /// The newest block the submitting client had shown, set on a user
+    /// block promoted from a draft that carried an `InputEdge`. `None` when
+    /// the client sent no edge, or on every block that isn't a promoted
+    /// draft. Never enters hydration — see docs/issues.md, "Async input
+    /// should carry the player's edge of context".
+    #[serde(default)]
+    pub edge_block: Option<BlockId>,
+    /// Characters of `edge_block` the client had shown, when it was still
+    /// streaming at submit time. `None` when `edge_block` is `None`, or when
+    /// the edge block was already fully shown.
+    #[serde(default)]
+    pub edge_shown: Option<u64>,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -1965,6 +1987,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2012,6 +2036,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2071,6 +2097,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2130,6 +2158,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2196,6 +2226,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2250,6 +2282,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2302,6 +2336,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2354,6 +2390,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2402,6 +2440,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2461,6 +2501,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2519,6 +2561,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2576,6 +2620,8 @@ impl BlockSnapshot {
             provenance: None,
             edited_since_ingest: false,
             summary: None,
+            edge_block: None,
+            edge_shown: None,
         }
     }
 
@@ -2640,6 +2686,9 @@ impl BlockSnapshot {
         //
         // `summary` is excluded for the same reason: it is a kernel-derived
         // display cache over `content`, not authored content itself.
+        //
+        // `edge_block`/`edge_shown` are excluded too: they record where the
+        // submitting client's view stood, not what the block says.
     }
 }
 
@@ -2709,6 +2758,8 @@ impl BlockSnapshotBuilder {
                 provenance: None,
                 edited_since_ingest: false,
                 summary: None,
+                edge_block: None,
+                edge_shown: None,
             },
         }
     }
@@ -2902,6 +2953,18 @@ impl BlockSnapshotBuilder {
     /// Set the kernel-derived summary (see `BlockSnapshot::summary`).
     pub fn summary(mut self, summary: impl Into<String>) -> Self {
         self.snap.summary = Some(summary.into());
+        self
+    }
+
+    /// Set the player's edge block (see [`InputEdge`]).
+    pub fn edge_block(mut self, block: BlockId) -> Self {
+        self.snap.edge_block = Some(block);
+        self
+    }
+
+    /// Set how much of the edge block the client had shown.
+    pub fn edge_shown(mut self, shown: u64) -> Self {
+        self.snap.edge_shown = Some(shown);
         self
     }
 

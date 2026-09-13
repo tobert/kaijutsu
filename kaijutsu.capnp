@@ -113,6 +113,15 @@ enum InputMode {
   shell @1;
 }
 
+# The player's edge at submit time: the newest block a client had shown, and
+# how much of it if it was still streaming. See BlockSnapshot's edge fields
+# and submitInput.
+struct InputEdge {
+  blockId @0 :BlockId;
+  shown @1 :UInt64;
+  hasShown @2 :Bool;
+}
+
 # One styled range over a block's STRIPPED content (docs/ansi-and-beyond.md).
 # Byte-addressed into `content`, always on UTF-8 char boundaries. Colors are
 # semantic (palette index or raw truecolor), resolved at draw time — themes
@@ -232,6 +241,15 @@ struct BlockSnapshot {
   # moved on"). "" falls back to "none" — same "empty = unset" convention as
   # contentType/taskStatus. Display only: never fed back into hydration.
   summary @45 :Text;
+
+  # The player's edge at submit time (docs/issues.md, "Async input should
+  # carry the player's edge of context"): the newest block a client had
+  # shown, and how much of it if it was still streaming. Set on a user block
+  # promoted from a draft that carried an edge; absent otherwise.
+  edgeBlockId @46 :BlockId;
+  hasEdgeBlockId @47 :Bool;
+  edgeShown @48 :UInt64;
+  hasEdgeShown @49 :Bool;
 }
 
 # Scalar block metadata carried by onBlockMetadataChanged.
@@ -2291,8 +2309,10 @@ interface Kernel {
   getInputState @44 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
 
   # Atomic submit: read input, create block, clear input.
-  # Mode is explicit — no prefix detection.
-  submitInput @45 (contextId :Data, mode :InputMode, trace :TraceContext) -> (outcome :SubmitInputOutcome);
+  # Mode is explicit — no prefix detection. `edge` is a null pointer (check
+  # with the generated has_edge()) when the client sends none; the kernel
+  # never guesses one.
+  submitInput @45 (contextId :Data, mode :InputMode, trace :TraceContext, edge :InputEdge) -> (outcome :SubmitInputOutcome);
 
   # Clear the input document for a context (discard draft).
   # Emits InputCleared so all clients can reset their compose state.
