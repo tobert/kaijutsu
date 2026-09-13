@@ -226,6 +226,31 @@ Compact mode has its own retention policy. It rejects `--include`, `--exclude`,
 `--preset`, and `--as`; use a filtered or subtree fork for those selections.
 `--prompt` adds a new instruction and requests a child turn after initialization.
 
+## The submit verb
+
+`submit` fires after the server promotes a player's chat submission to a
+durable user block, the way `drift` fires after a drift block lands
+(`kj/lifecycle.rs`, `run_rc_lifecycle_with_vars`). It runs awaited inline, so
+anything a script writes is durable before `submitInput` returns.
+
+Its scripts read the submit facts as `KJ_*` variables. Every name is always
+set, empty rather than absent when the fact does not apply:
+
+| Variable | Value |
+|---|---|
+| `KJ_INPUT_BLOCK` | The user block the draft became (a block key) |
+| `KJ_EDGE_BLOCK` | The newest block the client had shown when the player submitted (a block key), empty when the client said none |
+| `KJ_EDGE_SHOWN` | Characters of `KJ_EDGE_BLOCK` shown, empty unless that block was still streaming |
+| `KJ_LOG_TAIL` | The newest durable block in the log before `KJ_INPUT_BLOCK` (a block key), empty when there is none |
+| `KJ_TURN_LIVE` | `true` or `false` — whether a model turn was running when the submit arrived |
+
+No context type links a `submit` script by default; a type opts in by
+symlink, the way any rc verb does. `assets/defaults/rc/lib/submit/S10-edge.kai`
+is the shipped example: it emits a `(System, Notification)` excerpt of the
+edge block, but only when the player was looking at an older point in the
+conversation than the log tail. See `docs/issues.md`, "Async input should
+carry the player's edge of context" for the design this verb implements.
+
 ## Migration and comparison
 
 Deploy the `--as` implementation and metadata-reading director/handoff scripts

@@ -36,7 +36,7 @@ use approval_ledger::rc_runs;
 use approval_ledger::types::RcOutcome;
 use kaijutsu_types::paths;
 use kaijutsu_types::{
-    BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
+    BlockId, BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
 };
 
 use super::{KjCaller, KjDispatcher};
@@ -74,6 +74,47 @@ pub struct DriftInfo {
     pub source_model: Option<String>,
 }
 
+/// The facts a chat submit hands its rc scripts. See docs/issues.md,
+/// "Async input should carry the player's edge of context".
+#[derive(Clone, Debug)]
+pub struct SubmitInfo {
+    /// The user block the draft became.
+    pub input_block: BlockId,
+    /// The newest block the client had shown when the player submitted, if it said.
+    pub edge_block: Option<BlockId>,
+    /// Characters of `edge_block` shown, if it was still streaming.
+    pub edge_shown: Option<u64>,
+    /// The newest durable block in the log before `input_block`, if any.
+    pub log_tail: Option<BlockId>,
+    /// Whether a model turn was running when the submit arrived.
+    pub turn_live: bool,
+}
+
+impl SubmitInfo {
+    /// The script environment: KJ_INPUT_BLOCK, KJ_EDGE_BLOCK, KJ_EDGE_SHOWN,
+    /// KJ_LOG_TAIL (each a block key via `BlockId::to_key`, "" when absent),
+    /// KJ_TURN_LIVE ("true"/"false"). Every name is always set so a script
+    /// can test emptiness without guarding definedness.
+    pub fn vars(&self) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        vars.insert("KJ_INPUT_BLOCK".to_string(), self.input_block.to_key());
+        vars.insert(
+            "KJ_EDGE_BLOCK".to_string(),
+            self.edge_block.map(|b| b.to_key()).unwrap_or_default(),
+        );
+        vars.insert(
+            "KJ_EDGE_SHOWN".to_string(),
+            self.edge_shown.map(|n| n.to_string()).unwrap_or_default(),
+        );
+        vars.insert(
+            "KJ_LOG_TAIL".to_string(),
+            self.log_tail.map(|b| b.to_key()).unwrap_or_default(),
+        );
+        vars.insert("KJ_TURN_LIVE".to_string(), self.turn_live.to_string());
+        vars
+    }
+}
+
 /// Hard cap on rc-driven recursion depth. A script that hits this limit
 /// produces an error block and is skipped — its lifecycle does NOT run.
 pub const MAX_RC_DEPTH: u8 = 4;
@@ -96,6 +137,11 @@ pub const VERB_TICK: &str = "tick";
 /// play the child) run race-free — fork-lineage becomes song form
 /// (`docs/chameleon.md`).
 pub const VERB_ROTATE: &str = "rotate";
+/// The submit verb: fired by the server after a chat submit has promoted the
+/// player's draft to a durable user block. Scripts see the submit facts as
+/// `KJ_*` variables ([`SubmitInfo::vars`]). Runs awaited inline like `drift`,
+/// so anything a script writes is durable before `submitInput` returns.
+pub const VERB_SUBMIT: &str = "submit";
 
 /// The canonical set of rc lifecycle verbs — the single source of truth for
 /// both the firing gate ([`verb_is_wired`]) and the path validator
@@ -110,6 +156,7 @@ pub const RC_VERBS: &[&str] = &[
     VERB_DRIFT,
     VERB_TICK,
     VERB_ROTATE,
+    VERB_SUBMIT,
 ];
 
 fn verb_is_wired(verb: &str) -> bool {
@@ -3368,5 +3415,60 @@ esac
         let run = find_run_for_context(&d, new_id, "create").expect("run row");
         assert!(run.finished_at.is_some());
         assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Ok));
+    }
+
+    // ── submit verb (docs/issues.md, "Async input should carry the
+    // player's edge of context") ────────────────────────────────────────
+
+    #[test]
+    fn submit_info_vars_sets_all_names_with_optional_facts() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let input_block = BlockId::new(ctx, principal, 2);
+        let edge_block = BlockId::new(ctx, principal, 1);
+        let log_tail = BlockId::new(ctx, principal, 0);
+        let info = SubmitInfo {
+            input_block,
+            edge_block: Some(edge_block),
+            edge_shown: Some(42),
+            log_tail: Some(log_tail),
+            turn_live: true,
+        };
+
+        let vars = info.vars();
+        assert_eq!(vars.len(), 5, "every name is always set: {vars:?}");
+        assert_eq!(vars["KJ_INPUT_BLOCK"], input_block.to_key());
+        assert_eq!(vars["KJ_EDGE_BLOCK"], edge_block.to_key());
+        assert_eq!(vars["KJ_EDGE_SHOWN"], "42");
+        assert_eq!(vars["KJ_LOG_TAIL"], log_tail.to_key());
+        assert_eq!(vars["KJ_TURN_LIVE"], "true");
+    }
+
+    #[test]
+    fn submit_info_vars_sets_all_names_without_optional_facts() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let input_block = BlockId::new(ctx, principal, 0);
+        let info = SubmitInfo {
+            input_block,
+            edge_block: None,
+            edge_shown: None,
+            log_tail: None,
+            turn_live: false,
+        };
+
+        let vars = info.vars();
+        assert_eq!(vars.len(), 5, "every name is always set: {vars:?}");
+        assert_eq!(vars["KJ_INPUT_BLOCK"], input_block.to_key());
+        assert_eq!(vars["KJ_EDGE_BLOCK"], "", "empty, not absent, when unset");
+        assert_eq!(vars["KJ_EDGE_SHOWN"], "");
+        assert_eq!(vars["KJ_LOG_TAIL"], "");
+        assert_eq!(vars["KJ_TURN_LIVE"], "false");
+    }
+
+    #[test]
+    fn submit_is_a_canonical_wired_verb() {
+        assert!(RC_VERBS.contains(&VERB_SUBMIT));
+        assert!(verb_is_wired("submit"));
     }
 }

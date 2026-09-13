@@ -64,7 +64,7 @@ enum RcCommand {
         /// Filter by context_type (`lib` selects the shared bodies)
         #[arg(long = "type")]
         type_filter: Option<String>,
-        /// Filter by verb (create|fork|attach|drift|tick|rotate), or `hooks`
+        /// Filter by verb (create|fork|attach|drift|tick|rotate|submit), or `hooks`
         #[arg(long = "verb")]
         verb_filter: Option<String>,
     },

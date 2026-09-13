@@ -1,0 +1,51 @@
+# The submit verb fires after the server promotes a player's chat submit to
+# a durable user block (docs/prompts.md, "The submit verb"). This example
+# notices when the player's edge — the newest block their client had shown
+# at Enter — sits behind the log tail: the model's next turn would otherwise
+# read the submit as an in-order reply to output the player never saw.
+# docs/issues.md, "Async input should carry the player's edge of context".
+#
+# NOTIFICATION, never (Role::System, BlockKind::Text): this content differs
+# on every submit, and the System+Text slot folds into the CACHED system
+# prompt (llm/system_prompt.rs); writing there would invalidate the
+# --target=system cache breakpoint on every submit. Notification hydrates as
+# an ordinary appended turn (llm/hydrate.rs) and is never swept into the
+# system prompt.
+#
+# No context type links this by default; a type opts in with a symlink into
+# its own <type>/submit/ directory, the way any rc verb composes.
+#
+# kaish trap: a `case` pattern does NOT expand a variable — `case "$a" in
+# "$b") ... esac` never matches even when they hold the same string. Use
+# `test` for a variable-to-variable comparison instead.
+set -e
+
+if test -z "$KJ_EDGE_BLOCK"; then
+  exit 0
+fi
+if test "$KJ_EDGE_BLOCK" = "$KJ_LOG_TAIL"; then
+  exit 0
+fi
+
+info="$(kj block inspect --json "$KJ_EDGE_BLOCK")"
+role="$(echo "$info" | jq -r '.role')"
+kind="$(echo "$info" | jq -r '.kind')"
+
+# `block inspect --json` carries content_length, not content — read the
+# first line separately. `|| true` guards the substitution under `set -e`
+# (a trailing `||` on the assignment itself never fires); an unreadable edge
+# block still lets the notification land, with an empty excerpt.
+line="$(kj block read --no-line-numbers --range 0:1 "$KJ_EDGE_BLOCK" || true)"
+excerpt="$(echo "$line" | cut -c1-80)"
+if test "${#line}" -gt 80; then
+  excerpt="${excerpt}…"
+fi
+
+shown=""
+if test -n "$KJ_EDGE_SHOWN"; then
+  shown=", $KJ_EDGE_SHOWN characters shown"
+fi
+
+content="The player wrote the message above while looking at an earlier point in this context: $role $kind \"$excerpt\" (block $KJ_EDGE_BLOCK$shown). Blocks after it had not been read."
+
+kj block create --role system --kind notification --content "$content"
