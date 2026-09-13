@@ -184,6 +184,17 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
+## A paste into the tui's vi screen is refused (2026-09-13)
+
+Bracketed paste reaches the draft and the `:` bar (`docs/tui.md`,
+"Compose"). On the alternate screen the tui forwards keys to the kernel's
+vi session as `editor_keys` notation, which cannot carry a literal `<`,
+and the kernel editor has no insert-text call over the wire. So a paste
+there is refused with a notice rather than read as normal-mode commands.
+The fix is a wire method that inserts text at the session's cursor
+(`EditorCore::insert_at_cursor` already exists in `kaijutsu-editor`), and
+vim's rule of entering insert mode for a paste that lands in normal mode.
+
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 
 `crates/kaijutsu-tui/src/bridge.rs:78` spawns the actor with

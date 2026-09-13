@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::Event;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use kaijutsu_audio::RefDisposition;
 use kaijutsu_client::{ContextInfo, FeedEvent, ServerEvent};
@@ -270,6 +271,9 @@ async fn event_loop(
     // runtime resize — see `set_viewport_height`) and the beat-driven redraw
     // wake, both `None`/base until a track is found playing.
     let mut viewport_height = render::VIEWPORT_LINES;
+    // A band height the terminal refused (no cursor-query answer). Cleared
+    // by a resize event or by the wanted height changing.
+    let mut resize_refused: Option<u16> = None;
     // The cursor shape last sent to the terminal; `None` until the first
     // frame and again after a suspend, since the host shell may have set
     // its own.
@@ -309,7 +313,14 @@ async fn event_loop(
                             refresh.reset_immediately();
                         }
                     }
-                    Event::Resize(..) => dirty = true,
+                    Event::Paste(text) => {
+                        dirty = true;
+                        paste_text(bridge, app, text).await;
+                    }
+                    Event::Resize(..) => {
+                        dirty = true;
+                        resize_refused = None;
+                    }
                     _ => {}
                 }
             }
@@ -442,10 +453,21 @@ async fn event_loop(
                 let size = terminal.size()?;
                 app.screen_rows = size.height;
                 let want = render::viewport_lines(app, size.width);
-                if want != viewport_height {
+                if want != viewport_height && resize_refused != Some(want) {
                     tracing::debug!(from = viewport_height, to = want, "viewport resized");
-                    set_viewport_height(&wires.term_lock, terminal, want)?;
-                    viewport_height = want;
+                    match set_viewport_height(&wires.term_lock, terminal, want) {
+                        Ok(()) => viewport_height = want,
+                        Err(error) => {
+                            // The terminal did not answer the cursor query
+                            // (`Terminal::with_options` waits two seconds).
+                            // The band keeps its height rather than the
+                            // loop ending; the same height is not asked
+                            // for again until something else changes.
+                            tracing::warn!(%error, from = viewport_height, to = want, "viewport resize refused");
+                            app.note("the terminal did not answer the cursor query; the band keeps its height");
+                            resize_refused = Some(want);
+                        }
+                    }
                 }
                 if dirty {
                     dirty = false;
@@ -798,6 +820,52 @@ async fn act(
     Ok(Acted::Continue)
 }
 
+/// Where a bracketed paste goes.
+#[derive(Debug, PartialEq, Eq)]
+enum PasteTarget {
+    Draft,
+    CommandLine,
+    Refused(&'static str),
+}
+
+/// A paste is text for the draft or the `:` bar. Every other surface
+/// refuses it with a notice rather than reading it as keys: the alternate
+/// screen's `editor_keys` notation cannot carry a literal `<`, and the
+/// picker, the ledger and an ask card have no text field.
+fn paste_target(app: &App) -> PasteTarget {
+    if editor::route_key(app) == editor::KeyRoute::AlternateScreen {
+        return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
+    }
+    if app.ledger_view.is_some() || app.picker.is_some() || app.ask_card.is_some() {
+        return PasteTarget::Refused("nothing to paste into here");
+    }
+    if app.compose.command_line().is_some() { PasteTarget::CommandLine } else { PasteTarget::Draft }
+}
+
+/// Act on one `Event::Paste`. Line endings are normalized to `\n`, since
+/// terminals differ on what they send for a pasted newline. The draft
+/// takes it as one edit at the cursor, like `Ctrl+A ]`; the `:` bar takes
+/// it flattened onto one line at its end.
+async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    match paste_target(app) {
+        PasteTarget::Refused(why) => app.note(why),
+        PasteTarget::CommandLine => {
+            let body = app.compose.command_line().map(|line| line[1..].to_string()).unwrap_or_default();
+            let flat = text.lines().collect::<Vec<_>>().join(" ");
+            app.compose.set_command_body(&format!("{body}{flat}"));
+        }
+        PasteTarget::Draft => {
+            let Some(ctx) = app.current else {
+                app.note("no context attached");
+                return;
+            };
+            let ops = app.compose.paste(&text);
+            mirror_ops(bridge, app, ctx, &ops).await;
+        }
+    }
+}
+
 /// Switch the screen to `id`: watch it, make it current, and load its draft.
 /// The draft is per context, so the compose buffer follows the switch rather
 /// than carrying the old context's text along — `load_draft` keeps the `:`
@@ -1067,7 +1135,7 @@ fn suspend(
     // so the cursor query on the way back has crossterm's reader to itself.
     let _guard = term_lock.lock();
     let _ = terminal.flush();
-    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
+    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape, DisableBracketedPaste);
     let _ = disable_raw_mode();
     println!();
 
@@ -1076,6 +1144,7 @@ fn suspend(
     // Back from SIGCONT. The host shell moved the cursor, so the viewport is
     // re-anchored where the cursor is now rather than where it used to be.
     enable_raw_mode()?;
+    crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     let size = terminal.size()?;
     terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
     Ok(())
@@ -1413,6 +1482,9 @@ fn mark_activity(app: &mut App, event: &ServerEvent) -> bool {
 
 fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
+    // A paste arrives as one `Event::Paste` — text, not keystrokes — so a
+    // newline inside it is a newline in the draft, not an Enter.
+    crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
@@ -1448,7 +1520,7 @@ fn leave_terminal(
 /// signal path all come through here, so every way out agrees.
 pub fn restore_terminal() {
     editor::abandon();
-    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
+    let _ = crossterm::execute!(io::stdout(), SetCursorStyle::DefaultUserShape, DisableBracketedPaste);
     let _ = disable_raw_mode();
 }
 
@@ -1816,6 +1888,24 @@ mod tests {
             .or_else(|| line.strip_prefix("async fn "))
             .or_else(|| line.strip_prefix("pub async fn "))?;
         Some(&rest[..rest.find('(')?])
+    }
+
+    #[test]
+    fn a_paste_goes_to_the_draft_or_the_colon_bar_and_nowhere_else() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("amy");
+        assert_eq!(paste_target(&app), PasteTarget::Draft);
+
+        app.compose.press(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert_eq!(paste_target(&app), PasteTarget::CommandLine);
+        app.compose.press(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.open_picker(0);
+        assert!(matches!(paste_target(&app), PasteTarget::Refused(_)), "the picker has no text field");
+        app.picker = None;
+
+        app.screen = ScreenMode::Copy(crate::copy::CopyScreen::new("probe", Vec::new()));
+        assert!(matches!(paste_target(&app), PasteTarget::Refused(_)), "the alternate screen refuses");
     }
 
     /// The refresh's kernel calls live in `refresh::fetch`, on their own

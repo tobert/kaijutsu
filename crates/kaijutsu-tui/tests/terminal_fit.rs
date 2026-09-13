@@ -834,6 +834,79 @@ fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// m. A bracketed paste is text, not keystrokes
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Two pasted lines land in the draft as one edit: the newline is a
+/// newline in the draft, not an `Enter` that submits the first line
+/// (`docs/tui.md`, "Compose").
+#[test]
+fn a_bracketed_paste_lands_in_the_draft_without_submitting() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.send("i");
+    session.send("\x1b[200~pasted one\npasted two\x1b[201~");
+    let landed = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        let first = rows.iter().position(|l| l.contains('❯') && l.contains("pasted one"));
+        first.is_some_and(|i| rows.get(i + 1).is_some_and(|l| l.contains("pasted two")))
+    });
+    assert!(landed, "the paste did not land as two draft rows: {}", session.dump("after paste"));
+
+    // Nothing was submitted: the draft is still there a moment later and
+    // no user block carrying the first line reached scrollback.
+    std::thread::sleep(Duration::from_secs(2));
+    let (scrollback, visible) = session.history_snapshot();
+    assert!(
+        visible.iter().any(|l| l.contains("pasted two")),
+        "the draft was cleared, so something submitted: {}",
+        session.dump("after paste")
+    );
+    assert!(
+        !scrollback.iter().any(|l| l.contains("pasted one")),
+        "the first pasted line was submitted as a turn: {scrollback:?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// n. A terminal that never answers the cursor query does not end the client
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The inline viewport asks the terminal where the cursor is on every
+/// resize, with a two-second wait. A terminal that never answers — a
+/// stalled ssh hop — used to end the loop through `?`. Now the band keeps
+/// its height, the player is told, and keys still work.
+#[test]
+fn an_unanswered_cursor_query_keeps_the_client_alive() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    session.mute_cursor_queries();
+    // A draft past one row grows the band, which is a viewport rebuild and
+    // a query (the picker with two contexts fits the base band and asks
+    // nothing).
+    session.send("i");
+    session.send("\x1b[200~aaa\nbbb\nccc\x1b[201~");
+    let told = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "cursor query"));
+    assert!(told, "no notice about the unanswered query: {}", session.dump("after the grow"));
+    assert!(
+        session.wait_for_exit(Duration::from_millis(500)).is_none(),
+        "the client exited on an unanswered cursor query: {}",
+        session.dump("exited")
+    );
+
+    // `a` appends after the last pasted line, a continuation row with no
+    // prompt on it.
+    session.send("\x1b");
+    session.send("ax");
+    let responsive = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "cccx"));
+    assert!(responsive, "keys stopped working after the failed resize: {}", session.dump("after Esc, ax"));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // l. `Ctrl+Z` suspends, one press, no toggle
 // ────────────────────────────────────────────────────────────────────────────
 

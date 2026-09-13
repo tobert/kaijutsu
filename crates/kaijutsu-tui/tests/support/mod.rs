@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -126,6 +127,9 @@ pub struct TuiSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Whether the read loop answers `ESC [ 6 n`; off, it plays a terminal
+    /// that never replies, the shape of a stalled ssh hop.
+    answer_cursor_queries: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
 }
@@ -220,9 +224,11 @@ impl TuiSession {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
 
+        let answer_cursor_queries = Arc::new(AtomicBool::new(true));
         let reader_parser = parser.clone();
         let reader_writer = writer.clone();
-        let reader = std::thread::spawn(move || read_loop(reader, reader_parser, reader_writer));
+        let reader_answers = answer_cursor_queries.clone();
+        let reader = std::thread::spawn(move || read_loop(reader, reader_parser, reader_writer, reader_answers));
 
         Self {
             child,
@@ -230,6 +236,7 @@ impl TuiSession {
             writer,
             parser,
             reader: Some(reader),
+            answer_cursor_queries,
             rows,
             cols,
         }
@@ -317,6 +324,11 @@ impl TuiSession {
         }
     }
 
+    /// Stop answering the client's cursor-position queries from here on.
+    pub fn mute_cursor_queries(&self) {
+        self.answer_cursor_queries.store(false, Ordering::SeqCst);
+    }
+
     /// Whether the parsed terminal is on the alternate screen buffer.
     pub fn on_alternate_screen(&self) -> bool {
         self.parser.lock().expect("parser lock").screen().alternate_screen()
@@ -399,6 +411,7 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    answer: Arc<AtomicBool>,
 ) {
     const DSR_CURSOR: &[u8] = b"\x1b[6n";
     let mut buf = [0u8; 4096];
@@ -421,6 +434,9 @@ fn read_loop(
                 p.screen().cursor_position()
             };
             let reply = format!("\x1b[{};{}R", row + 1, col + 1);
+            if !answer.load(Ordering::SeqCst) {
+                continue;
+            }
             if let Ok(mut w) = writer.lock() {
                 let _ = w.write_all(reply.as_bytes());
                 let _ = w.flush();

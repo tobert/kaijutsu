@@ -273,6 +273,25 @@ Rules the figure carries:
   color applies. The armed legend, the picker, an ask card and the ledger
   hide it. The shape goes back to the terminal's default on `:q` and on
   `Ctrl+Z`.
+- **A paste is text, not keystrokes.** Bracketed paste is on while the
+  viewport is up, so the terminal delivers a paste as one event: the draft
+  takes it as one edit at the cursor, the way `Ctrl+A ]` does, and a
+  newline inside it is a newline in the draft, never an Enter that submits
+  the first line. The `:` bar takes it flattened onto one line. The
+  picker, the ledger, an ask card and the alternate screen refuse it with
+  a notice — the editor's `editor_keys` notation cannot carry a literal
+  `<`, so a paste into vi is still open (`docs/issues.md`). Line endings
+  are normalized, since terminals differ on what a pasted newline is.
+  Probe: `a_bracketed_paste_lands_in_the_draft_without_submitting`.
+- **A terminal that never answers the cursor query does not end the
+  client.** Every band grow rebuilds the inline viewport, which asks the
+  terminal where the cursor is and waits two seconds. A stalled hop used
+  to end the loop through `?`. Now the band keeps its height, the status
+  line says so, the same height is not asked for again until a resize or
+  a different height, and `draw_live` crops from the front so the draft's
+  tail and the status line stay. Probe:
+  `an_unanswered_cursor_query_keeps_the_client_alive`, which mutes the
+  harness's DSR answer.
 - There is no state past normal mode. The app's `Esc Esc` hands the
   keyboard to its block list; the tui prints its transcript into scrollback
   and never redraws it, so a block cursor would have nothing to act on, and
@@ -498,7 +517,7 @@ place the exit sequences are written: give the alternate screen back if this
 process took it (`editor::abandon`, guarded by a flag `enter` sets and the
 `AltScreen` drop clears, because xterm restores a saved cursor on `?1049l`
 even when the alternate buffer was never in use), reset the cursor shape,
-leave raw mode. `:q` reaches it through `leave_terminal`; a panic reaches
+turn bracketed paste off, leave raw mode. `:q` reaches it through `leave_terminal`; a panic reaches
 it through the hook `run` installs before the viewport, so the message
 prints on a cooked main screen; `SIGTERM` and `SIGHUP` reach it by ending
 the loop the way `:q` does. The key reader thread stops before raw mode
