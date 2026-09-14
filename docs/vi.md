@@ -20,8 +20,8 @@ hazard real.
 **Slices 1–3 shipped.** The full stack exists and is runner-verified: path
 resolver → `kaijutsu-editor` `EditorCore` (pure modalkit vim) → kernel
 `EditorSessions` → capnp wire surface (`editorOpen/Keys/State/Save/Quit @74–78`
-+ push `subscribeEditor @79`) → `Screen::Editor` MSDF renderer with a real
-cursor quad → key forwarding. Front doors: the `vi`/`edit` kaish builtin and
++ push `subscribeEditor @79` + `editorInsert @105`) → `Screen::Editor` MSDF
+renderer with a real cursor quad → key forwarding. Front doors: the `vi`/`edit` kaish builtin and
 `kj editor` verbs — both funneling to one `Kernel::editor_open` and one
 `EditorState::to_json` shape. The `:` command dialect shipped (core verbs, a
 hand-rolled `:s`, `:r <file>` / `:r !cmd`),
@@ -148,24 +148,26 @@ cursor/mode) can target one shared block; the kernel sequences every
 session's edits onto it, and siblings reconcile via the mechanism below.
 The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 `EditorCore` stays inside sync critical sections), exposed as
-`Kernel::editor_open/keys/state/save/quit`.
+`Kernel::editor_open/keys/insert/state/save/quit`.
 
 | Verb | Does |
 |---|---|
 | `editor_open(path)` | `resolve_editor_target(path)` → load block text into a fresh `EditorCore` → return a session handle + initial state. `editor_open_signaled` also fires the `open_editor` peer invoke at the submitter principal's app windows (falling back to `APP_PEER_NICK`; a missing renderer is a `warn`, never fatal — the session is already open). |
 | `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. A dirty file-backed edit marks the swap row; a `:w`/`:wq`/`:x`/`ZZ` inside the batch flushes to disk too (`docs/file-buffers.md`). **Async** since `:r` (and now the flush) — sync-lock, release, await, sync-lock again; `EditorCore` never crosses the await, only the fetched `String`/flush result does. |
+| `editor_insert(session, text)` | A paste, not keystrokes: `EditorCore::insert_at_cursor` splices `text` at the live cursor and mirrors the edit onto the block, the same as a key batch's plain edit — no write intent, so nothing to flush. It never touches the vim state machine, so the mode is exactly what it was before the call: insert stays insert, normal stays normal. Refuses with the state unchanged while the `:` command line is open, reporting on `EditorState.message` — the same dialect-level channel a bad `:s` regex uses. Synchronous. |
 | `editor_state(session)` | read text/cursor/mode/command-line/dirty (what a renderer draws). |
 | `editor_save(session)` | `ZZ` / `:w` — flush the document to its owner; advance the checkpoint. |
 | `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback; skipped when entangled with peer work), drop the session. |
 
 **The wire surface mirrors the input-doc surface.** capnp: `EditorState`
 struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`) +
-`editorOpen/Keys/State/Save/Quit @74–78` + `subscribeEditor @79` with
-`EditorEvents` callbacks. **The render channel is push, not poll** (decided
+`editorOpen/Keys/State/Save/Quit @74–78` + `subscribeEditor @79` +
+`editorInsert @105` with `EditorEvents` callbacks. **The render channel is
+push, not poll** (decided
 2026-06-23): a remote write landing in an open block must reach every renderer
 the instant it lands — collaborative editing is the point, and poll would lag
 it. `EditorFlow::StateChanged/Closed` ride an `editor_flows` bus; the kernel's
-`editor_keys/save/quit` publish after the registry mutates.
+`editor_keys/insert/save/quit` publish after the registry mutates.
 
 Remote ops are **one kernel responsibility**, not scattered per-client: the
 server's `spawn_editor_reconciler` (one per kernel, dedicated thread +
@@ -439,7 +441,7 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |
-| Wire schema | `kaijutsu.capnp` (`EditorState`, `editorOpen @74` … `subscribeEditor @79`) |
+| Wire schema | `kaijutsu.capnp` (`EditorState`, `editorOpen @74` … `subscribeEditor @79`, `editorInsert @105`) |
 | Wire e2e | `kaijutsu-server/tests/editor_wire.rs` |
 | App renderer | `kaijutsu-app/src/view/editor/` (`mod.rs`, `render.rs`, `keys.rs`); screen FSM `ui/screen.rs` |
 | Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `sync_editor_cursor`) |

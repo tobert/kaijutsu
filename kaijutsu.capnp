@@ -1885,7 +1885,7 @@ interface World {
 }
 
 interface Kernel {
-  # Next free ordinal: 103. Ordinals are dense and permanent — never
+  # Next free ordinal: 106. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
@@ -2441,6 +2441,13 @@ interface Kernel {
 
   # Push channel: server streams editor state changes (incl. future remote merges).
   subscribeEditor @79 (callback :EditorEvents);
+
+  # Insert `text` at the session's cursor — a paste, not keystrokes:
+  # `editorKeys`' notation cannot carry a literal `<`. Lands wherever the
+  # cursor already is and leaves the session's mode untouched (insert stays
+  # insert, normal stays normal); refuses with the state unchanged while the
+  # `:` command line is open, reporting on `EditorState.message`.
+  editorInsert @105 (sessionId :UInt64, text :Text, trace :TraceContext) -> (state :EditorState);
 
   # ==========================================================================
   # Transport and time (tracks, MIDI capture/presence, clock estimates)

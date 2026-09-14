@@ -1664,6 +1664,39 @@ impl Kernel {
         }
     }
 
+    /// Insert `text` at a session's cursor — the paste target
+    /// (`crates/kaijutsu-tui/src/run.rs`'s alternate-screen paste; a paste on
+    /// the draft or the `:` bar never reaches here). Mirrors the produced
+    /// edit onto the kernel block and publishes the new state, same as
+    /// [`editor_keys`](Self::editor_keys)'s plain-edit path.
+    ///
+    /// A paste carries no write intent (`ZZ`/`:w`/`:wq`), so there is
+    /// nothing to gate on `Capability::Editor` and nothing to flush — only a
+    /// dirty file-backed session records its swap marker, exactly like a
+    /// plain keystroke edit. See
+    /// [`EditorSessions::insert_at_cursor`](crate::editor::EditorSessions::insert_at_cursor)
+    /// for the mode-preserving insert and the command-line refusal.
+    pub fn editor_insert(
+        &self,
+        id: crate::editor::EditorSessionId,
+        text: &str,
+    ) -> Result<crate::editor::EditorState, String> {
+        let blocks = self.blocks();
+        let mut sessions = self.editor_sessions.lock();
+        let file_path = sessions.0.session_path(id);
+        let state = sessions.0.insert_at_cursor(id, text, blocks)?;
+        drop(sessions);
+        if let Some(fp) = file_path.as_deref()
+            && state.dirty
+        {
+            self.file_cache
+                .mark_dirty(fp)
+                .map_err(|e| format!("editor insert: failed to mark {fp} dirty: {e}"))?;
+        }
+        self.publish_editor_state(id, &state);
+        Ok(state)
+    }
+
     /// Fetch the content for a `:r` read intent. `:r <file>` reads through the
     /// shared `FileDocumentCache` (the same source the editor and file tools
     /// use). `:r !cmd` materializes a per-context kaish in the *opener's*
@@ -2404,6 +2437,111 @@ mod tests {
         kernel.editor_quit(id).unwrap();
         let err = kernel.editor_keys(id, "x").await.unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
+    }
+
+    // ── `editor_insert` — a paste lands at the cursor, not as keystrokes ────
+    // (docs/vi.md; the tui's `editor_keys` notation cannot carry a literal
+    // `<`, so a paste needs its own insert-text call over the wire).
+
+    #[tokio::test]
+    async fn editor_insert_in_insert_mode_keeps_insert_mode() {
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"ab");
+        let path = "/config/rc/coder/create/S00.kai";
+
+        let (id, st) = kernel.editor_open(path).await.unwrap();
+        assert_eq!(st.text, "ab");
+
+        // Enter insert mode (no Esc) before the paste lands.
+        let st = kernel.editor_keys(id, "i").await.unwrap();
+        assert_eq!(st.mode.as_deref(), Some("-- INSERT --"));
+
+        let st = kernel.editor_insert(id, "PASTE").unwrap();
+        assert_eq!(st.text, "PASTEab", "the text lands at the cursor");
+        assert_eq!(
+            st.mode.as_deref(),
+            Some("-- INSERT --"),
+            "a paste in insert mode must not leave insert mode"
+        );
+        assert!(st.dirty);
+    }
+
+    #[tokio::test]
+    async fn editor_insert_in_normal_mode_keeps_normal_mode() {
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"ab");
+        let path = "/config/rc/coder/create/S00.kai";
+
+        let (id, st) = kernel.editor_open(path).await.unwrap();
+        assert_eq!(st.mode, None, "starts in normal mode");
+
+        let st = kernel.editor_insert(id, "PASTE").unwrap();
+        assert_eq!(st.text, "PASTEab", "the text lands at the cursor");
+        assert_eq!(
+            st.mode, None,
+            "a paste in normal mode must not enter insert mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_insert_multiline_text_lands_as_lines() {
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"end");
+        let path = "/config/rc/coder/create/S00.kai";
+
+        let (id, _) = kernel.editor_open(path).await.unwrap();
+        let st = kernel.editor_insert(id, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(st.text, "one\ntwo\nthree\nend");
+    }
+
+    #[tokio::test]
+    async fn editor_insert_mirrors_onto_the_block_like_a_key_batch() {
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"ab");
+        let path = "/config/rc/coder/create/S00.kai";
+
+        let (id, _) = kernel.editor_open(path).await.unwrap();
+        let st = kernel.editor_insert(id, "X").unwrap();
+
+        let info = kernel
+            .editor_list()
+            .into_iter()
+            .find(|i| i.session == id.as_u64())
+            .expect("session listed");
+        let context_id = kaijutsu_types::ContextId::parse(&info.context_id)
+            .expect("valid context id");
+        let content = kernel
+            .blocks()
+            .get_content(context_id)
+            .expect("document exists");
+        assert_eq!(
+            content, st.text,
+            "editor_insert must mirror onto the block the same way a key batch does"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_insert_refuses_while_the_command_line_is_active() {
+        let (kernel, dir) = kernel_with_rc_dir().await;
+        write_rc_file(&dir, "coder/create/S00.kai", b"ab");
+        let path = "/config/rc/coder/create/S00.kai";
+
+        let (id, _) = kernel.editor_open(path).await.unwrap();
+        // Open the ':' bar without submitting.
+        let st = kernel.editor_keys(id, ":").await.unwrap();
+        assert_eq!(st.command_line.as_deref(), Some(":"));
+
+        let st = kernel.editor_insert(id, "PASTE").unwrap();
+        assert_eq!(st.text, "ab", "the buffer is untouched while ':' is open");
+        assert!(
+            st.message.is_some(),
+            "the refusal reports on the status line"
+        );
+        assert_eq!(
+            st.command_line.as_deref(),
+            Some(":"),
+            "the bar stays open"
+        );
     }
 
     #[tokio::test]

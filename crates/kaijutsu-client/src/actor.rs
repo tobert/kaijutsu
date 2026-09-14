@@ -646,6 +646,11 @@ enum RpcCommand {
         keys: String,
         reply: oneshot::Sender<Result<EditorState, CallError>>,
     },
+    EditorInsert {
+        session_id: u64,
+        text: String,
+        reply: oneshot::Sender<Result<EditorState, CallError>>,
+    },
 
     // ── Tool Execution ───────────────────────────────────────────────────
     ExecuteTool {
@@ -857,6 +862,7 @@ impl RpcCommand {
             Self::ReportAudioInventory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::VfsReadAll { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::EditorInsert { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1845,6 +1851,25 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::EditorKeys {
             session_id,
             keys: keys.into(),
+            reply,
+        })
+        .await
+    }
+
+    /// Insert `text` at the session's cursor — a paste, not keystrokes
+    /// (`editor_keys`' vim notation cannot carry a literal `<`). Leaves the
+    /// session's mode untouched; refuses with the state unchanged while the
+    /// `:` command line is open (`docs/vi.md`). The push subscription also
+    /// echoes this state; callers fire-and-forget.
+    #[tracing::instrument(skip(self, text))]
+    pub async fn editor_insert(
+        &self,
+        session_id: u64,
+        text: &str,
+    ) -> Result<EditorState, CallError> {
+        self.send(|reply| RpcCommand::EditorInsert {
+            session_id,
+            text: text.into(),
             reply,
         })
         .await
@@ -3965,6 +3990,9 @@ async fn dispatch_kernel_command(
         // ── Editor (vi) ──
         RpcCommand::EditorKeys { session_id, keys, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.editor_keys(session_id, &keys));
+        }
+        RpcCommand::EditorInsert { session_id, text, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.editor_insert(session_id, &text));
         }
 
         // ── Tool Execution ──

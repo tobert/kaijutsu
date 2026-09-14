@@ -1417,6 +1417,25 @@ impl KernelHandle {
         parse_editor_state(response.get()?.get_state()?)
     }
 
+    /// Insert `text` at the session's cursor — a paste, not keystrokes
+    /// (`editor_keys`' vim notation cannot carry a literal `<`). Leaves the
+    /// session's mode untouched; refuses with the state unchanged while the
+    /// `:` command line is open (`docs/vi.md`).
+    #[tracing::instrument(skip(self), name = "rpc_client.editor_insert")]
+    pub async fn editor_insert(&self, session_id: u64, text: &str) -> Result<EditorState, RpcError> {
+        let mut request = self.kernel.editor_insert_request();
+        request.get().set_session_id(session_id);
+        request.get().set_text(text);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        parse_editor_state(response.get()?.get_state()?)
+    }
+
     /// Read the current state of an open session.
     #[tracing::instrument(skip(self), name = "rpc_client.editor_state")]
     pub async fn editor_state(&self, session_id: u64) -> Result<EditorState, RpcError> {

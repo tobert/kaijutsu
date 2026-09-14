@@ -37,6 +37,13 @@ pub const APP_PEER_NICK: &str = "kaijutsu-app";
 pub const WRITE_CAPABILITY_REFUSED: &str =
     "write refused — this seat lacks the 'editor' capability";
 
+/// Status-line message for [`EditorSessions::insert_at_cursor`] (a paste)
+/// while the `:` command line is open. The `:`-line's own keystrokes mean
+/// something different than inserting into the document, and this pure
+/// registry does not guess between them — see `docs/vi.md`.
+pub const PASTE_REFUSED_COMMAND_LINE: &str =
+    "paste refused — close the ':' command line first";
+
 /// The location an editor binds to: the context + block that own a path's
 /// text. Edits go to `block_store.edit_text(context_id, block_id, …)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,6 +680,54 @@ impl EditorSessions {
                     op.delete,
                 )
                 .map_err(|e| format!("editor :r: block mirror failed: {e}"))?;
+        }
+        let saved = session.saved_content.clone();
+        Ok(state_of(&mut session.core, &saved))
+    }
+
+    /// Insert `text` at the session's *live* cursor — a paste, not
+    /// keystrokes (`docs/vi.md`: `editor_keys`' vim notation cannot carry a
+    /// literal `<`). Unlike [`insert_text`](Self::insert_text) (which the
+    /// `:r` async fetch path uses with an offset captured at submit time,
+    /// because the cursor can move during the await), a paste is
+    /// synchronous — nothing runs between the caller reading the cursor and
+    /// this call — so [`EditorCore::insert_at_cursor`] reads it itself.
+    ///
+    /// `EditorCore::insert_at_cursor` splices the buffer directly; it never
+    /// touches the vim state machine, so the session's mode is exactly what
+    /// it was before the paste — insert stays insert, normal stays normal.
+    ///
+    /// Refuses while the `:` command line is open ([`PASTE_REFUSED_COMMAND_LINE`]):
+    /// the buffer is left unchanged and the message rides the returned
+    /// state, the same dialect-level channel a bad `:s` regex uses — never
+    /// an RPC error the renderer can't display. Both renderers draw an open
+    /// `:` line in preference to the message, so a client that knows the
+    /// line is open refuses the paste itself with its own notice (the tui's
+    /// `paste_target`); this refusal is the backstop for one that does not.
+    pub fn insert_at_cursor(
+        &mut self,
+        id: EditorSessionId,
+        text: &str,
+        blocks: &SharedBlockStore,
+    ) -> Result<EditorState, String> {
+        let current = self.state(id)?;
+        if current.command_line.is_some() {
+            let mut state = current;
+            state.message = Some(PASTE_REFUSED_COMMAND_LINE.to_string());
+            return Ok(state);
+        }
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        let ops = session.core.insert_at_cursor(text);
+        for op in &ops {
+            blocks
+                .edit_text(
+                    session.target.context_id,
+                    &session.target.block_id,
+                    op.offset,
+                    &op.insert,
+                    op.delete,
+                )
+                .map_err(|e| format!("editor insert: block mirror failed: {e}"))?;
         }
         let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))

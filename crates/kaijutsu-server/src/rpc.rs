@@ -4607,6 +4607,28 @@ impl kernel::Server for KernelImpl {
         )
     }
 
+    /// Paste target: inserts text at the session's cursor rather than
+    /// forwarding it as `editorKeys` notation, which cannot carry a literal
+    /// `<` (`docs/vi.md`). Synchronous — an insert never awaits a fetch.
+    fn editor_insert(
+        self: Rc<Self>,
+        params: kernel::EditorInsertParams,
+        mut results: kernel::EditorInsertResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _guard = extract_rpc_trace(p.get_trace(), "editor_insert").entered();
+        let session_id = p.get_session_id();
+        let text = pry!(pry!(p.get_text()).to_str()).to_owned();
+        let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
+        match self.kernel.kernel.editor_insert(id, &text) {
+            Ok(state) => {
+                set_editor_state(results.get().init_state(), session_id, &state);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(format!("editor_insert failed: {e}"))),
+        }
+    }
+
     fn editor_state(
         self: Rc<Self>,
         params: kernel::EditorStateParams,

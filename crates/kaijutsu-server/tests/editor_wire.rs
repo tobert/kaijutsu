@@ -118,6 +118,86 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
 }
 
 #[test]
+fn editor_insert_pastes_at_the_cursor_and_pushes_over_the_wire() {
+    // The paste target (docs/vi.md): `editorInsert` lands text at the cursor
+    // without touching the session's mode, and mirrors + pushes exactly like
+    // `editorKeys` — proven end to end over the wire, not just in the kernel.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let (callback, mut rx) = editor_events_channel(64);
+        kernel.subscribe_editor(callback).await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        let original = opened.text.clone();
+
+        // Enter insert mode (no Esc), then paste — the session must stay in
+        // insert mode.
+        let insert_mode = kernel.editor_keys(session, "i").await.unwrap();
+        assert_eq!(insert_mode.mode.as_deref(), Some("-- INSERT --"));
+        let _ = recv_state(&mut rx).await; // the "i" keystroke's own push
+
+        let after = kernel.editor_insert(session, "PASTED").await.unwrap();
+        assert_eq!(after.text, format!("PASTED{original}"), "text lands at the cursor");
+        assert_eq!(
+            after.mode.as_deref(),
+            Some("-- INSERT --"),
+            "a paste in insert mode must not leave insert mode"
+        );
+        assert!(after.dirty);
+
+        // The same state independently arrives on the push channel.
+        let pushed = recv_state(&mut rx).await;
+        assert_eq!(pushed.session, session);
+        assert_eq!(pushed.text, after.text, "pushed state must match the insert's return");
+
+        // editorState confirms the block mirror, over the wire.
+        let polled = kernel.editor_state(session).await.unwrap();
+        assert_eq!(polled.text, after.text, "editorState matches after insert");
+
+        kernel.editor_quit(session).await.unwrap();
+    });
+}
+
+#[test]
+fn editor_insert_refuses_while_the_command_line_is_open_over_the_wire() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        let original = opened.text.clone();
+
+        // Open the ':' bar without submitting.
+        let typing = kernel.editor_keys(session, ":w").await.unwrap();
+        assert_eq!(typing.command_line.as_deref(), Some(":w"));
+
+        let after = kernel
+            .editor_insert(session, "PASTED")
+            .await
+            .expect("a refused paste does not error the RPC");
+        assert_eq!(after.text, original, "the buffer is untouched");
+        assert!(
+            after.message.is_some(),
+            "the refusal reports on the status line"
+        );
+        assert_eq!(
+            after.command_line.as_deref(),
+            Some(":w"),
+            "the bar stays open"
+        );
+
+        kernel.editor_keys(session, "<Esc>").await.unwrap();
+        kernel.editor_keys(session, ":q!<CR>").await.unwrap();
+    });
+}
+
+#[test]
 fn editor_save_clears_dirty_and_pushes_over_the_wire() {
     run_local(async {
         let addr = start_server().await;
