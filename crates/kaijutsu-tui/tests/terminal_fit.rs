@@ -1979,14 +1979,14 @@ fn the_kitty_keyboard_is_taken_with_the_screen_and_given_back() {
     );
 }
 
-/// `Shift+Enter` submits the draft from insert mode under the protocol —
-/// the feature the flag buys. The terminal encodes it as `CSI 13;2u`, which
-/// crossterm 0.29 decodes to `Enter` with the shift bit
-/// (`parse_csi_u_encoded_key_code`), and `Compose::press` submits on it. A
-/// legacy terminal cannot send it, so the unit test's hand-built `KeyEvent`
-/// only covers the branch; this covers the encoding.
+/// `Shift+Enter` is reserved under the protocol: the terminal encodes it as
+/// `CSI 13;2u`, crossterm 0.29 decodes that to `Enter` with the shift bit
+/// (`parse_csi_u_encoded_key_code`), and compose leaves it unbound — it
+/// must neither submit a half-written draft nor be lost as a plain
+/// newline (`docs/tui.md`, "Open"). The ephemeral kernel has no performer,
+/// so a submit would show as a refused-submit notice.
 #[test]
-fn shift_enter_submits_the_draft_from_insert_mode_under_the_kitty_protocol() {
+fn shift_enter_is_reserved_under_the_kitty_protocol() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("key tempdir");
@@ -1994,27 +1994,24 @@ fn shift_enter_submits_the_draft_from_insert_mode_under_the_kitty_protocol() {
     let mut session = TuiSession::spawn_with_args(server.addr, &key_path, 24, 80, &["--kitty-keyboard"]);
     wait_for_attach(&session);
 
-    session.send("ishift enter submits");
+    session.send("ishift enter reserved");
     let typed = session.wait_until(Duration::from_secs(5), |screen| {
-        screen_contains_str(screen, "-- INSERT --") && screen_contains_str(screen, "shift enter submits")
+        screen_contains_str(screen, "-- INSERT --") && screen_contains_str(screen, "shift enter reserved")
     });
     assert!(typed, "never entered insert mode with the draft typed: {}", session.dump("insert"));
 
     session.send("\x1b[13;2u"); // the kitty-encoded Shift+Enter
-    let submitted = session.wait_until(Duration::from_secs(10), |screen| {
-        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
-        let Some(draft) = compose_row(&rows) else { return false };
-        let cleared = !rows[draft].contains("shift enter submits")
-            && rows[..draft].iter().any(|l| l.contains("shift enter submits"));
-        // The ephemeral kernel has no performer, so the submit is refused
-        // and the refusal notice is the proof the client submitted: a plain
-        // insert-mode `Enter` adds a newline to the draft and says nothing.
-        let refused = rows[draft..].iter().any(|l| l.contains("submit failed"));
-        cleared || refused
-    });
+    std::thread::sleep(Duration::from_secs(2));
+    let rows = session.screen_text();
+    let draft = compose_row(&rows).expect("the draft is on screen");
     assert!(
-        submitted,
-        "Shift+Enter did not submit the draft from insert mode: {}",
+        rows[draft].contains("shift enter reserved"),
+        "the draft was cleared, so Shift+Enter submitted: {}",
+        session.dump("after Shift+Enter")
+    );
+    assert!(
+        !rows[draft..].iter().any(|l| l.contains("submit failed")),
+        "Shift+Enter tried to submit: {}",
         session.dump("after Shift+Enter")
     );
 

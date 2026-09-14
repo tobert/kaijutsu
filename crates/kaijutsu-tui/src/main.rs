@@ -79,8 +79,8 @@ struct Cli {
     diff: Option<Vec<String>>,
 
     /// Push the kitty keyboard protocol (`DISAMBIGUATE_ESCAPE_CODES`) with
-    /// the alternate screen: `Shift+Enter` submits the draft from insert
-    /// mode, and `Ctrl+I` no longer reads as `Tab`. Off by default — this
+    /// the alternate screen: a lone `Esc` arrives unambiguous, and `Ctrl+I`
+    /// no longer reads as `Tab`. Off by default — this
     /// client never queries the terminal, so support is never probed for,
     /// only requested. A terminal without the protocol ignores the request.
     #[arg(long)]

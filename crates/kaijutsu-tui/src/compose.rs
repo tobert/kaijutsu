@@ -380,16 +380,11 @@ impl Compose {
             return self.press_cmdline(key, raw);
         }
 
-        // Plain `Enter` submits in normal mode, the way it always has.
-        // `Shift+Enter` submits from insert mode too — only distinguishable
-        // from plain `Enter` when the kitty keyboard protocol is pushed
-        // (`docs/tui.md`, "What owning the screen lets us use"); without it,
-        // a legacy terminal never reports `Enter` with the shift bit set, so
-        // this arm is simply unreached and insert-mode `Enter` stays a
-        // newline.
-        if key.code == KeyCode::Enter
-            && (self.editor.mode().is_none() || key.modifiers.contains(KeyModifiers::SHIFT))
-        {
+        // Plain `Enter` submits in normal mode; `Esc Enter` is the way out
+        // of insert mode and into a submit. `Shift+Enter` is reserved: only
+        // the kitty keyboard protocol can deliver it apart from `Enter`, and
+        // it is not bound to anything yet (`docs/tui.md`, "Open").
+        if key.code == KeyCode::Enter && self.editor.mode().is_none() {
             return ComposeAction {
                 submit: true,
                 ..ComposeAction::default()
@@ -625,18 +620,17 @@ mod tests {
         assert!(compose.press(press(KeyCode::Enter)).submit);
     }
 
-    /// `Shift+Enter` in insert mode submits, the way plain `Enter` does in
-    /// normal mode — reachable only under the kitty keyboard protocol, which
-    /// is the only way a `KeyEvent` ever carries the shift bit on `Enter`
-    /// (`docs/tui.md`, "What owning the screen lets us use").
+    /// `Shift+Enter` is reserved, not a submit: it only reaches compose
+    /// apart from `Enter` under the kitty keyboard protocol, and until it
+    /// is bound it must not send a half-written draft (`docs/tui.md`,
+    /// "Open").
     #[test]
-    fn shift_enter_submits_from_insert_mode() {
+    fn shift_enter_does_not_submit_from_insert_mode() {
         let mut compose = Compose::new();
         insert(&mut compose);
         typed(&mut compose, "and getattr?");
         let action = compose.press(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-        assert!(action.submit, "Shift+Enter submits from insert mode");
-        assert!(action.ops.is_empty(), "a submit is not also an edit");
+        assert!(!action.submit, "Shift+Enter is reserved; it must not submit");
     }
 
     /// Enter in insert mode is a newline: that is how a multi-line draft is

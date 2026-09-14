@@ -220,10 +220,10 @@ None is a commitment; the ones marked *now* ride the first slice.
   (`DISAMBIGUATE_ESCAPE_CODES`), on by request only: `--kitty-keyboard`
   pushes it with the screen (`CSI > 1 u`, after `?1049h`) and pops it on
   every exit path (`CSI < 1 u`, before `?1049l` — kitty keeps a separate
-  flag stack per screen buffer). `Shift+Enter` then submits the draft from
-  insert mode the way plain `Enter` does from normal mode
-  (`compose::Compose::press`), and `Ctrl+I` stops reading as bare `Tab`
-  (`keys::Keys::interpret`'s `KeyCode::Tab if !ctrl`). Wezterm ships the
+  flag stack per screen buffer). A lone `Esc` then arrives unambiguous,
+  `Ctrl+I` stops reading as bare `Tab` (`keys::Keys::interpret`'s
+  `KeyCode::Tab if !ctrl`), and `Shift+Enter` arrives apart from `Enter`
+  but is reserved, bound to nothing (below, "Open"). Wezterm ships the
   protocol off by default (`enable_kitty_keyboard`); vim requests it through
   `'keyprotocol'`. The same disambiguation takes `Ctrl+M` apart from
   `Enter` and `Ctrl+[` apart from `Esc`: under the protocol `Ctrl+M` is a
@@ -284,7 +284,10 @@ terminal queries
 (`tests/terminal_fit.rs`'s `the_client_never_asks_where_the_cursor_is`)
 covers that query too — a probe-on-startup would have broken it. No config
 file exists yet for the client; a config key comes later with
-bindings.toml.
+bindings.toml. `Shift+Enter` is reserved under the protocol: a lane built
+it as a submit from insert mode and Amy set it aside ("escape-enter works
+well and is vim-y-er"), so it stays unbound until something else claims
+it. Probe: `shift_enter_is_reserved_under_the_kitty_protocol`.
 
 Decided 2026-09-13: the draft stays live while scrolled and typing snaps
 to the tail (above); `:q` is quiet — nothing is printed onto the primary
@@ -433,8 +436,8 @@ Rules the figure carries:
 Compose is a modalkit `VimMachine` over the kernel-owned input block
 (`edit_input` / `submit_input`), as the app's compose overlay is. The draft is
 a shared block: a sibling's typing shows. `Enter` in normal mode submits;
-under the kitty keyboard protocol (`--kitty-keyboard`), `Shift+Enter`
-submits from insert mode too (`compose::Compose::press`). A second `Esc` is
+`Esc Enter` is the way out of insert mode and into a submit
+(`compose::Compose::press`). A second `Esc` is
 harmless: compose always holds the keyboard. On a submit the
 tui sends the newest block the transcript showed as the player's edge, with
 its character count as rendered (`ContextView::edge`, `docs/prompts.md`,
@@ -465,8 +468,7 @@ Rules the figure carries:
   delete what was just typed.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
-  indent under the prompt; Enter in insert mode is a newline (`Shift+Enter`
-  submits instead, under the kitty keyboard protocol). Every row
+  indent under the prompt; Enter in insert mode is a newline. Every row
   past the first grows the band by one, taking that row from the
   transcript area, up to a third of the screen (`render::third_of_screen`,
   the same ceiling the thinking band takes): the transcript is redrawn one
