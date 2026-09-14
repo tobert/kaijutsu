@@ -216,9 +216,18 @@ None is a commitment; the ones marked *now* ride the first slice.
   trailing sentence punctuation trimmed, `file://<host>/<path>` targets);
   emission is blocked because ratatui 0.30 has no hyperlink attribute on
   spans or styles and the backend diffs cells (`docs/issues.md`).
-- **Kitty keyboard protocol** (`CSI = 1;1 u`), opt-in: `Shift+Enter` for a
-  newline in insert mode, `Ctrl+I` apart from `Tab`. Wezterm ships it off
-  (`enable_kitty_keyboard`); vim requests it through `'keyprotocol'`.
+- *landed 2026-09-14* **Kitty keyboard protocol**
+  (`DISAMBIGUATE_ESCAPE_CODES`), on by request only: `--kitty-keyboard`
+  pushes it with the screen (`CSI > 1 u`, after `?1049h`) and pops it on
+  every exit path (`CSI < 1 u`, before `?1049l` — kitty keeps a separate
+  flag stack per screen buffer). `Shift+Enter` then submits the draft from
+  insert mode the way plain `Enter` does from normal mode
+  (`compose::Compose::press`), and `Ctrl+I` stops reading as bare `Tab`
+  (`keys::Keys::interpret`'s `KeyCode::Tab if !ctrl`). Wezterm ships the
+  protocol off by default (`enable_kitty_keyboard`); vim requests it through
+  `'keyprotocol'`. The same disambiguation takes `Ctrl+M` apart from
+  `Enter` and `Ctrl+[` apart from `Esc`: under the protocol `Ctrl+M` is a
+  control chord for the draft, not a submit.
 - **Images** per terminal: iTerm2 inline images in wezterm and iTerm2,
   the kitty protocol in kitty; sixel is preliminary in wezterm. "Images"
   below stays additive.
@@ -263,12 +272,19 @@ view for both, a long result renders whole and the transcript scrolls
 5. **Terminal features** from the list above, one at a time, focus and
    title first. Focus reporting, the window title and the desktop
    notification landed 2026-09-13; OSC 8 link detection landed the same
-   day (emission still blocked on ratatui). Kitty keyboard, images and
-   in-band resize are open.
+   day (emission still blocked on ratatui); the kitty keyboard protocol
+   landed 2026-09-14, on by request. Images and in-band resize are open.
 
 ### Open
 
-- Kitty keyboard protocol: on by request or on by probe.
+Decided 2026-09-14: the kitty keyboard protocol is on by request
+(`--kitty-keyboard`), never by probe. `supports_keyboard_enhancement` asks
+the terminal with `CSI ? u`, and this client's pinned invariant of zero
+terminal queries
+(`tests/terminal_fit.rs`'s `the_client_never_asks_where_the_cursor_is`)
+covers that query too — a probe-on-startup would have broken it. No config
+file exists yet for the client; a config key comes later with
+bindings.toml.
 
 Decided 2026-09-13: the draft stays live while scrolled and typing snaps
 to the tail (above); `:q` is quiet — nothing is printed onto the primary
@@ -417,7 +433,9 @@ Rules the figure carries:
 Compose is a modalkit `VimMachine` over the kernel-owned input block
 (`edit_input` / `submit_input`), as the app's compose overlay is. The draft is
 a shared block: a sibling's typing shows. `Enter` in normal mode submits;
-A second `Esc` is harmless: compose always holds the keyboard. On `Enter` the
+under the kitty keyboard protocol (`--kitty-keyboard`), `Shift+Enter`
+submits from insert mode too (`compose::Compose::press`). A second `Esc` is
+harmless: compose always holds the keyboard. On a submit the
 tui sends the newest block the transcript showed as the player's edge, with
 its character count as rendered (`ContextView::edge`, `docs/prompts.md`,
 "The submit verb"). A context that has shown nothing at all sends no edge.
@@ -447,7 +465,8 @@ Rules the figure carries:
   delete what was just typed.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
-  indent under the prompt; Enter in insert mode is a newline. Every row
+  indent under the prompt; Enter in insert mode is a newline (`Shift+Enter`
+  submits instead, under the kitty keyboard protocol). Every row
   past the first grows the band by one, taking that row from the
   transcript area, up to a third of the screen (`render::third_of_screen`,
   the same ceiling the thinking band takes): the transcript is redrawn one
@@ -485,12 +504,16 @@ Rules the figure carries:
   viewport is up, so the terminal delivers a paste as one event: the draft
   takes it as one edit at the cursor, the way `Ctrl+A ]` does, and a
   newline inside it is a newline in the draft, never an Enter that submits
-  the first line. The `:` bar takes it flattened onto one line. The
-  picker, the ledger, an ask card and the alternate screen refuse it with
-  a notice — the editor's `editor_keys` notation cannot carry a literal
-  `<`, so a paste into vi is still open (`docs/issues.md`). Line endings
-  are normalized, since terminals differ on what a pasted newline is.
-  Probe: `a_bracketed_paste_lands_in_the_draft_without_submitting`.
+  the first line. The `:` bar takes it flattened onto one line. An open
+  editor session takes it as one `editorInsert` call at the cursor, leaving
+  the session's mode untouched — the editor's `editor_keys` notation cannot
+  carry a literal `<`, so a paste there rides its own wire method instead
+  of forwarding as keys. While the editor's own `:` line is open the tui
+  refuses with a notice, since the strip draws that line in preference to
+  the kernel's refusal message. The picker, the ledger, an ask card and a
+  frozen diff refuse it with a notice — none of them is wired for one. Line
+  endings are normalized, since terminals differ on what a pasted newline
+  is. Probe: `a_bracketed_paste_lands_in_the_draft_without_submitting`.
 - There is no state past normal mode. The app's `Esc Esc` hands the
   keyboard to its block list; the tui redraws its transcript every frame
   from the mirror rather than printing it once into scrollback, and

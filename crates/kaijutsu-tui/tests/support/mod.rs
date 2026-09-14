@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -148,6 +148,22 @@ pub struct TuiSession {
     /// `CSI 23 ; 0 t`) — the client pushes with the screen and pops on the
     /// way out, so the shell's own title comes back.
     title_stack: Arc<Mutex<(usize, usize)>>,
+    /// `(pushes, pops)` of the kitty keyboard-enhancement flag stack
+    /// (`CSI > 1 u` / `CSI < 1 u`) — pushed with the screen only when
+    /// `--kitty-keyboard` asked for it, popped on the way out, the same
+    /// shape as `title_stack`.
+    keyboard_enhancement: Arc<Mutex<(usize, usize)>>,
+    /// Keyboard-enhancement queries seen (`CSI ? u`, kitty's
+    /// `supports_keyboard_enhancement`). The client never sends one — it
+    /// requests the protocol or does not, but never probes for it
+    /// (`the_client_never_asks_where_the_cursor_is`).
+    keyboard_queries: Arc<AtomicUsize>,
+    /// Keyboard-enhancement pushes and pops that arrived while the
+    /// alternate screen was NOT active. Kitty keeps one flag stack per
+    /// screen buffer, so a push before `?1049h` or a pop after `?1049l`
+    /// lands on the primary screen's stack and leaks to the shell; the
+    /// client orders them inside the screen, and this must stay zero.
+    keyboard_off_screen: Arc<AtomicUsize>,
     /// Desktop notifications written: `(OSC 777, OSC 9)`. An ask that lands
     /// while the terminal is unfocused writes one of each.
     notifications: Arc<Mutex<(usize, usize)>>,
@@ -167,14 +183,20 @@ impl TuiSession {
     /// Spawn `kaijutsu-tui` against `server`, authenticating with the key at
     /// `key_path`, inside a `rows`x`cols` pty.
     pub fn spawn(server: SocketAddr, key_path: &Path, rows: u16, cols: u16) -> Self {
-        Self::spawn_with(server, key_path, rows, cols, 0, &[])
+        Self::spawn_with(server, key_path, rows, cols, 0, &[], &[])
     }
 
     /// Like [`spawn`](Self::spawn), with extra environment for the binary —
     /// the probe hooks `run.rs` reads at startup (`KAIJUTSU_TUI_PROBE_PANIC`)
     /// and `RUST_LOG`, which raises what reaches [`Self::log_path`].
     pub fn spawn_with_env(server: SocketAddr, key_path: &Path, rows: u16, cols: u16, env: &[(&str, &str)]) -> Self {
-        Self::spawn_with(server, key_path, rows, cols, 0, env)
+        Self::spawn_with(server, key_path, rows, cols, 0, env, &[])
+    }
+
+    /// Like [`spawn`](Self::spawn), with extra CLI arguments — `--kitty-
+    /// keyboard`, for the probes that need the flag on.
+    pub fn spawn_with_args(server: SocketAddr, key_path: &Path, rows: u16, cols: u16, args: &[&str]) -> Self {
+        Self::spawn_with(server, key_path, rows, cols, 0, &[], args)
     }
 
     /// Where `--log` sends the client's diagnostics: beside the key, so a
@@ -196,7 +218,7 @@ impl TuiSession {
         cols: u16,
         newlines: u16,
     ) -> Self {
-        Self::spawn_with(server, key_path, rows, cols, newlines, &[])
+        Self::spawn_with(server, key_path, rows, cols, newlines, &[], &[])
     }
 
     fn spawn_with(
@@ -206,6 +228,7 @@ impl TuiSession {
         cols: u16,
         newlines: u16,
         env: &[(&str, &str)],
+        args: &[&str],
     ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -240,6 +263,9 @@ impl TuiSession {
         // of whoever runs the suite; a failing probe can read it there.
         cmd.arg("--log");
         cmd.arg(key_path.with_file_name("tui.log"));
+        for arg in args {
+            cmd.arg(arg);
+        }
         cmd.env("RUST_LOG", "warn");
         cmd.env("TERM", "xterm-256color");
         for (key, value) in env {
@@ -263,6 +289,9 @@ impl TuiSession {
         let focus_reporting = Arc::new(Mutex::new((0usize, 0usize)));
         let titles = Arc::new(Mutex::new(Vec::new()));
         let title_stack = Arc::new(Mutex::new((0usize, 0usize)));
+        let keyboard_enhancement = Arc::new(Mutex::new((0usize, 0usize)));
+        let keyboard_queries = Arc::new(AtomicUsize::new(0));
+        let keyboard_off_screen = Arc::new(AtomicUsize::new(0));
         let notifications = Arc::new(Mutex::new((0usize, 0usize)));
         let clipboard = Arc::new(Mutex::new(Vec::new()));
         let reader_parser = parser.clone();
@@ -274,6 +303,10 @@ impl TuiSession {
             focus_reporting: focus_reporting.clone(),
             titles: titles.clone(),
             title_stack: title_stack.clone(),
+            keyboard_enhancement: keyboard_enhancement.clone(),
+            keyboard_queries: keyboard_queries.clone(),
+            keyboard_off_screen: keyboard_off_screen.clone(),
+            on_alt_screen: AtomicBool::new(false),
             notifications: notifications.clone(),
             clipboard: clipboard.clone(),
         };
@@ -293,6 +326,9 @@ impl TuiSession {
             focus_reporting,
             titles,
             title_stack,
+            keyboard_enhancement,
+            keyboard_queries,
+            keyboard_off_screen,
             notifications,
             clipboard,
             rows,
@@ -378,6 +414,23 @@ impl TuiSession {
         self.cursor_queries.load(Ordering::SeqCst)
     }
 
+    /// Keyboard-enhancement queries (`ESC [ ? u`, kitty's
+    /// `supports_keyboard_enhancement`) the client has sent so far. Always
+    /// zero: the protocol is requested with `--kitty-keyboard`, never
+    /// probed for (`docs/tui.md`, "Open").
+    pub fn keyboard_queries(&self) -> usize {
+        self.keyboard_queries.load(Ordering::SeqCst)
+    }
+
+    /// Keyboard-enhancement pushes and pops that landed while the
+    /// alternate screen was not active — on the primary screen's flag
+    /// stack, where they would leak to the shell. Always zero: the client
+    /// pushes after `?1049h` and pops before `?1049l` (`run::enter_terminal`,
+    /// `run::restore_terminal`, `run::suspend`).
+    pub fn keyboard_off_screen(&self) -> usize {
+        self.keyboard_off_screen.load(Ordering::SeqCst)
+    }
+
     /// Synchronized updates the client began and has not ended. Any value
     /// but zero at rest means a frame left the terminal holding its paint.
     pub fn sync_updates_open(&self) -> i64 {
@@ -402,6 +455,13 @@ impl TuiSession {
     /// `(pushes, pops)` of the xterm title stack seen so far.
     pub fn title_stack(&self) -> (usize, usize) {
         *self.title_stack.lock().expect("title stack lock")
+    }
+
+    /// `(pushes, pops)` of the kitty keyboard-enhancement flag stack
+    /// (`CSI > 1 u` / `CSI < 1 u`) seen so far — zero unless the session was
+    /// spawned with `--kitty-keyboard`.
+    pub fn keyboard_enhancement(&self) -> (usize, usize) {
+        *self.keyboard_enhancement.lock().expect("keyboard enhancement lock")
     }
 
     /// `(OSC 777, OSC 9)` desktop notifications written so far.
@@ -574,6 +634,13 @@ struct Counts {
     focus_reporting: Arc<Mutex<(usize, usize)>>,
     titles: Arc<Mutex<Vec<String>>>,
     title_stack: Arc<Mutex<(usize, usize)>>,
+    keyboard_enhancement: Arc<Mutex<(usize, usize)>>,
+    keyboard_queries: Arc<AtomicUsize>,
+    keyboard_off_screen: Arc<AtomicUsize>,
+    /// Whether the last `?1049h`/`?1049l` seen left the alternate screen
+    /// active — carried across read chunks, since a push and the screen
+    /// switch it must follow need not arrive in one read.
+    on_alt_screen: AtomicBool,
     notifications: Arc<Mutex<(usize, usize)>>,
     clipboard: Arc<Mutex<Vec<String>>>,
 }
@@ -609,6 +676,53 @@ impl Counts {
             let mut seen = self.title_stack.lock().expect("title stack lock");
             seen.0 += push;
             seen.1 += pop;
+        }
+
+        // `CSI > 1 u` (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_
+        // CODES)`) and `CSI < 1 u` (`PopKeyboardEnhancementFlags`) —
+        // crossterm 0.29's exact bytes for the one flag combination this
+        // client ever pushes.
+        let (push, pop) = (count(b"\x1b[>1u"), count(b"\x1b[<1u"));
+        if push + pop > 0 {
+            let mut seen = self.keyboard_enhancement.lock().expect("keyboard enhancement lock");
+            seen.0 += push;
+            seen.1 += pop;
+        }
+        let queried = count(b"\x1b[?u");
+        if queried > 0 {
+            self.keyboard_queries.fetch_add(queried, Ordering::SeqCst);
+        }
+        // Order matters for the flag stack: walk the screen switches and
+        // the pushes/pops in the order they were written, and count every
+        // push or pop that lands while the primary screen is showing.
+        let mut marks: Vec<(usize, bool, bool)> = Vec::new(); // (pos, is_screen_switch, on)
+        for (needle, is_screen, on) in [
+            (&b"\x1b[?1049h"[..], true, true),
+            (&b"\x1b[?1049l"[..], true, false),
+            (&b"\x1b[>1u"[..], false, true),
+            (&b"\x1b[<1u"[..], false, false),
+        ] {
+            let mut from = 0;
+            while let Some(at) = find_subslice(&bytes[from..], needle) {
+                marks.push((from + at, is_screen, on));
+                from += at + needle.len();
+            }
+        }
+        if !marks.is_empty() {
+            marks.sort_by_key(|m| m.0);
+            let mut on_alt = self.on_alt_screen.load(Ordering::SeqCst);
+            let mut off_screen = 0;
+            for (_, is_screen, on) in marks {
+                if is_screen {
+                    on_alt = on;
+                } else if !on_alt {
+                    off_screen += 1;
+                }
+            }
+            self.on_alt_screen.store(on_alt, Ordering::SeqCst);
+            if off_screen > 0 {
+                self.keyboard_off_screen.fetch_add(off_screen, Ordering::SeqCst);
+            }
         }
 
         let (osc777, osc9) = (count(b"\x1b]777;notify;"), count(b"\x1b]9;"));

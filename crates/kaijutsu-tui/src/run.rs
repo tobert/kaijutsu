@@ -16,6 +16,7 @@ use crossterm::style::Print;
 use crossterm::event::Event;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -227,12 +228,19 @@ struct Wires {
 }
 
 /// Run the client until it quits, restoring the terminal on the way out.
+///
+/// `kitty_keyboard` is `--kitty-keyboard`: the kitty keyboard protocol is on
+/// by request only, never by probe (`docs/tui.md`, "Open" — this client's
+/// pinned zero-terminal-query invariant rules out `supports_keyboard_
+/// enhancement`, which asks `CSI ? u`).
 pub async fn run(
     bridge: KernelBridge,
     start: ContextInfo,
     identity: String,
     diff: Option<Vec<String>>,
+    kitty_keyboard: bool,
 ) -> Result<()> {
+    KITTY_REQUESTED.store(kitty_keyboard, Ordering::SeqCst);
     let mut app = App::new(identity);
     app.set_contexts(bridge.list_contexts().await?);
     // Best-effort: a kernel that cannot answer this yet just means slash
@@ -306,7 +314,19 @@ pub async fn run(
 
     // The screen is taken after the connection is up, so a failure to
     // connect is a plain line on the shell's own screen.
-    let mut terminal = enter_terminal().context("take the alternate screen")?;
+    let mut terminal = match enter_terminal() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            // `enter_terminal` can fail after it has taken the screen, raw
+            // mode, the title and the kitty frame (`Terminal::new` is its
+            // last step). Every one of those is given back before the
+            // error reaches the shell, or the shell inherits them — a
+            // pushed kitty frame in particular would keep encoding its
+            // keys.
+            restore_terminal();
+            return Err(anyhow::Error::from(e).context("take the alternate screen"));
+        }
+    };
     let term_lock: TermLock = Arc::new(Mutex::new(()));
     let (key_tx, key_rx) = mpsc::channel::<Event>(64);
     // Stopped on the way out, before raw mode goes, so keys typed at the
@@ -1292,8 +1312,11 @@ async fn act(
             if app.compose.kj_typed().is_some() {
                 apply_kj_completion(app);
             } else {
-                let tab = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab);
-                compose_key(bridge, app, tab).await?;
+                // The key as it arrived, modifiers and all, not a
+                // synthesized bare `Tab`: `keys.rs` only routes an
+                // unmodified `Tab` here today, and a future modifier should
+                // reach compose rather than be dropped on the floor.
+                compose_key(bridge, app, key).await?;
             }
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
@@ -1452,15 +1475,27 @@ fn normalize_paste(text: &str) -> String {
 enum PasteTarget {
     Draft,
     CommandLine,
+    /// The alternate screen's editor session, by its kernel handle.
+    Editor(u64),
     Refused(&'static str),
 }
 
-/// A paste is text for the draft or the `:` bar. Every other surface
-/// refuses it with a notice rather than reading it as keys: the alternate
-/// screen's `editor_keys` notation cannot carry a literal `<`, and the
-/// picker's and the ledger's filters and an ask card are not wired for
-/// one.
+/// A paste is text for the draft, the `:` bar, or an open editor session.
+/// Every other surface refuses it with a notice rather than reading it as
+/// keys: a full-screen surface with no editor session (the diff viewer),
+/// the picker's and the ledger's filters, and an ask card are not wired for
+/// one. The editor's own `:` line refuses too, here rather than in the
+/// kernel: the kernel refuses that paste as well (`PASTE_REFUSED_COMMAND_
+/// LINE`), but its message rides `EditorState.message`, which the strip
+/// draws only while no `:` line is open (`editor::strip_line`), so the
+/// player would see nothing happen. A notice says why.
 fn paste_target(app: &App) -> PasteTarget {
+    if let Some(screen) = app.screen.editor() {
+        if screen.state.command_line.is_some() {
+            return PasteTarget::Refused("close the ':' line before pasting into the editor");
+        }
+        return PasteTarget::Editor(screen.session);
+    }
     if editor::route_key(app) == editor::KeyRoute::FullScreen {
         return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
     }
@@ -1473,7 +1508,10 @@ fn paste_target(app: &App) -> PasteTarget {
 /// Act on one `Event::Paste`. Line endings are normalized to `\n`, since
 /// terminals differ on what they send for a pasted newline. The draft
 /// takes it as one edit at the cursor, like `Ctrl+A ]`; the `:` bar takes
-/// it flattened onto one line at its end.
+/// it flattened onto one line at its end; an open editor session takes it
+/// as one `editorInsert` call, the same awaited-per-call shape
+/// `editor_keys` uses (`act_full_screen`) — a paste never leaves two editor
+/// calls in flight.
 async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
     let text = normalize_paste(&text);
     match paste_target(app) {
@@ -1483,6 +1521,26 @@ async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
             let flat = text.lines().collect::<Vec<_>>().join(" ");
             app.compose.set_command_body(&format!("{body}{flat}"));
         }
+        PasteTarget::Editor(session) => match bridge.actor().editor_insert(session, &text).await {
+            Ok(state) => {
+                if let Some(screen) = app.screen.editor_mut()
+                    && screen.session == state.session
+                {
+                    screen.state = state;
+                }
+            }
+            Err(e) => {
+                let message = e.to_string();
+                if editor::is_session_lost(&message) {
+                    editor::leave_on_session_lost(
+                        app,
+                        "editor session lost (kernel restarted?); reopen with vi",
+                    );
+                } else {
+                    tracing::warn!(session, error = %message, "editor_insert failed");
+                }
+            }
+        },
         PasteTarget::Draft => {
             let Some(ctx) = app.current else {
                 app.note("no context attached");
@@ -1782,6 +1840,8 @@ fn suspend(
     let _guard = term_lock.lock();
     let _ = terminal.flush();
     pop_title();
+    // Before `?1049l`, the same order as `restore_terminal`.
+    pop_kitty_keyboard();
     let _ = crossterm::execute!(
         io::stdout(),
         Print(ALTERNATE_SCROLL_OFF),
@@ -1800,6 +1860,8 @@ fn suspend(
     enable_raw_mode()?;
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     editor::take_screen()?;
+    // After `?1049h`, the same order as `enter_terminal`.
+    push_kitty_keyboard();
     crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON), EnableFocusChange)?;
     push_title();
     // A resize at the current size, not `Terminal::clear`: clear asks the
@@ -2296,6 +2358,10 @@ fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     // newline inside it is a newline in the draft, not an Enter.
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     editor::take_screen()?;
+    // Kitty keeps a separate keyboard-enhancement flag stack per screen
+    // buffer, so the push has to land after `?1049h`, not before it
+    // (`docs/tui.md`, "What owning the screen lets us use").
+    push_kitty_keyboard();
     crossterm::execute!(io::stdout(), Print(ALTERNATE_SCROLL_ON), EnableFocusChange)?;
     push_title();
     Terminal::new(CrosstermBackend::new(io::stdout()))
@@ -2345,6 +2411,46 @@ fn pop_title() {
     }
 }
 
+/// The kitty keyboard protocol is on by request, never by probe: this
+/// client's zero-terminal-query invariant
+/// (`the_client_never_asks_where_the_cursor_is`) rules out
+/// `supports_keyboard_enhancement`, which sends `CSI ? u` to ask. Set once,
+/// before the screen is taken (`run::run`), from `--kitty-keyboard`.
+static KITTY_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process has a keyboard-enhancement flag stack frame pushed,
+/// the same shape as `TITLE_PUSHED`: `restore_terminal` is idempotent and
+/// runs from the exit path, the panic hook and the signal path, while a
+/// blind pop when nothing was pushed lands on a terminal that ignores it
+/// (unlike a title pop, which would take the shell's own saved title off
+/// its stack).
+static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// `DISAMBIGUATE_ESCAPE_CODES` only — not `REPORT_EVENT_TYPES`: `keys.rs`
+/// already ignores `KeyEventKind::Release`, and there is no path here that
+/// wants a key-up event.
+const KEYBOARD_ENHANCEMENT_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// Push one keyboard-enhancement flag stack frame, once, and only when
+/// `--kitty-keyboard` asked for it.
+fn push_kitty_keyboard() {
+    if KITTY_REQUESTED.load(Ordering::SeqCst) && claim(&KITTY_PUSHED, true) {
+        let _ = crossterm::execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENT_FLAGS)
+        );
+    }
+}
+
+/// Pop the keyboard-enhancement flag stack frame this process pushed, if it
+/// pushed one; a no-op otherwise.
+fn pop_kitty_keyboard() {
+    if claim(&KITTY_PUSHED, false) {
+        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+}
+
 /// Leave the terminal the way we found it. Best-effort on every step: a
 /// failure here must not mask the error that ended the loop.
 ///
@@ -2374,6 +2480,10 @@ pub fn restore_terminal() {
     // `EndSynchronizedUpdate`, and a terminal left inside an update paints
     // nothing. Ending one that was never begun is a no-op.
     let _ = crossterm::execute!(io::stdout(), EndSynchronizedUpdate);
+    // Kitty keeps a separate keyboard-enhancement flag stack per screen
+    // buffer, so the pop has to land before `?1049l`, not after it — the
+    // reverse of the title-stack pop just below, which does not care.
+    pop_kitty_keyboard();
     editor::abandon();
     pop_title();
     // `?1004l` and `?1007l` go out blind: resetting a mode the terminal
@@ -3329,7 +3439,40 @@ mod tests {
             "one\ntwo",
             &app.palette,
         ));
-        assert!(matches!(paste_target(&app), PasteTarget::Refused(_)), "the alternate screen refuses");
+        assert!(
+            matches!(paste_target(&app), PasteTarget::Refused(_)),
+            "the diff viewer has no editor session — still refused"
+        );
+
+        editor::enter_editor(
+            &mut app,
+            EditorOpen {
+                path: "notes.kai".to_string(),
+                state: kaijutsu_client::EditorState {
+                    session: 7,
+                    text: "hello".to_string(),
+                    cursor: 0,
+                    mode: None,
+                    dirty: false,
+                    command_line: None,
+                    message: None,
+                },
+            },
+        );
+        assert_eq!(
+            paste_target(&app),
+            PasteTarget::Editor(7),
+            "an open editor session takes a paste at the cursor"
+        );
+
+        // With the editor's `:` line open the strip draws that line, not
+        // `EditorState.message`, so the kernel's refusal message would never
+        // be seen; the tui refuses first and says so.
+        app.screen.editor_mut().expect("editor open").state.command_line = Some(":w".to_string());
+        assert!(
+            matches!(paste_target(&app), PasteTarget::Refused(_)),
+            "a paste while the editor's ':' line is open is refused with a notice"
+        );
     }
 
     #[test]

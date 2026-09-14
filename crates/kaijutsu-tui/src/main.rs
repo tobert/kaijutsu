@@ -77,6 +77,14 @@ struct Cli {
     /// two paths diff the two documents.
     #[arg(long, num_args = 1..=2, value_names = ["A", "B"])]
     diff: Option<Vec<String>>,
+
+    /// Push the kitty keyboard protocol (`DISAMBIGUATE_ESCAPE_CODES`) with
+    /// the alternate screen: `Shift+Enter` submits the draft from insert
+    /// mode, and `Ctrl+I` no longer reads as `Tab`. Off by default — this
+    /// client never queries the terminal, so support is never probed for,
+    /// only requested. A terminal without the protocol ignores the request.
+    #[arg(long)]
+    kitty_keyboard: bool,
 }
 
 fn main() -> Result<()> {
@@ -160,5 +168,5 @@ async fn run(cli: Cli) -> Result<()> {
     };
     tracing::info!(context = %start.id.short(), label = %start.label, "attached");
 
-    kaijutsu_tui::run::run(bridge, start, identity, cli.diff).await
+    kaijutsu_tui::run::run(bridge, start, identity, cli.diff, cli.kitty_keyboard).await
 }

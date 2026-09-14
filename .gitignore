@@ -38,3 +38,4 @@ docs/kaijutsu-agent-feedback.md
 # versioned; prune it by hand.
 backups/
 __pycache__/
+/target-lanes/

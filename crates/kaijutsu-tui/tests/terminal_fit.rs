@@ -1349,6 +1349,12 @@ fn the_client_never_asks_where_the_cursor_is() {
         0,
         "the client asked the terminal where the cursor is; a full-screen viewport never does"
     );
+    assert_eq!(
+        session.keyboard_queries(),
+        0,
+        "the client probed for the kitty keyboard protocol; it is requested with \
+         --kitty-keyboard or not at all, never queried for (docs/tui.md, \"Open\")"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1869,4 +1875,180 @@ fn a_panic_inside_a_task_ends_the_client_and_restores_the_terminal() {
         "the panic message is not on a readable screen: {}",
         session.dump("after the task panic")
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// p. The kitty keyboard protocol: on by request, never by probe
+// (docs/tui.md, "What owning the screen lets us use", "Open")
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Without `--kitty-keyboard`, nothing pushes a keyboard-enhancement flag
+/// stack frame and nothing queries for the protocol either — this client's
+/// zero-terminal-query invariant covers the kitty query
+/// (`CSI ? u`, `supports_keyboard_enhancement`) the same way it covers the
+/// cursor-position query.
+#[test]
+fn the_kitty_keyboard_is_off_unless_asked() {
+    let _serial = serial();
+    let (_server, _key_dir, mut session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+    quit(&mut session);
+
+    assert_eq!(
+        session.keyboard_enhancement(),
+        (0, 0),
+        "the kitty keyboard protocol was pushed without --kitty-keyboard: {}",
+        session.dump("after quit")
+    );
+    assert_eq!(
+        session.keyboard_queries(),
+        0,
+        "the client queried for kitty keyboard support instead of just requesting it: {}",
+        session.dump("after quit")
+    );
+}
+
+/// `--kitty-keyboard` pushes one keyboard-enhancement flag stack frame with
+/// the alternate screen and pops it on the way out — kitty keeps a separate
+/// flag stack per screen buffer, so the push lands after `?1049h` and the
+/// pop before `?1049l` (`run::enter_terminal`, `run::restore_terminal`). The
+/// stack follows the screen across a suspend too, the same shape as the
+/// title stack and focus reporting (`run::suspend`): popped on the way
+/// down, pushed again on the way back.
+#[cfg(unix)]
+#[test]
+fn the_kitty_keyboard_is_taken_with_the_screen_and_given_back() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("key tempdir");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let mut session = TuiSession::spawn_with_args(server.addr, &key_path, 24, 80, &["--kitty-keyboard"]);
+    wait_for_attach(&session);
+    assert_eq!(
+        session.keyboard_enhancement(),
+        (1, 0),
+        "the kitty keyboard protocol was not pushed with the screen: {}",
+        session.dump("after attach")
+    );
+    assert_eq!(
+        session.keyboard_off_screen(),
+        0,
+        "the push landed before ?1049h, on the primary screen's flag stack: {}",
+        session.dump("after attach")
+    );
+
+    let pid = session.pid().expect("pid available on unix");
+    session.send("\x1a"); // Ctrl+Z
+    std::thread::sleep(Duration::from_millis(300));
+    // SIGCONT the way a shell's `fg` would; harmless if the process was
+    // never actually stopped (`ctrl_z_suspends_and_sigcont_resumes_a_
+    // responsive_client`'s sandbox note applies here too).
+    unsafe {
+        libc::kill(pid as i32, libc::SIGCONT);
+    }
+    session.send("ix");
+    let responsive = session.wait_until(Duration::from_secs(5), |screen| {
+        screen.rows(0, screen.size().1).any(|line| line.contains('❯') && line.contains('x'))
+    });
+    assert!(responsive, "client did not respond after SIGCONT: {}", session.dump("after SIGCONT"));
+    assert_eq!(
+        session.keyboard_enhancement(),
+        (2, 1),
+        "the keyboard-enhancement flag stack did not follow the screen across the suspend: {}",
+        session.dump("after SIGCONT")
+    );
+    assert_eq!(
+        session.keyboard_off_screen(),
+        0,
+        "a push or pop around the suspend landed outside the alternate screen: {}",
+        session.dump("after SIGCONT")
+    );
+
+    quit(&mut session);
+    assert_eq!(
+        session.keyboard_enhancement(),
+        (2, 2),
+        "the keyboard-enhancement flag stack is unbalanced after :q: {}",
+        session.dump("after quit")
+    );
+    assert_eq!(
+        session.keyboard_off_screen(),
+        0,
+        "the pop landed after ?1049l, on the primary screen's flag stack: {}",
+        session.dump("after quit")
+    );
+}
+
+/// `Shift+Enter` submits the draft from insert mode under the protocol —
+/// the feature the flag buys. The terminal encodes it as `CSI 13;2u`, which
+/// crossterm 0.29 decodes to `Enter` with the shift bit
+/// (`parse_csi_u_encoded_key_code`), and `Compose::press` submits on it. A
+/// legacy terminal cannot send it, so the unit test's hand-built `KeyEvent`
+/// only covers the branch; this covers the encoding.
+#[test]
+fn shift_enter_submits_the_draft_from_insert_mode_under_the_kitty_protocol() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("key tempdir");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let mut session = TuiSession::spawn_with_args(server.addr, &key_path, 24, 80, &["--kitty-keyboard"]);
+    wait_for_attach(&session);
+
+    session.send("ishift enter submits");
+    let typed = session.wait_until(Duration::from_secs(5), |screen| {
+        screen_contains_str(screen, "-- INSERT --") && screen_contains_str(screen, "shift enter submits")
+    });
+    assert!(typed, "never entered insert mode with the draft typed: {}", session.dump("insert"));
+
+    session.send("\x1b[13;2u"); // the kitty-encoded Shift+Enter
+    let submitted = session.wait_until(Duration::from_secs(10), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        let Some(draft) = compose_row(&rows) else { return false };
+        let cleared = !rows[draft].contains("shift enter submits")
+            && rows[..draft].iter().any(|l| l.contains("shift enter submits"));
+        // The ephemeral kernel has no performer, so the submit is refused
+        // and the refusal notice is the proof the client submitted: a plain
+        // insert-mode `Enter` adds a newline to the draft and says nothing.
+        let refused = rows[draft..].iter().any(|l| l.contains("submit failed"));
+        cleared || refused
+    });
+    assert!(
+        submitted,
+        "Shift+Enter did not submit the draft from insert mode: {}",
+        session.dump("after Shift+Enter")
+    );
+
+    quit(&mut session);
+}
+
+/// The kitty-encoded lone `Esc` (`CSI 27 u`) is unambiguous, unlike a bare
+/// `0x1b` byte, which crossterm holds to see whether an `Alt+<key>` sequence
+/// follows. `Ctrl+I` (`CSI 9;5 u`) rides the same protocol but is not tested
+/// here for a draft-level effect: `Tab` is already a no-op on the draft in
+/// normal mode (verified directly against `Compose::press` — no `EditOp`,
+/// text unchanged), which is the mode this probe's `Ctrl+I` lands in, so
+/// there is no "the way Tab would" contrast to observe from this sequence.
+/// The real contrast — `Tab` inserts a literal tab character in insert mode
+/// while `Ctrl+I` there is a no-op — is a `compose.rs` question, outside
+/// this probe's territory.
+#[test]
+fn a_lone_escape_leaves_insert_mode_under_the_kitty_protocol() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("key tempdir");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let mut session = TuiSession::spawn_with_args(server.addr, &key_path, 24, 80, &["--kitty-keyboard"]);
+    wait_for_attach(&session);
+
+    session.send("ihello");
+    let inserted = session.wait_until(Duration::from_secs(5), |screen| {
+        screen_contains_str(screen, "-- INSERT --") && screen_contains_str(screen, "hello")
+    });
+    assert!(inserted, "never entered insert mode with the draft typed: {}", session.dump("insert"));
+
+    session.send("\x1b[27u"); // the kitty-encoded lone Esc
+    let normal = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "-- NORMAL --"));
+    assert!(normal, "the kitty-encoded lone Esc never left insert mode: {}", session.dump("after kitty Esc"));
+
+    quit(&mut session);
 }

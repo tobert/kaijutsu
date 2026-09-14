@@ -243,16 +243,46 @@ one burst except on a paste, and bracketed paste already lands as its own
 event (`docs/tui.md`, "Compose"). Nothing to fix in the tui; recorded so
 nobody chases it as a bug again.
 
-## A paste into the tui's vi screen is refused (2026-09-13)
+## A pty probe flakes under load: the scrolled place after a switch (2026-09-14)
 
-Bracketed paste reaches the draft and the `:` bar (`docs/tui.md`,
-"Compose"). On the alternate screen the tui forwards keys to the kernel's
-vi session as `editor_keys` notation, which cannot carry a literal `<`,
-and the kernel editor has no insert-text call over the wire. So a paste
-there is refused with a notice rather than read as normal-mode commands.
-The fix is a wire method that inserts text at the session's cursor
-(`EditorCore::insert_at_cursor` already exists in `kaijutsu-editor`), and
-vim's rule of entering insert mode for a paste that lands in normal mode.
+`a_scrolled_context_comes_back_scrolled_after_a_switch` in
+`crates/kaijutsu-tui/tests/terminal_fit.rs` fails its `readout == place`
+assertion ("the reader landed somewhere else") when the full pty suite
+runs on a loaded box: twice now under the whole suite, and clean every
+time alone (3/3 on 2026-09-13, 3/3 on 2026-09-14). The scrolled position
+is restored by block and content line, so the suspect is a timing window
+between the switch back and the transcript re-anchoring while a late
+hydrate delivery is still landing, not a wrong anchor. Reproduce under
+load before changing the anchor logic; the probe passes alone, so a fix
+that only changes the probe's waits is suspect too.
+
+## `kj editor` has no `insert` verb (2026-09-14)
+
+`editorInsert @105` gives a client a way to land text at the vi session's
+cursor that `editorKeys` notation cannot carry (a literal `<`), but
+`EditorCommand` in `crates/kaijutsu-kernel/src/kj/editor.rs` still has only
+`open/keys/state/save/quit/list`. A model driving the editor through `kj
+editor keys` cannot paste a `<`. The verb is `Effect::Write` and one call
+into `Kernel::editor_insert`. Found by the kaibo review of the paste slice.
+
+## An editor edit publishes after it releases the lock (2026-09-14, inherited)
+
+`Kernel::editor_keys_checked` and `Kernel::editor_insert` compute the new
+state under the sessions lock, release it, run `mark_dirty` (a database
+write), and only then `publish_editor_state`. A reconciler merge landing in
+that window publishes the merged state first and the older snapshot second,
+so a renderer ends on a buffer missing the peer's edit until the next push.
+Not new with the paste slice; `editor_keys` has had the same window. Fix
+is to publish the state read under the lock before the database write, or
+re-read after it. Found by the kaibo review of the paste slice.
+
+## A paste ending in a newline at a newline-terminated block's end doubles the terminator (2026-09-14, inherited)
+
+`EditorCore` cannot tell `"hello"` from `"hello\n"` (`crates/kaijutsu-editor/
+src/lib.rs`, the terminator rule), so inserting `"X\n"` at the end of
+`"end\n"` gives `"endX\n\n"`. A typed `Enter` at the same spot does the same
+today; a paste makes it easy to hit, since a file's contents usually end in
+a newline. Found by the kaibo review of the paste slice.
 
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 
