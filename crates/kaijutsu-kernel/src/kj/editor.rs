@@ -2,7 +2,9 @@
 //!
 //! The programmatic face of the in-app editor (`docs/vi.md`): `open` resolves a
 //! path to its owning kernel block and starts a session; `keys` feeds vim input
-//! and mirrors the edits onto the block; `state` reads the buffer; `save`/`quit`
+//! and mirrors the edits onto the block; `insert` splices text at the cursor
+//! without touching the vim mode — the paste path, for text `keys`' vim
+//! notation cannot carry (a literal `<`); `state` reads the buffer; `save`/`quit`
 //! are `ZZ`/`ZQ`. The Bevy app renders these same kernel sessions, and a model
 //! drives them through here — one surface, many hands.
 
@@ -16,7 +18,7 @@ use crate::mcp::Capability;
 #[derive(Parser, Debug)]
 #[command(
     name = "editor",
-    about = "Drive kernel-owned vi editor sessions (open/keys/state/save/quit/list)",
+    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list)",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -40,6 +42,19 @@ enum EditorCommand {
         session: u64,
         /// Key sequence in vim notation.
         keys: String,
+    },
+    /// Splice text at the session's live cursor without touching the vim
+    /// mode — the paste path: `keys`' vim notation cannot carry a literal
+    /// `<`, so this is how a driver lands arbitrary text. Insert stays
+    /// insert, normal stays normal. Refused, with the buffer unchanged and
+    /// the reason on the state's message (not an error), while the `:`
+    /// command line is open. No capability is needed: a paste carries no
+    /// write intent, the same as a plain `keys` edit.
+    Insert {
+        /// Session handle from `kj editor open`.
+        session: u64,
+        /// Text to splice at the cursor.
+        text: String,
     },
     /// Print a session's current buffer/cursor/mode/dirty state.
     State {
@@ -149,6 +164,27 @@ impl KjDispatcher {
                     Err(e) => KjResult::Err(format!("kj editor keys: {e}")),
                 }
             }
+            EditorCommand::Insert { session, text } => {
+                let id = EditorSessionId::from_u64(session);
+                // Synchronous, ungated — a paste carries no write intent, the
+                // same as a plain `keys` edit (see `write_cap`'s doc comment).
+                match kernel.editor_insert(id, &text) {
+                    Ok(st) => {
+                        // A refusal (the `:` line is open) rides the status
+                        // line, not the error path — same as `Keys`.
+                        let mut line = format!(
+                            "session {session}: {} mode, {} chars",
+                            mode_label(&st),
+                            st.text.chars().count()
+                        );
+                        if let Some(msg) = &st.message {
+                            line.push_str(&format!(" — {msg}"));
+                        }
+                        KjResult::ok_with_data(line, state_json(id, &st))
+                    }
+                    Err(e) => KjResult::Err(format!("kj editor insert: {e}")),
+                }
+            }
             EditorCommand::State { session } => {
                 let id = EditorSessionId::from_u64(session);
                 match kernel.editor_state(id) {
@@ -252,6 +288,7 @@ impl Classify for EditorCommand {
             // a side effect on kernel state, not a pure read.
             EditorCommand::Open { .. }
             | EditorCommand::Keys { .. }
+            | EditorCommand::Insert { .. }
             | EditorCommand::Save { .. }
             | EditorCommand::Quit { .. } => Effect::Write,
         }
@@ -344,6 +381,78 @@ mod tests {
             Some("Xhello"),
             "kj editor quit must roll the rc doc back to the last save"
         );
+    }
+
+    /// `kj editor insert` is the paste path: it lands text at the cursor and
+    /// leaves the vim mode exactly as it was. Discriminates against `keys`
+    /// with the same text, which would type it as vim input — landing "iX"
+    /// in the buffer verbatim and stranding the session in INSERT mode —
+    /// rather than splicing "iX" at the cursor and staying in NORMAL.
+    #[tokio::test]
+    async fn kj_editor_insert_lands_text_at_cursor_and_keeps_normal_mode() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("ab")], &c)
+            .await;
+        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
+        let id = session_of(&opened);
+
+        let inserted = d
+            .dispatch(&[s("editor"), s("insert"), id.to_string(), s("iX")], &c)
+            .await;
+        match inserted {
+            KjResult::Ok { data: Some(dd), .. } => {
+                assert_eq!(
+                    dd["text"], "iXab",
+                    "insert splices the literal text at the cursor, unlike `keys`"
+                );
+                assert_eq!(
+                    dd["mode"],
+                    serde_json::Value::Null,
+                    "insert must not enter INSERT mode the way `keys iX` would"
+                );
+                assert_eq!(dd["dirty"], true);
+            }
+            other => panic!("expected ok-with-data, got {other:?}"),
+        }
+    }
+
+    /// `kj editor insert` refuses while the `:` command line is open — the
+    /// buffer is left unchanged and the reason rides the status message, not
+    /// a hard error.
+    #[tokio::test]
+    async fn kj_editor_insert_refuses_while_command_line_is_open() {
+        let d = test_dispatcher_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("ab")], &c)
+            .await;
+        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
+        let id = session_of(&opened);
+
+        // Open the ':' bar without submitting.
+        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s(":")], &c)
+            .await;
+
+        let inserted = d
+            .dispatch(
+                &[s("editor"), s("insert"), id.to_string(), s("PASTE")],
+                &c,
+            )
+            .await;
+        match inserted {
+            KjResult::Ok { data: Some(dd), .. } => {
+                assert_eq!(dd["text"], "ab", "the buffer is untouched while ':' is open");
+                assert!(
+                    dd["message"].as_str().is_some(),
+                    "the refusal must report on the status message, got: {dd:?}"
+                );
+            }
+            other => panic!("expected ok-with-data, got {other:?}"),
+        }
     }
 
     /// `kj editor list` is the census: an open session, however it was

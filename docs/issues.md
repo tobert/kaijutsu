@@ -256,15 +256,6 @@ hydrate delivery is still landing, not a wrong anchor. Reproduce under
 load before changing the anchor logic; the probe passes alone, so a fix
 that only changes the probe's waits is suspect too.
 
-## `kj editor` has no `insert` verb (2026-09-14)
-
-`editorInsert @105` gives a client a way to land text at the vi session's
-cursor that `editorKeys` notation cannot carry (a literal `<`), but
-`EditorCommand` in `crates/kaijutsu-kernel/src/kj/editor.rs` still has only
-`open/keys/state/save/quit/list`. A model driving the editor through `kj
-editor keys` cannot paste a `<`. The verb is `Effect::Write` and one call
-into `Kernel::editor_insert`. Found by the kaibo review of the paste slice.
-
 ## An editor edit publishes after it releases the lock (2026-09-14, inherited)
 
 `Kernel::editor_keys_checked` and `Kernel::editor_insert` compute the new
