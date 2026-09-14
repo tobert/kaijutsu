@@ -171,7 +171,9 @@ every refresh round the loop releases contexts that left the hot set
 hydrates every missing hot context in one spawned task per round, each
 landing through `adopt`; a switch releases too. `Feeds::hydrating` is the
 in-flight guard, so a switch mid-hydrate waits rather than subscribing
-twice. The wire has no unsubscribe — dropping the receiver ends the feed.
+twice. Dropping the receiver ends the feed on the wire, and the release
+also tells the actor to forget the context (`unsubscribe_context`) so a
+reconnect does not re-issue it.
 No cap landed on rendered lines: a warm frame over 5,000 blocks measured
 2.4 ms in release, 12.9 ms in debug (`render.rs`'s
 `a_warm_frame_over_five_thousand_blocks_costs_a_screenful_not_a_context`),
@@ -729,17 +731,23 @@ reporting off (`DisableFocusChange`), pop the xterm title stack (`CSI
 — around the `SIGTSTP`, then re-enables focus reporting and pushes the
 title stack again on the way back, vim's `stoptermcap`/`starttermcap`
 order. `:q` reaches it
-through `leave_terminal`; a panic reaches it through the hook `run`
-installs before the screen is taken, so the message prints on a cooked
-main screen; `SIGTERM` and `SIGHUP` reach it by ending
-the loop the way `:q` does. The key reader thread stops before raw mode
+through `leave_terminal`; a panic on the loop thread, outside any task,
+reaches it through the hook `run` installs before the screen is taken, so
+the message prints on a cooked main screen; `SIGTERM` and `SIGHUP` reach it
+by ending the loop the way `:q` does. A panic inside a `spawn_local` task
+nobody joins — `Feeds::pump`'s forwarder, a hydrate round — does not unwind
+the loop, so the hook must not restore in place there
+(`run::panic_unwinds_the_loop`); it records the panic instead and the loop
+ends on it the next iteration, reaching `leave_terminal` the normal way.
+The key reader thread stops before raw mode
 goes, so keys typed at the prompt while the connection tears down reach
 the shell. Diagnostics never touch the screen: when stderr is the terminal
 they go to `kaijutsu-tui/tui.log` under the state directory, a redirected
 stderr is used as given, and `--log` names the file. Probes:
 `tests/terminal_fit.rs`, "Every way out restores the terminal" — `:q`,
-`SIGTERM` from copy mode, and a panic from copy mode
-(`KAIJUTSU_TUI_PROBE_PANIC` makes `F12` panic) each leave the pty on the
+`SIGTERM` from copy mode, a panic from copy mode
+(`KAIJUTSU_TUI_PROBE_PANIC` makes `F12` panic), and a task panic
+(`KAIJUTSU_TUI_PROBE_PANIC=task`) each leave the pty on the
 main screen with a cooked line discipline.
 
 **Probes** (`tests/terminal_fit.rs`): `:` draws the bar visibly while
@@ -1150,9 +1158,17 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 ## Keys
 
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
-`Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a`, `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`,
-`h`, and the armed-prefix legend line; `Ctrl+A [` leaves the live tail
-without moving ("Copy mode (scroll, or `Ctrl+A [`)"). The legend takes the
+`Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a` (a literal `Ctrl+A` into the draft,
+screen's own `C-a a`), `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`, `h`, and the
+armed-prefix legend line. `q`, `'`, `A`, and `d` are chords the prefix
+already claims; the notice on the status line names what each will do —
+switch by prompt, rename, close-and-demote, detach — until this client
+builds them. `h` is not this client's yet either and has no notice of its
+own: an unbound chord, named the plain way (`Ctrl+A h is not bound`). Three
+chords are this client's own, with no app equivalent: `Ctrl+A v` opens the
+diff viewer, `Ctrl+A l` opens the ledger, `Ctrl+A ]` pastes the copy-mode
+yank buffer, and `Ctrl+A [` leaves the live tail without moving ("Copy mode
+(scroll, or `Ctrl+A [`)"). The legend takes the
 compose row while a prefix is pending — never the status line, whose seat digits are
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the

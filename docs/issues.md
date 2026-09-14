@@ -184,17 +184,6 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
-## The panic hook restores the terminal under a still-running loop (2026-09-13)
-
-`run::restore_terminal` is installed as a process-wide panic hook so a
-panic on the loop thread leaves a cooked main screen. A panic on a task
-whose JoinHandle is never joined — a hydrate round, the peer thread —
-runs the same hook while the loop keeps drawing: the alternate screen,
-raw mode, focus reporting and the title stack are torn out from under a
-live client, which then paints onto the shell's screen. The fix is to
-scope the restore to the loop thread (a thread id check in the hook) and
-let an unjoined task's panic surface as an error the loop ends on.
-
 ## OSC 8 hyperlinks wait on a ratatui span attribute (2026-09-13)
 
 `present::links` detects the paths and URLs a hyperlink would target, with
@@ -207,28 +196,6 @@ own bytes; neither is built. Separately, the ephemeral kernel a probe runs
 against needs `arrange_a_reviewer` (`tests/terminal_fit.rs`) before it can
 raise an ask at all — the default reviewer has no character sheet — which
 is worth a harness helper in `support/mod.rs` if a second probe needs it.
-
-## The event loop still awaits the kernel on two feed paths (2026-09-13)
-
-`run.rs`'s Resubscribed arm awaits `rehydrate_context` inside the loop,
-and `switch_seat` awaits `read_input` on the key path (a switch loads
-its draft). The guard test that forbids kernel awaits in `event_loop`
-names neither. Both block keys for one round trip; the switch one is
-deliberate, the rehydrate one should move to a spawned task the way
-`start_hydrate` does. Also: a failed `list_contexts` round leaves the
-rank stale and the hot set frozen, and the app cannot tell "unchanged"
-from "stale".
-
-## ActorHandle has no unsubscribe_context (2026-09-13)
-
-The wire ends a context feed when the observer capability is dropped
-(`kaijutsu_client::rpc::subscribe_context`), and the tui's hot-set
-release drops its receiver so the pump and the observer go. But the
-actor's `context_feeds` map never removes the entry, so a released
-context leaves a dead `Sender` that is re-issued and dies again on
-every reconnect. Bounded and harmless; the fix is an
-`ActorHandle::unsubscribe_context` that removes the entry, in
-`kaijutsu-client`.
 
 ## transcript_plan clones every block per frame (2026-09-13)
 
@@ -650,13 +617,8 @@ true:
    is complete); `Svg`/`Image` rasterization is unbuilt.
 6. Bar/beat assumes 4/4; the wire carries no time signature.
 
-Two open UX items from Amy's first sessions: show the reconnect when it is
-what blocks the client (status line has `app.connection`, nothing surfaces
-it); and `Ctrl+A a` is unbound (`keys.rs`, falls to
-`Intent::NotYet("unbound chord")`) and locked the client once — a harness
-probe that presses it and then types is still the next step. The seat-digit
-disagreement between the picker and the status line, and the ask-card/ledger
-follow-ups, are their own entries below.
+The seat-digit disagreement between the picker and the status line, and
+the ask-card/ledger follow-ups, are their own entries below.
 
 ## Telemetry span inventory needs a refresh (2026-09-12)
 
@@ -715,16 +677,14 @@ the app inherits) but the file doesn't exist yet, so the specific gaps still
 stand:
 
 - **App ahead, not yet in the tui:** `Ctrl+A '` (switch by prompt),
-  `Ctrl+A A` (rename), `Ctrl+A q` (close+demote), `Ctrl+A d` (detach),
-  `Ctrl+A a` (literal Ctrl+A).
+  `Ctrl+A A` (rename), `Ctrl+A q` (close+demote), `Ctrl+A d` (detach). The
+  tui names each one's future meaning on the status line.
 - **Tui ahead, not claimed in the app's table (no conflict rolling them in):**
   `Ctrl+A l` (ledger — app has no ledger surface), `Ctrl+A [` (copy mode),
   `Ctrl+A ]` (tui's own yank buffer, not the OS clipboard).
 - **`Ctrl+Z`** is suspend in the tui, `ToggleSurface` (chat/shell) in the app
   — the tui retired the shell surface for `:!`, the app still has the
   toggle. Name this in `docs/input.md` or retire the app's toggle.
-- `docs/tui.md` "Keys" summarizes the prefix table without `v`/`l`/`]` — the
-  summary line is stale, each has its own subsection.
 
 ## The /config melt's leftovers (2026-08-29/30)
 

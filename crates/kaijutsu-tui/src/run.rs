@@ -21,7 +21,7 @@ use crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use kaijutsu_audio::RefDisposition;
-use kaijutsu_client::{ContextInfo, FeedEvent, ServerEvent};
+use kaijutsu_client::{ActorHandle, ContextInfo, FeedEvent, ServerEvent};
 use parking_lot::Mutex;
 use kaijutsu_types::ContextId;
 use ratatui::backend::CrosstermBackend;
@@ -62,13 +62,16 @@ const KEY_POLL: Duration = Duration::from_millis(20);
 
 /// `KAIJUTSU_TUI_PROBE_PANIC`: unset, or `frame` to panic inside the frame
 /// — where a synchronized update is open and the restore path has to end it
-/// — or any other value to panic on the key.
+/// — or `task` to panic inside a `spawn_local` task the loop never joins,
+/// the way `Feeds::pump` or a hydrate round would — or any other value to
+/// panic on the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbePanic {
     Off,
     OnKey,
     InFrame,
 }
+    InTask,
 
 impl ProbePanic {
     fn from_env() -> Self {
@@ -76,22 +79,59 @@ impl ProbePanic {
             None => Self::Off,
             Some("frame") => Self::InFrame,
             Some(_) => Self::OnKey,
+            Some("task") => Self::InTask,
         }
     }
 }
 
 /// One feed delivery, tagged with the context it belongs to — several
+/// The event loop's own thread, recorded once when the panic hook is
+/// installed (`run`). Only a panic on this thread that is also outside any
+/// tokio task unwinds `LocalSet::run_until`'s root future — the hook's own
+/// [`panic_unwinds_the_loop`] check.
+static LOOP_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// A panic the hook saw but did not unwind the loop for — inside a
+/// `spawn_local` task nobody joins (`Feeds::pump`, a hydrate round), or on a
+/// background thread (the key reader, the peer thread). Recorded here so
+/// `event_loop` can notice it and end the loop with an `Err` instead of
+/// leaving a panicked task's silence to draw over a screen the hook left
+/// alone. `event_loop` takes it, so a second unnoticed panic before the
+/// first is drained overwrites rather than queues — the loop is about to end
+/// either way.
+static TASK_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+/// Whether a panic on `panicking_thread` unwinds `run_until`'s root future —
+/// the only case [`restore_terminal`] may run from inside the hook.
+/// `loop_thread` is [`LOOP_THREAD`] as the hook read it; `task_id` is
+/// `tokio::task::try_id()` on the panicking thread.
+///
+/// A `spawn_local` task shares the loop's own OS thread (`main.rs` drives
+/// every task through one `LocalSet::run_until` on the runtime's main
+/// thread) but panics without reaching the root future itself —
+/// `tokio::task::try_id()` is `Some` inside one and `None` at the root — so
+/// a thread-id check alone cannot tell a task panic from the root's own. A
+/// panic on any other thread does not reach the root future either.
+fn panic_unwinds_the_loop(
+    panicking_thread: std::thread::ThreadId,
+    loop_thread: Option<std::thread::ThreadId>,
+    task_id: Option<tokio::task::Id>,
+) -> bool {
+    Some(panicking_thread) == loop_thread && task_id.is_none()
+}
+
 /// contexts are watched at once and they share one loop.
 type TaggedFeed = (ContextId, FeedEvent);
 
 /// The context feeds this client is pumping: one forwarder task per watched
 /// context, and the one channel they all forward into.
 ///
-/// The wire has no unsubscribe — `subscribeContext` ends when the observer
-/// capability is dropped (`kaijutsu_client::rpc`) — so releasing a context
-/// aborts its forwarder here. That drops the actor's end of the feed, which
-/// ends the actor's pump, which drops the observer. Held by the loop rather
-/// than by [`App`], which stays free of tasks and connections.
+/// Releasing a context aborts its forwarder here and tells the actor to stop
+/// re-issuing `subscribeContext` for it (`ActorHandle::unsubscribe_context`).
+/// That ends the actor's pump, which drops the observer capability, which is
+/// what actually ends the feed on the wire (`kaijutsu_client::rpc`). Held by
+/// the loop rather than by [`App`], which stays free of tasks and
+/// connections.
 struct Feeds {
     tx: mpsc::Sender<TaggedFeed>,
     tasks: std::collections::HashMap<ContextId, tokio::task::JoinHandle<()>>,
@@ -99,6 +139,9 @@ struct Feeds {
     /// task, received by the loop's own arm.
     hydrated_tx: mpsc::Sender<Hydrated>,
     /// The contexts a background hydrate is in flight for. The round owns
+    /// The actor whose `context_feeds` map a release must also clear — see
+    /// [`Self::stop`].
+    actor: ActorHandle,
     /// the task; the ids live here because every watch path already carries
     /// `Feeds` and every one of them has to check them.
     ///
@@ -113,13 +156,14 @@ struct Feeds {
 }
 
 impl Feeds {
-    fn new(tx: mpsc::Sender<TaggedFeed>, hydrated_tx: mpsc::Sender<Hydrated>) -> Self {
+    fn new(tx: mpsc::Sender<TaggedFeed>, hydrated_tx: mpsc::Sender<Hydrated>, actor: ActorHandle) -> Self {
         Self {
             tx,
             tasks: std::collections::HashMap::new(),
             hydrated_tx,
             hydrating: std::collections::HashSet::new(),
         }
+            actor,
     }
 
     /// Forward `rx`'s deliveries into the loop's channel, tagged with the
@@ -143,10 +187,15 @@ impl Feeds {
 
     /// Stop forwarding `context_id`'s feed and let the subscription go.
     fn stop(&mut self, context_id: ContextId) {
+    ///
+    /// Non-blocking: `unsubscribe_context` only touches the actor's own
+    /// in-memory map, no wire round trip, so this stays safe to call from
+    /// inside `event_loop` without awaiting anything.
         if let Some(task) = self.tasks.remove(&context_id) {
             task.abort();
         }
     }
+        self.actor.unsubscribe_context(context_id);
 }
 
 /// crossterm's internal event reader is one shared resource, and a blocking
@@ -202,7 +251,7 @@ pub async fn run(
     // reading them, and [`HydrateGuard`]'s `try_send` always has a slot
     // while the loop is still draining.
     let (hydrated_tx, hydrated_rx) = mpsc::channel::<Hydrated>(64);
-    let mut feeds = Feeds::new(feed_tx, hydrated_tx);
+    let mut feeds = Feeds::new(feed_tx, hydrated_tx, bridge.actor().clone());
     watch_context(&bridge, &mut app, start.id, &mut feeds).await?;
     app.switch_to(start.id);
 
@@ -231,13 +280,27 @@ pub async fn run(
     app.principal = Some(identity.principal_id);
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
 
-    // A panic past this point unwinds through the screen without reaching
-    // `leave_terminal`. The hook restores the terminal first, so the panic
-    // message prints on a cooked main screen and the shell that follows
-    // reads keys. No terminal lock here: the panicking thread may hold it.
+    // A panic on this thread, outside any task, past this point unwinds
+    // through the screen without reaching `leave_terminal`. The hook
+    // restores the terminal first, so the panic message prints on a cooked
+    // main screen and the shell that follows reads keys. No terminal lock
+    // here: the panicking thread may hold it.
+    //
+    // A panic that does *not* unwind the loop this way — inside a
+    // `spawn_local` task nobody joins, or on a background thread — must not
+    // restore here: the loop is still drawing, and tearing the screen out
+    // from under it leaves the client painting onto the shell's own screen
+    // (`docs/issues.md` before this fix; `panic_unwinds_the_loop`). It goes
+    // into `TASK_PANIC` instead, for `event_loop` to notice and end the loop
+    // with, which reaches `leave_terminal` the normal way.
+    *LOOP_THREAD.lock() = Some(std::thread::current().id());
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        if panic_unwinds_the_loop(std::thread::current().id(), *LOOP_THREAD.lock(), tokio::task::try_id()) {
+            restore_terminal();
+        } else {
+            *TASK_PANIC.lock() = Some(info.to_string());
+        }
         default_panic(info);
     }));
 
@@ -351,10 +414,24 @@ fn adopt(
     tracing::debug!(context = %context_id.short(), "watching context feed");
 }
 
-/// One hot context hydrated in the background: the id asked for, and what
-/// the kernel answered.
-type Hydrated =
-    (ContextId, Result<(kaijutsu_client::ContextMirror, mpsc::Receiver<FeedEvent>)>);
+/// What one hydrate round answers for a context: a context newly watched
+/// carries a fresh feed receiver along with its mirror
+/// ([`KernelBridge::hydrate_context`], [`start_hydrate`]); a context already
+/// watched, rebuilt after `FeedEvent::Resubscribed`, keeps the receiver it
+/// already has and carries only a snapshot ([`KernelBridge::rehydrate_context`],
+/// [`start_rehydrate`]) — the landing arm applies it to the SAME mirror
+/// ([`land_rehydrate`]) rather than building a new one, since that mirror
+/// switched to buffering before the round started and must filter what it
+/// buffered against this exact snapshot. Each carries its own `Result`, so a
+/// failure says which kind of request it was.
+enum HydrateOutcome {
+    Fresh(Result<(kaijutsu_client::ContextMirror, mpsc::Receiver<FeedEvent>)>),
+    Rebuilt(Result<(Vec<kaijutsu_types::BlockSnapshot>, u64)>),
+}
+
+/// One hydrate or rehydrate answered in the background: the id asked for,
+/// and what the kernel answered.
+type Hydrated = (ContextId, HydrateOutcome);
 
 /// The contexts a round hydrates: every hot context this client is not
 /// watching and is not already hydrating. Pure, so a test can ask what a
@@ -383,10 +460,10 @@ fn start_hydrate(bridge: &KernelBridge, app: &App, feeds: &mut Feeds) {
     let bridge = bridge.clone();
     let tx = feeds.hydrated_tx.clone();
     tokio::spawn(async move {
-        let mut guard = HydrateGuard { remaining: round.clone(), tx: tx.clone() };
+        let mut guard = HydrateGuard { remaining: round.clone(), tx: tx.clone(), wrap: fresh_failed };
         for context_id in round {
             let hydrated = bridge.hydrate_context(context_id).await;
-            if tx.send((context_id, hydrated)).await.is_err() {
+            if tx.send((context_id, HydrateOutcome::Fresh(hydrated))).await.is_err() {
                 break;
             }
             guard.remaining.retain(|id| *id != context_id);
@@ -402,6 +479,38 @@ fn start_hydrate(bridge: &KernelBridge, app: &App, feeds: &mut Feeds) {
 /// one would wait forever on a round that ended. The guard sends an `Err`
 /// for each id still outstanding as it drops, which the loop's own error arm
 /// clears.
+/// Ask for one watched context's mirror to be rebuilt after
+/// `FeedEvent::Resubscribed`, off the loop — [`start_hydrate`]'s twin for a
+/// context that is already resident rather than one the hot set is missing.
+/// `rehydrate_context` does not re-subscribe (the actor already
+/// re-subscribed on the reconnect and this client keeps the same receiver,
+/// `KernelBridge::hydrate_context`'s doc comment) and does not build a
+/// mirror either: only a snapshot comes back — [`HydrateOutcome::Rebuilt`]
+/// carries that — for the landing arm to apply to the SAME mirror the
+/// caller already put into buffering mode
+/// ([`ContextMirror::begin_rehydrate`]) before calling this.
+///
+/// Guarded by the same [`Feeds::hydrating`] set `start_hydrate` uses: a
+/// second `Resubscribed` for a context already being rebuilt waits for that
+/// round instead of racing it.
+fn start_rehydrate(bridge: &KernelBridge, context_id: ContextId, feeds: &mut Feeds) {
+    if !feeds.hydrating.insert(context_id) {
+        return;
+    }
+    let bridge = bridge.clone();
+    let tx = feeds.hydrated_tx.clone();
+    // `tokio::spawn`, not `spawn_local` like `Feeds::pump`: this task only
+    // touches the `Send` `KernelBridge`/`ActorHandle` and plain data, no
+    // Cap'n Proto types, so it does not need the caller's `LocalSet`.
+    tokio::spawn(async move {
+        let mut guard = HydrateGuard { remaining: vec![context_id], tx: tx.clone(), wrap: rebuilt_failed };
+        let rehydrated = bridge.rehydrate_context(context_id).await;
+        if tx.send((context_id, HydrateOutcome::Rebuilt(rehydrated))).await.is_ok() {
+            guard.remaining.clear();
+        }
+    });
+}
+
 struct HydrateGuard {
     /// The round's ids, each removed once its own answer has been sent.
     remaining: Vec<ContextId>,
@@ -414,9 +523,15 @@ impl Drop for HydrateGuard {
             // `try_send`, because a `Drop` cannot await. The channel holds
             // more slots than a round has answers to give, so a full channel
             // means the loop has stopped draining it — it is shutting down,
+    /// How a stranded id's error is wrapped for the landing arm:
+    /// [`fresh_failed`] for [`start_hydrate`]'s round, [`rebuilt_failed`] for
+    /// [`start_rehydrate`]'s single id — the two ask the kernel for
+    /// different things and the landing arm's `Err` handling differs
+    /// accordingly.
+    wrap: fn(anyhow::Error) -> HydrateOutcome,
             // and a stranded id no longer matters. It is said out loud
             // rather than swallowed either way.
-            let answer = Err(anyhow::anyhow!(
+            let answer = (self.wrap)(anyhow::anyhow!(
                 "the hydrate round ended before {} was answered",
                 context_id.short()
             ));
@@ -438,6 +553,14 @@ impl Drop for HydrateGuard {
 /// nothing can start forwarding into a view that is on its way out.
 fn release_cold(app: &mut App, feeds: &mut Feeds) {
     for context_id in app.cold_contexts() {
+fn fresh_failed(e: anyhow::Error) -> HydrateOutcome {
+    HydrateOutcome::Fresh(Err(e))
+}
+
+fn rebuilt_failed(e: anyhow::Error) -> HydrateOutcome {
+    HydrateOutcome::Rebuilt(Err(e))
+}
+
         feeds.stop(context_id);
         app.release(context_id);
         tracing::debug!(context = %context_id.short(), "released a cold context");
@@ -505,6 +628,15 @@ async fn event_loop(
                         // Input only reaches a focused terminal, whatever
                         // the last focus report said (`App::saw_input`).
                         app.saw_input();
+        // A task the loop never joins panicked (`TASK_PANIC`, set by the
+        // hook installed in `run`); the hook did not restore the terminal
+        // for it, so this is the loop's own chance to end normally and
+        // reach `leave_terminal` — checked once an iteration, which bounds
+        // the delay by whatever else is ready to wake the loop and, absent
+        // that, by `TICK`.
+        if let Some(message) = TASK_PANIC.lock().take() {
+            return Err(anyhow::anyhow!(message));
+        }
                         if key.code == crossterm::event::KeyCode::F(12) {
                             match wires.probe_panic {
                                 ProbePanic::OnKey => panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed"),
@@ -517,6 +649,15 @@ async fn event_loop(
                             handle_picker_key(bridge, app, key, &mut wires.feeds).await?;
                         } else {
                             let width = terminal.size()?.width;
+                                // Never joined, like `Feeds::pump`'s forwarder
+                                // or a hydrate round: the loop must notice
+                                // this panic through `TASK_PANIC`, not by
+                                // unwinding.
+                                ProbePanic::InTask => {
+                                    tokio::task::spawn_local(async {
+                                        panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed inside a task");
+                                    });
+                                }
                             if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &mut wires.feeds, &wires.term_lock, width)
                                 .await?
                                 == Acted::Suspend
@@ -569,7 +710,7 @@ async fn event_loop(
             }
             Some((context_id, event)) = wires.feed_rx.recv() => {
                 dirty = true;
-                apply_feed(bridge, app, context_id, event, &mut wires.feeds).await;
+                apply_feed(bridge, app, context_id, event, &mut wires.feeds);
             }
             received = wires.server_events.recv() => {
                 let event = match received {
@@ -706,7 +847,7 @@ async fn event_loop(
                     // a switch can have hydrated the same context first. A
                     // mirror nobody wants is dropped, and the feed receiver
                     // with it, which ends the subscription.
-                    Ok((mirror, rx))
+                    HydrateOutcome::Fresh(Ok((mirror, rx)))
                         if app.hot_set().contains(&context_id)
                             && !app.views.contains_key(&context_id) =>
                     {
@@ -720,11 +861,11 @@ async fn event_loop(
                         }
                         dirty = true;
                     }
-                    Ok(_) => {}
+                    HydrateOutcome::Fresh(Ok(_)) => {}
                     // Not resident, so the next round asks again. A context
                     // on screen with no view renders nothing at all, so it
                     // says so rather than look like an empty conversation.
-                    Err(e) => {
+                    HydrateOutcome::Fresh(Err(e)) => {
                         tracing::warn!(
                             context = %context_id.short(),
                             error = %e,
@@ -743,6 +884,24 @@ async fn event_loop(
             // music"; `docs/midi.md`, "The one timebase"). The `if` guard
             // skips this arm entirely while nothing is playing, so it never
             // busy-polls a zero sleep.
+                    // A rebuilt snapshot lands on the view it belongs to, or
+                    // nowhere if the context was released while the round
+                    // was in flight — the same drop `apply_delivery` already
+                    // gives an ordinary feed delivery with no view to land
+                    // on.
+                    HydrateOutcome::Rebuilt(Ok((blocks, version))) => {
+                        if land_rehydrate(app, &mut wires.feeds, context_id, blocks, version) {
+                            dirty = true;
+                        }
+                    }
+                    // The round trip itself failed — never reached a
+                    // snapshot at all, so there is nothing to apply. See
+                    // `abandon_rehydrate` for why this releases rather than
+                    // retries or waits.
+                    HydrateOutcome::Rebuilt(Err(e)) => {
+                        abandon_rehydrate(app, &mut wires.feeds, context_id, e);
+                        dirty = true;
+                    }
             _ = tokio::time::sleep(beat_wake.map(|t| t.saturating_duration_since(Instant::now())).unwrap_or_default()), if beat_wake.is_some() => {
                 if let Some(scheduled) = beat_wake {
                     beat_wake = Some(picker::rearm(scheduled, beat_tempo_bps));
@@ -1133,6 +1292,9 @@ async fn act(
                 let tab = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab);
                 compose_key(bridge, app, tab).await?;
             }
+        Intent::Unbound(code) => {
+            app.note(format!("Ctrl+A {} is not bound", crate::keys::key_label(code)))
+        }
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
     }
@@ -1889,7 +2051,18 @@ fn report_decision(
 
 /// Apply one feed event to its mirror: the transcript redraws from the
 /// mirror, so nothing here has to say what a change could not reach.
-async fn apply_feed(
+///
+/// A `Resubscribed` delivery only asks for a rehydrate ([`start_rehydrate`]);
+/// it never awaits one. Before asking, it puts the EXISTING mirror back into
+/// buffering mode ([`ContextMirror::begin_rehydrate`]) rather than leaving it
+/// open to ordinary deliveries: the loop keeps draining `feed_rx` while the
+/// round is in flight, and a delivery that lands between the kernel's
+/// snapshot and this client's next look at it must wait for that snapshot
+/// instead of applying to — and then being discarded with — the mirror the
+/// round is about to replace. The mirror stays in that state until
+/// `hydrated_rx`'s answer lands, the same wait a cold context's own hydrate
+/// already costs.
+fn apply_feed(
     bridge: &KernelBridge,
     app: &mut App,
     context_id: ContextId,
@@ -1897,7 +2070,13 @@ async fn apply_feed(
     feeds: &mut Feeds,
 ) {
     if apply_delivery(app, feeds, context_id, event) == Rehydrate::Needed {
-        rehydrate(bridge, app, context_id).await;
+        // `apply_delivery` only returns `Needed` when the context still has
+        // a view (`docs/tui.md`, "The buffer"), so this always finds one;
+        // the guard stays rather than assumed, in case that ever changes.
+        if let Some(view) = app.views.get_mut(&context_id) {
+            view.mirror.begin_rehydrate();
+            start_rehydrate(bridge, context_id, feeds);
+        }
     }
 }
 
@@ -1971,33 +2150,83 @@ fn apply_delivery(
     Rehydrate::No
 }
 
-/// Throw the mirror away and hydrate a fresh one on the receiver the actor
-/// already re-subscribed for this client ([`FeedEvent::Resubscribed`]).
-/// Nothing the kernel published during the outage rides that feed, so the
-/// mirror held before it is stale.
-async fn rehydrate(bridge: &KernelBridge, app: &mut App, context_id: ContextId) {
-    match bridge.rehydrate_context(context_id).await {
-        Ok(fresh) => {
-            if let Some(view) = app.views.get_mut(&context_id) {
-                view.mirror = fresh;
-                view.seed_collapse();
-            }
-            reconcile_draft(app, context_id);
+/// Land a rebuilt snapshot once [`start_rehydrate`]'s answer comes back
+/// through `hydrated_rx` — applied to the SAME mirror the actor already
+/// re-subscribed for this client ([`FeedEvent::Resubscribed`]) put into
+/// buffering mode before the round started
+/// ([`kaijutsu_client::ContextMirror::begin_rehydrate`]), so whatever
+/// buffered mid-round is filtered against this exact snapshot rather than
+/// applied to — and lost with — a wholesale replacement mirror.
+///
+/// Returns whether anything changed on screen. The context can have been
+/// released while the round was in flight; a snapshot with no view to land
+/// on is dropped the same way an ordinary feed delivery is when its view is
+/// gone ([`apply_delivery`]) — every other exit from this function posts its
+/// own notice (below, and [`abandon_rehydrate`]), which is what stands in
+/// for clearing a stale `hydrating_notice`; this one posts nothing, so it
+/// takes that notice down itself if it is the one still showing, rather
+/// than leave the status row claiming a round is running that has already
+/// answered with nowhere to land. A snapshot that fails to apply —
+/// `MirrorError`, from something buffered during the round that the
+/// snapshot's version does not cover — would otherwise leave the mirror
+/// buffering forever with no round ever coming to finish it, so this
+/// releases the view instead, the same recovery `FeedEvent::Terminated`
+/// already gives a feed that cannot continue: the next switch re-subscribes
+/// and hydrates from scratch.
+fn land_rehydrate(
+    app: &mut App,
+    feeds: &mut Feeds,
+    context_id: ContextId,
+    blocks: Vec<kaijutsu_types::BlockSnapshot>,
+    version: u64,
+) -> bool {
+    let Some(view) = app.views.get_mut(&context_id) else {
+        // The switch that waited for this round may have posted
+        // `hydrating_notice` before the release; nothing else is ever
+        // coming to answer it, so it comes down here the same way a
+        // successful adopt already takes it down for a fresh hydrate.
+        if app.notice() == Some(hydrating_notice(app, context_id).as_str()) {
+            app.clear_notice();
+            return true;
+        }
+        return false;
+    };
+    let applied = view.mirror.apply_snapshot(blocks, version);
+    if applied.is_ok() {
+        view.seed_collapse();
+    }
+    match applied {
+        Ok(()) => {
+            let mut hydrated = false;
             // The feed only says `Resubscribed` on a new connection,
             // so the stream that clears a turn flag was broken. The
             // status watch coalesces, so a fast reconnect can leave
             // this the only sign: forget what this client believed
+                hydrated = view.mirror.is_hydrated();
+            }
+            // While buffering (`ContextMirror::begin_rehydrate`), the
+            // mirror's draft text and version are frozen at the
+            // pre-reconnect state. That is harmless for the context already
+            // on screen — `Compose::reconcile` refuses a version older than
+            // its own `acked` — but `switch_seat`'s `read_input` resets
+            // `acked` to 0 when the player switches onto this context
+            // mid-round (`compose::Compose::load_draft`), so a stale
+            // reconcile here is no longer refused and would overwrite the
+            // freshly loaded draft with the frozen one. `land_rehydrate`
+            // reconciles again once the snapshot applies.
+            if hydrated {
+                reconcile_draft(app, context_id);
             // was running rather than carry a flag nothing clears
             // (`docs/tui.md`, "Turn liveness is a partial signal").
             app.forget_turn_liveness();
-            // A fresh mirror names no changed blocks, so the pane
+            // A rebuilt mirror names no changed blocks, so the pane
             // latches on reasoning that is still streaming — once a
             // `TurnStarted` says a turn is running again.
             let streaming = streaming_thinking(app, context_id);
             app.observe_thinking(context_id, &streaming);
             app.note("reconnected; context rehydrated; turn liveness reset");
         }
-        Err(e) => app.note(format!("rehydrate failed: {e}")),
+        Err(e) => abandon_rehydrate(app, feeds, context_id, e),
     }
 }
 
@@ -2039,6 +2268,25 @@ fn mark_activity(app: &mut App, event: &ServerEvent) -> bool {
 /// Take the screen for the session: raw mode, bracketed paste, the alternate
 /// screen, and one full-screen `Terminal` over it.
 ///
+    true
+}
+
+/// Give up on a context's rehydrate: a failed round trip
+/// ([`HydrateOutcome::Rebuilt`]'s own `Err`) or a snapshot that landed but
+/// would not apply ([`land_rehydrate`]'s `MirrorError`). Either way the
+/// mirror is stuck in the buffering mode `ContextMirror::begin_rehydrate`
+/// put it in with no round left in flight to end it, so retrying is not
+/// bounded (nothing here caps how many times a persistent failure would be
+/// retried) and waiting is not recoverable on its own — releasing is. The
+/// same recovery `FeedEvent::Terminated` already gives a feed that cannot
+/// continue: the next switch re-subscribes and hydrates from scratch.
+fn abandon_rehydrate(app: &mut App, feeds: &mut Feeds, context_id: ContextId, error: impl std::fmt::Display) {
+    feeds.stop(context_id);
+    app.release(context_id);
+    app.note(format!(
+        "{} could not finish reconnecting: {error}; Ctrl+A <digit> reattaches",
+        app.label_for(context_id)
+    ));
 /// One terminal for the whole session. A full-screen viewport is anchored to
 /// nothing, so no frame asks the terminal where the cursor is and a slow hop
 /// never stalls a redraw (`docs/tui.md`, "The owned screen").
@@ -2365,8 +2613,10 @@ async fn open_kj_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_client::{ContextMirror, TurnCompletedStopReason, TurnOrigin};
-    use kaijutsu_types::PrincipalId;
+    use kaijutsu_client::{
+        ContextChange, ContextDelivery, ContextMirror, TurnCompletedStopReason, TurnOrigin, VersionedChange,
+    };
+    use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Role};
 
     /// Watch a context with an empty mirror — what `watch_context` leaves
     /// behind, without a kernel to hydrate from.
@@ -2719,7 +2969,10 @@ mod tests {
     fn feeds_for_test() -> (Feeds, mpsc::Receiver<Hydrated>) {
         let (tx, _feed_rx) = mpsc::channel::<TaggedFeed>(4);
         let (hydrated_tx, hydrated_rx) = mpsc::channel::<Hydrated>(8);
-        (Feeds::new(tx, hydrated_tx), hydrated_rx)
+        // Never answers and nobody reads it: `stop`'s unsubscribe is
+        // fire-and-forget, so these tests never wait on it either.
+        let (actor, _cmds) = ActorHandle::never_answers_for_test();
+        (Feeds::new(tx, hydrated_tx, actor), hydrated_rx)
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2789,11 +3042,14 @@ mod tests {
     fn a_dropped_hydrate_round_answers_every_id_it_did_not_reach() {
         let (a, b) = (ContextId::new(), ContextId::new());
         let (tx, mut rx) = mpsc::channel::<Hydrated>(8);
-        drop(HydrateGuard { remaining: vec![a, b], tx });
+        drop(HydrateGuard { remaining: vec![a, b], tx, wrap: fresh_failed });
 
         let mut answered = Vec::new();
         while let Ok((context_id, hydrated)) = rx.try_recv() {
-            assert!(hydrated.is_err(), "an id the round did not reach is an error, not a mirror");
+            assert!(
+                matches!(hydrated, HydrateOutcome::Fresh(Err(_))),
+                "an id the round did not reach is an error, not a mirror"
+            );
             answered.push(context_id);
         }
         assert_eq!(answered, vec![a, b], "every outstanding id is answered");
@@ -2805,7 +3061,7 @@ mod tests {
     fn a_hydrate_round_never_answers_an_id_twice() {
         let (a, b) = (ContextId::new(), ContextId::new());
         let (tx, mut rx) = mpsc::channel::<Hydrated>(8);
-        let mut guard = HydrateGuard { remaining: vec![a, b], tx };
+        let mut guard = HydrateGuard { remaining: vec![a, b], tx, wrap: fresh_failed };
         guard.remaining.retain(|id| *id != a);
         drop(guard);
 
@@ -2868,6 +3124,161 @@ mod tests {
             Some(7),
             "a came back to the place the reader left it"
         );
+    /// `apply_feed` on `Resubscribed` only asks for a rehydrate
+    /// ([`start_rehydrate`]) — it never awaits one. Entering a runtime
+    /// without driving it (no `block_on`, no `#[tokio::test]`) proves the
+    /// point: `tokio::spawn` inside `apply_feed` needs a runtime context to
+    /// register the task, but nothing here ever polls it, so a bridge that
+    /// never answers is never asked to.
+    #[test]
+    fn a_resubscribed_delivery_requests_a_rehydrate_without_awaiting_one() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("build a runtime");
+        let _entered = runtime.enter();
+
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        watched(&mut app, id);
+        let (mut feeds, _hydrated) = feeds_for_test();
+        let bridge = KernelBridge::never_answers_for_test();
+
+        apply_feed(&bridge, &mut app, id, FeedEvent::Resubscribed, &mut feeds);
+
+        assert!(feeds.hydrating.contains(&id), "a rehydrate round was requested");
+    }
+
+    /// A `BlockSnapshot` for a mirror this test hydrates by hand — content
+    /// and a distinct id, nothing else the mirror looks at.
+    fn text_block(context_id: ContextId, seq: u64, content: &str) -> BlockSnapshot {
+        BlockSnapshot::text(BlockId::new(context_id, PrincipalId::new(), seq), None, Role::User, content)
+    }
+
+    /// The hole a wholesale mirror swap left: the loop keeps draining
+    /// `feed_rx` while a rehydrate round is in flight, and a delivery that
+    /// lands between the kernel taking its snapshot and this client landing
+    /// it must not be applied to — and then thrown away with — the mirror
+    /// the round is about to replace. `apply_feed`'s `Resubscribed` handling
+    /// puts the SAME mirror into buffering mode first
+    /// (`ContextMirror::begin_rehydrate`), so a delivery the eventual
+    /// snapshot does not cover waits for it instead of being lost.
+    #[test]
+    fn a_delivery_mid_rehydrate_survives_a_snapshot_that_predates_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("build a runtime");
+        let _entered = runtime.enter();
+
+        let id = ContextId::new();
+        let a = text_block(id, 1, "a");
+        let mut app = App::new("amy");
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(vec![a.clone()], 5).unwrap();
+        app.views.insert(id, ContextView::new(mirror));
+        let (mut feeds, _hydrated) = feeds_for_test();
+        let bridge = KernelBridge::never_answers_for_test();
+
+        // The reconnect: puts the existing mirror into buffering mode and
+        // requests a rehydrate round (never driven here — see the test
+        // above).
+        apply_feed(&bridge, &mut app, id, FeedEvent::Resubscribed, &mut feeds);
+
+        // A delivery lands mid-round, at a version past what the snapshot
+        // below was read at.
+        let x = text_block(id, 2, "x");
+        let changed = FeedEvent::Changed(ContextDelivery {
+            context_id: id,
+            events: vec![VersionedChange {
+                version: 8,
+                change: ContextChange::BlockInserted { block: Box::new(x.clone()), after_id: Some(a.id) },
+            }],
+            version: 8,
+        });
+        apply_feed(&bridge, &mut app, id, changed, &mut feeds);
+
+        // The round's own answer: the kernel's state as read at version 7 —
+        // before the version-8 insert above.
+        assert!(land_rehydrate(&mut app, &mut feeds, id, vec![a.clone()], 7));
+
+        let ids: Vec<_> =
+            app.views.get(&id).expect("the view survives a successful rehydrate").mirror.blocks().iter().map(|b| b.id).collect();
+        assert!(ids.contains(&x.id), "the version-8 delivery must not be lost: {ids:?}");
+    }
+
+    /// Another hole the same buffering window opens: `apply_delivery`'s
+    /// `Changed` arm reconciles the compose line against the mirror on every
+    /// delivery, even while `ContextMirror::begin_rehydrate` has it frozen at
+    /// the pre-reconnect draft and version. For the context already on
+    /// screen that freeze is harmless — `Compose::reconcile` refuses a
+    /// version older than its own `acked` — but `switch_seat`'s
+    /// `read_input` + `Compose::load_draft` resets `acked` to 0 when the
+    /// player switches onto a context mid-rehydrate, so the stale reconcile
+    /// is no longer refused and overwrites the freshly loaded draft with the
+    /// frozen one.
+    #[test]
+    fn a_changed_delivery_does_not_reconcile_a_buffering_mirrors_frozen_draft() {
+        let id = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut app = App::new("amy");
+        app.principal = Some(principal);
+        app.current = Some(id);
+
+        let draft_id = BlockId::new(id, principal, 1);
+        let mut draft = BlockSnapshot::text(draft_id, None, Role::User, "old");
+        draft.status = kaijutsu_types::Status::Draft;
+        let mut mirror = ContextMirror::new(id);
+        mirror.apply_snapshot(vec![draft], 5).unwrap();
+        app.views.insert(id, ContextView::new(mirror));
+
+        // The reconnect: freezes the mirror's draft at "old"/version 5.
+        app.views.get_mut(&id).unwrap().mirror.begin_rehydrate();
+
+        // The switch onto this context mid-round: `read_input` loads the
+        // kernel's fresh draft the way `switch_seat` does, which resets
+        // `Compose`'s `acked` to 0 (`compose::Compose::load_draft`).
+        app.compose = Compose::over("new");
+
+        // Some other block changes while the round is still in flight.
+        let other = BlockId::new(id, PrincipalId::new(), 2);
+        let (mut feeds, _hydrated) = feeds_for_test();
+        let changed = FeedEvent::Changed(ContextDelivery {
+            context_id: id,
+            events: vec![VersionedChange {
+                version: 9,
+                change: ContextChange::TextAppended { block_id: other, suffix: "x".into() },
+            }],
+            version: 9,
+        });
+        apply_delivery(&mut app, &mut feeds, id, changed);
+
+        assert_eq!(
+            app.compose.text(),
+            "new",
+            "a delivery against a still-buffering mirror must not overwrite the fresh draft"
+        );
+    }
+
+    /// `X` was released (`Terminated` or `release_cold`) while its rehydrate
+    /// round was still in flight, and the player switched to it before the
+    /// round landed — `switch_seat` posts `hydrating_notice` for exactly
+    /// this case. When the round lands there is no view to apply the
+    /// snapshot to, so nothing else would ever take that notice down: the
+    /// success path a `Fresh` adopt clears it on (`hydrated_rx`'s landing
+    /// arm) does not run for a missing view either.
+    #[test]
+    fn a_landed_rehydrate_with_no_view_clears_a_stale_hydrating_notice() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        app.note(hydrating_notice(&app, id));
+        let (mut feeds, _hydrated) = feeds_for_test();
+
+        assert!(
+            land_rehydrate(&mut app, &mut feeds, id, vec![], 5),
+            "taking the stale notice down is itself a change worth a redraw"
+        );
+        assert_eq!(
+            app.notice(),
+            None,
+            "a round with nowhere to land must not leave the status row claiming one is still running"
+        );
+    }
+
 
         app.switch_to(b);
         assert!(app.following(), "b never left its tail");
@@ -2936,7 +3347,11 @@ mod tests {
         let start = source.find("async fn event_loop(").expect("event_loop is in run.rs");
         let body = &source[start..];
         let end = body.find("\n}\n").expect("event_loop ends");
-        let body = &body[..end];
+        let mut scanned = body[..end].to_string();
+        for helper in HELPERS {
+            scanned.push('\n');
+            scanned.push_str(function_body(source, helper));
+        }
         for call in [
             "list_contexts(",
             "poll_new_asks(",
@@ -2945,9 +3360,9 @@ mod tests {
             "hydrate_context(",
         ] {
             assert!(
-                !body.contains(call),
-                "`{call}` is awaited inside event_loop; run it on its own task and land the \
-                 result through a join arm, so keys never queue behind the kernel"
+                !scanned.contains(call),
+                "`{call}` is awaited on the loop's feed-apply path; run it on its own task and \
+                 land the result through a join arm, so keys never queue behind the kernel"
             );
         }
     }
@@ -2960,3 +3375,100 @@ mod tests {
         assert!(!mark_turn_liveness(&mut app, &event));
     }
 }
+    ///
+    /// A violation can hide one hop down: `event_loop`'s own text calls
+    /// `apply_feed` (in the `feed_rx` arm), and `apply_feed` is where a
+    /// `Resubscribed` delivery decides it needs a rehydrate and where an
+    /// ordinary `Changed` delivery reconciles the draft — both places a
+    /// straight-through kernel call has lived before. Scanning
+    /// `event_loop`'s literal body alone misses that, so this also scans the
+    /// named `HELPERS` below — the feed-apply path's own helpers — for the
+    /// same forbidden names. It stays a short, explicit list rather than a
+    /// full call-graph walk on purpose: the key path legitimately awaits the
+    /// kernel directly for a keystroke's own round trip (`switch_seat`
+    /// awaiting `read_input`, `open_ledger` reading `kj ledger show` to open
+    /// a view, both reached through `act`'s intent dispatch), and walking
+    /// the whole graph would flag those too. `start_rehydrate` and
+    /// `start_hydrate` are deliberately NOT in `HELPERS`: both hand their
+    /// kernel call to `tokio::spawn`, so scanning their bodies would flag
+    /// the exact off-loop pattern this test exists to require. Add a name to
+    /// `HELPERS` when the feed-apply chain grows another synchronous hop.
+        const HELPERS: &[&str] = &["apply_feed", "apply_delivery", "land_rehydrate"];
+
+            "rehydrate_context(",
+    /// The literal source of a top-level `fn name(` or `async fn name(` in
+    /// `run.rs`: from the `fn` keyword to its closing brace at column zero —
+    /// the same heuristic [`the_event_loop_never_awaits_the_kernel_for_background_work`]
+    /// has always used for `event_loop` itself, which holds because this
+    /// file's inner blocks stay indented.
+    ///
+    /// Panics when `name` is not found. A watched helper is named because it
+    /// sits on the loop's feed-apply path; a silent `None` for a renamed or
+    /// removed one would drop it out of the scan without saying so, which is
+    /// exactly the failure mode `HELPERS` exists to prevent one level up —
+    /// the whole point is that this test cannot go quiet on its own.
+    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("`{name}` is in HELPERS but no `fn {name}(` exists in run.rs any more"));
+        let body = &source[start..];
+        let end = body.find("\n}\n").unwrap_or_else(|| panic!("`{name}`'s body never closes at column zero"));
+        &body[..end]
+    }
+
+
+    // ────────────────────────────────────────────────────────────────────
+    // The panic hook (docs/tui.md, "Every way out restores the terminal")
+    // ────────────────────────────────────────────────────────────────────
+
+    /// The design fact the hook's restore-or-not decision rests on:
+    /// `tokio::task::try_id()` is `None` for `LocalSet::run_until`'s own
+    /// root future and `Some` inside a task `spawn_local` puts on that same
+    /// `LocalSet` — even though both run on the very thread that drives the
+    /// `LocalSet`, so a thread id alone cannot tell them apart.
+    #[test]
+    fn try_id_is_some_inside_a_spawned_task_and_none_at_the_root() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("current-thread runtime");
+        let local = tokio::task::LocalSet::new();
+        let (root_id, task_id) = runtime.block_on(local.run_until(async {
+            let root_id = tokio::task::try_id();
+            let task_id = tokio::task::spawn_local(async { tokio::task::try_id() })
+                .await
+                .expect("the spawned task did not panic");
+            (root_id, task_id)
+        }));
+        assert_eq!(root_id, None, "the run_until root future is not itself inside a task");
+        assert!(task_id.is_some(), "a spawn_local task carries a task id");
+    }
+
+    /// [`panic_unwinds_the_loop`] says yes only for the root panic on the
+    /// loop's own thread — a task sharing that thread, and a panic on any
+    /// other thread, both say no (`docs/issues.md` before this fix named a
+    /// thread-id check alone, which the test above falsifies).
+    #[test]
+    fn panic_unwinds_the_loop_only_at_the_root_on_the_loop_thread() {
+        let loop_thread = std::thread::current().id();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("current-thread runtime");
+        let handle = runtime.spawn(async {});
+        let task_id = handle.id();
+        runtime.block_on(handle).expect("the spawned task did not panic");
+        let other_thread =
+            std::thread::spawn(|| std::thread::current().id()).join().expect("the probe thread joins");
+
+        assert!(
+            panic_unwinds_the_loop(loop_thread, Some(loop_thread), None),
+            "the root panic, on the loop thread and in no task, unwinds it"
+        );
+        assert!(
+            !panic_unwinds_the_loop(loop_thread, Some(loop_thread), Some(task_id)),
+            "a task panic, even on the loop thread, does not unwind it"
+        );
+        assert!(
+            !panic_unwinds_the_loop(other_thread, Some(loop_thread), None),
+            "a panic on another thread never unwinds the loop"
+        );
+        assert!(
+            !panic_unwinds_the_loop(loop_thread, None, None),
+            "no recorded loop thread means the hook cannot tell, so it must not restore"
+        );
+    }

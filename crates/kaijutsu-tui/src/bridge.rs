@@ -12,7 +12,7 @@ use kaijutsu_client::rpc::KjExecutionResult;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
-use kaijutsu_types::{BlockId, BlockQuery, ContextId, InputEdge, PrincipalId};
+use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, InputEdge, PrincipalId};
 use tokio::sync::mpsc;
 
 /// Per-process subscription identity.
@@ -125,6 +125,17 @@ impl KernelBridge {
         &self.actor
     }
 
+    /// A bridge whose actor never answers, for a `kaijutsu-tui` test that
+    /// needs to call a kernel-shaped function (spawn a task that awaits one)
+    /// without ever reaching a real kernel. Wraps
+    /// [`ActorHandle::never_answers_for_test`], the same test double `Feeds`
+    /// tests already use for its `ActorHandle`.
+    #[cfg(test)]
+    pub(crate) fn never_answers_for_test() -> Self {
+        let (actor, _cmds) = ActorHandle::never_answers_for_test();
+        Self { actor, context_type: "default".to_string() }
+    }
+
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>> {
         self.actor.list_contexts().await.context("list contexts")
     }
@@ -183,7 +194,8 @@ impl KernelBridge {
     /// then apply it. Keep both halves: apply later deliveries to the mirror,
     /// and redo this on `FeedEvent::Terminated`; on `FeedEvent::Resubscribed`
     /// call [`Self::rehydrate_context`] instead — the actor has already
-    /// re-subscribed, so there is no new receiver.
+    /// re-subscribed, so there is no new receiver, and the caller keeps its
+    /// existing mirror rather than taking a new one (see that method).
     pub async fn hydrate_context(
         &self,
         context_id: ContextId,
@@ -193,27 +205,30 @@ impl KernelBridge {
             .subscribe_context(context_id)
             .await
             .with_context(|| format!("subscribe to context feed for {}", context_id.short()))?;
-        let mirror = self.hydrate_mirror(context_id).await?;
-        Ok((mirror, rx))
-    }
-
-    /// Rebuild a fresh mirror after `FeedEvent::Resubscribed`, on the same
-    /// receiver the caller already holds.
-    pub async fn rehydrate_context(&self, context_id: ContextId) -> Result<ContextMirror> {
-        self.hydrate_mirror(context_id).await
-    }
-
-    async fn hydrate_mirror(&self, context_id: ContextId) -> Result<ContextMirror> {
         let mut mirror = ContextMirror::new(context_id);
-        let (blocks, version) = self
-            .actor
-            .get_blocks_versioned(context_id, BlockQuery::All)
-            .await
-            .with_context(|| format!("get_blocks_versioned for {}", context_id.short()))?;
+        let (blocks, version) = self.blocks_versioned(context_id).await?;
         mirror
             .apply_snapshot(blocks, version)
             .with_context(|| format!("apply initial snapshot for {}", context_id.short()))?;
-        Ok(mirror)
+        Ok((mirror, rx))
+    }
+
+    /// Fetch the snapshot a rehydrate applies after `FeedEvent::Resubscribed`.
+    /// Deliberately just the fetch, not a fresh [`ContextMirror`]: the
+    /// caller's own mirror already switched to buffering
+    /// ([`ContextMirror::begin_rehydrate`]) before asking, and must apply
+    /// this snapshot to that SAME mirror so what buffered during the round
+    /// is filtered against it rather than discarded along with a
+    /// replacement mirror.
+    pub async fn rehydrate_context(&self, context_id: ContextId) -> Result<(Vec<BlockSnapshot>, u64)> {
+        self.blocks_versioned(context_id).await
+    }
+
+    async fn blocks_versioned(&self, context_id: ContextId) -> Result<(Vec<BlockSnapshot>, u64)> {
+        self.actor
+            .get_blocks_versioned(context_id, BlockQuery::All)
+            .await
+            .with_context(|| format!("get_blocks_versioned for {}", context_id.short()))
     }
 
     /// This client's own principal, which selects its draft block out of the

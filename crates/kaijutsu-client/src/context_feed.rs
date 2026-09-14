@@ -135,9 +135,12 @@ pub enum FeedEvent {
     Changed(ContextDelivery),
     /// The connection dropped and the actor has already re-subscribed. Nothing
     /// the kernel published during the outage is on this feed, so the mirror
-    /// held before it is stale: fetch a fresh snapshot and hydrate a new
-    /// mirror. Continuing to apply deltas to the old one would silently skip
-    /// the gap.
+    /// held before it is stale: call [`ContextMirror::begin_rehydrate`] on it
+    /// and fetch a fresh snapshot with [`ContextMirror::apply_snapshot`].
+    /// Continuing to apply deltas straight through without buffering would
+    /// silently skip the gap; a delivery that lands mid-round must wait for
+    /// the snapshot rather than land on the mirror the round is about to
+    /// replace.
     Resubscribed,
     /// The feed ended and is **not** resumable: re-subscribe and refetch.
     /// `delivered_version` is the last version actually applied, useful for
@@ -483,6 +486,22 @@ impl ContextMirror {
         self.snapshot_applied
     }
 
+    /// Start a rehydrate on this same mirror after a reconnect
+    /// (`FeedEvent::Resubscribed`): [`Self::receive`] buffers again exactly
+    /// as it does before the first snapshot, so a delivery that lands while
+    /// the round is in flight waits for the snapshot that follows instead of
+    /// landing on a mirror the round is about to discard. `blocks` and
+    /// `version` are left alone, so a caller that keeps rendering this
+    /// mirror mid-round shows the last good state rather than nothing.
+    ///
+    /// Does not un-poison — a poisoned mirror stays poisoned until
+    /// [`Self::apply_snapshot`] clears it, the same as any other rehydrate —
+    /// but it buffers meanwhile, poisoned or not, since the snapshot on its
+    /// way is the repair.
+    pub fn begin_rehydrate(&mut self) {
+        self.snapshot_applied = false;
+    }
+
     /// Take a delivery. Before the snapshot it is buffered; after, applied.
     ///
     /// This is the only entry point a client needs, and it is safe to call in
@@ -503,12 +522,15 @@ impl ContextMirror {
                 got: delivery.context_id,
             });
         }
-        if self.poisoned {
-            return Err(MirrorError::NeedsRehydration);
-        }
+        // Buffering comes before the poison check: a mirror mid-rehydrate
+        // is about to receive the snapshot that clears its poison, and the
+        // deliveries it buffers meanwhile drain after that.
         if !self.snapshot_applied {
             self.buffered.push(delivery);
             return Ok(());
+        }
+        if self.poisoned {
+            return Err(MirrorError::NeedsRehydration);
         }
         self.apply(delivery)
     }
@@ -788,6 +810,83 @@ mod tests {
 
         assert_eq!(mirror.block(&id).unwrap().content, "はい、世界");
         assert_eq!(mirror.version(), 13);
+    }
+
+    /// A `Resubscribed` reconnect keeps the same mirror rather than
+    /// replacing it, so it needs the same protection a brand-new mirror
+    /// already has: `begin_rehydrate` reopens the buffer, a delivery that
+    /// lands mid-round waits in it instead of applying to state the round is
+    /// about to discard, and the snapshot that follows filters it exactly
+    /// like the very first hydrate does — dropping what it already covers,
+    /// keeping what it does not.
+    /// A poisoned mirror is exactly the one a rehydrate repairs, so a
+    /// delivery that lands during its round is buffered like any other and
+    /// drained by the snapshot that clears the poison, not refused.
+    #[test]
+    fn a_poisoned_mirror_still_buffers_during_a_rehydrate() {
+        let c = ctx();
+        let a = block(c, 1, "a");
+        let b = block(c, 2, "b");
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![a.clone()], 5).unwrap();
+        let six = delivery(c, 6, vec![ContextChange::BlockInserted { block: Box::new(b.clone()), after_id: Some(a.id) }]);
+        mirror.receive(six.clone()).unwrap();
+        // The same version twice is a duplicate, which poisons.
+        assert!(mirror.receive(six).is_err());
+
+        mirror.begin_rehydrate();
+        let x = block(c, 3, "x");
+        mirror
+            .receive(delivery(c, 8, vec![ContextChange::BlockInserted { block: Box::new(x.clone()), after_id: Some(b.id) }]))
+            .expect("a rehydrating mirror buffers, poisoned or not");
+
+        mirror.apply_snapshot(vec![a.clone(), b.clone()], 7).unwrap();
+        let ids: Vec<_> = mirror.blocks().iter().map(|blk| blk.id).collect();
+        assert_eq!(ids, vec![a.id, b.id, x.id], "the buffered delivery drained after the snapshot cleared the poison");
+    }
+
+   #[test]
+    fn a_rehydrate_buffers_a_delivery_and_filters_it_against_the_new_snapshot() {
+        let c = ctx();
+        let a = block(c, 1, "a");
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![a.clone()], 5).unwrap();
+
+        mirror.begin_rehydrate();
+        assert!(!mirror.is_hydrated(), "buffering again, like a mirror with no snapshot yet");
+
+        let b = block(c, 2, "b");
+        let x = block(c, 3, "x");
+        // One delivery straddling the snapshot version to come: version 6 is
+        // already in the version-7 snapshot below, version 8 is not.
+        mirror
+            .receive(batched(
+                c,
+                vec![
+                    (
+                        6,
+                        ContextChange::BlockInserted { block: Box::new(b.clone()), after_id: Some(a.id) },
+                    ),
+                    (
+                        8,
+                        ContextChange::BlockInserted { block: Box::new(x.clone()), after_id: Some(b.id) },
+                    ),
+                ],
+            ))
+            .unwrap();
+        assert!(!mirror.is_hydrated(), "still buffering — no snapshot has landed yet");
+
+        // The kernel's own state at version 7 already reflects the
+        // version-6 insert.
+        mirror.apply_snapshot(vec![a.clone(), b.clone()], 7).unwrap();
+
+        let ids: Vec<_> = mirror.blocks().iter().map(|blk| blk.id).collect();
+        assert_eq!(
+            ids,
+            vec![a.id, b.id, x.id],
+            "x from version 8 landed once; b from version 6 was not duplicated"
+        );
+        assert_eq!(mirror.version(), 8);
     }
 
     /// Spans arrive as a whole projection, not a patch: the fold replaces

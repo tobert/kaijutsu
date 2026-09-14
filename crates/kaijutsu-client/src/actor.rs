@@ -4668,9 +4668,8 @@ mod tests {
 
     /// A released context feed must actually leave `context_feeds`, or
     /// `resubscribe_context_feeds` walks it into the next reconnect and
-    /// re-issues a subscribe whose receiver nobody holds
-    /// (docs/issues.md, "ActorHandle has no unsubscribe_context"). The
-    /// removal must also be surgical: unsubscribing one context must not
+    /// re-issues a subscribe whose receiver nobody holds. The removal must
+    /// also be surgical: unsubscribing one context must not
     /// touch another's live feed.
     #[test]
     fn unsubscribing_a_context_removes_its_feed_before_the_next_reconnect_replay() {

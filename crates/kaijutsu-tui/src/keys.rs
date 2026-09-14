@@ -37,9 +37,12 @@ pub enum Intent {
     /// "The `:` line": the `Ctrl+Z` shell surface retired in favor of `:!`,
     /// so this is now a single-press suspend, not a toggle).
     Suspend,
-    /// A chord a later lane owns. The text is what the status line says, so
-    /// a key is never swallowed silently.
+    /// A chord a later lane owns. The text names the chord's future meaning,
+    /// so a key is never swallowed silently.
     NotYet(&'static str),
+    /// A chord under the prefix nothing binds. The key rides along so the
+    /// status line can name exactly what was pressed.
+    Unbound(KeyCode),
     /// The prefix was armed or cancelled; the legend line changed.
     LegendChanged,
     /// `Ctrl+A v` — open the diff viewer on the newest diff block in the
@@ -64,6 +67,17 @@ pub enum Intent {
     /// a search take over (`docs/tui.md`, "Scrolling is copy mode"). `Up`,
     /// `PageUp` and the wheel reach the same state.
     CopyMode,
+}
+
+/// A short name for a key, for the `Ctrl+A <key> is not bound` notice
+/// ([`Intent::Unbound`]). Plain chars print themselves; everything else
+/// prints its `Debug` name, which is already the word a player would type
+/// looking for it (`Backspace`, `PageUp`).
+pub fn key_label(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(c) => c.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// The prefix state machine.
@@ -115,6 +129,14 @@ impl Keys {
             self.armed = false;
             return match key.code {
                 KeyCode::Char('a') if ctrl => Intent::LastContext,
+                // Screen's own `C-a a`: a bare `a` (no ctrl) after the
+                // prefix sends the prefix key itself into the draft as
+                // ordinary input, so it rides the same `InputKey` path any
+                // other keystroke does.
+                KeyCode::Char('a') => Intent::InputKey(KeyEvent::new(
+                    KeyCode::Char('a'),
+                    KeyModifiers::CONTROL,
+                )),
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     Intent::SwitchSeat(c as usize - '0' as usize)
                 }
@@ -125,10 +147,22 @@ impl Keys {
                 KeyCode::Char(']') => Intent::Paste,
                 KeyCode::Char('n') => Intent::StepSeat(1),
                 KeyCode::Char('p') => Intent::StepSeat(-1),
-                KeyCode::Char('\'') | KeyCode::Char('A') | KeyCode::Char('q')
-                | KeyCode::Char('d') | KeyCode::Char('h') => Intent::NotYet("chord: later lane"),
+                // The app already has these (`docs/input.md`, "The prefix
+                // table"); this lane has not built them, so the notice names
+                // what they will do rather than reading as a plain unbound
+                // key.
+                KeyCode::Char('\'') => {
+                    Intent::NotYet("Ctrl+A ' will switch by prompt; not built yet")
+                }
+                KeyCode::Char('A') => {
+                    Intent::NotYet("Ctrl+A A will rename the context; not built yet")
+                }
+                KeyCode::Char('q') => {
+                    Intent::NotYet("Ctrl+A q will close and demote; not built yet")
+                }
+                KeyCode::Char('d') => Intent::NotYet("Ctrl+A d will detach; not built yet"),
                 KeyCode::Esc => Intent::LegendChanged,
-                _ => Intent::NotYet("unbound chord"),
+                _ => Intent::Unbound(key.code),
             };
         }
 
@@ -299,6 +333,47 @@ mod tests {
         assert!(keys.claims(&press(KeyCode::Char('1'))), "a seat digit under the armed prefix");
         assert!(keys.claims(&press(KeyCode::Esc)), "Esc cancels the armed prefix");
         assert!(keys.claims(&press(KeyCode::Char('j'))), "everything, while armed");
+    }
+
+    /// `Ctrl+A a` sends a literal `Ctrl+A` to the draft — screen's own
+    /// `C-a a` — by handing back the same key the prefix itself would have
+    /// been, so it rides the ordinary `InputKey` path into compose.
+    #[test]
+    fn ctrl_a_a_sends_a_literal_ctrl_a_to_the_draft() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('a'))), Intent::InputKey(ctrl('a')));
+        assert!(!keys.armed());
+    }
+
+    /// An armed chord nothing binds names the key it saw and disarms, so the
+    /// next key is never eaten silently.
+    #[test]
+    fn an_unbound_chord_names_the_key_and_disarms() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(keys.interpret(press(KeyCode::Char('x'))), Intent::Unbound(KeyCode::Char('x')));
+        assert!(!keys.armed());
+    }
+
+    /// A chord the app already has but this lane has not built yet names its
+    /// future meaning rather than pretending it is simply unbound
+    /// (`docs/input.md`, "The prefix table").
+    #[test]
+    fn a_later_lane_chord_names_its_future_meaning() {
+        let mut keys = Keys::new();
+        keys.interpret(ctrl('a'));
+        assert_eq!(
+            keys.interpret(press(KeyCode::Char('\''))),
+            Intent::NotYet("Ctrl+A ' will switch by prompt; not built yet")
+        );
+    }
+
+    #[test]
+    fn key_label_names_a_char_and_a_named_key() {
+        assert_eq!(key_label(KeyCode::Char('x')), "x");
+        assert_eq!(key_label(KeyCode::Backspace), "Backspace");
+        assert_eq!(key_label(KeyCode::PageUp), "PageUp");
     }
 
     #[test]

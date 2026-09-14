@@ -1773,3 +1773,100 @@ fn a_promoted_context_goes_resident_before_any_switch_to_it() {
         std::fs::read_to_string(&log).unwrap_or_default()
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// o. A chord never locks the keyboard (docs/issues.md, "Ctrl+A a")
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `Ctrl+A` then any key must hand control back to compose — an unbound
+/// chord, a later-lane chord, and `Ctrl+A a` alike. This is the harness probe
+/// `docs/issues.md` called for: `Ctrl+A a` "locked the client once," and the
+/// disarm (`self.armed = false` before the match in `keys::Keys::interpret`)
+/// looks correct in today's code, so this is how we find out.
+#[test]
+fn a_chord_never_locks_the_keyboard() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    // An unbound chord names the key on the status line
+    // (`run::act`'s `Intent::Unbound` arm) rather than swallowing it.
+    session.send("\x01x");
+    let named = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        rows.last().is_some_and(|row| row.contains("Ctrl+A x is not bound"))
+    });
+    assert!(named, "the unbound chord never named the key: {}", session.dump("unbound chord"));
+
+    // And the very next keystroke still reaches the draft — `\x1b` forces
+    // normal mode first so entering insert with `i` is unambiguous whatever
+    // mode the unbound chord left compose in.
+    session.send("\x1bimarker-one");
+    let landed_one = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, 80).collect();
+        compose_row(&rows).is_some_and(|row| rows[row].contains("marker-one"))
+    });
+    assert!(landed_one, "typing after an unbound chord never reached the draft: {}", session.dump("after unbound"));
+
+    // `Ctrl+A a`: screen's own `C-a a`, a literal `Ctrl+A` sent to the draft
+    // (`keys::Keys::interpret`, the bare-`a` arm). What the vi engine does
+    // with the byte is its own business; what this probe pins is that the
+    // keyboard is not left armed or stuck afterward.
+    session.send("\x01a");
+    session.send("\x1bimarker-two");
+    let landed_two = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> = screen.rows(0, 80).collect();
+        compose_row(&rows).is_some_and(|row| rows[row].contains("marker-two"))
+    });
+    assert!(
+        landed_two,
+        "typing after Ctrl+A a never reached the draft — the chord locked the keyboard: {}",
+        session.dump("after ctrl+a a")
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// e2. A task panic ends the client instead of tearing the screen out from
+// under a still-running loop (docs/issues.md, "The panic hook restores the
+// terminal under a still-running loop")
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `KAIJUTSU_TUI_PROBE_PANIC=task` makes `F12` `spawn_local` a task that
+/// panics — the shape of `Feeds::pump`'s forwarder or a hydrate round, whose
+/// `JoinHandle` the loop never joins. Unlike the on-key and in-frame probes,
+/// this panic does not unwind `event_loop` itself, so the hook must not
+/// restore the terminal in place (`run::panic_unwinds_the_loop`); instead it
+/// records the panic and the loop notices it on its next iteration
+/// (`run::TASK_PANIC`) and ends normally through `leave_terminal`, the same
+/// path `:q` takes.
+#[cfg(unix)]
+#[test]
+fn a_panic_inside_a_task_ends_the_client_and_restores_the_terminal() {
+    let _serial = serial();
+    let server = EphemeralServer::start();
+    let key_dir = tempfile::tempdir().expect("key tempdir");
+    let key_path = write_ephemeral_key(key_dir.path());
+    let mut session = TuiSession::spawn_with_env(server.addr, &key_path, 24, 80, &[("KAIJUTSU_TUI_PROBE_PANIC", "task")]);
+    wait_for_attach(&session);
+    open_copy_mode(&session);
+
+    session.send("\x1b[24~"); // F12
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    let status = status.unwrap_or_else(|| panic!("process did not exit on the task panic: {}", session.dump("still running")));
+    assert!(!status.success(), "a task panic must not look like a clean exit: {}", session.dump("after the task panic"));
+    assert_terminal_restored(&session, "after the task panic");
+    assert_eq!(
+        session.sync_updates_open(),
+        0,
+        "the terminal was left inside a synchronized update: {}",
+        session.dump("after the task panic")
+    );
+    let (pushes, pops) = session.title_stack();
+    assert_eq!(pushes, pops, "the title stack is unbalanced after the task panic: {pushes} pushed, {pops} popped");
+    let (scrollback, visible) = session.history_snapshot();
+    assert!(
+        scrollback.iter().chain(visible.iter()).any(|l| l.contains("KAIJUTSU_TUI_PROBE_PANIC")),
+        "the panic message is not on a readable screen: {}",
+        session.dump("after the task panic")
+    );
+}
