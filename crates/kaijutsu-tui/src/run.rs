@@ -70,21 +70,20 @@ enum ProbePanic {
     Off,
     OnKey,
     InFrame,
-}
     InTask,
+}
 
 impl ProbePanic {
     fn from_env() -> Self {
         match std::env::var("KAIJUTSU_TUI_PROBE_PANIC").ok().as_deref() {
             None => Self::Off,
             Some("frame") => Self::InFrame,
-            Some(_) => Self::OnKey,
             Some("task") => Self::InTask,
+            Some(_) => Self::OnKey,
         }
     }
 }
 
-/// One feed delivery, tagged with the context it belongs to — several
 /// The event loop's own thread, recorded once when the panic hook is
 /// installed (`run`). Only a panic on this thread that is also outside any
 /// tokio task unwinds `LocalSet::run_until`'s root future — the hook's own
@@ -120,6 +119,7 @@ fn panic_unwinds_the_loop(
     Some(panicking_thread) == loop_thread && task_id.is_none()
 }
 
+/// One feed delivery, tagged with the context it belongs to — several
 /// contexts are watched at once and they share one loop.
 type TaggedFeed = (ContextId, FeedEvent);
 
@@ -138,10 +138,10 @@ struct Feeds {
     /// Where a hydrated context is delivered — cloned into each round's
     /// task, received by the loop's own arm.
     hydrated_tx: mpsc::Sender<Hydrated>,
-    /// The contexts a background hydrate is in flight for. The round owns
     /// The actor whose `context_feeds` map a release must also clear — see
     /// [`Self::stop`].
     actor: ActorHandle,
+    /// The contexts a background hydrate is in flight for. The round owns
     /// the task; the ids live here because every watch path already carries
     /// `Feeds` and every one of them has to check them.
     ///
@@ -162,8 +162,8 @@ impl Feeds {
             tasks: std::collections::HashMap::new(),
             hydrated_tx,
             hydrating: std::collections::HashSet::new(),
-        }
             actor,
+        }
     }
 
     /// Forward `rx`'s deliveries into the loop's channel, tagged with the
@@ -186,16 +186,16 @@ impl Feeds {
     }
 
     /// Stop forwarding `context_id`'s feed and let the subscription go.
-    fn stop(&mut self, context_id: ContextId) {
     ///
     /// Non-blocking: `unsubscribe_context` only touches the actor's own
     /// in-memory map, no wire round trip, so this stays safe to call from
     /// inside `event_loop` without awaiting anything.
+    fn stop(&mut self, context_id: ContextId) {
         if let Some(task) = self.tasks.remove(&context_id) {
             task.abort();
         }
-    }
         self.actor.unsubscribe_context(context_id);
+    }
 }
 
 /// crossterm's internal event reader is one shared resource, and a blocking
@@ -471,14 +471,6 @@ fn start_hydrate(bridge: &KernelBridge, app: &App, feeds: &mut Feeds) {
     });
 }
 
-/// Answers the loop for every id a round did not reach.
-///
-/// A round that panics, or is dropped because the runtime is going away,
-/// would otherwise leave its ids in [`Feeds::hydrating`] for the life of the
-/// session, and those contexts could never go resident again — a switch to
-/// one would wait forever on a round that ended. The guard sends an `Err`
-/// for each id still outstanding as it drops, which the loop's own error arm
-/// clears.
 /// Ask for one watched context's mirror to be rebuilt after
 /// `FeedEvent::Resubscribed`, off the loop — [`start_hydrate`]'s twin for a
 /// context that is already resident rather than one the hot set is missing.
@@ -511,10 +503,24 @@ fn start_rehydrate(bridge: &KernelBridge, context_id: ContextId, feeds: &mut Fee
     });
 }
 
+/// Answers the loop for every id a round did not reach.
+///
+/// A round that panics, or is dropped because the runtime is going away,
+/// would otherwise leave its ids in [`Feeds::hydrating`] for the life of the
+/// session, and those contexts could never go resident again — a switch to
+/// one would wait forever on a round that ended. The guard sends an `Err`
+/// for each id still outstanding as it drops, which the loop's own error arm
+/// clears.
 struct HydrateGuard {
     /// The round's ids, each removed once its own answer has been sent.
     remaining: Vec<ContextId>,
     tx: mpsc::Sender<Hydrated>,
+    /// How a stranded id's error is wrapped for the landing arm:
+    /// [`fresh_failed`] for [`start_hydrate`]'s round, [`rebuilt_failed`] for
+    /// [`start_rehydrate`]'s single id — the two ask the kernel for
+    /// different things and the landing arm's `Err` handling differs
+    /// accordingly.
+    wrap: fn(anyhow::Error) -> HydrateOutcome,
 }
 
 impl Drop for HydrateGuard {
@@ -523,12 +529,6 @@ impl Drop for HydrateGuard {
             // `try_send`, because a `Drop` cannot await. The channel holds
             // more slots than a round has answers to give, so a full channel
             // means the loop has stopped draining it — it is shutting down,
-    /// How a stranded id's error is wrapped for the landing arm:
-    /// [`fresh_failed`] for [`start_hydrate`]'s round, [`rebuilt_failed`] for
-    /// [`start_rehydrate`]'s single id — the two ask the kernel for
-    /// different things and the landing arm's `Err` handling differs
-    /// accordingly.
-    wrap: fn(anyhow::Error) -> HydrateOutcome,
             // and a stranded id no longer matters. It is said out loud
             // rather than swallowed either way.
             let answer = (self.wrap)(anyhow::anyhow!(
@@ -545,14 +545,6 @@ impl Drop for HydrateGuard {
     }
 }
 
-/// Drop every watched context that has left the hot set, and stop its feed.
-/// No kernel call, so a key path may run it.
-///
-/// The forwarder goes first and the view second: a delivery that reached the
-/// loop before the abort finds no view and is discarded ([`apply_feed`]), and
-/// nothing can start forwarding into a view that is on its way out.
-fn release_cold(app: &mut App, feeds: &mut Feeds) {
-    for context_id in app.cold_contexts() {
 fn fresh_failed(e: anyhow::Error) -> HydrateOutcome {
     HydrateOutcome::Fresh(Err(e))
 }
@@ -561,6 +553,14 @@ fn rebuilt_failed(e: anyhow::Error) -> HydrateOutcome {
     HydrateOutcome::Rebuilt(Err(e))
 }
 
+/// Drop every watched context that has left the hot set, and stop its feed.
+/// No kernel call, so a key path may run it.
+///
+/// The forwarder goes first and the view second: a delivery that reached the
+/// loop before the abort finds no view and is discarded ([`apply_feed`]), and
+/// nothing can start forwarding into a view that is on its way out.
+fn release_cold(app: &mut App, feeds: &mut Feeds) {
+    for context_id in app.cold_contexts() {
         feeds.stop(context_id);
         app.release(context_id);
         tracing::debug!(context = %context_id.short(), "released a cold context");
@@ -620,14 +620,6 @@ async fn event_loop(
     app.connection = Some(bridge.actor().current_status());
 
     while !app.quit {
-        tokio::select! {
-            Some(event) = wires.key_rx.recv() => {
-                match event {
-                    Event::Key(key) => {
-                        dirty = true;
-                        // Input only reaches a focused terminal, whatever
-                        // the last focus report said (`App::saw_input`).
-                        app.saw_input();
         // A task the loop never joins panicked (`TASK_PANIC`, set by the
         // hook installed in `run`); the hook did not restore the terminal
         // for it, so this is the loop's own chance to end normally and
@@ -637,18 +629,18 @@ async fn event_loop(
         if let Some(message) = TASK_PANIC.lock().take() {
             return Err(anyhow::anyhow!(message));
         }
+        tokio::select! {
+            Some(event) = wires.key_rx.recv() => {
+                match event {
+                    Event::Key(key) => {
+                        dirty = true;
+                        // Input only reaches a focused terminal, whatever
+                        // the last focus report said (`App::saw_input`).
+                        app.saw_input();
                         if key.code == crossterm::event::KeyCode::F(12) {
                             match wires.probe_panic {
                                 ProbePanic::OnKey => panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed"),
                                 ProbePanic::InFrame => panic_in_frame = true,
-                                ProbePanic::Off => {}
-                            }
-                        }
-                        let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
-                        if app.picker.is_some() {
-                            handle_picker_key(bridge, app, key, &mut wires.feeds).await?;
-                        } else {
-                            let width = terminal.size()?.width;
                                 // Never joined, like `Feeds::pump`'s forwarder
                                 // or a hydrate round: the loop must notice
                                 // this panic through `TASK_PANIC`, not by
@@ -658,6 +650,14 @@ async fn event_loop(
                                         panic!("KAIJUTSU_TUI_PROBE_PANIC: F12 pressed inside a task");
                                     });
                                 }
+                                ProbePanic::Off => {}
+                            }
+                        }
+                        let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
+                        if app.picker.is_some() {
+                            handle_picker_key(bridge, app, key, &mut wires.feeds).await?;
+                        } else {
+                            let width = terminal.size()?.width;
                             if act(bridge, app, &mut keys, &mut interrupt_ladder, key, &mut wires.feeds, &wires.term_lock, width)
                                 .await?
                                 == Acted::Suspend
@@ -876,14 +876,6 @@ async fn event_loop(
                             dirty = true;
                         }
                     }
-                }
-            }
-            // The beat-driven redraw: armed at the playing track's predicted
-            // next onset, re-armed at `scheduled + period` inside the arm
-            // body — never `actual_wake + period` (`docs/tui.md`, "Timing to
-            // music"; `docs/midi.md`, "The one timebase"). The `if` guard
-            // skips this arm entirely while nothing is playing, so it never
-            // busy-polls a zero sleep.
                     // A rebuilt snapshot lands on the view it belongs to, or
                     // nowhere if the context was released while the round
                     // was in flight — the same drop `apply_delivery` already
@@ -902,6 +894,14 @@ async fn event_loop(
                         abandon_rehydrate(app, &mut wires.feeds, context_id, e);
                         dirty = true;
                     }
+                }
+            }
+            // The beat-driven redraw: armed at the playing track's predicted
+            // next onset, re-armed at `scheduled + period` inside the arm
+            // body — never `actual_wake + period` (`docs/tui.md`, "Timing to
+            // music"; `docs/midi.md`, "The one timebase"). The `if` guard
+            // skips this arm entirely while nothing is playing, so it never
+            // busy-polls a zero sleep.
             _ = tokio::time::sleep(beat_wake.map(|t| t.saturating_duration_since(Instant::now())).unwrap_or_default()), if beat_wake.is_some() => {
                 if let Some(scheduled) = beat_wake {
                     beat_wake = Some(picker::rearm(scheduled, beat_tempo_bps));
@@ -1284,6 +1284,9 @@ async fn act(
             None => app.note("no context to read"),
         },
         Intent::NotYet(message) => app.note(message),
+        Intent::Unbound(code) => {
+            app.note(format!("Ctrl+A {} is not bound", crate::keys::key_label(code)))
+        }
         Intent::OpenLedger => open_ledger(bridge, app).await,
         Intent::Tab => {
             if app.compose.kj_typed().is_some() {
@@ -1292,9 +1295,6 @@ async fn act(
                 let tab = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Tab);
                 compose_key(bridge, app, tab).await?;
             }
-        Intent::Unbound(code) => {
-            app.note(format!("Ctrl+A {} is not bound", crate::keys::key_label(code)))
-        }
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
     }
@@ -2121,13 +2121,27 @@ fn apply_delivery(
                 }
                 app.apply_collapse_change(context_id, change);
             }
+            let mut hydrated = false;
             if let Some(view) = app.views.get_mut(&context_id) {
                 if let Err(e) = view.mirror.receive(delivery) {
                     tracing::warn!(context = %context_id.short(), error = %e, "mirror rejected a delivery");
                 }
                 view.seed_collapse();
+                hydrated = view.mirror.is_hydrated();
             }
-            reconcile_draft(app, context_id);
+            // While buffering (`ContextMirror::begin_rehydrate`), the
+            // mirror's draft text and version are frozen at the
+            // pre-reconnect state. That is harmless for the context already
+            // on screen — `Compose::reconcile` refuses a version older than
+            // its own `acked` — but `switch_seat`'s `read_input` resets
+            // `acked` to 0 when the player switches onto this context
+            // mid-round (`compose::Compose::load_draft`), so a stale
+            // reconcile here is no longer refused and would overwrite the
+            // freshly loaded draft with the frozen one. `land_rehydrate`
+            // reconciles again once the snapshot applies.
+            if hydrated {
+                reconcile_draft(app, context_id);
+            }
             app.observe_thinking(context_id, &touched);
         }
         FeedEvent::Resubscribed => return Rehydrate::Needed,
@@ -2197,25 +2211,11 @@ fn land_rehydrate(
     }
     match applied {
         Ok(()) => {
-            let mut hydrated = false;
+            reconcile_draft(app, context_id);
             // The feed only says `Resubscribed` on a new connection,
             // so the stream that clears a turn flag was broken. The
             // status watch coalesces, so a fast reconnect can leave
             // this the only sign: forget what this client believed
-                hydrated = view.mirror.is_hydrated();
-            }
-            // While buffering (`ContextMirror::begin_rehydrate`), the
-            // mirror's draft text and version are frozen at the
-            // pre-reconnect state. That is harmless for the context already
-            // on screen — `Compose::reconcile` refuses a version older than
-            // its own `acked` — but `switch_seat`'s `read_input` resets
-            // `acked` to 0 when the player switches onto this context
-            // mid-round (`compose::Compose::load_draft`), so a stale
-            // reconcile here is no longer refused and would overwrite the
-            // freshly loaded draft with the frozen one. `land_rehydrate`
-            // reconciles again once the snapshot applies.
-            if hydrated {
-                reconcile_draft(app, context_id);
             // was running rather than carry a flag nothing clears
             // (`docs/tui.md`, "Turn liveness is a partial signal").
             app.forget_turn_liveness();
@@ -2228,6 +2228,25 @@ fn land_rehydrate(
         }
         Err(e) => abandon_rehydrate(app, feeds, context_id, e),
     }
+    true
+}
+
+/// Give up on a context's rehydrate: a failed round trip
+/// ([`HydrateOutcome::Rebuilt`]'s own `Err`) or a snapshot that landed but
+/// would not apply ([`land_rehydrate`]'s `MirrorError`). Either way the
+/// mirror is stuck in the buffering mode `ContextMirror::begin_rehydrate`
+/// put it in with no round left in flight to end it, so retrying is not
+/// bounded (nothing here caps how many times a persistent failure would be
+/// retried) and waiting is not recoverable on its own — releasing is. The
+/// same recovery `FeedEvent::Terminated` already gives a feed that cannot
+/// continue: the next switch re-subscribes and hydrates from scratch.
+fn abandon_rehydrate(app: &mut App, feeds: &mut Feeds, context_id: ContextId, error: impl std::fmt::Display) {
+    feeds.stop(context_id);
+    app.release(context_id);
+    app.note(format!(
+        "{} could not finish reconnecting: {error}; Ctrl+A <digit> reattaches",
+        app.label_for(context_id)
+    ));
 }
 
 /// Draw the compose line from kernel state rather than from the local buffer
@@ -2268,25 +2287,6 @@ fn mark_activity(app: &mut App, event: &ServerEvent) -> bool {
 /// Take the screen for the session: raw mode, bracketed paste, the alternate
 /// screen, and one full-screen `Terminal` over it.
 ///
-    true
-}
-
-/// Give up on a context's rehydrate: a failed round trip
-/// ([`HydrateOutcome::Rebuilt`]'s own `Err`) or a snapshot that landed but
-/// would not apply ([`land_rehydrate`]'s `MirrorError`). Either way the
-/// mirror is stuck in the buffering mode `ContextMirror::begin_rehydrate`
-/// put it in with no round left in flight to end it, so retrying is not
-/// bounded (nothing here caps how many times a persistent failure would be
-/// retried) and waiting is not recoverable on its own — releasing is. The
-/// same recovery `FeedEvent::Terminated` already gives a feed that cannot
-/// continue: the next switch re-subscribes and hydrates from scratch.
-fn abandon_rehydrate(app: &mut App, feeds: &mut Feeds, context_id: ContextId, error: impl std::fmt::Display) {
-    feeds.stop(context_id);
-    app.release(context_id);
-    app.note(format!(
-        "{} could not finish reconnecting: {error}; Ctrl+A <digit> reattaches",
-        app.label_for(context_id)
-    ));
 /// One terminal for the whole session. A full-screen viewport is anchored to
 /// nothing, so no frame asks the terminal where the cursor is and a slow hop
 /// never stalls a redraw (`docs/tui.md`, "The owned screen").
@@ -3033,97 +3033,6 @@ mod tests {
         );
     }
 
-    /// A round that never answers — a panic, or a runtime going away —
-    /// would otherwise strand its ids in `Feeds::hydrating` for the session,
-    /// and a switch to one would wait on a round that ended. The guard
-    /// answers for every id it did not reach, which the loop's error arm
-    /// clears.
-    #[test]
-    fn a_dropped_hydrate_round_answers_every_id_it_did_not_reach() {
-        let (a, b) = (ContextId::new(), ContextId::new());
-        let (tx, mut rx) = mpsc::channel::<Hydrated>(8);
-        drop(HydrateGuard { remaining: vec![a, b], tx, wrap: fresh_failed });
-
-        let mut answered = Vec::new();
-        while let Ok((context_id, hydrated)) = rx.try_recv() {
-            assert!(
-                matches!(hydrated, HydrateOutcome::Fresh(Err(_))),
-                "an id the round did not reach is an error, not a mirror"
-            );
-            answered.push(context_id);
-        }
-        assert_eq!(answered, vec![a, b], "every outstanding id is answered");
-    }
-
-    /// An id whose own answer was already sent is not answered twice: the
-    /// round takes it off the guard as it goes.
-    #[test]
-    fn a_hydrate_round_never_answers_an_id_twice() {
-        let (a, b) = (ContextId::new(), ContextId::new());
-        let (tx, mut rx) = mpsc::channel::<Hydrated>(8);
-        let mut guard = HydrateGuard { remaining: vec![a, b], tx, wrap: fresh_failed };
-        guard.remaining.retain(|id| *id != a);
-        drop(guard);
-
-        let mut answered = Vec::new();
-        while let Ok((context_id, _)) = rx.try_recv() {
-            answered.push(context_id);
-        }
-        assert_eq!(answered, vec![b]);
-    }
-
-    /// A round takes on every hot context that is missing, not one of them:
-    /// two seats promoted between rounds both go resident on the next
-    /// round rather than over two of them (`docs/tui.md`, "The buffer").
-    #[test]
-    fn one_round_hydrates_every_missing_hot_context() {
-        let (seen, a, b) = (ContextId::new(), ContextId::new(), ContextId::new());
-        let mut app = App::new("amy");
-        watched(&mut app, seen);
-        app.switch_to(seen);
-        app.seats = vec![
-            kaijutsu_client::RankedSeat { context_id: a, band: kaijutsu_viz::layout::Band::Active },
-            kaijutsu_client::RankedSeat { context_id: b, band: kaijutsu_viz::layout::Band::Active },
-        ];
-
-        let round = hydrate_round(&app, &std::collections::HashSet::new());
-        assert_eq!(round, vec![a, b], "both new seats ride the same round");
-
-        // A context already in flight is never asked for twice: the actor
-        // keeps one feed sender per context and the second subscribe would
-        // orphan the receiver this client kept.
-        let in_flight = std::collections::HashSet::from([a]);
-        assert_eq!(hydrate_round(&app, &in_flight), vec![b]);
-        assert!(
-            hydrate_round(&app, &std::collections::HashSet::from([a, b])).is_empty(),
-            "nothing is asked for while the whole round is in flight"
-        );
-    }
-
-    /// The place the reader scrolled to belongs to the context, not to the
-    /// screen: switching away and back finds it where it was, and a context
-    /// at its tail is still at its tail (`docs/tui.md`, "The buffer").
-    ///
-    /// The page height fingerprints the view, so this reads the same
-    /// `Scrolled` back rather than merely some scrolled state.
-    #[test]
-    fn switching_seats_keeps_each_contexts_own_place() {
-        let (a, b) = (ContextId::new(), ContextId::new());
-        let mut app = App::new("amy");
-        watched(&mut app, a);
-        watched(&mut app, b);
-        app.switch_to(a);
-        assert!(app.set_scrolled(copy::Scrolled::entering(7)), "a is watched");
-
-        app.switch_to(b);
-        assert!(app.following(), "b opens on its own live tail");
-
-        app.switch_to(a);
-        assert_eq!(
-            app.scrolled().map(copy::Scrolled::page),
-            Some(7),
-            "a came back to the place the reader left it"
-        );
     /// `apply_feed` on `Resubscribed` only asks for a rehydrate
     /// ([`start_rehydrate`]) — it never awaits one. Entering a runtime
     /// without driving it (no `block_on`, no `#[tokio::test]`) proves the
@@ -3279,6 +3188,97 @@ mod tests {
         );
     }
 
+    /// A round that never answers — a panic, or a runtime going away —
+    /// would otherwise strand its ids in `Feeds::hydrating` for the session,
+    /// and a switch to one would wait on a round that ended. The guard
+    /// answers for every id it did not reach, which the loop's error arm
+    /// clears.
+    #[test]
+    fn a_dropped_hydrate_round_answers_every_id_it_did_not_reach() {
+        let (a, b) = (ContextId::new(), ContextId::new());
+        let (tx, mut rx) = mpsc::channel::<Hydrated>(8);
+        drop(HydrateGuard { remaining: vec![a, b], tx, wrap: fresh_failed });
+
+        let mut answered = Vec::new();
+        while let Ok((context_id, hydrated)) = rx.try_recv() {
+            assert!(
+                matches!(hydrated, HydrateOutcome::Fresh(Err(_))),
+                "an id the round did not reach is an error, not a mirror"
+            );
+            answered.push(context_id);
+        }
+        assert_eq!(answered, vec![a, b], "every outstanding id is answered");
+    }
+
+    /// An id whose own answer was already sent is not answered twice: the
+    /// round takes it off the guard as it goes.
+    #[test]
+    fn a_hydrate_round_never_answers_an_id_twice() {
+        let (a, b) = (ContextId::new(), ContextId::new());
+        let (tx, mut rx) = mpsc::channel::<Hydrated>(8);
+        let mut guard = HydrateGuard { remaining: vec![a, b], tx, wrap: fresh_failed };
+        guard.remaining.retain(|id| *id != a);
+        drop(guard);
+
+        let mut answered = Vec::new();
+        while let Ok((context_id, _)) = rx.try_recv() {
+            answered.push(context_id);
+        }
+        assert_eq!(answered, vec![b]);
+    }
+
+    /// A round takes on every hot context that is missing, not one of them:
+    /// two seats promoted between rounds both go resident on the next
+    /// round rather than over two of them (`docs/tui.md`, "The buffer").
+    #[test]
+    fn one_round_hydrates_every_missing_hot_context() {
+        let (seen, a, b) = (ContextId::new(), ContextId::new(), ContextId::new());
+        let mut app = App::new("amy");
+        watched(&mut app, seen);
+        app.switch_to(seen);
+        app.seats = vec![
+            kaijutsu_client::RankedSeat { context_id: a, band: kaijutsu_viz::layout::Band::Active },
+            kaijutsu_client::RankedSeat { context_id: b, band: kaijutsu_viz::layout::Band::Active },
+        ];
+
+        let round = hydrate_round(&app, &std::collections::HashSet::new());
+        assert_eq!(round, vec![a, b], "both new seats ride the same round");
+
+        // A context already in flight is never asked for twice: the actor
+        // keeps one feed sender per context and the second subscribe would
+        // orphan the receiver this client kept.
+        let in_flight = std::collections::HashSet::from([a]);
+        assert_eq!(hydrate_round(&app, &in_flight), vec![b]);
+        assert!(
+            hydrate_round(&app, &std::collections::HashSet::from([a, b])).is_empty(),
+            "nothing is asked for while the whole round is in flight"
+        );
+    }
+
+    /// The place the reader scrolled to belongs to the context, not to the
+    /// screen: switching away and back finds it where it was, and a context
+    /// at its tail is still at its tail (`docs/tui.md`, "The buffer").
+    ///
+    /// The page height fingerprints the view, so this reads the same
+    /// `Scrolled` back rather than merely some scrolled state.
+    #[test]
+    fn switching_seats_keeps_each_contexts_own_place() {
+        let (a, b) = (ContextId::new(), ContextId::new());
+        let mut app = App::new("amy");
+        watched(&mut app, a);
+        watched(&mut app, b);
+        app.switch_to(a);
+        assert!(app.set_scrolled(copy::Scrolled::entering(7)), "a is watched");
+
+        app.switch_to(b);
+        assert!(app.following(), "b opens on its own live tail");
+
+        app.switch_to(a);
+        assert_eq!(
+            app.scrolled().map(copy::Scrolled::page),
+            Some(7),
+            "a came back to the place the reader left it"
+        );
 
         app.switch_to(b);
         assert!(app.following(), "b never left its tail");
@@ -3341,40 +3341,6 @@ mod tests {
     /// round in `refresh::fetch`, the hot set's hydrate in `start_hydrate`
     /// — and land through a join arm. Inside the loop they would hold every
     /// key until a busy kernel answered (`docs/tui.md`, "Keys").
-    #[test]
-    fn the_event_loop_never_awaits_the_kernel_for_background_work() {
-        let source = include_str!("run.rs");
-        let start = source.find("async fn event_loop(").expect("event_loop is in run.rs");
-        let body = &source[start..];
-        let end = body.find("\n}\n").expect("event_loop ends");
-        let mut scanned = body[..end].to_string();
-        for helper in HELPERS {
-            scanned.push('\n');
-            scanned.push_str(function_body(source, helper));
-        }
-        for call in [
-            "list_contexts(",
-            "poll_new_asks(",
-            "list_tracks(",
-            "show_ask_detail(",
-            "hydrate_context(",
-        ] {
-            assert!(
-                !scanned.contains(call),
-                "`{call}` is awaited on the loop's feed-apply path; run it on its own task and \
-                 land the result through a join arm, so keys never queue behind the kernel"
-            );
-        }
-    }
-
-    #[test]
-    fn an_unrelated_event_carries_no_turn_liveness_either() {
-        let id = ContextId::new();
-        let mut app = App::new("amy");
-        let event = ServerEvent::ContextSwitched { context_id: id };
-        assert!(!mark_turn_liveness(&mut app, &event));
-    }
-}
     ///
     /// A violation can hide one hop down: `event_loop`'s own text calls
     /// `apply_feed` (in the `feed_rx` arm), and `apply_feed` is where a
@@ -3393,9 +3359,35 @@ mod tests {
     /// kernel call to `tokio::spawn`, so scanning their bodies would flag
     /// the exact off-loop pattern this test exists to require. Add a name to
     /// `HELPERS` when the feed-apply chain grows another synchronous hop.
+    #[test]
+    fn the_event_loop_never_awaits_the_kernel_for_background_work() {
         const HELPERS: &[&str] = &["apply_feed", "apply_delivery", "land_rehydrate"];
 
+        let source = include_str!("run.rs");
+        let start = source.find("async fn event_loop(").expect("event_loop is in run.rs");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("event_loop ends");
+        let mut scanned = body[..end].to_string();
+        for helper in HELPERS {
+            scanned.push('\n');
+            scanned.push_str(function_body(source, helper));
+        }
+        for call in [
+            "list_contexts(",
+            "poll_new_asks(",
+            "list_tracks(",
+            "show_ask_detail(",
             "rehydrate_context(",
+            "hydrate_context(",
+        ] {
+            assert!(
+                !scanned.contains(call),
+                "`{call}` is awaited on the loop's feed-apply path; run it on its own task and \
+                 land the result through a join arm, so keys never queue behind the kernel"
+            );
+        }
+    }
+
     /// The literal source of a top-level `fn name(` or `async fn name(` in
     /// `run.rs`: from the `fn` keyword to its closing brace at column zero —
     /// the same heuristic [`the_event_loop_never_awaits_the_kernel_for_background_work`]
@@ -3416,6 +3408,13 @@ mod tests {
         &body[..end]
     }
 
+    #[test]
+    fn an_unrelated_event_carries_no_turn_liveness_either() {
+        let id = ContextId::new();
+        let mut app = App::new("amy");
+        let event = ServerEvent::ContextSwitched { context_id: id };
+        assert!(!mark_turn_liveness(&mut app, &event));
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // The panic hook (docs/tui.md, "Every way out restores the terminal")
@@ -3472,3 +3471,4 @@ mod tests {
             "no recorded loop thread means the hook cannot tell, so it must not restore"
         );
     }
+}
