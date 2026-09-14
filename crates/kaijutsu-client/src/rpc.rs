@@ -1327,8 +1327,10 @@ impl KernelHandle {
     /// [`ContextMirror`](crate::ContextMirror) sort out the overlap — fetching
     /// first loses whatever lands in the gap.
     ///
-    /// The feed ends when the observer capability is dropped; there is no
-    /// unsubscribe call.
+    /// The feed ends when the observer capability is dropped. This wire call
+    /// carries no unsubscribe of its own; a caller done with a context's feed
+    /// uses `ActorHandle::unsubscribe_context` instead, which stops the actor
+    /// from re-issuing this call for that context on the next reconnect.
     #[tracing::instrument(skip(self, observer), name = "rpc_client.subscribe_context")]
     pub async fn subscribe_context(
         &self,

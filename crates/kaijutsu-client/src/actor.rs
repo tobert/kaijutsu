@@ -465,6 +465,14 @@ enum RpcCommand {
         sender: mpsc::Sender<crate::context_feed::FeedEvent>,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    /// Stop following one context's change feed — the intent half of
+    /// [`ActorHandle::unsubscribe_context`]. Removes the entry from
+    /// `context_feeds` so a later reconnect's `resubscribe_context_feeds`
+    /// no longer walks it.
+    UnsubscribeContext {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
     /// Same query, but keeping the context version the blocks were read at —
     /// the snapshot half of the change feed's recovery protocol
     /// (docs/change-feed.md rules 21-26).
@@ -818,6 +826,7 @@ impl RpcCommand {
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocksVersioned { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubscribeContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::UnsubscribeContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextVersion { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::TurnInFlight { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CompactContext { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1344,6 +1353,29 @@ impl ActorHandle {
         })
         .await?;
         Ok(receiver)
+    }
+
+    /// Stop following one context's change feed.
+    ///
+    /// Call this once a caller is done with a context's feed — releasing it
+    /// from a hot set, for instance. A receiver still held past this call
+    /// simply stops receiving: nothing more will arrive on it, and it is not
+    /// woken or closed, so a caller must drop it too.
+    ///
+    /// Fire-and-forget and non-async on purpose: it only removes this
+    /// context's entry from the actor's own `context_feeds` map, no wire
+    /// call involved, so a caller on a latency-sensitive path (an event
+    /// loop, say) can call it without awaiting anything. `try_send` mirrors
+    /// `close_tx`'s best-effort sends elsewhere in this module — a full or
+    /// closed channel means the actor is already shutting down, and the
+    /// cleanup this call performs no longer matters.
+    pub fn unsubscribe_context(&self, context_id: ContextId) {
+        let (reply, _rx) = oneshot::channel();
+        let cmd = ChannelCmd {
+            command: RpcCommand::UnsubscribeContext { context_id, reply },
+            span: tracing::Span::current(),
+        };
+        let _ = self.tx.try_send(cmd);
     }
 
     /// Query blocks and keep the version they were read at, atomically.
@@ -2759,6 +2791,10 @@ impl RpcActor {
                 self.issue_context_feed(context_id, sender, false);
                 let _ = reply.send(Ok(()));
             }
+            RpcCommand::UnsubscribeContext { context_id, reply } => {
+                self.unsubscribe_context_feed(context_id);
+                let _ = reply.send(Ok(()));
+            }
             RpcCommand::ResubscribeBlocks { reply } => {
                 // Inline: uses the live connection's kernel via the actor's
                 // own scoped re-subscribe helper. Fire-and-forget on the wire;
@@ -2934,6 +2970,21 @@ impl RpcActor {
         for (context_id, sender) in &self.context_feeds {
             self.issue_context_feed(*context_id, sender.clone(), true);
         }
+    }
+
+    /// Drop one context's feed intent (`RpcCommand::UnsubscribeContext`).
+    ///
+    /// This is the only place `context_feeds` loses an entry. Nothing else
+    /// writes the map after this runs for `context_id`: `issue_context_feed`
+    /// never touches `context_feeds` (it only holds the `Sender` its caller
+    /// handed it), and `resubscribe_context_feeds` only reads it — so a task
+    /// that `issue_context_feed` spawned before this call cannot race the
+    /// removal back open. Such a task keeps pumping its own clone of the
+    /// sender until the consumer drops the matching receiver, at which point
+    /// its `sender.send` fails and it exits on its own, dropping the
+    /// observer capability the way any released feed does.
+    fn unsubscribe_context_feed(&mut self, context_id: ContextId) {
+        self.context_feeds.remove(&context_id);
     }
 
     /// (Re)issue the block-events subscription on the live connection, scoped
@@ -4051,6 +4102,14 @@ async fn dispatch_kernel_command(
             )));
         }
 
+        // ── UnsubscribeContext handled inline by RpcActor::dispatch (mutates
+        //    context_feeds, which this dispatcher never sees) ──
+        RpcCommand::UnsubscribeContext { reply, .. } => {
+            let _ = reply.send(Err(CallError::Rpc(
+                "unsubscribe_context leaked into kernel dispatch (bug)".into(),
+            )));
+        }
+
         // ── ResubscribeBlocks handled inline by RpcActor::dispatch ──
         RpcCommand::ResubscribeBlocks { reply } => {
             let _ = reply.send(Err(CallError::Rpc(
@@ -4605,6 +4664,43 @@ mod tests {
         assert_eq!(actor.connection_epoch.load(Ordering::Acquire), 0);
         assert_eq!(actor.advance_connection_epoch(), 1);
         assert_eq!(actor.advance_connection_epoch(), 2);
+    }
+
+    /// A released context feed must actually leave `context_feeds`, or
+    /// `resubscribe_context_feeds` walks it into the next reconnect and
+    /// re-issues a subscribe whose receiver nobody holds
+    /// (docs/issues.md, "ActorHandle has no unsubscribe_context"). The
+    /// removal must also be surgical: unsubscribing one context must not
+    /// touch another's live feed.
+    #[test]
+    fn unsubscribing_a_context_removes_its_feed_before_the_next_reconnect_replay() {
+        let mut actor = test_actor();
+        let released = ContextId::new();
+        let kept = ContextId::new();
+        let (released_tx, _released_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+        let (kept_tx, _kept_rx) = mpsc::channel(CONTEXT_FEED_QUEUE);
+        actor.context_feeds.insert(released, released_tx);
+        actor.context_feeds.insert(kept, kept_tx);
+
+        actor.unsubscribe_context_feed(released);
+
+        assert!(
+            !actor.context_feeds.contains_key(&released),
+            "unsubscribe must remove the entry, or the next reconnect's \
+             resubscribe_context_feeds would replay it and re-issue a dead \
+             subscribe"
+        );
+        assert!(
+            actor.context_feeds.contains_key(&kept),
+            "unsubscribe must be surgical: another context's feed must survive"
+        );
+
+        // Trigger the reconnect replay itself. `test_actor()` has no live
+        // connection, so `issue_context_feed` no-ops for any entry it would
+        // still find — but the removed context is no longer even a
+        // candidate: the loop only ever visits what's left in the map.
+        actor.resubscribe_context_feeds();
+        assert!(!actor.context_feeds.contains_key(&released));
     }
 
     /// Regression test for the backoff reset bug: `finish_closing` used to
