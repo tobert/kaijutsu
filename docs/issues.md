@@ -6,6 +6,46 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
+
+Read by the lead; each line re-checked before it went here.
+
+- **Kernel boot runs rc on a default tokio worker stack.** `create_shared_kernel`
+  runs the ROOT genesis `create` rc chain on the `#[tokio::main]` runtime
+  (`crates/kaijutsu-server/src/main.rs`, `rpc.rs` `create_shared_kernel`),
+  which reserves no `KAISH_RC_THREAD_STACK`. Same class as the turn-driver
+  abort fixed in abcfb568; inferred from the code, not reproduced. Fix:
+  `Builder::worker_thread_stack_size(KAISH_RC_THREAD_STACK)` on the runtime,
+  or boot on a reserved thread, and a fifth entry in `rc_thread_stack_tests`.
+- **A registry rebuild rewinds every mock queue.** `Provider::from_backend`
+  re-reads `KJ_MOCK_SCRIPT_DIR` on every `build_llm_registry`, and `kj cast`,
+  `kj backend`, and `kj alias` writes rebuild it, so a mid-scenario write
+  replays consumed turns instead of panicking. `session_scenario.rs` survives
+  by ordering; say so in the file, or hold the queues outside the provider.
+- **Nothing parses the committed fixtures at unit speed.** The mock's unit
+  test serializes the same type it reads. A ten-line test that
+  `serde_json::from_str`s `tests/mock_scripts/*.json` as `Vec<Vec<StreamEvent>>`
+  catches a shape drift before the e2e's 30 s timeout does.
+- **A mock script panic surfaces as a timeout.** The panic happens inside
+  the spawned `process_llm_stream` task, so no `TurnFlow::Failed` is
+  published; the scenario reports "timed out waiting for a turn event". A
+  `Result` from `stream()` would reach the turn's own error path.
+- **Drift and fork stamp the requester; block and handoff stamp the
+  performer.** `kj drift push|pull|merge` and `kj fork` author with
+  `caller.principal_id` on purpose ("the caller is the sender",
+  `kj/drift.rs:196-211`, `kj/fork.rs:901`), so a coder lane's report drift
+  lands in banto's seat authored by amy, the connection that started the
+  session. The scenario asserts the drift's kind and text, not its author.
+  Amy decides which rule drift follows; if performer, the sites are
+  `drift.rs:209,372,429,513,636` and `fork.rs:748,923,1319`.
+- **`kj handoff tail <other>` refuses a reader with no sheet** because the
+  caller is resolved before the target is chosen (`kj/handoff.rs:250-253`).
+  Resolve the caller only on the no-target branch.
+- Stale comments: `llm/mod.rs:470-476` says the mock refuses streaming;
+  `kj/handoff.rs:17,274` point at a `READ_ONLY_TABLE` that no longer exists.
+- The scenario's `#[test]` count of one is load-bearing: the env var is set
+  and never restored. A `Drop` guard makes that structural.
+
 ## Roots, the accountability chain, and rotation (Amy, 2026-09-15)
 
 Guidance in `docs/character.md`, "Roots and rotation", and
