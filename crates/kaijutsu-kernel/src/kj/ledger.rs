@@ -382,9 +382,11 @@ enum LedgerCommand {
     Escalate {
         /// The ask to reassign.
         request_id: String,
-        /// The live character who will review the ask next.
+        /// The live character who will review the ask next. Defaults to the
+        /// first live character above the ask's current reviewer in its
+        /// accountable_to chain; refuses if the current reviewer is a root.
         #[arg(long)]
-        to: String,
+        to: Option<String>,
     },
     /// List the gate rules in force for this context: standing rules a
     /// human taught (exact-text and family, newest first, capped at
@@ -560,7 +562,7 @@ impl KjDispatcher {
                 self.ledger_decide(&request_id, false, caller, remember, family)
             }
             LedgerCommand::Cancel { request_id } => self.ledger_cancel(&request_id, caller),
-            LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, &to, caller).await,
+            LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, to.as_deref(), caller).await,
             LedgerCommand::Delegation { command } => self.ledger_delegation(command, caller).await,
             LedgerCommand::Rules { limit, since } => {
                 self.ledger_rules(limit, since.as_deref(), caller).await
@@ -1022,7 +1024,11 @@ impl KjDispatcher {
         }
     }
 
-    async fn ledger_escalate(&self, request_id: &str, to: &str, caller: &KjCaller) -> KjResult {
+    /// `to` names the next reviewer explicitly; omitted, it defaults to the
+    /// first live character above the ask's CURRENT reviewer in its
+    /// `accountable_to` chain (`docs/character.md`, "Roots and rotation").
+    /// Refuses at a root — there is nothing above it to default to.
+    async fn ledger_escalate(&self, request_id: &str, to: Option<&str>, caller: &KjCaller) -> KjResult {
         if let Err(error) = self.kernel().default_approval_reviewer().await {
             tracing::warn!(%error, "default review authority unavailable; only the assigned reviewer may escalate");
         }
@@ -1042,28 +1048,56 @@ impl KjDispatcher {
                 Ok(authority) => authority,
                 Err(error) => return KjResult::Err(format!("kj ledger: could not resolve current authority: {error}")),
             };
-            let target = match db.get_character_by_name(to) {
-                Ok(Some(character)) if character.retired_at.is_none() => character.principal_id,
-                Ok(Some(_)) => return KjResult::Err(format!("kj ledger: character '{to}' is retired")),
-                Ok(None) => return KjResult::Err(format!("kj ledger: no character named '{to}'")),
-                Err(e) => return KjResult::Err(format!("kj ledger: could not resolve character '{to}': {e}")),
+            let (target, target_name) = match to {
+                Some(name) => match db.get_character_by_name(name) {
+                    Ok(Some(character)) if character.retired_at.is_none() => (character.principal_id, character.name),
+                    Ok(Some(_)) => return KjResult::Err(format!("kj ledger: character '{name}' is retired")),
+                    Ok(None) => return KjResult::Err(format!("kj ledger: no character named '{name}'")),
+                    Err(e) => return KjResult::Err(format!("kj ledger: could not resolve character '{name}': {e}")),
+                },
+                None => {
+                    let row = match db.get_approval(request_id) {
+                        Ok(Some(row)) => row,
+                        Ok(None) => return KjResult::Err(format!("kj ledger: no such ask '{request_id}'")),
+                        Err(e) => return KjResult::Err(format!("kj ledger: could not read ask '{request_id}': {e}")),
+                    };
+                    let current_reviewer = match row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice) {
+                        Some(id) => id,
+                        None => return KjResult::Err(format!("kj ledger: ask '{request_id}' has no current reviewer to escalate above")),
+                    };
+                    let current_name = db.get_character(current_reviewer).ok().flatten()
+                        .map(|character| character.name)
+                        .unwrap_or_else(|| current_reviewer.to_string());
+                    match db.nearest_live_accountable_to(current_reviewer) {
+                        Ok(Some(parent)) => match db.get_character(parent) {
+                            Ok(Some(character)) => (character.principal_id, character.name),
+                            Ok(None) | Err(_) => return KjResult::Err(format!(
+                                "kj ledger: could not resolve {current_name}'s accountable_to target"
+                            )),
+                        },
+                        Ok(None) => return KjResult::Err(format!(
+                            "kj ledger: {current_name} is at the root; nobody above {current_name}"
+                        )),
+                        Err(e) => return KjResult::Err(format!("kj ledger: could not read accountability chain: {e}")),
+                    }
+                }
             };
             approval_ledger::decide::escalate_with_authority(
                 db.conn_for_ledger(), request_id, caller.actor_id.as_bytes(), target.as_bytes(),
                 default_authority.as_ref().map(|authority| authority.as_bytes().as_slice()),
-            )
+            ).map(|row| (row, target_name))
         };
         match result {
-            Ok(row) => {
+            Ok((row, target_name)) => {
                 record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
                 tracing::info!("approval ask escalated");
                 crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
                 KjResult::ok_with_data(
-                    format!("escalated ask {request_id} to {to}"),
+                    format!("escalated ask {request_id} to {target_name}"),
                     serde_json::json!({
                         "request_id": row.request_id,
                         "reviewer_id": row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
-                        "reviewer_name": to,
+                        "reviewer_name": target_name,
                     }),
                 )
             }
@@ -4161,6 +4195,54 @@ mod tests {
         assert!(result.is_ok(), "{}", result.message());
         let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
         assert_eq!(row.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
+    }
+
+    /// Omitting `--to` escalates to the first live character above the
+    /// ask's CURRENT reviewer in its `accountable_to` chain.
+    #[tokio::test]
+    async fn ledger_escalate_without_to_defaults_to_the_next_live_character_above_the_current_reviewer() {
+        let d = test_dispatcher().await;
+        let banto = PrincipalId::new();
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let caller = crate::kj::test_helpers::registered_caller(&d);
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+            db.update_character_accountable_to(banto, Some(amy)).unwrap();
+            db.update_context_review(caller.context_id.unwrap(), None, Some(banto)).unwrap();
+        }
+        let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
+        let reviewer = caller.with_actor(banto, Some(banto));
+        let result = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone()], &reviewer).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
+        assert_eq!(row.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
+    }
+
+    /// Omitting `--to` when the ask's current reviewer is a root (no
+    /// `accountable_to`) refuses, naming the root, instead of guessing a
+    /// target or falling back to the configured default.
+    #[tokio::test]
+    async fn ledger_escalate_without_to_refuses_at_a_root() {
+        let d = test_dispatcher().await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let caller = crate::kj::test_helpers::registered_caller(&d);
+        {
+            let db = d.kernel_db().lock();
+            db.update_context_review(caller.context_id.unwrap(), None, Some(amy)).unwrap();
+        }
+        let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
+        let reviewer = caller.with_actor(amy, Some(amy));
+        let result = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone()], &reviewer).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("at the root"), "{}", result.message());
+        let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
+        assert_eq!(
+            row.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()),
+            "a refused escalate must not change the ask's reviewer",
+        );
     }
 
     /// AGENTS.md "Writing style" → "Published text": help is a product

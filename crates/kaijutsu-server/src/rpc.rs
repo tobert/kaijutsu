@@ -10013,6 +10013,27 @@ async fn context_reviewer(
     }
 }
 
+/// Like [`context_reviewer`], but resolves for `actor` explicitly rather
+/// than the context's own configured performer. A human's direct shell
+/// command needs the CONNECTED human's identity walked up the
+/// accountability chain, not the context's `played_by` — otherwise a
+/// context with no performer set skips the chain layer entirely and falls
+/// straight to the default reviewer, which can equal the connected human
+/// (`docs/approval-identity.md`, "Three identities").
+async fn context_reviewer_for(
+    kernel: &SharedKernelState,
+    context_id: ContextId,
+    actor: PrincipalId,
+) -> Option<PrincipalId> {
+    match kernel.kernel.resolve_context_review_for(context_id, actor).await {
+        Ok(review) => Some(review.reviewer.principal_id),
+        Err(error) => {
+            log::warn!("approval reviewer unavailable for direct RPC in {context_id}: {error}");
+            None
+        }
+    }
+}
+
 /// Validate and persist a durable cwd through the same backend used by `cd`.
 /// `Ok(Err(message))` is a normal validation refusal for the wire result;
 /// outer errors mean the operation itself could not be performed.
@@ -10256,7 +10277,7 @@ async fn execute_shell_command(
         context_id,
         connection.borrow().session_id,
         kernel.id,
-    ).with_actor(user_principal_id, context_reviewer(kernel, context_id).await);
+    ).with_actor(user_principal_id, context_reviewer_for(kernel, context_id, user_principal_id).await);
     match kernel_arc.broker().shell_pre_call_hooks(code, &call_ctx).await {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {

@@ -206,6 +206,20 @@ impl ContextRow {
 /// layout seats).
 pub const ACTIVE_RING_CAPACITY: i64 = kaijutsu_types::RING_SLOTS as i64;
 
+/// Outcome of [`KernelDb::effective_approval_reviewer`]. Distinct from a
+/// `KernelDbResult` error: an exhausted chain for a root actor is an
+/// expected terminal state, not a ledger fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveReviewer {
+    /// A live character, distinct from the acting one, reviews its work.
+    Assigned(PrincipalId),
+    /// Every resolution layer is exhausted for this actor: no explicit
+    /// override or delegation applies, it has no live `accountable_to`
+    /// parent, and the configured default either is unset or names the
+    /// actor itself. The actor is effectively a root for this context.
+    NoReviewer,
+}
+
 /// Outcome of one step on the demote ladder — see
 /// [`KernelDb::demote_context`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2061,20 +2075,57 @@ impl KernelDb {
         Ok(true)
     }
 
-    /// Resolve a context's reviewer while holding the ledger write domain.
-    pub fn effective_approval_reviewer(&self, context_id: ContextId) -> KernelDbResult<Option<PrincipalId>> {
-        let Some(row) = self.get_context(context_id)? else { return Ok(None) };
-        let reviewer = match row.reviewer_id {
-            Some(reviewer) => Some(reviewer),
-            None => match row.director_id {
-                Some(director) => self.active_approval_delegation(director)?,
-                None => None,
-            }.or(self.cached_default_approval_reviewer()?),
-        };
-        match reviewer {
-            Some(reviewer) if self.get_character(reviewer)?.is_some_and(|character| character.retired_at.is_none()) => Ok(Some(reviewer)),
-            Some(_) => Err(KernelDbError::Validation("effective approval reviewer is not a live character".into())),
-            None => Ok(None),
+    /// Resolve a context's reviewer while holding the ledger write domain,
+    /// for the character `actor` currently performing an invocation in it.
+    ///
+    /// Order: the context's explicit reviewer override, the director's
+    /// active delegation, the first live character above `actor` in its
+    /// `accountable_to` chain (`nearest_live_accountable_to`), then the
+    /// cached default reviewer. Explicit override and delegation are
+    /// resolved as configured even when they name `actor`: a director may
+    /// legitimately delegate review of its OTHER contexts to itself
+    /// (`kj ledger delegation grant banto --to banto`), and a self-review
+    /// specifically for `actor`'s own work is caught by the caller that
+    /// knows it is validating a performer assignment
+    /// (`validate_model_review_assignment`), not by this general-purpose
+    /// resolver. The chain layer cannot name `actor` at all:
+    /// `update_character_accountable_to` refuses a self-reference. Only the
+    /// default layer skips itself when it equals `actor` — an unrelated,
+    /// independently configured character sheet — and there is no layer
+    /// left after it: that exhaustion is [`EffectiveReviewer::NoReviewer`],
+    /// not an error. `actor` is a root for this context and its gated
+    /// statement has nobody above it to ask.
+    pub fn effective_approval_reviewer(&self, context_id: ContextId, actor: PrincipalId) -> KernelDbResult<EffectiveReviewer> {
+        let Some(row) = self.get_context(context_id)? else { return Ok(EffectiveReviewer::NoReviewer) };
+
+        if let Some(reviewer) = row.reviewer_id {
+            return self.live_approval_reviewer(reviewer).map(EffectiveReviewer::Assigned);
+        }
+
+        if let Some(director) = row.director_id {
+            if let Some(delegate) = self.active_approval_delegation(director)? {
+                return self.live_approval_reviewer(delegate).map(EffectiveReviewer::Assigned);
+            }
+        }
+
+        if let Some(parent) = self.nearest_live_accountable_to(actor)? {
+            return self.live_approval_reviewer(parent).map(EffectiveReviewer::Assigned);
+        }
+
+        match self.cached_default_approval_reviewer()? {
+            Some(default_reviewer) if default_reviewer != actor => {
+                self.live_approval_reviewer(default_reviewer).map(EffectiveReviewer::Assigned)
+            }
+            _ => Ok(EffectiveReviewer::NoReviewer),
+        }
+    }
+
+    /// Validate that `reviewer` names a live character sheet, the same check
+    /// every resolution layer needs before it can hand the id back.
+    fn live_approval_reviewer(&self, reviewer: PrincipalId) -> KernelDbResult<PrincipalId> {
+        match self.get_character(reviewer)? {
+            Some(character) if character.retired_at.is_none() => Ok(reviewer),
+            _ => Err(KernelDbError::Validation("effective approval reviewer is not a live character".into())),
         }
     }
 
@@ -2085,6 +2136,31 @@ impl KernelDb {
             params![blob_param(director.as_bytes())],
             |row| read_principal_id(row, 0),
         ).optional().map_err(Into::into)
+    }
+
+    /// The first live character directly above `actor` in its
+    /// `accountable_to` chain — one hop, not a multi-level walk: the write
+    /// path (`update_character_accountable_to`) refuses a self-reference and
+    /// a cycle, so `actor`'s own `accountable_to` target is already the
+    /// answer and can never be `actor` itself.
+    ///
+    /// Returns `Ok(None)` when `actor` has no character sheet or no
+    /// `accountable_to` (a root). Refuses, naming the retired character,
+    /// when the `accountable_to` target exists but is retired — the chain
+    /// does not skip past a retired link to keep walking.
+    pub fn nearest_live_accountable_to(&self, actor: PrincipalId) -> KernelDbResult<Option<PrincipalId>> {
+        let Some(actor_row) = self.get_character(actor)? else { return Ok(None) };
+        let Some(parent) = actor_row.accountable_to else { return Ok(None) };
+        match self.get_character(parent)? {
+            Some(parent_row) if parent_row.retired_at.is_none() => Ok(Some(parent)),
+            Some(parent_row) => Err(KernelDbError::Validation(format!(
+                "{} is retired; {}'s accountability chain cannot resolve through a retired character",
+                parent_row.name, actor_row.name
+            ))),
+            None => Err(KernelDbError::Validation(format!(
+                "accountable_to target {} has no character sheet", parent.short()
+            ))),
+        }
     }
 
     /// Grant or replace one director-wide reviewer delegation and record its actor.
@@ -10586,6 +10662,203 @@ mod tests {
         assert!(db.retire_character(root, 100).is_err());
         assert!(db.retire_character(dep, 150).unwrap());
         assert!(db.retire_character(root, 200).unwrap());
+    }
+
+    // ── 22d. reviewer resolution's chain layer ──────────────────────────
+
+    /// One hop up `accountable_to`: no sheet or no parent yields `None`; a
+    /// live parent yields `Some(parent)`; a retired parent refuses, naming
+    /// it, rather than skipping past it to keep walking.
+    #[test]
+    fn nearest_live_accountable_to_one_hop_and_retired_link_refuses() {
+        let db = KernelDb::temporary().unwrap();
+        let coder = PrincipalId::new();
+        let banto = PrincipalId::new();
+        for (id, name) in [(coder, "coder"), (banto, "banto")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id, name: name.to_string(), created_at: 0,
+                retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        assert_eq!(db.nearest_live_accountable_to(coder).unwrap(), None, "no accountable_to yet");
+        assert_eq!(db.nearest_live_accountable_to(PrincipalId::new()).unwrap(), None, "no character sheet at all");
+
+        db.update_character_accountable_to(coder, Some(banto)).unwrap();
+        assert_eq!(db.nearest_live_accountable_to(coder).unwrap(), Some(banto));
+
+        // Retiring banto through raw SQL, bypassing `retire_character`'s
+        // live-dependent guard, simulates a link the chain must still
+        // refuse rather than silently skip.
+        db.conn.execute(
+            "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1",
+            params![blob_param(banto.as_bytes())],
+        ).unwrap();
+        let error = db.nearest_live_accountable_to(coder).unwrap_err();
+        assert!(error.to_string().contains("banto"), "{error}");
+        assert!(error.to_string().contains("retired"), "{error}");
+    }
+
+    /// coder -> banto -> amy(root): a context with no explicit reviewer or
+    /// director resolves coder's ask to banto and banto's ask to amy; amy's
+    /// own ask — a root, and also the configured default — exhausts every
+    /// layer and yields `NoReviewer`, never amy herself.
+    #[test]
+    fn effective_approval_reviewer_chain_of_three_and_root_exhaustion() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let coder = PrincipalId::new();
+        let banto = PrincipalId::new();
+        let amy = PrincipalId::new();
+        for (id, name) in [(coder, "coder"), (banto, "banto"), (amy, "amy")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id, name: name.to_string(), created_at: 0,
+                retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        db.update_character_accountable_to(coder, Some(banto)).unwrap();
+        db.update_character_accountable_to(banto, Some(amy)).unwrap();
+        db.set_default_approval_reviewer(amy).unwrap();
+
+        let ctx = make_context_row(Some("chain-ctx"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        assert_eq!(
+            db.effective_approval_reviewer(ctx.context_id, coder).unwrap(),
+            EffectiveReviewer::Assigned(banto),
+            "coder's chain layer resolves to its direct accountable_to parent",
+        );
+        assert_eq!(
+            db.effective_approval_reviewer(ctx.context_id, banto).unwrap(),
+            EffectiveReviewer::Assigned(amy),
+        );
+        assert_eq!(
+            db.effective_approval_reviewer(ctx.context_id, amy).unwrap(),
+            EffectiveReviewer::NoReviewer,
+            "amy has no accountable_to parent and is also the configured default: every layer is exhausted",
+        );
+    }
+
+    /// A retired chain link surfaces through `effective_approval_reviewer`
+    /// the same way it does through the raw query: named, not skipped.
+    #[test]
+    fn effective_approval_reviewer_retired_chain_link_refuses_by_name() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let coder = PrincipalId::new();
+        let banto = PrincipalId::new();
+        for (id, name) in [(coder, "coder"), (banto, "banto")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id, name: name.to_string(), created_at: 0,
+                retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        db.update_character_accountable_to(coder, Some(banto)).unwrap();
+        db.conn.execute(
+            "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1",
+            params![blob_param(banto.as_bytes())],
+        ).unwrap();
+
+        let ctx = make_context_row(Some("retired-link-ctx"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let error = db.effective_approval_reviewer(ctx.context_id, coder).unwrap_err();
+        assert!(error.to_string().contains("banto"), "{error}");
+        assert!(error.to_string().contains("retired"), "{error}");
+    }
+
+    /// An explicit reviewer override still wins over a live chain parent.
+    #[test]
+    fn effective_approval_reviewer_explicit_override_wins_over_chain() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let coder = PrincipalId::new();
+        let banto = PrincipalId::new();
+        let judge = PrincipalId::new();
+        for (id, name) in [(coder, "coder"), (banto, "banto"), (judge, "judge")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id, name: name.to_string(), created_at: 0,
+                retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        db.update_character_accountable_to(coder, Some(banto)).unwrap();
+
+        let mut ctx = make_context_row(Some("explicit-ctx"));
+        ctx.reviewer_id = Some(judge);
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        assert_eq!(
+            db.effective_approval_reviewer(ctx.context_id, coder).unwrap(),
+            EffectiveReviewer::Assigned(judge),
+            "an explicit override wins even though banto is live above coder",
+        );
+    }
+
+    /// The director's active delegation still wins over the director's own
+    /// chain parent.
+    #[test]
+    fn effective_approval_reviewer_delegation_wins_over_chain() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let coder = PrincipalId::new();
+        let lead = PrincipalId::new();
+        let banto = PrincipalId::new();
+        let judge = PrincipalId::new();
+        let amy = PrincipalId::new();
+        for (id, name) in [(coder, "coder"), (lead, "lead"), (banto, "banto"), (judge, "judge"), (amy, "amy")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id, name: name.to_string(), created_at: 0,
+                retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        db.update_character_accountable_to(coder, Some(banto)).unwrap();
+        db.grant_approval_delegation(lead, judge, amy).unwrap();
+
+        let mut ctx = make_context_row(Some("delegation-ctx"));
+        ctx.director_id = Some(lead);
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        assert_eq!(
+            db.effective_approval_reviewer(ctx.context_id, coder).unwrap(),
+            EffectiveReviewer::Assigned(judge),
+            "the director's delegation wins over coder's own chain",
+        );
+    }
+
+    /// An explicit override or delegation resolves as configured even when
+    /// it names `actor` — a director may legitimately delegate review of
+    /// its OTHER contexts to itself, and self-review specifically is a
+    /// separate, caller-side check (`validate_model_review_assignment`,
+    /// `kj/context.rs`'s commit-time comparison), not this resolver's job.
+    /// Only the default layer (the one layer unrelated to `actor`'s own
+    /// configuration) skips itself on a match.
+    #[test]
+    fn effective_approval_reviewer_explicit_and_delegation_resolve_even_naming_the_actor() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let coder = PrincipalId::new();
+        let amy = PrincipalId::new();
+        for (id, name) in [(coder, "coder"), (amy, "amy")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id, name: name.to_string(), created_at: 0,
+                retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        let mut explicit_ctx = make_context_row(Some("self-explicit-ctx"));
+        explicit_ctx.reviewer_id = Some(coder);
+        insert_context_with_doc(&db, &explicit_ctx, ws_id);
+        assert_eq!(
+            db.effective_approval_reviewer(explicit_ctx.context_id, coder).unwrap(),
+            EffectiveReviewer::Assigned(coder),
+        );
+
+        db.grant_approval_delegation(coder, coder, amy).unwrap();
+        let mut delegation_ctx = make_context_row(Some("self-delegation-ctx"));
+        delegation_ctx.director_id = Some(coder);
+        insert_context_with_doc(&db, &delegation_ctx, ws_id);
+        assert_eq!(
+            db.effective_approval_reviewer(delegation_ctx.context_id, coder).unwrap(),
+            EffectiveReviewer::Assigned(coder),
+        );
     }
 
     /// `contexts_played_by` returns only the LIVE contexts a principal

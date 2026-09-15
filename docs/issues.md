@@ -31,43 +31,67 @@ Read by the lead; each line re-checked before it went here.
 - The scenario's `#[test]` count of one is load-bearing: the env var is set
   and never restored. A `Drop` guard makes that structural.
 
+## After slice 1 of the chain: three things it surfaced (2026-09-15)
+
+- **A director cannot cast performers on the contexts it directs.**
+  `caller_may_assign_performer` (`kj/context.rs`) asks whether the caller
+  is the target's resolved reviewer; the chain answers who reviews the
+  DIRECTOR's own work, its parent, so banto still cannot `kj context set
+  lane-a --as coder-a` for a lane it forked, and amy assigns every lane's
+  performer in the session scenario. Amy said "banto can answer for its
+  children"; whether that extends to casting a character accountable to
+  banto into a context banto directs is her call. If yes: allow the
+  assignment when the target's director is the caller and the performer's
+  chain reaches the caller. Test pinned in `kj/context.rs`,
+  `a_directors_accountable_to_parent_does_not_grant_it_authority_over_its_directed_contexts`.
+- **An explicit reviewer can still equal a direct human actor.** The
+  resolver returns an explicit override or delegation as configured even
+  when it names the actor, because a director legitimately delegates
+  review of the contexts it directs to itself and the strict
+  performer-versus-reviewer check lives at assignment. A human who sets
+  themselves as a context's explicit reviewer and then runs a gated
+  command there directly gets an unanswerable ask. Belongs to slice 2
+  with the root self-confirmation.
+- **`kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
+  is flaky under the parallel test runner** and passes single-threaded;
+  pre-existing, reproduced with slice 1 stashed.
+
 ## Roots, the accountability chain, and rotation (Amy, 2026-09-15)
 
 Guidance in `docs/character.md`, "Roots and rotation", and
 `docs/approval-identity.md`, "Planned: the accountability chain". Queued in
 build order; each slice leaves the tree green.
 
-1. **Reviewer resolution takes the actor and walks `accountable_to`.**
-   `effective_approval_reviewer` and `resolve_review_assignment` gain the
-   actor and the chain layer (override, delegation, chain, default) and
-   never return the actor. Tests: a delegated reviewer acting with its own
-   credential gets its own root as reviewer; a chain of three resolves to
-   the nearest live one; a retired link is skipped or refused (decide which
-   and pin it).
-2. **A root confirms itself.** When resolution finds no reviewer for a root
+Slice 1 (reviewer resolution takes the actor and walks `accountable_to`)
+shipped: `effective_approval_reviewer` and `resolve_review_assignment` gain
+the actor and the chain layer (override, delegation, chain, default). The
+gate's ask-raising resolver never returns the actor; a retired chain link
+refuses, naming it, rather than being skipped or silently substituted.
+
+1. **A root confirms itself.** When resolution finds no reviewer for a root
    actor, the gate returns an in-band confirmation instead of creating an
    ask, and the ledger records a self-confirmation. `user_input_identity.rs`'s
    fourth test flips to the new behavior. Escalate refuses at a root.
-3. **A root character has no model.** `turn_identity::resolve` refuses a
+2. **A root character has no model.** `turn_identity::resolve` refuses a
    performer with `accountable_to = NULL` and names the rule; `kj character
    set --root` on a character with a cast, or a cast on a root, refuses.
-4. **`ROOT` is reserved and single.** One reserved-names set (`ROOT`, the
+3. **`ROOT` is reserved and single.** One reserved-names set (`ROOT`, the
    drift queue, factory preset labels); `ROOT` claimed once per kernel like
    the drift queue; it must be played by a root character. Move the label
    from banto's seat to Amy's root context; banto's seat is labeled `banto`.
-5. **`root_ctx` on the sheet, with rotation as its reader.** `kj context
+4. **`root_ctx` on the sheet, with rotation as its reader.** `kj context
    rotate <character>` (or `create --rotate`): reads the predecessor from the
    sheet, sets `ROTATED_FROM`, mints the successor with the same type and
    cast and performer, moves the pointer, archives the predecessor, one
    transaction. Label follows the live holder. `docs/prompts.md`, "Rotating
    a director context" changes to the verb.
-6. **`create --as` asks instead of refusing.** Apply the held patch
+5. **`create --as` asks instead of refusing.** Apply the held patch
    (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
    then turn its refusal into an ask to the actor's reviewer, and accept a
    redeemed approval for the exact statement as authority. A static allow
    rule for a well-formed self-rotation is a policy entry, added when Amy
    wants rotation unattended.
-7. **banto from `ROOT`.** Seed: `amy` root, `banto` accountable to amy,
+6. **banto from `ROOT`.** Seed: `amy` root, `banto` accountable to amy,
    banto's seat created from the root context. A migration note for the
    live kernel, since `ROOT` is banto's today.
 

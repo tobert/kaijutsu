@@ -38,7 +38,7 @@ use kaijutsu_client::{KeySource};
 use kaijutsu_kernel::kernel_db::CharacterRow;
 use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
-use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, ContextId, PrincipalId, Role, Status};
+use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, ContextId, PrincipalId, RefusalKind, Role, Status};
 use russh::keys::{Algorithm, PrivateKey};
 
 /// Poll until `check` returns true, or fail loudly. A timeout here IS the
@@ -403,7 +403,6 @@ struct OneCredential {
     _client: RpcClient,
     kj: KernelHandle,
     server: SharedKernel,
-    principal: PrincipalId,
 }
 
 async fn one_credential(name: &str) -> OneCredential {
@@ -434,7 +433,7 @@ async fn one_credential(name: &str) -> OneCredential {
 
     let client = connect_with_key(addr, key, name).await;
     let (kj, _) = client.bind_kernel().await.unwrap();
-    OneCredential { _client: client, kj, server, principal }
+    OneCredential { _client: client, kj, server }
 }
 
 /// Find the block right after `command_block_id` — its `ToolResult` pair,
@@ -450,102 +449,50 @@ fn output_after(server: &SharedKernel, ctx: ContextId, command_block_id: &kaijut
         .expect("a ToolResult block immediately follows its ToolCall")
 }
 
-/// **4. THE OPEN QUESTION.** A human whose character is the context's
-/// resolved reviewer runs a gated shell command in that context. The
-/// context is created with no explicit reviewer override and no `played_by`
-/// — assets/defaults/approval.toml's shipped `default_reviewer = "amy"`
+/// **4. A root's own gated command refuses instead of raising an
+/// unanswerable ask.** A human whose character is a root (no
+/// `accountable_to`) runs a gated shell command in a context with no
+/// explicit reviewer override and no `played_by` —
+/// assets/defaults/approval.toml's shipped `default_reviewer = "amy"`
 /// resolves through the character sheet this test seeds at the connection's
-/// own principal, so amy the connection IS amy the default reviewer.
+/// own principal, so amy the connection IS amy the default reviewer, and
+/// amy has nobody above her in the accountability chain either.
 ///
-/// This pins what the code does TODAY: the ask is raised with
-/// `actor_id == reviewer_id` (both amy), and `ensure_not_self_approval`
-/// checks the performing actor before it ever checks who the reviewer is
-/// — so amy's own `kj ledger allow` is refused `self_approval`, not
-/// `unauthorized_reviewer`, and the ask is left `Pending` forever unless
-/// someone cancels or escalates it (`docs/approval-identity.md`,
-/// "Direct commands retain their connected actor... it cannot confirm its
-/// own ask: it can cancel it or explicitly reassign it").
+/// Before the accountability chain (slice 1 of `docs/issues.md`, "Roots,
+/// the accountability chain, and rotation"), reviewer resolution ignored
+/// the acting character entirely: the ask was raised with
+/// `actor_id == reviewer_id` (both amy) and left `Pending` forever, since
+/// `ensure_not_self_approval` refuses amy's own `kj ledger allow` on it and
+/// nobody else was assigned. Now resolution takes the actor, walks the
+/// chain, and the default layer skips itself when it would equal the
+/// actor — every layer for amy is exhausted
+/// (`kernel_db::EffectiveReviewer::NoReviewer`), so the gate refuses
+/// in-band instead of creating that unanswerable row.
 ///
-/// This is a doc comment about a state Amy has not decided on, not an
-/// endorsement of it. Alternatives she might choose instead: (a) refuse to
-/// raise the ask at all when actor and reviewer resolve identically,
-/// routing straight to escalation instead of a Pending ask nobody can
-/// answer; (b) auto-escalate such an ask to a distinct review authority at
-/// raise time; (c) leave it exactly as observed here, with the human
-/// expected to `kj ledger escalate` their own asks. If this test starts
-/// failing because that policy changed, that is progress, not a regression
-/// — update the assertions to match the new guidance.
+/// Slice 2 (not yet built) replaces this refusal with an in-band
+/// self-confirmation for a root actor — see `docs/approval-identity.md`,
+/// "Planned: the accountability chain". This test pins slice 1's interim
+/// behavior, not the final one.
 #[test]
 fn a_self_reviewing_human_raises_an_ask_it_cannot_answer_itself() {
     run_local(async {
         let amy = one_credential("amy").await;
-        // Two contexts: the ask is raised (and gated) in `work`, and the
-        // answer is attempted from `answer` — a context with no hook, so
-        // the attempt to decide is not itself intercepted by the same Ask
-        // hook. Eligibility to answer is the ask's snapped actor/reviewer,
-        // independent of which context the reviewer uses
-        // (`gate_executes_wire.rs`'s own comment on `Seats`).
         let work = amy.kj.create_context("amy-self-review-work").await.unwrap();
-        let answer = amy.kj.create_context("amy-self-review-answer").await.unwrap();
         amy.kj.join_context(work, "amy").await.unwrap();
-        amy.kj.join_context(answer, "amy").await.unwrap();
         install_ask_hook(&amy.server, work, "wire-amy-self-review").await;
 
         let refusal = match amy.kj.shell_execute("echo should-not-run", work, true).await {
             Err(RpcError::Refused(r)) => r,
-            other => panic!("expected a pending ask, got {other:?}"),
+            other => panic!("expected a gate-unavailable refusal, got {other:?}"),
         };
-        assert!(refusal.is_pending());
-        let ask_id = refusal.ask_id().expect("pending refusal names its ask").to_string();
+        assert_eq!(refusal.kind, RefusalKind::GateUnavailable);
+        assert!(!refusal.is_pending(), "a root's exhausted resolution is not an open question");
+        assert!(refusal.ask.is_none(), "no ask row is left behind for nobody to answer");
+        assert!(refusal.reason.contains("amy"), "expected the root named: {}", refusal.reason);
 
-        let row = amy
-            .server
-            .kernel_db
-            .lock()
-            .get_approval(&ask_id)
-            .unwrap()
-            .expect("the ask row");
-        assert_eq!(
-            row.actor_id.as_deref(),
-            Some(amy.principal.as_bytes().as_slice()),
-            "amy performed the gated command"
-        );
-        assert_eq!(
-            row.reviewer_id.as_deref(),
-            Some(amy.principal.as_bytes().as_slice()),
-            "the default reviewer resolves to amy too — actor == reviewer, observed"
-        );
-
-        // amy tries to answer her own ask, from the hook-free context — a
-        // wire-level `kj ledger allow`, exactly what a human types.
-        let command_block_id = amy
-            .kj
-            .shell_execute(&format!("kj ledger allow {ask_id}"), answer, true)
-            .await
-            .expect("the shell_execute call itself succeeds; the kj command is what fails");
-
-        wait_for("amy's self-approval attempt to settle", || {
-            output_after(&amy.server, answer, &command_block_id).status != Status::Running
-        })
-        .await;
-
-        let output = output_after(&amy.server, answer, &command_block_id);
-        assert_eq!(
-            output.status,
-            Status::Error,
-            "amy's attempt to approve her own ask must not succeed"
-        );
-        let stderr = output.stderr.clone().unwrap_or_default();
         assert!(
-            stderr.contains("cannot be approved by its performing actor"),
-            "expected the self_approval refusal text, got: {stderr:?}"
-        );
-
-        let row_after = amy.server.kernel_db.lock().get_approval(&ask_id).unwrap().unwrap();
-        assert_eq!(
-            row_after.status,
-            kaijutsu_kernel::ApprovalStatus::Pending,
-            "the ask is left pending — nobody answered it"
+            amy.server.kernel_db.lock().list_pending_asks().unwrap().is_empty(),
+            "the gate must not have raised a pending ask nobody can answer",
         );
     });
 }

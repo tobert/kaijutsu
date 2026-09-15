@@ -29,17 +29,13 @@
 //!   (`docs/prompts.md`, "Rotating a director context":
 //!   `kj context create <name>-next --type director --as <character> --env
 //!   'ROTATED_FROM=<name>'`), not a verb a model calls itself.
-//! - **Root self-confirmation** (same section, slice 2 — a root's gated
-//!   statement in-band-confirms instead of raising an ask) is also
-//!   guidance, not implemented. `docs/approval-identity.md`, "Planned: the
-//!   accountability chain" confirms today's gate still resolves a reviewer
-//!   from the context alone (explicit override → director delegation →
-//!   the configured default, `amy`), never by walking `accountable_to`. So
-//!   the ask this scenario raises resolves to `amy` by that *default* path,
-//!   not because she sits above banto in a chain the gate does not read yet
-//!   — the assertion below is written to move with the code once the chain
-//!   lands (see `docs/issues.md`, slice 1 of "Roots, the accountability
-//!   chain, and rotation").
+//! - **Root self-confirmation** (`docs/character.md`, "Roots and rotation",
+//!   slice 2 — a root's gated statement in-band-confirms instead of
+//!   raising an ask) is guidance, not implemented. Slice 1 (reviewer
+//!   resolution walks `accountable_to`) has landed: the ask this scenario
+//!   raises resolves to `amy` through the chain (banto's `accountable_to`),
+//!   not the configured default — see the assertion below and
+//!   `docs/issues.md`, "Roots, the accountability chain, and rotation".
 //! - **The coder lanes' own `context_type`.** `kj fork` always copies the
 //!   parent's `context_type` onto the child
 //!   (`crates/kaijutsu-kernel/src/kj/fork.rs:1649-1686`,
@@ -57,14 +53,17 @@
 //! - **A lane's own performer must be assigned by amy, not by banto's own
 //!   tool call.** `kj context set <ctx> --as <character>` refuses unless
 //!   the caller is the target's resolved reviewer
-//!   (`crates/kaijutsu-kernel/src/kj/context.rs:1670`), and a fork
+//!   (`crates/kaijutsu-kernel/src/kj/context.rs:1697`), and a fork
 //!   preserves the parent's `director_id`
 //!   (`docs/approval-identity.md`'s Current implementation table) — since
 //!   amy (not banto) created banto's own seat, she is the director every
-//!   lane banto forks inherits too, and today only she (or an explicit
-//!   delegate) can assign their performers. `docs/character.md`'s "Roots
-//!   and rotation" accountability chain, once implemented, is what would
-//!   let banto do this itself.
+//!   lane banto forks inherits too. The accountability chain does not
+//!   change who may pass this check: a lane's own chain (walked from
+//!   whichever actor is doing the assigning) resolves to amy — banto's
+//!   parent — not to banto itself, so only amy (or an explicit delegate)
+//!   can assign a lane's performer today. `docs/character.md`'s "Roots and
+//!   rotation" slice 6 (`create --as` raising an ask instead of refusing)
+//!   is what would let banto do this itself.
 //! - **Two defects this scenario found**, fixed the same day and pinned
 //!   here: the `"turn-driver"` thread now reserves `KAISH_RC_THREAD_STACK`
 //!   (`crates/kaijutsu-server/src/rpc.rs`, `spawn_turn_driver`), and
@@ -555,9 +554,10 @@ fn kaijutsu_session_scenario() {
         assert_eq!(
             ask.reviewer_id.as_deref(),
             Some(amy_principal_id.as_bytes().as_slice()),
-            "the ask's reviewer resolves to amy — today's configured default \
-             (docs/approval-identity.md's accountability chain is not implemented \
-             yet; see this file's module doc)"
+            "the ask's reviewer resolves to amy through the accountability \
+             chain (banto's own `accountable_to`), not the configured \
+             default — banto has no explicit reviewer or delegation here, \
+             so the chain layer is what resolves this, ahead of default"
         );
 
         // ------------------------------------------------------------

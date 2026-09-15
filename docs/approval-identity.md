@@ -27,11 +27,24 @@ metadata visible and reports a reviewer error when its assignment cannot
 resolve. Direct client commands remain available for inspection and repair;
 the gate still refuses an ask with no valid reviewer.
 
-Reviewer resolution follows this order:
+Reviewer resolution takes the acting character (the actor) and follows this
+order:
 
 1. Explicit reviewer override on the context.
 2. Explicit delegation for its director character.
-3. Configured default reviewer, Amy.
+3. The first live character above the actor in its `accountable_to` chain
+   (`docs/character.md`, "Roots and rotation").
+4. Configured default reviewer, Amy.
+
+The default layer skips itself when it would name the actor, since it is
+independently configured and unrelated to the actor's own assignment — the
+one layer where a match is coincidence, not intent. When every layer is
+exhausted for a root actor this way — no `accountable_to` parent, and the
+default either is unset or names the actor itself — the gate has nobody to
+raise the ask to. Today it refuses in-band, naming the root; a planned
+self-confirmation replaces that refusal (see below). Explicit override and
+delegation resolve as configured even when they name the actor; see
+"Current implementation" for why.
 
 Amy can delegate review across a director's coder contexts:
 
@@ -227,26 +240,36 @@ superseded request need explicit linkage so rotation does not duplicate work.
   Having no default expiry does not change those policies. Restart survival and
   rotation recovery need an explicit execution/recovery design before removal
   of those cleanup paths.
+- Reviewer resolution takes the actor and walks its `accountable_to` chain
+  as a layer between delegation and the configured default (guidance from
+  Amy, 2026-09-15; see `docs/character.md`, "Roots and rotation"). Explicit
+  override and delegation resolve as configured even when they name the
+  actor — a director may legitimately delegate review of its OTHER
+  contexts to itself (`kj ledger delegation grant banto --to banto`);
+  self-review specifically for the actor's own work is caught by the
+  caller that knows it is validating a performer assignment
+  (`validate_model_review_assignment`, and `kj context set`'s commit-time
+  check), not by the general-purpose resolver. The chain layer cannot name
+  the actor at all — `update_character_accountable_to` refuses a
+  self-reference. Only the default layer, unrelated to the actor's own
+  configuration, skips itself on a match instead of substituting the
+  actor. A retired chain link refuses, naming it, rather than being
+  skipped. `kj ledger escalate` without `--to` defaults to the first live
+  character above the ask's CURRENT reviewer in its own chain, and refuses
+  at a root ("at the root; nobody above `<name>`").
+- A root actor — no `accountable_to` parent, and the configured default is
+  either unset or names the actor itself — exhausts every resolution layer.
+  The gate does not yet raise an in-band self-confirmation for this case
+  (see "Planned" below); it refuses the same way an unconfigured reviewer
+  always has, naming the root by name so the refusal is diagnosable.
+  `crates/kaijutsu-server/tests/user_input_identity.rs` pins this interim
+  behavior.
 
 ## Planned: the accountability chain
 
 Guidance from Amy, 2026-09-15; see `docs/character.md`, "Roots and
-rotation". Not implemented.
-
-Reviewer resolution takes the actor and adds the `accountable_to` chain as
-a layer: explicit override, then the director's delegation, then the first
-live character above the actor, then the configured default. It never
-returns the actor. Today the gate resolves from the context alone, so a
-connection actor who is also the resolved reviewer, Amy in her own contexts
-or a delegated reviewer acting with its own credential, gets an ask that
-self-approval then refuses; `crates/kaijutsu-server/tests/user_input_identity.rs`
-pins that state.
-
-A root, a character with no `accountable_to`, has no reviewer. Its gated
-statement never becomes an ask: the gate returns an in-band confirmation
-to the connection and the ledger records a self-confirmation, distinct from
-an approval. Escalation refuses at a root. Every other actor has a
-reviewer, so an ask nobody can answer cannot be created.
+rotation". Reviewer resolution itself (the previous bullets) is
+implemented; the rest of this section is not.
 
 A `kj context create --as <character>` by a caller without reviewer
 authority raises an ask rather than refusing; approval executes the

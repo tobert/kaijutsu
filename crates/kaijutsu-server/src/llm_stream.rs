@@ -1740,6 +1740,7 @@ async fn process_llm_stream(
         let review_source = match identity.review_source {
             kaijutsu_kernel::approval_identity::ReviewSource::Explicit => "explicit",
             kaijutsu_kernel::approval_identity::ReviewSource::Delegation => "delegation",
+            kaijutsu_kernel::approval_identity::ReviewSource::Chain => "chain",
             kaijutsu_kernel::approval_identity::ReviewSource::Default => "default",
         };
         span.record("review.source", review_source);

@@ -15,12 +15,15 @@ const APPROVAL_CONFIG_FILE: &str = "approval.toml";
 pub enum ReviewSource {
     Explicit,
     Delegation,
+    /// The first live character above the actor in its `accountable_to`
+    /// chain (`docs/character.md`, "Roots and rotation").
+    Chain,
     Default,
 }
 
 impl ReviewSource {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Explicit => "explicit", Self::Delegation => "delegation", Self::Default => "default" }
+        match self { Self::Explicit => "explicit", Self::Delegation => "delegation", Self::Chain => "chain", Self::Default => "default" }
     }
 }
 
@@ -48,7 +51,8 @@ impl ApprovalConfig {
 }
 
 impl Kernel {
-    /// Resolve this context's effective approval reviewer.
+    /// Resolve this context's effective approval reviewer, chained above its
+    /// own configured performer (`played_by`) when one is set.
     pub async fn resolve_context_review(
         &self,
         context_id: ContextId,
@@ -59,10 +63,33 @@ impl Kernel {
         self.resolve_review_assignment(row.played_by, row.director_id, row.reviewer_id).await
     }
 
+    /// Resolve `context_id`'s reviewer for `actor` specifically, rather than
+    /// the context's own configured performer — needed where the actor
+    /// performing this particular invocation is not the context's
+    /// `played_by`, e.g. a human's direct shell command in a context with no
+    /// model performer set (`docs/approval-identity.md`, "Three identities").
+    pub async fn resolve_context_review_for(
+        &self,
+        context_id: ContextId,
+        actor: PrincipalId,
+    ) -> Result<ResolvedContextReview, String> {
+        let row = self.kernel_db().lock().get_context(context_id)
+            .map_err(|error| format!("could not read context review assignment: {error}"))?
+            .ok_or_else(|| format!("no such context: {context_id}"))?;
+        self.resolve_review_assignment(Some(actor), row.director_id, row.reviewer_id).await
+    }
+
     /// Resolve a hypothetical context assignment before committing it.
+    ///
+    /// Order: explicit override, the director's delegation, the first live
+    /// character above `actor` in its `accountable_to` chain, then the
+    /// configured default (`docs/character.md`, "Roots and rotation"). The
+    /// chain layer applies only when `actor` is known and structurally
+    /// cannot resolve to `actor` itself — `update_character_accountable_to`
+    /// refuses a self-reference and a cycle at write time.
     pub async fn resolve_review_assignment(
         &self,
-        _performer: Option<PrincipalId>,
+        actor: Option<PrincipalId>,
         director: Option<PrincipalId>,
         explicit_reviewer: Option<PrincipalId>,
     ) -> Result<ResolvedContextReview, String> {
@@ -74,17 +101,36 @@ impl Kernel {
         let (reviewer_id, source) = if let Some(reviewer) = explicit_reviewer {
             (reviewer, ReviewSource::Explicit)
         } else if let Some(director) = director {
-            match self.kernel_db().lock().active_approval_delegation(director)
-                .map_err(|error| format!("could not read approval delegation: {error}"))? {
+            let delegation = self.kernel_db().lock().active_approval_delegation(director)
+                .map_err(|error| format!("could not read approval delegation: {error}"))?;
+            match delegation {
                 Some(reviewer) => (reviewer, ReviewSource::Delegation),
-                None => (default_reviewer?, ReviewSource::Default),
+                None => self.chain_then_default(actor, default_reviewer).await?,
             }
         } else {
-            (default_reviewer?, ReviewSource::Default)
+            self.chain_then_default(actor, default_reviewer).await?
         };
 
         let reviewer = self.live_character(reviewer_id, "reviewer")?;
         Ok(ResolvedContextReview { reviewer, source })
+    }
+
+    /// The chain and default layers of [`Self::resolve_review_assignment`]:
+    /// the first live character above `actor`, or the configured default
+    /// when `actor` is unknown or has none (a root).
+    async fn chain_then_default(
+        &self,
+        actor: Option<PrincipalId>,
+        default_reviewer: Result<PrincipalId, String>,
+    ) -> Result<(PrincipalId, ReviewSource), String> {
+        if let Some(actor_id) = actor {
+            let parent = self.kernel_db().lock().nearest_live_accountable_to(actor_id)
+                .map_err(|error| format!("could not read accountability chain: {error}"))?;
+            if let Some(parent) = parent {
+                return Ok((parent, ReviewSource::Chain));
+            }
+        }
+        Ok((default_reviewer?, ReviewSource::Default))
     }
 
     /// Require a model performer to differ from its resolved reviewer.

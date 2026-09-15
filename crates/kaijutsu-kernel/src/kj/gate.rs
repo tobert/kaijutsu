@@ -62,7 +62,7 @@ use approval_ledger::types::{
 use kaijutsu_types::{AskRef, AskStatus, ContextId, PrincipalId};
 
 use crate::flows::SharedLedgerFlowBus;
-use crate::kernel_db::KernelDb;
+use crate::kernel_db::{EffectiveReviewer, KernelDb};
 use crate::kj::env_snapshot::{self, AskEnvEntry};
 use crate::kj::KjCaller;
 
@@ -322,6 +322,12 @@ fn caller_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, caller: &KjCaller) -> Opti
     let context_id = caller.context_id?;
     let db = db.lock();
     db.get_context_shell(context_id).ok().flatten().and_then(|row| row.cwd)
+}
+
+/// Best-effort character name for a refusal message — the id's short form
+/// when no sheet resolves, since the message must still name something.
+fn actor_display_name(db: &KernelDb, actor: PrincipalId) -> String {
+    db.get_character(actor).ok().flatten().map(|character| character.name).unwrap_or_else(|| actor.short().to_string())
 }
 
 /// The env snapshot's human-facing summary, appended to the ask's
@@ -694,9 +700,12 @@ pub(crate) async fn run_gate(
             Some(context) => context,
             None => return GateOutcome::unavailable_without_row("approval gate could not resolve reviewer: approval asks require a context".into()),
         };
-        let reviewer = match db.effective_approval_reviewer(context) {
-            Ok(Some(reviewer)) => reviewer,
-            Ok(None) => return GateOutcome::unavailable_without_row("approval gate could not resolve reviewer: no configured approval reviewer".into()),
+        let reviewer = match db.effective_approval_reviewer(context, caller.actor_id) {
+            Ok(EffectiveReviewer::Assigned(reviewer)) => reviewer,
+            Ok(EffectiveReviewer::NoReviewer) => return GateOutcome::unavailable_without_row(format!(
+                "approval gate could not resolve reviewer: {} is at the root of the accountability chain, with nobody above it to ask",
+                actor_display_name(&db, caller.actor_id)
+            )),
             Err(error) => return GateOutcome::unavailable_without_row(format!("approval gate could not resolve reviewer: {error}")),
         };
         ask.continuation_epoch = match db.continuation_epoch(context) {
@@ -841,9 +850,9 @@ pub(crate) async fn record_dry_run_ask(
     let request_id = {
         let db = db.lock();
         let context = match caller.context_id { Some(context) => context, None => { tracing::warn!("dry run ask has no context"); return None; } };
-        let reviewer = match db.effective_approval_reviewer(context) {
-            Ok(Some(reviewer)) => reviewer,
-            Ok(None) => { tracing::warn!("dry run ask has no configured reviewer"); return None; }
+        let reviewer = match db.effective_approval_reviewer(context, caller.actor_id) {
+            Ok(EffectiveReviewer::Assigned(reviewer)) => reviewer,
+            Ok(EffectiveReviewer::NoReviewer) => { tracing::warn!("dry run ask has no reviewer above its root actor"); return None; }
             Err(error) => { tracing::warn!("dry run could not resolve reviewer: {error}"); return None; }
         };
         ask.continuation_epoch = match db.continuation_epoch(context) {
@@ -1317,8 +1326,55 @@ mod tests {
         assert_ne!(spent.ask.expect("a replacement ask").request_id, request_id);
     }
 
-    /// Amy's own direct ask resolves to Amy by default, but she cannot approve
-    /// her own operation. She must explicitly assign a distinct reviewer.
+    /// A root actor (no `accountable_to`) whose context has no explicit
+    /// reviewer, delegation, or non-self default raises no ask at all:
+    /// every resolution layer is exhausted, `NoReviewer`, and the gate
+    /// refuses in-band — fail-closed, exactly like today's "no configured
+    /// approval reviewer", but naming the root by name. No row is left
+    /// pending for anyone to be confused by (`docs/issues.md`, "Roots, the
+    /// accountability chain, and rotation", slice 1). Turning this into a
+    /// self-confirmation is slice 2, not yet built.
+    #[tokio::test]
+    async fn a_root_actors_own_ask_refuses_without_raising_a_pending_row() {
+        let d = gate_dispatcher().await;
+        let mut direct = test_caller();
+        let actor = crate::kj::test_helpers::test_reviewer_principal();
+        direct.actor_id = actor;
+        direct.principal_id = actor;
+        let context = register_context(&d, Some("root-direct-gate"), None, direct.principal_id);
+        direct.context_id = Some(context);
+        direct.reviewer_id = None;
+
+        let outcome = run_gate(
+            &d.kernel_db.clone(),
+            &direct,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable);
+        assert!(outcome.ask.is_none(), "a root's exhausted resolution must not leave an ask row behind");
+        assert!(outcome.reason.contains("root"), "{}", outcome.reason);
+        let name = d.kernel_db.lock().get_character(actor).unwrap().unwrap().name;
+        assert!(outcome.reason.contains(&name), "{}", outcome.reason);
+        assert!(d.kernel_db.lock().list_pending_asks().unwrap().is_empty());
+    }
+
+    /// Amy's own direct ask resolves to Amy through an explicit assignment,
+    /// but she cannot approve her own operation. She must explicitly assign
+    /// a distinct reviewer.
+    ///
+    /// The explicit assignment is deliberate, not default resolution: Amy
+    /// is a root (no `accountable_to`) and is also the configured default
+    /// reviewer, so leaving this to default resolution would exhaust every
+    /// layer (`EffectiveReviewer::NoReviewer`) and refuse to raise an ask at
+    /// all — the behavior this test exercised before the accountability
+    /// chain landed. Explicit override still resolves to the actor itself
+    /// (`kj/context.rs`'s commit-time check is what prevents a PERFORMER
+    /// from being assigned that way; a direct human caller is not a
+    /// performer), so it reconstructs the same self-review ask this test is
+    /// about.
     #[tokio::test]
     async fn a_direct_ask_requires_escalation_before_anyone_can_allow_it() {
         let d = gate_dispatcher().await;
@@ -1342,6 +1398,7 @@ mod tests {
                 })
                 .unwrap();
             }
+            db.update_context_review_assignment(context, None, Some(actor), None).unwrap();
         }
 
         let first = run_gate(
