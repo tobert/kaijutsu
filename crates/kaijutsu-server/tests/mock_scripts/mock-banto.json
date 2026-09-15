@@ -1,0 +1,56 @@
+[
+  [
+    {"ToolUse": {"id": "banto-1", "name": "shell_write", "input": {"command": "kj fork --name lane-a && kj fork --name lane-b", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "lanes forked."},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    {"ToolUse": {"id": "banto-3", "name": "shell_write", "input": {"command": "kj drive lane-a --prompt 'report status' && kj drive lane-b --prompt 'report status'", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    {"ToolUse": {"id": "banto-4", "name": "shell_write", "input": {"command": "kj wait lane-a --timeout 20 && kj wait lane-b --timeout 20", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "lanes forked, driven, and waited."},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    {"ToolUse": {"id": "banto-5", "name": "shell_write", "input": {"command": "kj handoff note --for banto 'lanes landed'", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "noted."},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    {"ToolUse": {"id": "banto-6", "name": "shell_write", "input": {"command": "echo gate-approved-for-real", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "waiting for approval."},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    {"ToolUse": {"id": "banto-7", "name": "shell_write", "input": {"command": "kj handoff signoff 'rotating'", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "signed off."},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ]
+]

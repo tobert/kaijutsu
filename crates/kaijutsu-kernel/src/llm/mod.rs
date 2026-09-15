@@ -86,6 +86,29 @@ pub struct MockClient {
     /// Combine with `tokio::test(start_paused = true)` so a caller's idle
     /// timeout fires on virtual-clock auto-advance instead of real wall time.
     hangs_when_exhausted: bool,
+    /// Directory a per-model script set was loaded from (`with_script_dir`),
+    /// kept only so a missing-model panic can name the expected path.
+    script_dir: Option<std::path::PathBuf>,
+    /// Per-model turn queues loaded from `script_dir` — one `<model>.json`
+    /// file's parsed content per model whose file was found there. `stream()`
+    /// keys into this by `BuildOpts::model`, the model the caller's cast slot
+    /// resolved to, so a director's and a coder's scripts never collide even
+    /// though both run through the same Mock backend. `None` means no
+    /// directory was loaded (`KJ_MOCK_SCRIPT_DIR` unset); `Some` with a model
+    /// absent from the map means the directory was loaded but held no file
+    /// for that model — a fixture bug, not a fallback case.
+    script_by_model:
+        Option<Arc<parking_lot::Mutex<HashMap<String, ScriptedModelQueue>>>>,
+}
+
+/// One model's scripted turns plus the count it started with, so an
+/// exhausted-queue panic can report how many turns the fixture actually
+/// provided.
+#[cfg(any(test, feature = "test-mock"))]
+#[derive(Debug)]
+struct ScriptedModelQueue {
+    turns: std::collections::VecDeque<Vec<stream::StreamEvent>>,
+    total_turns: usize,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -96,6 +119,8 @@ impl MockClient {
             delay: std::time::Duration::ZERO,
             scripted: None,
             hangs_when_exhausted: false,
+            script_dir: None,
+            script_by_model: None,
         }
     }
 
@@ -124,6 +149,54 @@ impl MockClient {
     /// events are exhausted — see the `hangs_when_exhausted` field doc.
     pub fn hangs_when_exhausted(mut self) -> Self {
         self.hangs_when_exhausted = true;
+        self
+    }
+
+    /// Builder: load one scripted turn-queue per model out of `dir`, one
+    /// `<model>.json` file per model. Each file is an ordered JSON array of
+    /// turns, each turn an ordered array of [`stream::StreamEvent`] in its
+    /// derived `Serialize`/`Deserialize` shape (externally tagged — a unit
+    /// variant like `TextStart` is the bare string `"TextStart"`, a struct
+    /// variant like `ToolUse` is `{"ToolUse":{"id":...,"name":...,"input":...}}`).
+    ///
+    /// Panics on an unreadable directory or malformed JSON — a broken
+    /// fixture is a test-setup bug to surface immediately, never a runtime
+    /// condition this client recovers from. See `BackendKind::Mock` in
+    /// `Provider::from_backend` for the `KJ_MOCK_SCRIPT_DIR` entry point that
+    /// calls this.
+    pub fn with_script_dir(mut self, dir: &std::path::Path) -> Self {
+        let mut by_model = HashMap::new();
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+            panic!("KJ_MOCK_SCRIPT_DIR={} is not readable: {error}", dir.display())
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("reading KJ_MOCK_SCRIPT_DIR={}: {error}", dir.display())
+            });
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let model = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_else(|| panic!("non-UTF8 mock script filename: {}", path.display()))
+                .to_string();
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            let turns: Vec<Vec<stream::StreamEvent>> = serde_json::from_str(&raw)
+                .unwrap_or_else(|error| panic!("parsing {}: {error}", path.display()));
+            let total_turns = turns.len();
+            by_model.insert(
+                model,
+                ScriptedModelQueue {
+                    turns: std::collections::VecDeque::from(turns),
+                    total_turns,
+                },
+            );
+        }
+        self.script_dir = Some(dir.to_path_buf());
+        self.script_by_model = Some(Arc::new(parking_lot::Mutex::new(by_model)));
         self
     }
 }
@@ -765,10 +838,22 @@ impl Provider {
                 }))
             }
             #[cfg(any(test, feature = "test-mock"))]
-            BackendKind::Mock => Ok(Self::Mock(MockClient::new(format!(
-                "Mock summary for testing (backend: {}).",
-                config.name
-            )))),
+            BackendKind::Mock => {
+                let mock = MockClient::new(format!(
+                    "Mock summary for testing (backend: {}).",
+                    config.name
+                ));
+                // KJ_MOCK_SCRIPT_DIR lets an e2e test drive real tool calls
+                // through the mock backend (one script per model, see
+                // `MockClient::with_script_dir`) instead of the canned
+                // single-sentence reply below. Unset — the default — keeps
+                // today's behavior exactly.
+                let mock = match std::env::var("KJ_MOCK_SCRIPT_DIR") {
+                    Ok(dir) => mock.with_script_dir(std::path::Path::new(&dir)),
+                    Err(_) => mock,
+                };
+                Ok(Self::Mock(mock))
+            }
         }
     }
 
@@ -870,7 +955,30 @@ impl Provider {
             Self::CodexApp(client) => client.stream(opts, messages).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
-                let events = if let Some(script) = &mock.scripted {
+                let events = if let Some(by_model) = &mock.script_by_model {
+                    let mut map = by_model.lock();
+                    let entry = map.get_mut(&opts.model).unwrap_or_else(|| {
+                        let dir = mock
+                            .script_dir
+                            .as_ref()
+                            .expect("script_by_model implies script_dir was recorded");
+                        panic!(
+                            "KJ_MOCK_SCRIPT_DIR={} has no script for model '{}' — expected {}",
+                            dir.display(),
+                            opts.model,
+                            dir.join(format!("{}.json", opts.model)).display()
+                        )
+                    });
+                    entry.turns.pop_front().unwrap_or_else(|| {
+                        panic!(
+                            "MockClient script for model '{}' exhausted after {} turn(s) — \
+                             the agentic loop called stream() more times than the script \
+                             provided; add another turn or fix the test's iteration \
+                             expectations",
+                            opts.model, entry.total_turns
+                        )
+                    })
+                } else if let Some(script) = &mock.scripted {
                     script.lock().pop_front().unwrap_or_else(|| {
                         panic!(
                             "MockClient scripted stream exhausted — the agentic loop called \
@@ -1493,6 +1601,199 @@ mod tests {
             }
             _ => panic!("Expected blocks"),
         }
+    }
+
+    /// `MockClient::with_script_dir` keys its queues by `BuildOpts::model`
+    /// (the way `Provider::stream` receives the model name, `mod.rs:849-853`
+    /// and its `opts.model` read at `mod.rs` in the `Self::Mock` arm), so two
+    /// models sharing the Mock backend never see each other's turns. Also
+    /// pins the ToolUse content survives the JSON round trip byte-for-byte —
+    /// this is the shape `docs/issues.md` "Identity audit" item 5 needs an
+    /// e2e test to drive a real tool call through, which the wire-level
+    /// authorship assertion (performer vs. requester) belongs in
+    /// `kaijutsu-server/tests/session_scenario.rs` for: block authorship is
+    /// stamped by the server-crate block writer
+    /// (`kaijutsu-server/src/llm_stream.rs`), which this lower crate cannot
+    /// depend on or exercise directly.
+    #[tokio::test]
+    async fn mock_script_dir_pops_per_model_turns_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mock-coder.json"),
+            serde_json::to_string(&vec![vec![
+                stream::StreamEvent::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "shell_write".to_string(),
+                    input: serde_json::json!({"statement": "echo hi"}),
+                },
+                stream::StreamEvent::TextStart,
+                stream::StreamEvent::TextDelta("done".to_string()),
+                stream::StreamEvent::TextEnd,
+                stream::StreamEvent::Done {
+                    stop_reason: Some("end_turn".to_string()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    extra: None,
+                },
+            ]])
+            .expect("serialize coder script"),
+        )
+        .expect("write mock-coder.json");
+        std::fs::write(
+            dir.path().join("mock-banto.json"),
+            serde_json::to_string(&vec![vec![
+                stream::StreamEvent::TextStart,
+                stream::StreamEvent::TextDelta("banto turn".to_string()),
+                stream::StreamEvent::TextEnd,
+                stream::StreamEvent::Done {
+                    stop_reason: Some("end_turn".to_string()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    extra: None,
+                },
+            ]])
+            .expect("serialize banto script"),
+        )
+        .expect("write mock-banto.json");
+
+        let mock = MockClient::new("unused canned response").with_script_dir(dir.path());
+        let provider = Provider::Mock(mock);
+
+        let mut coder_stream = provider
+            .stream(BuildOpts::new("mock-coder"), vec![Message::user("go")])
+            .await
+            .expect("coder stream starts");
+        let mut coder_events = Vec::new();
+        while let Some(event) = coder_stream.next_event().await {
+            let terminal = event.is_terminal();
+            coder_events.push(event);
+            if terminal {
+                break;
+            }
+        }
+        assert_eq!(
+            coder_events,
+            vec![
+                stream::StreamEvent::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "shell_write".to_string(),
+                    input: serde_json::json!({"statement": "echo hi"}),
+                },
+                stream::StreamEvent::TextStart,
+                stream::StreamEvent::TextDelta("done".to_string()),
+                stream::StreamEvent::TextEnd,
+                stream::StreamEvent::Done {
+                    stop_reason: Some("end_turn".to_string()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    extra: None,
+                },
+            ],
+            "the coder model must replay exactly its own file's turn, unmixed with banto's"
+        );
+
+        let mut banto_stream = provider
+            .stream(BuildOpts::new("mock-banto"), vec![Message::user("go")])
+            .await
+            .expect("banto stream starts");
+        let mut banto_saw_tool_use = false;
+        while let Some(event) = banto_stream.next_event().await {
+            if matches!(event, stream::StreamEvent::ToolUse { .. }) {
+                banto_saw_tool_use = true;
+            }
+            if event.is_terminal() {
+                break;
+            }
+        }
+        assert!(
+            !banto_saw_tool_use,
+            "mock-banto's script has no ToolUse — a leak from mock-coder's queue would be a real defect"
+        );
+    }
+
+    /// `KJ_MOCK_SCRIPT_DIR` set but no file for the requested model is a
+    /// fixture bug, not a silent fallback to the canned sentence — see the
+    /// `with_script_dir` doc and CLAUDE.md's "Silent fallbacks are often a
+    /// mistake."
+    #[tokio::test]
+    #[should_panic(expected = "has no script for model 'mock-missing'")]
+    async fn mock_script_dir_panics_naming_the_missing_model_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mock-coder.json"),
+            serde_json::to_string(&vec![vec![stream::StreamEvent::TextStart]])
+                .expect("serialize"),
+        )
+        .expect("write mock-coder.json");
+
+        let mock = MockClient::new("unused").with_script_dir(dir.path());
+        let provider = Provider::Mock(mock);
+        let _ = provider
+            .stream(BuildOpts::new("mock-missing"), vec![Message::user("go")])
+            .await
+            .expect("stream() itself does not fail — the panic is inside next dispatch")
+            .next_event()
+            .await;
+    }
+
+    /// Popping past a model's last scripted turn panics naming the model and
+    /// how many turns it actually provided, matching the in-process
+    /// `with_scripted_stream` rule this mirrors.
+    #[tokio::test]
+    #[should_panic(expected = "MockClient script for model 'mock-coder' exhausted after 1 turn(s)")]
+    async fn mock_script_dir_panics_on_exhausted_queue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mock-coder.json"),
+            serde_json::to_string(&vec![vec![stream::StreamEvent::Done {
+                stop_reason: Some("end_turn".to_string()),
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                extra: None,
+            }]])
+            .expect("serialize"),
+        )
+        .expect("write mock-coder.json");
+
+        let mock = MockClient::new("unused").with_script_dir(dir.path());
+        let provider = Provider::Mock(mock);
+        provider
+            .stream(BuildOpts::new("mock-coder"), vec![Message::user("go")])
+            .await
+            .expect("first stream call");
+        // Second call for the same model: the queue is now empty.
+        provider
+            .stream(BuildOpts::new("mock-coder"), vec![Message::user("go again")])
+            .await
+            .expect("second stream call panics inside, not here");
+    }
+
+    /// `KJ_MOCK_SCRIPT_DIR` unset must leave `Provider::from_backend`'s Mock
+    /// construction byte-identical to before this change: the canned
+    /// single-sentence stream, no script lookup at all.
+    #[tokio::test]
+    async fn mock_backend_construction_without_env_var_keeps_canned_response() {
+        // SAFETY: single-threaded test; no other test in this process sets
+        // or reads KJ_MOCK_SCRIPT_DIR concurrently within this crate.
+        unsafe {
+            std::env::remove_var("KJ_MOCK_SCRIPT_DIR");
+        }
+        let config = config::BackendConfig::new("mock", config::BackendKind::Mock);
+        let provider = Provider::from_backend(&config).expect("build mock provider");
+        let mut stream = provider
+            .stream(BuildOpts::new("mock-model"), vec![Message::user("go")])
+            .await
+            .expect("stream starts");
+        let mut saw_text = String::new();
+        while let Some(event) = stream.next_event().await {
+            if let stream::StreamEvent::TextDelta(delta) = &event {
+                saw_text.push_str(delta);
+            }
+            if event.is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(saw_text, "Mock summary for testing (backend: mock).");
     }
 
     #[test]

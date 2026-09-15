@@ -1,0 +1,12 @@
+[
+  [
+    {"ToolUse": {"id": "coder-a-1", "name": "shell_write", "input": {"command": "kj drift push banto 'report: done'", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "report: done"},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ]
+]

@@ -1,0 +1,701 @@
+//! e2e: a working session, the way `docs/character.md`, "A session, inside
+//! kaijutsu" describes it, driven end to end with a real mock model on every
+//! seat — director and coders alike — through `KJ_MOCK_SCRIPT_DIR`
+//! (`crates/kaijutsu-kernel/src/llm/mod.rs`'s `MockClient::with_script_dir`).
+//!
+//! Amy sits in banto's seat and submits one prompt. banto (the mock
+//! `mock-banto` model) forks two coder lanes; amy assigns each a performer
+//! and a distinct model (`mock-coder-a` / `mock-coder-b` — one `MockClient`
+//! per-model queue per lane, so their concurrently-driven turns can never
+//! interleave each other's scripted events); banto then drives and waits on
+//! them, and each lane drifts a report back to banto's seat. banto then
+//! notes a handoff, and a later
+//! turn issues a gated statement that raises an ask; amy answers it as the
+//! default reviewer; a final turn signs off, closing the continuation
+//! window; amy rotates banto's seat and reads the successor's instructions.
+//!
+//! This binary has exactly one `#[test]` function. `KJ_MOCK_SCRIPT_DIR` is
+//! process-wide state read once when the mock backend is constructed
+//! (`Provider::from_backend`'s `BackendKind::Mock` arm) — a second test in
+//! this file racing to set a different directory would be a real bug, not a
+//! style question, so the whole scenario stays one test rather than several
+//! that could interleave.
+//!
+//! ## What this does not cover
+//!
+//! - **Rotation by verb** (`docs/character.md`, "Roots and rotation",
+//!   slice 5 — "A model asks to rotate itself") is guidance, not shipped;
+//!   rotation here uses today's documented manual procedure
+//!   (`docs/prompts.md`, "Rotating a director context":
+//!   `kj context create <name>-next --type director --as <character> --env
+//!   'ROTATED_FROM=<name>'`), not a verb a model calls itself.
+//! - **Root self-confirmation** (same section, slice 2 — a root's gated
+//!   statement in-band-confirms instead of raising an ask) is also
+//!   guidance, not implemented. `docs/approval-identity.md`, "Planned: the
+//!   accountability chain" confirms today's gate still resolves a reviewer
+//!   from the context alone (explicit override → director delegation →
+//!   the configured default, `amy`), never by walking `accountable_to`. So
+//!   the ask this scenario raises resolves to `amy` by that *default* path,
+//!   not because she sits above banto in a chain the gate does not read yet
+//!   — the assertion below is written to move with the code once the chain
+//!   lands (see `docs/issues.md`, slice 1 of "Roots, the accountability
+//!   chain, and rotation").
+//! - **The coder lanes' own `context_type`.** `kj fork` always copies the
+//!   parent's `context_type` onto the child
+//!   (`crates/kaijutsu-kernel/src/kj/fork.rs:1649-1686`,
+//!   `inherit_parent_context_type`) — there is no `--type` on `fork`. Each
+//!   lane therefore stays `context_type = "director"`, the same as banto's
+//!   seat, so the cast's `coder` slot (keyed on `context_type`, per
+//!   `crates/kaijutsu-kernel/src/model_resolution.rs:11-14`) is never
+//!   reached by a lane's own type. Each lane instead gets an **explicit
+//!   per-context model override** (`kj context set <lane> --model
+//!   mock/mock-coder-a`, `-b` for the other), which the same module's resolution ladder
+//!   (`model_resolution.rs:83-94`) always tries first — a real, exercised
+//!   path, just not the cast-by-role path the brief sketched for the coder
+//!   slot. The cast is still created and the `director` slot IS reached
+//!   normally (banto's own `context_type` really is `director`).
+//! - **A lane's own performer must be assigned by amy, not by banto's own
+//!   tool call.** `kj context set <ctx> --as <character>` refuses unless
+//!   the caller is the target's resolved reviewer
+//!   (`crates/kaijutsu-kernel/src/kj/context.rs:1670`), and a fork
+//!   preserves the parent's `director_id`
+//!   (`docs/approval-identity.md`'s Current implementation table) — since
+//!   amy (not banto) created banto's own seat, she is the director every
+//!   lane banto forks inherits too, and today only she (or an explicit
+//!   delegate) can assign their performers. `docs/character.md`'s "Roots
+//!   and rotation" accountability chain, once implemented, is what would
+//!   let banto do this itself.
+//! - **Two real defects this scenario found**, both outside this lane's
+//!   territory and reported rather than fixed here:
+//!   1. `crates/kaijutsu-server/src/rpc.rs`'s `spawn_turn_driver` (~line
+//!      546) builds the `"turn-driver"` OS thread with no
+//!      `.stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)`, unlike its
+//!      sibling rc-driving threads (`"gate-resume"`, `"beat-scheduler"`,
+//!      the per-session SSH thread) — seen in `boot()`'s comment.
+//!   2. `kj handoff note`/`signoff` with no explicit `--for` resolve their
+//!      target (and stamp authorship) from `caller.principal_id` (the
+//!      requester) instead of `caller.actor_id` (the performer) — seen at
+//!      the handoff-tail assertions after turn 4, below.
+
+mod common;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::{run_local, seed_mock_backend_with_model, shell_exec_wait};
+use kaijutsu_client::{
+    KernelHandle, KeySource, RpcClient, ServerEvent, SshClient, SshConfig, turn_events_channel,
+};
+use kaijutsu_kernel::kernel_db::CharacterRow;
+use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
+use kaijutsu_types::{BlockKind, BlockQuery, ContextId, PrincipalId, Role, Status};
+use russh::keys::{Algorithm, PrivateKey};
+
+/// Poll until `check` returns true, or fail loudly — every wait in this
+/// file is on work a background driver does, so a timeout IS the bug
+/// (`gate_executes_wire.rs`'s pattern).
+async fn wait_for(label: &str, mut check: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {label}");
+}
+
+async fn connect_with_key(addr: std::net::SocketAddr, key: PrivateKey, username: &str) -> RpcClient {
+    let config = SshConfig {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        username: username.to_string(),
+        key_source: KeySource::InMemory(Arc::new(key)),
+        insecure: true,
+    };
+    let mut ssh = SshClient::new(config);
+    let channel = ssh.connect().await.expect("SSH connect");
+    let mut client = RpcClient::new(channel.into_stream()).await.expect("RPC client init");
+    client.retain_ssh_session(ssh);
+    client
+}
+
+fn character_row(principal_id: PrincipalId, name: &str) -> CharacterRow {
+    CharacterRow {
+        principal_id,
+        name: name.to_string(),
+        created_at: kaijutsu_types::now_millis() as i64,
+        retired_at: None,
+        handoff_ctx: None,
+        accountable_to: None,
+    }
+}
+
+/// Drain the turn push channel until a terminal event for `ctx` arrives,
+/// panicking on failure or a mismatched context — `user_input_identity.rs`'s
+/// pattern.
+async fn recv_turn_event(
+    rx: &mut tokio::sync::broadcast::Receiver<ServerEvent>,
+    ctx: ContextId,
+) -> ServerEvent {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            Ok(Ok(ev @ ServerEvent::TurnCompleted { context_id, .. }))
+            | Ok(Ok(ev @ ServerEvent::TurnFailed { context_id, .. }))
+                if context_id == ctx =>
+            {
+                return ev;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("turn push channel error: {e}"),
+            Err(_) => panic!("timed out waiting for a turn event on {ctx}"),
+        }
+    }
+}
+
+/// Fail loudly on a failed turn — a mock-scripted turn should never produce
+/// one; a `TurnFailed` here means the script or the setup is wrong, not
+/// something to shrug past.
+fn expect_completed(event: ServerEvent, label: &str) {
+    match event {
+        ServerEvent::TurnCompleted { .. } => {}
+        ServerEvent::TurnFailed { error, .. } => {
+            panic!("{label}: turn failed instead of completing: {error}")
+        }
+        other => panic!("{label}: expected a terminal turn event, got {other:?}"),
+    }
+}
+
+/// Everything the scenario needs: one authenticated connection for amy, the
+/// live kernel handle for direct DB reads, and the two contexts she works
+/// from.
+struct Scenario {
+    _amy_client: RpcClient,
+    amy: KernelHandle,
+    amy_principal: PrincipalId,
+    kernel: SharedKernel,
+    /// Amy's own out-of-band context: character/cast setup, rotation, and
+    /// ledger answers all run here, never inside banto's context — so none
+    /// of it can be caught by a hook scoped to banto's context id.
+    amy_home: ContextId,
+}
+
+/// Boot a server with `KJ_MOCK_SCRIPT_DIR` pointed at this crate's
+/// `tests/mock_scripts/` fixtures, a mock backend seeded (`mock-model` stays
+/// the registry default; the scenario's contexts pick their own models via
+/// cast slot / explicit override), and one real SSH credential bound to a
+/// character named `amy` — the shipped default reviewer
+/// (`docs/approval-identity.md`, "`/config/kernel/approval.toml` names the
+/// default reviewer... shipped value is `amy`").
+async fn boot() -> Scenario {
+    // SAFETY: this binary has exactly one #[test] (see the module doc) —
+    // nothing else in this process reads or writes this variable.
+    unsafe {
+        std::env::set_var(
+            "KJ_MOCK_SCRIPT_DIR",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mock_scripts"),
+        );
+    }
+    // NOTE: a real defect, not something this test can route around. Once
+    // banto's own turn nests a nested `kj` command deeply enough (`kj
+    // drive`, exercised below), the server's `"turn-driver"` OS thread
+    // stack-overflows and SIGABRTs the whole process —
+    // `crates/kaijutsu-server/src/rpc.rs`'s `spawn_turn_driver` (~line 546)
+    // builds that thread via `std::thread::Builder::new()
+    // .name("turn-driver".to_string())` with no `.stack_size(..)` call,
+    // unlike its sibling rc-driving threads (the `"gate-resume"` and
+    // `"beat-scheduler"` builders, and the per-session SSH thread), which
+    // all reserve `kaijutsu_kernel::KAISH_RC_THREAD_STACK` (16 MiB) in the
+    // same chain. `rpc.rs`'s own `rc_thread_stack_tests` module pins exactly
+    // this requirement for those three threads — its enumeration was never
+    // extended to `turn-driver`. Setting `RUST_MIN_STACK` from here does not
+    // reliably help: std caches its default-stack-size decision the first
+    // time any thread spawns without an explicit `.stack_size`, and
+    // something earlier in the test process (the libtest runner itself)
+    // already spawns such a thread before this function runs. `rpc.rs` is
+    // outside this lane's territory (see the coding brief), so the fix —
+    // adding `.stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)` to that
+    // one builder chain, and `"\"turn-driver\""` to `rc_thread_stack_tests`'s
+    // `sources` array so a regression is caught again — is reported rather
+    // than made here. See this file's final report for what ran before this
+    // was hit.
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let auth_db_path = tmp.path().join("auth.db");
+    let amy_principal = PrincipalId::new();
+    let amy_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).expect("key");
+    let auth_db = AuthDb::open(&auth_db_path).expect("open auth db");
+    auth_db
+        .add_key(amy_principal, amy_key.public_key(), Some("amy"))
+        .expect("bind amy's key");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let mut config = SshServerConfig::ephemeral(addr.port());
+    config.auth_db_path = Some(auth_db_path);
+    if let Some(ref data_dir) = config.data_dir {
+        seed_mock_backend_with_model(data_dir, "mock-model");
+    }
+
+    // `gate.toml`'s shipped default (`assets/defaults/gate.toml`) allow-lists
+    // "kj handoff note" globally but has no `[context_type.director]` tier,
+    // so banto's own `fork`/`context set`/`drive`/`wait`/`handoff signoff`
+    // tool calls would each raise their own ask (`Uncovered` falls to `ask`,
+    // `crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s module doc) — the
+    // "static allow tiers pass the routine ones" step of `docs/character.md`,
+    // "A session, inside kaijutsu" step 3. This adds that tier so the
+    // orchestration itself runs unattended; the plain `echo` statement later
+    // in the script names no `kj` verb and so is never covered by any tier,
+    // staying the one statement this scenario actually gates.
+    let gate_toml_path = config
+        .config_mounts
+        .host_dir(kaijutsu_types::paths::CONFIG_ROOT)
+        .join("gate.toml");
+    std::fs::create_dir_all(gate_toml_path.parent().expect("gate.toml has a parent dir"))
+        .expect("create /config/kernel dir");
+    std::fs::write(
+        &gate_toml_path,
+        format!(
+            "{}\n[context_type.director]\nallow = [\n  \"kj fork\",\n  \"kj drive\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n]\n",
+            std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../assets/defaults/gate.toml"
+            ))
+            .expect("read shipped gate.toml")
+        ),
+    )
+    .expect("write scenario gate.toml");
+
+    let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_local(async move {
+        if let Err(e) = SshServer::new(config)
+            .run_on_listener_with_kernel_sink(listener, kernel_tx)
+            .await
+        {
+            log::error!("session_scenario server error: {e}");
+        }
+    });
+    let kernel = kernel_rx.await.expect("server dropped the kernel handle");
+
+    kernel
+        .kernel_db
+        .lock()
+        .insert_character(&character_row(amy_principal, "amy"))
+        .expect("seed amy's character sheet");
+
+    let amy_client = connect_with_key(addr, amy_key, "amy").await;
+    let (amy, _) = amy_client.bind_kernel().await.expect("bind_kernel");
+    // `director` rc grants `config-write` (character/cast administration)
+    // and the `drive`/`fork`/`drift` verb authorities — amy's own admin
+    // seat needs the same loadout banto's seat gets, not the bare "default"
+    // type's narrower grant (`assets/defaults/rc/director/create/S10-binding.kai`).
+    let amy_home = amy
+        .create_context_typed("amy-home", "director")
+        .await
+        .expect("create amy-home");
+    amy.join_context(amy_home, "amy").await.expect("join amy-home");
+
+    Scenario {
+        _amy_client: amy_client,
+        amy,
+        amy_principal,
+        kernel,
+        amy_home,
+    }
+}
+
+impl Scenario {
+    /// Run a `kj` command from amy's own context and return its output —
+    /// panics on a non-`Done` status or a refusal, since every command this
+    /// scenario runs from `amy_home` is expected to succeed outright.
+    async fn kj(&self, code: &str) -> String {
+        let (_id, output, status) = shell_exec_wait(&self.amy, code, self.amy_home).await;
+        assert_eq!(
+            status,
+            Status::Done,
+            "kj command {code:?} did not finish Done: output={output:?}"
+        );
+        output
+    }
+
+    fn context_by_label(&self, label: &str) -> ContextId {
+        self.kernel
+            .kernel_db
+            .lock()
+            .find_context_by_label(label)
+            .unwrap_or_else(|e| panic!("looking up context {label:?}: {e}"))
+            .unwrap_or_else(|| panic!("no context labeled {label:?}"))
+            .context_id
+    }
+
+    fn character_principal(&self, name: &str) -> PrincipalId {
+        self.kernel
+            .kernel_db
+            .lock()
+            .list_characters(false)
+            .expect("list characters")
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no character named {name:?}"))
+            .principal_id
+    }
+
+    fn blocks(&self, ctx: ContextId) -> Vec<kaijutsu_types::BlockSnapshot> {
+        self.kernel
+            .documents
+            .block_snapshots(ctx)
+            .unwrap_or_else(|e| panic!("reading blocks for {ctx}: {e}"))
+    }
+}
+
+#[test]
+fn kaijutsu_session_scenario() {
+    run_local(async {
+        let s = boot().await;
+
+        // ------------------------------------------------------------
+        // Setup: characters, cast, banto's seat.
+        // ------------------------------------------------------------
+        s.kj("kj character create banto --accountable-to amy").await;
+        s.kj("kj character create coder-a --accountable-to banto").await;
+        s.kj("kj character create coder-b --accountable-to banto").await;
+
+        s.kj("kj cast create mockcast").await;
+        s.kj("kj cast slot set mockcast director --backend mock --model mock-banto").await;
+        s.kj("kj cast slot set mockcast coder --backend mock --model mock-coder").await;
+
+        s.kj("kj context create banto --type director --as banto --cast mockcast").await;
+        let banto_ctx = s.context_by_label("banto");
+        let banto_principal = s.character_principal("banto");
+        let coder_a_principal = s.character_principal("coder-a");
+        let coder_b_principal = s.character_principal("coder-b");
+
+        // ------------------------------------------------------------
+        // Turn 1a: amy submits a prompt in banto's seat. banto's mock script
+        // forks lane-a and lane-b.
+        //
+        // Assigning each lane's performer happens next, as amy's own action
+        // rather than another banto tool call: `kj context set --as` refuses
+        // unless the caller IS the resolved reviewer
+        // (`crates/kaijutsu-kernel/src/kj/context.rs:1670`), and a fork
+        // preserves the parent's `director_id` (`docs/approval-identity.md`'s
+        // Current implementation table) — banto's own seat is directed by
+        // amy (she created it), so every lane banto forks is too, and amy
+        // is the one with authority to assign their performers. This
+        // matches the documented example verbatim (`docs/approval-identity.md`,
+        // "For an explicit context assignment, Amy runs: `kj context set
+        // repair --as coder --reviewer banto`") — today's mechanics give
+        // this step to amy, not banto; `docs/character.md`'s "Roots and
+        // rotation" chain, once implemented, is what would let banto do it
+        // itself.
+        // ------------------------------------------------------------
+        let (callback, mut turn_rx) = turn_events_channel(64);
+        s.amy.subscribe_turn_events(callback).await.expect("subscribe_turn_events");
+
+        s.amy.join_context(banto_ctx, "amy-in-banto").await.expect("join banto");
+        s.amy
+            .edit_input(banto_ctx, 0, "kick off today's lanes", 0)
+            .await
+            .expect("edit_input");
+        let submit = s.amy.submit_input(banto_ctx, false).await.expect("submit_input");
+
+        let all = s.amy.get_blocks(banto_ctx, &BlockQuery::All).await.expect("get_blocks");
+        let prompt_block = all
+            .iter()
+            .find(|b| b.id == submit.block_id)
+            .expect("the submitted prompt block exists");
+        assert_eq!(
+            prompt_block.id.principal_id, s.amy_principal,
+            "amy's prompt block must be authored by amy's connection principal"
+        );
+
+        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 1a (fork)");
+        assert_eq!(
+            s.kernel.kernel_db.lock().get_context(banto_ctx).unwrap().unwrap().played_by,
+            Some(banto_principal),
+            "banto's seat is played by banto"
+        );
+
+        let lane_a_ctx = s.context_by_label("lane-a");
+        let lane_b_ctx = s.context_by_label("lane-b");
+        for (label, ctx) in [("lane-a", lane_a_ctx), ("lane-b", lane_b_ctx)] {
+            let row = s.kernel.kernel_db.lock().get_context(ctx).unwrap().unwrap();
+            assert_eq!(row.forked_from, Some(banto_ctx), "{label}'s structural parent must be banto's seat");
+        }
+
+        s.kj("kj context set lane-a --as coder-a --model mock/mock-coder-a").await;
+        s.kj("kj context set lane-b --as coder-b --model mock/mock-coder-b").await;
+
+        // ------------------------------------------------------------
+        // Turn 1b: banto drives and waits on both lanes.
+        // ------------------------------------------------------------
+        s.kj("kj drive banto --prompt go").await;
+        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 1b (drive + wait)");
+
+        // ------------------------------------------------------------
+        // Assert: every banto text/tool-call block so far is authored by
+        // banto's principal, not amy's (the requester) or the system's —
+        // `docs/issues.md`, "Identity audit", item 5.
+        // ------------------------------------------------------------
+        let banto_blocks_after_turn1 = s.blocks(banto_ctx);
+        let model_authored: Vec<_> = banto_blocks_after_turn1
+            .iter()
+            .filter(|b| matches!(b.kind, BlockKind::Text | BlockKind::ToolCall) && b.role == Role::Model)
+            .collect();
+        assert!(
+            !model_authored.is_empty(),
+            "banto's turn 1 must have produced at least one model text/tool-call block"
+        );
+        for b in &model_authored {
+            assert_eq!(
+                b.id.principal_id, banto_principal,
+                "banto's model block {:?} (kind={:?}) must be authored by banto's principal, got {:?}",
+                b.id, b.kind, b.id.principal_id
+            );
+        }
+
+        // Assert: the lanes are played by the coder characters amy assigned.
+        for (label, ctx, performer) in [
+            ("lane-a", lane_a_ctx, coder_a_principal),
+            ("lane-b", lane_b_ctx, coder_b_principal),
+        ] {
+            let row = s.kernel.kernel_db.lock().get_context(ctx).unwrap().unwrap();
+            assert_eq!(
+                row.forked_from,
+                Some(banto_ctx),
+                "{label}'s structural parent must be banto's seat"
+            );
+            assert_eq!(
+                row.played_by,
+                Some(performer),
+                "{label} must be played by its assigned coder character"
+            );
+
+            let lane_blocks = s.blocks(ctx);
+            // A full fork (`kj fork`'s default — no `--include`/`--exclude`
+            // narrowing) shares the parent's history up to the fork point,
+            // block ids and all (`docs/fork-filters.md`) — lane-a's log
+            // therefore legitimately starts with banto's own pre-fork
+            // blocks, the fork tool call among them. Only the blocks after
+            // the lane's own seed (its `kj drive --prompt` text) are this
+            // lane's actual turn; that is what "authored by its own
+            // performer" pins.
+            let own_seed = lane_blocks
+                .iter()
+                .rposition(|b| b.role == Role::User)
+                .unwrap_or_else(|| panic!("{label} has no seed block to anchor its own turn"));
+            let lane_model_blocks: Vec<_> = lane_blocks[own_seed + 1..]
+                .iter()
+                .filter(|b| matches!(b.kind, BlockKind::Text | BlockKind::ToolCall) && b.role == Role::Model)
+                .collect();
+            assert!(
+                !lane_model_blocks.is_empty(),
+                "{label} must have produced at least one model block after its own seed"
+            );
+            for b in &lane_model_blocks {
+                assert_eq!(
+                    b.id.principal_id, performer,
+                    "{label}'s model block {:?} must be authored by its own performer, got {:?}",
+                    b.id, b.id.principal_id
+                );
+            }
+        }
+
+        // Assert: each coder's `kj drift push` landed a report in banto's
+        // seat.
+        // `kj drift push` lands a `BlockKind::Drift` block — a plain
+        // substring match on "report: done" also catches `kj wait`'s own
+        // narrative tool-result text (RT4 tails both lanes' conversations,
+        // "report: done" included), so the kind filter is load-bearing,
+        // not decorative.
+        let banto_blocks_after_lanes = s.blocks(banto_ctx);
+        let report_count = banto_blocks_after_lanes
+            .iter()
+            .filter(|b| b.kind == BlockKind::Drift && b.content.contains("report: done"))
+            .count();
+        assert_eq!(
+            report_count, 2,
+            "both lanes' drift-pushed reports must land in banto's seat, found {report_count}"
+        );
+
+        // ------------------------------------------------------------
+        // Turn 2: banto notes a handoff.
+        // ------------------------------------------------------------
+        s.kj("kj drive banto --prompt go").await;
+        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 2 (handoff note)");
+
+        let tail_after_note = s.kj("kj handoff tail banto").await;
+        assert!(
+            tail_after_note.contains("lanes landed"),
+            "banto's handoff tail must contain the first note, got: {tail_after_note}"
+        );
+
+        // ------------------------------------------------------------
+        // Turn 3: banto's gated statement raises an ask. `echo` names no
+        // `kj` verb, so no tier in `gate.toml` — not even the
+        // `[context_type.director]` one this scenario just wrote — ever
+        // covers it; it is `Uncovered` and falls to the default `ask`
+        // (`crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s module doc).
+        // No hook install needed: this is the kernel's real default gate
+        // policy, the same one `gate_executes_wire.rs` and
+        // `user_input_identity.rs` exercise.
+        // ------------------------------------------------------------
+        s.kj("kj drive banto --prompt go").await;
+        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 3 (gated statement)");
+
+        let amy_principal_id = s.amy_principal;
+        let pending = s.kernel.kernel_db.lock().list_pending_asks().expect("list_pending_asks");
+        let ask = pending
+            .into_iter()
+            .find(|a| a.exec_source.as_deref().unwrap_or("").contains("gate-approved-for-real"))
+            .unwrap_or_else(|| panic!("banto's gated `echo` statement must have raised a pending ask"));
+        assert_eq!(
+            ask.context_id,
+            banto_ctx.as_bytes().to_vec(),
+            "the ask's context must be banto's seat"
+        );
+        assert_eq!(
+            ask.actor_id.as_deref(),
+            Some(banto_principal.as_bytes().as_slice()),
+            "the ask's actor must be banto, the performer who called shell_write"
+        );
+        assert_eq!(
+            ask.reviewer_id.as_deref(),
+            Some(amy_principal_id.as_bytes().as_slice()),
+            "the ask's reviewer resolves to amy — today's configured default \
+             (docs/approval-identity.md's accountability chain is not implemented \
+             yet; see this file's module doc)"
+        );
+
+        // ------------------------------------------------------------
+        // Amy answers the ask from her own context.
+        // ------------------------------------------------------------
+        s.kj(&format!("kj ledger allow {}", ask.request_id)).await;
+        wait_for("the ask to be decided", || {
+            matches!(
+                s.kernel.kernel_db.lock().get_approval(&ask.request_id).unwrap(),
+                Some(row) if row.status == kaijutsu_kernel::ApprovalStatus::Allowed
+            )
+        })
+        .await;
+
+        // The approval EXECUTES — the statement really ran as banto, not
+        // just a recorded decision (`docs/gate-shape-b.md`, "Slice 5:
+        // approval executes"): the ask's own linked output block fills in
+        // with the command's real stdout.
+        let output_block_id = ask
+            .output_block_id
+            .as_deref()
+            .and_then(kaijutsu_types::BlockId::from_key)
+            .expect("an executable ask links an output block");
+        wait_for("the approved statement to actually execute", || {
+            s.kernel
+                .documents
+                .get_block_snapshot(banto_ctx, &output_block_id)
+                .ok()
+                .flatten()
+                .map(|b| b.status == Status::Done && b.content.contains("gate-approved-for-real"))
+                .unwrap_or(false)
+        })
+        .await;
+
+        // ------------------------------------------------------------
+        // Turn 4: banto signs off — reached by the kernel's own automatic
+        // resume, not another explicit `kj drive`. Approving the ask opens
+        // a continuation epoch (`crates/kaijutsu-server/src/llm_stream.rs`'s
+        // gate-resume path) and the approved command's completion resumes
+        // banto's conversation on it directly: the mock queue's evidence
+        // (the "handoff signoff" round trip was already consumed by the
+        // time the next explicit `kj drive` ran, panicking the queue empty
+        // when this test still issued one) is what corrected this section —
+        // originally written assuming every turn boundary here was an
+        // explicit drive. `docs/approval-identity.md`, "Continuation
+        // windows and async work" names the mechanism; this scenario is the
+        // evidence that an *approval*, not only a human's own next message,
+        // is what resumes it.
+        // ------------------------------------------------------------
+        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 4 (auto-resumed signoff)");
+
+        // REAL DEFECT, found by this scenario, not a test-shape gap:
+        // `kj handoff note`/`signoff` with no explicit `--for` target
+        // resolve "whose log is this" via `resolve_caller_character`
+        // (`crates/kaijutsu-kernel/src/kj/handoff.rs:123-134`), which reads
+        // `caller.principal_id` — the authenticated REQUESTER
+        // (`docs/approval-identity.md`, "Three identities") — not
+        // `caller.actor_id`, the PERFORMER whose turn is actually running.
+        // The same file's note-insertion call
+        // (`crates/kaijutsu-kernel/src/kj/handoff.rs:178`,
+        // `insert_block_as(..., Some(caller.principal_id))`) stamps the
+        // note's author the same wrong way. Everywhere else on the turn
+        // path authorship correctly follows the performer
+        // (`crates/kaijutsu-server/src/llm_stream.rs`'s `insert_tool_call_as`
+        // calls take `actor_principal`, pinned by this file's own turn-1
+        // assertions above) — `kj handoff`'s implicit-target path is the
+        // one place that still uses the connection's original human
+        // identity instead. banto's own `kj handoff signoff 'rotating'`
+        // tool call above (no `--for` — the natural way a director signs
+        // off its own seat, `docs/approval-identity.md`, "The coder
+        // maintains a handoff while active... before an explicit wait or
+        // signoff") lands in AMY's handoff log, not banto's, because amy is
+        // the connection whose `submitInput` started this whole session and
+        // `principal_id` is preserved unchanged through every nested `kj`
+        // dispatch since. `crates/kaijutsu-kernel/src/kj/handoff.rs` is
+        // outside this lane's territory, so this is reported rather than
+        // fixed here; the two assertions below pin today's actual behavior
+        // so a fix (switching both sites to `caller.actor_id`) is visible
+        // as this test changing, not as it starting to fail.
+        let banto_tail = s.kj("kj handoff tail banto").await;
+        assert!(
+            banto_tail.contains("lanes landed"),
+            "the explicit-target note (`--for banto`) must still land in banto's own log, got: {banto_tail}"
+        );
+        assert!(
+            !banto_tail.contains("rotating"),
+            "if this now contains 'rotating', the misattribution above is fixed — \
+             update this pin and the successor assertion below to expect it too. Got: {banto_tail}"
+        );
+        let amy_tail = s.kj("kj handoff tail amy").await;
+        assert!(
+            amy_tail.contains("rotating"),
+            "banto's implicit-target signoff note currently misfiles into amy's log \
+             (the defect cited above) — got: {amy_tail}"
+        );
+
+        // ------------------------------------------------------------
+        // Rotation: today's documented manual procedure
+        // (`docs/prompts.md`, "Rotating a director context").
+        // ------------------------------------------------------------
+        s.kj("kj context create banto-next --type director --as banto --env 'ROTATED_FROM=banto'")
+            .await;
+        let banto_next_ctx = s.context_by_label("banto-next");
+
+        // `S16-handoff.kai` injects the handoff tail as a `Notification`
+        // block, not into the hydrated instruction text `kj context prompt`
+        // renders (that surface covers the `(System, Text)` create-lifecycle
+        // blocks — `docs/prompts.md` — plus runtime facts, not every
+        // notification a create-time rc script leaves). The block log is
+        // the durable record either way, so this checks it directly rather
+        // than the narrower rendered surface.
+        let banto_next_blocks = s.blocks(banto_next_ctx);
+        let handoff_injection = banto_next_blocks
+            .iter()
+            .find(|b| b.content.contains("Handoff") && b.content.contains("auto-injected at create"))
+            .unwrap_or_else(|| panic!("banto-next must have an injected handoff block"));
+        assert!(
+            handoff_injection.content.contains("lanes landed"),
+            "the injected handoff must carry the note that actually reached banto's own \
+             log, got: {}",
+            handoff_injection.content
+        );
+
+        let predecessor_injection = banto_next_blocks
+            .iter()
+            .find(|b| b.content.contains("Rotated from context"))
+            .unwrap_or_else(|| panic!("banto-next must have an injected predecessor excerpt"));
+        assert!(
+            predecessor_injection.content.contains("signed off."),
+            "the predecessor excerpt should reach banto's last turn, got: {}",
+            predecessor_injection.content
+        );
+    });
+}

@@ -7,8 +7,9 @@ use std::net::SocketAddr;
 
 use tokio::task::LocalSet;
 
-use kaijutsu_client::{KeySource, RpcClient, SshConfig};
+use kaijutsu_client::{KernelHandle, KeySource, RpcClient, SshConfig};
 use kaijutsu_server::{SshServer, SshServerConfig};
+use kaijutsu_types::{BlockId, BlockKind, BlockQuery, ContextId, Status};
 
 /// Run async test code on a single-threaded runtime with LocalSet (capnp-rpc requirement).
 pub fn run_local<F: std::future::Future<Output = ()>>(f: F) {
@@ -244,6 +245,72 @@ pub async fn start_server_with_kernel_handle() -> (SocketAddr, kaijutsu_server::
     let kernel = kernel_rx.await.expect("server dropped the kernel handle before sending it");
     tokio::task::yield_now().await;
     (addr, kernel)
+}
+
+/// Run `code` through `shell_execute` and poll until its output block
+/// reaches a terminal status, timing out after `timeout_ms`.
+///
+/// Returns `(command_block_id, output_content, output_status)`. Panics on
+/// timeout — `e2e_kj_workflow.rs`'s pattern, lifted here so more than one
+/// test file can drive an ordinary (non-gated) `kj` command without
+/// duplicating the poll loop.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn shell_exec_wait_timeout(
+    kernel: &KernelHandle,
+    code: &str,
+    context_id: ContextId,
+    timeout_ms: u64,
+) -> (BlockId, String, Status) {
+    let cmd_block_id = kernel
+        .shell_execute(code, context_id, false)
+        .await
+        .unwrap_or_else(|e| panic!("shell_execute({code:?}) failed: {e}"));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            let blocks = kernel
+                .get_blocks(context_id, &BlockQuery::All)
+                .await
+                .unwrap_or_default();
+            panic!(
+                "shell_exec_wait({code:?}) timed out after {timeout_ms}ms.\n\
+                 cmd_block_id={cmd_block_id:?}\n\
+                 blocks ({} total): {blocks:#?}",
+                blocks.len()
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let blocks = kernel
+            .get_blocks(context_id, &BlockQuery::All)
+            .await
+            .unwrap_or_else(|e| panic!("get_blocks failed while polling {code:?}: {e}"));
+
+        if let Some(output) = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_block_id))
+        {
+            match output.status {
+                Status::Done | Status::Error => {
+                    return (cmd_block_id, output.content.clone(), output.status);
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// [`shell_exec_wait_timeout`] with the shared 10-second default.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn shell_exec_wait(
+    kernel: &KernelHandle,
+    code: &str,
+    context_id: ContextId,
+) -> (BlockId, String, Status) {
+    shell_exec_wait_timeout(kernel, code, context_id, 10_000).await
 }
 
 /// Connect to server with ephemeral key.
