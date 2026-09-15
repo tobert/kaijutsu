@@ -31,6 +31,39 @@ Read by the lead; each line re-checked before it went here.
 - The scenario's `#[test]` count of one is load-bearing: the env var is set
   and never restored. A `Drop` guard makes that structural.
 
+## Accountability propagates at four more boundaries (Amy, 2026-09-15)
+
+Amy: "queue those four after the lane lands." Reviewer resolution walks
+`forked_from`, so every path that mints or re-parents a context decides
+who reviews. Fork and `kj context create` from inside a context are
+covered; these are not:
+
+1. **`kj context move` needs authority.** Re-parenting rewrites
+   `forked_from`, so it moves accountability with it, and it is gated by
+   Operator alone. A lane could reparent itself under `ROOT` and change
+   its reviewer. Require the authority of the new parent's responsible
+   character or the reviewer's, as casting does.
+2. **`kj context remove` orphans children.** `forked_from` is
+   `ON DELETE SET NULL`, so a removed context's children become forest
+   roots and their asks fall to the default with nothing recorded. Refuse
+   while live children exist.
+3. **Handoff logs are parentless.** `kj handoff note` mints the
+   character's log with `forked_from: None` (`kj/handoff.rs`), a
+   parentless context played by a model. Mint it from the character's
+   `root_ctx` once that exists, and from `ROOT` until then.
+4. **Wire creates are parentless.** `create_context_inner` writes
+   `forked_from: None` for the app, the tui, ACP with a character, and the
+   MCP bridge's per-session contexts. Take an optional parent on the wire
+   and default to the creator's `root_ctx`; belongs with the root_ctx
+   slice.
+
+Open question from the lane: the walk starts at the ask's own context,
+so an actor who is not that context's performer, a human typing in a
+lane coder plays, resolves to coder. Starting at the parent would give
+banto. Both are models. Neither the docs nor a test pins it; Amy decides
+whether a human's command in a model's lane is reviewed by that model,
+by its parent, or walks to the nearest root.
+
 ## Roots, accountability as a runtime relation, and rotation (Amy, 2026-09-15)
 
 Guidance in `docs/character.md`, "Roots and rotation", and
