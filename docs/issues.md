@@ -31,58 +31,48 @@ Read by the lead; each line re-checked before it went here.
 - The scenario's `#[test]` count of one is load-bearing: the env var is set
   and never restored. A `Drop` guard makes that structural.
 
-## After slice 1 of the chain: two things it surfaced (2026-09-15)
-
-- **An explicit reviewer can still equal a direct human actor.** The
-  resolver returns an explicit override or delegation as configured even
-  when it names the actor, because a director legitimately delegates
-  review of the contexts it directs to itself and the strict
-  performer-versus-reviewer check lives at assignment. A human who sets
-  themselves as a context's explicit reviewer and then runs a gated
-  command there directly gets an unanswerable ask. Belongs to slice 2
-  with the root self-confirmation.
-- **`kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
-  is flaky under the parallel test runner** and passes single-threaded;
-  pre-existing, reproduced with slice 1 stashed.
-
-## Roots, the accountability chain, and rotation (Amy, 2026-09-15)
+## Roots, accountability as a runtime relation, and rotation (Amy, 2026-09-15)
 
 Guidance in `docs/character.md`, "Roots and rotation", and
-`docs/approval-identity.md`, "Planned: the accountability chain". Queued in
-build order; each slice leaves the tree green.
+`docs/approval-identity.md`. Amy, after reading the noon slice: "My thought
+was that accountable_to is a relation at runtime, so if banto forks a
+coder, that coder is accountable to the precise banto that forked it, not
+any banto." Queued in build order; each slice leaves the tree green.
 
-Slice 1 (reviewer resolution takes the actor and walks `accountable_to`)
-shipped: `effective_approval_reviewer` and `resolve_review_assignment` gain
-the actor and the chain layer (override, delegation, chain, default). The
-gate's ask-raising resolver never returns the actor; a retired chain link
-refuses, naming it, rather than being skipped or silently substituted.
-
-1. **A root confirms itself.** When resolution finds no reviewer for a root
-   actor, the gate returns an in-band confirmation instead of creating an
-   ask, and the ledger records a self-confirmation. `user_input_identity.rs`'s
-   fourth test flips to the new behavior. Escalate refuses at a root.
+1. **The walk replaces the sheet chain, and a root confirms itself.**
+   Reviewer resolution walks `forked_from` to the nearest ancestor whose
+   responsible character (performer, else director) is live and not the
+   actor; the sheet's `accountable_to` column, `kj character set
+   --accountable-to|--root`, `create --accountable-to`, the retire
+   dependent guard, and the casting rule's chain check are demolished. The
+   sheet gains a `root` flag. When the walk finds no one, the ask is raised
+   with the actor as reviewer and only the actor may answer it, recorded as
+   a self-confirmation; this also settles an explicit reviewer that equals
+   the actor. Escalate climbs the walk. Wire-created contexts have no
+   parent and resolve through their director, then the default.
 2. **A root character has no model.** `turn_identity::resolve` refuses a
-   performer with `accountable_to = NULL` and names the rule; `kj character
-   set --root` on a character with a cast, or a cast on a root, refuses.
+   performer whose sheet is `root`; casting a root refuses.
 3. **`ROOT` is reserved and single.** One reserved-names set (`ROOT`, the
    drift queue, factory preset labels); `ROOT` claimed once per kernel like
    the drift queue; it must be played by a root character. Move the label
    from banto's seat to Amy's root context; banto's seat is labeled `banto`.
 4. **`root_ctx` on the sheet, with rotation as its reader.** `kj context
-   rotate <character>` (or `create --rotate`): reads the predecessor from the
-   sheet, sets `ROTATED_FROM`, mints the successor with the same type and
-   cast and performer, moves the pointer, archives the predecessor, one
-   transaction. Label follows the live holder. `docs/prompts.md`, "Rotating
-   a director context" changes to the verb.
+   rotate <character>`: reads the predecessor from the sheet, creates the
+   successor from the predecessor's own parent with the same type, cast,
+   and performer, sets `ROTATED_FROM`, moves the pointer, archives the
+   predecessor, one transaction. Label follows the live holder.
+   `docs/prompts.md`, "Rotating a director context" changes to the verb.
 5. **`create --as` asks instead of refusing.** Apply the held patch
    (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
-   then turn its refusal into an ask to the actor's reviewer, and accept a
-   redeemed approval for the exact statement as authority. A static allow
-   rule for a well-formed self-rotation is a policy entry, added when Amy
-   wants rotation unattended.
-6. **banto from `ROOT`.** Seed: `amy` root, `banto` accountable to amy,
-   banto's seat created from the root context. A migration note for the
-   live kernel, since `ROOT` is banto's today.
+   turn its refusal into an ask to the responsible character above, and
+   accept a redeemed approval for the exact statement as authority. A
+   static allow rule for a well-formed self-rotation is a policy entry.
+6. **banto from `ROOT`.** Seed: `amy` root, banto's seat created from the
+   root context. A migration note for the live kernel, since `ROOT` is
+   banto's today.
+
+Also open: `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
+is flaky under the parallel test runner and passes single-threaded.
 
 ## Identity audit: what stays open (2026-09-15)
 
@@ -92,12 +82,9 @@ to check who it is?"* Scan by the lead plus a kaibo (deepseek) audit against
 `docs/approval-identity.md`; every line below was re-read by the lead. Full
 notes: `~/exomemory/kaijutsu/identity-gate-audit-2026-09-15.md`.
 
-`accountable_to` shipped 2026-09-15 (`kernel_db.rs:1184`,
-`update_character_accountable_to`, `kj character create --accountable-to`,
-`kj character set --accountable-to|--root`): the sheet has the column,
-validated (never self, never a cycle, target must be live), and `kj
-character retire` refuses a live dependent. No gate site reads it yet —
-that is still open. Reviewer resolution, delegation, answering,
+The sheet-level `accountable_to` that shipped at noon is being replaced by
+the runtime relation ("Roots, accountability as a runtime relation");
+Reviewer resolution, delegation, answering,
 cancel/escalate, redemption, turn identity, `require_cap`, the facade gate,
 and every draft/shell RPC read the identifier the doc names. Open:
 

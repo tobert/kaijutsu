@@ -26,7 +26,7 @@ does not become an instruction to use nonexistent features.
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
-| Accountability | `accountable_to` on the sheet; `NULL` is a root. `kj character create --accountable-to <character>` sets it at mint time, `kj character set <character> --accountable-to <character>\|--root` updates or clears it afterward. Validated in the DB layer inside one transaction: never self, never a target that would close a cycle (the target's own chain is walked), and the target must exist and be live. `kj character retire` refuses while a live character is still accountable to it — re-root or retire the dependent first. No reader of the field exists yet; this ships the sheet column and its validation only |
+| Accountability | A relation between contexts: `forked_from`, set by fork and by `kj context create` from inside a context; the responsible character is the performer, or the director when unset. Reviewer resolution walks it (`docs/approval-identity.md`). The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
 
 Sources: `kernel_db.rs::CharacterRow`, `kj/context.rs::context_create`,
 `kj/character.rs`, `kj/handoff.rs`, `kj/lifecycle.rs::load_rc_scripts` in
@@ -117,42 +117,69 @@ Two things follow, and they are the ones to check a change against:
 
 ## Roots and rotation (guidance, Amy, 2026-09-15)
 
-- **A root character has no model.** `accountable_to` is `NULL`, it has no
-  cast, and turn identity refuses it as a performer. A root is a place with
-  hands on it: Amy fools around there, and during bootstrap asks a Claude
-  Code session to do something through the MCP bridge, where the model is
-  outside the kernel and drives through `kj`. Autonomous operation restricts
-  it further later.
-- **A root context is played by a root character and holds the reserved
-  name `ROOT`.** One live holder per kernel, claimed the way the drift
-  queue is claimed on the router. The reserved names live in one place:
-  `ROOT`, the drift queue, and the factory preset labels.
+- **Accountability is a relation between performances, not between
+  sheets.** A context is accountable to the context it was forked or
+  created from: `forked_from` on the context row, set by `kj fork` and by
+  `kj context create` run from inside a context. The character responsible
+  for a context is its performer, or its director when no performer is
+  set. So a coder lane banto forks is accountable to that banto seat, not
+  to "banto" in general, and two bantos never collide. There is no
+  `accountable_to` on the character sheet; Amy: "accountable_to is a
+  relation at runtime, so if banto forks a coder, that coder is accountable
+  to the precise banto that forked it, not any banto."
+- **A root context has no `forked_from`.** A context created over the wire
+  with no parent, or `ROOT`, is a root of the forest. Its responsible
+  character is a root character.
+- **A root character has no model.** The sheet carries a `root` flag set at
+  create; a root has no cast and turn identity refuses it as a performer. A
+  root is a place with hands on it: Amy fools around there, and during
+  bootstrap asks a Claude Code session to do something through the MCP
+  bridge, where the model is outside the kernel and drives through `kj`.
+  Autonomous operation restricts it further later.
+- **`ROOT` is reserved and single.** One live holder per kernel, played by
+  a root character, claimed the way the drift queue is claimed on the
+  router. The reserved names live in one place: `ROOT`, the drift queue,
+  and the factory preset labels.
 - **Rotation belongs to `root_ctx`, and every character has one.** On a
   root character it names the root context; on a model character it names
   the home seat. Rotation mints a successor of the same type and cast,
-  played by the same character, sets `ROTATED_FROM` from the pointer,
-  moves the pointer, and archives the predecessor, in one transaction. The
-  label follows the live holder, as `ROOT` does today. A root rotates too,
-  when its history goes stale; a root confirms itself, so no ask is raised.
-  Forks and delegated lanes are work, never `root_ctx`.
-- **banto is accountable to amy and starts from `ROOT`.** Its home seat is
-  created from the root context so its lineage begins there. The seat takes
-  the character's name as its label. The old arrangement, where `ROOT` named
-  banto's director seat, ends: `ROOT` is Amy's, banto's seat is `banto`.
-- **The reviewer is the nearest character above the actor.** Resolution
-  takes the actor: explicit override, then the director's delegation, then
-  the first live character up the actor's `accountable_to` chain, then the
-  configured default. It never returns the actor. A root acting on its own
-  behalf has nobody above it, so its gated statement never becomes an ask; the
-  gate returns an in-band confirmation and the ledger records a
-  self-confirmation. Escalation stops at a root. See
-  `docs/approval-identity.md`, "Planned: the accountability chain".
+  played by the same character, from the predecessor's own parent, sets
+  `ROTATED_FROM` from the pointer, moves the pointer, and archives the
+  predecessor, in one transaction. The label follows the live holder, as
+  `ROOT` does today. A root rotates too, when its history goes stale; a
+  root confirms itself, so no one else is asked. Forks and delegated lanes
+  are work, never `root_ctx`.
+- **banto starts from `ROOT`.** Its home seat is created from the root
+  context, so its lineage, and its accountability, begin there. The seat
+  takes the character's name as its label. The old arrangement, where
+  `ROOT` named banto's director seat, ends: `ROOT` is Amy's, banto's seat
+  is `banto`.
+- **The reviewer is the responsible character of the nearest ancestor.**
+  Resolution takes the actor and the context: an explicit override on the
+  context, then the director's delegation, then the walk up `forked_from`
+  to the first ancestor whose responsible character is live and is not the
+  actor, then the configured default. Archived ancestors are walked
+  through; what matters is who is responsible for them. When the walk
+  ends without finding anyone else, the actor is at its own root and the
+  ask is a **self-confirmation**: the row is raised with the actor as its
+  reviewer, the actor alone may answer it, and the ledger records the
+  answer as a self-confirmation. Every other ask has a reviewer who is not
+  its actor, so an ask nobody can answer cannot exist. Escalation climbs
+  the same walk one ancestor further and refuses at a root. See
+  `docs/approval-identity.md`.
+- **A director casts its children.** `kj context set <ctx> --as <character>`
+  is allowed when the caller is the context's resolved reviewer, or when
+  the caller's actor directs the context, which a fork or create from the
+  caller's own context records. Casting is what makes the cast character
+  accountable to the caller there; no sheet relation is consulted. Roots
+  cannot be cast, since they have no model.
 - **A model asks to rotate itself.** `kj context create --as <character>` by
-  a caller without reviewer authority raises an ask instead of refusing; the
-  reviewer is the root above it; approval executes the statement, and the
-  verb accepts a redeemed approval for that exact statement as its
-  authority. A static rule in the allow tier may pass a rotation whose
-  character, type, and predecessor line up, when Amy wants it unattended.
+  a caller without reviewer authority raises an ask instead of refusing;
+  the reviewer is the responsible character above it; approval executes
+  the statement, and the verb accepts a redeemed approval for that exact
+  statement as its authority. A static rule in the allow tier may pass a
+  rotation whose character, type, and predecessor line up, when Amy wants
+  it unattended.
 
 ### A session, inside kaijutsu
 
@@ -164,7 +191,7 @@ prompts, banto directs lanes, and the lanes are contexts.
    authors a user block as amy, and the turn runs with banto as actor and amy
    as reviewer.
 2. banto plans and forks lanes with filters, each played by a coder character
-   accountable to banto, each with a label, a territory, and a worktree under
+   forked from banto's seat, each with a label, a territory, and a worktree under
    `~/src/wt/`.
 3. Lanes run as driven turns. banto drives and waits. A lane's gated
    statement walks the chain to banto; banto's own, such as a commit, walks to
@@ -317,7 +344,7 @@ CREATE TABLE IF NOT EXISTS characters (
     created_at       INTEGER NOT NULL,
     retired_at       INTEGER,                     -- characters retire; never deleted
     -- arrive with later slices:
-    accountable_to   BLOB REFERENCES characters(principal_id) ON DELETE RESTRICT,
+    root             INTEGER NOT NULL DEFAULT 0, -- no model; see "Roots and rotation"
     default_cast_id  BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     rc_dir           TEXT,                        -- default /config/rc/character/<name>
     memory_root      TEXT,                        -- host path; NULL = no memory of its own
@@ -1005,7 +1032,7 @@ Each slice is independently shippable and leaves the tree green.
    doc comment said otherwise until 2026-09-05.
 7. **Drift to a character.** `@name` addressing; one resolver.
 8. **Janitor, then proctor.** The `yakin` character, its track, its tick rc;
-   `accountable_to` and `default_cast_id` arrive with the character rows that
+   `default_cast_id` arrives with the character rows that
    need them; the distill-cast refusal and `--distill-model` on pull.
 
 Deferred: saifu, availability, and `memory_root` until a reader exists.

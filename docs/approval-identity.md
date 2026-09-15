@@ -27,24 +27,27 @@ metadata visible and reports a reviewer error when its assignment cannot
 resolve. Direct client commands remain available for inspection and repair;
 the gate still refuses an ask with no valid reviewer.
 
-Reviewer resolution takes the acting character (the actor) and follows this
-order:
+Reviewer resolution takes the acting character (the actor) and the
+context, and follows this order:
 
 1. Explicit reviewer override on the context.
 2. Explicit delegation for its director character.
-3. The first live character above the actor in its `accountable_to` chain
+3. The responsible character of the nearest ancestor context, walking
+   `forked_from` upward, that is live and is not the actor. A context's
+   responsible character is its performer, or its director when no
+   performer is set. Archived ancestors are walked through
    (`docs/character.md`, "Roots and rotation").
 4. Configured default reviewer, Amy.
 
 The default layer skips itself when it would name the actor, since it is
-independently configured and unrelated to the actor's own assignment — the
-one layer where a match is coincidence, not intent. When every layer is
-exhausted for a root actor this way — no `accountable_to` parent, and the
-default either is unset or names the actor itself — the gate has nobody to
-raise the ask to. Today it refuses in-band, naming the root; a planned
-self-confirmation replaces that refusal (see below). Explicit override and
-delegation resolve as configured even when they name the actor; see
-"Current implementation" for why.
+independently configured and unrelated to the actor's own assignment.
+When every layer is exhausted, the actor is at its own root: the ask is
+raised with the actor as its reviewer, the actor alone may answer it, and
+the ledger records the answer as a self-confirmation. The performer of a
+model turn is never a root, so self-confirmation is a human's act. An
+explicit override or delegation that names the actor resolves the same
+way, as a self-confirmation, since the human set it up. Escalation climbs
+the walk one ancestor further and refuses at a root, naming it.
 
 Amy can delegate review across a director's coder contexts:
 
@@ -77,17 +80,15 @@ override. Regular client creation leaves the performer unset, so model work
 still needs an explicit performing character.
 
 `kj context set <ctx> --as <character>` is allowed for a caller who is not
-the target's resolved reviewer when the target's `director_id` names the
-caller and the named performer's `accountable_to` chain reaches the caller
-(guidance, Amy 2026-09-15, "yes banto can cast its own children") — a
-director may cast, as a context it directs, any character accountable to
-it through that chain, without needing to be the context's reviewer
-itself. Casting itself trivially satisfies the chain. This is a second way
-to earn `--as` authority, not a change to reviewer authority: it does not
-let a director assign `--reviewer` or `--director`, which still require
-the default reviewer, and it does not make the director the context's
-reviewer for the performer it just cast — that is still resolved
-separately, and the performer still cannot review its own work.
+the target's resolved reviewer when the caller's actor directs the target,
+which a fork or a create from the caller's own context records as
+`director_id` (guidance, Amy 2026-09-15, "yes banto can cast its own
+children"). Casting is what makes the cast character accountable to the
+caller in that context; no sheet relation is consulted, and a root
+character cannot be cast. This is a second way to earn `--as` authority,
+not a change to reviewer authority: it does not let a director assign
+`--reviewer` or `--director`, which still require the default reviewer,
+and the performer still cannot review its own work.
 
 ## Three identities
 
@@ -253,39 +254,24 @@ superseded request need explicit linkage so rotation does not duplicate work.
   Having no default expiry does not change those policies. Restart survival and
   rotation recovery need an explicit execution/recovery design before removal
   of those cleanup paths.
-- Reviewer resolution takes the actor and walks its `accountable_to` chain
-  as a layer between delegation and the configured default (guidance from
-  Amy, 2026-09-15; see `docs/character.md`, "Roots and rotation"). Explicit
-  override and delegation resolve as configured even when they name the
-  actor — a director may legitimately delegate review of its OTHER
-  contexts to itself (`kj ledger delegation grant banto --to banto`);
-  self-review specifically for the actor's own work is caught by the
-  caller that knows it is validating a performer assignment
-  (`validate_model_review_assignment`, and `kj context set`'s commit-time
-  check), not by the general-purpose resolver. The chain layer cannot name
-  the actor at all — `update_character_accountable_to` refuses a
-  self-reference. Only the default layer, unrelated to the actor's own
-  configuration, skips itself on a match instead of substituting the
-  actor. A retired chain link refuses, naming it, rather than being
-  skipped. `kj ledger escalate` without `--to` defaults to the first live
-  character above the ask's CURRENT reviewer in its own chain, and refuses
-  at a root ("at the root; nobody above `<name>`").
-- A root actor — no `accountable_to` parent, and the configured default is
-  either unset or names the actor itself — exhausts every resolution layer.
-  The gate does not yet raise an in-band self-confirmation for this case
-  (see "Planned" below); it refuses the same way an unconfigured reviewer
-  always has, naming the root by name so the refusal is diagnosable.
-  `crates/kaijutsu-server/tests/user_input_identity.rs` pins this interim
-  behavior.
+- Reviewer resolution takes the actor and the context and walks
+  `forked_from` (guidance from Amy, 2026-09-15; see `docs/character.md`,
+  "Roots and rotation"). Explicit override and delegation resolve as
+  configured even when they name the actor; the walk itself never returns
+  the actor. A retired responsible character on an ancestor refuses,
+  naming it, rather than being skipped. `kj ledger escalate` without
+  `--to` climbs one ancestor further and refuses at a root.
+- Self-confirmation: an ask whose reviewer is its own actor is answerable
+  only by that actor, and the decision is recorded as a self-confirmation.
+  The performer-cannot-approve rule holds for every other ask.
 
-## Planned: the accountability chain
+## Planned
 
 Guidance from Amy, 2026-09-15; see `docs/character.md`, "Roots and
-rotation". Reviewer resolution itself (the previous bullets) is
-implemented; the rest of this section is not.
+rotation".
 
 A `kj context create --as <character>` by a caller without reviewer
 authority raises an ask rather than refusing; approval executes the
 statement and the verb accepts a redeemed approval for that statement as
-authority.
-
+authority. A root character cannot perform a model turn, and `ROOT` is a
+reserved, single name.
