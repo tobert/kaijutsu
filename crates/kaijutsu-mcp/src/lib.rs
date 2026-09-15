@@ -1007,59 +1007,6 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Resolve a user-provided context query (label or hex prefix) to a ContextId.
-    async fn resolve_context(
-        &self,
-        actor: &ActorHandle,
-        query: &str,
-    ) -> Result<kaijutsu_types::ContextId, String> {
-        let contexts = actor
-            .list_contexts()
-            .await
-            .map_err(|e| format!("Error listing contexts: {e}"))?;
-        let entries = contexts.iter().map(|c| {
-            let label: Option<&str> = if c.label.is_empty() {
-                None
-            } else {
-                Some(&c.label)
-            };
-            (c.id, label)
-        });
-        kaijutsu_types::resolve_context_prefix(entries, query)
-            .map_err(|e| format!("Error resolving context '{query}': {e}"))
-    }
-
-    /// Resolve a context ID for input document operations.
-    ///
-    /// If `query` is Some, resolves via label/hex prefix lookup (Remote) or
-    /// direct parse (Local). If None, falls back to the current joined
-    /// context (Remote) or errors (Local).
-    async fn resolve_input_context(
-        &self,
-        query: Option<&str>,
-    ) -> Result<kaijutsu_types::ContextId, String> {
-        match (&self.backend, query) {
-            // Explicit context provided — resolve it
-            (Backend::Remote(remote), Some(q)) => self.resolve_context(&remote.actor, q).await,
-            (Backend::Local(_), Some(q)) => {
-                ContextId::parse(q).map_err(|e| format!("Error: invalid context ID '{}': {}", q, e))
-            }
-            // No context provided — use current joined context
-            (Backend::Remote(remote), None) => {
-                let guard = remote.joined.read().await;
-                match guard.as_ref() {
-                    Some(joined) => Ok(joined.context_id),
-                    None => {
-                        Err("Error: no active context — call register_session first".to_string())
-                    }
-                }
-            }
-            (Backend::Local(_), None) => {
-                Err("Error: context_id is required in local mode".to_string())
-            }
-        }
-    }
-
     /// Shared polling loop for shell command completion.
     ///
     /// `shell()` dispatches a command via `shell_execute`, then waits for the
@@ -1839,7 +1786,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell, read_input/write_input/submit_input). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
+        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell, kaish_exec). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
@@ -2306,165 +2253,6 @@ impl KaijutsuMcp {
         }
     }
 
-    // ========================================================================
-    // Input Document Tools (compose scratchpad)
-    // ========================================================================
-
-    #[tool(
-        description = "Read the current input document text for a context. The input document is a kernel-owned scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
-    )]
-    #[tracing::instrument(skip(self, req), name = "mcp.read_input")]
-    async fn read_input(&self, Parameters(req): Parameters<InputReadRequest>) -> CallToolResult {
-        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
-            Ok(id) => id,
-            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
-        };
-
-        match &self.backend {
-            Backend::Local(_store) => {
-                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
-            }
-            Backend::Remote(remote) => {
-                match remote.actor.get_input_state(ctx_id).await {
-                    Ok(state) => CallToolResult::success(vec![ContentBlock::text(
-                        serde_json::json!({
-                            "context_id": ctx_id.short(),
-                            "content": state.content,
-                            "length": input_char_len(&state.content),
-                            "version": state.version,
-                        }).to_string(),
-                    )]),
-                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
-                }
-            }
-        }
-    }
-
-    #[tool(
-        description = "Replace all text in the input document. Clears existing content and writes the new text. The input document is shared — changes are visible to all participants immediately. Omit context_id to use the current context.",
-        annotations(destructive_hint = false, open_world_hint = false)
-    )]
-    #[tracing::instrument(skip(self, req), name = "mcp.write_input")]
-    async fn write_input(&self, Parameters(req): Parameters<InputWriteRequest>) -> CallToolResult {
-        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
-            Ok(id) => id,
-            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
-        };
-
-        match &self.backend {
-            Backend::Local(_store) => {
-                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
-            }
-            Backend::Remote(remote) => {
-                // Get current state to know how much to delete — in CHARS,
-                // matching edit_input's char-addressed `delete` (found by the
-                // kaijutsu-acp lane: bytes here over-deletes on non-ASCII).
-                let current_len = match remote.actor.get_input_state(ctx_id).await {
-                    Ok(state) => input_char_len(&state.content),
-                    Err(e) => {
-                        return CallToolResult::error(vec![ContentBlock::text(format!(
-                            "Error getting current state: {e}"
-                        ))]);
-                    }
-                };
-                // Delete all, then insert new text in one operation
-                match remote
-                    .actor
-                    .edit_input(ctx_id, 0, &req.text, current_len)
-                    .await
-                {
-                    Ok(version) => CallToolResult::success(vec![ContentBlock::text(
-                        serde_json::json!({
-                            "success": true,
-                            "context_id": ctx_id.short(),
-                            "length": input_char_len(&req.text),
-                            "version": version,
-                        }).to_string(),
-                    )]),
-                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
-                }
-            }
-        }
-    }
-
-    #[tool(
-        description = "Surgical edit on the input document: insert and/or delete characters at a specific position. More efficient than write_input for small edits to large text. Omit context_id to use the current context.",
-        annotations(destructive_hint = false, open_world_hint = false)
-    )]
-    #[tracing::instrument(skip(self, req), name = "mcp.edit_input")]
-    async fn edit_input(&self, Parameters(req): Parameters<InputEditRequest>) -> CallToolResult {
-        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
-            Ok(id) => id,
-            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
-        };
-
-        match &self.backend {
-            Backend::Local(_store) => {
-                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
-            }
-            Backend::Remote(remote) => {
-                match remote
-                    .actor
-                    .edit_input(ctx_id, req.pos, &req.insert, req.delete)
-                    .await
-                {
-                    Ok(version) => CallToolResult::success(vec![ContentBlock::text(
-                        serde_json::json!({
-                            "success": true,
-                            "context_id": ctx_id.short(),
-                            "version": version,
-                        }).to_string(),
-                    )]),
-                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
-                }
-            }
-        }
-    }
-
-    #[tool(
-        description = "Submit the input document: snapshot its content into a conversation block and clear it. This is equivalent to pressing Enter in the compose box. Returns the created block ID and whether it was detected as a shell command. Omit context_id to use the current context.",
-        annotations(destructive_hint = true, open_world_hint = false)
-    )]
-    #[tracing::instrument(skip(self, req), name = "mcp.submit_input")]
-    async fn submit_input(&self, Parameters(req): Parameters<InputSubmitRequest>) -> CallToolResult {
-        let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
-            Ok(id) => id,
-            Err(e) => return CallToolResult::error(vec![ContentBlock::text(e)]),
-        };
-        // A malformed edge is refused, never dropped: the caller said it
-        // could say where it was, so silently sending none would lie.
-        let edge = match req.edge_block.as_deref() {
-            None => None,
-            Some(key) => match kaijutsu_types::BlockId::from_key(key) {
-                Some(block) => Some(kaijutsu_types::InputEdge { block, shown: req.edge_shown }),
-                None => {
-                    return CallToolResult::error(vec![ContentBlock::text(format!(
-                        "Error: edge_block {key:?} is not a block key (use a block_id from block_list)"
-                    ))]);
-                }
-            },
-        };
-
-        match &self.backend {
-            Backend::Local(_store) => {
-                CallToolResult::error(vec![ContentBlock::text(LOCAL_INPUT_UNSUPPORTED)])
-            }
-            Backend::Remote(remote) => {
-                let is_shell = req.mode.as_deref() == Some("shell");
-                match remote.actor.submit_input_with_edge(ctx_id, is_shell, edge).await {
-                    Ok(result) => CallToolResult::success(vec![ContentBlock::text(
-                        serde_json::json!({
-                            "success": true,
-                            "context_id": ctx_id.short(),
-                            "block_id": result.block_id.to_key(),
-                        }).to_string(),
-                    )]),
-                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
-                }
-            }
-        }
-    }
 }
 
 // ============================================================================
@@ -3169,32 +2957,6 @@ impl ServerHandler for KaijutsuMcp {
 /// a JSON object or array, unwrap that one layer. A genuine scalar/string param
 /// (whose text is not JSON object/array) is passed through unchanged — we only
 /// undo the specific double-encoding, never reinterpret real string values.
-/// Length on the input-document surface, counted in CHARACTERS.
-///
-/// The compose surface exists only against a real kernel.
-///
-/// A draft is a block belonging to a (context, principal), authored through the
-/// kernel's mutation path like any other. Local mode has no connection and no
-/// principal on that path, so it cannot hold one. It previously drove
-/// `BlockStore`'s input document directly, which was already the odd one out —
-/// `submit_input` had always refused here — and once the draft became a block
-/// that document stopped being read by anything. Refusing all four is the
-/// honest answer: reading text nobody can submit, or writing text nobody will
-/// read, is worse than an error, because both look like they worked.
-const LOCAL_INPUT_UNSUPPORTED: &str =
-    "Error: the input/compose tools require --connect to kaijutsu-server";
-
-/// `edit_input`'s `pos`/`delete` are character-addressed (rpc.rs: "insert
-/// text at position, delete characters"), so every length this surface
-/// derives — and reports, since a reported length is the position math a
-/// caller's next edit starts from — must be chars. `str::len()` is bytes;
-/// feeding it to a char-addressed delete overshoots on any non-ASCII
-/// content (e.g. 日本語 is 9 bytes, 3 chars — the same byte→char class as
-/// the file-tools hashline bug).
-fn input_char_len(s: &str) -> u64 {
-    s.chars().count() as u64
-}
-
 fn normalize_peer_params(params: &serde_json::Value) -> serde_json::Value {
     if let serde_json::Value::String(s) = params
         && let Ok(inner @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
@@ -3209,20 +2971,6 @@ fn normalize_peer_params(params: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The input-document surface is character-addressed end to end
-    /// (`edit_input`'s `pos`/`delete` are chars), so its lengths must be
-    /// counted in chars — `write_input` used to feed `str::len()` BYTES as
-    /// the delete count, over-deleting on any non-ASCII content (found by
-    /// the kaijutsu-acp lane, 2026-08-05).
-    #[test]
-    fn input_lengths_are_chars_not_bytes() {
-        // 9 bytes; a byte-derived delete count would ask for 3x the doc.
-        assert_eq!("日本語".len(), 9, "premise: the byte length really differs");
-        assert_eq!(input_char_len("日本語"), 3);
-        assert_eq!(input_char_len("hello"), 5);
-        assert_eq!(input_char_len(""), 0);
-    }
 
     /// `register_session`'s peer nick follows the `<kind>/<name>` convention
     /// (docs/instrument-design.md): a session labeled "toad" attaches as
@@ -3337,116 +3085,6 @@ mod tests {
             &CallError::Timeout(std::time::Duration::from_secs(5))
         ));
         assert!(!KaijutsuMcp::is_retryable_label_conflict(&CallError::Shutdown));
-    }
-
-    // =========================================================================
-    // Input Document Tools (Local mode)
-    // =========================================================================
-
-    /// A malformed `edge_block` is refused before any backend is consulted:
-    /// the caller claimed to know where it was, and sending no edge instead
-    /// would silently drop the claim.
-    #[tokio::test]
-    async fn submit_input_refuses_a_malformed_edge_key() {
-        let mcp = KaijutsuMcp::new();
-        let result = mcp
-            .submit_input(Parameters(InputSubmitRequest {
-                context_id: Some(ContextId::new().to_string()),
-                mode: None,
-                edge_block: Some("not-a-block-key".to_string()),
-                edge_shown: Some(3),
-            }))
-            .await;
-        assert_eq!(result.is_error, Some(true), "{result:?}");
-        assert!(
-            call_result_text(&result).contains("edge_block"),
-            "the refusal names the field: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_read_input_local_requires_context() {
-        let mcp = KaijutsuMcp::new();
-        let result = mcp
-            .read_input(Parameters(InputReadRequest { context_id: None }))
-            .await;
-        assert_eq!(
-            result.is_error,
-            Some(true),
-            "Should error without context_id in local mode: {result:?}"
-        );
-        assert!(call_result_text(&result).contains("Error"), "{result:?}");
-    }
-
-    /// Every compose tool refuses in local mode, and refuses the same way.
-    ///
-    /// These four used to disagree: `submit_input` errored while read/write/edit
-    /// quietly drove `BlockStore`'s input document. Once the draft became a block
-    /// authored through the kernel, that document stopped being read by anything,
-    /// so the quiet three were writing where nobody looks and reading what nobody
-    /// can send. An error is the honest answer, and one error for all four is the
-    /// only shape an agent can learn.
-    #[tokio::test]
-    async fn every_compose_tool_refuses_without_a_kernel() {
-        let mcp = KaijutsuMcp::new();
-        let hex = ContextId::new().to_hex();
-
-        let read = mcp
-            .read_input(Parameters(InputReadRequest {
-                context_id: Some(hex.clone()),
-            }))
-            .await;
-        let write = mcp
-            .write_input(Parameters(InputWriteRequest {
-                context_id: Some(hex.clone()),
-                text: "hello from MCP".to_string(),
-            }))
-            .await;
-        let edit = mcp
-            .edit_input(Parameters(InputEditRequest {
-                context_id: Some(hex.clone()),
-                pos: 0,
-                insert: "x".to_string(),
-                delete: 0,
-            }))
-            .await;
-        let submit = mcp
-            .submit_input(Parameters(InputSubmitRequest {
-                context_id: Some(hex.clone()),
-                mode: None,
-                edge_block: None,
-                edge_shown: None,
-            }))
-            .await;
-
-        for (name, result) in [
-            ("read_input", &read),
-            ("write_input", &write),
-            ("edit_input", &edit),
-            ("submit_input", &submit),
-        ] {
-            // The refusal rides the MCP error envelope, so a client can key
-            // on `is_error` instead of parsing prose out of a success.
-            assert_eq!(
-                result.is_error,
-                Some(true),
-                "{name} must refuse through the MCP error envelope"
-            );
-            assert_eq!(
-                call_result_text(result),
-                LOCAL_INPUT_UNSUPPORTED,
-                "{name} must refuse in local mode with the shared message"
-            );
-        }
-    }
-
-    /// Concatenated text content of a tool result.
-    fn call_result_text(result: &CallToolResult) -> String {
-        result
-            .content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-            .collect()
     }
 
     // ========================================================================

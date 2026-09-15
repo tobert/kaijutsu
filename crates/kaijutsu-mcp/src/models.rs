@@ -3,7 +3,6 @@
 //! Slim surface after the MCP cleanup (see docs/kj-cleanup.md):
 //! - shell for context-bound command execution
 //! - kaish_exec as the escape hatch into kernel tools
-//! - {read,write,edit,submit}_input for the shared input scratchpad
 //! - register_session, invoke_peer for peer/session concerns
 //!
 //! The block_*, doc_*, kernel_search, and stage_commit request types
@@ -70,69 +69,6 @@ mod shell_request_tests {
             "command": "echo hello", "background": true,
         })).is_err());
     }
-}
-
-// ============================================================================
-// Input Document Types
-// ============================================================================
-
-/// Read the current input document text for a context.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct InputReadRequest {
-    /// Context ID (hex or label). Omit to use the current context.
-    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
-    pub context_id: Option<String>,
-}
-
-/// Replace the entire input document text.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct InputWriteRequest {
-    /// Context ID (hex or label). Omit to use the current context.
-    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
-    pub context_id: Option<String>,
-    /// The text to write (replaces all existing content).
-    #[schemars(description = "The text to write (replaces all existing content)")]
-    pub text: String,
-}
-
-/// Surgical edit on the input document: insert and/or delete at a position.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct InputEditRequest {
-    /// Context ID (hex or label). Omit to use the current context.
-    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
-    pub context_id: Option<String>,
-    /// Character position to start the edit (0-indexed).
-    #[schemars(description = "Character position to start the edit (0-indexed)")]
-    pub pos: u64,
-    /// Text to insert at the position (empty string for delete-only).
-    #[schemars(description = "Text to insert at the position (empty string for delete-only)")]
-    #[serde(default)]
-    pub insert: String,
-    /// Number of characters to delete starting at the position.
-    #[schemars(description = "Number of characters to delete starting at the position")]
-    #[serde(default)]
-    pub delete: u64,
-}
-
-/// Submit the input document: snapshot to a conversation block and clear.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct InputSubmitRequest {
-    /// Context ID (hex or label). Omit to use the current context.
-    #[schemars(description = "Context ID (hex UUID or label). Omit to use the current context.")]
-    pub context_id: Option<String>,
-    /// Input mode: "chat" (default) or "shell".
-    #[serde(default)]
-    #[schemars(description = "Input mode: 'chat' (default) or 'shell'.")]
-    pub mode: Option<String>,
-    /// The player's edge: the newest block this client had read when it
-    /// submitted, as a block key from block_list. Omit when you cannot say.
-    #[serde(default)]
-    #[schemars(description = "The newest block you had read when you submitted (a block_id from block_list). Stored on the message so the model knows what you were replying to; omit when you cannot say.")]
-    pub edge_block: Option<String>,
-    /// Characters of `edge_block` read, when that block was still streaming.
-    #[serde(default)]
-    #[schemars(description = "Characters of edge_block you had read, only when that block was still streaming.")]
-    pub edge_shown: Option<u64>,
 }
 
 // ============================================================================

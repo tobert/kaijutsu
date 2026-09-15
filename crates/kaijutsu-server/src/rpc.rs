@@ -48,7 +48,7 @@
 //! - **Peer Helper Functions** — `PeerInfo` capnp converters.
 //! - **Cap'n Proto ↔ Rust Type Helpers** — tool filter (de)serialization.
 //! - **Shell Execution Dispatch** — [`execute_shell_command`], shared by
-//!   the `shell_execute` RPC and `submit_input`.
+//!   the `shell_execute` and `submitInput` RPCs.
 //! - **Utility Functions** — block ID / filter / status converters.
 //! - **VFS Implementation** — [`VfsImpl`] (filesystem capability).
 //! - **Synthesis** — Rhai-driven keyword extraction.
@@ -7453,9 +7453,9 @@ impl kernel::Server for KernelImpl {
         let principal_id = self.connection.borrow().principal;
         Promise::from_future(
             async move {
-                // Shared facade gate — both live compose typing (app) and the
-                // MCP write_input/edit_input handlers reach the draft through
-                // this RPC, so the allow-set is enforced here for everyone.
+                // Shared facade gate — every client's compose typing (app,
+                // tui, ACP) reaches the draft through this RPC, so the
+                // allow-set is enforced here for everyone.
                 if let Err(e) = kernel
                     .kernel
                     .broker()
@@ -7562,8 +7562,8 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
-                // Shared facade gate (deny-by-default): submit is reachable by
-                // both the app (Enter in compose) and the MCP submit_input tool.
+                // Shared facade gate (deny-by-default): every client's Enter
+                // in compose reaches submit through this RPC.
                 if let Err(e) = kernel
                     .kernel
                     .broker()

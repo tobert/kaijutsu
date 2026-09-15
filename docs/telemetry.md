@@ -177,13 +177,15 @@ All `ExecutionEngine::execute()` implementations:
 | `DriftMergeEngine` | `drift.merge` | Merge fork back to parent |
 | `DriftLsEngine` | `engine.drift_ls` | List available contexts |
 
-### MCP Tools (10 tools)
+### MCP Tools (6 tools)
 
 The MCP slim-down cut 16 doc/block/drift-detail tools that duplicated
 kernel-side functionality now reached through `kj` (via `shell`/`context_shell`)
 — see the removal note at the top of `impl KaijutsuMcp` in
-`kaijutsu-mcp/src/lib.rs`. All 10 remaining `#[tool(...)]` methods have
-`#[tracing::instrument]`:
+`kaijutsu-mcp/src/lib.rs`. The compose-input tools (`read_input`/`write_input`/
+`edit_input`/`submit_input`) were removed 2026-09-15: the draft is the
+player's alone (`docs/issues.md`, "The compose draft is the player's alone").
+All 6 remaining `#[tool(...)]` methods have `#[tracing::instrument]`:
 
 | Tool | Span |
 |------|------|
@@ -193,10 +195,6 @@ kernel-side functionality now reached through `kj` (via `shell`/`context_shell`)
 | `register_session` | `mcp.register_session` |
 | `whoami` | `mcp.whoami` |
 | `invoke_peer` | `mcp.invoke_peer` |
-| `read_input` | `mcp.read_input` |
-| `write_input` | `mcp.write_input` |
-| `edit_input` | `mcp.edit_input` |
-| `submit_input` | `mcp.submit_input` |
 
 ### LLM (4 methods)
 

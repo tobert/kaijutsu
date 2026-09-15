@@ -92,9 +92,14 @@ runner-verify and `:e <path>`.
 ## The core idea: the editor is the input-doc surface, generalized
 
 The compose box is already a **kernel-owned editable buffer**: `input_doc.rs`,
-fronted by a tool-shaped surface — `read_input` / `write_input` / `edit_input` /
-`submit_input` (real MCP tools) — that the Bevy app merely *renders*. A model
-edits the compose box over the wire right now; the GUI is one view onto it.
+fronted by the `editInput`/`submitInput` RPC methods that the app and tui
+compose paths drive. The Bevy app merely *renders* it; the GUI is one view
+onto it.
+
+The pattern is shared; the target is not. The draft is the player's alone:
+it never gets a VFS path, a `kj` verb, or an editor session, because the
+safety assumptions around who submits a turn rest on it (`docs/issues.md`,
+"The compose draft is the player's alone").
 
 The vi editor is that **exact pattern pointed at a file/config block** instead
 of the input doc. So the testability win isn't scaffolding we throw away — it

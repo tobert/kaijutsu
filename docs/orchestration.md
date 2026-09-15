@@ -36,8 +36,8 @@ The most useful distinction for orchestration: **the Agent driving a context
 is not the same as the model bound to it.**
 
 An Agent (Claude, over MCP) can be wired to a context whose binding is Haiku.
-When the Agent calls `submit_input`, the kernel runs a turn for *Haiku*, not
-the Agent. The Agent has its hands at the keyboard; Haiku is the voice the
+When the Agent runs `kj drive`, the kernel runs a turn for *Haiku*, not
+the Agent. The Agent directs from the shell; Haiku is the voice the
 binding plays in.
 
 This is the key to multi-model orchestration: an Agent reads, plans, drifts,
@@ -92,25 +92,26 @@ When forking or registering, give every context a meaningful label.
 
 ## Patterns
 
-### 1. Drive a turn (submit-and-pump)
+### 1. Drive a turn
 
 To make a context's binding take a turn:
 
-```
-write_input text="..."
-submit_input
+```bash
+kj drive --prompt "..."
 ```
 
 The kernel pumps the binding for as long as the consent budget allows
 (see [Turn Pump](#the-turn-pump)), then pauses. New blocks accumulate in the
 document. Read them with `block_list`.
 
-The input document is kernel-owned and shared — the User in `kaijutsu-app`,
-an Agent over MCP, and other peers all see the same buffer. `submit_input`
-snapshots it into a user block and clears it.
+`kj drive` seeds a turn on the current context (or a named target — see
+`kj drive --help`) and publishes a turn request; the binding runs against
+that seed plus whatever is already in the context's block log.
 
-Use this when an Agent wants the binding's perspective. Let the model think;
-don't think for it.
+An Agent has no path to the compose draft — that is the player's alone (see
+`docs/issues.md`, "The compose draft is the player's alone"). Use `kj drive`
+when an Agent wants the binding's perspective. Let the model think; don't
+think for it.
 
 ### 2. Fork to explore
 
@@ -208,7 +209,8 @@ share the block store but have isolated histories.
 
 When does a binding actually take a turn?
 
-- **`submit_input` triggers a turn.** That's the event.
+- **A submit (`submitInput`, the human's compose path) or `kj drive` triggers
+  a turn.** That's the event.
 - The pump runs the binding for up to the **consent budget**. In
   collaborative mode the kernel pauses after a few agentic iterations with
   a `Paused after N agentic iteration(s)` message. The User or an Agent has
@@ -219,8 +221,8 @@ When does a binding actually take a turn?
   triggers an action on the receiving peer — e.g. "focus this block").
 
 Implication: an Agent that wants a binding to react to a drift must follow
-the drift with a submit — its own `submit_input` to that context, or an
-`invoke_peer` to a peer that will submit there.
+the drift with a `kj drive` on that context, or an `invoke_peer` to a peer
+that will drive it there.
 
 ## Known Friction
 
@@ -328,8 +330,7 @@ shell "kj drift flush"
 
 # 4. Move to the scout and let it think
 shell "kj context switch scout"
-write_input text="investigate as instructed; report findings"
-submit_input
+shell 'kj drive --prompt "investigate as instructed; report findings"'
 # wait, then block_list to see the binding's response
 
 # 5. Pull the scout's findings back

@@ -194,10 +194,6 @@ pub const KAIJUTSU_MCP_TOOLS: &[&str] = &[
     "block_diff",
     "block_history",
     "block_list",
-    "read_input",
-    "write_input",
-    "edit_input",
-    "submit_input",
     "register_session",
     "invoke_peer",
 ];

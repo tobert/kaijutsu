@@ -168,7 +168,7 @@ candidates, not commitments.
 - **Inline `@{file}` prompt injection.** The user can't say "here's the file I mean"
   in prompt text — they must wait for the model to choose to call `read`. gemini
   expands `@{path}` (text/image/PDF) in the input before submission. Parse `@{path}`
-  in `write_input`, respecting the VFS boundary.
+  in the compose write path (`editInput`), respecting the VFS boundary.
 - **`!{shell}` injection in prompt templates.** Pairs with command templates: gemini
   expands `!{git diff --staged}` stdout into the prompt at construction time (policy-
   confirmed), outside the model's tool loop — e.g. a `/git:review` one-liner.

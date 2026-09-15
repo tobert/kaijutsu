@@ -20,8 +20,10 @@ directly over RPC. The prior design fetched a server snapshot to seed a
 now-deleted `RemoteState.synced` mirror; nothing here builds or holds a document
 at all today (`docs/crdt-position-2026-08.md`, "The mirror that stopped being a
 mirror"). Tools: `shell`, `register_session`, `whoami`, `invoke_peer`,
-`kaish_exec`, `list_kernel_tools`, and the input tools
-(`read_input`/`write_input`/`edit_input`/`submit_input`). `HookListener`
+`kaish_exec`, `list_kernel_tools`. The compose-input tools
+(`read_input`/`write_input`/`edit_input`/`submit_input`) were removed
+2026-09-15 — the draft is the player's alone (`docs/issues.md`, "The
+compose draft is the player's alone"). `HookListener`
 (`hook_listener.rs:29`) is a Unix-socket server that turns Claude Code lifecycle
 events into blocks and injects drift context into responses.
 

@@ -6,6 +6,29 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## The compose draft is the player's alone (Amy, 2026-09-15)
+
+Amy: *"the draft should never have a path for the model to reach it. we may
+add things to the apps to make testing easier but that draft has to be user
+only for some of our assumptions about safety to hold up."* And: *"we'll
+allow the mcp for now, we use it a lot for testing, but we should mark it for
+removal later, y'all have drive and drift for talking to each other."*
+
+The draft is the per-principal input block written by `edit_draft`
+(`crates/kaijutsu-kernel/src/block_store.rs`) and reached only through the
+`edit_input`/`submit_input` RPC facades. Today the kernel editor cannot open
+it: `resolve_editor_target` (`crates/kaijutsu-kernel/src/editor.rs`) binds to
+file-backed blocks only, and no `kj` verb touches the draft. Keep it that way:
+no VFS path for the draft, no `kj input`, no editor session over it.
+
+The MCP bridge's `read_input`/`write_input`/`edit_input`/`submit_input` tools
+are gone as of today. A model that wants another player's attention uses `kj
+drive` and drift instead. What remains open: the facade gate at the wire
+(`facade:edit_input`/`facade:submit_input`) reads the context binding and
+cannot tell a human connection from a model principal holding its own
+credential, so the assumption that "a user block was typed by a human" is
+not yet enforced at the wire. That is the next design conversation.
+
 ## Thinking folds to a summary line once the player has moved on (Amy, 2026-09-12)
 
 Amy: *"I'm watching y'all work, and you're thinking, I often read/scan it

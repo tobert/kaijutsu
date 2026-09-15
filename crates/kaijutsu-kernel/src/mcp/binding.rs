@@ -22,19 +22,20 @@ use super::types::InstanceId;
 /// Resolved tool name → (instance, original tool name).
 pub type ResolvedName = (InstanceId, String);
 
-/// The facade tool surfaces a context can be granted. Facades are the
-/// non-broker-routed tools an agent reaches over RPC — they don't pass through
+/// The facade surfaces a context can be granted. Facades are the
+/// non-broker-routed surfaces reached over RPC — they don't pass through
 /// `broker.call_tool`, so they're enforced at the shared kernel RPC layer
-/// (`shell_execute`/`edit_input`/`submit_input` handlers), which both the human
-/// app and external agents cross. The same [`ContextToolBinding::allows`]
-/// predicate is consulted there.
+/// (`shell_execute`/`editInput`/`submitInput` handlers), which every client
+/// crosses. The same [`ContextToolBinding::allows`] predicate is consulted
+/// there.
 ///
 /// Collapsed surfaces: `shell` is the single context-bound shell MCP tool (one
-/// `shell_execute` RPC); `edit_input` covers both `write_input` and
-/// `edit_input` (write is edit-with-full-delete). `read_input`
-/// (`get_input_state`) is intentionally **not** gated — reading compose text is
-/// benign and gating it traps the `write_input` handler, which reads before it
-/// writes.
+/// `shell_execute` RPC); `edit_input` gates `editInput`, the compose draft's
+/// only write path; `submit_input` gates `submitInput`. Reading the draft
+/// (`getInputState`) is intentionally **not** gated — reading compose text is
+/// benign. The draft is the player's alone: no MCP tool, `kj` verb, or editor
+/// session reaches it (`docs/issues.md`, "The compose draft is the player's
+/// alone").
 ///
 /// **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3", Amy's
 /// 2026-08-16 ruling): `shell` is the unmarked, SAFE facade
@@ -167,7 +168,7 @@ pub enum Capability {
     /// — `kj editor save`, and a `kj editor keys` batch that submits a write
     /// (`:w`, `:w!`, `:wq`, `:x`, `ZZ`). `open`/`keys` otherwise/`state`/
     /// `quit`/`list` stay ungated: opening and reading the buffer is benign,
-    /// like `read_input`.
+    /// like reading the compose draft.
     ///
     /// Deliberately its own authority, not a reuse of `Tool{builtin.file,
     /// edit}`: the editor writes through `resolve_editor_target`
