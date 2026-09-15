@@ -6,6 +6,45 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Identity audit: eight sites read the wrong identifier, or none (2026-09-15)
+
+Amy: *"I do want the credentials we check to be aligned to the newer fields
+like accountable_to ... are all the gate sites using the right identifiers
+to check who it is?"* Scan by the lead plus a kaibo (deepseek) audit against
+`docs/approval-identity.md`; every line below was re-read by the lead. Full
+notes: `~/exomemory/kaijutsu/identity-gate-audit-2026-09-15.md`.
+
+`accountable_to` has not shipped: the sheet is still five columns
+(`kernel_db.rs:1185`). Reviewer resolution, delegation, answering,
+cancel/escalate, redemption, turn identity, `require_cap`, the facade gate,
+and every draft/shell RPC read the identifier the doc names. Open:
+
+1. `authorBlock` takes `principalId` from the request (`rpc.rs:8687`), the
+   only RPC that does; documented as shared-trust in `kaijutsu.capnp:2232`.
+2. `hook_matches` keys `match_principal` on the requester
+   (`mcp/broker.rs:3785`); a character-scoped hook misses that character's
+   model-turn tool calls. Should read `actor_id`.
+3. `create_context_inner` stores the raw connection principal as
+   `director_id` with no sheet lookup (`rpc.rs:3836`); the `mcp` branch at
+   `:3799` looks it up, and `kj context create` uses `caller.actor_id`.
+4. `kj block append|edit|create` attribute to `caller.principal_id`
+   (`kj/block.rs:1336,1501,1750`), the requester, not the performer.
+5. The `commit_capture` facade (`rpc.rs:8962`) is missing from
+   `KNOWN_FACADES` (`mcp/binding.rs:54`); only `facade:*` grants it.
+6. The hook listener authors under `for_agent_session` with a `system()`
+   fallback (`hook_listener.rs:949`); the bridge-identity design in
+   `docs/character.md` replaces it.
+7. `kj context create --as` is ungated (`kj/context.rs:579`) while
+   `kj context set --as` needs Operator plus reviewer authority.
+8. ROOT seeds `system()` as `created_by`/`director_id` (`rpc.rs:2534`);
+   benign.
+
+Unverified, wants a coded test: a human's own gated shell command snapshots
+actor == reviewer when the human is the context's reviewer
+(`rpc.rs:10191`), and `ensure_not_self_approval` then refuses that human
+answering it. `gate_executes_wire.rs` only covers a worker with a distinct
+reviewer.
+
 ## The compose draft is the player's alone (Amy, 2026-09-15)
 
 Amy: *"the draft should never have a path for the model to reach it. we may
