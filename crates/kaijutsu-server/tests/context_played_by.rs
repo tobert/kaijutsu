@@ -149,9 +149,9 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
             "a characterless creating principal must leave played_by NULL, not fail"
         );
         assert_eq!(
-            row.director_id,
-            Some(unmapped),
-            "the authenticated creator remains the director even before a character sheet exists"
+            row.director_id, None,
+            "a creator with no character sheet cannot hold a delegation, so it is not \
+             recorded as director; the reviewer resolves to the default instead"
         );
         assert_eq!(row.reviewer_id, None);
         drop(kj);

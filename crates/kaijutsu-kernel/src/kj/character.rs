@@ -150,9 +150,17 @@ impl KjDispatcher {
         }
 
         // Resolve the accountable-to name before minting anything, so an
-        // unknown target never leaves an orphan character behind.
+        // unknown or retired target never leaves an orphan character behind.
+        // `update_character_accountable_to` checks liveness again under its
+        // own write; by then the row would already exist.
         let accountable_to_id = match accountable_to {
             Some(target_name) => match db.get_character_by_name(target_name) {
+                Ok(Some(t)) if t.retired_at.is_some() => {
+                    return KjResult::Err(format!(
+                        "kj character create: {target_name} is retired and cannot be an \
+                         accountable-to target"
+                    ));
+                }
                 Ok(Some(t)) => Some(t.principal_id),
                 Ok(None) => {
                     return KjResult::Err(format!(
@@ -334,6 +342,22 @@ impl KjDispatcher {
         };
         if row.retired_at.is_some() {
             return KjResult::ok(format!("{name} already retired"));
+        }
+        // A live dependent refuses the whole retire, before any context is
+        // concluded or archived: `conclude_context` and `archive_context`
+        // each commit on their own, so a refusal after the loop would leave
+        // the contexts archived and the character live.
+        match db.live_accountable_dependents(row.principal_id) {
+            Ok(dependents) if dependents.is_empty() => {}
+            Ok(dependents) => {
+                return KjResult::Err(format!(
+                    "kj character retire: cannot retire {name}: {} character(s) are still \
+                     accountable to it ({}) — re-root or retire them first",
+                    dependents.len(),
+                    dependents.join(", ")
+                ));
+            }
+            Err(e) => return KjResult::Err(format!("kj character retire: {e}")),
         }
         let live = match db.contexts_played_by(row.principal_id) {
             Ok(l) => l,
@@ -772,5 +796,64 @@ mod tests {
         assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
         let mentor = d.kernel_db().lock().get_character_by_name("mentor").unwrap().unwrap();
         assert!(mentor.retired_at.is_none(), "a refused retire must not have stamped retired_at");
+    }
+
+    /// A refused retire leaves the character's live contexts alone. The
+    /// dependent check runs before any context is concluded or archived,
+    /// so a character with both a live dependent and a live context comes
+    /// out of a refusal exactly as it went in.
+    #[tokio::test]
+    async fn retire_refused_by_a_dependent_archives_nothing() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("mentor")], &caller).await;
+        d.dispatch(
+            &[s("character"), s("create"), s("mentee"), s("--accountable-to"), s("mentor")],
+            &caller,
+        )
+        .await;
+        let mentor_id = {
+            let db = d.kernel_db().lock();
+            db.get_character_by_name("mentor").unwrap().unwrap().principal_id
+        };
+        let ctx = register_context(&d, Some("mentor-ctx"), None, mentor_id);
+        d.kernel_db().lock().update_played_by(ctx, Some(mentor_id)).unwrap();
+
+        let mut confirmed = caller.clone();
+        confirmed.confirmed = true;
+        let result = d.dispatch(&[s("character"), s("retire"), s("mentor")], &confirmed).await;
+        assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
+
+        let ctx_row = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
+        assert!(ctx_row.archived_at.is_none(), "a refused retire must not archive the context");
+        assert!(ctx_row.concluded_at.is_none(), "nor conclude it");
+        let mentor = d.kernel_db().lock().get_character_by_name("mentor").unwrap().unwrap();
+        assert!(mentor.retired_at.is_none());
+    }
+
+    /// A retired `--accountable-to` target refuses before minting, the same
+    /// as an unknown one: no root character is left behind for a retry to
+    /// find "already exists".
+    #[tokio::test]
+    async fn create_with_retired_accountable_to_leaves_no_character() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("elder")], &caller).await;
+        let mut confirmed = caller.clone();
+        confirmed.confirmed = true;
+        let retired = d.dispatch(&[s("character"), s("retire"), s("elder")], &confirmed).await;
+        assert!(matches!(retired, KjResult::Ok { .. }), "{retired:?}");
+
+        let result = d
+            .dispatch(
+                &[s("character"), s("create"), s("orphan"), s("--accountable-to"), s("elder")],
+                &caller,
+            )
+            .await;
+        assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
+        assert!(
+            d.kernel_db().lock().get_character_by_name("orphan").unwrap().is_none(),
+            "a retired target must not leave a root character behind"
+        );
     }
 }

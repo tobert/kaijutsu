@@ -70,6 +70,18 @@ and every draft/shell RPC read the identifier the doc names. Open:
    `docs/character.md` replaces it.
 3. ROOT seeds `system()` as `created_by`/`director_id` (`rpc.rs:2534`);
    benign.
+5. `user_input_identity.rs` runs every seat with actor equal to principal,
+   so it cannot falsify "gates read the performer": a `kj ledger allow`
+   keyed on the requester would pass it unchanged. The kernel unit tests
+   cover the split (`kj/gate.rs`, `kj/block.rs`, `mcp/broker.rs`); one wire
+   case with a model-turn seat, where actor differs from principal, would
+   close it. Found by the kaibo review, 2026-09-15.
+6. Rc block authorship splits by file kind: `.kai` blocks are authored by
+   `caller.actor_id` (`kj/lifecycle.rs:390`) and `.md` blocks by the
+   context's `created_by` (`:243-250`, `:376`), and the comment at
+   `kj/context.rs:1338` still says the requester owns rc output. Equal for
+   every create path today; a context created from a model turn's shell
+   would diverge. Decide one owner and say it in both places.
 4. `kj context create --as` is ungated (`kj/context.rs:579`) while
    `kj context set --as` needs Operator plus reviewer authority. A patch
    that gates `create --as` the same way exists

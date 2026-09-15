@@ -7608,15 +7608,23 @@ impl KernelDb {
     /// Does not touch the character's contexts — `kj character retire`
     /// concludes and archives them separately, through the same
     /// `archive_context`/`conclude_context` every other archival path uses.
+    /// Names of the live characters whose `accountable_to` is `principal_id`,
+    /// ordered by name. `kj character retire` checks this before it touches
+    /// any context, and `retire_character` checks it again under its own
+    /// write.
+    pub fn live_accountable_dependents(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name FROM characters WHERE accountable_to = ?1 AND retired_at IS NULL \
+             ORDER BY name",
+        )?;
+        let names = stmt
+            .query_map(params![blob_param(principal_id.as_bytes())], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        Ok(names)
+    }
+
     pub fn retire_character(&self, principal_id: PrincipalId, at: i64) -> KernelDbResult<bool> {
-        let dependents: Vec<String> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT name FROM characters WHERE accountable_to = ?1 AND retired_at IS NULL \
-                 ORDER BY name",
-            )?;
-            stmt.query_map(params![blob_param(principal_id.as_bytes())], |row| row.get(0))?
-                .collect::<SqliteResult<Vec<_>>>()?
-        };
+        let dependents = self.live_accountable_dependents(principal_id)?;
         if !dependents.is_empty() {
             let name = self.name_for(principal_id);
             return Err(KernelDbError::Validation(format!(
