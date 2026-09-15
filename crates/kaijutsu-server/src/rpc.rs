@@ -544,7 +544,11 @@ pub fn answerer_name(
 /// broadcast, so hosting a subscriber on every connection would drive each
 /// request once per connection. One driver, one subscription, one turn.
 pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
-    let builder = std::thread::Builder::new().name("turn-driver".to_string());
+    // The turn driver runs tool calls through kaish, and nested `kj`
+    // commands overflow the default stack — see `KAISH_RC_THREAD_STACK`.
+    let builder = std::thread::Builder::new()
+        .name("turn-driver".to_string())
+        .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
     if let Err(e) = builder.spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -13596,8 +13600,9 @@ mod rc_thread_stack_tests {
     /// same chain. The gate-resume driver was the one that got missed.
     #[test]
     fn every_rc_driving_thread_reserves_the_rc_stack() {
-        let sources: [(&str, &str, &str); 3] = [
+        let sources: [(&str, &str, &str); 4] = [
             ("rpc.rs", include_str!("rpc.rs"), "\"gate-resume\""),
+            ("rpc.rs", include_str!("rpc.rs"), "\"turn-driver\""),
             ("beat.rs", include_str!("beat.rs"), "\"beat-scheduler\""),
             ("ssh.rs", include_str!("ssh.rs"), ".name(session_label.clone())"),
         ];

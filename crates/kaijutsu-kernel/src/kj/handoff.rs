@@ -116,18 +116,21 @@ impl KjDispatcher {
         }
     }
 
-    /// Resolve the caller to the character they play. Never falls back to a
+    /// Resolve the caller to the character it performs as. The performer
+    /// owns the log: a model turn's requester is the connection that started
+    /// it, and its notes belong to the character whose turn is running. For
+    /// a human shell the two are the same principal. Never falls back to a
     /// default identity or to `system` — a principal with no sheet row
     /// can't be the implicit "my own log" target, and the fix is always to
     /// mint one, never to guess.
     fn resolve_caller_character(&self, caller: &KjCaller, verb: &str) -> Result<CharacterRow, String> {
         let db = self.kernel_db().lock();
-        match db.get_character(caller.principal_id) {
+        match db.get_character(caller.actor_id) {
             Ok(Some(row)) => Ok(row),
             Ok(None) => Err(format!(
                 "kj handoff {verb}: principal {} has no character — \
                  `kj character create <name>` first",
-                caller.principal_id.short()
+                caller.actor_id.short()
             )),
             Err(e) => Err(format!("kj handoff {verb}: {e}")),
         }
@@ -184,7 +187,7 @@ impl KjDispatcher {
             text.to_string(),
             Status::Done,
             ContentType::Plain,
-            Some(caller.principal_id),
+            Some(caller.actor_id),
         ) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj handoff note: {e}")),
@@ -457,6 +460,34 @@ mod tests {
         let hex = obj["principal_id"].as_str().unwrap();
         let principal = PrincipalId::parse(hex).expect("valid principal hex");
         caller_as(principal)
+    }
+
+    /// A note with no `--for` belongs to the performer, not the requester.
+    /// A model turn's `kj handoff note` runs with the connection's
+    /// principal as requester and the context's performer as actor; the
+    /// note lands in the performer's log and is authored by the performer.
+    #[tokio::test]
+    async fn note_without_for_files_under_the_actor_not_the_requester() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let amy = create_and_play(&d, "amy").await;
+        let banto = create_and_play(&d, "banto").await;
+        let turn = amy.clone().with_actor(banto.principal_id, Some(amy.principal_id));
+
+        let result = d.dispatch(&[s("handoff"), s("note"), s("rotating")], &turn).await;
+        assert!(matches!(result, KjResult::Ok { .. }), "{result:?}");
+
+        let (amy_log, banto_log) = {
+            let db = d.kernel_db().lock();
+            (
+                db.get_character(amy.principal_id).unwrap().unwrap().handoff_ctx,
+                db.get_character(banto.principal_id).unwrap().unwrap().handoff_ctx,
+            )
+        };
+        assert!(amy_log.is_none(), "the requester's log must not be minted or written");
+        let banto_log = banto_log.expect("the performer's log must be minted");
+        let blocks = d.block_store().block_snapshots(banto_log).unwrap();
+        let note = blocks.iter().find(|b| b.content.contains("rotating")).expect("the note is in banto's log");
+        assert_eq!(note.author(), banto.principal_id, "the note is authored by the performer");
     }
 
     /// `note` then `tail` round-trips the text.

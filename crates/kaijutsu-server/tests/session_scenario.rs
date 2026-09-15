@@ -65,17 +65,11 @@
 //!   delegate) can assign their performers. `docs/character.md`'s "Roots
 //!   and rotation" accountability chain, once implemented, is what would
 //!   let banto do this itself.
-//! - **Two real defects this scenario found**, both outside this lane's
-//!   territory and reported rather than fixed here:
-//!   1. `crates/kaijutsu-server/src/rpc.rs`'s `spawn_turn_driver` (~line
-//!      546) builds the `"turn-driver"` OS thread with no
-//!      `.stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)`, unlike its
-//!      sibling rc-driving threads (`"gate-resume"`, `"beat-scheduler"`,
-//!      the per-session SSH thread) — seen in `boot()`'s comment.
-//!   2. `kj handoff note`/`signoff` with no explicit `--for` resolve their
-//!      target (and stamp authorship) from `caller.principal_id` (the
-//!      requester) instead of `caller.actor_id` (the performer) — seen at
-//!      the handoff-tail assertions after turn 4, below.
+//! - **Two defects this scenario found**, fixed the same day and pinned
+//!   here: the `"turn-driver"` thread now reserves `KAISH_RC_THREAD_STACK`
+//!   (`crates/kaijutsu-server/src/rpc.rs`, `spawn_turn_driver`), and
+//!   `kj handoff note`/`signoff` without `--for` file under the performer
+//!   (`crates/kaijutsu-kernel/src/kj/handoff.rs`, `resolve_caller_character`).
 
 mod common;
 
@@ -196,29 +190,9 @@ async fn boot() -> Scenario {
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mock_scripts"),
         );
     }
-    // NOTE: a real defect, not something this test can route around. Once
-    // banto's own turn nests a nested `kj` command deeply enough (`kj
-    // drive`, exercised below), the server's `"turn-driver"` OS thread
-    // stack-overflows and SIGABRTs the whole process —
-    // `crates/kaijutsu-server/src/rpc.rs`'s `spawn_turn_driver` (~line 546)
-    // builds that thread via `std::thread::Builder::new()
-    // .name("turn-driver".to_string())` with no `.stack_size(..)` call,
-    // unlike its sibling rc-driving threads (the `"gate-resume"` and
-    // `"beat-scheduler"` builders, and the per-session SSH thread), which
-    // all reserve `kaijutsu_kernel::KAISH_RC_THREAD_STACK` (16 MiB) in the
-    // same chain. `rpc.rs`'s own `rc_thread_stack_tests` module pins exactly
-    // this requirement for those three threads — its enumeration was never
-    // extended to `turn-driver`. Setting `RUST_MIN_STACK` from here does not
-    // reliably help: std caches its default-stack-size decision the first
-    // time any thread spawns without an explicit `.stack_size`, and
-    // something earlier in the test process (the libtest runner itself)
-    // already spawns such a thread before this function runs. `rpc.rs` is
-    // outside this lane's territory (see the coding brief), so the fix —
-    // adding `.stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)` to that
-    // one builder chain, and `"\"turn-driver\""` to `rc_thread_stack_tests`'s
-    // `sources` array so a regression is caught again — is reported rather
-    // than made here. See this file's final report for what ran before this
-    // was hit.
+    // banto's turn nests `kj drive` inside a tool call; the turn-driver
+    // thread reserves the rc stack for exactly this (`rpc.rs`,
+    // `spawn_turn_driver`, pinned by `rc_thread_stack_tests`).
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let auth_db_path = tmp.path().join("auth.db");
@@ -616,49 +590,24 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 4 (auto-resumed signoff)");
 
-        // REAL DEFECT, found by this scenario, not a test-shape gap:
-        // `kj handoff note`/`signoff` with no explicit `--for` target
-        // resolve "whose log is this" via `resolve_caller_character`
-        // (`crates/kaijutsu-kernel/src/kj/handoff.rs:123-134`), which reads
-        // `caller.principal_id` — the authenticated REQUESTER
-        // (`docs/approval-identity.md`, "Three identities") — not
-        // `caller.actor_id`, the PERFORMER whose turn is actually running.
-        // The same file's note-insertion call
-        // (`crates/kaijutsu-kernel/src/kj/handoff.rs:178`,
-        // `insert_block_as(..., Some(caller.principal_id))`) stamps the
-        // note's author the same wrong way. Everywhere else on the turn
-        // path authorship correctly follows the performer
-        // (`crates/kaijutsu-server/src/llm_stream.rs`'s `insert_tool_call_as`
-        // calls take `actor_principal`, pinned by this file's own turn-1
-        // assertions above) — `kj handoff`'s implicit-target path is the
-        // one place that still uses the connection's original human
-        // identity instead. banto's own `kj handoff signoff 'rotating'`
-        // tool call above (no `--for` — the natural way a director signs
-        // off its own seat, `docs/approval-identity.md`, "The coder
-        // maintains a handoff while active... before an explicit wait or
-        // signoff") lands in AMY's handoff log, not banto's, because amy is
-        // the connection whose `submitInput` started this whole session and
-        // `principal_id` is preserved unchanged through every nested `kj`
-        // dispatch since. `crates/kaijutsu-kernel/src/kj/handoff.rs` is
-        // outside this lane's territory, so this is reported rather than
-        // fixed here; the two assertions below pin today's actual behavior
-        // so a fix (switching both sites to `caller.actor_id`) is visible
-        // as this test changing, not as it starting to fail.
+        // A note without `--for` belongs to the performer, not the
+        // requesting connection (`kj/handoff.rs`, `resolve_caller_character`).
+        // banto's own signoff lands in banto's log although amy's
+        // `submitInput` started the session.
         let banto_tail = s.kj("kj handoff tail banto").await;
         assert!(
             banto_tail.contains("lanes landed"),
-            "the explicit-target note (`--for banto`) must still land in banto's own log, got: {banto_tail}"
+            "the explicit-target note (`--for banto`) lands in banto's own log, got: {banto_tail}"
         );
         assert!(
-            !banto_tail.contains("rotating"),
-            "if this now contains 'rotating', the misattribution above is fixed — \
-             update this pin and the successor assertion below to expect it too. Got: {banto_tail}"
+            banto_tail.contains("rotating"),
+            "banto's signoff without --for belongs to the performer, banto \
+             (`kj/handoff.rs`, `resolve_caller_character` reads the actor), got: {banto_tail}"
         );
         let amy_tail = s.kj("kj handoff tail amy").await;
         assert!(
-            amy_tail.contains("rotating"),
-            "banto's implicit-target signoff note currently misfiles into amy's log \
-             (the defect cited above) — got: {amy_tail}"
+            !amy_tail.contains("rotating"),
+            "the requesting connection's log must not receive the performer's note, got: {amy_tail}"
         );
 
         // ------------------------------------------------------------
