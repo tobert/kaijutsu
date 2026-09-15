@@ -23,14 +23,6 @@ Read by the lead; each line re-checked before it went here.
   the spawned `process_llm_stream` task, so no `TurnFlow::Failed` is
   published; the scenario reports "timed out waiting for a turn event". A
   `Result` from `stream()` would reach the turn's own error path.
-- **Drift and fork stamp the requester; block and handoff stamp the
-  performer.** `kj drift push|pull|merge` and `kj fork` author with
-  `caller.principal_id` on purpose ("the caller is the sender",
-  `kj/drift.rs:196-211`, `kj/fork.rs:901`), so a coder lane's report drift
-  lands in banto's seat authored by amy, the connection that started the
-  session. The scenario asserts the drift's kind and text, not its author.
-  Amy decides which rule drift follows; if performer, the sites are
-  `drift.rs:209,372,429,513,636` and `fork.rs:748,923,1319`.
 - **`kj handoff tail <other>` refuses a reader with no sheet** because the
   caller is resolved before the target is chosen (`kj/handoff.rs:250-253`).
   Resolve the caller only on the no-target branch.

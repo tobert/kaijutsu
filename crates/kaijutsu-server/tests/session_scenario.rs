@@ -483,13 +483,32 @@ fn kaijutsu_session_scenario() {
         // "report: done" included), so the kind filter is load-bearing,
         // not decorative.
         let banto_blocks_after_lanes = s.blocks(banto_ctx);
-        let report_count = banto_blocks_after_lanes
+        let report_blocks: Vec<_> = banto_blocks_after_lanes
             .iter()
             .filter(|b| b.kind == BlockKind::Drift && b.content.contains("report: done"))
-            .count();
+            .collect();
         assert_eq!(
-            report_count, 2,
-            "both lanes' drift-pushed reports must land in banto's seat, found {report_count}"
+            report_blocks.len(), 2,
+            "both lanes' drift-pushed reports must land in banto's seat, found {}",
+            report_blocks.len()
+        );
+
+        // Each report is a drift block, so its sender is the performer that
+        // ran `kj drift push` — the pushing lane's own coder character, not
+        // amy's connection principal (`docs/approval-identity.md`, "Three
+        // identities"; `kj/drift.rs`'s `deliver_drift`).
+        let mut report_authors: Vec<PrincipalId> =
+            report_blocks.iter().map(|b| b.author()).collect();
+        report_authors.sort();
+        let mut expected_authors = [coder_a_principal, coder_b_principal];
+        expected_authors.sort();
+        assert_eq!(
+            report_authors, expected_authors,
+            "each lane's drift-pushed report must be authored by its own performer, got {report_authors:?}"
+        );
+        assert!(
+            !report_authors.contains(&s.amy_principal),
+            "a drift-pushed report must never be authored by amy's connection principal, got {report_authors:?}"
         );
 
         // ------------------------------------------------------------

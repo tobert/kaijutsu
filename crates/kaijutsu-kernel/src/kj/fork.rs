@@ -745,7 +745,7 @@ impl KjDispatcher {
 
         // If --prompt given, inject a Drift block
         if let Some(note) = &prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, note, caller.principal_id)
+            && let Err(e) = self.inject_fork_note(new_id, source_id, note, caller.actor_id)
         {
             return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
         }
@@ -787,7 +787,7 @@ impl KjDispatcher {
             source_label.as_deref(),
             staging,
             marker_note.as_deref(),
-            caller.principal_id,
+            caller.actor_id,
         ) {
             tracing::warn!("kj fork: failed to inject fork marker: {e}");
         }
@@ -894,11 +894,12 @@ impl KjDispatcher {
                 let router = self.drift_router().read();
                 router.get(source_id).and_then(|h| h.model.clone())
             };
-            // The distillation seed belongs to the context owner, not the
-            // store's own identity — same ruling as the fork note/marker
-            // below. At this point in `fork_compact` the child's ContextRow
-            // doesn't exist yet, but its `created_by` (inserted further down)
-            // is always `caller.principal_id`, so that is the right value here.
+            // The distillation seed is a drift block, so it carries the
+            // performer as its sender — same rule as the fork note/marker
+            // below. The child's `created_by` (inserted further down) names
+            // the requester instead; the two identities differ on purpose
+            // and must not be conflated (`docs/approval-identity.md`,
+            // "Three identities").
             let summary_id = match self.block_store().insert_drift_block_as(
                 new_id,
                 None,
@@ -907,7 +908,7 @@ impl KjDispatcher {
                 source_id,
                 source_model,
                 kaijutsu_types::DriftKind::Distill,
-                Some(caller.principal_id),
+                Some(caller.actor_id),
             ) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj fork --compact: failed to insert summary: {e}")),
@@ -920,7 +921,7 @@ impl KjDispatcher {
 
         // If --prompt given, inject a fork note after the summary
         if let Some(note) = &prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, note, caller.principal_id)
+            && let Err(e) = self.inject_fork_note(new_id, source_id, note, caller.actor_id)
         {
             tracing::warn!("failed to inject fork note: {e}");
         }
@@ -1056,7 +1057,7 @@ impl KjDispatcher {
             source_label.as_deref(),
             staging,
             None,
-            caller.principal_id,
+            caller.actor_id,
         ) {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
@@ -1316,7 +1317,7 @@ impl KjDispatcher {
         // anchor lands at the true tail.
         if let Some(note) = &prompt
             && let Err(e) =
-                self.inject_fork_note(new_root_id, source_id, note, caller.principal_id)
+                self.inject_fork_note(new_root_id, source_id, note, caller.actor_id)
         {
             return KjResult::Err(format!("kj fork --as: failed to inject fork note: {e}"));
         }
@@ -1329,7 +1330,7 @@ impl KjDispatcher {
             Some(&template_ref),
             staging,
             None,
-            caller.principal_id,
+            caller.actor_id,
         ) {
             tracing::warn!("kj fork --as: failed to inject fork marker: {e}");
         }
@@ -1555,10 +1556,10 @@ impl KjDispatcher {
         target_id: ContextId,
         source_id: ContextId,
         note: &str,
-        // Per Amy's ruling (2026-08-12): a fork marker/note is NOT a drift
-        // arrival from an outsider, it belongs to the context owner. At fork
-        // time that owner is the forking caller (the child's `created_by` —
-        // verified against all three fork call sites, they always match).
+        // A fork note is a drift block, so it carries the performer as its
+        // sender (`docs/approval-identity.md`, "Three identities") — never
+        // the requester that opened the connection, and never the store's
+        // own identity.
         owner: PrincipalId,
     ) -> Result<(), String> {
         use kaijutsu_types::DriftKind;
@@ -1595,8 +1596,8 @@ impl KjDispatcher {
         // A visible note appended to the marker — e.g. a dropped hydration
         // policy (3d). `None` for the plain marker.
         note: Option<&str>,
-        // Same reasoning as `inject_fork_note`'s `owner`: the marker belongs
-        // to the context owner, not the store's own identity.
+        // Same reasoning as `inject_fork_note`'s `owner`: the marker is a
+        // drift block and carries the performer as its sender.
         owner: PrincipalId,
     ) -> Result<(), String> {
         use kaijutsu_types::DriftKind;
@@ -2700,6 +2701,68 @@ mod tests {
         assert!(result.is_ok(), "fork failed: {}", result.message());
     }
 
+    /// The requester/performer split (`docs/approval-identity.md`, "Three
+    /// identities"): `kj fork`'s note and marker are drift blocks, so they
+    /// carry the performer as their sender, never the requester. The new
+    /// context row's `created_by` is the opposite — it names the requester
+    /// who created the context.
+    #[tokio::test]
+    async fn fork_note_and_marker_carry_the_performer_not_the_requester() {
+        let d = test_dispatcher().await;
+        let requester = PrincipalId::new();
+        let source = register_context(&d, Some("perf-fork-src"), None, requester);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let performer = PrincipalId::new();
+        let c = caller_with_context(source).with_actor(performer, None);
+        assert_ne!(
+            c.principal_id, c.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("perf-fork-child"),
+                    s("--prompt"),
+                    s("explore the bug"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "perf-fork-child");
+        let created_by = d.kernel_db().lock().get_context(child).unwrap().unwrap().created_by;
+        assert_eq!(
+            created_by, c.principal_id,
+            "created_by names the requester who created the context"
+        );
+
+        let blocks = d.block_store().block_snapshots(child).expect("snapshots");
+        let drift_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .collect();
+        assert!(
+            drift_blocks.len() >= 2,
+            "expected both the fork note and the fork marker, saw {}",
+            drift_blocks.len()
+        );
+        for b in &drift_blocks {
+            assert_eq!(
+                b.author(),
+                performer,
+                "fork note/marker must carry the performer, not the requester: {:?}",
+                b.content
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fork_help() {
         let d = test_dispatcher().await;
@@ -3649,6 +3712,69 @@ mod tests {
         );
     }
 
+    /// The requester/performer split for `fork --compact`: the distillation
+    /// seed, the fork note, and the fork marker are all drift blocks, so
+    /// they carry the performer — never the requester. `created_by` on the
+    /// new context row stays the requester.
+    #[tokio::test]
+    async fn fork_compact_seed_note_and_marker_carry_the_performer_not_the_requester() {
+        let d = test_dispatcher().await;
+        let requester = PrincipalId::new();
+        let source = register_context(&d, Some("perf-compact-src"), None, requester);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        setup_compact_source(&d, source, requester).await;
+
+        let performer = PrincipalId::new();
+        let c = caller_with_context(source).with_actor(performer, None);
+        assert_ne!(
+            c.principal_id, c.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--compact"),
+                    s("--name"),
+                    s("perf-compact-child"),
+                    s("--prompt"),
+                    s("explore compact"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork --compact failed: {}", result.message());
+
+        let child = child_id(&d, "perf-compact-child");
+        let created_by = d.kernel_db().lock().get_context(child).unwrap().unwrap().created_by;
+        assert_eq!(
+            created_by, c.principal_id,
+            "created_by names the requester who created the context"
+        );
+
+        let blocks = d.block_store().block_snapshots(child).expect("snapshots");
+        let drift_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .collect();
+        assert!(
+            drift_blocks.len() >= 3,
+            "expected the distillation seed, fork note, and fork marker, saw {}",
+            drift_blocks.len()
+        );
+        for b in &drift_blocks {
+            assert_eq!(
+                b.author(),
+                performer,
+                "distillation seed/note/marker must carry the performer, not the requester: {:?}",
+                b.content
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fork_compact_switch_flag_moves_to_child() {
         let d = test_dispatcher().await;
@@ -3739,6 +3865,69 @@ mod tests {
             sub.try_recv().is_none(),
             "a bare subtree fork must not request a turn"
         );
+    }
+
+    /// The requester/performer split for `fork --as`: the subtree root's
+    /// fork note and fork marker are drift blocks, so they carry the
+    /// performer — never the requester. `created_by` on the new root's
+    /// context row stays the requester.
+    #[tokio::test]
+    async fn fork_subtree_note_and_marker_carry_the_performer_not_the_requester() {
+        let d = test_dispatcher().await;
+        let requester = PrincipalId::new();
+        let source = register_context(&d, Some("perf-subtree-parent"), None, requester);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let performer = PrincipalId::new();
+        let c = caller_with_context(source).with_actor(performer, None);
+        assert_ne!(
+            c.principal_id, c.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--as"),
+                    s("perf-subtree-parent"),
+                    s("--name"),
+                    s("perf-subtree-tmpl"),
+                    s("--prompt"),
+                    s("explore subtree"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork --as failed: {}", result.message());
+
+        let root = child_id(&d, "perf-subtree-tmpl");
+        let created_by = d.kernel_db().lock().get_context(root).unwrap().unwrap().created_by;
+        assert_eq!(
+            created_by, c.principal_id,
+            "created_by names the requester who created the context"
+        );
+
+        let blocks = d.block_store().block_snapshots(root).expect("snapshots");
+        let drift_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .collect();
+        assert!(
+            drift_blocks.len() >= 2,
+            "expected both the fork note and the fork marker, saw {}",
+            drift_blocks.len()
+        );
+        for b in &drift_blocks {
+            assert_eq!(
+                b.author(),
+                performer,
+                "fork note/marker must carry the performer, not the requester: {:?}",
+                b.content
+            );
+        }
     }
 
     // ── 2026-07-04 papercuts: compact-fork label conflict + distill provider ──
@@ -4061,18 +4250,19 @@ mod tests {
         assert!(found.is_none(), "failed distill resolution must not create a context");
     }
 
-    // ── block-authorship leftovers: fork marker/note/compact seed (2026-08-13) ──
+    // ── block authorship: fork marker/note/compact seed ──
     //
-    // Amy's ruling: the drift block carries the sending principal; everything
-    // else — including fork markers, fork notes, and the --compact distill
-    // seed — belongs to the context owner. Before this fix all three went
-    // through the `insert_drift_block` wrapper, whose `None` fell back to
-    // `BlockStore::principal_id()` (the kernel's own identity), so a fresh
-    // child's very first blocks were authored by nobody real.
+    // A fork marker, a fork note, and the --compact distill seed are drift
+    // blocks, so each carries the performer as its sender
+    // (`docs/approval-identity.md`, "Three identities") — never the store's
+    // own identity, and never the requester that opened the connection.
+    // The child's `created_by` names the requester instead; the two
+    // identities can differ and must not be conflated.
 
     /// The plain fork marker (`kj fork --name`) must carry the forking
-    /// caller's principal — the same value that lands in the child's
-    /// `created_by` — not the store's own identity.
+    /// caller's performer, not the store's own identity. This fixture's
+    /// performer and requester are the same principal; the distinct-identity
+    /// case is `fork_note_and_marker_carry_the_performer_not_the_requester`.
     #[tokio::test]
     async fn fork_marker_carries_the_forking_caller() {
         let d = test_dispatcher().await;
@@ -4145,8 +4335,8 @@ mod tests {
     }
 
     /// `kj fork --compact` seeds the child with an LLM distillation as a Drift
-    /// block (`DriftKind::Distill`). Same ruling: it belongs to the forking
-    /// caller (the child's `created_by`), not the kernel's own identity.
+    /// block (`DriftKind::Distill`). Same rule: it carries the forking
+    /// caller's performer, not the kernel's own identity.
     #[tokio::test]
     async fn fork_compact_seed_carries_the_forking_caller() {
         use crate::llm::{MockClient, Provider};

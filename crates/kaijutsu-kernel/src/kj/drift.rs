@@ -194,7 +194,9 @@ impl KjDispatcher {
     ) -> Result<(), String> {
         let after = self.block_store().last_block_id(target_ctx);
         // The drift block is the one block in the target that legitimately
-        // belongs to an outsider, so it carries the SENDER. Everything the
+        // belongs to an outsider, so it carries the SENDER — the performer,
+        // not the requester that opened the connection
+        // (`docs/approval-identity.md`, "Three identities"). Everything the
         // arrival then triggers (the target's `drift` rc scripts) belongs to
         // the context owner instead — see `run_rc_lifecycle_inner`.
         self.block_store()
@@ -206,7 +208,7 @@ impl KjDispatcher {
                 source_ctx,
                 source_model.clone(),
                 drift_kind,
-                Some(caller.principal_id),
+                Some(caller.actor_id),
             )
             .map_err(|e| e.to_string())?;
 
@@ -363,13 +365,16 @@ impl KjDispatcher {
                 // non-durably than refused.
                 let durable = self.ensure_drift_queue_persistence();
                 let mut router = self.drift_router().write();
+                // `staged_by` becomes the drift block's sender at flush time
+                // (`flushed_drift_carries_the_stager_not_the_flusher`), so it
+                // is the performer, matching every other drift send site.
                 match router.stage(
                     context_id,
                     target_id,
                     content.clone(),
                     source_model.clone(),
                     drift_kind,
-                    caller.principal_id,
+                    caller.actor_id,
                 ) {
                     // Loud, not silent: the push failed, but the content is
                     // parked in the queue that already knows how to retry
@@ -426,7 +431,7 @@ impl KjDispatcher {
                 content,
                 source_model,
                 drift_kind,
-                caller.principal_id,
+                caller.actor_id,
             ) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift push: {e}")),
@@ -501,7 +506,8 @@ impl KjDispatcher {
         let after = self.block_store().last_block_id(context_id);
 
         // `pull` is a send the caller performs on their own behalf: they asked
-        // for the summary and it lands in their context, so they author it.
+        // for the summary and it lands in their context, so the performer
+        // authors it — never the requester that opened the connection.
         if let Err(e) = self.block_store().insert_drift_block_as(
             context_id,
             None,
@@ -510,7 +516,7 @@ impl KjDispatcher {
             source_id,
             source_model.clone(),
             DriftKind::Pull,
-            Some(caller.principal_id),
+            Some(caller.actor_id),
         ) {
             return KjResult::Err(format!("kj drift pull: failed to insert drift block: {e}"));
         }
@@ -623,8 +629,9 @@ impl KjDispatcher {
             router.get(context_id).and_then(|h| h.model.clone())
         };
         let after = self.block_store().last_block_id(target_id);
-        // `merge` sends the child's distillation up to the parent — the caller
-        // is the sender, and the block lands in a context they may not own.
+        // `merge` sends the child's distillation up to the parent — the
+        // performer is the sender, and the block lands in a context they may
+        // not own.
         if let Err(e) = self.block_store().insert_drift_block_as(
             target_id,
             None,
@@ -633,7 +640,7 @@ impl KjDispatcher {
             context_id,
             source_model.clone(),
             DriftKind::Merge,
-            Some(caller.principal_id),
+            Some(caller.actor_id),
         ) {
             return KjResult::Err(format!("kj drift merge: failed to insert drift block: {e}"));
         }
@@ -1379,6 +1386,53 @@ mod tests {
         );
     }
 
+    /// The requester/performer split (`docs/approval-identity.md`, "Three
+    /// identities"): a model turn's `kj drift push` is authored by the
+    /// performer, never the connection that requested the turn. A caller
+    /// built with `with_actor` pins a performer distinct from its
+    /// requester; the landed drift block must carry the performer.
+    #[tokio::test]
+    async fn drift_push_block_carries_the_performer_not_the_requester() {
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let src = register_context(&d, Some("perf-src"), None, owner);
+        let dst = register_context(&d, Some("perf-dst"), None, owner);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let performer = PrincipalId::new();
+        let sender = caller_with_context(src).with_actor(performer, None);
+        assert_ne!(
+            sender.principal_id, sender.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let result = d
+            .dispatch(
+                &[s("drift"), s("push"), s("perf-dst"), s("hello from performer")],
+                &sender,
+            )
+            .await;
+        assert!(result.is_ok(), "push failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        let drifted = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("drift block landed");
+        assert_eq!(
+            drifted.author(),
+            performer,
+            "drift block must carry the performer, not the requester"
+        );
+        assert_ne!(
+            drifted.author(),
+            sender.principal_id,
+            "drift block must not be attributed to the requester"
+        );
+    }
+
     /// Staging splits the sender from the flusher, and the *sender* is the one
     /// the block belongs to. Contexts are shared (many hands, one trust
     /// boundary), so "whoever ran flush" is a different principal often enough
@@ -1432,6 +1486,60 @@ mod tests {
         assert_ne!(
             drifted.id.principal_id, flusher.principal_id,
             "flushed drift must not be relabelled with the flusher"
+        );
+    }
+
+    /// The requester/performer split reaches staged drift too: `staged_by`
+    /// must carry the stager's performer, not its requester, so a flushed
+    /// item still lands under the right character.
+    #[tokio::test]
+    async fn staged_drift_carries_the_stagers_performer_not_its_requester() {
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let src = register_context(&d, Some("perf-stage-src"), None, owner);
+        let dst = register_context(&d, Some("perf-stage-dst"), None, owner);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let performer = PrincipalId::new();
+        let stager = caller_with_context(src).with_actor(performer, None);
+        assert_ne!(
+            stager.principal_id, stager.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let staged = d
+            .dispatch(
+                &[
+                    s("drift"),
+                    s("push"),
+                    s("--stage"),
+                    s("perf-stage-dst"),
+                    s("batched note"),
+                ],
+                &stager,
+            )
+            .await;
+        assert!(staged.is_ok(), "stage failed: {}", staged.message());
+
+        let flushed = d.dispatch(&[s("drift"), s("flush")], &stager).await;
+        assert!(flushed.is_ok(), "flush failed: {}", flushed.message());
+
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        let drifted = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("flushed drift block landed");
+        assert_eq!(
+            drifted.author(),
+            performer,
+            "flushed drift must carry the stager's performer"
+        );
+        assert_ne!(
+            drifted.author(),
+            stager.principal_id,
+            "flushed drift must not be attributed to the requester"
         );
     }
 
@@ -1517,6 +1625,61 @@ mod tests {
             "content must survive a failed push: {}",
             queue.message()
         );
+    }
+
+    /// The delivery-failure fallback stages content too
+    /// (`stage_after_failure`), and its `staged_by` must be the performer,
+    /// not the requester — the same rule as every other drift send site.
+    /// Once the target gains a document, `flush` delivers and the block
+    /// must carry the performer.
+    #[tokio::test]
+    async fn drift_push_delivery_failure_stages_with_the_performer() {
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let src = register_context(&d, Some("perf-fail-src"), None, owner);
+        // No document on the target yet — insertion cannot succeed, so this
+        // exercises the delivery-failure staging fallback, not the plain
+        // `--stage` path.
+        let dst = register_context(&d, Some("perf-fail-dst"), None, owner);
+
+        let performer = PrincipalId::new();
+        let c = caller_with_context(src).with_actor(performer, None);
+        assert_ne!(
+            c.principal_id, c.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("perf-fail-dst"), s("precious")], &c)
+            .await;
+        assert!(
+            !result.is_ok(),
+            "a failed delivery must not report success: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("staged"),
+            "error must say the content was staged: {}",
+            result.message()
+        );
+
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let flushed = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(flushed.is_ok(), "flush failed: {}", flushed.message());
+
+        let blocks = d.block_store().block_snapshots(dst).expect("snapshots");
+        let drifted = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("flushed drift block landed");
+        assert_eq!(
+            drifted.author(),
+            performer,
+            "delivery-failure staging must carry the performer"
+        );
+        assert_ne!(drifted.author(), c.principal_id);
     }
 
     /// `push` must accept the same address grammar as `pull`/`merge`/
@@ -2297,6 +2460,75 @@ mod tests {
         );
     }
 
+    /// The requester/performer split for `drift pull`: the puller's
+    /// performer authors the landed drift block, not the connection that
+    /// requested the pull.
+    #[tokio::test]
+    async fn drift_pull_block_carries_the_performer_not_the_requester() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let source = register_context(&d, Some("perf-pull-source"), None, owner);
+        let dest = register_context(&d, Some("perf-pull-dest"), None, owner);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(dest, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                source,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "mock",
+                Arc::new(Provider::Mock(MockClient::new("PULL-SUMMARY-PERF"))),
+            );
+            reg.set_default("mock");
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "mock", "mock-model");
+        }
+
+        let performer = PrincipalId::new();
+        let c = caller_with_context(dest).with_actor(performer, None);
+        assert_ne!(
+            c.principal_id, c.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let result = d
+            .dispatch(&[s("drift"), s("pull"), s("perf-pull-source")], &c)
+            .await;
+        assert!(result.is_ok(), "drift pull failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(dest).unwrap();
+        let drift_block = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("drift pull must insert a Drift block");
+        assert_eq!(
+            drift_block.author(),
+            performer,
+            "pulled drift must carry the performer, not the requester"
+        );
+        assert_ne!(drift_block.author(), c.principal_id);
+    }
+
     /// `drift pull` is the one call site where caller and source are
     /// genuinely different contexts, so it is the one place the source's
     /// cast could get billed to the caller silently. With no
@@ -2796,6 +3028,73 @@ mod tests {
             "drift block should carry the LLM's distilled summary: {:?}",
             drift_block.unwrap().content
         );
+    }
+
+    /// The requester/performer split for `drift merge`: the merging
+    /// context's performer authors the landed drift block in the parent,
+    /// not the connection that requested the merge.
+    #[tokio::test]
+    async fn drift_merge_block_carries_the_performer_not_the_requester() {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+
+        let d = test_dispatcher().await;
+        let owner = PrincipalId::new();
+        let parent = register_context(&d, Some("perf-merge-parent"), None, owner);
+        let child = register_context(&d, Some("perf-merge-child"), Some(parent), owner);
+        d.block_store()
+            .create_document(parent, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .create_document(child, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block(
+                child,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "child material to distill",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .unwrap();
+
+        {
+            let mut reg = d.kernel().llm().write().await;
+            reg.register(
+                "mock",
+                Arc::new(Provider::Mock(MockClient::new("MERGE-SUMMARY-PERF"))),
+            );
+            reg.set_default("mock");
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(child, "mock", "mock-model");
+        }
+
+        let performer = PrincipalId::new();
+        let c = caller_with_context(child).with_actor(performer, None);
+        assert_ne!(
+            c.principal_id, c.actor_id,
+            "fixture needs a performer distinct from the requester"
+        );
+
+        let result = d.dispatch(&[s("drift"), s("merge")], &c).await;
+        assert!(result.is_ok(), "drift merge failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(parent).unwrap();
+        let drift_block = blocks
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift)
+            .expect("drift merge must insert a Drift block into the parent context");
+        assert_eq!(
+            drift_block.author(),
+            performer,
+            "merged drift must carry the performer, not the requester"
+        );
+        assert_ne!(drift_block.author(), c.principal_id);
     }
 
     /// `drift merge` gains the same `--distill-model` grammar as `fork
