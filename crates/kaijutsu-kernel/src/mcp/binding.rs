@@ -25,17 +25,18 @@ pub type ResolvedName = (InstanceId, String);
 /// The facade surfaces a context can be granted. Facades are the
 /// non-broker-routed surfaces reached over RPC — they don't pass through
 /// `broker.call_tool`, so they're enforced at the shared kernel RPC layer
-/// (`shell_execute`/`editInput`/`submitInput` handlers), which every client
-/// crosses. The same [`ContextToolBinding::allows`] predicate is consulted
-/// there.
+/// (`shell_execute`/`editInput`/`submitInput`/`commitCapture` handlers), which
+/// every client crosses. The same [`ContextToolBinding::allows`] predicate is
+/// consulted there.
 ///
 /// Collapsed surfaces: `shell` is the single context-bound shell MCP tool (one
 /// `shell_execute` RPC); `edit_input` gates `editInput`, the compose draft's
-/// only write path; `submit_input` gates `submitInput`. Reading the draft
-/// (`getInputState`) is intentionally **not** gated — reading compose text is
-/// benign. The draft is the player's alone: no MCP tool, `kj` verb, or editor
-/// session reaches it (`docs/issues.md`, "The compose draft is the player's
-/// alone").
+/// only write path; `submit_input` gates `submitInput`; `commit_capture`
+/// gates `commitCapture`, the MIDI capture-commit RPC (`rpc.rs`'s
+/// `commit_capture` handler). Reading the draft (`getInputState`) is
+/// intentionally **not** gated — reading compose text is benign. The draft is
+/// the player's alone: no MCP tool, `kj` verb, or editor session reaches it
+/// (`docs/issues.md`, "The compose draft is the player's alone").
 ///
 /// **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3", Amy's
 /// 2026-08-16 ruling): `shell` is the unmarked, SAFE facade
@@ -51,7 +52,8 @@ pub type ResolvedName = (InstanceId, String);
 /// roster is built from broker tools, not facades — gets a shell. The facade
 /// bit gates all three reach paths (human box, external MCP, in-kernel tool)
 /// so shell policy stays single-axis per flavor.
-pub const KNOWN_FACADES: &[&str] = &["shell", "shell_write", "edit_input", "submit_input"];
+pub const KNOWN_FACADES: &[&str] =
+    &["shell", "shell_write", "edit_input", "submit_input", "commit_capture"];
 
 /// The `kj` *authority* capabilities — bare-word grants that gate the
 /// escalation-relevant `kj` verbs which never reach the broker `call_tool` path
@@ -692,6 +694,25 @@ mod tests {
             assert!(b.allows(&Capability::Facade((*f).into())));
         }
         assert!(!b.allows_tool(&inst("builtin.file"), "read"));
+    }
+
+    /// `commit_capture` gates `rpc.rs`'s `commit_capture` handler (the MIDI
+    /// capture-commit RPC) the same way `shell`/`edit_input`/`submit_input`
+    /// gate their own RPCs. A granular `facade:commit_capture` grant must
+    /// pass `allows` on its own — not only via `facade:*` — and the name
+    /// must be documented in `KNOWN_FACADES` so `kj binding allow
+    /// facade:commit_capture` is discoverable.
+    #[test]
+    fn granular_commit_capture_grant_passes_allows() {
+        let mut b = ContextToolBinding::new();
+        assert!(!b.allows(&Capability::Facade("commit_capture".into())));
+        b.grant(Capability::Facade("commit_capture".into()));
+        assert!(b.allows(&Capability::Facade("commit_capture".into())));
+        assert!(
+            KNOWN_FACADES.contains(&"commit_capture"),
+            "commit_capture must be listed in KNOWN_FACADES alongside the \
+             other RPC facades",
+        );
     }
 
     #[test]

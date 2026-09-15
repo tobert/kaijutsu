@@ -6,7 +6,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
-## Identity audit: eight sites read the wrong identifier, or none (2026-09-15)
+## Identity audit: what stays open (2026-09-15)
 
 Amy: *"I do want the credentials we check to be aligned to the newer fields
 like accountable_to ... are all the gate sites using the right identifiers
@@ -25,29 +25,34 @@ and every draft/shell RPC read the identifier the doc names. Open:
 
 1. `authorBlock` takes `principalId` from the request (`rpc.rs:8687`), the
    only RPC that does; documented as shared-trust in `kaijutsu.capnp:2232`.
-2. `hook_matches` keys `match_principal` on the requester
-   (`mcp/broker.rs:3785`); a character-scoped hook misses that character's
-   model-turn tool calls. Should read `actor_id`.
-3. `create_context_inner` stores the raw connection principal as
-   `director_id` with no sheet lookup (`rpc.rs:3836`); the `mcp` branch at
-   `:3799` looks it up, and `kj context create` uses `caller.actor_id`.
-4. `kj block append|edit|create` attribute to `caller.principal_id`
-   (`kj/block.rs:1336,1501,1750`), the requester, not the performer.
-5. The `commit_capture` facade (`rpc.rs:8962`) is missing from
-   `KNOWN_FACADES` (`mcp/binding.rs:54`); only `facade:*` grants it.
-6. The hook listener authors under `for_agent_session` with a `system()`
+2. The hook listener authors under `for_agent_session` with a `system()`
    fallback (`hook_listener.rs:949`); the bridge-identity design in
    `docs/character.md` replaces it.
-7. `kj context create --as` is ungated (`kj/context.rs:579`) while
-   `kj context set --as` needs Operator plus reviewer authority.
-8. ROOT seeds `system()` as `created_by`/`director_id` (`rpc.rs:2534`);
+3. ROOT seeds `system()` as `created_by`/`director_id` (`rpc.rs:2534`);
    benign.
+4. `kj context create --as` is ungated (`kj/context.rs:579`) while
+   `kj context set --as` needs Operator plus reviewer authority. A patch
+   that gates `create --as` the same way exists
+   (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`)
+   and is held back: it refuses the documented director self-rotation,
+   `kj context create ROOT-next --type director --as banto` from a live
+   model turn (`docs/prompts.md`, "Rotating a director context"), which is
+   neither rc-privileged nor the default reviewer. Amy decides: exempt a
+   caller casting itself into a new context, grant banto a delegation, or
+   accept the tightening and change the docs.
 
-Unverified, wants a coded test: a human's own gated shell command snapshots
-actor == reviewer when the human is the context's reviewer
-(`rpc.rs:10191`), and `ensure_not_self_approval` then refuses that human
-answering it. `gate_executes_wire.rs` only covers a worker with a distinct
-reviewer.
+Verified by `crates/kaijutsu-server/tests/user_input_identity.rs`: a human
+who is the context's reviewer runs a gated shell command, the ask snapshots
+actor == reviewer, and that human's own `kj ledger allow` is refused as
+self-approval. The ask sits Pending until someone cancels or escalates it.
+The test pins today's behavior and names the alternatives for Amy: refuse
+to raise such an ask and route to escalation, auto-escalate at raise time,
+or keep it and expect the human to escalate their own asks.
+
+Found while writing that test: an Ask hook installed on a context re-gates
+the `kj ledger allow` typed into that same context, so the answer to an ask
+raises another ask. The test answers from a hook-free context. Wants a rule
+or a test of its own.
 
 ## The compose draft is the player's alone (Amy, 2026-09-15)
 

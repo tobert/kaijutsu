@@ -3796,9 +3796,8 @@ async fn create_context_inner(
         // hosting a kernel model needs an explicit performer; the connected
         // creator becomes its director, and the kernel resolves its effective
         // reviewer from an explicit override, director delegation, or Amy's default.
-        let played_by = match db.get_character(created_by) {
-            Ok(character) if context_type == "mcp" => character.map(|c| c.principal_id),
-            Ok(_) => None,
+        let creator_has_sheet = match db.get_character(created_by) {
+            Ok(character) => character.is_some(),
             Err(e) => {
                 drop(db);
                 let _ = state.documents.delete_document(context_id);
@@ -3808,6 +3807,8 @@ async fn create_context_inner(
                 )));
             }
         };
+        let (played_by, director_id) =
+            resolve_creator_identity(created_by, creator_has_sheet, context_type);
         let row = ContextRow {
             context_id,
             label: label.map(|s| s.to_string()),
@@ -3833,7 +3834,7 @@ async fn create_context_inner(
             origin_host: None,
             played_by,
             reviewer_id: None,
-            director_id: Some(created_by),
+            director_id,
         };
         // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
         // no row in `workspaces`, so it only turns a legible workspace error
@@ -3907,6 +3908,67 @@ async fn create_context_inner(
     // no kernel edit. See `docs/chameleon.md`, "context_type is an rc bundle".
 
     Ok(())
+}
+
+/// Resolve a connecting principal's `played_by`/`director_id` for a newly
+/// created context. `has_sheet` says whether `created_by` names a live
+/// character (`KernelDb::get_character(created_by).is_some()`). A raw
+/// connection principal with no sheet can never hold a review delegation, so
+/// it becomes no one's director rather than a director that can never be
+/// reassigned or delegated to; `kj context create --as`/`context_set` are the
+/// only paths that turn it into a real director later, once a sheet exists.
+/// `played_by` additionally requires `context_type == "mcp"` — every other
+/// creation path leaves the performer unset (`docs/approval-identity.md`,
+/// "Regular client creation leaves the performer unset").
+fn resolve_creator_identity(
+    created_by: PrincipalId,
+    has_sheet: bool,
+    context_type: &str,
+) -> (Option<PrincipalId>, Option<PrincipalId>) {
+    let director_id = has_sheet.then_some(created_by);
+    let played_by = if context_type == "mcp" { director_id } else { None };
+    (played_by, director_id)
+}
+
+#[cfg(test)]
+mod resolve_creator_identity_tests {
+    use super::*;
+
+    #[test]
+    fn no_sheet_gets_no_director() {
+        let created_by = PrincipalId::new();
+        let (played_by, director_id) = resolve_creator_identity(created_by, false, "coder");
+        assert_eq!(played_by, None);
+        assert_eq!(
+            director_id, None,
+            "a raw connection principal with no character sheet can never \
+             hold a delegation, so it must not be stamped as director"
+        );
+    }
+
+    #[test]
+    fn sheet_becomes_director_but_not_played_by_outside_mcp() {
+        let created_by = PrincipalId::new();
+        let (played_by, director_id) = resolve_creator_identity(created_by, true, "coder");
+        assert_eq!(played_by, None, "non-mcp context types leave the performer unset");
+        assert_eq!(director_id, Some(created_by));
+    }
+
+    #[test]
+    fn mcp_context_with_sheet_gets_played_by_too() {
+        let created_by = PrincipalId::new();
+        let (played_by, director_id) = resolve_creator_identity(created_by, true, "mcp");
+        assert_eq!(played_by, Some(created_by));
+        assert_eq!(director_id, Some(created_by));
+    }
+
+    #[test]
+    fn mcp_context_with_no_sheet_gets_neither() {
+        let created_by = PrincipalId::new();
+        let (played_by, director_id) = resolve_creator_identity(created_by, false, "mcp");
+        assert_eq!(played_by, None);
+        assert_eq!(director_id, None);
+    }
 }
 
 impl kernel::Server for KernelImpl {

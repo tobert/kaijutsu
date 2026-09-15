@@ -3783,7 +3783,7 @@ fn hook_matches(
         return false;
     }
     if let Some(p) = &entry.match_principal
-        && *p != ctx.principal_id
+        && *p != ctx.actor_id
     {
         return false;
     }
@@ -7274,6 +7274,74 @@ mod tests {
             .await
             .unwrap();
         assert!(!ok.is_error);
+    }
+
+    /// `match_principal` scopes a hook to the performing character
+    /// (`ctx.actor_id`), not the connection that requested the call
+    /// (`ctx.principal_id`) — a character-scoped hook must fire for that
+    /// character's own model-turn tool calls even when a different requester
+    /// (a director, an external MCP credential) placed the call, and must
+    /// NOT fire merely because the requester happens to equal the hooked
+    /// principal while someone else is actually performing.
+    #[tokio::test]
+    async fn hook_match_principal_scopes_to_actor_not_requester() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let performer = kaijutsu_types::PrincipalId::new();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("performer-only"),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: Some(performer),
+            action: HookAction::Deny("performer-scoped hook fired".into()),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        // A director requests the call; the hooked character performs it.
+        // The hook must match on the performer.
+        let mut on_behalf_of_performer = CallContext::test();
+        on_behalf_of_performer.principal_id = kaijutsu_types::PrincipalId::new();
+        on_behalf_of_performer.actor_id = performer;
+        let err = broker
+            .call_tool(
+                params("svc", "t"),
+                &on_behalf_of_performer,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_refusal_from(RefusalKind::Denied, "performer-only"),
+            "hook scoped to the performer must match that performer's own \
+             model-turn call even though a different principal requested it; \
+             got {err:?}"
+        );
+
+        // The hooked principal is the requester but NOT the performer of
+        // this call — the hook must not match on the requester alone.
+        let mut requested_by_hooked_principal = CallContext::test();
+        requested_by_hooked_principal.principal_id = performer;
+        requested_by_hooked_principal.actor_id = kaijutsu_types::PrincipalId::new();
+        let ok = broker
+            .call_tool(
+                params("svc", "t"),
+                &requested_by_hooked_principal,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !ok.is_error,
+            "hook scoped to a performer must not fire just because the \
+             requester matches — the requester did not perform this call"
+        );
     }
 
     /// §4.3 evaluation law: priority ascending, insertion-order tiebreak.

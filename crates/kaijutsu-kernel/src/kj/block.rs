@@ -1329,11 +1329,12 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
-        // append_text_as takes Option<PrincipalId>; pass the caller's so
-        // the op is attributed to whoever invoked kj, not the system agent.
+        // append_text_as takes Option<PrincipalId>; pass the performer's, not
+        // the requester's — a model turn's edits are authored by the actor
+        // (docs/approval-identity.md, "Three identities").
         if let Err(e) =
             self.blocks
-                .append_text_as(ctx_id, &block_id, text, Some(caller.principal_id))
+                .append_text_as(ctx_id, &block_id, text, Some(caller.actor_id))
         {
             return KjResult::Err(format!("kj block append: {e}"));
         }
@@ -1492,13 +1493,15 @@ impl KjDispatcher {
             }
         };
 
+        // The performer authors the edit, not the requester — same rule as
+        // block_append (docs/approval-identity.md, "Three identities").
         if let Err(e) = self.blocks.edit_text_as(
             ctx_id,
             &block_id,
             pos,
             &insert_text,
             delete_len,
-            Some(caller.principal_id),
+            Some(caller.actor_id),
         ) {
             return KjResult::Err(format!("kj block edit: {e}"));
         }
@@ -1738,6 +1741,9 @@ impl KjDispatcher {
             },
         };
 
+        // The new block is authored by the performer, not the requester —
+        // same rule as block_append/block_edit
+        // (docs/approval-identity.md, "Three identities").
         let new_id = match self.blocks.insert_block_as(
             ctx_id,
             parent_id.as_ref(),
@@ -1747,7 +1753,7 @@ impl KjDispatcher {
             content,
             Status::Done,
             ContentType::Plain,
-            Some(caller.principal_id),
+            Some(caller.actor_id),
         ) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj block create: {e}")),
@@ -3170,6 +3176,46 @@ mod tests {
         assert_eq!(snap.role, TypesRole::User);
         assert_eq!(snap.kind, BlockKind::Text);
         assert_eq!(snap.status, Status::Done);
+    }
+
+    /// A model turn's edits are authored by the performer, not whoever
+    /// requested the turn (`docs/approval-identity.md`, "Three identities":
+    /// "Provider text, reasoning, and tool calls are authored by the
+    /// performer"). `kj block create` must attribute the new block to
+    /// `caller.actor_id`, never `caller.principal_id`.
+    #[tokio::test]
+    async fn block_create_is_authored_by_the_actor_not_the_requester() {
+        let d = test_dispatcher().await;
+        let requester = PrincipalId::new();
+        let performer = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), requester);
+        let c = caller_with_context(ctx).with_actor(performer, None);
+        assert_ne!(c.principal_id, c.actor_id, "test needs a distinct requester/performer");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("create"),
+                    s("--role"),
+                    s("user"),
+                    s("--kind"),
+                    s("text"),
+                    s("--content"),
+                    s("performer wrote this"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let key = result.message().trim();
+        let parsed = kaijutsu_types::BlockId::from_key(key)
+            .expect("emitted id must be a valid BlockId key");
+        assert_eq!(
+            parsed.principal_id, performer,
+            "the new block's author must be the performer (actor_id), not the requester"
+        );
     }
 
     #[tokio::test]
