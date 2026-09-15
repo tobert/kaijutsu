@@ -297,7 +297,21 @@ struct ReviewAssignment {
     director: Option<kaijutsu_types::PrincipalId>,
     caller_actor: kaijutsu_types::PrincipalId,
     routing_changed: bool,
-    expected_reviewer: kaijutsu_types::PrincipalId,
+    authority: AssignAuthority,
+}
+
+/// Which rule justified a non-default caller's authority to assign a
+/// context's performer, so [`KjDispatcher::apply_context_config`]'s
+/// commit-time re-check can redo that SAME rule under its transaction lock
+/// instead of assuming the reviewer path (`docs/approval-identity.md`, the
+/// assignment paragraph). Unused (and irrelevant) whenever the caller IS
+/// the default reviewer — that path bypasses both rules entirely.
+enum AssignAuthority {
+    /// The caller was the target's resolved effective reviewer.
+    EffectiveReviewer(kaijutsu_types::PrincipalId),
+    /// The caller directs the target and `performer`'s `accountable_to`
+    /// chain reached the caller.
+    DirectorChain { performer: kaijutsu_types::PrincipalId },
 }
 
 /// A `--model` spec resolved against the LLM registry: a bare model name has
@@ -443,15 +457,26 @@ impl KjDispatcher {
                         return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
                     }
                     if !review.routing_changed && !is_default {
-                        let review_actor = current.played_by.unwrap_or(review.caller_actor);
-                        let current_reviewer = match db.effective_approval_reviewer(target_id, review_actor)? {
-                            EffectiveReviewer::Assigned(reviewer) => reviewer,
-                            EffectiveReviewer::NoReviewer => {
-                                return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
+                        match &review.authority {
+                            AssignAuthority::EffectiveReviewer(expected_reviewer) => {
+                                let review_actor = current.played_by.unwrap_or(review.caller_actor);
+                                let current_reviewer = match db.effective_approval_reviewer(target_id, review_actor)? {
+                                    EffectiveReviewer::Assigned(reviewer) => reviewer,
+                                    EffectiveReviewer::NoReviewer => {
+                                        return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
+                                    }
+                                };
+                                if review.caller_actor != *expected_reviewer || current_reviewer != *expected_reviewer {
+                                    return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
+                                }
                             }
-                        };
-                        if review.caller_actor != review.expected_reviewer || current_reviewer != review.expected_reviewer {
-                            return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
+                            AssignAuthority::DirectorChain { performer } => {
+                                let reaches = current.director_id == Some(review.caller_actor)
+                                    && db.accountable_to_chain_reaches(*performer, review.caller_actor)?;
+                                if !reaches {
+                                    return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
+                                }
+                            }
                         }
                     }
                     if db.list_pending_asks()?.iter().any(|ask| ask.context_id.as_slice() == target_id.as_bytes()) {
@@ -1633,6 +1658,70 @@ impl KjDispatcher {
         ))
     }
 
+    /// Whether `caller` may assign `performer` as `target_id`'s performer
+    /// via `kj context set <ctx> --as <character>`. Called only once the
+    /// outer `context_set` has already established that `caller` is not
+    /// the default reviewer and that this is a pure `--as` (no
+    /// `--reviewer`/`--director`/`--clear-reviewer` in the same call — that
+    /// routing-change case is gated separately, above, and unaffected by
+    /// this rule).
+    ///
+    /// Allowed when EITHER `caller` is `target_id`'s currently resolved
+    /// effective reviewer — recomputed for the context's existing
+    /// performer, or `caller` itself when it has none, exactly as before —
+    /// OR `target_id`'s `director_id` names `caller` and `performer`'s
+    /// `accountable_to` chain reaches `caller`: a director may cast, as a
+    /// context it directs, any character accountable to it through that
+    /// chain (`docs/approval-identity.md`, the assignment paragraph;
+    /// guidance, Amy 2026-09-15, "yes banto can cast its own children").
+    /// Casting itself trivially satisfies the chain. Neither branch grants
+    /// review authority over the context — only who may name its performer.
+    ///
+    /// Returns which rule matched, tagged for
+    /// [`Self::apply_context_config`]'s commit-time re-check to redo the
+    /// SAME rule under its transaction lock rather than assume the
+    /// reviewer path.
+    async fn caller_may_assign_performer(
+        &self,
+        target_id: ContextId,
+        performer: kaijutsu_types::PrincipalId,
+        performer_name: &str,
+        caller: kaijutsu_types::PrincipalId,
+    ) -> Result<AssignAuthority, String> {
+        let (director_id, current_played_by) = {
+            let db = self.kernel_db().lock();
+            match db.get_context(target_id) {
+                Ok(Some(row)) => (row.director_id, row.played_by),
+                Ok(None) => return Err("context not found".into()),
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        // The chain walks above an actor: the context's own performer when
+        // it has one, the caller itself when it does not — never "resolve
+        // with the caller as actor" unconditionally, which would ask
+        // whether the caller may review *itself* rather than whether it
+        // may review this context's performer.
+        let review_actor = current_played_by.unwrap_or(caller);
+        let effective = self.kernel().resolve_context_review_for(target_id, review_actor).await?;
+        if caller == effective.reviewer.principal_id {
+            return Ok(AssignAuthority::EffectiveReviewer(effective.reviewer.principal_id));
+        }
+        if director_id != Some(caller) {
+            return Err("only the default or effective reviewer may assign a performer".into());
+        }
+        if self.kernel_db().lock().accountable_to_chain_reaches(performer, caller).map_err(|error| error.to_string())? {
+            return Ok(AssignAuthority::DirectorChain { performer });
+        }
+        let caller_name = self.kernel_db().lock().get_character(caller)
+            .map_err(|error| error.to_string())?
+            .map(|sheet| sheet.name)
+            .unwrap_or_else(|| caller.short().to_string());
+        Err(format!(
+            "only the default or effective reviewer may assign a performer; '{performer_name}' is not \
+             accountable, through the chain, to '{caller_name}', which directs this context"
+        ))
+    }
+
     /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
     async fn context_set(
         &self,
@@ -1675,30 +1764,37 @@ impl KjDispatcher {
             if changes_routing && authority != Some(caller.actor_id) {
                 return KjResult::Err("kj context set: only the default reviewer may change approval routing".into());
             }
-            let expected_reviewer = if authority != Some(caller.actor_id) {
-                // The chain walks above an actor: the context's own performer
-                // when it has one, the caller itself when it does not — never
-                // "resolve with the caller as actor" unconditionally, which
-                // would ask whether the caller may review *itself* rather
-                // than whether it may review this context's performer.
-                let review_actor = {
+            // `--as` is the only field this branch can be reached for
+            // without `changes_routing` (the early return above already
+            // covers every `--reviewer`/`--director`/`--clear-reviewer`
+            // case for a non-default caller), so `character` is resolved up
+            // front: both the authority check below and the eventual
+            // assignment need its principal id, and an unknown or retired
+            // name fails the same way regardless of which rule would
+            // otherwise have applied.
+            let performer_principal = match character {
+                Some(name) => {
                     let db = self.kernel_db().lock();
-                    match db.get_context(target_id) {
-                        Ok(Some(row)) => row.played_by.unwrap_or(caller.actor_id),
-                        Ok(None) => return KjResult::Err("kj context set: context not found".into()),
-                        Err(error) => return KjResult::Err(format!("kj context set: {error}")),
+                    match db.get_character_by_name(name) {
+                        Ok(Some(sheet)) if sheet.retired_at.is_none() => Some(sheet.principal_id),
+                        Ok(Some(_)) => return KjResult::Err(format!("kj context set: character '{name}' is retired")),
+                        Ok(None) => return KjResult::Err(format!("kj context set: no character named '{name}'")),
+                        Err(e) => return KjResult::Err(format!("kj context set: {e}")),
                     }
-                };
-                let effective = match self.kernel().resolve_context_review_for(target_id, review_actor).await {
-                    Ok(review) => review,
-                    Err(error) => return KjResult::Err(format!("kj context set: {error}")),
-                };
-                if caller.actor_id != effective.reviewer.principal_id {
-                    return KjResult::Err("kj context set: only the default or effective reviewer may assign a performer".into());
                 }
-                effective.reviewer.principal_id
+                None => None,
+            };
+            let authority_record = if authority != Some(caller.actor_id) {
+                let performer = performer_principal
+                    .expect("--as is the only field reachable here without changes_routing");
+                let performer_name = character
+                    .expect("performer_principal is only Some when --as named a character");
+                match self.caller_may_assign_performer(target_id, performer, performer_name, caller.actor_id).await {
+                    Ok(record) => record,
+                    Err(error) => return KjResult::Err(format!("kj context set: {error}")),
+                }
             } else {
-                caller.actor_id
+                AssignAuthority::EffectiveReviewer(caller.actor_id)
             };
             let assignment = {
                 let db = self.kernel_db().lock();
@@ -1714,10 +1810,10 @@ impl KjDispatcher {
                         if sheet.retired_at.is_some() { return Err(format!("character '{name}' is retired")); }
                         Ok(sheet.principal_id)
                     };
-                    let actor = character.map(resolve).transpose()?.or(row.played_by);
+                    let actor = performer_principal.or(row.played_by);
                     let reviewer = if clear_reviewer { None } else { reviewer.map(resolve).transpose()?.or(row.reviewer_id) };
                     let director = director.map(resolve).transpose()?.or(row.director_id);
-                    Ok(ReviewAssignment { actor, reviewer, director, caller_actor: caller.actor_id, routing_changed: changes_routing, expected_reviewer })
+                    Ok(ReviewAssignment { actor, reviewer, director, caller_actor: caller.actor_id, routing_changed: changes_routing, authority: authority_record })
                 })()
             };
             let assignment = match assignment { Ok(value) => value, Err(error) => return KjResult::Err(format!("kj context set: {error}")) };
@@ -2374,7 +2470,7 @@ impl Classify for ContextCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_new_context_checked, ContextConfig, ReviewAssignment};
+    use super::{insert_new_context_checked, AssignAuthority, ContextConfig, ReviewAssignment};
     use crate::kernel_db::ContextEdgeRow;
     #[allow(unused_imports)]
     use crate::kj::KjResult;
@@ -2665,7 +2761,7 @@ mod tests {
         let expected = d.kernel().resolve_context_review(context).await.unwrap();
         assert_eq!(expected.reviewer.principal_id, lead);
         d.kernel_db().lock().revoke_approval_delegation(lead, amy).unwrap();
-        let cfg = ContextConfig { review: Some(ReviewAssignment { actor: Some(coder), reviewer: None, director: Some(lead), caller_actor: lead, routing_changed: false, expected_reviewer: lead }), ..Default::default() };
+        let cfg = ContextConfig { review: Some(ReviewAssignment { actor: Some(coder), reviewer: None, director: Some(lead), caller_actor: lead, routing_changed: false, authority: AssignAuthority::EffectiveReviewer(lead) }), ..Default::default() };
         let error = d.apply_context_config(context, &cfg, None, None).await.unwrap_err();
         assert!(error.contains("authority changed"), "{error}");
         let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
@@ -2747,14 +2843,18 @@ mod tests {
         assert_eq!(unchanged.reviewer_id, Some(lead));
     }
 
-    /// A director's own `accountable_to` parent does not grant the director
-    /// authority to assign a performer to a context it directs: the chain
-    /// answers "who reviews THIS director's work" (its parent), not
-    /// "does this director control the target" — `session_scenario.rs`'s
-    /// banto still needs amy to assign each lane's performer even though
-    /// banto -> amy is a real, configured chain link.
+    /// A director's own `accountable_to` parent does not, by itself, grant
+    /// it authority over contexts it directs: the chain answers "who
+    /// reviews THIS director's work" (its parent), not "does this director
+    /// control the target". But when the NAMED PERFORMER's own chain
+    /// reaches the director, casting it as that directed context's
+    /// performer is allowed (`docs/approval-identity.md`, the assignment
+    /// paragraph; guidance, Amy 2026-09-15, "yes banto can cast its own
+    /// children") — this test used to pin the refusal; flipped once the
+    /// rule accounted for the PERFORMER's chain rather than only the
+    /// director's own.
     #[tokio::test]
-    async fn a_directors_accountable_to_parent_does_not_grant_it_authority_over_its_directed_contexts() {
+    async fn a_director_may_cast_a_performer_whose_chain_reaches_it_into_a_context_it_directs() {
         let d = test_dispatcher().await;
         let amy_id = test_reviewer_principal();
         let banto = PrincipalId::new();
@@ -2765,15 +2865,121 @@ mod tests {
             }).unwrap();
         }
         d.kernel_db().lock().update_character_accountable_to(banto, Some(amy_id)).unwrap();
+        d.kernel_db().lock().update_character_accountable_to(coder, Some(banto)).unwrap();
         let context = register_context(&d, Some("banto-directed"), None, amy_id);
         d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(banto)).unwrap();
         let banto_caller = crate::kj::KjCaller {
             principal_id: banto, actor_id: banto, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
         };
-        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder")], &banto_caller).await;
-        assert!(!refused.is_ok(), "the chain must not let a director assign a performer to its own directed context");
+        let assigned = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder")], &banto_caller).await;
+        assert!(assigned.is_ok(), "coder's chain reaches banto, and banto directs this context: {}", assigned.message());
+        let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(row.played_by, Some(coder));
+    }
+
+    /// The director-chain rule names the chain, not just the director: a
+    /// performer with no `accountable_to` at all (a root) still refuses
+    /// even though the caller directs the target.
+    #[tokio::test]
+    async fn a_director_cannot_cast_a_performer_whose_chain_does_not_reach_it() {
+        let d = test_dispatcher().await;
+        let amy_id = test_reviewer_principal();
+        let banto = PrincipalId::new();
+        let coder_x = PrincipalId::new();
+        for (principal_id, name) in [(banto, "banto"), (coder_x, "coder-x")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        d.kernel_db().lock().update_character_accountable_to(banto, Some(amy_id)).unwrap();
+        // coder-x has no accountable_to at all — a root, so its chain never
+        // reaches banto no matter how far it is walked.
+        let context = register_context(&d, Some("banto-directed-2"), None, amy_id);
+        d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(banto)).unwrap();
+        let banto_caller = crate::kj::KjCaller {
+            principal_id: banto, actor_id: banto, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+        };
+        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder-x")], &banto_caller).await;
+        assert!(!refused.is_ok(), "coder-x is a root; its chain does not reach banto");
+        assert!(refused.message().contains("coder-x"), "{}", refused.message());
+        assert!(refused.message().contains("banto"), "{}", refused.message());
+        let unchanged = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(unchanged.played_by, None);
+    }
+
+    /// A character with the same accountable_to chain as the real director —
+    /// but who does not itself direct this context — earns no authority
+    /// from that chain: `director_id` must name the CALLER, not merely
+    /// someone at the caller's own level.
+    #[tokio::test]
+    async fn a_non_directing_sibling_cannot_cast_into_another_directors_context() {
+        let d = test_dispatcher().await;
+        let amy_id = test_reviewer_principal();
+        let banto = PrincipalId::new();
+        let sibling = PrincipalId::new();
+        let coder = PrincipalId::new();
+        for (principal_id, name) in [(banto, "banto"), (sibling, "sibling"), (coder, "coder")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        d.kernel_db().lock().update_character_accountable_to(banto, Some(amy_id)).unwrap();
+        d.kernel_db().lock().update_character_accountable_to(sibling, Some(amy_id)).unwrap();
+        // coder's chain reaches SIBLING, not banto — so if the director
+        // check ever went missing, sibling's own chain-membership check
+        // would wrongly succeed. banto still directs the target context,
+        // not sibling.
+        d.kernel_db().lock().update_character_accountable_to(coder, Some(sibling)).unwrap();
+        let context = register_context(&d, Some("banto-directed-3"), None, amy_id);
+        d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(banto)).unwrap();
+        let sibling_caller = crate::kj::KjCaller {
+            principal_id: sibling, actor_id: sibling, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+        };
+        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder")], &sibling_caller).await;
+        assert!(!refused.is_ok(), "sibling does not direct this context, even though coder's chain reaches sibling");
         assert!(refused.message().contains("only the default or effective reviewer"), "{}", refused.message());
+        let unchanged = d.kernel_db().lock().get_context(context).unwrap().unwrap();
+        assert_eq!(unchanged.played_by, None);
+    }
+
+    /// A retired link in the performer's chain refuses by name rather than
+    /// silently being skipped over — same behavior as
+    /// `nearest_live_accountable_to`, reused by the multi-hop walk.
+    #[tokio::test]
+    async fn a_retired_link_in_the_performers_chain_refuses_by_name() {
+        let d = test_dispatcher().await;
+        let amy_id = test_reviewer_principal();
+        let banto = PrincipalId::new();
+        let middle = PrincipalId::new();
+        let coder_y = PrincipalId::new();
+        for (principal_id, name) in [(banto, "banto"), (middle, "middle"), (coder_y, "coder-y")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        d.kernel_db().lock().update_character_accountable_to(banto, Some(amy_id)).unwrap();
+        d.kernel_db().lock().update_character_accountable_to(middle, Some(banto)).unwrap();
+        d.kernel_db().lock().update_character_accountable_to(coder_y, Some(middle)).unwrap();
+        // Retiring `middle` through raw SQL, as `nearest_live_accountable_to`'s
+        // own test does, simulates a link the walk must still refuse rather
+        // than silently skip.
+        d.kernel_db().lock().conn_for_ledger().execute(
+            "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1",
+            [middle.as_bytes().as_slice()],
+        ).unwrap();
+        let context = register_context(&d, Some("banto-directed-4"), None, amy_id);
+        d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(banto)).unwrap();
+        let banto_caller = crate::kj::KjCaller {
+            principal_id: banto, actor_id: banto, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+        };
+        let error = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder-y")], &banto_caller).await;
+        assert!(!error.is_ok());
+        assert!(error.message().contains("middle"), "{}", error.message());
+        assert!(error.message().contains("retired"), "{}", error.message());
         let unchanged = d.kernel_db().lock().get_context(context).unwrap().unwrap();
         assert_eq!(unchanged.played_by, None);
     }

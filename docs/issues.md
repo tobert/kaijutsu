@@ -31,19 +31,8 @@ Read by the lead; each line re-checked before it went here.
 - The scenario's `#[test]` count of one is load-bearing: the env var is set
   and never restored. A `Drop` guard makes that structural.
 
-## After slice 1 of the chain: three things it surfaced (2026-09-15)
+## After slice 1 of the chain: two things it surfaced (2026-09-15)
 
-- **A director cannot cast performers on the contexts it directs.**
-  `caller_may_assign_performer` (`kj/context.rs`) asks whether the caller
-  is the target's resolved reviewer; the chain answers who reviews the
-  DIRECTOR's own work, its parent, so banto still cannot `kj context set
-  lane-a --as coder-a` for a lane it forked, and amy assigns every lane's
-  performer in the session scenario. Amy said "banto can answer for its
-  children"; whether that extends to casting a character accountable to
-  banto into a context banto directs is her call. If yes: allow the
-  assignment when the target's director is the caller and the performer's
-  chain reaches the caller. Test pinned in `kj/context.rs`,
-  `a_directors_accountable_to_parent_does_not_grant_it_authority_over_its_directed_contexts`.
 - **An explicit reviewer can still equal a direct human actor.** The
   resolver returns an explicit override or delegation as configured even
   when it names the actor, because a director legitimately delegates

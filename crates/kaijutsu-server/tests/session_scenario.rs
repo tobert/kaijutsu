@@ -4,15 +4,22 @@
 //! (`crates/kaijutsu-kernel/src/llm/mod.rs`'s `MockClient::with_script_dir`).
 //!
 //! Amy sits in banto's seat and submits one prompt. banto (the mock
-//! `mock-banto` model) forks two coder lanes; amy assigns each a performer
-//! and a distinct model (`mock-coder-a` / `mock-coder-b` — one `MockClient`
-//! per-model queue per lane, so their concurrently-driven turns can never
-//! interleave each other's scripted events); banto then drives and waits on
-//! them, and each lane drifts a report back to banto's seat. banto then
-//! notes a handoff, and a later
+//! `mock-banto` model) forks two coder lanes and assigns each a performer
+//! and a distinct model itself (`mock-coder-a` / `mock-coder-b` — one
+//! `MockClient` per-model queue per lane, so their concurrently-driven
+//! turns can never interleave each other's scripted events) — a director
+//! casting a performer accountable to it into a context it directs
+//! (guidance, Amy 2026-09-15, "yes banto can cast its own children");
+//! banto then drives and waits on them, and each lane drifts a report back
+//! to banto's seat. banto then notes a handoff, and a later
 //! turn issues a gated statement that raises an ask; amy answers it as the
 //! default reviewer; a final turn signs off, closing the continuation
 //! window; amy rotates banto's seat and reads the successor's instructions.
+//!
+//! **This scenario currently fails at the performer-assignment step** — see
+//! "What this does not cover" below for the confirmed reason: it is a real
+//! gap in `kj fork`, not a test-shape problem, and stays red on purpose
+//! rather than being papered over.
 //!
 //! This binary has exactly one `#[test]` function. `KJ_MOCK_SCRIPT_DIR` is
 //! process-wide state read once when the mock backend is constructed
@@ -50,20 +57,13 @@
 //!   path, just not the cast-by-role path the brief sketched for the coder
 //!   slot. The cast is still created and the `director` slot IS reached
 //!   normally (banto's own `context_type` really is `director`).
-//! - **A lane's own performer must be assigned by amy, not by banto's own
-//!   tool call.** `kj context set <ctx> --as <character>` refuses unless
-//!   the caller is the target's resolved reviewer
-//!   (`crates/kaijutsu-kernel/src/kj/context.rs:1697`), and a fork
-//!   preserves the parent's `director_id`
-//!   (`docs/approval-identity.md`'s Current implementation table) — since
-//!   amy (not banto) created banto's own seat, she is the director every
-//!   lane banto forks inherits too. The accountability chain does not
-//!   change who may pass this check: a lane's own chain (walked from
-//!   whichever actor is doing the assigning) resolves to amy — banto's
-//!   parent — not to banto itself, so only amy (or an explicit delegate)
-//!   can assign a lane's performer today. `docs/character.md`'s "Roots and
-//!   rotation" slice 6 (`create --as` raising an ask instead of refusing)
-//!   is what would let banto do this itself.
+//! - **banto casts its own lanes.** `kj context set <lane> --as <coder>`
+//!   is allowed when the target's director is the caller and the coder's
+//!   `accountable_to` chain reaches the caller
+//!   (`crates/kaijutsu-kernel/src/kj/context.rs`, `caller_may_assign_performer`),
+//!   and a fork is directed by the actor that forked it
+//!   (`crates/kaijutsu-kernel/src/kj/fork.rs`), so the assignment happens
+//!   inside banto's own scripted turn; amy assigns nothing.
 //! - **Two defects this scenario found**, fixed the same day and pinned
 //!   here: the `"turn-driver"` thread now reserves `KAISH_RC_THREAD_STACK`
 //!   (`crates/kaijutsu-server/src/rpc.rs`, `spawn_turn_driver`), and
@@ -229,7 +229,7 @@ async fn boot() -> Scenario {
     std::fs::write(
         &gate_toml_path,
         format!(
-            "{}\n[context_type.director]\nallow = [\n  \"kj fork\",\n  \"kj drive\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n]\n",
+            "{}\n[context_type.director]\nallow = [\n  \"kj fork\",\n  \"kj context set\",\n  \"kj drive\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n]\n",
             std::fs::read_to_string(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../assets/defaults/gate.toml"
@@ -345,22 +345,14 @@ fn kaijutsu_session_scenario() {
 
         // ------------------------------------------------------------
         // Turn 1a: amy submits a prompt in banto's seat. banto's mock script
-        // forks lane-a and lane-b.
+        // forks lane-a and lane-b, then assigns each lane's performer
+        // itself (`kj context set lane-x --as coder-x`), as the director
+        // that forked them (guidance, Amy 2026-09-15, "yes banto can cast
+        // its own children"; `docs/approval-identity.md`, the assignment
+        // paragraph).
         //
-        // Assigning each lane's performer happens next, as amy's own action
-        // rather than another banto tool call: `kj context set --as` refuses
-        // unless the caller IS the resolved reviewer
-        // (`crates/kaijutsu-kernel/src/kj/context.rs:1670`), and a fork
-        // preserves the parent's `director_id` (`docs/approval-identity.md`'s
-        // Current implementation table) — banto's own seat is directed by
-        // amy (she created it), so every lane banto forks is too, and amy
-        // is the one with authority to assign their performers. This
-        // matches the documented example verbatim (`docs/approval-identity.md`,
-        // "For an explicit context assignment, Amy runs: `kj context set
-        // repair --as coder --reviewer banto`") — today's mechanics give
-        // this step to amy, not banto; `docs/character.md`'s "Roots and
-        // rotation" chain, once implemented, is what would let banto do it
-        // itself.
+        // banto directs the lanes it forked and coder-a/b are accountable
+        // to banto, so banto's own turn assigns their performers.
         // ------------------------------------------------------------
         let (callback, mut turn_rx) = turn_events_channel(64);
         s.amy.subscribe_turn_events(callback).await.expect("subscribe_turn_events");
@@ -395,9 +387,6 @@ fn kaijutsu_session_scenario() {
             let row = s.kernel.kernel_db.lock().get_context(ctx).unwrap().unwrap();
             assert_eq!(row.forked_from, Some(banto_ctx), "{label}'s structural parent must be banto's seat");
         }
-
-        s.kj("kj context set lane-a --as coder-a --model mock/mock-coder-a").await;
-        s.kj("kj context set lane-b --as coder-b --model mock/mock-coder-b").await;
 
         // ------------------------------------------------------------
         // Turn 1b: banto drives and waits on both lanes.

@@ -20,7 +20,7 @@ does not become an instruction to use nonexistent features.
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
 | Performer | `kj context create --as <character>` records `played_by` before create rc, rejects unknown, retired, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
 | Client creation | Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer |
-| Review assignment | Explicit context override, then explicit director-wide delegation, then the configured Amy default. Amy controls delegation and reviewer/director overrides. Fork preserves director and override. See `docs/approval-identity.md` |
+| Review assignment | Explicit context override, then explicit director-wide delegation, then the configured Amy default. Amy controls delegation and reviewer/director overrides. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context. See `docs/approval-identity.md` |
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged |

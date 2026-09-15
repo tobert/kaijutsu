@@ -576,7 +576,6 @@ impl KjDispatcher {
             // whoever plays the source plays the child too.
             let source_played_by = source_row.as_ref().and_then(|r| r.played_by);
             let source_reviewer_id = source_row.as_ref().and_then(|r| r.reviewer_id);
-            let source_director_id = source_row.as_ref().and_then(|r| r.director_id);
 
             let row = ContextRow {
                 context_id: new_id,
@@ -607,7 +606,9 @@ impl KjDispatcher {
                 origin_host: None,
                 played_by: source_played_by,
                 reviewer_id: source_reviewer_id,
-                director_id: source_director_id,
+                // The forking actor directs the child; the reviewer override is
+                // the one review field a fork preserves.
+                director_id: Some(caller.actor_id),
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -936,7 +937,6 @@ impl KjDispatcher {
             // whoever plays the source plays the child too.
             let source_played_by = source_row.played_by;
             let source_reviewer_id = source_row.reviewer_id;
-            let source_director_id = source_row.director_id;
 
             let row = ContextRow {
                 context_id: new_id,
@@ -963,7 +963,7 @@ impl KjDispatcher {
                 origin_host: None,
                 played_by: source_played_by,
                 reviewer_id: source_reviewer_id,
-                director_id: source_director_id,
+                director_id: Some(caller.actor_id),
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1206,7 +1206,7 @@ impl KjDispatcher {
                     origin_host: None,
                     played_by: row.played_by,
                     reviewer_id: row.reviewer_id,
-                    director_id: None,
+                    director_id: Some(caller.actor_id),
                 };
                 let default_ws =
                     match db.get_or_create_default_workspace(caller.principal_id) {
@@ -2706,6 +2706,37 @@ mod tests {
     /// carry the performer as their sender, never the requester. The new
     /// context row's `created_by` is the opposite — it names the requester
     /// who created the context.
+    /// The forking actor directs the child. A fork is the actor's own
+    /// work, so `director_id` names the performer that forked it, not
+    /// whoever directed the source; the reviewer override is preserved.
+    /// This is what lets a director cast its own children into the lanes
+    /// it forks (`docs/approval-identity.md`).
+    #[tokio::test]
+    async fn fork_child_is_directed_by_the_forking_actor() {
+        let d = test_dispatcher().await;
+        let requester = PrincipalId::new();
+        let source = register_context(&d, Some("dir-fork-src"), None, requester);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let performer = PrincipalId::new();
+        let c = caller_with_context(source).with_actor(performer, None);
+
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("dir-fork-child")], &c)
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "dir-fork-child");
+        let row = d.kernel_db().lock().get_context(child).unwrap().unwrap();
+        assert_eq!(
+            row.director_id,
+            Some(performer),
+            "the forking actor directs the child, not the source's director"
+        );
+        assert_eq!(row.created_by, c.principal_id, "created_by still names the requester");
+    }
+
     #[tokio::test]
     async fn fork_note_and_marker_carry_the_performer_not_the_requester() {
         let d = test_dispatcher().await;

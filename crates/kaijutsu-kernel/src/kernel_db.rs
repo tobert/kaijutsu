@@ -2163,6 +2163,36 @@ impl KernelDb {
         }
     }
 
+    /// Whether `ancestor` appears in `performer`'s `accountable_to` chain —
+    /// a multi-hop walk, unlike [`Self::nearest_live_accountable_to`]'s
+    /// single hop, used to answer "may this director cast that performer"
+    /// (`docs/approval-identity.md`, the assignment paragraph).
+    ///
+    /// `performer == ancestor` is trivially true without a walk — a
+    /// director casting itself as a directed context's performer. Each
+    /// further hop is one call to `nearest_live_accountable_to`, so a
+    /// retired link along the way refuses, naming it, exactly as that
+    /// method does; the walk never skips past a retired character to keep
+    /// looking. `visited` guards against an already-impossible cycle,
+    /// matching `update_character_accountable_to`'s write-time defense —
+    /// it should never fire against data that method wrote.
+    pub fn accountable_to_chain_reaches(&self, performer: PrincipalId, ancestor: PrincipalId) -> KernelDbResult<bool> {
+        let mut current = performer;
+        let mut visited = HashSet::new();
+        loop {
+            if current == ancestor {
+                return Ok(true);
+            }
+            if !visited.insert(current) {
+                return Ok(false);
+            }
+            match self.nearest_live_accountable_to(current)? {
+                Some(parent) => current = parent,
+                None => return Ok(false),
+            }
+        }
+    }
+
     /// Grant or replace one director-wide reviewer delegation and record its actor.
     pub fn grant_approval_delegation(&self, director: PrincipalId, reviewer: PrincipalId, granted_by: PrincipalId) -> KernelDbResult<()> {
         if self.conn.is_autocommit() {
@@ -10695,6 +10725,42 @@ mod tests {
         ).unwrap();
         let error = db.nearest_live_accountable_to(coder).unwrap_err();
         assert!(error.to_string().contains("banto"), "{error}");
+        assert!(error.to_string().contains("retired"), "{error}");
+    }
+
+    /// coder -> middle -> banto: the chain walk reaches an ancestor two hops
+    /// up, not just the nearest one; a sibling with no such link never
+    /// reaches it; casting oneself is trivially true; and a retired link
+    /// partway up the walk refuses by name rather than being skipped.
+    #[test]
+    fn accountable_to_chain_reaches_walks_multiple_hops_and_refuses_a_retired_link() {
+        let db = KernelDb::temporary().unwrap();
+        let banto = PrincipalId::new();
+        let middle = PrincipalId::new();
+        let coder = PrincipalId::new();
+        let sibling = PrincipalId::new();
+        for (id, name) in [(banto, "banto"), (middle, "middle"), (coder, "coder"), (sibling, "sibling")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id, name: name.to_string(), created_at: 0,
+                retired_at: None, handoff_ctx: None, accountable_to: None,
+            }).unwrap();
+        }
+        db.update_character_accountable_to(middle, Some(banto)).unwrap();
+        db.update_character_accountable_to(coder, Some(middle)).unwrap();
+
+        assert!(db.accountable_to_chain_reaches(banto, banto).unwrap(), "casting oneself is trivially true");
+        assert!(db.accountable_to_chain_reaches(coder, banto).unwrap(), "coder -> middle -> banto is a two-hop reach");
+        assert!(!db.accountable_to_chain_reaches(sibling, banto).unwrap(), "sibling has no accountable_to at all");
+
+        // Retiring `middle` through raw SQL, as the one-hop test above does,
+        // simulates a link the multi-hop walk must still refuse rather than
+        // silently skip past.
+        db.conn.execute(
+            "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1",
+            params![blob_param(middle.as_bytes())],
+        ).unwrap();
+        let error = db.accountable_to_chain_reaches(coder, banto).unwrap_err();
+        assert!(error.to_string().contains("middle"), "{error}");
         assert!(error.to_string().contains("retired"), "{error}");
     }
 

@@ -1,6 +1,6 @@
 [
   [
-    {"ToolUse": {"id": "banto-1", "name": "shell_write", "input": {"command": "kj fork --name lane-a && kj fork --name lane-b", "foreground": true}}},
+    {"ToolUse": {"id": "banto-1", "name": "shell_write", "input": {"command": "kj fork --name lane-a && kj fork --name lane-b && kj context set lane-a --as coder-a --model mock/mock-coder-a && kj context set lane-b --as coder-b --model mock/mock-coder-b", "foreground": true}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [

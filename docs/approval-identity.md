@@ -76,6 +76,19 @@ distinct characters. Ordinary forks preserve the director and explicit
 override. Regular client creation leaves the performer unset, so model work
 still needs an explicit performing character.
 
+`kj context set <ctx> --as <character>` is allowed for a caller who is not
+the target's resolved reviewer when the target's `director_id` names the
+caller and the named performer's `accountable_to` chain reaches the caller
+(guidance, Amy 2026-09-15, "yes banto can cast its own children") — a
+director may cast, as a context it directs, any character accountable to
+it through that chain, without needing to be the context's reviewer
+itself. Casting itself trivially satisfies the chain. This is a second way
+to earn `--as` authority, not a change to reviewer authority: it does not
+let a director assign `--reviewer` or `--director`, which still require
+the default reviewer, and it does not make the director the context's
+reviewer for the performer it just cast — that is still resolved
+separately, and the performer still cannot review its own work.
+
 ## Three identities
 
 | Field | Meaning |
