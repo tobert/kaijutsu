@@ -545,11 +545,8 @@ pub fn answerer_name(
 /// request once per connection. One driver, one subscription, one turn.
 pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
     // The turn driver runs tool calls through kaish, and nested `kj`
-    // commands overflow the default stack — see `KAISH_RC_THREAD_STACK`.
-    let builder = std::thread::Builder::new()
-        .name("turn-driver".to_string())
-        .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
-    if let Err(e) = builder.spawn(move || {
+    // commands overflow the default stack — see `spawn_kaish_thread`.
+    if let Err(e) = kaijutsu_kernel::spawn_kaish_thread("turn-driver", move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1272,11 +1269,8 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
     // An approved `kj context create` or `kj fork` runs its rc lifecycle on
     // THIS thread, re-entering kaish deeply; the default 2 MiB stack
     // overflows and aborts the whole server. Same reservation as the SSH
-    // session and beat-scheduler threads — see `KAISH_RC_THREAD_STACK`.
-    let builder = std::thread::Builder::new()
-        .name("gate-resume".to_string())
-        .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
-    if let Err(e) = builder.spawn(move || {
+    // session and beat-scheduler threads — see `spawn_kaish_thread`.
+    if let Err(e) = kaijutsu_kernel::spawn_kaish_thread("gate-resume", move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1711,6 +1705,9 @@ pub fn spawn_gate_resume_driver(registry: Arc<ServerRegistry>) {
 /// dedicated thread + LocalSet mirrors `spawn_turn_driver` (the reconcile path
 /// touches the `!Send` editor sessions behind the kernel mutex).
 pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
+    // Not spawned through `spawn_kaish_thread`: the reconcile path only
+    // touches editor session state and never re-enters kaish, so the
+    // default stack is sized correctly here.
     let builder = std::thread::Builder::new().name("editor-reconciler".to_string());
     if let Err(e) = builder.spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -13592,32 +13589,130 @@ mod status_wire_mapping_tests {
 
 #[cfg(test)]
 mod rc_thread_stack_tests {
-    //! Every thread that drives an rc lifecycle reserves
-    //! `KAISH_RC_THREAD_STACK`; on the default 2 MiB stack the nested kaish
-    //! re-entry of a create or fork overflows and aborts the server.
+    //! Every thread that can run kaish is spawned through
+    //! `kaijutsu_kernel::spawn_kaish_thread`, which reserves
+    //! `KAISH_RC_THREAD_STACK`; on the default 2 MiB stack, kaish's deep
+    //! re-entry on a create or fork overflows and aborts the server.
+    //!
+    //! This enforces it structurally instead of pinning a fixed list of
+    //! thread names: a bare, unwrapped `std::thread` builder call under
+    //! `crates/*/src` (kernel and server) is either the helper's own
+    //! definition or a named, reasoned exemption below — any other hit is a
+    //! new kaish-reachable thread that forgot to reserve the stack.
 
-    /// The builder that names each rc-driving thread must size it in the
-    /// same chain. The gate-resume driver was the one that got missed.
+    use std::path::{Path, PathBuf};
+
+    /// The exact call-site text every kaish-reachable thread must go through
+    /// `spawn_kaish_thread` instead of writing directly. Built with
+    /// `concat!` so this module's own source — which necessarily talks
+    /// about that text — never matches its own scan.
+    const BARE_BUILDER_CALL: &str = concat!("thread", "::", "Builder::new()");
+
+    /// One bare-builder occurrence: its file, 1-based line, and that line's
+    /// trimmed text.
+    struct Hit {
+        file: PathBuf,
+        line: usize,
+        text: String,
+    }
+
+    /// Recursively collect every bare-builder-call occurrence in the `.rs`
+    /// files under `root` (a crate's `src/` directory), skipping comment
+    /// lines so a doc comment mentioning the pattern in prose is not a hit.
+    fn find_bare_builders(root: &Path) -> Vec<Hit> {
+        let mut hits = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                for (i, line) in text.lines().enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    if line.contains(BARE_BUILDER_CALL) {
+                        hits.push(Hit {
+                            file: path.clone(),
+                            line: i + 1,
+                            text: trimmed.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// Threads that never reach kaish, named so a future addition here is a
+    /// deliberate, reviewed decision rather than a silent exemption. Matched
+    /// against a small window of lines around the bare builder, so a name
+    /// set a line or two away from `.new()` still counts.
+    const ALLOWED_NON_KAISH: &[(&str, &str)] = &[(
+        "editor-reconciler",
+        "reconciles open editor sessions against merged block text; \
+         touches no kaish state (rpc.rs, spawn_editor_reconciler)",
+    )];
+
+    /// Lines around `hit.line` in its file (1-based, inclusive `before`, `after`).
+    fn window(hit: &Hit, before: usize, after: usize) -> Vec<String> {
+        let text = std::fs::read_to_string(&hit.file).expect("re-read source");
+        let lines: Vec<&str> = text.lines().collect();
+        let start = hit.line.saturating_sub(1).saturating_sub(before);
+        let end = (hit.line - 1 + after + 1).min(lines.len());
+        lines[start..end].iter().map(|l| l.to_string()).collect()
+    }
+
     #[test]
-    fn every_rc_driving_thread_reserves_the_rc_stack() {
-        let sources: [(&str, &str, &str); 4] = [
-            ("rpc.rs", include_str!("rpc.rs"), "\"gate-resume\""),
-            ("rpc.rs", include_str!("rpc.rs"), "\"turn-driver\""),
-            ("beat.rs", include_str!("beat.rs"), "\"beat-scheduler\""),
-            ("ssh.rs", include_str!("ssh.rs"), ".name(session_label.clone())"),
-        ];
-        for (file, source, thread) in sources {
-            let at = source
-                .find(thread)
-                .unwrap_or_else(|| panic!("{file}: the thread named by {thread} is gone; update this pin"));
-            let chain = &source[at..source.len().min(at + 200)];
+    fn every_bare_thread_builder_is_the_helper_or_allow_listed() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut hits = find_bare_builders(&manifest.join("src"));
+        hits.extend(find_bare_builders(&manifest.join("../kaijutsu-kernel/src")));
+        assert!(!hits.is_empty(), "the scan itself is broken: found zero bare-builder hits");
+
+        for hit in &hits {
+            let is_helper_definition = hit.file.ends_with("kaijutsu-kernel/src/lib.rs")
+                && window(hit, 6, 0)
+                    .iter()
+                    .any(|l| l.contains("pub fn spawn_kaish_thread"));
+            if is_helper_definition {
+                continue;
+            }
+            let allowed = ALLOWED_NON_KAISH.iter().any(|(marker, _reason)| {
+                window(hit, 1, 3).iter().any(|l| l.contains(marker))
+            });
             assert!(
-                chain.contains(".stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)"),
-                "{file}: the thread named by {thread} runs rc lifecycles and must reserve \
-                 KAISH_RC_THREAD_STACK in the same builder chain, or an approved \
-                 `kj context create` aborts the whole server (stack overflow)"
+                allowed,
+                "{}:{}: bare `{}` is neither spawn_kaish_thread's own definition nor an \
+                 allow-listed non-kaish thread — spawn through spawn_kaish_thread",
+                hit.file.display(),
+                hit.line,
+                hit.text,
             );
         }
+    }
+
+    #[test]
+    fn main_sizes_the_tokio_runtime_stack() {
+        let main_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let source = std::fs::read_to_string(&main_rs).expect("read main.rs");
+        assert!(
+            source.contains(".thread_stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)"),
+            "main.rs must size the tokio runtime's worker threads to \
+             KAISH_RC_THREAD_STACK — the ROOT genesis rc chain (create_shared_kernel) \
+             runs on this runtime at boot and overflows the default 2 MiB stack \
+             otherwise"
+        );
     }
 }
 

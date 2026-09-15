@@ -64,6 +64,23 @@ pub mod vfs;
 /// so the headroom is effectively free. Threads that run rc must opt into it.
 pub const KAISH_RC_THREAD_STACK: usize = 16 * 1024 * 1024;
 
+/// Spawn an OS thread sized for kaish.
+///
+/// Any thread that can run kaish — an rc lifecycle, a hook, a tool call, the
+/// turn driver, gate resume, the beat scheduler, or an SSH session thread —
+/// is spawned through this, never through `std::thread::Builder` directly, so
+/// none of them can regress to the default 2 MiB stack and abort the server
+/// on a deep rc nest. See [`KAISH_RC_THREAD_STACK`].
+pub fn spawn_kaish_thread(
+    name: impl Into<String>,
+    f: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(KAISH_RC_THREAD_STACK)
+        .spawn(f)
+}
+
 pub use peers::{
     InvokeRequest, InvokeResponse, PeerConfig, PeerError, PeerInfo, PeerRegistry,
     SharedPeerRegistry, peer_key, shared_peer_registry,

@@ -1073,23 +1073,21 @@ mod tests {
     /// assert propagation without self-recreation; this proof only runs green.
     ///
     /// The deep rc nest (each hop re-enters kaish) overflows the default 2 MiB
-    /// test stack, so the body runs on `KAISH_RC_THREAD_STACK` — the same
+    /// test stack, so the body runs through `spawn_kaish_thread` — the same
     /// stack production rc-driving threads use (see transport.rs's
     /// `run_on_rc_stack` for the pattern's origin).
     #[test]
     fn self_recreating_rc_chain_stops_at_guard() {
-        std::thread::Builder::new()
-            .stack_size(crate::KAISH_RC_THREAD_STACK)
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build current-thread runtime")
-                    .block_on(self_recreating_rc_chain_body());
-            })
-            .expect("spawn rc-stack thread")
-            .join()
-            .expect("rc-stack thread panicked");
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime")
+                .block_on(self_recreating_rc_chain_body());
+        })
+        .expect("spawn rc-stack thread")
+        .join()
+        .expect("rc-stack thread panicked");
     }
 
     /// Body of [`self_recreating_rc_chain_stops_at_guard`], extracted so the

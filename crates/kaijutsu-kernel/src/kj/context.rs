@@ -2736,18 +2736,16 @@ mod tests {
     // Creating through a shell re-enters kaish for rc; use the production rc stack.
     #[test]
     fn context_create_as_records_performer_and_loads_director_handoff() {
-        std::thread::Builder::new()
-            .stack_size(crate::KAISH_RC_THREAD_STACK)
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(context_create_as_director_body());
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(context_create_as_director_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
     }
 
     async fn context_create_as_director_body() {

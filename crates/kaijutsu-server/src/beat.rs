@@ -2494,11 +2494,9 @@ pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     // `.await`, so the whole nest accumulates on one stack). The default 2 MiB
     // thread stack is too small for that depth with kaish's interpreter — it
     // SIGABRTs the scheduler mid-rotate. Reserve a generous stack; it's virtual
-    // address space, committed page-by-page only as used.
-    let builder = std::thread::Builder::new()
-        .name("beat-scheduler".to_string())
-        .stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK);
-    if let Err(e) = builder.spawn(move || {
+    // address space, committed page-by-page only as used. See
+    // `spawn_kaish_thread`.
+    if let Err(e) = kaijutsu_kernel::spawn_kaish_thread("beat-scheduler", move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

@@ -111,8 +111,23 @@ fn default_kernel_db_path() -> PathBuf {
     kernel_data_dir().join("kernel.db")
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // The default `#[tokio::main]` runtime sizes worker threads at 2 MiB,
+    // which is too small for the ROOT genesis `create` rc chain that boot
+    // runs on this runtime (`run_server` → `SshServer::run` →
+    // `create_shared_kernel`, `rpc.rs`) — the same class of overflow
+    // `spawn_kaish_thread`'s dedicated threads exist to avoid. Size every
+    // worker thread the same way.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("kaijutsu-server-worker")
+        .thread_stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)
+        .enable_all()
+        .build()
+        .expect("build the server's tokio runtime");
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let registry = tracing_subscriber::registry()

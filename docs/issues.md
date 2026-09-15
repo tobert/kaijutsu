@@ -10,13 +10,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 Read by the lead; each line re-checked before it went here.
 
-- **Kernel boot runs rc on a default tokio worker stack.** `create_shared_kernel`
-  runs the ROOT genesis `create` rc chain on the `#[tokio::main]` runtime
-  (`crates/kaijutsu-server/src/main.rs`, `rpc.rs` `create_shared_kernel`),
-  which reserves no `KAISH_RC_THREAD_STACK`. Same class as the turn-driver
-  abort fixed in abcfb568; inferred from the code, not reproduced. Fix:
-  `Builder::worker_thread_stack_size(KAISH_RC_THREAD_STACK)` on the runtime,
-  or boot on a reserved thread, and a fifth entry in `rc_thread_stack_tests`.
 - **A registry rebuild rewinds every mock queue.** `Provider::from_backend`
   re-reads `KJ_MOCK_SCRIPT_DIR` on every `build_llm_registry`, and `kj cast`,
   `kj backend`, and `kj alias` writes rebuild it, so a mid-scenario write

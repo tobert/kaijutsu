@@ -1788,11 +1788,9 @@ mod tests {
     /// Run `body` to completion on a thread sized for rc lifecycles, joining it
     /// and re-raising any panic. Mirrors the server's beat-scheduler/SSH threads:
     /// a deep rc nest (kaish re-entered many levels) overflows the default 2 MiB
-    /// test stack, so the work runs on [`crate::KAISH_RC_THREAD_STACK`] instead.
+    /// test stack, so the work runs through [`crate::spawn_kaish_thread`] instead.
     fn run_on_rc_stack(body: impl FnOnce() + Send + 'static) {
-        std::thread::Builder::new()
-            .stack_size(crate::KAISH_RC_THREAD_STACK)
-            .spawn(body)
+        crate::spawn_kaish_thread("rc-test-thread", body)
             .expect("spawn rc-stack thread")
             .join()
             .expect("rc-stack thread panicked");
