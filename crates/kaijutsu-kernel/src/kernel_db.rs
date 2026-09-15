@@ -1178,22 +1178,26 @@ CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
 -- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
--- `handoff_ctx` arrives with slice 4 (`kj handoff`); the rest of the sheet
--- (accountable_to, default_cast_id, rc_dir, memory_root, root_ctx) arrives
--- with the slice that reads it. See docs/character.md,
--- "Character = principal + sheet".
+-- `handoff_ctx` and `accountable_to` have shipped; the rest of the sheet
+-- (default_cast_id, rc_dir, memory_root, root_ctx) arrives with the slice
+-- that reads it. See docs/character.md, "Character = principal + sheet".
 CREATE TABLE IF NOT EXISTS characters (
-    principal_id BLOB NOT NULL PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,
-    created_at   INTEGER NOT NULL,
+    principal_id     BLOB NOT NULL PRIMARY KEY,
+    name             TEXT NOT NULL UNIQUE,
+    created_at       INTEGER NOT NULL,
     -- Characters retire; they are never deleted. NULL = live.
-    retired_at   INTEGER,
+    retired_at       INTEGER,
     -- The character's handoff-log context, minted lazily by the first `kj
     -- handoff note`/`tail` that needs one (docs/character.md, "The handoff
     -- is an ordinary context"). ON DELETE SET NULL rather than CASCADE: an
     -- archived context is retained work, not a reason to disown the sheet
     -- row that points at it.
-    handoff_ctx  BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
+    handoff_ctx      BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
+    -- The chain replaces any group concept: every model character points
+    -- at a character, and a human is a root. NULL = root. Validated in the
+    -- DB layer (never self, never a cycle, target must be live) rather than
+    -- by this FK alone, which only guards existence.
+    accountable_to   BLOB REFERENCES characters(principal_id) ON DELETE RESTRICT
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
@@ -2312,6 +2316,7 @@ impl KernelDb {
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
                  CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0)",
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
+            "ALTER TABLE characters ADD COLUMN accountable_to BLOB REFERENCES characters(principal_id) ON DELETE RESTRICT",
         ];
         for sql in alters {
             match conn.execute(sql, []) {
@@ -6836,6 +6841,12 @@ pub struct CharacterRow {
     /// checked it was still unset (`docs/character.md`, "The handoff is an
     /// ordinary context").
     pub handoff_ctx: Option<ContextId>,
+    /// The character this one is accountable to. `None` is a root (a human,
+    /// or a character deliberately left unrooted). Validated in
+    /// `update_character_accountable_to`: the target must exist and be
+    /// live, never itself, and never on the chain back to this character
+    /// (`docs/character.md`, "Accountability is a chain").
+    pub accountable_to: Option<PrincipalId>,
 }
 
 /// One role's seat in a cast. NULL tunables cascade to `llm_defaults`.
@@ -7393,14 +7404,15 @@ impl KernelDb {
         validate_label(&row.name)?;
         self.conn
             .execute(
-                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, accountable_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     blob_param(row.principal_id.as_bytes()),
                     row.name,
                     row.created_at,
                     row.retired_at,
                     row.handoff_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
+                    row.accountable_to.as_ref().map(|p| p.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -7412,7 +7424,7 @@ impl KernelDb {
     /// Fetch a character by its kernel-owned name.
     pub fn get_character_by_name(&self, name: &str) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, accountable_to
              FROM characters WHERE name = ?1",
         )?;
         Ok(stmt.query_row(params![name], row_to_character_row).optional()?)
@@ -7423,7 +7435,7 @@ impl KernelDb {
     /// `played_by` (e.g. resolving the name to display in `kj context info`).
     pub fn get_character(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, accountable_to
              FROM characters WHERE principal_id = ?1",
         )?;
         Ok(stmt
@@ -7436,11 +7448,11 @@ impl KernelDb {
     /// ones by default.
     pub fn list_characters(&self, include_retired: bool) -> KernelDbResult<Vec<CharacterRow>> {
         let sql = if include_retired {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx FROM characters \
-             ORDER BY name"
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, accountable_to \
+             FROM characters ORDER BY name"
         } else {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx FROM characters \
-             WHERE retired_at IS NULL ORDER BY name"
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, accountable_to \
+             FROM characters WHERE retired_at IS NULL ORDER BY name"
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], row_to_character_row)?;
@@ -7475,16 +7487,144 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Set (or clear, with `None` — `kj character set --root`) a
+    /// character's `accountable_to`. Validated inside one transaction
+    /// (`docs/character.md`, "Accountability is a chain"):
+    ///
+    /// - `principal_id` must name an existing character.
+    /// - A character cannot be accountable to itself.
+    /// - The target must exist and be live — a retired character is not a
+    ///   valid accountability root going forward.
+    /// - The target must not already lead back to `principal_id`: this
+    ///   walks the target's own `accountable_to` chain and refuses if it
+    ///   ever reaches `principal_id`, which would close a cycle.
+    ///
+    /// Each refusal carries a distinct message so a caller (or a test)
+    /// never has to pattern-match error text to tell them apart.
+    pub fn update_character_accountable_to(
+        &self,
+        principal_id: PrincipalId,
+        accountable_to: Option<PrincipalId>,
+    ) -> KernelDbResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM characters WHERE principal_id = ?1)",
+            params![blob_param(principal_id.as_bytes())],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(KernelDbError::NotFound(format!(
+                "character {}",
+                principal_id.short()
+            )));
+        }
+
+        if let Some(target) = accountable_to {
+            if target == principal_id {
+                return Err(KernelDbError::Validation(
+                    "a character cannot be accountable to itself".to_string(),
+                ));
+            }
+
+            let target_row: Option<(String, Option<i64>)> = tx
+                .query_row(
+                    "SELECT name, retired_at FROM characters WHERE principal_id = ?1",
+                    params![blob_param(target.as_bytes())],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((target_name, target_retired_at)) = target_row else {
+                return Err(KernelDbError::NotFound(format!(
+                    "character {}",
+                    target.short()
+                )));
+            };
+            if target_retired_at.is_some() {
+                return Err(KernelDbError::Validation(format!(
+                    "{target_name} is retired and cannot be an accountable-to target"
+                )));
+            }
+
+            // Walk the target's own chain; refuse if it ever leads back to
+            // `principal_id` — that would close a cycle. `visited` guards
+            // against looping forever if the chain is ever corrupt; it
+            // should never fire against data this method itself wrote.
+            let mut visited = HashSet::new();
+            let mut current = target;
+            loop {
+                if current == principal_id {
+                    return Err(KernelDbError::Validation(format!(
+                        "{target_name} is already accountable, through the chain, to \
+                         the character being updated — that would close a cycle"
+                    )));
+                }
+                if !visited.insert(current) {
+                    break;
+                }
+                let next: Option<Vec<u8>> = tx.query_row(
+                    "SELECT accountable_to FROM characters WHERE principal_id = ?1",
+                    params![blob_param(current.as_bytes())],
+                    |row| row.get(0),
+                )?;
+                match next {
+                    Some(bytes) => {
+                        current = PrincipalId::try_from_slice(&bytes).ok_or_else(|| {
+                            KernelDbError::Validation(format!(
+                                "corrupt accountable_to blob on character {}",
+                                current.short()
+                            ))
+                        })?;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        tx.execute(
+            "UPDATE characters SET accountable_to = ?1 WHERE principal_id = ?2",
+            params![
+                accountable_to.as_ref().map(|p| p.as_bytes().to_vec()),
+                blob_param(principal_id.as_bytes())
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Retire a character: stamp `retired_at`, first time only. Returns
     /// `true` if this call newly retired it, `false` if it was unknown or
     /// already retired — idempotent re-retire is a no-op success, never an
     /// error, since "already retired" and "just retired" leave the same
     /// row behind.
     ///
+    /// Refuses to retire a character with a live dependent —
+    /// `accountable_to` can only ever point at a live character
+    /// (`update_character_accountable_to` enforces it at write time), so a
+    /// live dependent existing at all means this character cannot retire
+    /// out from under it; the caller must re-root or retire the dependent
+    /// first (`docs/character.md`, "Retire takes its contexts with it").
+    ///
     /// Does not touch the character's contexts — `kj character retire`
     /// concludes and archives them separately, through the same
     /// `archive_context`/`conclude_context` every other archival path uses.
     pub fn retire_character(&self, principal_id: PrincipalId, at: i64) -> KernelDbResult<bool> {
+        let dependents: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT name FROM characters WHERE accountable_to = ?1 AND retired_at IS NULL \
+                 ORDER BY name",
+            )?;
+            stmt.query_map(params![blob_param(principal_id.as_bytes())], |row| row.get(0))?
+                .collect::<SqliteResult<Vec<_>>>()?
+        };
+        if !dependents.is_empty() {
+            let name = self.name_for(principal_id);
+            return Err(KernelDbError::Validation(format!(
+                "cannot retire {name}: {} character(s) are still accountable to it ({})",
+                dependents.len(),
+                dependents.join(", ")
+            )));
+        }
         let updated = self.conn.execute(
             "UPDATE characters SET retired_at = ?1
              WHERE principal_id = ?2 AND retired_at IS NULL",
@@ -7730,6 +7870,7 @@ fn row_to_character_row(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterRow> {
         created_at: row.get(2)?,
         retired_at: row.get(3)?,
         handoff_ctx: read_opt_context_id(row, 4)?,
+        accountable_to: read_opt_principal_id(row, 5)?,
     })
 }
 
@@ -10171,7 +10312,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         })
         .unwrap();
 
@@ -10206,7 +10347,7 @@ mod tests {
         db.set_default_approval_reviewer(reviewer).unwrap();
         assert_eq!(db.cached_default_approval_reviewer().unwrap(), None);
         db.insert_character(&CharacterRow {
-            principal_id: reviewer, name: "amy".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+            principal_id: reviewer, name: "amy".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
         }).unwrap();
         assert_eq!(db.cached_default_approval_reviewer().unwrap(), Some(reviewer));
         assert!(db.retire_character(reviewer, 1).unwrap());
@@ -10223,7 +10364,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         })
         .unwrap();
         let err = db
@@ -10232,10 +10373,211 @@ mod tests {
                 name: "hajime".to_string(),
                 created_at: 2000,
                 retired_at: None,
-                handoff_ctx: None,
+                handoff_ctx: None, accountable_to: None,
             })
             .unwrap_err();
         assert!(matches!(err, KernelDbError::LabelConflict(_)), "got: {err}");
+    }
+
+    // ── 22c. `accountable_to` ───────────────────────────────────────────
+
+    /// A pre-`accountable_to` `characters` table (the schema this column
+    /// arrived after) gets the column added by the guarded ALTER, and an
+    /// existing row survives with `accountable_to` reading back `None`
+    /// rather than erroring or dropping the row.
+    #[test]
+    fn accountable_to_migration_adds_column_to_existing_db_with_rows() {
+        let db = KernelDb::temporary().unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE characters;
+                 CREATE TABLE characters (
+                     principal_id BLOB NOT NULL PRIMARY KEY,
+                     name         TEXT NOT NULL UNIQUE,
+                     created_at   INTEGER NOT NULL,
+                     retired_at   INTEGER,
+                     handoff_ctx  BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
+                 );",
+            )
+            .unwrap();
+        let principal = PrincipalId::new();
+        db.conn
+            .execute(
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx) \
+                 VALUES (?1, ?2, ?3, NULL, NULL)",
+                params![blob_param(principal.as_bytes()), "pre-existing", 1000],
+            )
+            .unwrap();
+
+        let has_column_before: bool = db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('characters') WHERE name = 'accountable_to')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_column_before, "test setup must start without the column");
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        let has_column_after: bool = db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('characters') WHERE name = 'accountable_to')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_column_after, "the guarded ALTER must add accountable_to");
+
+        let row = db.get_character(principal).unwrap().unwrap();
+        assert_eq!(row.name, "pre-existing", "an existing row must survive the migration");
+        assert_eq!(row.accountable_to, None, "a pre-migration row has no accountable_to yet");
+    }
+
+    /// Self, cycle, a missing target, and a retired target each refuse
+    /// `update_character_accountable_to` with a message distinct from the
+    /// other three — a caller (or a test) never has to pattern-match error
+    /// text to tell them apart.
+    #[test]
+    fn accountable_to_self_cycle_missing_and_retired_targets_refuse_distinctly() {
+        let db = KernelDb::temporary().unwrap();
+        let a = PrincipalId::new();
+        let b = PrincipalId::new();
+        let retired = PrincipalId::new();
+        for (id, name) in [(a, "a"), (b, "b"), (retired, "retired-target")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id,
+                name: name.to_string(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                accountable_to: None,
+            })
+            .unwrap();
+        }
+        assert!(db.retire_character(retired, 1).unwrap());
+
+        let err_self = db.update_character_accountable_to(a, Some(a)).unwrap_err();
+        assert!(matches!(err_self, KernelDbError::Validation(_)), "{err_self}");
+        assert!(err_self.to_string().contains("itself"), "{err_self}");
+
+        let missing = PrincipalId::new();
+        let err_missing = db.update_character_accountable_to(a, Some(missing)).unwrap_err();
+        assert!(matches!(err_missing, KernelDbError::NotFound(_)), "{err_missing}");
+
+        let err_retired = db.update_character_accountable_to(a, Some(retired)).unwrap_err();
+        assert!(matches!(err_retired, KernelDbError::Validation(_)), "{err_retired}");
+        assert!(err_retired.to_string().contains("retired"), "{err_retired}");
+
+        // b → a, then a → b would close the loop.
+        db.update_character_accountable_to(b, Some(a)).unwrap();
+        let err_cycle = db.update_character_accountable_to(a, Some(b)).unwrap_err();
+        assert!(matches!(err_cycle, KernelDbError::Validation(_)), "{err_cycle}");
+        assert!(err_cycle.to_string().contains("cycle"), "{err_cycle}");
+
+        let msgs = [
+            err_self.to_string(),
+            err_missing.to_string(),
+            err_retired.to_string(),
+            err_cycle.to_string(),
+        ];
+        for i in 0..msgs.len() {
+            for j in (i + 1)..msgs.len() {
+                assert_ne!(msgs[i], msgs[j], "messages must be pairwise distinct: {msgs:?}");
+            }
+        }
+    }
+
+    /// A valid re-root and a `None` clear (`kj character set --root`) both
+    /// round-trip through `get_character`.
+    #[test]
+    fn accountable_to_valid_update_and_root_clear_round_trip() {
+        let db = KernelDb::temporary().unwrap();
+        let a = PrincipalId::new();
+        let b = PrincipalId::new();
+        for (id, name) in [(a, "a"), (b, "b")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id,
+                name: name.to_string(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                accountable_to: None,
+            })
+            .unwrap();
+        }
+
+        db.update_character_accountable_to(a, Some(b)).unwrap();
+        assert_eq!(db.get_character(a).unwrap().unwrap().accountable_to, Some(b));
+
+        db.update_character_accountable_to(a, None).unwrap();
+        assert_eq!(
+            db.get_character(a).unwrap().unwrap().accountable_to,
+            None,
+            "a root clear must round-trip back to None"
+        );
+    }
+
+    /// `retire_character` refuses while a live character is still
+    /// accountable to it, and succeeds once the dependent is re-rooted
+    /// away — the DB layer's guard, exercised directly rather than through
+    /// `kj character retire`.
+    #[test]
+    fn retire_refuses_live_dependent_then_succeeds_after_reroot() {
+        let db = KernelDb::temporary().unwrap();
+        let root = PrincipalId::new();
+        let dep = PrincipalId::new();
+        for (id, name) in [(root, "root"), (dep, "dep")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id,
+                name: name.to_string(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                accountable_to: None,
+            })
+            .unwrap();
+        }
+        db.update_character_accountable_to(dep, Some(root)).unwrap();
+
+        let err = db.retire_character(root, 100).unwrap_err();
+        assert!(matches!(err, KernelDbError::Validation(_)), "{err}");
+        assert!(err.to_string().contains("dep"), "{err}");
+        assert!(
+            db.get_character(root).unwrap().unwrap().retired_at.is_none(),
+            "a refused retire must not have stamped retired_at"
+        );
+
+        db.update_character_accountable_to(dep, None).unwrap();
+        assert!(db.retire_character(root, 200).unwrap());
+        assert!(db.get_character(root).unwrap().unwrap().retired_at.is_some());
+    }
+
+    /// The same guard, cleared by retiring the dependent itself instead of
+    /// re-rooting it.
+    #[test]
+    fn retire_succeeds_after_the_live_dependent_itself_retires() {
+        let db = KernelDb::temporary().unwrap();
+        let root = PrincipalId::new();
+        let dep = PrincipalId::new();
+        for (id, name) in [(root, "root2"), (dep, "dep2")] {
+            db.insert_character(&CharacterRow {
+                principal_id: id,
+                name: name.to_string(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None,
+                accountable_to: None,
+            })
+            .unwrap();
+        }
+        db.update_character_accountable_to(dep, Some(root)).unwrap();
+
+        assert!(db.retire_character(root, 100).is_err());
+        assert!(db.retire_character(dep, 150).unwrap());
+        assert!(db.retire_character(root, 200).unwrap());
     }
 
     /// `contexts_played_by` returns only the LIVE contexts a principal
@@ -10279,7 +10621,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         })
         .unwrap();
         assert_eq!(db.name_for(character), "hajime");
@@ -10309,7 +10651,7 @@ mod tests {
                 name: "hajime".to_string(),
                 created_at: 1000,
                 retired_at: None,
-                handoff_ctx: None,
+                handoff_ctx: None, accountable_to: None,
             })
             .unwrap();
         }
@@ -10326,7 +10668,7 @@ mod tests {
                 name: "intruder".to_string(),
                 created_at: 2000,
                 retired_at: None,
-                handoff_ctx: None,
+                handoff_ctx: None, accountable_to: None,
             })
             .unwrap_err();
         assert!(

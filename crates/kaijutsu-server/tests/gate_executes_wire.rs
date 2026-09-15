@@ -140,21 +140,21 @@ async fn seats() -> Seats {
             name: "amy".into(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         }).unwrap();
         db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
             principal_id: worker_principal,
             name: "gate-worker".into(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         }).unwrap();
         db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
             principal_id: approver_principal,
             name: "gate-approver".into(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         }).unwrap();
     }
     let connect = |key: PrivateKey| async move {
@@ -579,7 +579,7 @@ fn a_turn_pair_with_a_changed_performer_settles_without_execution_or_reuse() {
                 name: "gate-replacement".into(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 retired_at: None,
-                handoff_ctx: None,
+                handoff_ctx: None, accountable_to: None,
             })
             .unwrap();
         s.kernel

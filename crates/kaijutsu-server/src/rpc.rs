@@ -2592,7 +2592,7 @@ mod context_bootstrap_tests {
             name: "amy".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         })
         .unwrap();
         let kdb = std::sync::Arc::new(parking_lot::Mutex::new(kdb));

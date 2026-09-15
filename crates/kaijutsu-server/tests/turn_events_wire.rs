@@ -44,7 +44,7 @@ fn assign_turn_identity(
             name: "turn-actor".into(),
             created_at: 0,
             retired_at: None,
-            handoff_ctx: None,
+            handoff_ctx: None, accountable_to: None,
         })
         .unwrap();
     }
@@ -53,7 +53,7 @@ fn assign_turn_identity(
         name: "turn-reviewer".into(),
         created_at: 0,
         retired_at: None,
-        handoff_ctx: None,
+        handoff_ctx: None, accountable_to: None,
     })
     .unwrap();
     db.update_context_review(context, Some(actor), Some(reviewer))

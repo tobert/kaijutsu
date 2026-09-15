@@ -1094,7 +1094,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+                principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
             }).unwrap();
             db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
         }
@@ -1254,7 +1254,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None,
+                principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
             }).unwrap();
             db.update_context_review(context, Some(coder), Some(lead)).unwrap();
         }
@@ -1338,7 +1338,7 @@ mod tests {
                     name: name.into(),
                     created_at: 0,
                     retired_at: None,
-                    handoff_ctx: None,
+                    handoff_ctx: None, accountable_to: None,
                 })
                 .unwrap();
             }

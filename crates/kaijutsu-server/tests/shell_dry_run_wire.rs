@@ -115,7 +115,7 @@ fn an_asking_hook_reports_a_would_ask_and_leaves_no_pending_ask() {
                 name: "dry-run-reviewer".into(),
                 created_at: 0,
                 retired_at: None,
-                handoff_ctx: None,
+                handoff_ctx: None, accountable_to: None,
             })
             .unwrap();
             db.update_context_review(context_id, Some(actor), Some(reviewer))

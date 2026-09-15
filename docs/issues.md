@@ -14,8 +14,12 @@ to check who it is?"* Scan by the lead plus a kaibo (deepseek) audit against
 `docs/approval-identity.md`; every line below was re-read by the lead. Full
 notes: `~/exomemory/kaijutsu/identity-gate-audit-2026-09-15.md`.
 
-`accountable_to` has not shipped: the sheet is still five columns
-(`kernel_db.rs:1185`). Reviewer resolution, delegation, answering,
+`accountable_to` shipped 2026-09-15 (`kernel_db.rs:1184`,
+`update_character_accountable_to`, `kj character create --accountable-to`,
+`kj character set --accountable-to|--root`): the sheet has the column,
+validated (never self, never a cycle, target must be live), and `kj
+character retire` refuses a live dependent. No gate site reads it yet —
+that is still open. Reviewer resolution, delegation, answering,
 cancel/escalate, redemption, turn identity, `require_cap`, the facade gate,
 and every draft/shell RPC read the identifier the doc names. Open:
 

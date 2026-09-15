@@ -26,6 +26,7 @@ does not become an instruction to use nonexistent features.
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
+| Accountability | `accountable_to` on the sheet; `NULL` is a root. `kj character create --accountable-to <character>` sets it at mint time, `kj character set <character> --accountable-to <character>\|--root` updates or clears it afterward. Validated in the DB layer inside one transaction: never self, never a target that would close a cycle (the target's own chain is walked), and the target must exist and be live. `kj character retire` refuses while a live character is still accountable to it — re-root or retire the dependent first. No reader of the field exists yet; this ships the sheet column and its validation only |
 
 Sources: `kernel_db.rs::CharacterRow`, `kj/context.rs::context_create`,
 `kj/character.rs`, `kj/handoff.rs`, `kj/lifecycle.rs::load_rc_scripts` in
@@ -41,8 +42,8 @@ create a successor with `--as banto` and verify it before archiving its
 predecessor. See `docs/prompts.md`, "Rotating a director context".
 
 Still planned: character rc composition (slice 5), roster grouping and character drift addressing (slices 6–7), and
-scheduled janitor/proctor work (slice 8). The sheet has no `accountable_to`,
-`default_cast_id`, `rc_dir`, `memory_root`, or `root_ctx` fields yet. The handoff
+scheduled janitor/proctor work (slice 8). The sheet still has no
+`default_cast_id`, `rc_dir`, `memory_root`, or `root_ctx` fields. The handoff
 is a context, not a transport track. Requester and performer remain separate;
 setting `played_by` changes subsequent model invocation and output attribution;
 it never changes credentials or rewrites existing asks and block authors.

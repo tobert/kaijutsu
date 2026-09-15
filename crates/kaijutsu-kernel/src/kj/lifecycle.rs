@@ -1696,7 +1696,7 @@ mod tests {
                     name: name.into(),
                     created_at: 0,
                     retired_at: None,
-                    handoff_ctx: None,
+                    handoff_ctx: None, accountable_to: None,
                 })
                 .expect("insert live character");
         }
