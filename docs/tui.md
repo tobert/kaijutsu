@@ -976,8 +976,10 @@ line and nothing else happens.
 
 **The assigned reviewer answers in the context on screen.** An ask records
 its requester, actor, and reviewer. The actor cannot approve it from any
-context. The reviewer can approve it in the work context, including the
-context that raised it. A card for another player shows its asker and
+context, unless it is the assigned reviewer too — a self-confirmation,
+which shows its approval keys to that actor (`docs/approval-identity.md`).
+The reviewer can approve it in the work context, including the context that
+raised it. A card for another player shows its asker and
 reviewer and offers cancellation or escalation guidance instead of approval
 keys.
 

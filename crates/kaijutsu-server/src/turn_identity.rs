@@ -26,6 +26,9 @@ pub(crate) fn resolve(
     if character.retired_at.is_some() {
         return Err(format!("The assigned performer '{}' is retired. Assign a live character before starting a model turn.", character.name));
     }
+    if character.root {
+        return Err(format!("A root character has no model, so '{}' cannot perform a turn. Cast a character a model plays with 'kj context set . --as <character>'.", character.name));
+    }
     Ok(TurnIdentity { actor, reviewer })
 }
 
@@ -38,7 +41,7 @@ mod tests {
         let principal_id = PrincipalId::new();
         db.insert_character(&CharacterRow {
             principal_id, name: name.into(), created_at: 0,
-            retired_at: None, handoff_ctx: None, accountable_to: None,
+            retired_at: None, handoff_ctx: None, root: false,
         }).unwrap();
         principal_id
     }
@@ -57,6 +60,22 @@ mod tests {
         let amy = character(&db, "amy");
         assert!(resolve(&db, None, amy).unwrap_err().contains("No performer"));
         assert!(resolve(&db, Some(amy), amy).unwrap_err().contains("cannot review"));
+    }
+
+    /// A root character has no model: turn identity refuses it as a
+    /// performer, naming the rule, before any provider call.
+    #[test]
+    fn a_root_character_cannot_perform_a_turn() {
+        let db = KernelDb::temporary().unwrap();
+        let amy = character(&db, "amy");
+        let banto = character(&db, "banto");
+        db.update_character_root(amy, true).unwrap();
+        let error = resolve(&db, Some(amy), banto).unwrap_err();
+        assert!(error.contains("root character has no model"), "{error}");
+        assert!(error.contains("amy"), "{error}");
+        // The same character, no longer a root, performs normally.
+        db.update_character_root(amy, false).unwrap();
+        assert!(resolve(&db, Some(amy), banto).is_ok());
     }
 
     #[test]

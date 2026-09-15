@@ -472,8 +472,8 @@ pub type LlmResult<T> = Result<T, LlmError>;
 /// Dispatch is an explicit `match` at call sites — adding a provider is a
 /// new variant plus a new arm wherever the enum is matched. The mock
 /// variant exists only under `cfg(test)` / `feature = "test-mock"`; it
-/// returns canned responses on `prompt_with_system` and refuses streaming
-/// (matching the rig-era behavior).
+/// returns canned responses on `prompt_with_system` and replays a scripted
+/// event queue, per model, on `stream`.
 #[derive(Clone, Debug)]
 pub enum Provider {
     /// Anthropic Claude (see `llm/claude/`).

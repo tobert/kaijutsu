@@ -2593,7 +2593,7 @@ mod context_bootstrap_tests {
             name: "amy".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None, accountable_to: None,
+            handoff_ctx: None, root: false,
         })
         .unwrap();
         let kdb = std::sync::Arc::new(parking_lot::Mutex::new(kdb));
@@ -10015,11 +10015,11 @@ async fn context_reviewer(
 
 /// Like [`context_reviewer`], but resolves for `actor` explicitly rather
 /// than the context's own configured performer. A human's direct shell
-/// command needs the CONNECTED human's identity walked up the
-/// accountability chain, not the context's `played_by` — otherwise a
-/// context with no performer set skips the chain layer entirely and falls
-/// straight to the default reviewer, which can equal the connected human
-/// (`docs/approval-identity.md`, "Three identities").
+/// command is performed by the CONNECTED human, so that is the identity
+/// the walk excludes — resolving for the context's `played_by` instead
+/// would answer a different question, and in a context with no performer
+/// set would fall straight to the default reviewer, which can equal the
+/// connected human (`docs/approval-identity.md`, "Three identities").
 async fn context_reviewer_for(
     kernel: &SharedKernelState,
     context_id: ContextId,

@@ -8,8 +8,8 @@
 //! and a distinct model itself (`mock-coder-a` / `mock-coder-b` — one
 //! `MockClient` per-model queue per lane, so their concurrently-driven
 //! turns can never interleave each other's scripted events) — a director
-//! casting a performer accountable to it into a context it directs
-//! (guidance, Amy 2026-09-15, "yes banto can cast its own children");
+//! casting its own children (guidance, Amy 2026-09-15, "yes banto can
+//! cast its own children");
 //! banto then drives and waits on them, and each lane drifts a report back
 //! to banto's seat. banto then notes a handoff, and a later
 //! turn issues a gated statement that raises an ask; amy answers it as the
@@ -36,13 +36,12 @@
 //!   (`docs/prompts.md`, "Rotating a director context":
 //!   `kj context create <name>-next --type director --as <character> --env
 //!   'ROTATED_FROM=<name>'`), not a verb a model calls itself.
-//! - **Root self-confirmation** (`docs/character.md`, "Roots and rotation",
-//!   slice 2 — a root's gated statement in-band-confirms instead of
-//!   raising an ask) is guidance, not implemented. Slice 1 (reviewer
-//!   resolution walks `accountable_to`) has landed: the ask this scenario
-//!   raises resolves to `amy` through the chain (banto's `accountable_to`),
-//!   not the configured default — see the assertion below and
-//!   `docs/issues.md`, "Roots, the accountability chain, and rotation".
+//! - **Reviewer resolution walks the context forest.** banto's seat is
+//!   created from amy's own context, so the ask this scenario raises
+//!   resolves to `amy` as the character responsible for that parent, and a
+//!   lane's ask resolves to `banto` as the character responsible for the
+//!   seat that forked it — see the assertions below and
+//!   `docs/character.md`, "Roots and rotation".
 //! - **The coder lanes' own `context_type`.** `kj fork` always copies the
 //!   parent's `context_type` onto the child
 //!   (`crates/kaijutsu-kernel/src/kj/fork.rs:1649-1686`,
@@ -58,8 +57,7 @@
 //!   slot. The cast is still created and the `director` slot IS reached
 //!   normally (banto's own `context_type` really is `director`).
 //! - **banto casts its own lanes.** `kj context set <lane> --as <coder>`
-//!   is allowed when the target's director is the caller and the coder's
-//!   `accountable_to` chain reaches the caller
+//!   is allowed when the target's director is the caller
 //!   (`crates/kaijutsu-kernel/src/kj/context.rs`, `caller_may_assign_performer`),
 //!   and a fork is directed by the actor that forked it
 //!   (`crates/kaijutsu-kernel/src/kj/fork.rs`), so the assignment happens
@@ -120,7 +118,7 @@ fn character_row(principal_id: PrincipalId, name: &str) -> CharacterRow {
         created_at: kaijutsu_types::now_millis() as i64,
         retired_at: None,
         handoff_ctx: None,
-        accountable_to: None,
+        root: false,
     }
 }
 
@@ -329,9 +327,9 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         // Setup: characters, cast, banto's seat.
         // ------------------------------------------------------------
-        s.kj("kj character create banto --accountable-to amy").await;
-        s.kj("kj character create coder-a --accountable-to banto").await;
-        s.kj("kj character create coder-b --accountable-to banto").await;
+        s.kj("kj character create banto").await;
+        s.kj("kj character create coder-a").await;
+        s.kj("kj character create coder-b").await;
 
         s.kj("kj cast create mockcast").await;
         s.kj("kj cast slot set mockcast director --backend mock --model mock-banto").await;
@@ -351,8 +349,8 @@ fn kaijutsu_session_scenario() {
         // its own children"; `docs/approval-identity.md`, the assignment
         // paragraph).
         //
-        // banto directs the lanes it forked and coder-a/b are accountable
-        // to banto, so banto's own turn assigns their performers.
+        // banto directs the lanes it forked, so banto's own turn assigns
+        // their performers.
         // ------------------------------------------------------------
         let (callback, mut turn_rx) = turn_events_channel(64);
         s.amy.subscribe_turn_events(callback).await.expect("subscribe_turn_events");
@@ -543,11 +541,24 @@ fn kaijutsu_session_scenario() {
         assert_eq!(
             ask.reviewer_id.as_deref(),
             Some(amy_principal_id.as_bytes().as_slice()),
-            "the ask's reviewer resolves to amy through the accountability \
-             chain (banto's own `accountable_to`), not the configured \
-             default — banto has no explicit reviewer or delegation here, \
-             so the chain layer is what resolves this, ahead of default"
+            "the ask's reviewer resolves to amy by the walk: banto's seat \
+             was created from amy's own context, and amy is the character \
+             responsible for it"
         );
+
+        // The same walk one level down: a lane's ask answers to banto, the
+        // character responsible for the seat that forked it. Read through
+        // the resolver rather than by raising a second ask, so the lanes'
+        // scripted turns stay as they are.
+        for (label, ctx, performer) in
+            [("lane-a", lane_a_ctx, coder_a_principal), ("lane-b", lane_b_ctx, coder_b_principal)]
+        {
+            assert_eq!(
+                s.kernel.kernel_db.lock().effective_approval_reviewer(ctx, performer).unwrap(),
+                kaijutsu_kernel::kernel_db::EffectiveReviewer::Assigned(banto_principal),
+                "{label}'s performer answers to banto, which forked it",
+            );
+        }
 
         // ------------------------------------------------------------
         // Amy answers the ask from her own context.

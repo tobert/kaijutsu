@@ -1,8 +1,10 @@
 # Approval identity
 
 Amy reviews by default. Delegation is explicit. The character performing an
-operation cannot approve it, from any context. The assigned reviewer may be
-Amy, a directing model, or a separate adjudicator character.
+operation cannot approve it, from any context — except the self-confirmation
+whose assigned reviewer IS that character, which nobody else may answer. The
+assigned reviewer may be Amy, a directing model, or a separate adjudicator
+character.
 
 ```sh
 kj character create coder
@@ -32,22 +34,29 @@ context, and follows this order:
 
 1. Explicit reviewer override on the context.
 2. Explicit delegation for its director character.
-3. The responsible character of the nearest ancestor context, walking
-   `forked_from` upward, that is live and is not the actor. A context's
-   responsible character is its performer, or its director when no
-   performer is set. Archived ancestors are walked through
-   (`docs/character.md`, "Roots and rotation").
+3. The responsible character of the nearest context at or above the ask's
+   own, walking `forked_from` upward, that is live and is not the actor. A
+   context's responsible character is its performer, or its director when
+   no performer is set. Starting at the ask's own context is how a context
+   with no parent still resolves through its own director; a model turn's
+   performer is that context's own responsible character, so the walk
+   immediately climbs past it. Archived ancestors are walked through, a
+   retired responsible character refuses by name, and a `forked_from`
+   pointing at no row is an error (`docs/character.md`, "Roots and
+   rotation").
 4. Configured default reviewer, Amy.
 
 The default layer skips itself when it would name the actor, since it is
 independently configured and unrelated to the actor's own assignment.
 When every layer is exhausted, the actor is at its own root: the ask is
 raised with the actor as its reviewer, the actor alone may answer it, and
-the ledger records the answer as a self-confirmation. The performer of a
-model turn is never a root, so self-confirmation is a human's act. An
-explicit override or delegation that names the actor resolves the same
-way, as a self-confirmation, since the human set it up. Escalation climbs
-the walk one ancestor further and refuses at a root, naming it.
+the ledger records the answer as a self-confirmation. A model turn refuses
+to start when its performer resolves as its own reviewer, and a root can
+never be a performer, so self-confirmation is a human's act. An explicit
+override or delegation that names the actor resolves the same way, as a
+self-confirmation, since the human set it up. Escalation runs the same walk
+past the context that yielded the current reviewer, and refuses at a root,
+naming it.
 
 Amy can delegate review across a director's coder contexts:
 
@@ -85,7 +94,8 @@ which a fork or a create from the caller's own context records as
 `director_id` (guidance, Amy 2026-09-15, "yes banto can cast its own
 children"). Casting is what makes the cast character accountable to the
 caller in that context; no sheet relation is consulted, and a root
-character cannot be cast. This is a second way to earn `--as` authority,
+character cannot be cast, by any caller, through `create --as` or
+`set --as`. This is a second way to earn `--as` authority,
 not a change to reviewer authority: it does not let a director assign
 `--reviewer` or `--director`, which still require the default reviewer,
 and the performer still cannot review its own work.
@@ -166,9 +176,9 @@ evaluate its asks. Reviewer assignment does not automatically schedule a
 turn in one of that character's contexts.
 
 Direct commands retain their connected actor. If that actor is also the
-reviewer, it cannot confirm its own ask: it can cancel it or explicitly
-reassign it to a different character. Human status is not inferred from a
-client type.
+assigned reviewer, the ask is a self-confirmation: that actor answers it,
+cancels it, or reassigns it to a different character. Human status is not
+inferred from a client type.
 
 ## Persistence and replay
 
@@ -255,12 +265,13 @@ superseded request need explicit linkage so rotation does not duplicate work.
   rotation recovery need an explicit execution/recovery design before removal
   of those cleanup paths.
 - Reviewer resolution takes the actor and the context and walks
-  `forked_from` (guidance from Amy, 2026-09-15; see `docs/character.md`,
-  "Roots and rotation"). Explicit override and delegation resolve as
-  configured even when they name the actor; the walk itself never returns
-  the actor. A retired responsible character on an ancestor refuses,
-  naming it, rather than being skipped. `kj ledger escalate` without
-  `--to` climbs one ancestor further and refuses at a root.
+  `forked_from` (`KernelDb::responsible_character_above`; guidance from
+  Amy, 2026-09-15, and `docs/character.md`, "Roots and rotation").
+  Explicit override and delegation resolve as configured even when they
+  name the actor; the walk itself never returns the actor. A retired
+  responsible character on an ancestor refuses, naming it, rather than
+  being skipped. `kj ledger escalate` without `--to` runs the same walk
+  excluding the current reviewer and refuses at a root.
 - Self-confirmation: an ask whose reviewer is its own actor is answerable
   only by that actor, and the decision is recorded as a self-confirmation.
   The performer-cannot-approve rule holds for every other ask.
@@ -273,5 +284,4 @@ rotation".
 A `kj context create --as <character>` by a caller without reviewer
 authority raises an ask rather than refusing; approval executes the
 statement and the verb accepts a redeemed approval for that statement as
-authority. A root character cannot perform a model turn, and `ROOT` is a
-reserved, single name.
+authority. `ROOT` is a reserved, single name.

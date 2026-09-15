@@ -1,9 +1,8 @@
 //! e2e: identity invariants around a **human's** input — the compose draft
 //! and the interactive shell. Amy: *"the draft should never have a path for
 //! the model to reach it"* (`docs/issues.md`, "The compose draft is the
-//! player's alone") and *"I do want the credentials we check to be aligned
-//! to the newer fields like accountable_to ... are all the gate sites using
-//! the right identifiers to check who it is?"* (`docs/issues.md`, "Identity
+//! player's alone") and *"are all the gate sites using the right
+//! identifiers to check who it is?"* (`docs/issues.md`, "Identity
 //! audit"). `docs/approval-identity.md`, "Three identities" is the contract:
 //! `principal_id` is the authenticated requester, `actor_id` the performer,
 //! `reviewer_id` the effective reviewer — and `user_initiated` "controls
@@ -19,8 +18,8 @@
 //!     tool call once a hook asks for one, and `user_initiated` only
 //!     changes how the command is displayed (`Role::User`, excluded by
 //!     default) — never whether it runs;
-//!   * a human who is also the context's resolved reviewer cannot approve
-//!     their own gated command — pinned as observed, not endorsed;
+//!   * a human with nobody responsible above her confirms her own gated
+//!     command, and the approval executes it;
 //!   * a model-bound credential that is neither the ask's actor nor its
 //!     reviewer cannot answer it either.
 
@@ -38,7 +37,7 @@ use kaijutsu_client::{KeySource};
 use kaijutsu_kernel::kernel_db::CharacterRow;
 use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
-use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, ContextId, PrincipalId, RefusalKind, Role, Status};
+use kaijutsu_types::{BlockKind, BlockQuery, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 use russh::keys::{Algorithm, PrivateKey};
 
 /// Poll until `check` returns true, or fail loudly. A timeout here IS the
@@ -90,7 +89,7 @@ fn character(principal_id: PrincipalId, name: &str) -> CharacterRow {
         created_at: kaijutsu_types::now_millis() as i64,
         retired_at: None,
         handoff_ctx: None,
-        accountable_to: None,
+        root: false,
     }
 }
 
@@ -402,6 +401,7 @@ fn a_humans_own_shell_command_is_gated_like_a_models_and_user_initiated_grants_n
 struct OneCredential {
     _client: RpcClient,
     kj: KernelHandle,
+    kj_principal: PrincipalId,
     server: SharedKernel,
 }
 
@@ -433,7 +433,7 @@ async fn one_credential(name: &str) -> OneCredential {
 
     let client = connect_with_key(addr, key, name).await;
     let (kj, _) = client.bind_kernel().await.unwrap();
-    OneCredential { _client: client, kj, server }
+    OneCredential { _client: client, kj, kj_principal: principal, server }
 }
 
 /// Find the block right after `command_block_id` — its `ToolResult` pair,
@@ -449,51 +449,79 @@ fn output_after(server: &SharedKernel, ctx: ContextId, command_block_id: &kaijut
         .expect("a ToolResult block immediately follows its ToolCall")
 }
 
-/// **4. A root's own gated command refuses instead of raising an
-/// unanswerable ask.** A human whose character is a root (no
-/// `accountable_to`) runs a gated shell command in a context with no
-/// explicit reviewer override and no `played_by` —
+/// **4. A root's own gated command is a self-confirmation.** A human whose
+/// character has nobody responsible above it — her context has no parent,
+/// no explicit reviewer, no `played_by`, and
 /// assets/defaults/approval.toml's shipped `default_reviewer = "amy"`
-/// resolves through the character sheet this test seeds at the connection's
-/// own principal, so amy the connection IS amy the default reviewer, and
-/// amy has nobody above her in the accountability chain either.
+/// resolves to the very character this test seeds at the connection's own
+/// principal — runs a gated shell command. Every resolution layer is
+/// exhausted, so the ask is raised with amy as its own reviewer, amy alone
+/// may answer it, and her answer EXECUTES the command
+/// (`docs/approval-identity.md`).
 ///
-/// Before the accountability chain (slice 1 of `docs/issues.md`, "Roots,
-/// the accountability chain, and rotation"), reviewer resolution ignored
-/// the acting character entirely: the ask was raised with
-/// `actor_id == reviewer_id` (both amy) and left `Pending` forever, since
-/// `ensure_not_self_approval` refuses amy's own `kj ledger allow` on it and
-/// nobody else was assigned. Now resolution takes the actor, walks the
-/// chain, and the default layer skips itself when it would equal the
-/// actor — every layer for amy is exhausted
-/// (`kernel_db::EffectiveReviewer::NoReviewer`), so the gate refuses
-/// in-band instead of creating that unanswerable row.
+/// She answers from a second, hook-free context: the blanket `Ask` hook
+/// this test installs would otherwise re-gate the `kj ledger allow` typed
+/// into the same context (`docs/issues.md`, "Identity audit").
 ///
-/// Slice 2 (not yet built) replaces this refusal with an in-band
-/// self-confirmation for a root actor — see `docs/approval-identity.md`,
-/// "Planned: the accountability chain". This test pins slice 1's interim
-/// behavior, not the final one.
+/// Before the walk, this same scenario left an `actor_id == reviewer_id`
+/// row pending forever, and then briefly refused in-band instead of
+/// raising one at all. Both are gone: an ask nobody can answer cannot
+/// exist.
 #[test]
-fn a_self_reviewing_human_raises_an_ask_it_cannot_answer_itself() {
+fn a_root_humans_own_gated_command_is_a_self_confirmation_she_can_answer() {
     run_local(async {
         let amy = one_credential("amy").await;
+        let amy_principal = amy.kj_principal;
         let work = amy.kj.create_context("amy-self-review-work").await.unwrap();
+        let answering = amy.kj.create_context("amy-answering").await.unwrap();
         amy.kj.join_context(work, "amy").await.unwrap();
         install_ask_hook(&amy.server, work, "wire-amy-self-review").await;
 
-        let refusal = match amy.kj.shell_execute("echo should-not-run", work, true).await {
+        let refusal = match amy.kj.shell_execute("echo self-confirmed-for-real", work, true).await {
             Err(RpcError::Refused(r)) => r,
-            other => panic!("expected a gate-unavailable refusal, got {other:?}"),
+            other => panic!("expected a pending refusal, got {other:?}"),
         };
-        assert_eq!(refusal.kind, RefusalKind::GateUnavailable);
-        assert!(!refusal.is_pending(), "a root's exhausted resolution is not an open question");
-        assert!(refusal.ask.is_none(), "no ask row is left behind for nobody to answer");
-        assert!(refusal.reason.contains("amy"), "expected the root named: {}", refusal.reason);
+        assert!(refusal.is_pending(), "a self-confirmation is an open question, not a refusal: {refusal:?}");
+        let ask_id = refusal.ask_id().expect("a pending refusal names its ask").to_string();
 
-        assert!(
-            amy.server.kernel_db.lock().list_pending_asks().unwrap().is_empty(),
-            "the gate must not have raised a pending ask nobody can answer",
+        let row = amy.server.kernel_db.lock().get_approval(&ask_id).unwrap().expect("the ask row");
+        assert_eq!(row.actor_id.as_deref(), Some(amy_principal.as_bytes().as_slice()));
+        assert_eq!(
+            row.reviewer_id.as_deref(),
+            Some(amy_principal.as_bytes().as_slice()),
+            "with every layer exhausted the ask names its own actor as reviewer",
         );
+        let output_block_id = row
+            .output_block_id
+            .as_deref()
+            .and_then(kaijutsu_types::BlockId::from_key)
+            .expect("the gated command left a linked output block");
+
+        amy.kj.join_context(answering, "amy").await.unwrap();
+        amy.kj
+            .shell_execute(&format!("kj ledger allow {ask_id}"), answering, true)
+            .await
+            .expect("shell_execute for the answer");
+        wait_for("amy's own answer to land in the ledger", || {
+            matches!(
+                amy.server.kernel_db.lock().get_approval(&ask_id).unwrap(),
+                Some(row) if row.status == kaijutsu_kernel::ApprovalStatus::Allowed
+            )
+        })
+        .await;
+
+        // The approval EXECUTES: the ask's own linked output block fills
+        // in with the command's real stdout.
+        wait_for("the self-confirmed statement to actually execute", || {
+            amy.server
+                .documents
+                .get_block_snapshot(work, &output_block_id)
+                .ok()
+                .flatten()
+                .map(|b| b.status == Status::Done && b.content.contains("self-confirmed-for-real"))
+                .unwrap_or(false)
+        })
+        .await;
     });
 }
 

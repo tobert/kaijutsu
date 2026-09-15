@@ -1232,7 +1232,7 @@ pub(crate) mod test_helpers {
                 name: "amy".to_string(),
                 created_at: 0,
                 retired_at: None,
-                handoff_ctx: None, accountable_to: None,
+                handoff_ctx: None, root: false,
             })
             .unwrap();
             db.set_default_approval_reviewer(reviewer).unwrap();

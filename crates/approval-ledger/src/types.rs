@@ -293,6 +293,13 @@ pub enum EventKind {
     Redeemed,
     Cancelled,
     Escalated,
+    /// A decision an ask's own actor made on itself, which the actor alone
+    /// could make: its reviewer snapshot names the actor, because every
+    /// resolution layer above it was exhausted or a human pointed it back
+    /// at itself (`docs/approval-identity.md`). Appended alongside the
+    /// `Decided` row, so a reader counting decisions sees one either way
+    /// and a reader asking "who stood behind this" can tell the two apart.
+    SelfConfirmation,
 }
 
 impl EventKind {
@@ -306,6 +313,7 @@ impl EventKind {
             Self::Redeemed => "redeemed",
             Self::Cancelled => "cancelled",
             Self::Escalated => "escalated",
+            Self::SelfConfirmation => "self_confirmation",
         }
     }
 }

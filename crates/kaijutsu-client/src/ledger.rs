@@ -329,13 +329,18 @@ pub struct AskDetail {
 }
 
 impl AskDetail {
-    /// Whether `principal` is the reviewer this ask snapshots, while the ask
-    /// still names a distinct performer. Legacy or incomplete rows carry no
-    /// review authority.
+    /// Whether `principal` is the reviewer this ask snapshots. An ask
+    /// whose reviewer IS its actor is a self-confirmation, which that
+    /// actor alone may answer, so being the reviewer is the whole test:
+    /// every other ask names a reviewer distinct from its performer, and
+    /// the performer therefore fails it. Legacy or incomplete rows — one
+    /// of the two identities missing — carry no review authority. The
+    /// kernel remains authoritative if the assignment changes while a
+    /// control is on screen.
     pub fn can_review(&self, principal: PrincipalId) -> bool {
         matches!(
             (self.actor_id, self.reviewer_id),
-            (Some(actor), Some(reviewer)) if principal == reviewer && principal != actor
+            (Some(_), Some(reviewer)) if principal == reviewer
         )
     }
 }
@@ -581,9 +586,20 @@ mod detail_tests {
         missing_actor.actor_id = None;
         assert!(!missing_actor.can_review(reviewer), "missing actor is unresolved identity");
 
-        let mut missing_reviewer = detail;
+        let mut missing_reviewer = detail.clone();
         missing_reviewer.reviewer_id = None;
         assert!(!missing_reviewer.can_review(reviewer), "missing reviewer is unresolved identity");
+
+        // A self-confirmation: reviewer and actor are the same character,
+        // and the controls belong to that character
+        // (`docs/approval-identity.md`).
+        let mut self_confirmation = detail;
+        self_confirmation.reviewer_id = Some(actor);
+        assert!(
+            self_confirmation.can_review(actor),
+            "an ask whose reviewer is its own actor shows its controls to that actor",
+        );
+        assert!(!self_confirmation.can_review(reviewer), "and to nobody else");
     }
 
     #[test]

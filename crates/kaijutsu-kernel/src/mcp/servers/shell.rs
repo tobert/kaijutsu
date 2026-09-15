@@ -1258,7 +1258,7 @@ mod tests {
         let reviewer = PrincipalId::new();
         let ctx_id = register_context(&d, Some("ledger-shw"), None, principal);
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+            principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().update_context_review(ctx_id, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();
@@ -2030,7 +2030,7 @@ mod tests {
         let context = register_context(&d, Some("async-pending"), None, principal);
         d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+            principal_id: reviewer, name: "reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().update_context_review(context, Some(principal), Some(reviewer)).unwrap();
         let mut binding = ContextToolBinding::new();

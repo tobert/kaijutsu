@@ -13,9 +13,8 @@
 //! `note` is ungated (see `dispatch_handoff`'s doc comment on why this
 //! differs from `kj character`'s mutating verbs). `tail` never mints —
 //! a character with no notes yet has nothing to read, and `tail`'s whole
-//! flag surface must stay incapable of a write to sit in
-//! `kj/readonly.rs`'s `READ_ONLY_TABLE`, the same rationale as `kj
-//! character list`/`show`.
+//! flag surface must stay incapable of a write to carry `Effect::Read`
+//! (`kj/effect.rs`), the same rationale as `kj character list`/`show`.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{
@@ -271,8 +270,8 @@ impl KjDispatcher {
 
         // `tail` never mints — a target with no log yet has nothing to
         // read, and this verb's whole flag surface must stay incapable of
-        // a write (`kj/readonly.rs`'s `READ_ONLY_TABLE` carries `handoff
-        // tail`; only `note` calls `get_or_create_handoff_ctx`).
+        // a write, which is why it declares `Effect::Read`; only `note`
+        // calls `get_or_create_handoff_ctx`.
         let Some(ctx) = target.handoff_ctx else {
             return KjResult::ok_with_data(
                 format!("{} has no handoff notes yet", target.name),

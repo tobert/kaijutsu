@@ -382,9 +382,9 @@ enum LedgerCommand {
     Escalate {
         /// The ask to reassign.
         request_id: String,
-        /// The live character who will review the ask next. Defaults to the
-        /// first live character above the ask's current reviewer in its
-        /// accountable_to chain; refuses if the current reviewer is a root.
+        /// The live character who will review the ask next. Defaults to
+        /// the next responsible character above the one already assigned,
+        /// walking the ask's context forest; refuses at a root.
         #[arg(long)]
         to: Option<String>,
     },
@@ -1024,10 +1024,11 @@ impl KjDispatcher {
         }
     }
 
-    /// `to` names the next reviewer explicitly; omitted, it defaults to the
-    /// first live character above the ask's CURRENT reviewer in its
-    /// `accountable_to` chain (`docs/character.md`, "Roots and rotation").
-    /// Refuses at a root — there is nothing above it to default to.
+    /// `to` names the next reviewer explicitly; omitted, it continues the
+    /// same walk reviewer resolution made, from the ask's own context up
+    /// `forked_from`, past the ancestor that yielded the current reviewer
+    /// (`docs/character.md`, "Roots and rotation"). Refuses at a root —
+    /// there is nothing above it to default to.
     async fn ledger_escalate(&self, request_id: &str, to: Option<&str>, caller: &KjCaller) -> KjResult {
         if let Err(error) = self.kernel().default_approval_reviewer().await {
             tracing::warn!(%error, "default review authority unavailable; only the assigned reviewer may escalate");
@@ -1068,17 +1069,27 @@ impl KjDispatcher {
                     let current_name = db.get_character(current_reviewer).ok().flatten()
                         .map(|character| character.name)
                         .unwrap_or_else(|| current_reviewer.to_string());
-                    match db.nearest_live_accountable_to(current_reviewer) {
-                        Ok(Some(parent)) => match db.get_character(parent) {
+                    let Some(context) = kaijutsu_types::ContextId::try_from_slice(&row.context_id) else {
+                        return KjResult::Err(format!("kj ledger: ask '{request_id}' has no readable context to walk"));
+                    };
+                    // Exclude the actor as well: escalation climbs past
+                    // whoever already holds the ask, and never lands on
+                    // the character that performed it.
+                    let mut excluded = vec![current_reviewer];
+                    if let Some(actor) = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice) {
+                        excluded.push(actor);
+                    }
+                    match db.responsible_character_above(context, &excluded) {
+                        Ok(Some(next)) => match db.get_character(next) {
                             Ok(Some(character)) => (character.principal_id, character.name),
                             Ok(None) | Err(_) => return KjResult::Err(format!(
-                                "kj ledger: could not resolve {current_name}'s accountable_to target"
+                                "kj ledger: the character responsible above {current_name} has no character sheet"
                             )),
                         },
                         Ok(None) => return KjResult::Err(format!(
                             "kj ledger: {current_name} is at the root; nobody above {current_name}"
                         )),
-                        Err(e) => return KjResult::Err(format!("kj ledger: could not read accountability chain: {e}")),
+                        Err(e) => return KjResult::Err(format!("kj ledger: could not walk the accountability forest: {e}")),
                     }
                 }
             };
@@ -2167,7 +2178,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+                principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
             }).unwrap();
             db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
         }
@@ -4156,7 +4167,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false }).unwrap();
             }
             db.set_default_approval_reviewer(amy).unwrap();
         }
@@ -4179,7 +4190,7 @@ mod tests {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
                 db.insert_character(&crate::kernel_db::CharacterRow {
-                    principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+                    principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
                 }).unwrap();
             }
             db.update_context_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
@@ -4197,33 +4208,45 @@ mod tests {
         assert_eq!(row.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
     }
 
-    /// Omitting `--to` escalates to the first live character above the
-    /// ask's CURRENT reviewer in its `accountable_to` chain.
+    /// Omitting `--to` continues the walk reviewer resolution made: past
+    /// the ancestor that yielded the current reviewer, to the next
+    /// responsible character above it.
     #[tokio::test]
-    async fn ledger_escalate_without_to_defaults_to_the_next_live_character_above_the_current_reviewer() {
+    async fn ledger_escalate_without_to_climbs_to_the_next_responsible_character() {
         let d = test_dispatcher().await;
         let banto = PrincipalId::new();
         let amy = crate::kj::test_helpers::test_reviewer_principal();
-        let caller = crate::kj::test_helpers::registered_caller(&d);
+        let mut caller = crate::kj::test_helpers::test_caller();
+        let root = crate::kj::test_helpers::register_context(&d, Some("escalate-root"), None, caller.principal_id);
+        let lane = crate::kj::test_helpers::register_context(&d, Some("escalate-lane"), Some(root), caller.principal_id);
+        caller.context_id = Some(lane);
         {
             let db = d.kernel_db().lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+                principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
             }).unwrap();
-            db.update_character_accountable_to(banto, Some(amy)).unwrap();
-            db.update_context_review(caller.context_id.unwrap(), None, Some(banto)).unwrap();
+            db.update_context_review_assignment(root, None, None, Some(amy)).unwrap();
+            db.update_context_review(lane, None, Some(banto)).unwrap();
         }
         let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
-        let reviewer = caller.with_actor(banto, Some(banto));
+        let reviewer = caller.clone().with_actor(banto, Some(banto));
         let result = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone()], &reviewer).await;
         assert!(result.is_ok(), "{}", result.message());
         let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
         assert_eq!(row.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
+
+        // One more climb has nowhere to go: amy is responsible for the
+        // root of this chain.
+        let amy_reviewer = caller.with_actor(amy, Some(amy));
+        let at_root = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone()], &amy_reviewer).await;
+        assert!(!at_root.is_ok(), "{}", at_root.message());
+        assert!(at_root.message().contains("at the root"), "{}", at_root.message());
     }
 
-    /// Omitting `--to` when the ask's current reviewer is a root (no
-    /// `accountable_to`) refuses, naming the root, instead of guessing a
-    /// target or falling back to the configured default.
+    /// Omitting `--to` when the ask's current reviewer is already the one
+    /// responsible for the root of its chain refuses, naming that
+    /// character, instead of guessing a target or falling back to the
+    /// configured default.
     #[tokio::test]
     async fn ledger_escalate_without_to_refuses_at_a_root() {
         let d = test_dispatcher().await;

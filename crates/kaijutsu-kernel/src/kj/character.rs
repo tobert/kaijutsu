@@ -35,12 +35,11 @@ enum CharacterCommand {
     Create {
         /// The character's kernel-owned given name.
         name: String,
-        /// The character this one is accountable to. Omit to create a root
-        /// (a human, or a character deliberately left unrooted) —
-        /// accountability is a chain, and every model character is meant to
-        /// point at one (`docs/character.md`, "Accountability is a chain").
-        #[arg(long = "accountable-to")]
-        accountable_to: Option<String>,
+        /// Create a root character: a place with hands on it, never a seat
+        /// a model plays. A root cannot be cast as a context's performer
+        /// and cannot take a model turn.
+        #[arg(long)]
+        root: bool,
     },
     /// List the live (non-retired) characters.
     #[command(alias = "ls")]
@@ -48,8 +47,8 @@ enum CharacterCommand {
         /// Include retired characters too.
         #[arg(long)]
         all: bool,
-        /// Emit each row as a JSON object (name, id, timestamps,
-        /// accountable_to) instead of the default array of ids.
+        /// Emit each row as a JSON object (name, id, timestamps, root)
+        /// instead of the default array of ids.
         #[arg(long)]
         json: bool,
     },
@@ -58,24 +57,22 @@ enum CharacterCommand {
         /// The character's name.
         name: String,
     },
-    /// Update a character's sheet. Currently only `accountable_to`.
+    /// Update a character's sheet. Currently only `root`.
     Set {
         /// The character to update.
         name: String,
-        /// Point this character's accountability chain at another
-        /// character. Refused on self, a cycle, an unknown name, or a
-        /// retired target.
-        #[arg(long = "accountable-to", conflicts_with = "root")]
-        accountable_to: Option<String>,
-        /// Clear `accountable_to` — this character becomes a root.
-        #[arg(long, conflicts_with = "accountable_to")]
+        /// Make this character a root: no model, and it cannot be cast as
+        /// a context's performer.
+        #[arg(long, conflicts_with = "no_root")]
         root: bool,
+        /// Make this character an ordinary one that a model can play.
+        #[arg(long = "no-root", conflicts_with = "root")]
+        no_root: bool,
     },
     /// Retire a character: stamp `retired_at`, and conclude + archive every
     /// live context it plays, in the same act. There is no reassignment and
     /// no verb to move a context to another character — a retired
-    /// character's contexts are archived, not orphaned. Refuses while a
-    /// live character is still accountable to this one.
+    /// character's contexts are archived, not orphaned.
     Retire {
         /// The character's name.
         name: String,
@@ -119,13 +116,11 @@ impl KjDispatcher {
         }
 
         match parsed.command {
-            CharacterCommand::Create { name, accountable_to } => {
-                self.character_create(&name, accountable_to.as_deref())
-            }
+            CharacterCommand::Create { name, root } => self.character_create(&name, root),
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
-            CharacterCommand::Set { name, accountable_to, root } => {
-                self.character_set(&name, accountable_to.as_deref(), root)
+            CharacterCommand::Set { name, root, no_root } => {
+                self.character_set(&name, root, no_root)
             }
             CharacterCommand::Retire { name } => self.character_retire(&name),
         }
@@ -136,7 +131,7 @@ impl KjDispatcher {
     /// hazard `add-key` avoids by binding instead of minting
     /// (`docs/character.md`, "Adding a key binds; it never mints") applies
     /// just as much to a repeated `create`.
-    fn character_create(&self, name: &str, accountable_to: Option<&str>) -> KjResult {
+    fn character_create(&self, name: &str, root: bool) -> KjResult {
         let db = self.kernel_db().lock();
         match db.get_character_by_name(name) {
             Ok(Some(existing)) => {
@@ -149,55 +144,23 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj character create: {e}")),
         }
 
-        // Resolve the accountable-to name before minting anything, so an
-        // unknown or retired target never leaves an orphan character behind.
-        // `update_character_accountable_to` checks liveness again under its
-        // own write; by then the row would already exist.
-        let accountable_to_id = match accountable_to {
-            Some(target_name) => match db.get_character_by_name(target_name) {
-                Ok(Some(t)) if t.retired_at.is_some() => {
-                    return KjResult::Err(format!(
-                        "kj character create: {target_name} is retired and cannot be an \
-                         accountable-to target"
-                    ));
-                }
-                Ok(Some(t)) => Some(t.principal_id),
-                Ok(None) => {
-                    return KjResult::Err(format!(
-                        "kj character create: no character named '{target_name}' — \
-                         `kj character list` to see who exists"
-                    ));
-                }
-                Err(e) => return KjResult::Err(format!("kj character create: {e}")),
-            },
-            None => None,
-        };
-
         let row = CharacterRow {
             principal_id: PrincipalId::new(),
             name: name.to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             retired_at: None,
             handoff_ctx: None,
-            accountable_to: None,
+            root,
         };
         if let Err(e) = db.insert_character(&row) {
             return KjResult::Err(format!("kj character create: {e}"));
         }
-        // Set through the validated path even though a brand-new principal
-        // can never close a cycle — it is the one place liveness is
-        // checked, and a fresh character is no exception to that rule.
-        if let Some(target_id) = accountable_to_id
-            && let Err(e) = db.update_character_accountable_to(row.principal_id, Some(target_id))
-        {
-            return KjResult::Err(format!("kj character create: {e}"));
-        }
-        let row = match db.get_character_by_name(name) {
-            Ok(Some(r)) => r,
-            Ok(None) | Err(_) => row,
-        };
         KjResult::ok_with_data(
-            format!("created {name} ({})", row.principal_id.short()),
+            format!(
+                "created {name} ({}){}",
+                row.principal_id.short(),
+                if root { " as a root" } else { "" }
+            ),
             character_to_json(&row),
         )
     }
@@ -205,7 +168,7 @@ impl KjDispatcher {
     /// `list` → an array of full-id strings by default
     /// (`project_kj_structured_data` convention): a caller iterating the
     /// result never has to re-derive a truncated display id. `--json` opts
-    /// into the full row per entry, `accountable_to` included, for a caller
+    /// into the full row per entry, `root` included, for a caller
     /// that wants the sheet without a `show` per name.
     fn character_list(&self, all: bool, json: bool) -> KjResult {
         let db = self.kernel_db().lock();
@@ -242,16 +205,12 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         match db.get_character_by_name(name) {
             Ok(Some(row)) => {
-                let accountable_to_name = match row.accountable_to {
-                    Some(pid) => db.name_for(pid),
-                    None => "(root)".to_string(),
-                };
                 let text = format!(
-                    "Character:       {}\nID:              {}\nAccountable to:  {}\n\
+                    "Character:       {}\nID:              {}\nRoot:            {}\n\
                      Created:         {}\nRetired:         {}",
                     row.name,
                     row.principal_id.to_hex(),
-                    accountable_to_name,
+                    if row.root { "yes" } else { "no" },
                     super::format::format_timestamp(row.created_at),
                     row.retired_at
                         .map(super::format::format_timestamp)
@@ -270,15 +229,12 @@ impl KjDispatcher {
         }
     }
 
-    /// Update `accountable_to`: point it at another character, or clear it
-    /// to a root with `--root`. All the validation (self, cycle, missing,
-    /// retired) lives in `KernelDb::update_character_accountable_to`; this
-    /// handler only resolves names to ids and relays whatever it says.
-    fn character_set(&self, name: &str, accountable_to: Option<&str>, root: bool) -> KjResult {
-        if accountable_to.is_none() && !root {
-            return KjResult::Err(
-                "kj character set: specify --accountable-to <character> or --root".to_string(),
-            );
+    /// Set or clear `root`. A root has no model: it cannot be cast as a
+    /// context's performer and turn identity refuses it
+    /// (`docs/character.md`, "Roots and rotation").
+    fn character_set(&self, name: &str, root: bool, no_root: bool) -> KjResult {
+        if !root && !no_root {
+            return KjResult::Err("kj character set: specify --root or --no-root".to_string());
         }
         let db = self.kernel_db().lock();
         let row = match db.get_character_by_name(name) {
@@ -291,31 +247,17 @@ impl KjDispatcher {
             }
             Err(e) => return KjResult::Err(format!("kj character set: {e}")),
         };
-        let target = if root {
-            None
-        } else {
-            let target_name = accountable_to.expect("checked above");
-            match db.get_character_by_name(target_name) {
-                Ok(Some(t)) => Some(t.principal_id),
-                Ok(None) => {
-                    return KjResult::Err(format!(
-                        "kj character set: no character named '{target_name}' — \
-                         `kj character list` to see who exists"
-                    ));
-                }
-                Err(e) => return KjResult::Err(format!("kj character set: {e}")),
-            }
-        };
-        if let Err(e) = db.update_character_accountable_to(row.principal_id, target) {
+        if let Err(e) = db.update_character_root(row.principal_id, root) {
             return KjResult::Err(format!("kj character set: {e}"));
         }
         let updated = match db.get_character_by_name(name) {
             Ok(Some(r)) => r,
             Ok(None) | Err(_) => row,
         };
-        let msg = match (target, accountable_to) {
-            (Some(_), Some(target_name)) => format!("{name} is now accountable to {target_name}"),
-            _ => format!("{name} is now a root"),
+        let msg = if root {
+            format!("{name} is now a root")
+        } else {
+            format!("{name} is no longer a root")
         };
         KjResult::ok_with_data(msg, character_to_json(&updated))
     }
@@ -342,22 +284,6 @@ impl KjDispatcher {
         };
         if row.retired_at.is_some() {
             return KjResult::ok(format!("{name} already retired"));
-        }
-        // A live dependent refuses the whole retire, before any context is
-        // concluded or archived: `conclude_context` and `archive_context`
-        // each commit on their own, so a refusal after the loop would leave
-        // the contexts archived and the character live.
-        match db.live_accountable_dependents(row.principal_id) {
-            Ok(dependents) if dependents.is_empty() => {}
-            Ok(dependents) => {
-                return KjResult::Err(format!(
-                    "kj character retire: cannot retire {name}: {} character(s) are still \
-                     accountable to it ({}) — re-root or retire them first",
-                    dependents.len(),
-                    dependents.join(", ")
-                ));
-            }
-            Err(e) => return KjResult::Err(format!("kj character retire: {e}")),
         }
         let live = match db.contexts_played_by(row.principal_id) {
             Ok(l) => l,
@@ -409,7 +335,7 @@ fn character_to_json(row: &CharacterRow) -> serde_json::Value {
         "name": row.name,
         "created_at": row.created_at,
         "retired_at": row.retired_at,
-        "accountable_to": row.accountable_to.map(|p| p.to_hex()),
+        "root": row.root,
     })
 }
 
@@ -621,197 +547,86 @@ mod tests {
         assert_eq!(data["played_by_name"], serde_json::Value::Null);
     }
 
-    /// `create --accountable-to` resolves the name and sets the chain in
-    /// the same act.
+    /// The emitted help is a product surface: every subcommand and flag
+    /// this module publishes is read by a player, so the text is pinned
+    /// here rather than left to drift (`docs/writing.md`).
     #[tokio::test]
-    async fn create_with_accountable_to_sets_the_chain() {
+    async fn published_help_names_root_and_no_sheet_relation() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("root-char")], &caller).await;
-        let result = d
-            .dispatch(
-                &[s("character"), s("create"), s("dep-char"), s("--accountable-to"), s("root-char")],
-                &caller,
-            )
-            .await;
-        let KjResult::Ok { data: Some(serde_json::Value::Object(obj)), .. } = result else {
-            panic!("expected Ok with an object, got {result:?}");
-        };
-        let root_id = d
-            .kernel_db()
-            .lock()
-            .get_character_by_name("root-char")
-            .unwrap()
-            .unwrap()
-            .principal_id
-            .to_hex();
-        assert_eq!(obj["accountable_to"], root_id);
+        let KjResult::Ok { message, .. } = d.dispatch(&[s("character"), s("--help")], &caller).await
+        else { panic!("help must render") };
+        println!("{message}");
+        assert!(!message.contains("accountable"), "the sheet chain is gone: {message}");
+        for (argv, expected) in [
+            (vec![s("character"), s("create"), s("--help")], "--root"),
+            (vec![s("character"), s("set"), s("--help")], "--no-root"),
+        ] {
+            let KjResult::Ok { message, .. } = d.dispatch(&argv, &caller).await
+            else { panic!("help must render for {argv:?}") };
+            println!("{message}");
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("accountable"), "{message}");
+        }
     }
 
-    /// An unknown `--accountable-to` target fails loudly and leaves no
-    /// half-formed character behind.
+    /// `create --root` writes the flag, and `show`/`list --json` both
+    /// carry it. An ordinary create is not a root.
     #[tokio::test]
-    async fn create_with_unknown_accountable_to_fails_loudly() {
+    async fn create_root_flag_reaches_the_sheet_and_every_reader() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let caller = test_caller();
-        let result = d
-            .dispatch(
-                &[s("character"), s("create"), s("orphan"), s("--accountable-to"), s("nobody")],
-                &caller,
-            )
-            .await;
-        assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
-        assert!(
-            d.kernel_db().lock().get_character_by_name("orphan").unwrap().is_none(),
-            "an unresolvable target must not leave a half-formed character behind"
-        );
-    }
+        d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
+        d.dispatch(&[s("character"), s("create"), s("coder")], &caller).await;
 
-    /// `set --accountable-to` and `set --root` round-trip through the
-    /// sheet.
-    #[tokio::test]
-    async fn set_accountable_to_and_root_round_trip() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("lead")], &caller).await;
-        d.dispatch(&[s("character"), s("create"), s("worker")], &caller).await;
+        assert!(d.kernel_db().lock().get_character_by_name("sovereign").unwrap().unwrap().root);
+        assert!(!d.kernel_db().lock().get_character_by_name("coder").unwrap().unwrap().root);
 
-        let set = d
-            .dispatch(&[s("character"), s("set"), s("worker"), s("--accountable-to"), s("lead")], &caller)
-            .await;
-        assert!(matches!(set, KjResult::Ok { .. }), "{set:?}");
-        let lead_id = d.kernel_db().lock().get_character_by_name("lead").unwrap().unwrap().principal_id;
-        let worker = d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap();
-        assert_eq!(worker.accountable_to, Some(lead_id));
+        let KjResult::Ok { message, .. } = d.dispatch(&[s("character"), s("show"), s("sovereign")], &caller).await
+        else { panic!("show must succeed") };
+        assert!(message.contains("Root:            yes"), "{message}");
+        let KjResult::Ok { message, .. } = d.dispatch(&[s("character"), s("show"), s("coder")], &caller).await
+        else { panic!("show must succeed") };
+        assert!(message.contains("Root:            no"), "{message}");
 
-        let cleared = d.dispatch(&[s("character"), s("set"), s("worker"), s("--root")], &caller).await;
-        assert!(matches!(cleared, KjResult::Ok { .. }), "{cleared:?}");
-        let worker = d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap();
-        assert_eq!(worker.accountable_to, None, "--root must clear accountable_to");
-    }
-
-    /// `set` with neither `--accountable-to` nor `--root` is a usage error,
-    /// not a silent no-op.
-    #[tokio::test]
-    async fn set_requires_accountable_to_or_root() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("solo")], &caller).await;
-        let result = d.dispatch(&[s("character"), s("set"), s("solo")], &caller).await;
-        assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
-    }
-
-    /// A self target and a would-be cycle both refuse through `set`, the
-    /// same way `update_character_accountable_to` refuses them at the DB
-    /// layer.
-    #[tokio::test]
-    async fn set_rejects_self_and_cycle() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("a")], &caller).await;
-        d.dispatch(&[s("character"), s("create"), s("b")], &caller).await;
-
-        let self_result =
-            d.dispatch(&[s("character"), s("set"), s("a"), s("--accountable-to"), s("a")], &caller).await;
-        assert!(matches!(self_result, KjResult::Err(_)), "expected Err, got {self_result:?}");
-
-        let b_to_a =
-            d.dispatch(&[s("character"), s("set"), s("b"), s("--accountable-to"), s("a")], &caller).await;
-        assert!(matches!(b_to_a, KjResult::Ok { .. }), "{b_to_a:?}");
-        let cycle_result =
-            d.dispatch(&[s("character"), s("set"), s("a"), s("--accountable-to"), s("b")], &caller).await;
-        assert!(matches!(cycle_result, KjResult::Err(_)), "expected Err, got {cycle_result:?}");
-    }
-
-    /// `show`'s text form prints the accountable-to character's NAME, not
-    /// its bare id.
-    #[tokio::test]
-    async fn show_text_prints_accountable_to_name() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("boss")], &caller).await;
-        d.dispatch(
-            &[s("character"), s("create"), s("staff"), s("--accountable-to"), s("boss")],
-            &caller,
-        )
-        .await;
-        let result = d.dispatch(&[s("character"), s("show"), s("staff")], &caller).await;
-        let KjResult::Ok { message, .. } = result else {
-            panic!("expected Ok, got {result:?}");
-        };
-        assert!(message.contains("boss"), "{message}");
-    }
-
-    /// `show` on a root prints `(root)` rather than a blank line.
-    #[tokio::test]
-    async fn show_text_prints_root_for_no_accountable_to() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("standalone")], &caller).await;
-        let result = d.dispatch(&[s("character"), s("show"), s("standalone")], &caller).await;
-        let KjResult::Ok { message, .. } = result else {
-            panic!("expected Ok, got {result:?}");
-        };
-        assert!(message.contains("(root)"), "{message}");
-    }
-
-    /// `list --json` emits each row as an object carrying `accountable_to`
-    /// as a full id string (or null for a root) — the default (no flag)
-    /// array-of-ids form is unaffected.
-    #[tokio::test]
-    async fn list_json_includes_accountable_to() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("boss2")], &caller).await;
-        d.dispatch(
-            &[s("character"), s("create"), s("staff2"), s("--accountable-to"), s("boss2")],
-            &caller,
-        )
-        .await;
         let result = d.dispatch(&[s("character"), s("list"), s("--json")], &caller).await;
         let KjResult::Ok { data: Some(serde_json::Value::Array(rows)), .. } = result else {
             panic!("expected a JSON array, got {result:?}");
         };
-        let staff_row = rows.iter().find(|r| r["name"] == "staff2").expect("staff2 present");
-        assert!(staff_row["accountable_to"].is_string(), "{staff_row:?}");
-        let boss_row = rows.iter().find(|r| r["name"] == "boss2").expect("boss2 present");
-        assert!(boss_row["accountable_to"].is_null(), "a root's accountable_to must be null, {boss_row:?}");
+        let row = |name: &str| rows.iter().find(|r| r["name"] == name).unwrap_or_else(|| panic!("{name} present")).clone();
+        assert_eq!(row("sovereign")["root"], serde_json::Value::Bool(true));
+        assert_eq!(row("coder")["root"], serde_json::Value::Bool(false));
     }
 
-    /// `retire` refuses while a live character is still accountable to it.
+    /// `set --root` and `set --no-root` round-trip, and `set` with neither
+    /// is a usage error rather than a silent no-op.
     #[tokio::test]
-    async fn retire_refuses_with_a_live_dependent() {
+    async fn set_root_and_no_root_round_trip() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("worker")], &caller).await;
+
+        let set = d.dispatch(&[s("character"), s("set"), s("worker"), s("--root")], &caller).await;
+        assert!(matches!(set, KjResult::Ok { .. }), "{set:?}");
+        assert!(d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().root);
+
+        let cleared = d.dispatch(&[s("character"), s("set"), s("worker"), s("--no-root")], &caller).await;
+        assert!(matches!(cleared, KjResult::Ok { .. }), "{cleared:?}");
+        assert!(!d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().root);
+
+        let neither = d.dispatch(&[s("character"), s("set"), s("worker")], &caller).await;
+        assert!(matches!(neither, KjResult::Err(_)), "expected Err, got {neither:?}");
+        let both = d.dispatch(&[s("character"), s("set"), s("worker"), s("--root"), s("--no-root")], &caller).await;
+        assert!(matches!(both, KjResult::Err(_)), "expected Err, got {both:?}");
+    }
+
+    /// `retire` no longer consults any sheet relation: a character with a
+    /// live context still retires, taking that context with it.
+    #[tokio::test]
+    async fn retire_takes_its_contexts_with_it() {
         let d = super::super::test_helpers::test_dispatcher().await;
         let caller = test_caller();
         d.dispatch(&[s("character"), s("create"), s("mentor")], &caller).await;
-        d.dispatch(
-            &[s("character"), s("create"), s("mentee"), s("--accountable-to"), s("mentor")],
-            &caller,
-        )
-        .await;
-
-        let mut confirmed = caller.clone();
-        confirmed.confirmed = true;
-        let result = d.dispatch(&[s("character"), s("retire"), s("mentor")], &confirmed).await;
-        assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
-        let mentor = d.kernel_db().lock().get_character_by_name("mentor").unwrap().unwrap();
-        assert!(mentor.retired_at.is_none(), "a refused retire must not have stamped retired_at");
-    }
-
-    /// A refused retire leaves the character's live contexts alone. The
-    /// dependent check runs before any context is concluded or archived,
-    /// so a character with both a live dependent and a live context comes
-    /// out of a refusal exactly as it went in.
-    #[tokio::test]
-    async fn retire_refused_by_a_dependent_archives_nothing() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("mentor")], &caller).await;
-        d.dispatch(
-            &[s("character"), s("create"), s("mentee"), s("--accountable-to"), s("mentor")],
-            &caller,
-        )
-        .await;
         let mentor_id = {
             let db = d.kernel_db().lock();
             db.get_character_by_name("mentor").unwrap().unwrap().principal_id
@@ -822,38 +637,9 @@ mod tests {
         let mut confirmed = caller.clone();
         confirmed.confirmed = true;
         let result = d.dispatch(&[s("character"), s("retire"), s("mentor")], &confirmed).await;
-        assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
-
+        assert!(matches!(result, KjResult::Ok { .. }), "expected Ok, got {result:?}");
         let ctx_row = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
-        assert!(ctx_row.archived_at.is_none(), "a refused retire must not archive the context");
-        assert!(ctx_row.concluded_at.is_none(), "nor conclude it");
-        let mentor = d.kernel_db().lock().get_character_by_name("mentor").unwrap().unwrap();
-        assert!(mentor.retired_at.is_none());
-    }
-
-    /// A retired `--accountable-to` target refuses before minting, the same
-    /// as an unknown one: no root character is left behind for a retry to
-    /// find "already exists".
-    #[tokio::test]
-    async fn create_with_retired_accountable_to_leaves_no_character() {
-        let d = super::super::test_helpers::test_dispatcher().await;
-        let caller = test_caller();
-        d.dispatch(&[s("character"), s("create"), s("elder")], &caller).await;
-        let mut confirmed = caller.clone();
-        confirmed.confirmed = true;
-        let retired = d.dispatch(&[s("character"), s("retire"), s("elder")], &confirmed).await;
-        assert!(matches!(retired, KjResult::Ok { .. }), "{retired:?}");
-
-        let result = d
-            .dispatch(
-                &[s("character"), s("create"), s("orphan"), s("--accountable-to"), s("elder")],
-                &caller,
-            )
-            .await;
-        assert!(matches!(result, KjResult::Err(_)), "expected Err, got {result:?}");
-        assert!(
-            d.kernel_db().lock().get_character_by_name("orphan").unwrap().is_none(),
-            "a retired target must not leave a root character behind"
-        );
+        assert!(ctx_row.archived_at.is_some(), "retirement archives the character's live contexts");
+        assert!(d.kernel_db().lock().get_character_by_name("mentor").unwrap().unwrap().retired_at.is_some());
     }
 }

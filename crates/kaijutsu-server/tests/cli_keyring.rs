@@ -39,7 +39,7 @@ impl Fixture {
             name: character_name.to_string(),
             created_at: 1,
             retired_at: None,
-                handoff_ctx: None, accountable_to: None,
+                handoff_ctx: None, root: false,
         })
         .unwrap();
         Self { home, character }
@@ -126,7 +126,7 @@ fn re_adding_a_bound_key_refuses_and_names_the_binding_then_rebind_moves_it() {
         name: "amy".to_string(),
         created_at: 2,
         retired_at: None,
-                handoff_ctx: None, accountable_to: None,
+                handoff_ctx: None, root: false,
     })
     .unwrap();
 

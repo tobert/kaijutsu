@@ -624,7 +624,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
                     name: name.into(),
                     created_at: 0,
                     retired_at: None,
-                    handoff_ctx: None, accountable_to: None,
+                    handoff_ctx: None, root: false,
                 })
                 .unwrap();
             }

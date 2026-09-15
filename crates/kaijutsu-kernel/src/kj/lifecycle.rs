@@ -1655,7 +1655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rc_nested_context_keeps_the_lead_as_director_and_amy_as_default_reviewer() {
+    async fn rc_nested_context_keeps_the_lead_as_director_and_its_reviewer() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         install_script(
@@ -1696,7 +1696,7 @@ mod tests {
                     name: name.into(),
                     created_at: 0,
                     retired_at: None,
-                    handoff_ctx: None, accountable_to: None,
+                    handoff_ctx: None, root: false,
                 })
                 .expect("insert live character");
         }
@@ -1724,8 +1724,8 @@ mod tests {
         assert_eq!(child.reviewer_id, None, "there is no implicit reviewer override");
         assert_eq!(
             d.kernel().resolve_context_review(child_id).await.unwrap().reviewer.principal_id,
-            caller.principal_id,
-            "Amy remains the default reviewer without an explicit delegation",
+            lead,
+            "the child is accountable to the context the lead created it from, so the lead reviews it",
         );
     }
 

@@ -62,7 +62,7 @@ use approval_ledger::types::{
 use kaijutsu_types::{AskRef, AskStatus, ContextId, PrincipalId};
 
 use crate::flows::SharedLedgerFlowBus;
-use crate::kernel_db::{EffectiveReviewer, KernelDb};
+use crate::kernel_db::KernelDb;
 use crate::kj::env_snapshot::{self, AskEnvEntry};
 use crate::kj::KjCaller;
 
@@ -322,12 +322,6 @@ fn caller_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, caller: &KjCaller) -> Opti
     let context_id = caller.context_id?;
     let db = db.lock();
     db.get_context_shell(context_id).ok().flatten().and_then(|row| row.cwd)
-}
-
-/// Best-effort character name for a refusal message — the id's short form
-/// when no sheet resolves, since the message must still name something.
-fn actor_display_name(db: &KernelDb, actor: PrincipalId) -> String {
-    db.get_character(actor).ok().flatten().map(|character| character.name).unwrap_or_else(|| actor.short().to_string())
 }
 
 /// The env snapshot's human-facing summary, appended to the ask's
@@ -700,12 +694,11 @@ pub(crate) async fn run_gate(
             Some(context) => context,
             None => return GateOutcome::unavailable_without_row("approval gate could not resolve reviewer: approval asks require a context".into()),
         };
+        // A self-confirmation names the actor as its own reviewer: the row
+        // is raised, and only that actor may answer it
+        // (`docs/approval-identity.md`).
         let reviewer = match db.effective_approval_reviewer(context, caller.actor_id) {
-            Ok(EffectiveReviewer::Assigned(reviewer)) => reviewer,
-            Ok(EffectiveReviewer::NoReviewer) => return GateOutcome::unavailable_without_row(format!(
-                "approval gate could not resolve reviewer: {} is at the root of the accountability chain, with nobody above it to ask",
-                actor_display_name(&db, caller.actor_id)
-            )),
+            Ok(resolved) => resolved.reviewer(),
             Err(error) => return GateOutcome::unavailable_without_row(format!("approval gate could not resolve reviewer: {error}")),
         };
         ask.continuation_epoch = match db.continuation_epoch(context) {
@@ -851,8 +844,7 @@ pub(crate) async fn record_dry_run_ask(
         let db = db.lock();
         let context = match caller.context_id { Some(context) => context, None => { tracing::warn!("dry run ask has no context"); return None; } };
         let reviewer = match db.effective_approval_reviewer(context, caller.actor_id) {
-            Ok(EffectiveReviewer::Assigned(reviewer)) => reviewer,
-            Ok(EffectiveReviewer::NoReviewer) => { tracing::warn!("dry run ask has no reviewer above its root actor"); return None; }
+            Ok(resolved) => resolved.reviewer(),
             Err(error) => { tracing::warn!("dry run could not resolve reviewer: {error}"); return None; }
         };
         ask.continuation_epoch = match db.continuation_epoch(context) {
@@ -1103,7 +1095,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+                principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
             }).unwrap();
             db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
         }
@@ -1263,7 +1255,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, accountable_to: None,
+                principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
             }).unwrap();
             db.update_context_review(context, Some(coder), Some(lead)).unwrap();
         }
@@ -1326,16 +1318,18 @@ mod tests {
         assert_ne!(spent.ask.expect("a replacement ask").request_id, request_id);
     }
 
-    /// A root actor (no `accountable_to`) whose context has no explicit
-    /// reviewer, delegation, or non-self default raises no ask at all:
-    /// every resolution layer is exhausted, `NoReviewer`, and the gate
-    /// refuses in-band — fail-closed, exactly like today's "no configured
-    /// approval reviewer", but naming the root by name. No row is left
-    /// pending for anyone to be confused by (`docs/issues.md`, "Roots, the
-    /// accountability chain, and rotation", slice 1). Turning this into a
-    /// self-confirmation is slice 2, not yet built.
+    /// A root actor — nobody responsible above it, and the configured
+    /// default names the actor itself — raises an ask with ITSELF as
+    /// reviewer, and it alone may answer it. The answer is a
+    /// self-confirmation, recorded as such, and the approval is then
+    /// redeemable exactly like any other (`docs/approval-identity.md`).
+    ///
+    /// Falsified by making `walk_then_default` fall through to the default
+    /// reviewer even when it equals the actor: the ask came back assigned
+    /// to a reviewer distinct from its actor, and the self-answer was
+    /// refused as self-approval. Restored.
     #[tokio::test]
-    async fn a_root_actors_own_ask_refuses_without_raising_a_pending_row() {
+    async fn a_root_actor_confirms_its_own_ask() {
         let d = gate_dispatcher().await;
         let mut direct = test_caller();
         let actor = crate::kj::test_helpers::test_reviewer_principal();
@@ -1353,30 +1347,52 @@ mod tests {
             &crate::kj::gate_policy::no_config(),
         )
         .await;
-        assert_eq!(outcome.verdict, GateVerdict::Unavailable);
-        assert!(outcome.ask.is_none(), "a root's exhausted resolution must not leave an ask row behind");
-        assert!(outcome.reason.contains("root"), "{}", outcome.reason);
-        let name = d.kernel_db.lock().get_character(actor).unwrap().unwrap().name;
-        assert!(outcome.reason.contains(&name), "{}", outcome.reason);
-        assert!(d.kernel_db.lock().list_pending_asks().unwrap().is_empty());
+        assert_eq!(outcome.verdict, GateVerdict::Pending, "{}", outcome.reason);
+        let request_id = outcome.ask.expect("a root's ask is raised, not refused").request_id;
+        {
+            let db = d.kernel_db.lock();
+            let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id).unwrap().unwrap();
+            assert_eq!(row.actor_id.as_deref(), Some(actor.as_bytes().as_slice()));
+            assert_eq!(
+                row.reviewer_id.as_deref(), Some(actor.as_bytes().as_slice()),
+                "a self-confirmation names the actor as its own reviewer",
+            );
+        }
+
+        // A stranger still cannot answer it.
+        let stranger = kaijutsu_types::PrincipalId::new();
+        let stranger_call = direct.clone().with_actor(stranger, None);
+        let refused = d.dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &stranger_call).await;
+        assert!(!refused.is_ok(), "only the actor may answer its own confirmation");
+
+        let allowed = d.dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &direct).await;
+        assert!(allowed.is_ok(), "the actor answers its own confirmation: {}", allowed.message());
+        {
+            let db = d.kernel_db.lock();
+            let events = approval_ledger::ask::list_events(db.conn_for_ledger(), &request_id).unwrap();
+            assert!(
+                events.iter().any(|event| event.kind == approval_ledger::types::EventKind::SelfConfirmation),
+                "the ledger records the answer as a self-confirmation: {events:?}",
+            );
+        }
+
+        let redeemed = run_gate(
+            &d.kernel_db.clone(),
+            &direct,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+        assert_eq!(redeemed.verdict, GateVerdict::Allowed);
     }
 
-    /// Amy's own direct ask resolves to Amy through an explicit assignment,
-    /// but she cannot approve her own operation. She must explicitly assign
-    /// a distinct reviewer.
-    ///
-    /// The explicit assignment is deliberate, not default resolution: Amy
-    /// is a root (no `accountable_to`) and is also the configured default
-    /// reviewer, so leaving this to default resolution would exhaust every
-    /// layer (`EffectiveReviewer::NoReviewer`) and refuse to raise an ask at
-    /// all — the behavior this test exercised before the accountability
-    /// chain landed. Explicit override still resolves to the actor itself
-    /// (`kj/context.rs`'s commit-time check is what prevents a PERFORMER
-    /// from being assigned that way; a direct human caller is not a
-    /// performer), so it reconstructs the same self-review ask this test is
-    /// about.
+    /// An explicit override that names the actor resolves the same way as
+    /// an exhausted walk: a self-confirmation the actor may answer. The
+    /// actor can still hand the ask to someone else, and `--to` refuses to
+    /// name the performer.
     #[tokio::test]
-    async fn a_direct_ask_requires_escalation_before_anyone_can_allow_it() {
+    async fn an_explicit_self_assignment_is_a_self_confirmation_and_can_still_be_handed_on() {
         let d = gate_dispatcher().await;
         let mut direct = test_caller();
         let actor = crate::kj::test_helpers::test_reviewer_principal();
@@ -1388,17 +1404,17 @@ mod tests {
         direct.reviewer_id = None;
         {
             let db = d.kernel_db.lock();
-            for (principal_id, name) in [(judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow {
-                    principal_id,
-                    name: name.into(),
-                    created_at: 0,
-                    retired_at: None,
-                    handoff_ctx: None, accountable_to: None,
-                })
-                .unwrap();
-            }
-            db.update_context_review_assignment(context, None, Some(actor), None).unwrap();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: judge,
+                name: "judge".into(),
+                created_at: 0,
+                retired_at: None,
+                handoff_ctx: None, root: false,
+            })
+            .unwrap();
+            // judge directs the context, so the walk would resolve to
+            // judge: only the explicit override can name the actor here.
+            db.update_context_review_assignment(context, None, Some(actor), Some(judge)).unwrap();
         }
 
         let first = run_gate(
@@ -1410,12 +1426,14 @@ mod tests {
         )
         .await;
         let request_id = first.ask.expect("the direct ask").request_id;
-
-        let self_allow = d
-            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &direct)
-            .await;
-        assert!(!self_allow.is_ok(), "a direct actor cannot approve its own ask");
-        assert!(self_allow.message().contains("performed this operation"), "{}", self_allow.message());
+        {
+            let db = d.kernel_db.lock();
+            let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id).unwrap().unwrap();
+            assert_eq!(
+                row.reviewer_id.as_deref(), row.actor_id.as_deref(),
+                "an explicit override naming the actor raises a self-confirmation",
+            );
+        }
 
         let self_target = d
             .dispatch(
@@ -1439,6 +1457,13 @@ mod tests {
             )
             .await;
         assert!(escalated.is_ok(), "the direct actor can assign a distinct reviewer: {escalated:?}");
+
+        // Once handed on, the actor is an ordinary performer again.
+        let self_allow = d
+            .dispatch(&["ledger".into(), "allow".into(), request_id.clone()], &direct)
+            .await;
+        assert!(!self_allow.is_ok(), "the performer cannot approve an ask assigned to someone else");
+        assert!(self_allow.message().contains("performed this operation"), "{}", self_allow.message());
 
         let judge_call = direct.clone().with_actor(judge, None);
         let allowed = d

@@ -57,6 +57,14 @@ pub struct DecideInput<'a> {
 /// Require the assigned reviewer to answer, while refusing the performing
 /// actor even if it switches contexts.
 ///
+/// The one ask an actor may answer is its own **self-confirmation**: a row
+/// whose reviewer snapshot IS its actor, raised when every resolution
+/// layer above the actor was exhausted or a human pointed the assignment
+/// back at it. Only that actor may answer it — a stranger is still
+/// refused — and [`decide`] records the answer with a
+/// [`EventKind::SelfConfirmation`] row beside the decision
+/// (`docs/approval-identity.md`).
+///
 /// Call this **before claiming**. [`decide`] calls it too, so the invariant
 /// holds for every caller, but a claim taken first would leave the ask
 /// `claimed` by the one seat that may not answer it — locking out the seats
@@ -78,7 +86,7 @@ pub fn ensure_not_self_approval(
         events::append_refusal(conn, request_id, "unresolved_identity", Some(answerer.principal), answerer.context)?;
         return Err(LedgerError::UnresolvedIdentity { request_id: request_id.to_string() });
     };
-    if answerer.principal == actor_id {
+    if answerer.principal == actor_id && actor_id != reviewer_id {
         events::append_refusal(conn, request_id, "self_approval", Some(answerer.principal), answerer.context)?;
         return Err(LedgerError::SelfApproval {
             request_id: request_id.to_string(),
@@ -117,7 +125,7 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
             .optional()?;
         let Some(row) = row else { return Err(LedgerError::NotFound(request_id.to_string())); };
         let (reason, error) = match (row.actor_id.as_deref(), row.reviewer_id.as_deref()) {
-            (Some(actor), Some(_)) if answerer.principal == actor => (
+            (Some(actor), Some(reviewer)) if answerer.principal == actor && actor != reviewer => (
                 "self_approval",
                 LedgerError::SelfApproval { request_id: request_id.to_string(), reason: "the answering actor performed this operation" },
             ),
@@ -173,6 +181,25 @@ pub fn decide(conn: &Connection, request_id: &str, input: DecideInput) -> Result
             input.auto_reason,
             None,
         )?;
+        // A row whose reviewer snapshot is its own actor was answered by
+        // the one person who could: mark it, so an audit can tell a
+        // self-confirmation from a decision someone else stood behind.
+        if let (Some(answerer), Some(actor), Some(reviewer)) =
+            (decided_by, row.actor_id.as_deref(), row.reviewer_id.as_deref())
+            && answerer == actor
+            && actor == reviewer
+        {
+            events::append(
+                &tx,
+                request_id,
+                EventKind::SelfConfirmation,
+                decided_by,
+                input.decided_option,
+                None,
+                None,
+                None,
+            )?;
+        }
         tx.commit()?;
         return Ok(row);
     }
@@ -513,6 +540,66 @@ mod tests {
         let events = list_events(&conn, &request_id).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::Decided);
+    }
+
+    /// A **self-confirmation**: an ask whose reviewer snapshot IS its
+    /// actor. Only that actor may answer it — a stranger is refused
+    /// `unauthorized_reviewer` — and the decision carries a
+    /// `SelfConfirmation` event beside the ordinary `Decided` one.
+    ///
+    /// Falsified by restoring the unconditional `answerer == actor`
+    /// refusal in `ensure_not_self_approval`: the actor's own answer came
+    /// back `SelfApproval`, with no row decided. Restored.
+    #[test]
+    fn a_self_confirmation_is_answerable_only_by_its_own_actor() {
+        let conn = open_memory();
+        let mut ask = minimal_ask();
+        ask.reviewer_id = b"coder".to_vec();
+        let request_id = create_ask(&conn, &ask).unwrap();
+
+        let stranger = ensure_not_self_approval(&conn, &request_id, reviewer(b"amy")).unwrap_err();
+        assert!(matches!(stranger, LedgerError::UnauthorizedReviewer { .. }), "{stranger:?}");
+        assert_eq!(
+            get_approval(&conn, &request_id).unwrap().unwrap().status,
+            ApprovalStatus::Pending,
+            "a refused answer decides nothing",
+        );
+
+        ensure_not_self_approval(&conn, &request_id, actor(b"coder")).unwrap();
+        let row = decide(
+            &conn,
+            &request_id,
+            DecideInput { allow: true, decided_by: Some(actor(b"coder")), decided_option: Some("allow_once"), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(row.status, ApprovalStatus::Allowed);
+
+        let kinds: Vec<EventKind> = list_events(&conn, &request_id).unwrap().into_iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![EventKind::Decided, EventKind::SelfConfirmation]);
+    }
+
+    /// The ordinary ask is unchanged: its performer is a distinct
+    /// character from its reviewer, and the performer is still refused as
+    /// self-approval — including on the re-check inside `decide` itself.
+    #[test]
+    fn a_distinct_performer_is_still_refused_as_self_approval() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &minimal_ask()).unwrap();
+
+        let guard = ensure_not_self_approval(&conn, &request_id, actor(b"coder")).unwrap_err();
+        assert!(matches!(guard, LedgerError::SelfApproval { .. }), "{guard:?}");
+        let attempt = decide(
+            &conn,
+            &request_id,
+            DecideInput { allow: true, decided_by: Some(actor(b"coder")), ..Default::default() },
+        )
+        .unwrap_err();
+        assert!(matches!(attempt, LedgerError::SelfApproval { .. }), "{attempt:?}");
+        assert_eq!(
+            get_approval(&conn, &request_id).unwrap().unwrap().status,
+            ApprovalStatus::Pending,
+        );
+        assert!(list_events(&conn, &request_id).unwrap().is_empty(), "a refusal decides nothing");
     }
 
     #[test]

@@ -39,35 +39,22 @@ was that accountable_to is a relation at runtime, so if banto forks a
 coder, that coder is accountable to the precise banto that forked it, not
 any banto." Queued in build order; each slice leaves the tree green.
 
-1. **The walk replaces the sheet chain, and a root confirms itself.**
-   Reviewer resolution walks `forked_from` to the nearest ancestor whose
-   responsible character (performer, else director) is live and not the
-   actor; the sheet's `accountable_to` column, `kj character set
-   --accountable-to|--root`, `create --accountable-to`, the retire
-   dependent guard, and the casting rule's chain check are demolished. The
-   sheet gains a `root` flag. When the walk finds no one, the ask is raised
-   with the actor as reviewer and only the actor may answer it, recorded as
-   a self-confirmation; this also settles an explicit reviewer that equals
-   the actor. Escalate climbs the walk. Wire-created contexts have no
-   parent and resolve through their director, then the default.
-2. **A root character has no model.** `turn_identity::resolve` refuses a
-   performer whose sheet is `root`; casting a root refuses.
-3. **`ROOT` is reserved and single.** One reserved-names set (`ROOT`, the
+1. **`ROOT` is reserved and single.** One reserved-names set (`ROOT`, the
    drift queue, factory preset labels); `ROOT` claimed once per kernel like
    the drift queue; it must be played by a root character. Move the label
    from banto's seat to Amy's root context; banto's seat is labeled `banto`.
-4. **`root_ctx` on the sheet, with rotation as its reader.** `kj context
+2. **`root_ctx` on the sheet, with rotation as its reader.** `kj context
    rotate <character>`: reads the predecessor from the sheet, creates the
    successor from the predecessor's own parent with the same type, cast,
    and performer, sets `ROTATED_FROM`, moves the pointer, archives the
    predecessor, one transaction. Label follows the live holder.
    `docs/prompts.md`, "Rotating a director context" changes to the verb.
-5. **`create --as` asks instead of refusing.** Apply the held patch
+3. **`create --as` asks instead of refusing.** Apply the held patch
    (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
    turn its refusal into an ask to the responsible character above, and
    accept a redeemed approval for the exact statement as authority. A
    static allow rule for a well-formed self-rotation is a policy entry.
-6. **banto from `ROOT`.** Seed: `amy` root, banto's seat created from the
+4. **banto from `ROOT`.** Seed: `amy` root, banto's seat created from the
    root context. A migration note for the live kernel, since `ROOT` is
    banto's today.
 
@@ -76,17 +63,16 @@ is flaky under the parallel test runner and passes single-threaded.
 
 ## Identity audit: what stays open (2026-09-15)
 
-Amy: *"I do want the credentials we check to be aligned to the newer fields
-like accountable_to ... are all the gate sites using the right identifiers
-to check who it is?"* Scan by the lead plus a kaibo (deepseek) audit against
+Amy: *"are all the gate sites using the right identifiers to check who it
+is?"* Scan by the lead plus a kaibo (deepseek) audit against
 `docs/approval-identity.md`; every line below was re-read by the lead. Full
 notes: `~/exomemory/kaijutsu/identity-gate-audit-2026-09-15.md`.
 
-The sheet-level `accountable_to` that shipped at noon is being replaced by
-the runtime relation ("Roots, accountability as a runtime relation");
-Reviewer resolution, delegation, answering,
-cancel/escalate, redemption, turn identity, `require_cap`, the facade gate,
-and every draft/shell RPC read the identifier the doc names. Open:
+The sheet-level `accountable_to` that shipped at noon is gone, replaced by
+the walk up the context forest ("Roots, accountability as a runtime
+relation"). Reviewer resolution, delegation, answering, cancel/escalate,
+redemption, turn identity, `require_cap`, the facade gate, and every
+draft/shell RPC read the identifier the doc names. Open:
 
 1. `authorBlock` takes `principalId` from the request (`rpc.rs:8687`), the
    only RPC that does; documented as shared-trust in `kaijutsu.capnp:2232`.
@@ -113,12 +99,11 @@ and every draft/shell RPC read the identifier the doc names. Open:
    accept the tightening and change the docs.
 
 Verified by `crates/kaijutsu-server/tests/user_input_identity.rs`: a human
-who is the context's reviewer runs a gated shell command, the ask snapshots
-actor == reviewer, and that human's own `kj ledger allow` is refused as
-self-approval. The ask sits Pending until someone cancels or escalates it.
-The test pins today's behavior and names the alternatives for Amy: refuse
-to raise such an ask and route to escalation, auto-escalate at raise time,
-or keep it and expect the human to escalate their own asks.
+with nobody responsible above her runs a gated shell command, the ask
+snapshots actor == reviewer, and her own `kj ledger allow` confirms it and
+executes the command. That is the self-confirmation the walk settles on;
+the earlier unanswerable Pending row, and the in-band refusal that briefly
+replaced it, are both gone.
 
 Seen while writing that test: the test's blanket Ask hook re-gated the
 `kj ledger allow` typed into the same context, so the test answers from a

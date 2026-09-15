@@ -16,19 +16,20 @@ does not become an instruction to use nonexistent features.
 
 | Part | Implemented contract |
 |---|---|
-| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`; `kj character create\|list\|show\|retire` |
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag; `kj character create [--root]\|list\|show\|set --root\|--no-root\|retire` |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Performer | `kj context create --as <character>` records `played_by` before create rc, rejects unknown, retired, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
+| Performer | `kj context create --as <character>` records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
 | Client creation | Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer |
-| Review assignment | Explicit context override, then explicit director-wide delegation, then the configured Amy default. Amy controls delegation and reviewer/director overrides. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
-| Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn. Provider output and tool calls carry the performer; the requester stays separate |
-| Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context. See `docs/approval-identity.md` |
-| Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged |
+| Review assignment | Explicit context override, then explicit director-wide delegation, then the walk up `forked_from`, then the configured Amy default; an exhausted walk is a self-confirmation. Amy controls delegation and reviewer/director overrides. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
+| Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
+| Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation whose reviewer IS its performer. See `docs/approval-identity.md` |
+| Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged. A retired character responsible for an ancestor context refuses reviewer resolution below it, by name |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
-| Accountability | A relation between contexts: `forked_from`, set by fork and by `kj context create` from inside a context; the responsible character is the performer, or the director when unset. Reviewer resolution walks it (`docs/approval-identity.md`). The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
+| Accountability | A relation between contexts: `forked_from`, set by fork and by `kj context create` from inside a context; the responsible character is the performer, or the director when unset. Reviewer resolution and `kj ledger escalate` both walk it (`KernelDb::responsible_character_above`; `docs/approval-identity.md`). The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
 
-Sources: `kernel_db.rs::CharacterRow`, `kj/context.rs::context_create`,
+Sources: `kernel_db.rs::CharacterRow`, `kernel_db.rs::effective_approval_reviewer`,
+`kj/context.rs::context_create`,
 `kj/character.rs`, `kj/handoff.rs`, `kj/lifecycle.rs::load_rc_scripts` in
 `crates/kaijutsu-kernel/src/`; `crates/kaijutsu-server/src/rpc.rs::create_context_inner`;
 `assets/defaults/rc/director/create/S00-stance.kai` and
@@ -96,8 +97,10 @@ Two things follow, and they are the ones to check a change against:
   drift address. The word fits the cast vocabulary kaijutsu already uses: a
   character is what an actor is cast *as*, and a context is one performance.
 - **A character has a default cast.** A gig may pin another.
-- **Accountability is a chain and replaces any group concept.** Every model
-  character points at a character; a human is a root. No party.
+- **Accountability replaces any group concept.** Every model character
+  answers to a character above it; a human is a root. No party. Superseded
+  in shape by "Roots and rotation": the relation is between contexts, not
+  between sheets.
 - **rc is a union.** A context runs its `context_type` rc and its
   character's rc, merged by the `SXX-name` ordering rc already sorts on. A
   character script chooses what comes through per type in kaish code.
@@ -154,19 +157,21 @@ Two things follow, and they are the ones to check a change against:
   takes the character's name as its label. The old arrangement, where
   `ROOT` named banto's director seat, ends: `ROOT` is Amy's, banto's seat
   is `banto`.
-- **The reviewer is the responsible character of the nearest ancestor.**
-  Resolution takes the actor and the context: an explicit override on the
-  context, then the director's delegation, then the walk up `forked_from`
-  to the first ancestor whose responsible character is live and is not the
-  actor, then the configured default. Archived ancestors are walked
+- **The reviewer is the nearest responsible character that is not the
+  actor.** Resolution takes the actor and the context: an explicit
+  override on the context, then the director's delegation, then the walk
+  up `forked_from` to the first context whose responsible character is
+  live and is not the actor, then the configured default. The walk starts
+  at the context itself, which is how a context with no parent still
+  resolves through its own director. Archived ancestors are walked
   through; what matters is who is responsible for them. When the walk
   ends without finding anyone else, the actor is at its own root and the
   ask is a **self-confirmation**: the row is raised with the actor as its
   reviewer, the actor alone may answer it, and the ledger records the
   answer as a self-confirmation. Every other ask has a reviewer who is not
-  its actor, so an ask nobody can answer cannot exist. Escalation climbs
-  the same walk one ancestor further and refuses at a root. See
-  `docs/approval-identity.md`.
+  its actor, so an ask nobody can answer cannot exist. Escalation runs the
+  same walk past the context that yielded the current reviewer, and
+  refuses at a root. See `docs/approval-identity.md`.
 - **A director casts its children.** `kj context set <ctx> --as <character>`
   is allowed when the caller is the context's resolved reviewer, or when
   the caller's actor directs the context, which a fork or create from the
