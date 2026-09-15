@@ -6,6 +6,46 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Roots, the accountability chain, and rotation (Amy, 2026-09-15)
+
+Guidance in `docs/character.md`, "Roots and rotation", and
+`docs/approval-identity.md`, "Planned: the accountability chain". Queued in
+build order; each slice leaves the tree green.
+
+1. **Reviewer resolution takes the actor and walks `accountable_to`.**
+   `effective_approval_reviewer` and `resolve_review_assignment` gain the
+   actor and the chain layer (override, delegation, chain, default) and
+   never return the actor. Tests: a delegated reviewer acting with its own
+   credential gets its own root as reviewer; a chain of three resolves to
+   the nearest live one; a retired link is skipped or refused (decide which
+   and pin it).
+2. **A root confirms itself.** When resolution finds no reviewer for a root
+   actor, the gate returns an in-band confirmation instead of creating an
+   ask, and the ledger records a self-confirmation. `user_input_identity.rs`'s
+   fourth test flips to the new behavior. Escalate refuses at a root.
+3. **A root character has no model.** `turn_identity::resolve` refuses a
+   performer with `accountable_to = NULL` and names the rule; `kj character
+   set --root` on a character with a cast, or a cast on a root, refuses.
+4. **`ROOT` is reserved and single.** One reserved-names set (`ROOT`, the
+   drift queue, factory preset labels); `ROOT` claimed once per kernel like
+   the drift queue; it must be played by a root character. Move the label
+   from banto's seat to Amy's root context; banto's seat is labeled `banto`.
+5. **`root_ctx` on the sheet, with rotation as its reader.** `kj context
+   rotate <character>` (or `create --rotate`): reads the predecessor from the
+   sheet, sets `ROTATED_FROM`, mints the successor with the same type and
+   cast and performer, moves the pointer, archives the predecessor, one
+   transaction. Label follows the live holder. `docs/prompts.md`, "Rotating
+   a director context" changes to the verb.
+6. **`create --as` asks instead of refusing.** Apply the held patch
+   (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
+   then turn its refusal into an ask to the actor's reviewer, and accept a
+   redeemed approval for the exact statement as authority. A static allow
+   rule for a well-formed self-rotation is a policy entry, added when Amy
+   wants rotation unattended.
+7. **banto from `ROOT`.** Seed: `amy` root, `banto` accountable to amy,
+   banto's seat created from the root context. A migration note for the
+   live kernel, since `ROOT` is banto's today.
+
 ## Identity audit: what stays open (2026-09-15)
 
 Amy: *"I do want the credentials we check to be aligned to the newer fields
@@ -49,10 +89,11 @@ The test pins today's behavior and names the alternatives for Amy: refuse
 to raise such an ask and route to escalation, auto-escalate at raise time,
 or keep it and expect the human to escalate their own asks.
 
-Found while writing that test: an Ask hook installed on a context re-gates
-the `kj ledger allow` typed into that same context, so the answer to an ask
-raises another ask. The test answers from a hook-free context. Wants a rule
-or a test of its own.
+Seen while writing that test: the test's blanket Ask hook re-gated the
+`kj ledger allow` typed into the same context, so the test answers from a
+hook-free context. The shipped evaluator exempts `kj ledger` as a whole verb
+(`docs/gate-policy-tuning.md`, "Builtin tier"), so this is likely a test
+artifact; a test that pins the exemption under a custom hook would settle it.
 
 ## The compose draft is the player's alone (Amy, 2026-09-15)
 

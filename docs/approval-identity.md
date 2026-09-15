@@ -227,3 +227,29 @@ superseded request need explicit linkage so rotation does not duplicate work.
   Having no default expiry does not change those policies. Restart survival and
   rotation recovery need an explicit execution/recovery design before removal
   of those cleanup paths.
+
+## Planned: the accountability chain
+
+Guidance from Amy, 2026-09-15; see `docs/character.md`, "Roots and
+rotation". Not implemented.
+
+Reviewer resolution takes the actor and adds the `accountable_to` chain as
+a layer: explicit override, then the director's delegation, then the first
+live character above the actor, then the configured default. It never
+returns the actor. Today the gate resolves from the context alone, so a
+connection actor who is also the resolved reviewer, Amy in her own contexts
+or a delegated reviewer acting with its own credential, gets an ask that
+self-approval then refuses; `crates/kaijutsu-server/tests/user_input_identity.rs`
+pins that state.
+
+A root, a character with no `accountable_to`, has no reviewer. Its gated
+statement never becomes an ask: the gate returns an in-band confirmation
+to the connection and the ledger records a self-confirmation, distinct from
+an approval. Escalation refuses at a root. Every other actor has a
+reviewer, so an ask nobody can answer cannot be created.
+
+A `kj context create --as <character>` by a caller without reviewer
+authority raises an ask rather than refusing; approval executes the
+statement and the verb accepts a redeemed approval for that statement as
+authority.
+

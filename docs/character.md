@@ -114,6 +114,77 @@ Two things follow, and they are the ones to check a change against:
   several currencies: tokens, dollars, megabytes, a house scrip) and an
   availability field.
 - **Kaijutsu stays bespoke** for Amy and the fleet. Open source, so who knows.
+
+## Roots and rotation (guidance, Amy, 2026-09-15)
+
+- **A root character has no model.** `accountable_to` is `NULL`, it has no
+  cast, and turn identity refuses it as a performer. A root is a place with
+  hands on it: Amy fools around there, and during bootstrap asks a Claude
+  Code session to do something through the MCP bridge, where the model is
+  outside the kernel and drives through `kj`. Autonomous operation restricts
+  it further later.
+- **A root context is played by a root character and holds the reserved
+  name `ROOT`.** One live holder per kernel, claimed the way the drift
+  queue is claimed on the router. The reserved names live in one place:
+  `ROOT`, the drift queue, and the factory preset labels.
+- **Rotation belongs to `root_ctx`, and every character has one.** On a
+  root character it names the root context; on a model character it names
+  the home seat. Rotation mints a successor of the same type and cast,
+  played by the same character, sets `ROTATED_FROM` from the pointer,
+  moves the pointer, and archives the predecessor, in one transaction. The
+  label follows the live holder, as `ROOT` does today. A root rotates too,
+  when its history goes stale; a root confirms itself, so no ask is raised.
+  Forks and delegated lanes are work, never `root_ctx`.
+- **banto is accountable to amy and starts from `ROOT`.** Its home seat is
+  created from the root context so its lineage begins there. The seat takes
+  the character's name as its label. The old arrangement, where `ROOT` named
+  banto's director seat, ends: `ROOT` is Amy's, banto's seat is `banto`.
+- **The reviewer is the nearest character above the actor.** Resolution
+  takes the actor: explicit override, then the director's delegation, then
+  the first live character up the actor's `accountable_to` chain, then the
+  configured default. It never returns the actor. A root acting on its own
+  behalf has nobody above it, so its gated statement never becomes an ask; the
+  gate returns an in-band confirmation and the ledger records a
+  self-confirmation. Escalation stops at a root. See
+  `docs/approval-identity.md`, "Planned: the accountability chain".
+- **A model asks to rotate itself.** `kj context create --as <character>` by
+  a caller without reviewer authority raises an ask instead of refusing; the
+  reviewer is the root above it; approval executes the statement, and the
+  verb accepts a redeemed approval for that exact statement as its
+  authority. A static rule in the allow tier may pass a rotation whose
+  character, type, and predecessor line up, when Amy wants it unattended.
+
+### A session, inside kaijutsu
+
+How a day like 2026-09-15 runs once the pieces above exist. Amy gives
+prompts, banto directs lanes, and the lanes are contexts.
+
+1. Amy sits in banto's seat, not `ROOT`. `ROOT` is where she runs `kj` by
+   hand. She attaches the tui to `banto` and types; the draft is hers, submit
+   authors a user block as amy, and the turn runs with banto as actor and amy
+   as reviewer.
+2. banto plans and forks lanes with filters, each played by a coder character
+   accountable to banto, each with a label, a territory, and a worktree under
+   `~/src/wt/`.
+3. Lanes run as driven turns. banto drives and waits. A lane's gated
+   statement walks the chain to banto; banto's own, such as a commit, walks to
+   amy. Static allow tiers pass the routine ones; the rest reach Amy's asks
+   pane.
+4. Review is a tool call: kaibo mounts as an MCP server in banto's loadout,
+   and the review is a tool-result block in the seat, with a fix lane forked
+   from it.
+5. Results come back as drift into banto's seat, distilled when casts differ.
+   banto re-reads every citation against the tree, then commits path-scoped
+   through the gated shell.
+6. Every lane stays a context: open it in the picker, scroll, copy, or exclude
+   a bad turn, fork, and re-drive. `kj context info` and `kj block list -c
+   <lane>` answer what a lane did a week later.
+7. `kj handoff note` replaces `signoff.md`. When the seat grows long, banto
+   asks to rotate; the successor hydrates from `ROTATED_FROM` and the handoff
+   tail, and the predecessor archives with its lineage intact.
+
+Polish step 3 first: driving and waiting on lanes with disjoint territories
+is where a session spends its care.
 - **The principal is the character's key.** No distinct `CharacterId`.
   Permanence comes from the three rules in the design: kernel-owned name, no
   deletion while referenced, missing mapping is corruption. Revisit if a
@@ -937,8 +1008,9 @@ Each slice is independently shippable and leaves the tree green.
    `accountable_to` and `default_cast_id` arrive with the character rows that
    need them; the distill-cast refusal and `--distill-model` on pull.
 
-Deferred: saifu, availability, `memory_root` and `root_ctx` until a reader
-exists. Not doing: party, chair, seat, any reputation or trust score
+Deferred: saifu, availability, and `memory_root` until a reader exists.
+`root_ctx` has its reader, rotation ("Roots and rotation" above), and is
+queued in `docs/issues.md`. Not doing: party, chair, seat, any reputation or trust score
 (shared trust rules it out), a `Character` Rust type.
 
 ## What changes for a morning
