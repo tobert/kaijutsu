@@ -7383,6 +7383,8 @@ impl kernel::Server for KernelImpl {
                         None => {
                             let command_block_id = submission.command_block_id;
                             // The command exists durably; the draft has done its job.
+                            // TODO: Consume only the revision used for this command.
+                            // See docs/issues.md, "Shell submission can clear a newer draft".
                             documents
                                 .clear_draft(context_id, user_principal_id)
                                 .map_err(|e| capnp::Error::failed(format!("clear draft: {}", e)))?;

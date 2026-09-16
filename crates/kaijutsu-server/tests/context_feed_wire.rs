@@ -58,7 +58,7 @@ async fn drain_until(mirror: &mut ContextMirror, rx: &mut Receiver<FeedEvent>, v
     }
 }
 
-/// Every event must carry its OWN version, strictly increasing across the
+/// Every event must carry its OWN version, nondecreasing across the
 /// delivery, with the last equal to the delivery's.
 ///
 /// Checked on the wire and not only in the mirror's unit tests because the
@@ -71,8 +71,8 @@ fn assert_per_event_versions(delivery: &kaijutsu_client::ContextDelivery) {
     let mut last = 0u64;
     for event in &delivery.events {
         assert!(
-            event.version > last,
-            "event versions must strictly increase within a delivery: {} after {last}",
+            event.version >= last,
+            "event versions must not decrease within a delivery: {} after {last}",
             event.version
         );
         last = event.version;
@@ -184,6 +184,34 @@ fn appends_and_an_edit_reproduce_the_kernel_text() {
             "a client following only the feed must hold exactly the kernel's text"
         );
         assert_eq!(mirror.version(), kv);
+    });
+}
+
+/// A submitted draft's status and metadata arrive together over SSH and
+/// apply to the same mirror clients render. Drive the kernel promotion directly
+/// so model-turn startup cannot hide a feed failure behind unrelated events.
+#[test]
+fn submitted_draft_metadata_reaches_the_mirror_over_ssh() {
+    run_local(async {
+        let (addr, server) = common::start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let ctx = create_context(&kernel, "feed-compose").await.unwrap();
+        kernel.join_context(ctx, "feed-test").await.unwrap();
+        kernel.edit_input(ctx, 0, "hello", 0).await.unwrap();
+        let (observer, mut rx) = context_feed_channel(256);
+        kernel.subscribe_context(ctx, observer).await.unwrap();
+        let (blocks, version) = kernel.get_blocks_versioned(ctx, &BlockQuery::All).await.unwrap();
+        let draft = blocks.iter().find(|b| b.status == kaijutsu_types::Status::Draft).unwrap().clone();
+        let mut mirror = ContextMirror::new(ctx);
+        mirror.apply_snapshot(blocks, version).unwrap();
+        server.documents.submit_draft(ctx, draft.id.principal_id, None).unwrap();
+        let target = server.documents.get(ctx).unwrap().version();
+        drain_until(&mut mirror, &mut rx, target).await;
+        let seen = mirror.block(&draft.id).unwrap();
+        assert_eq!(seen.content, "hello");
+        assert_eq!(seen.status, kaijutsu_types::Status::Done);
+        assert!(!seen.ephemeral);
     });
 }
 

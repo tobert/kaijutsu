@@ -1429,6 +1429,17 @@ second compose lock. Draft creation journals both hydration exclusions in its
 initial snapshot. Controlled pauses reproduced all three released-guard
 windows; competing create/submit calls and journal replay check the result.
 
+Change-feed publication now carries explicit group boundaries through FlowBus.
+The bridge finishes each group before closing a delivery, preserves publish
+order without sorting, and discards incomplete groups on termination. Topic
+filters mark their own final matching event; timing messages stay independent.
+A batch-limit regression reproduced a split draft submission, then exposed the
+client mirror's assumption that every event had a distinct version. The mirror
+now accepts equal versions inside one delivery while rejecting duplicates
+across deliveries. Separate output and status mutations remain ordered separate
+acceptances; batching never made them one transaction. Callback-failure recovery
+and shell submission's async draft consumption remain tracked follow-ups.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

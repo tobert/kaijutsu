@@ -141,6 +141,9 @@ pub struct FlowMessage<T> {
     /// there is honest and expected: it says beats were missed, which is what
     /// that lane promises. `0` on a message that never went through a queue.
     pub seq: u64,
+    /// Last matching event of one publish group for this subscription.
+    /// Single-event publishes and timing messages always end their own group.
+    pub group_end: bool,
 }
 
 impl<T: HasSubject> FlowMessage<T> {
@@ -152,6 +155,7 @@ impl<T: HasSubject> FlowMessage<T> {
             timestamp: Instant::now(),
             sender: None,
             seq: 0,
+            group_end: true,
         }
     }
 
@@ -163,6 +167,7 @@ impl<T: HasSubject> FlowMessage<T> {
             timestamp: Instant::now(),
             sender: Some(sender.into()),
             seq: 0,
+            group_end: true,
         }
     }
 }
@@ -1114,26 +1119,35 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
         self.dispatch(payload, Some(sender.into()))
     }
 
+    /// Publish one complete group of ordered events. Subscription creation and
+    /// other publishers cannot interleave with the group. Topic filtering marks
+    /// the last matching event for each subscriber. Overflow still terminates
+    /// the subscriber; it must discard any incomplete group and recover.
+    /// Returns the number of subscriptions that accepted a nonempty group.
+    pub fn publish_batch(&self, payloads: Vec<T>) -> usize {
+        let messages: Vec<_> = payloads.into_iter().map(|payload| {
+            let topic = payload.subject();
+            assert_eq!(T::topic_class(topic), TopicClass::Ordered,
+                "timing events must not be grouped");
+            FlowMessage::new(topic, payload)
+        }).collect();
+        self.dispatch_messages(&messages)
+    }
+
     fn dispatch(&self, payload: T, sender: Option<String>) -> usize {
-        let topic = payload.subject();
-        if !self.inner.topics.contains(topic) {
-            // A subject without a registered topic means the payload's
-            // FlowTopics::TOPICS list is out of sync with its subject() — the
-            // publish reaches nobody. That class of bug hid
-            // `block.context_switched` for months. Scream in debug; stay
-            // non-crashing in release.
-            debug_assert!(false, "published to unregistered topic {topic:?}");
-            tracing::error!(topic, "published to unknown topic — dropped");
-            return 0;
+        let mut message = FlowMessage::new(payload.subject(), payload);
+        message.sender = sender;
+        self.dispatch_messages(std::slice::from_ref(&message))
+    }
+
+    fn dispatch_messages(&self, messages: &[FlowMessage<T>]) -> usize {
+        for message in messages {
+            if !self.inner.topics.contains(message.topic) {
+                debug_assert!(false, "published to unregistered topic {:?}", message.topic);
+                tracing::error!(topic = message.topic, "published to unknown topic — dropped");
+                return 0;
+            }
         }
-        let class = T::topic_class(topic);
-        let template = FlowMessage {
-            topic,
-            payload,
-            timestamp: Instant::now(),
-            sender,
-            seq: 0,
-        };
 
         let mut delivered = 0usize;
         let mut kicked: Vec<(String, FlowTermination)> = Vec::new();
@@ -1146,10 +1160,19 @@ impl<T: Clone + Send + HasSubject + FlowTopics + 'static> FlowBus<T> {
                 let Some(slot) = weak.upgrade() else {
                     return false;
                 };
-                if !slot.matches(topic) {
-                    return true;
+                let mut matching = messages.iter().filter(|m| slot.matches(m.topic)).peekable();
+                if matching.peek().is_none() { return true; }
+                let mut accepted = true;
+                while let Some(message) = matching.next() {
+                    let mut message = message.clone();
+                    message.group_end = matching.peek().is_none();
+                    let class = T::topic_class(message.topic);
+                    if !slot.offer(message, class) {
+                        accepted = false;
+                        break;
+                    }
                 }
-                if slot.offer(template.clone(), class) {
+                if accepted {
                     delivered += 1;
                     return true;
                 }
@@ -2705,6 +2728,75 @@ mod tests {
             version: byte as u64,
             source: OpSource::Local,
         }
+    }
+
+    #[test]
+    fn publish_groups_end_at_each_subscribers_last_matching_topic() {
+        let bus: FlowBus<BlockFlow> = FlowBus::new(8);
+        let mut all = bus.subscribe("block.>");
+        let mut texts = bus.subscribe("block.text_appended");
+        let mut statuses = bus.subscribe("block.status");
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        assert_eq!(bus.publish_batch(vec![
+            text_op(ctx, id, 1),
+            BlockFlow::StatusChanged { context_id: ctx, block_id: id, status: Status::Done,
+                version: 1, source: OpSource::Local },
+            text_op(ctx, id, 2),
+        ]), 3);
+        for (sub, ends) in [(&mut all, vec![false, false, true]), (&mut texts, vec![false, true]),
+            (&mut statuses, vec![true])]
+        {
+            for (i, end) in ends.into_iter().enumerate() {
+                let message = sub.try_recv().unwrap();
+                assert_eq!(message.group_end, end);
+                assert_eq!(message.seq, i as u64 + 1);
+            }
+            assert!(sub.try_recv_event().is_none());
+        }
+    }
+
+    #[test]
+    fn group_overflow_terminates_only_the_full_subscriber() {
+        let bus: FlowBus<BlockFlow> = FlowBus::new(1);
+        let mut all = bus.subscribe("block.>");
+        let mut texts = bus.subscribe("block.text_appended");
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        assert_eq!(bus.publish_batch(vec![text_op(ctx, id, 1),
+            BlockFlow::StatusChanged { context_id: ctx, block_id: id, status: Status::Done,
+                version: 1, source: OpSource::Local },
+        ]), 1);
+        assert!(matches!(all.try_recv_event(), Some(FlowRecv::Terminated(_))));
+        assert!(texts.try_recv().unwrap().group_end);
+        assert!(!texts.is_terminated());
+    }
+
+    #[test]
+    fn concurrent_publishers_keep_groups_contiguous() {
+        let bus: FlowBus<BlockFlow> = FlowBus::new(512);
+        let mut sub = bus.subscribe("block.>");
+        let ctx = ContextId::new();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let bus = &bus;
+                scope.spawn(move || {
+                    let id = BlockId::new(ctx, PrincipalId::new(), 1);
+                    for _ in 0..16 {
+                        bus.publish_batch(vec![text_op(ctx, id, 1), text_op(ctx, id, 2)]);
+                    }
+                });
+            }
+        });
+        for _ in 0..128 {
+            let first = sub.try_recv().unwrap();
+            let second = sub.try_recv().unwrap();
+            assert!(!first.group_end);
+            assert!(second.group_end);
+            assert_eq!(first.payload.block_id(), second.payload.block_id());
+            assert_eq!(first.seq + 1, second.seq);
+        }
+        assert!(sub.try_recv_event().is_none());
     }
 
     /// The headline property. One subscriber never reads; another reads

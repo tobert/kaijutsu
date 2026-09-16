@@ -365,15 +365,16 @@ impl BlockStore {
         self.block_flows.as_ref()
     }
 
-    /// Emit a block flow event if the bus is configured.
-    fn emit(&self, flow: BlockFlow) {
+    /// Publish a complete accepted mutation while its document guard is held.
+    fn emit_group(&self, events: Vec<BlockFlow>) {
+        if events.is_empty() { return; }
         #[cfg(test)]
         {
             let hook = self.before_publish.lock().take();
             if let Some(hook) = hook { hook(); }
         }
         if let Some(bus) = &self.block_flows {
-            bus.publish(flow);
+            bus.publish_batch(events);
         }
     }
 
@@ -619,13 +620,13 @@ impl BlockStore {
                 }
                 self.recompute_live_status(context_id, &[snapshot.status]);
                 let _entry = vacant.insert(entry);
-                self.emit(BlockFlow::Inserted {
+                self.emit_group(vec![BlockFlow::Inserted {
                     context_id,
                     block: Arc::new(snapshot),
                     after_id: None,
                     version,
                     source: OpSource::Local,
-                });
+                }]);
                 Ok(block_id)
             }
         }
@@ -1030,9 +1031,7 @@ impl BlockStore {
             return Err(error);
         }
         self.recompute_live_status(context_id, &entry.doc.statuses_ordered());
-        for event in events {
-            self.emit(event);
-        }
+        self.emit_group(events);
         entry.poisoned = false;
         Ok(result)
     }

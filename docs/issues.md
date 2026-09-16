@@ -74,9 +74,9 @@ external-edit regressions from `docs/file-buffers.md`; only then remove clean
 read materialization. This remains a separate design change.
 
 **Order:** runtime settlement, shared recovery, rendering, then file-buffer
-persistence. Compound compose operations and feed acceptance groups are
-tracked below. Each requires its own reviewable change; the source TODOs point
-to these entries.
+persistence. Feed callback recovery and shell draft consumption are tracked
+below. Each requires its own reviewable change; the source TODOs point to
+these entries.
 
 ### Kernel architecture overview needs a refresh
 
@@ -2298,16 +2298,22 @@ shipped. Still open, all verified against current code:
 - **Backgrounds/underlines bake color into vertices** — `ShapeKey::
   baked_theme_epoch` exists for exactly this reason.
 
-## Change-feed batching after ordered acceptance
+## Change-feed callback failures must end the feed
 
-The block store now publishes in version order. `server/context_feed.rs`
-still sorts a delivery to repair the retired publisher race. Remove that
-repair with wire-level order tests. Also pin a mutation's multiple events at
-the batch limit: draft submission emits status and metadata at one version,
-and splitting them between deliveries currently ends the feed on the second
-one and forces a snapshot. Preserve complete acceptance groups before
-claiming transactional delivery; a four-millisecond window cannot guarantee
-it. Keep the existing recovery check until that contract is tested.
+`server/context_feed.rs::deliver` clears its batch before awaiting the observer.
+A refused or timed-out callback returns `Ok(None)` and the feed continues with
+later events. The observer may never have accepted the skipped delivery; an
+append-only gap can look like valid text. End the feed and force resubscribe /
+snapshot recovery on either outcome, with regressions for refusal and timeout.
+
+## Shell submission can clear a newer draft
+
+`rpc.rs::submit_input` in shell mode reads a draft, awaits command submission,
+then clears whichever draft that principal currently owns. Individual compose
+operations are guarded, but this async sequence is not. Typing or replacing the
+draft during the await can lose newer text. Consume only the draft revision used
+to author the command, and test concurrent edits and replacement across the
+await. Chat promotion already happens in one guarded operation.
 
 ## vte 0.15.0 drops a control byte after a chunked partial UTF-8 codepoint (2026-08-19)
 

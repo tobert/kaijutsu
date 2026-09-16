@@ -17,9 +17,8 @@
 //! - **Batching is native.** A delivery is a list, so a burst of streamed
 //!   tokens is one call. The old surface needed a bespoke `onBlockTextOpsBatch`
 //!   to say the same thing, and it could only batch *one block's* text ops.
-//! - **A delivery is transactional.** A tool's final output text and its `Done`
-//!   status ride the same call, closing the race where a client renders a
-//!   finished tool with no output.
+//! - **A mutation stays complete.** All events of one accepted mutation ride
+//!   the same call. Separate mutations can land in separate deliveries.
 //! - **One clock.** The context's `version` replaces both the per-context op
 //!   counter and the per-subscription delivery counter.
 //!
@@ -27,8 +26,8 @@
 //!
 //! The block store holds the document guard through durable acceptance and
 //! publication. This bridge preserves that order and ends the feed if a
-//! delivery would move its version backward. Its legacy sort is now redundant;
-//! see `docs/issues.md`, "Change-feed batching after ordered acceptance".
+//! delivery would move its version backward. FlowBus marks complete publish
+//! groups, so neither the batching window nor the size limit splits a mutation.
 //!
 //! # What must never ride this feed
 //!
@@ -39,7 +38,7 @@
 
 use std::time::Duration;
 
-use kaijutsu_kernel::flows::{BlockFlow, FlowRecv, Subscription};
+use kaijutsu_kernel::flows::{BlockFlow, FlowMessage, FlowRecv, FlowTopics, Subscription, TopicClass};
 use kaijutsu_types::{ContextId, KernelId};
 use tokio_util::sync::CancellationToken;
 
@@ -56,7 +55,7 @@ use crate::kaijutsu_capnp::{context_event, context_observer};
 /// names this constant by path.
 pub(crate) const FEED_BATCH_WINDOW: Duration = Duration::from_millis(4);
 
-/// Hard cap on one delivery, so a firehose cannot grow an unbounded message.
+/// Target cap on one delivery. Finish a started group before closing it.
 const FEED_BATCH_MAX: usize = 512;
 
 /// How long the observer has to accept one delivery.
@@ -85,9 +84,10 @@ pub(crate) async fn run_context_feed(
             ev = sub.recv_event() => ev,
         };
         let mut batch: Vec<BlockFlow> = Vec::new();
+        let mut complete = 0;
         match first {
             None => break,
-            Some(FlowRecv::Message(m)) => batch.push(m.payload),
+            Some(FlowRecv::Message(m)) => append_message(&mut batch, &mut complete, m),
             Some(FlowRecv::Terminated(info)) => {
                 terminate(&observer, delivered_version, kernel_id, &info).await;
                 disconnect.cancel();
@@ -97,19 +97,31 @@ pub(crate) async fn run_context_feed(
 
         // 2. Hold the window open to coalesce a burst.
         let deadline = tokio::time::Instant::now() + FEED_BATCH_WINDOW;
-        while batch.len() < FEED_BATCH_MAX {
+        while batch.len() < FEED_BATCH_MAX || complete < batch.len() {
             let next = tokio::select! {
-                _ = conn_cancel.cancelled() => break,
-                ev = tokio::time::timeout_at(deadline, sub.recv_event()) => ev,
+                _ = conn_cancel.cancelled() => return,
+                ev = async {
+                    if complete < batch.len() {
+                        Ok(sub.recv_event().await)
+                    } else {
+                        tokio::time::timeout_at(deadline, sub.recv_event()).await
+                    }
+                } => ev,
             };
             match next {
-                // Window expired, or the bus closed — ship what we have.
-                Err(_) | Ok(None) => break,
-                Ok(Some(FlowRecv::Message(m))) => batch.push(m.payload),
+                Err(_) => break,
+                Ok(None) => {
+                    if complete < batch.len() {
+                        terminate_fault(&observer, delivered_version, kernel_id, FeedFault::IncompleteGroup).await;
+                        disconnect.cancel();
+                        return;
+                    }
+                    break;
+                }
+                Ok(Some(FlowRecv::Message(m))) => append_message(&mut batch, &mut complete, m),
                 Ok(Some(FlowRecv::Terminated(info))) => {
-                    // Deliver what we already hold first: those events are
-                    // accepted facts, and the client's recovery is cheaper if
-                    // its snapshot is as recent as possible.
+                    // Only complete groups can advance the client's version.
+                    batch.truncate(complete);
                     if let Ok(Some(v)) =
                         deliver(&observer, context_id, &mut batch, kernel_id, delivered_version)
                             .await
@@ -138,6 +150,13 @@ pub(crate) async fn run_context_feed(
     }
 }
 
+/// Timing events use their own lane and cannot end an ordered group.
+fn append_message(batch: &mut Vec<BlockFlow>, complete: &mut usize, message: FlowMessage<BlockFlow>) {
+    if BlockFlow::topic_class(message.topic) == TopicClass::Timing { return; }
+    batch.push(message.payload);
+    if message.group_end { *complete = batch.len(); }
+}
+
 /// Build and send one delivery. Returns the version the observer was brought
 /// to, or `None` when nothing in the batch belonged on this feed or the
 /// observer refused the call.
@@ -155,34 +174,14 @@ async fn deliver(
         return Ok(None);
     }
 
-    // Version order within the delivery (rules 11, 13, 14). Stable, so two
-    // events the kernel accepted at the same version keep the order it
-    // published them in.
-    // TODO: Remove repair sorting and preserve complete acceptance groups.
-    // See docs/issues.md, "Change-feed batching after ordered acceptance".
-    batch.sort_by_key(|flow| flow.version().unwrap_or(0));
     let version = batch.last().and_then(|flow| flow.version()).unwrap_or(0);
-
-    // The window repairs an inversion by sorting; an inversion that spans two
-    // windows it cannot repair, because the earlier event is already gone. Say
-    // so instead of shipping it: an event older than one already delivered
-    // would either be applied out of order (corrupting text) or skipped
-    // (losing a change), and neither is something a client can discover on its
-    // own. `Err` here ends the feed, and the client rehydrates from a
-    // snapshot — the same recovery a slow subscriber gets, for the same
-    // reason.
     let oldest = batch.first().and_then(|flow| flow.version()).unwrap_or(0);
-    if last_delivered > 0 && oldest <= last_delivered {
+    if oldest <= last_delivered || batch.windows(2).any(|pair| pair[0].version() > pair[1].version()) {
         tracing::error!(
-            kernel = %kernel_id,
-            %context_id,
-            oldest,
-            last_delivered,
-            "context feed saw an event older than one already delivered — the \
-             batching window could not repair it; ending the feed so the client \
-             refetches rather than applying it out of order"
+            kernel = %kernel_id, %context_id, oldest, last_delivered,
+            "context feed received events out of version order; ending the feed for recovery"
         );
-        return Err(FeedFault::UnrepairableInversion);
+        return Err(FeedFault::VersionOrder);
     }
 
     let mut req = observer.on_context_changed_request();
@@ -202,6 +201,8 @@ async fn deliver(
     }
     batch.clear();
 
+    // TODO: End the feed on callback refusal or timeout. See docs/issues.md,
+    // "Change-feed callback failures must end the feed".
     match tokio::time::timeout(FEED_CALLBACK_TIMEOUT, req.send().promise).await {
         Ok(Ok(_)) => Ok(Some(version)),
         Ok(Err(e)) => {
@@ -221,9 +222,8 @@ async fn deliver(
 /// A fault the feed cannot deliver through — it ends the feed instead.
 #[derive(Debug, Clone, Copy)]
 enum FeedFault {
-    /// An event arrived older than one already delivered, across two batching
-    /// windows. Sorting cannot repair what has already been sent.
-    UnrepairableInversion,
+    VersionOrder,
+    IncompleteGroup,
 }
 
 /// End the feed because the server cannot deliver a correct stream.
@@ -433,6 +433,110 @@ mod tests {
     use super::*;
     use kaijutsu_types::{BlockId, ContextId, PrincipalId, ProvenanceTag, StyleAttrs, StyleColor,
         StyleSpan};
+
+    #[tokio::test(start_paused = true)]
+    async fn draft_submission_stays_complete_at_the_delivery_limit() {
+        use capnp::capability::FromClientHook;
+        use kaijutsu_client::{ContextChange, ContextMirror, FeedEvent, context_feed_channel};
+        use kaijutsu_kernel::{BlockStore, block_store::DocumentKind};
+        use kaijutsu_kernel::flows::FlowBus;
+        use std::sync::Arc;
+
+        tokio::task::LocalSet::new().run_until(async {
+            let ctx = ContextId::new();
+            let me = PrincipalId::new();
+            let bus = Arc::new(FlowBus::new(FEED_BATCH_MAX * 4));
+            let store = BlockStore::with_flows(me, bus.clone());
+            store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let id = store.edit_draft(ctx, me, 0, "hello", 0).unwrap();
+            let sub = bus.subscribe("block.>");
+            let mut mirror = ContextMirror::new(ctx);
+            mirror.apply_snapshot(store.block_snapshots(ctx).unwrap(), store.get(ctx).unwrap().version()).unwrap();
+            for _ in 0..FEED_BATCH_MAX - 1 { store.append_text(ctx, &id, "x").unwrap(); }
+            store.submit_draft(ctx, me, None).unwrap();
+            let submitted_version = store.get(ctx).unwrap().version();
+            store.append_text(ctx, &id, "after").unwrap();
+            let target = store.get(ctx).unwrap().version();
+            let (observer, mut rx) = context_feed_channel(8);
+            let cancel = CancellationToken::new();
+            let disconnect = CancellationToken::new();
+            let feed = tokio::task::spawn_local(run_context_feed(
+                observer.cast_to(), ctx, sub, KernelId::new(), cancel.clone(), disconnect.clone(),
+            ));
+            let mut last = 0;
+            while last < target {
+                let event = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+                let FeedEvent::Changed(delivery) = event else { panic!("unexpected feed event: {event:?}"); };
+                assert!(delivery.events[0].version > last);
+                assert!(delivery.events.windows(2).all(|pair| pair[0].version <= pair[1].version));
+                let submission: Vec<_> = delivery.events.iter()
+                    .filter(|event| event.version == submitted_version).collect();
+                if !submission.is_empty() {
+                    assert_eq!(submission.len(), 2, "a delivery must contain the whole submitted mutation");
+                    assert!(matches!(submission[0].change, ContextChange::StatusChanged { .. }));
+                    assert!(matches!(submission[1].change, ContextChange::MetadataChanged { .. }));
+                }
+                last = delivery.version;
+                mirror.receive(delivery).expect("complete mutation applies to the client mirror");
+            }
+            let live = store.get_block_snapshot(ctx, &id).unwrap().unwrap();
+            let seen = mirror.block(&id).unwrap();
+            assert_eq!(seen.content, live.content);
+            assert_eq!(seen.status, live.status);
+            assert_eq!(seen.ephemeral, live.ephemeral);
+            assert!(!disconnect.is_cancelled());
+            cancel.cancel();
+            feed.await.unwrap();
+        }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_refuses_an_inversion_instead_of_sorting_it() {
+        use capnp::capability::FromClientHook;
+        use kaijutsu_client::{FeedEvent, context_feed_channel};
+        use kaijutsu_client::subscriptions::SubscriptionEndReason;
+        use kaijutsu_kernel::flows::{FlowBus, OpSource};
+
+        tokio::task::LocalSet::new().run_until(async {
+            let ctx = ContextId::new();
+            let id = BlockId::new(ctx, PrincipalId::new(), 1);
+            let bus = FlowBus::new(8);
+            let sub = bus.subscribe("block.>");
+            for version in [2, 1] {
+                bus.publish(BlockFlow::TextAppended { context_id: ctx, block_id: id,
+                    suffix: "x".into(), version, source: OpSource::Local });
+            }
+            let (observer, mut rx) = context_feed_channel(8);
+            let disconnect = CancellationToken::new();
+            run_context_feed(observer.cast_to(), ctx, sub, KernelId::new(),
+                CancellationToken::new(), disconnect.clone()).await;
+            assert!(disconnect.is_cancelled());
+            assert!(matches!(rx.recv().await, Some(FeedEvent::Terminated {
+                reason: SubscriptionEndReason::InternalFault, delivered_version: 0,
+            })));
+        }).await;
+    }
+
+    #[test]
+    fn timing_messages_cannot_complete_an_ordered_group() {
+        use kaijutsu_kernel::flows::OpSource;
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        let flow = BlockFlow::TextAppended { context_id: ctx, block_id: id,
+            suffix: "x".into(), version: 1, source: OpSource::Local };
+        let mut first = FlowMessage::new(flow.subject(), flow.clone());
+        first.group_end = false;
+        let mut batch = Vec::new();
+        let mut complete = 0;
+        append_message(&mut batch, &mut complete, first);
+        let beat = BlockFlow::BeatSync { context_id: ctx,
+            beat_ref: kaijutsu_audio::BeatRef::new(0.0, 2.0) };
+        append_message(&mut batch, &mut complete, FlowMessage::new(beat.subject(), beat));
+        assert_eq!(complete, 0, "a timing event cannot complete the partial ordered group");
+        append_message(&mut batch, &mut complete, FlowMessage::new(flow.subject(), flow));
+        assert_eq!(complete, 2);
+        assert_eq!(batch.len(), 2, "timing events never enter the delivery");
+    }
 
     /// The encoder half of the span wire mapping (docs/ansi-and-beyond.md).
     ///

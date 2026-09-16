@@ -10,9 +10,9 @@ One feed gets three things a set of per-change events cannot:
 
 1. **Coalescing is native.** A list expresses "here are fifty changes"; a
    per-event method cannot.
-2. **Transactional delivery.** A tool's final output text and its `Done` status
-   arrive in one message, so a client can never render a completed tool with
-   missing output.
+2. **Complete mutations.** All events of one accepted mutation arrive in one
+   message. Separate mutations, such as appending final output and setting its
+   `Done` status, can arrive in separate messages, in acceptance order.
 3. **One clock instead of two.** A single monotonic `version` replaces a
    per-context op counter plus a per-subscription delivery counter.
 
@@ -67,7 +67,9 @@ one `String` per block per subscriber.
 
 `BlockStore::accept` holds the document guard while preparing a mutation,
 committing its durable operation, updating the live-status cache, and
-publishing its projected events. Metadata comes from that same guarded state.
+publishing its projected events as one FlowBus group. Metadata comes from that
+same guarded state. Each subscription marks its last matching event in the group;
+other publishers and new subscriptions cannot interleave with publication.
 Compaction snapshots exactly the committed prefix while the guard is held.
 Journal counters advance after the database commit. Fork creation persists
 its document row and initial snapshot together before exposing the document.
@@ -80,6 +82,14 @@ include that operation even when its caller received an error.
 
 Lock order is document, then database. A caller must release its database
 guard before entering block-store reads or writes.
+
+The bridge finishes a started group before closing its four-millisecond window
+or its 512-event target. Overflow discards any incomplete group and terminates
+the feed for recovery. Timing events use their own lane and cannot complete an
+ordered group. The bridge preserves publish order without sorting; a version
+inversion ends the feed. A client accepts equal versions within a delivery,
+above the previous delivery's version, and rejects repeats across deliveries.
+Snapshot overlap skips all events of a mutation the snapshot already contains.
 
 ## Normative rules
 

@@ -581,19 +581,16 @@ impl ContextMirror {
     /// that kept accepting deliveries onto it would compound the damage
     /// silently — which is the whole failure mode this migration exists to end.
     fn apply(&mut self, delivery: ContextDelivery) -> Result<(), MirrorError> {
+        let before_delivery = self.version;
         for event in delivery.events {
             if event.version <= self.snapshot_version {
                 // Already in the snapshot this mirror was hydrated from.
                 continue;
             }
-            // Strictly greater, not "at least": every event this feed carries
-            // comes from its own kernel mutation, so two carried events never
-            // share a version. Requiring an advance means a duplicate delivery
-            // is refused instead of doubling an append. The cost if that ever
-            // stops being true — a mutation that publishes two carried events
-            // — is a spurious rehydrate, which is loud and recoverable; the
-            // cost of the lax version is silently duplicated text.
-            if event.version <= self.version {
+            // One mutation can project several events at the same version.
+            // They must arrive together, above the previous delivery's version;
+            // versions from an earlier delivery are still refused.
+            if event.version <= before_delivery || event.version < self.version {
                 return self.poison(MirrorError::VersionWentBackwards {
                     have: self.version,
                     got: event.version,
@@ -764,6 +761,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_mutation_can_have_multiple_events_but_cannot_be_delivered_twice() {
+        let c = ctx();
+        let b = block(c, 1, "start");
+        let id = b.id;
+        let mut mirror = ContextMirror::new(c);
+        mirror.apply_snapshot(vec![b], 1).unwrap();
+        let group = delivery(c, 2, vec![
+            ContextChange::TextAppended { block_id: id, suffix: "!".into() },
+            ContextChange::StatusChanged { block_id: id, status: Status::Done },
+        ]);
+        mirror.receive(group.clone()).unwrap();
+        assert_eq!(mirror.block(&id).unwrap().content, "start!");
+        assert_eq!(mirror.version(), 2);
+        assert_eq!(mirror.receive(group), Err(MirrorError::VersionWentBackwards { have: 2, got: 2 }));
+        assert_eq!(mirror.block(&id).unwrap().content, "start!");
+    }
+
+    #[test]
+    fn snapshot_overlap_discards_the_whole_accepted_group() {
+        let c = ctx();
+        let b = block(c, 1, "start!");
+        let id = b.id;
+        let mut mirror = ContextMirror::new(c);
+        mirror.receive(batched(c, vec![
+            (2, ContextChange::TextAppended { block_id: id, suffix: "!".into() }),
+            (2, ContextChange::StatusChanged { block_id: id, status: Status::Done }),
+            (3, ContextChange::TextAppended { block_id: id, suffix: "next".into() }),
+        ])).unwrap();
+        mirror.apply_snapshot(vec![b], 2).unwrap();
+        assert_eq!(mirror.block(&id).unwrap().content, "start!next");
+        assert_eq!(mirror.version(), 3);
+    }
+
     /// The whole point of the feed: a client that only appends suffixes and
     /// swaps in replacements ends up with the kernel's text.
     #[test]
@@ -774,8 +805,7 @@ mod tests {
         let mut mirror = ContextMirror::new(c);
         mirror.apply_snapshot(vec![b], 10).unwrap();
 
-        // Two appends are two mutations, so two versions — the wire never puts
-        // two carried events at one version.
+        // These two appends are separate mutations, so they have two versions.
         mirror
             .receive(batched(
                 c,
