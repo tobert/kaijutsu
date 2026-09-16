@@ -1,6 +1,6 @@
 //! Run-control (rc) subcommands: add, list, rm, show.
 //!
-//! Manages lifecycle script **files** at canonical paths
+//! Manages lifecycle scripts and Markdown data at canonical paths
 //! `/config/rc/<context_type>/<verb>/SXX-name.{kai,md}` (deployed under
 //! `~/.config/kaijutsu/config/rc/`). The path itself is the user-facing key;
 //! structural fields (context_type, verb, sort_key, name, extension) are
@@ -29,7 +29,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "rc",
-    about = "Run-control lifecycle scripts at /config/rc/<type>/<verb>/SXX-name.{kai,md}",
+    about = "Rc scripts (.kai) and companion data (.md) at /config/rc/<type>/<verb>/SXX-name.{kai,md}",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -40,27 +40,20 @@ pub(crate) struct RcArgs {
 
 #[derive(Subcommand, Debug)]
 enum RcCommand {
-    /// Install a script. `--content <body>` (or piped stdin) is the script text.
+    /// Install a script (.kai) or data file (.md) from --content or stdin.
     Add {
         /// Canonical path: /config/rc/<type>/<verb>/SXX-name.{kai,md}
         path: String,
-        /// Script body (stdin is piped here for `kj rc add` when omitted).
-        /// Free text: a body may legitimately begin with `-`, so this must
-        /// accept a hyphen-prefixed value without clap reading it as a flag.
+        /// File content. Reads stdin when omitted; explicit content takes precedence.
         #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
     },
-    /// List installed scripts and the hook bodies under
-    /// /config/rc/lib/hooks, optionally filtered. Each entry is marked
-    /// against its embedded seed: in-sync, differs (edited since seeding),
-    /// no-seed (a live-only, user-authored script), not-installed (a seed
-    /// ships for the path and nothing is live at it — a script added to the
-    /// embedded set after this kernel was first seeded), or dangling (a
-    /// symlink whose target is gone, which fails every lifecycle run through
-    /// it). Indicator only — it never writes anything. `kaijutsu-server rc
-    /// reseed` installs what is not-installed; `--force` also restores what
-    /// differs. Repair a dangling link by restoring its **target** — the link
-    /// itself is fine.
+    /// List scripts, Markdown data, and hook bodies with their seed status.
+    /// Status is in-sync, differs from seed, no seed, not installed, or dangling.
+    /// Markdown entries are marked [data] and never execute.
+    /// `kaijutsu-server rc reseed` installs missing defaults; --force also
+    /// restores differing files. A dangling
+    /// link needs its target restored.
     #[command(alias = "ls")]
     List {
         /// Filter by context_type (`lib` selects the shared bodies)
@@ -70,13 +63,13 @@ enum RcCommand {
         #[arg(long = "verb")]
         verb_filter: Option<String>,
     },
-    /// Remove a script.
+    /// Remove a script or data file.
     #[command(alias = "remove")]
     Rm {
         /// Canonical rc path to remove
         path: String,
     },
-    /// Print one script's or hook body's content + metadata.
+    /// Show a script, Markdown data file, or hook body with its metadata.
     #[command(alias = "cat")]
     Show {
         /// Canonical rc path, or a hook body path, to show
@@ -107,8 +100,8 @@ enum RcSeedStatus {
     NotInstalled,
     /// The live entry is a symlink whose target cannot be read. This outranks
     /// every seed comparison because it is the more urgent fact: the lifecycle
-    /// loader treats an unreadable entry as fatal, so one dangling link fails
-    /// every run of the verb it sits in. The repair is restoring the
+    /// loader rejects unreadable scripts and explicit data reads fail.
+    /// A dangling link fails every run that reads it. The repair is restoring the
     /// **target**, not the link — the link itself is fine.
     Dangling,
 }
@@ -144,51 +137,60 @@ fn hook_body_regex() -> &'static Regex {
     })
 }
 
-/// What an rc path names: a lifecycle script or a hook body.
+/// What an rc path names: a lifecycle script, companion data, or a hook body.
 pub enum RcEntry {
     Script(RcPathParts),
+    Data(RcPathParts),
     HookBody { name: String },
 }
 
 impl RcEntry {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Script(_) => "script",
+            Self::Data(_) => "data",
+            Self::HookBody { .. } => "hook",
+        }
+    }
+
     fn context_type(&self) -> &str {
         match self {
-            Self::Script(p) => &p.context_type,
+            Self::Script(p) | Self::Data(p) => &p.context_type,
             Self::HookBody { .. } => HOOK_BUCKET,
         }
     }
 
     fn verb(&self) -> &str {
         match self {
-            Self::Script(p) => &p.verb,
+            Self::Script(p) | Self::Data(p) => &p.verb,
             Self::HookBody { .. } => HOOK_SLOT,
         }
     }
 
     fn sort_key(&self) -> Option<&str> {
         match self {
-            Self::Script(p) => Some(&p.sort_key),
+            Self::Script(p) | Self::Data(p) => Some(&p.sort_key),
             Self::HookBody { .. } => None,
         }
     }
 
     fn name(&self) -> &str {
         match self {
-            Self::Script(p) => &p.name,
+            Self::Script(p) | Self::Data(p) => &p.name,
             Self::HookBody { name } => name,
         }
     }
 
     fn extension(&self) -> &str {
         match self {
-            Self::Script(p) => &p.extension,
+            Self::Script(p) | Self::Data(p) => &p.extension,
             Self::HookBody { .. } => "kai",
         }
     }
 }
 
-/// Split a path `kj rc list` and `kj rc show` address: a canonical script
-/// path ([`parse_rc_path`]) or a hook body path. The error is the script
+/// Split a path `kj rc list` and `kj rc show` address: a canonical script or
+/// Markdown data path ([`parse_rc_path`]), or a hook body path. The error is the script
 /// path's, extended with the hook form.
 pub fn parse_rc_entry(path: &str) -> Result<RcEntry, String> {
     if let Some(caps) = hook_body_regex().captures(path) {
@@ -196,7 +198,9 @@ pub fn parse_rc_entry(path: &str) -> Result<RcEntry, String> {
             name: caps[1].to_string(),
         });
     }
-    parse_rc_path(path).map(RcEntry::Script).map_err(|e| {
+    parse_rc_path(path).map(|parts| {
+        if parts.extension == "md" { RcEntry::Data(parts) } else { RcEntry::Script(parts) }
+    }).map_err(|e| {
         format!(
             "{e}\n- or a hook body: {}/{HOOK_BUCKET}/{HOOK_SLOT}/<name>.kai",
             paths::RC_ROOT
@@ -435,7 +439,8 @@ impl KjDispatcher {
 
         let mut lines = Vec::with_capacity(rows.len());
         for (p, link, status) in &rows {
-            let marker = format!(" [{}]", status.as_str());
+            let data_label = if p.ends_with(".md") { " [data]" } else { "" };
+            let marker = format!(" [{}]{data_label}", status.as_str());
             match link {
                 Some(target) => lines.push(format!("  {p} → {target}{marker}")),
                 None => lines.push(format!("  {p}{marker}")),
@@ -560,6 +565,7 @@ impl KjDispatcher {
         // the kernel block, not here.
         let record = serde_json::json!({
             "path": path,
+            "kind": entry.kind(),
             "context_type": entry.context_type(),
             "verb": entry.verb(),
             "sort_key": entry.sort_key(),
@@ -585,8 +591,9 @@ impl KjDispatcher {
         // Fence content with the extension so .md renders as markdown and
         // .kai displays as a shell-ish block in surfaces that highlight it.
         let out = format!(
-            "path:       {}\ntype:       {}\nverb:       {}\n{}name:       {}\nextension:  {}\n{}length:     {} bytes\n\n```{}\n{}\n```\n",
+            "path:       {}\nkind:       {}\ntype:       {}\nverb:       {}\n{}name:       {}\nextension:  {}\n{}length:     {} bytes\n\n```{}\n{}\n```\n",
             path,
+            entry.kind(),
             entry.context_type(),
             entry.verb(),
             sort_line,
@@ -684,6 +691,23 @@ impl Classify for RcCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn markdown_data_is_distinct_from_executable_scripts() {
+        use crate::kj::test_helpers::*;
+        let d = test_dispatcher_rc().await;
+        let caller = test_caller();
+        let path = "/config/rc/default/create/S00-stance.md";
+        let shown = d.dispatch(&["rc", "show", path].map(String::from), &caller).await;
+        assert!(shown.is_ok(), "{}", shown.message());
+        assert!(shown.message().contains("kind:       data"));
+        let listed = d.dispatch(&["rc", "list", "--type", "default"].map(String::from), &caller).await;
+        assert!(listed.is_ok(), "{}", listed.message());
+        assert!(listed.message().contains(&format!("{path} [in-sync] [data]")));
+        assert!(matches!(parse_rc_entry(path).unwrap(), RcEntry::Data(_)));
+        assert!(!crate::rc::is_rc_script_filename("S00-stance.md"));
+        assert!(crate::rc::is_rc_script_filename("S00-stance.kai"));
+    }
 
     #[test]
     fn path_valid_canonical_forms() {
@@ -1401,7 +1425,7 @@ mod tests {
     /// target strings reports it healthy; the marker resolves the link instead
     /// and says "dangling". This is the more urgent fact than any seed
     /// comparison — the lifecycle loader treats an unreadable entry as fatal,
-    /// so one dangling link fails every run of the verb it sits in.
+    /// so one dangling link fails every run that reads it.
     #[tokio::test]
     async fn rc_list_reports_a_dangling_seed_symlink_as_dangling() {
         use crate::kj::test_helpers::*;

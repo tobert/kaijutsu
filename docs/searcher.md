@@ -25,9 +25,9 @@ scripts. So a `searcher` type needs **no kernel edit, no registration, no restar
   `/config/rc/<type>/<verb>/` as "no scripts", not an error — so `searcher` exists as
   a type the moment its `create/` dir does.
   ✓ `kaijutsu-kernel/src/rc/mod.rs` `load_scripts` (NotFound → empty).
-- **Script shape.** Filenames must be `SXX-name.{kai,md}` (lexical order = sort order);
-  `.kai` executes as kaish, `.md` lands in the model's system-prompt slot; symlinks are
-  followed, so shared scripts compose from `lib/` (init.d style).
+- **Script shape.** Executable filenames must be `SXX-name.kai` (lexical order =
+  sort order). Markdown is ordinary data; scripts use `kj block create` for
+  instructions. Symlinks compose shared scripts and companion data from `lib/`.
   ✓ same file + `rc/mod.rs` doc comment.
 - **Create-lifecycle runs privileged**, so `kj binding allow …` inside
   `S10-binding.kai` lands under a narrowed loadout.
@@ -58,7 +58,8 @@ scripts. So a `searcher` type needs **no kernel edit, no registration, no restar
 ```
 /config/rc/searcher/
   create/
-    S00-stance.md          # searcher posture (system-prompt slot)
+    S00-stance.kai         # author the Markdown companion with kj block create
+    S00-stance.md          # searcher posture (data)
     S10-binding.kai        # the narrow allow-set (below)
     S25-datetime.kai       # wall-clock seed — symlink → ../../lib/create/S25-datetime.kai
 ```

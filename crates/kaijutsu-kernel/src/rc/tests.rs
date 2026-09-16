@@ -3,6 +3,95 @@
     use kaijutsu_types::{ContextId, PrincipalId};
 
     #[tokio::test]
+    async fn rc_snapshots_programs_but_reads_companion_data_at_execution() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let ctx = register_context(&d, Some("snapshot"), None, PrincipalId::new());
+        set_context_type(&d, ctx, "snapshot");
+        install_rc_script_file(&d, "/config/rc/snapshot/create/S00-change.kai", r#"
+            echo 'exit 19' > /config/rc/snapshot/create/S10-author.kai
+            echo 'new data' > /config/rc/snapshot/create/S10-author.md
+        "#).await;
+        install_rc_script_file(&d, "/config/rc/snapshot/create/S10-author.kai", r#"
+            kj block create --role system --kind text --content-type text/markdown < /config/rc/snapshot/create/S10-author.md
+        "#).await;
+        install_rc_script_file(&d, "/config/rc/snapshot/create/S10-author.md", "old data").await;
+        crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let instructions: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Text).collect();
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].content, "new data\n");
+        let run = find_run_for_context(&d, ctx, "create").unwrap();
+        assert_eq!(run.outcome, Some(RcOutcome::Ok));
+        assert_eq!(run.script_count, Some(2));
+    }
+
+    #[tokio::test]
+    async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt() {
+        use crate::vfs::VfsOps;
+        for context_type in ["default", "coder", "director", "mcp", "toolie", "musician", "bassist"] {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let prefix = format!("/config/rc/{context_type}/create/");
+            let mut expected = Vec::new();
+            for (path, _) in crate::seed_scripts::seed_files().into_iter()
+                .filter(|(path, _)| path.starts_with(&prefix) && path.ends_with(".md")) {
+                let data = d.kernel().vfs().read_all(std::path::Path::new(&path)).await.unwrap();
+                expected.push(String::from_utf8(data).unwrap());
+            }
+            assert!(!expected.is_empty(), "{context_type} must exercise companion data");
+            let mut caller = unjoined_caller();
+            caller.actor_id = PrincipalId::new();
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: caller.actor_id, name: "amy".into(), created_at: 0,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            let created = d.dispatch(&argv(&["context", "create", "prompt-test", "--type", context_type]), &caller).await;
+            assert!(created.is_ok(), "{context_type}: {}", created.message());
+            let ctx = lookup_context_id(&d, "prompt-test");
+            let blocks = d.block_store().block_snapshots(ctx).unwrap();
+            let instructions: Vec<_> = blocks.iter()
+                .filter(|b| b.role == Role::System && b.kind == BlockKind::Text).collect();
+            let markdown: Vec<_> = instructions.iter()
+                .filter(|b| b.content_type == ContentType::Markdown).map(|b| b.content.clone()).collect();
+            assert_eq!(markdown, expected, "{context_type}: companion instructions changed or reordered");
+            assert!(instructions.iter().all(|b| b.id.principal_id == caller.actor_id && b.status == Status::Done),
+                "{context_type}: instruction attribution or status differs");
+            caller.context_id = Some(ctx);
+            let prompt = d.dispatch(&argv(&["context", "prompt"]), &caller).await;
+            assert!(prompt.is_ok(), "{context_type}: {}", prompt.message());
+            for instruction in &expected {
+                assert!(prompt.message().contains(instruction.trim()), "{context_type}: missing rendered instruction");
+            }
+            let base = include_str!("../../../../assets/defaults/rc/lib/create/S00-base.md").trim();
+            assert_eq!(prompt.message().contains(base), ["default", "coder", "director"].contains(&context_type),
+                "{context_type}: optional base composition changed");
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_markdown_is_data_not_an_executable_entry() {
+        use crate::vfs::VfsOps;
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let ctx = register_context(&d, Some("md-data"), None, PrincipalId::new());
+        set_context_type(&d, ctx, "mddata");
+        d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        for name in ["S00-former.md", "README.md"] {
+            install_rc_script_file(&d, &format!("/config/rc/mddata/create/{name}"), "data only").await;
+        }
+        d.kernel().vfs().symlink(
+            std::path::Path::new("/config/rc/mddata/create/S10-missing.md"),
+            std::path::Path::new("missing-target.md"),
+        ).await.unwrap();
+        crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+        assert!(d.block_store().block_snapshots(ctx).unwrap().is_empty());
+        let run = find_run_for_context(&d, ctx, "create").unwrap();
+        assert_eq!(run.script_count, Some(0));
+        assert_eq!(run.outcome, Some(RcOutcome::Ok));
+    }
+
+    #[tokio::test]
     async fn rc_explicit_instructions_preserve_input_and_performer() {
         use crate::vfs::VfsOps;
         for symlinked in [false, true] {
@@ -20,8 +109,8 @@
             // Exceeds both the agent preview and internal output limits. Stdin
             // is instruction data and must never be replaced with a preview.
             let body = format!("--literal option\n{}\n\n", "頑張（がんば）って！\n".repeat(170_000));
-            install_rc_script_file(&d, &format!("{path}.txt"), &body).await;
-            let program = r#"kj block create --role system --kind text --content-type text/markdown < "$0.txt""#;
+            install_rc_script_file(&d, &path.replace(".kai", ".md"), &body).await;
+            let program = r#"kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md""#;
             if symlinked {
                 install_rc_script_file(&d, "/config/rc/lib/create/S00-shared.kai", program).await;
                 d.kernel().vfs().symlink(
@@ -159,10 +248,10 @@
     }
 
     #[tokio::test]
-    async fn rc_create_md_inserts_block() {
+    async fn rc_create_script_authors_instruction_block() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/create/S00-prompt.md", "You are a test context. Be terse.").await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-prompt.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'You are a test context. Be terse.'"#).await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-md", "--type", "test"]), &caller)
@@ -173,17 +262,13 @@
         let contents = block_contents_in(&d, new_id);
         assert!(
             contents.iter().any(|c| c.contains("You are a test context")),
-            "expected .md content as block, got: {contents:?}"
+            "expected authored instruction, got: {contents:?}"
         );
     }
 
-    /// init.d-style composition: a context type pulls in a shared `.md` stance
-    /// via a symlink in its `create/` dir. The lifecycle must follow the link
-    /// and insert the *target's full content* as a block — proving both the
-    /// readdir filter includes symlinks and `read_all` follows + sizes the
-    /// target (not the short link path).
+    /// A composed executable follows its symlink and authors the instruction.
     #[tokio::test]
-    async fn rc_create_follows_symlinked_md() {
+    async fn rc_create_follows_symlinked_script() {
         use crate::vfs::VfsOps;
         // `/config/rc` is an ordinary host directory (`LocalBackend`) — a
         // real POSIX symlink, resolved host-relative to the link's own
@@ -194,16 +279,16 @@
         // The shared, canonical stance lives once under a `lib` type.
         install_rc_script_file(
             &d,
-            "/config/rc/lib/create/S00-shared.md",
-            "You are composed from a shared stance fragment. Be terse.",
+            "/config/rc/lib/create/S00-shared.kai",
+            r#"kj block create --role system --kind text --content-type text/markdown --content 'You are composed from a shared stance fragment. Be terse.'"#,
         )
         .await;
         // The consuming type composes it in by symlink.
         d.kernel()
             .vfs()
             .symlink(
-                std::path::Path::new("/config/rc/test/create/S00-stance.md"),
-                std::path::Path::new("../../lib/create/S00-shared.md"),
+                std::path::Path::new("/config/rc/test/create/S00-stance.kai"),
+                std::path::Path::new("../../lib/create/S00-shared.kai"),
             )
             .await
             .expect("create rc symlink");
@@ -220,7 +305,7 @@
             contents
                 .iter()
                 .any(|c| c.contains("composed from a shared stance fragment")),
-            "expected symlinked .md target content as block, got: {contents:?}"
+            "expected symlinked script to author an instruction, got: {contents:?}"
         );
     }
 
@@ -228,7 +313,7 @@
     /// empty prompt section. Creation leaves the context inert, reports the
     /// repair path, and records the unreadable link in a durable Error block.
     #[tokio::test]
-    async fn rc_create_reports_and_records_a_broken_symlinked_md() {
+    async fn rc_create_reports_and_records_a_broken_symlinked_script() {
         use crate::vfs::VfsOps;
 
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
@@ -236,8 +321,8 @@
         d.kernel()
             .vfs()
             .symlink(
-                std::path::Path::new("/config/rc/test/create/S00-broken.md"),
-                std::path::Path::new("../../lib/create/no-such-shared.md"),
+                std::path::Path::new("/config/rc/test/create/S00-broken.kai"),
+                std::path::Path::new("../../lib/create/no-such-shared.kai"),
             )
             .await
             .expect("create broken rc symlink");
@@ -273,7 +358,7 @@
             .filter(|block| block.kind == kaijutsu_types::BlockKind::Error)
             .collect();
         assert!(
-            errors.iter().any(|block| block.content.contains("S00-broken.md")),
+            errors.iter().any(|block| block.content.contains("S00-broken.kai")),
             "the durable Error must name the unreadable link: {errors:?}"
         );
     }
@@ -535,67 +620,7 @@
         );
     }
 
-    /// The identity smear, rc half: rc scripts run *in* a context, on behalf of
-    /// that context — never on behalf of whoever happened to trigger the verb.
-    /// A drift push from Amy into a musician's context fires the musician's
-    /// `drift` scripts; before this, every block those scripts produced was
-    /// stamped with *Amy's* principal, so the musician's own timeline read as
-    /// though Amy had been writing in it.
-    ///
-    /// Authorship only. `require_cap` authorizes against the caller's
-    /// *loadout* (`kj/mod.rs`), never against `principal_id`, and rc shells are
-    /// privileged by construction — so moving the rc principal changes who the
-    /// blocks belong to and nothing about what the scripts may do.
-    #[tokio::test]
-    async fn rc_md_block_is_authored_by_context_owner_not_caller() {
-        let d = std::sync::Arc::new(test_dispatcher().await);
-        d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/tick/S00-stance.md", "Play to the beat.")
-        .await;
-
-        // Owner creates the context; `created_by` follows the creating caller.
-        let owner = unjoined_caller();
-        let result = d
-            .dispatch(
-                &argv(&["context", "create", "ctx-owned", "--type", "test"]),
-                &owner,
-            )
-            .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-        let new_id = lookup_context_id(&d, "ctx-owned");
-
-        // A *different* principal fires the verb — the drift-push shape.
-        let visitor = unjoined_caller();
-        assert_ne!(
-            owner.principal_id, visitor.principal_id,
-            "fixture must use two distinct principals or the assertion is vacuous"
-        );
-
-        crate::rc::run(
-            &d,
-            crate::rc::RcInvocation::new("tick", new_id),
-            &visitor,
-        )
-            .await
-            .expect("tick lifecycle");
-
-        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
-        let stance = snapshots
-            .iter()
-            .find(|b| b.content.contains("Play to the beat."))
-            .expect("the .md script produced a block");
-        assert_eq!(
-            stance.id.principal_id, owner.principal_id,
-            "rc .md block must belong to the context owner"
-        );
-        assert_ne!(
-            stance.id.principal_id, visitor.principal_id,
-            "rc .md block must NOT be smeared with the triggering caller"
-        );
-    }
-
-    /// Same invariant for the `.kai` path, whose Trace blocks are the ones a
-    /// human actually reads in the timeline.
+    /// Lifecycle Trace diagnostics retain context-creator attribution.
     #[tokio::test]
     async fn rc_kai_trace_block_is_authored_by_context_owner_not_caller() {
         let d = std::sync::Arc::new(test_dispatcher().await);
@@ -1060,8 +1085,8 @@
     async fn rc_run_records_intended_script_count() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/counted/create/S00-one.md", "first").await;
-        install_rc_script_file(&d, "/config/rc/counted/create/S10-two.md", "second").await;
+        install_rc_script_file(&d, "/config/rc/counted/create/S00-one.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'first'"#).await;
+        install_rc_script_file(&d, "/config/rc/counted/create/S10-two.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'second'"#).await;
 
         let caller = unjoined_caller();
         let result = d
@@ -1111,19 +1136,15 @@
         assert_eq!(run.script_count, Some(0));
     }
 
-    /// A `.kai` or `.md` file in a verb directory that is not a canonical
-    /// `SXX-name.ext` fails the whole verb, and fails it before any script
-    /// runs. Both extensions reach the model — `.kai` executes, `.md` lands
-    /// in the system-prompt slot — so a file nobody meant as a script must
-    /// not be able to reach either by being dropped in the directory.
+    /// A noncanonical .kai filename fails discovery before any script runs.
     #[tokio::test]
     async fn rc_non_canonical_script_name_fails_the_verb() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(
             &d,
-            "/config/rc/stray/create/S00-benign.md",
-            "would reach the system-prompt slot",
+            "/config/rc/stray/create/S00-benign.kai",
+            "echo would-run",
         )
         .await;
         // The shape that prompted this: a hook body parked beside its
@@ -1156,14 +1177,12 @@
         );
     }
 
-    /// A file whose extension is neither `.kai` nor `.md` is ignored, not an
-    /// error: it can neither execute nor reach the system-prompt slot, so it
-    /// is inert rather than a mistake worth failing a context create over.
+    /// Non-executable data files do not participate in lifecycle dispatch.
     #[tokio::test]
     async fn rc_ignores_files_that_are_not_scripts() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/inert/create/S00-real.md", "the real script").await;
+        install_rc_script_file(&d, "/config/rc/inert/create/S00-real.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'the real script'"#).await;
         install_rc_script_file(&d, "/config/rc/inert/create/README.txt", "notes").await;
 
         let caller = unjoined_caller();
@@ -1179,9 +1198,10 @@
         let run = find_run_for_context(&d, new_id, "create").expect("run row");
         assert_eq!(run.outcome, Some(RcOutcome::Ok));
         assert_eq!(
-            block_contents_in(&d, new_id),
+            d.block_store().block_snapshots(new_id).unwrap().into_iter()
+                .filter(|b| b.kind == BlockKind::Text).map(|b| b.content).collect::<Vec<_>>(),
             vec!["the real script".to_string()],
-            "the .md script runs and the non-script file is ignored"
+            "the .kai script runs and the data file is ignored"
         );
     }
 
@@ -1191,7 +1211,7 @@
         d.set_self_arc();
         // S00 returns non-zero; S10 is benign.
         install_rc_script_file(&d, "/config/rc/test/create/S00-fail.kai", "exit 17").await;
-        install_rc_script_file(&d, "/config/rc/test/create/S10-after.md", "ran-after-failure").await;
+        install_rc_script_file(&d, "/config/rc/test/create/S10-after.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'ran-after-failure'"#).await;
 
         let caller = unjoined_caller();
         let result = d
@@ -1224,8 +1244,8 @@
     async fn rc_attach_fires_scripts_on_target() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        // `.md` script lands its content as a block on the target.
-        install_rc_script_file(&d, "/config/rc/test/attach/S00-banner.md", "attach-banner-content").await;
+        // The script authors its instruction on the target.
+        install_rc_script_file(&d, "/config/rc/test/attach/S00-banner.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'attach-banner-content'"#).await;
 
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("attach-target"), None, principal);
@@ -1243,7 +1263,7 @@
         let contents = block_contents_in(&d, target);
         assert!(
             contents.iter().any(|c| c.contains("attach-banner-content")),
-            "attach .md script must land its content as a block; got: {contents:?}"
+            "attach script must author its instruction; got: {contents:?}"
         );
     }
 
@@ -1251,7 +1271,7 @@
     async fn rc_recursion_guard_caps_depth() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.md", "would-run").await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'would-run'"#).await;
         let mut caller = unjoined_caller();
         caller.rc_depth = MAX_RC_DEPTH; // simulate already-deep invocation
 
@@ -1265,7 +1285,7 @@
         assert!(result.is_ok());
         let new_id = lookup_context_id(&d, "ctx-recur");
         let kinds = block_kinds_in(&d, new_id);
-        // Recursion guard fires: error block, no .md block.
+        // Recursion guard fires: error block, no instruction block.
         assert!(
             kinds.contains(&kaijutsu_types::BlockKind::Error),
             "guard should insert Error block, got: {kinds:?}"
@@ -1273,7 +1293,7 @@
         let contents = block_contents_in(&d, new_id);
         assert!(
             !contents.iter().any(|c| c.contains("would-run")),
-            "guarded run must not insert .md block, got: {contents:?}"
+            "guarded run must not insert an instruction block, got: {contents:?}"
         );
     }
 
@@ -1392,7 +1412,7 @@ esac
     async fn rc_drift_flush_fires_per_item() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/drift/S00-marker.md", "DRIFT-MARKER").await;
+        install_rc_script_file(&d, "/config/rc/test/drift/S00-marker.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'DRIFT-MARKER'"#).await;
 
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -1435,7 +1455,7 @@ esac
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/drift/S00-fail.kai", "exit 17").await;
-        install_rc_script_file(&d, "/config/rc/test/drift/S10-after.md", "AFTER-MARKER").await;
+        install_rc_script_file(&d, "/config/rc/test/drift/S10-after.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'AFTER-MARKER'"#).await;
 
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -1478,8 +1498,8 @@ esac
     async fn rc_drift_compact_fork_does_not_double_fire() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/fork/S00-fork.md", "FORK-MARKER").await;
-        install_rc_script_file(&d, "/config/rc/test/drift/S00-drift.md", "DRIFT-MARKER").await;
+        install_rc_script_file(&d, "/config/rc/test/fork/S00-fork.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'FORK-MARKER'"#).await;
+        install_rc_script_file(&d, "/config/rc/test/drift/S00-drift.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'DRIFT-MARKER'"#).await;
 
         let caller = unjoined_caller();
         let r = d
@@ -1682,8 +1702,8 @@ esac
     async fn rc_fork_does_not_trigger_create_scripts() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/create/S00-only-create.md", "CREATE-MARKER").await;
-        install_rc_script_file(&d, "/config/rc/test/fork/S00-only-fork.md", "FORK-MARKER").await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-only-create.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'CREATE-MARKER'"#).await;
+        install_rc_script_file(&d, "/config/rc/test/fork/S00-only-fork.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'FORK-MARKER'"#).await;
 
         // Step 1: create parent (CREATE-MARKER appears in parent).
         let caller = unjoined_caller();
@@ -2131,7 +2151,7 @@ esac
     async fn a_recursion_guarded_run_still_finishes_as_failed() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.md", "would-run")
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'would-run'"#)
         .await;
         let mut caller = unjoined_caller();
         caller.rc_depth = MAX_RC_DEPTH;
@@ -2150,12 +2170,12 @@ esac
         assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Failed));
     }
 
-    /// A verb whose directory EXISTS but has no `.kai`/`.md` scripts in it
+    /// A verb whose directory EXISTS but has no `.kai` scripts in it
     /// still leaves a finished `Ok` run — the empty case is legitimate, not
     /// a gap in the log. Distinct from `rc_no_scripts_for_type_is_noop`,
     /// which covers a type with no rc directory at all: this one installs a
     /// non-script file so the directory is real and non-empty, exercising
-    /// "readdir succeeds, nothing matches `.kai`/`.md`" rather than "readdir
+    /// "readdir succeeds, nothing matches `.kai`" rather than "readdir
     /// reports the directory missing."
     #[tokio::test]
     async fn a_verb_with_no_scripts_still_finishes_as_ok() {

@@ -1,8 +1,8 @@
 //! Run-control (rc) lifecycle dispatch.
 //!
 //! Runs at create, fork, attach, drift, tick, rotate, and submit. Scripts under
-//! `/config/rc/<context_type>/<verb>/` run in lexical order. Markdown entries
-//! author instruction blocks; kaish entries use the shared runtime constructor
+//! `/config/rc/<context_type>/<verb>/SXX-name.kai` run in lexical order.
+//! Other files are data. Scripts use the shared runtime constructor
 //! with rc authority and `TimeoutPolicy::rc_script_timeout`.
 //!
 //! ## Failure semantics
@@ -57,21 +57,11 @@ impl RcAuthority {
 }
 
 /// One rc script resolved from the `/config/rc` file tree for a single
-/// lifecycle run. The path is canonical (`/config/rc/<type>/<verb>/SXX-name.ext`);
-/// `sort_key` and `extension` are parsed from the filename for ordering and
-/// dispatch. Bodies are read through the VFS before execution starts.
+/// lifecycle run. Bodies are read through the VFS before execution starts.
 pub(crate) struct RcScript {
     pub path: String,
     pub sort_key: String,
-    pub extension: String,
     pub content: String,
-}
-
-/// Split a validated canonical filename into its sort key and extension.
-fn parse_rc_filename(name: &str) -> (String, String) {
-    let sort_key = name.split('-').next().unwrap_or("").to_string();
-    let extension = name.rsplit('.').next().unwrap_or("").to_string();
-    (sort_key, extension)
 }
 
 /// Per-drift metadata surfaced to rc scripts via `KJ_DRIFT_INFO`. Built by
@@ -202,8 +192,8 @@ pub async fn run(
         return Err(format!("rc lifecycle: unknown verb '{verb}'; expected {}", RC_VERBS.join(", ")));
     }
 
-    // Loader-authored instructions and diagnostics belong to the context's
-    // creator. Commands inside scripts retain the invoking performer.
+    // Lifecycle diagnostics belong to the context creator. Commands inside
+    // scripts author their blocks as the invoking performer.
     let (context_type, owner) = {
         let db = dispatcher.kernel_db().lock();
         match db.get_context(new_id) {
@@ -322,25 +312,7 @@ pub async fn run(
 
     for script in &scripts {
         let script_started_at = now_millis();
-        let result = match script.extension.as_str() {
-            "md" => run_md_script(dispatcher, new_id, script, owner),
-            "kai" => {
-                run_kai_script(dispatcher, &invocation, &context_type, script, caller, owner)
-                .await
-            }
-            other => {
-                insert_rc_failure_block(
-                    dispatcher,
-                    new_id,
-                    &script.path,
-                    &script.sort_key,
-                    None,
-                    format!("rc lifecycle: unknown extension '{other}'"),
-                    owner,
-                );
-                ScriptRunResult::Failed { exit_code: None }
-            }
-        };
+        let result = run_kai_script(dispatcher, &invocation, &context_type, script, caller, owner).await;
         if matches!(result, ScriptRunResult::Failed { .. }) {
             any_script_failed = true;
         }
@@ -381,28 +353,22 @@ async fn load_scripts(
 
     // Include symlinks alongside regular files: an init.d-style link
     // (`coder/create/S10-binding.kai → lib/create/binding.kai`) composes a
-    // shared script into this verb dir. The *link's* `SXX-name.ext` governs
-    // ordering and which extension-handler runs; `read_all` auto-follows the
-    // link to the target's content.
+    // shared script into this verb directory. The link name governs ordering;
+    // read_all follows the link to capture the executable body.
     let candidates = entries
         .into_iter()
         .filter(|e| e.kind.is_file() || e.kind.is_symlink())
         .map(|e| e.name)
-        .filter(|n| n.ends_with(".kai") || n.ends_with(".md"));
+        .filter(|n| n.ends_with(".kai"));
 
-    // A `.kai`/`.md` file here that is not a canonical `SXX-name.ext`
-    // fails the whole verb rather than being skipped. Both extensions
-    // are executable in the sense that matters: `.kai` runs as kaish and
-    // `.md` lands in the model's system-prompt slot, so a file nobody
-    // meant as a script must not be able to reach either by sitting in
-    // the directory. Non-script data belongs outside a verb directory.
+    // Reject invalid executable names before running anything. Other files,
+    // including Markdown, are ordinary data and are not read by discovery.
     let mut names: Vec<String> = Vec::new();
     for name in candidates {
         if !is_rc_script_filename(&name) {
             return Err(format!(
                 "rc lifecycle: {dir}/{name} is not a valid rc script name; \
-                 expected SXX-name.kai or SXX-name.md — move non-script files \
-                 out of the verb directory"
+                 expected SXX-name.kai — use another extension for data"
             ));
         }
         names.push(name);
@@ -424,11 +390,10 @@ async fn load_scripts(
         };
         let content = String::from_utf8(bytes)
             .map_err(|e| format!("rc lifecycle: read {path}: not valid UTF-8: {e}"))?;
-        let (sort_key, extension) = parse_rc_filename(&name);
+        let sort_key = name.split_once('-').expect("validated rc name").0.to_string();
         scripts.push(RcScript {
             path,
             sort_key,
-            extension,
             content,
         });
     }
@@ -436,47 +401,10 @@ async fn load_scripts(
 }
 /// Whether one rc script's execution succeeded, for the run log
 /// (`RunGuard::record_script`) and for the whole run's own pass/fail outcome.
-/// `exit_code` is `None` wherever there is no process exit code to report —
-/// an `.md` insert failure, a kaish-init failure, an unsupported extension,
-/// or an exec error — the same shape `insert_rc_failure_block` already uses.
+/// `exit_code` is `None` when initialization or execution fails without one.
 enum ScriptRunResult {
     Ok,
     Failed { exit_code: Option<i32> },
-}
-
-fn run_md_script(
-    dispatcher: &KjDispatcher,
-    new_id: ContextId,
-    script: &RcScript,
-    principal: PrincipalId,
-) -> ScriptRunResult {
-    let after = dispatcher.block_store().last_block_id(new_id);
-    let result = dispatcher.block_store().insert_block_as(
-        new_id,
-        None,
-        after.as_ref(),
-        Role::System,
-        BlockKind::Text,
-        script.content.clone(),
-        Status::Done,
-        ContentType::Markdown,
-        Some(principal),
-    );
-    match result {
-        Ok(_) => ScriptRunResult::Ok,
-        Err(e) => {
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                None,
-                format!("rc .md insert failed: {e}"),
-                principal,
-            );
-            ScriptRunResult::Failed { exit_code: None }
-        }
-    }
 }
 
 async fn run_kai_script(

@@ -298,11 +298,11 @@ Wired verbs are `create`, `fork`, `attach`, `drift`, `tick`, `rotate`, and
 and emits error/trace blocks. A failed script marks the run failed while later
 scripts continue.
 
-Currently `.md` entries author durable system-text blocks and `.kai` entries
-execute through the shared factory with rc authority and internal output
-limits. Ordinary hooks and editor commands do not receive rc authority.
-Replacing the `.md` handler with explicit scripts is planned;
-see `docs/kaish-integration.md`, "Rc Markdown: explicit instruction authoring".
+Only canonical `.kai` entries execute through the shared factory with rc
+authority and internal output limits. Markdown is ordinary companion data.
+Scripts explicitly author instructions through `kj`, using the invoking
+performer. Ordinary hooks and editor commands do not receive rc authority.
+See `docs/kaish-integration.md`, "Rc Markdown: explicit instruction authoring".
 
 Prompt composition and hydration rules live in `docs/prompts.md`. Fork copies
 and filters the parent's document before hydrating a new conversation; changing

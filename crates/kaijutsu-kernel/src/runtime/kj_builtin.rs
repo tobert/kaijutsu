@@ -933,7 +933,7 @@ mod tests {
     }
 
     /// Contents of every block in `ctx`, read from the dispatcher's store —
-    /// where rc lifecycle blocks (guard errors, .md banners) land.
+    /// where rc lifecycle blocks (guard errors, instruction blocks) land.
     fn block_contents_in(dispatcher: &KjDispatcher, ctx: ContextId) -> Vec<String> {
         dispatcher
             .block_store()
@@ -993,7 +993,7 @@ mod tests {
     /// WITHOUT any self-recreating script (so a pre-fix run cannot fork-bomb):
     /// at `KJ_RC_DEPTH == MAX_RC_DEPTH`, a `kj context create` still creates
     /// the context, but its rc scripts are refused with the guard error block
-    /// and the inert `.md` banner never lands.
+    /// and the instruction script never runs.
     #[tokio::test]
     async fn rc_depth_in_scope_reaches_recursion_guard() {
         use crate::rc::MAX_RC_DEPTH;
@@ -1006,8 +1006,8 @@ mod tests {
         // Inert banner: proves the lifecycle ran (pre-fix) or was refused (post-fix).
         install_rc_script_file(
             &dispatcher,
-            "/config/rc/rdtest/create/S00-banner.md",
-            "rdtest-would-run",
+            "/config/rc/rdtest/create/S00-banner.kai",
+            r#"kj block create --role system --kind text --content 'rdtest-would-run'"#,
         )
         .await;
 
@@ -1041,7 +1041,7 @@ mod tests {
         );
         assert!(
             !contents.iter().any(|c| c.contains("rdtest-would-run")),
-            "guarded run must not execute the .md script; got: {contents:?}"
+            "guarded run must not execute the instruction script; got: {contents:?}"
         );
     }
 

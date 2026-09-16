@@ -1,10 +1,10 @@
-//! Canonical lifecycle script paths, shared by discovery and administration.
+//! Canonical rc file paths and the executable subset used by discovery.
 
 use kaijutsu_types::paths;
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Filename grammar shared by directory discovery and path validation.
+/// Administration addresses executable scripts and Markdown companion data.
 const RC_FILENAME_PATTERN: &str = r"(S\d{1,3})-([a-z][a-z0-9_-]*)\.(kai|md)";
 
 fn rc_path_pattern() -> String {
@@ -19,16 +19,16 @@ fn rc_path_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(&rc_path_pattern()).expect("rc path regex compiles"))
 }
 
-/// Accept only canonical executable entries: `SXX-name.kai` or `SXX-name.md`.
+/// Accept only canonical executable entries: `SXX-name.kai`.
 pub fn is_rc_script_filename(name: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
+    name.ends_with(".kai") && RE.get_or_init(|| {
         Regex::new(&format!(r"^{RC_FILENAME_PATTERN}$")).expect("rc filename regex compiles")
     })
     .is_match(name)
 }
 
-/// Parsed components of a canonical rc path.
+/// Parsed components of a canonical rc script or Markdown data path.
 pub struct RcPathParts {
     pub context_type: String,
     pub verb: String,

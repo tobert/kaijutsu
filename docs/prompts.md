@@ -1,19 +1,22 @@
 # Prompts
 
 This document describes current behavior. The complete kaish/rc migration is
-planned in [Kaish integration and rc lifecycle](kaish-integration.md). It
-replaces automatic `.md` instruction loading with explicit `.kai`
-block authoring. The loader and examples below remain supported until that
-change migrates the seeds and verifies the instructions models receive.
+tracked in [Kaish integration and rc lifecycle](kaish-integration.md).
+Only `.kai` lifecycle entries execute; Markdown is data read by scripts.
 
 ## Context types choose their instructions
 
 ```text
+/config/rc/lib/create/S00-base.kai
 /config/rc/lib/create/S00-base.md
+/config/rc/coder/create/S00-base.kai -> ../../lib/create/S00-base.kai
 /config/rc/coder/create/S00-base.md -> ../../lib/create/S00-base.md
 /config/rc/coder/create/S00-stance.kai
+/config/rc/default/create/S00-base.kai -> ../../lib/create/S00-base.kai
 /config/rc/default/create/S00-base.md -> ../../lib/create/S00-base.md
+/config/rc/default/create/S00-stance.kai
 /config/rc/default/create/S00-stance.md
+/config/rc/director/create/S00-base.kai -> ../../lib/create/S00-base.kai
 /config/rc/director/create/S00-base.md -> ../../lib/create/S00-base.md
 /config/rc/director/create/S00-stance.kai
 /config/rc/director/create/S06-kj-help.kai
@@ -33,7 +36,7 @@ The kernel adds runtime facts, including the performing character and its
 assigned reviewer (stable IDs and names); rc supplies the chosen instruction
 sections. Provider/model selection remains a separate fact.
 
-The link filename controls order: `S00-base.md` precedes `S00-stance.*`.
+The executable filename controls order: `S00-base.kai` precedes `S00-stance.kai`.
 The shared file ends with `頑張（がんば）って！`. Default handles general work;
 assistant remains fleet coordination. Coder retains focused and guided branches
 with test-driven development and an explicit warning that a context fork does
@@ -42,7 +45,7 @@ not a measured ranking of model capability.
 
 Edit shipped defaults under `assets/defaults/rc/`, then use
 `kaijutsu-server rc reseed` to materialize them when deploying. Every rc lifecycle
-reads the current host files. Markdown creates durable `(System, Text)` blocks;
+snapshots current executable bodies. Scripts create durable `(System, Text)` blocks;
 editing a source file does not rewrite existing contexts. Create a fresh context
 to exercise new create instructions. Stored instruction blocks are read again
 before each turn: edits and exclusions affect the next turn without a fork.
@@ -60,11 +63,11 @@ instruction sections remains valid.
 ## Explicit instruction scripts
 
 ```sh
-kj block create --role system --kind text --content-type text/markdown < "$0.txt"
+kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
 ```
 
 An rc script's `$0` is its invoked VFS path, including a symlink's name.
-The example reads a companion named `S00-instructions.kai.txt` when invoked
+The example reads a companion named `S00-instructions.md` when invoked
 as `S00-instructions.kai`. The file is ordinary data, read when the script
 runs. Missing files or invalid UTF-8 fail visibly. Redirection preserves
 trailing newlines and does not route instruction text through stdout limits.
@@ -75,9 +78,11 @@ with other `kj` writes. The context creator and requester may differ.
 `--content-type` defaults to `text/plain`; use `text/markdown` for Markdown.
 Existing instruction blocks retain their authors and content.
 
-Automatic `.md` loading remains supported during migration. Until that
-handler is removed, use a non-`.md` companion as above to avoid loading
-instructions twice. The shipped seeds have not moved to this path yet.
+Markdown files never execute on their own. A composed script locates data
+beside its invoked entry; include both script and data symlinks when composing
+shared instructions. Executable bodies are captured before the run, while
+companion reads happen during execution. The run's script digest covers the
+executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 
 ## Characters and lifecycle observations
 

@@ -166,12 +166,13 @@ mod tests {
     /// `attach` rc scripts on the target.
     #[tokio::test]
     async fn attach_returns_switch_and_runs_scripts() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("planner"), None, principal);
         set_context_type(&d, target, "planner");
 
-        install_attach_script(&d, "planner", "attach-marker", "md").await;
+        install_attach_script(&d, "planner", r#"kj block create --role system --kind text --content 'attach-marker'"#, "kai").await;
 
         let caller = unjoined_caller();
         let result = d.dispatch(&[s("attach"), s("planner")], &caller).await;

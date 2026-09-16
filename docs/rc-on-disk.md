@@ -36,7 +36,7 @@ every lifecycle run and records what it ran in the approval ledger's
 content-addressed store. Git is optional and unmanaged by us.
 
 Shared prompt text is an ordinary rc file chosen through relative symlinks.
-Coder and default opt in; other context types keep their own instructions.
+Coder, default, and director opt in; other context types keep their own instructions.
 See `docs/prompts.md` for composition and when edited text reaches a context.
 
 ## Rc lifecycle and kaish execution
@@ -48,18 +48,45 @@ commands use that integration with their own policies and result contracts.
 A hook file under `/config/rc/lib/hooks/` is interpreted by the broker's hook
 protocol, not dispatched as an rc lifecycle entry.
 
-Today both `.kai` and `.md` entries participate in lifecycle discovery. The
-link's filename controls ordering and dispatch; `.md` authors a system-text
-block, while `.kai` runs a program. Successful program output is diagnostic
-trace text, not an instruction block. The loader reads bodies directly through
-the VFS before the first script runs.
+Only canonical `SXX-name.kai` entries execute. The link's filename controls
+ordering and `$0`; ordinary Markdown files are data. Scripts author instruction
+blocks explicitly through `kj`. Successful program output is diagnostic trace
+text. Executable bodies are read through the VFS before the first script runs;
+companion data is read during execution. The script digest covers only the
+captured executable body, and the authored block stores the text read.
 
-[Kaish integration and rc lifecycle](kaish-integration.md) owns the complete
-migration plan. It calls for executing only `.kai` entries and treating
-Markdown as data explicitly read by those scripts. That proposal includes
-setting `$0` to the invoked VFS path, authoring instruction blocks explicitly,
-and documenting ordinary data reads separately from captured executable bodies.
-No loader, seed, or reseed behavior changes with this documentation update.
+`kj rc list` and `show` distinguish Markdown data from scripts and hook bodies.
+Canonical `SXX-name.md` files retain seed comparison and add/rm/show support.
+Other data files, including `README.md`, are ignored by lifecycle discovery.
+A missing required companion fails the script's read and produces an Error
+block; a dangling data link matters only when something reads it.
+
+## Migrating existing rc trees
+
+The automatic `.md` handler is removed. Existing durable instruction blocks
+remain unchanged. Before creating new contexts on an existing host tree:
+
+1. Review `kj rc list` and preserve local changes to the rc directory.
+2. Run `kaijutsu-server rc reseed` to install the new shipped `.kai` partners.
+   Without `--force`, edited Markdown remains intact and is reported as
+   differing from the seed. `--force` restores embedded content as usual.
+3. Give each custom Markdown instruction an explicit `.kai` entry. For
+   `S05-local.md`, create `S05-local.kai` containing:
+
+   ```sh
+   kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
+   ```
+
+   For composed instructions, install both script and data links beside each
+   other. `$0` is the invoked link path, not its resolved target. Reseed does
+   not invent wrappers for custom data or remove retired host files.
+4. Create a fresh context and inspect `kj context prompt` and `kj ledger runs`.
+   Re-running all create scripts can also rebind tools and reload observations.
+
+New instruction blocks use the invoking performer as author. This deliberately
+replaces the old Markdown handler's context-creator attribution. Updating the
+code or embedded seeds does not deploy, reseed, or rewrite existing contexts.
+The wider migration is tracked in `docs/kaish-integration.md`.
 
 ## The four decisions
 

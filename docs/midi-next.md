@@ -111,11 +111,10 @@ MIDI toolbox*. Flip to it, say "turn the reverb down 25%" (or whatever the
 device actually has), and the model works it out from injected knowledge.
 Everything needed already exists:
 
-- **rc symlinks are the injection mechanism.** A `subharmonicon`
-  context_type's rc bucket symlinks the profile
-  (`ln -s /config/midi/devices/subharmonicon /config/rc/subharmonicon/create/S20-device.md`);
-  the `.md` routes into the system-prompt slot at hydrate. No new machinery —
-  init.d-style composition doing its job.
+- **rc scripts author device instructions.** A `subharmonicon` context type
+  can read its profile with `kj block create --role system --kind text
+  --content-type text/markdown < /config/midi/devices/subharmonicon`. Put that
+  command in `S20-device.kai`; a `.md` file or symlink alone does not execute.
 - **The narrow loadout is what makes a cheap model workable.** The chameleon
   lesson: small models hang on big tool surfaces. A device context's toolbox
   is roughly *send CC / send notes / read profile / read state* — footguns

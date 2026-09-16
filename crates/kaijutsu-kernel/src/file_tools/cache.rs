@@ -358,7 +358,8 @@ impl FileDocumentCache {
             })
         };
         if let Some((cid, bid, dirty, loaded_generation)) = cached {
-            let disk_generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
+            let disk_attr = self.vfs.getattr(vfs_path).await.ok();
+            let disk_generation = disk_attr.as_ref().map(|a| a.generation);
             let stale =
                 matches!((disk_generation, loaded_generation), (Some(d), Some(l)) if d > l);
             if dirty {
@@ -375,7 +376,11 @@ impl FileDocumentCache {
                 }
                 return Ok((cid, bid));
             }
-            if !stale {
+            // getattr is lstat-like: the link generation says nothing about
+            // target edits or deletion. Re-read clean symlink buffers; dirty
+            // buffers above retain unsaved work under the normal file rules.
+            let symlink = disk_attr.is_some_and(|attr| attr.kind.is_symlink());
+            if !stale && !symlink {
                 return Ok((cid, bid));
             }
             match self.reload_block_from_disk(ctx_id, &bid, path).await {
@@ -710,22 +715,9 @@ impl FileDocumentCache {
     /// read" means "read disk"), plain `invalidate` is already enough to pick up
     /// a change.
     ///
-    /// A **config path** still needs the stronger call. `kj rc add/rm` and
-    /// `kj config reset` write straight to the host file over the VFS,
-    /// bypassing this cache entirely; a composition symlink's write can
-    /// defeat the disk-generation staleness check `try_get_or_load` relies
-    /// on for everything else, so a cache entry still resident in memory
-    /// (not yet invalidated) has no coherence signal telling it the file
-    /// changed underneath it, and would go on serving pre-edit content
-    /// indefinitely. Every such direct write must invalidate the entry
-    /// explicitly rather than rely on that staleness detection.
-    /// `invalidate_document` drops both the in-memory entry
-    /// and the shadow document itself, so the next read reloads fresh from the
-    /// VFS. The shadow is a pure cache materialization, so dropping it is safe;
-    /// a delete failure is surfaced (never a swallowed stale serve). Refuses
-    /// on a pinned entry, same rule and same message as
-    /// [`invalidate`](Self::invalidate) — this is `invalidate` plus a
-    /// document delete, not a second ownership decision.
+    /// Direct config writes use this operation to discard their cached
+    /// materialization. It refuses pinned entries before deleting anything.
+    /// A document-delete failure is returned to the caller.
     pub fn invalidate_document(&self, path: &str) -> Result<(), String> {
         self.invalidate(path)?;
         let ctx_id = file_context_id(path);
@@ -1234,6 +1226,21 @@ mod tests {
         vfs.mount("/tmp", MemoryBackend::new()).await;
         let cache = FileDocumentCache::new(blocks, vfs.clone(), tmp_db());
         (vfs, cache)
+    }
+
+    #[tokio::test]
+    async fn clean_symlink_reads_refresh_changed_and_missing_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/linked", crate::vfs::LocalBackend::new(root.path())).await;
+        let cache = FileDocumentCache::new(shared_block_store(PrincipalId::system()), vfs.clone(), tmp_db());
+        vfs.write_all(p("/linked/target.md"), b"before").await.unwrap();
+        vfs.symlink(p("/linked/view.md"), p("target.md")).await.unwrap();
+        assert_eq!(cache.try_read_content("/linked/view.md").await.unwrap(), "before");
+        vfs.write_all(p("/linked/target.md"), b"after!").await.unwrap();
+        assert_eq!(cache.try_read_content("/linked/view.md").await.unwrap(), "after!");
+        vfs.unlink(p("/linked/target.md")).await.unwrap();
+        assert!(matches!(cache.try_read_content("/linked/view.md").await, Err(CacheReadError::NotCached)));
     }
 
     fn p(s: &str) -> &std::path::Path {

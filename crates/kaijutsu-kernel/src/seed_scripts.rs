@@ -14,7 +14,7 @@
 //!   breakpoints until the user installs them by hand.
 //! - `/config/rc/<type>/**` — the worked examples of real context_types
 //!   (coder, mcp, toolie, director, musician). Most ship an `S00-stance`
-//!   (`.md`, or `.kai` when the stance tunes itself to the bound model) so the
+//!   `.kai` script that authors instructions, reading `.md` data when needed, so the
 //!   kernel-side contract is self-contained (independent of any per-client
 //!   CLAUDE.md), a binding loadout, and the cache recipe.
 //!
@@ -345,6 +345,22 @@ mod tests {
 
     fn read(root: &std::path::Path, rel: &str) -> Option<String> {
         std::fs::read_to_string(root.join(rel)).ok()
+    }
+
+    #[test]
+    fn reseed_adds_instruction_scripts_without_overwriting_custom_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("default/create/S00-stance.md");
+        std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+        std::fs::write(&data, "custom instructions\n").unwrap();
+        let report = reseed_rc_files(dir.path(), false).unwrap();
+        assert!(report.diverged.contains(&"default/create/S00-stance.md".to_string()));
+        assert_eq!(std::fs::read_to_string(&data).unwrap(), "custom instructions\n");
+        assert!(read(dir.path(), "default/create/S00-stance.kai").unwrap().contains("kj block create"));
+        assert!(dir.path().join("default/create/S00-base.kai").is_symlink());
+        assert!(dir.path().join("default/create/S00-base.md").is_symlink());
+        reseed_rc_files(dir.path(), true).unwrap();
+        assert_eq!(std::fs::read_to_string(data).unwrap(), seed_body("/config/rc/default/create/S00-stance.md").unwrap());
     }
 
     #[test]

@@ -302,12 +302,12 @@ interruption problem the mailbox exists to avoid.
 
 Verified against `main`. Re-verify before relying on any of it.
 
-**How `.md` reaches the model, three hops:** `run_md_script` inserts the body
-as one `Role::System` + `BlockKind::Text` block
-(`kernel/src/rc/mod.rs`) → `extract_system_prompt_sections`
-filters exactly `System && Text && !ephemeral && !excluded && !empty`
-(`kernel/src/llm/system_prompt.rs:145-157`) → `build_system_prompt` emits
-base → rc sections in block order → `<situation>` (`:69`).
+**How instructions reach the model:** rc `.kai` scripts use `kj block create`
+to author `Role::System` + `BlockKind::Text` blocks, optionally reading Markdown
+companions. `extract_system_prompt_sections` selects non-ephemeral, non-draft,
+non-excluded, nonempty instructions. `build_system_prompt` emits those sections
+in block order, followed by the runtime `<situation>` facts. There is no mandatory
+base instruction prepend. See `docs/prompts.md`.
 
 **`.kai` has arbitrary shell power over that slot.** The shipped
 `assets/defaults/rc/coder/create/S00-stance.kai` already shells out to

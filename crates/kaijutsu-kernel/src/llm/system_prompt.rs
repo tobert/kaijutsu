@@ -1,6 +1,6 @@
-//! Per-call system-prompt assembly (A4).
+//! Per-call system-prompt assembly.
 //!
-//! Context types choose their system instructions through rc `.md` scripts.
+//! Context types choose their system instructions through rc `.kai` scripts.
 //! `build_system_prompt` joins their persisted sections and appends a
 //! structured per-call situational addendum. The kernel supplies facts; it
 //! does not prepend a mandatory instruction body.
@@ -168,10 +168,9 @@ pub fn build_system_prompt(situational: &SituationalContext, rc_sections: &[Stri
 /// contribute to the system prompt. Filters mirror `hydrate_from_blocks`:
 /// skip ephemeral / draft / excluded / empty blocks.
 ///
-/// The result feeds `build_system_prompt`'s `rc_sections` parameter. rc
-/// `.md` lifecycle scripts produce blocks in exactly this shape (see
-/// `rc/mod.rs::run_md_script`); any other producer that wants to
-/// contribute system-prompt material can do the same.
+/// The result feeds `build_system_prompt`'s `rc_sections` parameter. Rc
+/// scripts author these blocks through `kj block create`; any other producer
+/// of system instructions uses the same block shape.
 pub fn extract_system_prompt_sections(blocks: &[BlockSnapshot]) -> Vec<String> {
     blocks
         .iter()
@@ -329,15 +328,9 @@ mod tests {
         assert!(out.starts_with("<situation>\n"));
     }
 
-    // ── rc-derived sections (the .md system-prompt path) ─────────────────
-
-    /// The bug the rc rework is fixing: an installed `.md` rc script
-    /// produces `(Role::System, BlockKind::Text)` blocks that were
-    /// invisible to the model before this change. With the extract +
-    /// build pipeline wired, that content becomes the system prompt before
-    /// the `<situation>` addendum.
+    /// Persisted system-text instructions precede the runtime situation facts.
     #[test]
-    fn rc_md_content_reaches_system_prompt() {
+    fn rc_instruction_content_reaches_system_prompt() {
         let blocks = vec![
             snap(Role::System, BlockKind::Text, "You are a focused planner."),
             snap(Role::User, BlockKind::Text, "user msg, must not leak"),

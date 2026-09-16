@@ -1,8 +1,8 @@
 # Kaish integration and rc lifecycle
 
 Status: migration in progress. Contextual construction belongs to runtime and
-lifecycle orchestration belongs to rc. Instruction loading, command settlement,
-and turn ownership remain open. The inventory distinguishes completed and pending work.
+lifecycle orchestration belongs to rc. Instruction scripts now use explicit
+block authoring; command settlement and turn ownership remain open. The inventory distinguishes completed and pending work.
 
 Amy's objective: "*completely* migrate kaijutsu and clean up all the call
 sites." Completion includes deleting superseded entry points and correcting
@@ -54,7 +54,7 @@ These are source observations, not promises that all paths behave alike.
 - `runtime/synthesis.rs` owns the block-source adapters used by contextual
   shells; hooks no longer depend on rc for synthesis wiring.
 - `rc::run` accepts `RcInvocation` and owns loading, ordering, variables,
-  recursion, run records, `.md` block creation, and `.kai` execution. All
+  recursion, run records, and `.kai` execution. Markdown is ordinary data. All
   lifecycle callers use this entry point; dispatcher lifecycle methods are
   deleted. `rc/script_path.rs` owns the shared filename/path grammar, and
   `kj rc` remains a command adapter. Unknown lifecycle verbs fail explicitly.
@@ -83,7 +83,7 @@ remove the obsolete API in the same change as its final caller.
 | Pending | Structured `executeKj` | server `rpc.rs::execute_kj_command` | Addressed context, structured argv, gates/latches, quiet mode, data, and shell-state write-back |
 | Pending | Approval resume | server `rpc.rs` resume drivers and helpers | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
 | Pending | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs` | Read-only/writable distinction, stdin, typed rejection, job ownership, receipts, cancellation, and async completion |
-| Owner migrated; instruction loading pending | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
+| Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Pending | Editor shell reads | kernel `kernel.rs::fetch_editor_io` | Opener identity/context, full text, and fail-before-splice behavior |
 | Pending | Environment setup and approved environment restore | `EmbeddedKaish::apply_context_config`, `apply_ask_env`, server state helpers, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |
@@ -131,66 +131,45 @@ the durable operation receipt remains Kaijutsu's restart/recovery record.
 
 ## Rc Markdown: explicit instruction authoring
 
-Replace automatic Markdown loading with `.kai` scripts that use `$0` to read
-companion data and `kj` to author instruction blocks. Amy suggested removing
-the `.md` feature and confirmed: "that's fine if the script uses kj." Prove
-this path against the acceptance conditions below before deleting the handler.
-This is the intended migration, not current behavior.
+Automatic Markdown loading is removed. Only canonical `SXX-name.kai` entries
+execute. Other files, including noncanonical or dangling `.md` entries, are
+ignored before executable-name validation. Invalid `.kai` names still fail
+before any script executes. `kj rc` administers canonical `.kai` scripts and
+`.md` data, labeling data separately in list/show output.
 
-Today `load_scripts` selects both `.kai` and `.md` before validating names,
-snapshots their bodies before the first script runs, and sorts by the entry
-filename. A symlink's name determines its order and handler. `run_md_script`
-authors a `System` / `Text` / `Done` / `Markdown` block as the lifecycle owner.
-Successful `.kai` stdout becomes bounded diagnostic trace text, excluded from
-hydration. Printing a file therefore does not replace `.md` block creation.
+Shipped instruction scripts use the ordinary `kj` write path:
 
-The locked kaish dependency is 0.17.2 at `a9807a64078f136b7a559e8fbde562086149889f`.
-Its public `Kernel::set_positional(script_name, args)` supplies `$0` and
-arguments. `EmbeddedKaish::set_positional` exposes that operation, and rc
-sets the invoked VFS path before executing each captured body. No upstream
-API addition was needed.
+```sh
+kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
+```
 
-The proposed replacement has these acceptance conditions:
+`$0` is the invoked VFS entry path, including its context-type symlink name.
+Companion lookup is relative to that entry. Composed seeds include both a
+script symlink and a data symlink. Existing Markdown paths remain unchanged,
+so non-forced reseeding can install wrappers while preserving edited text.
+See `docs/rc-on-disk.md`, "Migrating existing rc trees" for custom entries.
 
-1. Only canonical `SXX-name.kai` entries execute. Markdown files become data,
-   ignored by discovery, including before script-name validation. An invalid
-   `.kai` name still fails visibly.
-2. `$0` is the invoked VFS entry path, including its context-type symlink name,
-   not a host path or resolved target. Companion lookup is relative to that
-   entry. If a shared script needs data beside its target instead, it names
-   that shared path explicitly. Test both regular and symlinked entries.
-3. Scripts explicitly create instruction blocks through `kj`, authored by the
-   invoking performer. Amy chose this over the old Markdown handler's context-
-   creator attribution: "Use the invoking performer consistently with kj."
-   Existing blocks keep their authors. Prove role, kind, author, status, content
-   type, order, and content fidelity through the real `kj` path, including
-   distinct requester, performer, and context creator. `kj block create` accepts
-   stdin when `--content` is omitted and an explicit `--content-type`. Direct
-   file redirection preserves trailing newlines and bypasses stdout preview
-   limits; a regression covers more than 4 MiB of UTF-8 text through regular
-   and symlinked scripts. Missing files and invalid UTF-8 must produce an
-   error without authoring an instruction block.
-4. Executable bodies still snapshot at lifecycle start. Ordinary companion
-   reads happen when the script runs. Document that change from automatic
-   Markdown snapshotting; do not quietly recreate a dependency loader to hide
-   it. The script digest records the executable body, while the authored block
-   preserves the text read. Do not claim the digest includes transitive data.
-5. Missing or unreadable required data fails the script visibly. Oversized
-   input cannot become a truncated instruction block reported as successful.
-   Preserve intentional optional-data behavior explicitly in each script.
-6. Convert every shipped Markdown instruction and symlink, all relevant
-   fixtures, filename validators, seed inspection/reseed behavior, `kj rc`
-   help, and prompt-composition documentation together. Existing durable
-   instruction blocks stay untouched. Host rc migration must account for
-   custom files; no reseed or deployment is part of this documentation step.
-7. Check rendered system instructions from newly created contexts, including
-   optional shared base composition. Running the interpreter tests alone does
-   not prove the model receives the same instructions.
+Amy chose invoking-performer authorship: "Use the invoking performer
+consistently with kj." New instructions are `System` / `Text` / `Done` /
+`Markdown` blocks authored by `caller.actor_id`; creator and requester may
+differ. Existing durable blocks retain their authors. Required missing or
+invalid UTF-8 input fails visibly without authoring a block. Redirection
+preserves trailing newlines and does not route instruction bytes through
+stdout limits. Successful script stdout is still bounded diagnostic trace.
 
-Implement this in a separate change. Delete the handler and its special-case
-tests after migrating their behavioral assertions to the explicit scripts.
-If a required guarantee cannot be expressed through `kj`, identify that gap
-before changing the loader.
+Executable bodies snapshot at lifecycle start. Companion data is read when
+the script runs. The script digest records only the executable body; it does
+not claim to include transitive data. The authored block preserves the text
+read. This differs deliberately from the former Markdown loader's snapshot
+of every instruction body.
+
+Tests cover regular and symlinked invocation paths, distinct creator/requester/
+performer identities, more than 4 MiB of exact UTF-8 input, missing and invalid
+input, executable snapshots versus live data reads, reseeding with custom
+Markdown, and rendered prompts for every migrated context type. The locked
+kaish API supplies positional parameters directly; no upstream API change was
+needed. Its unsupported `${0%.kai}` expansion is recorded in `docs/issues.md`;
+the shipped scripts use supported `dirname` and `basename` builtins.
 
 ## Implementation sequence
 
@@ -206,10 +185,10 @@ adapters must have a named deletion step and must not become permanent aliases.
    All factory callers now use `EmbeddedKaish::for_context`; the
    `materialize_context_kaish_*` family is deleted. Backend and builtin
    interfaces are preserved. Rc authority belongs to its lifecycle caller.
-3. **Separate rc orchestration (ownership implemented).** `rc::run` owns
+3. **Separate rc orchestration (implemented).** `rc::run` owns
    discovery, execution records, recursion, and diagnostics adjacent to runtime.
    `kj rc` is an administration adapter; every lifecycle caller is migrated.
-   The Markdown replacement above remains a separate tested change.
+   Markdown loading is replaced by the explicit instruction scripts above.
 4. **Consolidate command settlement.** Introduce one outcome and projection
    path, then migrate interactive, streaming, structured `kj`, model foreground,
    model background, and approved-resume callers. Remove server-to-`rpc.rs`

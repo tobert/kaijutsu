@@ -6,6 +6,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Kaish positional suffix expansion
+
+The locked kaish 0.17.2 expands `${0%.kai}` to an empty value, rather than
+stripping the suffix or rejecting unsupported syntax. The rc migration exposed
+this as a failed companion-file read. Shipped scripts use `dirname "$0"` and
+`basename "$0" .kai` instead. Audit unsupported parameter expansion in kaish;
+keep it explicit rather than silently accepting a different expression.
+No upstream issue has been posted.
+
 ## Architecture cleanup plan
 
 Source review at `f7e46f8e`, September 16:
@@ -48,14 +57,20 @@ that loading succeeded.
 Rc orchestration and its path grammar now belong to `rc`; every lifecycle caller
 uses `rc::run` with `RcInvocation`. The old dispatcher lifecycle methods and
 unused-argument fixture adapter are deleted. Explicit `.kai` instruction
-loading remains to implement. Amy chose invoking-performer authorship for the
-replacement, resolving the design question in the identity audit below.
+loading replaces automatic Markdown handling, with invoking-performer
+authorship and migrated seeds.
 
 Shared command settlement and headless turn ownership remain separate changes.
 Keep connection/session subscriptions in the server and preserve JobManager's
-execution lifetime separately from durable receipts. Replace rc
-`.md` handlers with explicit `.kai` block authoring; the new plan records the
-`$0`, symlink, content-fidelity, and data-read semantics that must be tested.
+execution lifetime separately from durable receipts. The rc migration tests
+`$0`, symlinks, content fidelity, live companion reads, and rendered prompts.
+
+The companion-read audit also found wider cache work: generation metadata errors
+are swallowed, comparison only detects increasing generations, and dirty symlink
+buffers do not detect target changes for the guarded-write check. Clean symlink
+reads now refresh target content; preserve dirty work while fixing the remaining
+metadata/guard behavior in the file-cache audit. Also check stale-read error
+branches that remove cache entries without preserving editor pins.
 
 ### Shared client recovery
 
@@ -259,13 +274,6 @@ draft/shell RPC read the identifier the doc names. Open:
    `docs/character.md` replaces it.
 3. ROOT seeds `system()` as `created_by`/`director_id` (`rpc.rs:2534`);
    benign.
-5. Rc block authorship splits by file kind: `.kai` blocks are authored by
-   `caller.actor_id` (`rc/mod.rs`) and `.md` blocks by the
-   context's `created_by` (`:243-250`, `:376`), and the comment at
-   `kj/context.rs:1338` still says the requester owns rc output. Amy chose
-   invoking-performer authorship for instructions during the `.md` replacement.
-   Implement that choice and correct the comments; keep existing block authors
-   unchanged.
 4. `kj context create --as` is ungated (`kj/context.rs:579`) while
    `kj context set --as` needs Operator plus reviewer authority. A patch
    that gates `create --as` the same way exists
@@ -1142,7 +1150,7 @@ every per-client write names its full path by hand. Still undecided.
 
 The mount table rewrites an absolute target on the link's own mount relative
 to the link (`vfs/mount.rs`, `symlink`), so the documented same-tree idiom
-resolves. A target on another mount — `docs/midi-next.md`'s
+resolves. A target on another mount — for example,
 `ln -s /config/midi/devices/x /config/rc/x/create/S20-device.md` — is stored
 as given and resolves to nothing on the host, because a backend does not
 know another mount's host directory. Either the mount table resolves both
@@ -2019,8 +2027,8 @@ rows or agree.
   `Broker.policies` (`mcp/broker.rs:125`) is a bare map, so a live-tuned
   `call_timeout_ms`/`max_result_bytes` reverts on restart.
 - **No project-instructions discovery** (CLAUDE.md/AGENTS.md analog).
-  `build_system_prompt` (`llm/system_prompt.rs`) assembles base + rc `.md`
-  + `<situation>` with no filesystem crawl.
+  `build_system_prompt` (`llm/system_prompt.rs`) assembles stored instruction
+  sections plus `<situation>`, with no filesystem crawl.
 
 ## MIDI device profiles: routing does not consume port roles (`docs/midi-next.md` slice 2)
 

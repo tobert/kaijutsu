@@ -62,7 +62,7 @@ read by the shipped scripts. `ROTATED_FROM` loads predecessor prose.
 Use `docs/prompts.md`, "Rotating a director context" for the current procedure.
 
 Each context type chooses its instructions through rc. Coder, default, and
-director link to `lib/create/S00-base.md`; other types choose their own
+director link to `lib/create/S00-base.kai` and its Markdown companion; other types choose their own
 contracts. There is no mandatory behavioral prepend. Rc creates durable
 `(System, Text)` instruction blocks; the kernel adds runtime facts.
 

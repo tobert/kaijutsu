@@ -89,8 +89,8 @@ Published in kaijutsu:
 - **MCP tool schemas.** Tool and parameter descriptions reach every connected
   client.
 - **`docs/kj-help/`.** Help topics, read by models mid-task.
-- **rc scripts** under `/config/rc` — a `.md` block lands in the system-prompt
-  slot. This is the most expensive prose in the repo; every token competes.
+- **rc instructions** under `/config/rc` — `.kai` scripts author system-text
+  blocks, reading Markdown companions when needed. This is the most expensive prose in the repo; every token competes.
 - **Error blocks.** `BlockKind::Error` text is read by the model that caused it.
 
 > Before: `/// List rc lifecycle runs (the durable "did the rc lifecycle`

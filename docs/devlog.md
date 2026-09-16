@@ -1471,7 +1471,7 @@ removed from the live issue list.
 Amy is "open to removing the .md feature" and confirmed "that's fine if the
 script uses kj." The plan calls for explicit `.kai`
 instruction authoring with `$0` naming the invoked VFS path. The locked kaish
-already supplies positional-parameter setup; the rc adapter does not call it.
+already supplied positional-parameter setup; the rc adapter had not exposed it.
 Printing Markdown currently produces diagnostic trace text, so replacement
 must author a block and verify its content, metadata, and rendered instructions.
 Ordinary companion-file reads also differ from the loader's current snapshot
@@ -1488,8 +1488,8 @@ retired tool names or rollout history.
 Construction no longer silently omits `kj` and editor builtins when dispatcher
 registration is missing. A regression reproduced that fallback before it was
 replaced with an explicit initialization error. Lifecycle test fixtures now wire
-the dispatcher as production does. Rc loading and command settlement retain
-their current behavior for the next migration steps.
+the dispatcher as production does. That change retained rc loading and command
+settlement for their own migration steps.
 
 Lifecycle orchestration moved into `rc`, alongside the shared runtime. One
 `rc::run` entry takes the invocation facts; create, fork, attach, drift, beat,
@@ -1497,19 +1497,28 @@ rotation, and submit callers all moved, and the dispatcher lifecycle methods
 were removed. Discovery and `kj rc` now share the rc module's path grammar.
 Tests live beside the lifecycle owner, with the unused-argument fixture adapter
 deleted. An unknown verb now returns an error; its regression first reproduced
-the previous silent success. Markdown loading remains unchanged for its own
-migration. Amy resolved its authorship split: "Use the invoking performer
-consistently with kj." The replacement must test a distinct context creator
-and performer; existing instruction blocks retain their authors.
+the previous silent success. Amy resolved the instruction-authorship split: "Use the invoking performer
+consistently with kj." Existing instruction blocks retain their authors.
 
-Rc now supplies the invoked VFS path as `$0`. `kj block create` accepts exact
-stdin text and an explicit content type, so scripts can author Markdown
-instructions through the ordinary performer-attributed write path. File
-redirection preserves trailing newlines and avoids stdout preview limits.
-Tests cover distinct creator/requester/performer identities, symlink-relative
-companions, input beyond the internal output ceiling, invalid UTF-8, missing
-files, empty input, and explicit content precedence. This enables the seed
-migration; automatic Markdown loading remains until those callers move.
+Rc supplies the invoked VFS path as `$0`. `kj block create` accepts exact
+stdin text and an explicit content type, so scripts author Markdown through
+the ordinary performer-attributed write path. File redirection preserves
+trailing newlines and avoids stdout preview limits. Automatic `.md` loading
+is deleted; every shipped Markdown instruction has a `.kai` partner, including
+composed script/data symlinks. Canonical Markdown remains visible as data in
+`kj rc` inspection and seed comparisons. Non-forced reseeding installs wrappers
+without replacing custom Markdown, and custom entries need their own scripts.
+
+Tests cover distinct identities, symlink-relative companions, input beyond the
+internal output ceiling, invalid/missing/empty input, explicit content precedence,
+and every migrated context type's rendered instructions. Executables remain
+snapshotted before a run; companion data is read during execution. The script
+digest records the executable only, and the authored block retains input text.
+Two tests exposed contributing factors outside the loader: kaish silently expands
+unsupported `${0%.kai}` syntax to an empty value, and clean file-cache entries
+used a symlink's own generation to judge its target's freshness. Scripts use
+supported `dirname`/`basename`; clean symlink reads refresh their targets.
+The remaining dirty-buffer/generation audit is recorded in `docs/issues.md`.
 
 ## The kernel with no one to answer to (September 16)
 
