@@ -300,57 +300,14 @@ impl Kernel {
         blocks: crate::block_store::SharedBlockStore,
         db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
     ) -> Self {
-        let name = name.into();
-        let vfs = Arc::new(MountTable::new());
-        let file_cache = Arc::new(crate::file_tools::FileDocumentCache::new(
-            blocks.clone(),
-            vfs.clone(),
-            db.clone(),
-        ));
-
-        Self {
-            id: kaijutsu_types::KernelId::new(),
-            vfs,
-            state: RwLock::new(KernelState::new(&name)),
-            llm: RwLock::new(LlmRegistry::new()),
-            peers: parking_lot::RwLock::new(PeerRegistry::new()),
-            consent_mode: RwLock::new(ConsentMode::default()),
-            block_flows: shared_block_flow_bus(default_flow_capacity()),
-            turn_flows: shared_turn_flow_bus(default_flow_capacity()),
-            drift: shared_drift_router(),
-            cas: Self::cas_for_data_dir(data_dir),
-            share_registry: Arc::new(crate::vfs::ShareRegistry::new()),
-            midi_presence: Arc::new(crate::midi_presence::MidiPresenceStore::new()),
-            audio_inventory: Arc::new(crate::audio_inventory::AudioInventoryStore::new()),
-            midi_exchange: Arc::new(crate::midi_exchange::MidiExchangeRegistry::new()),
-            image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
-            broker: Arc::new({
-                let b = Broker::new();
-                b.engage_unbound_deny();
-                b
-            }),
-            timeouts: kaijutsu_types::TimeoutPolicy::default(),
+        Self::with_flows(
+            kaijutsu_types::KernelId::new(),
+            name,
+            shared_block_flow_bus(default_flow_capacity()),
+            data_dir,
             blocks,
-            file_cache,
-            db: db.clone(),
-            timelines: dashmap::DashMap::new(),
-            track_timelines: dashmap::DashMap::new(),
-            beat_ingress: OnceLock::new(),
-            temp_cleanup: None,
-            editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
-                crate::editor::EditorSessions::new(),
-            )),
-            editor_flows: shared_editor_flow_bus(default_flow_capacity()),
-            ledger_flows: shared_ledger_flow_bus(default_flow_capacity()),
-            shell_operations: {
-                let operations = crate::shell_operations::ShellOperationRegistry::new(db.clone())
-                    .expect("initialize shell operation registry");
-                operations.abandon_unfinished().expect("settle interrupted shell operations");
-                Arc::new(operations)
-            },
-            cc_inbox: OnceLock::new(),
-            turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        }
+            db,
+        ).await
     }
 
     /// Create a kernel rooted at a throwaway, per-call temp directory.

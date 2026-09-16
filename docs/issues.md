@@ -17,12 +17,7 @@ markers and corrected misleading comments, without changing behavior.
 
 Take these as separate changes so each has a clear verification boundary:
 
-1. **Consolidate kernel construction.** Make `Kernel::new` delegate to
-   `with_flows` with the same ID and flow-bus defaults. Preserve injected
-   dependencies, broker defaults, receipt recovery, and ephemeral cleanup.
-   Run existing kernel construction and shell-operation tests; check workspace
-   compilation. Do not change identity or flow wiring as part of this deletion.
-2. **Remove the unused shell-state facade.** Recheck callers of `KernelState`,
+1. **Remove the unused shell-state facade.** Recheck callers of `KernelState`,
    `state_id`, variables, history, and checkpoints across the workspace,
    examples, and integration tests. Delete verified unused APIs, backing state,
    and tests that only exercise the retired API. Preserve the kernel name and

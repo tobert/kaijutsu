@@ -1375,3 +1375,8 @@ writable shell could replace or clear it. Three regressions demonstrated those
 paths before the adapter and mount were deleted. Client compose remains on
 its RPC path; this deletion does not establish that generic block access or
 `/v/docs` excludes drafts. Those routes remain an explicit audit item.
+
+Kernel construction now has one service initializer. `Kernel::new` supplies
+its existing identity and flow-bus defaults to `with_flows`, so broker setup,
+file-cache wiring, and unfinished-operation recovery cannot drift between
+two copies. Ephemeral construction continues through that same path.
