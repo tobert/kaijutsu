@@ -131,7 +131,10 @@ These are source observations, not promises that all paths behave alike.
   installs one subscription and snapshots old answers before returning; failure
   refuses host startup. Shutdown stops delivery, cancels preparation and running
   commands, and joins their settlement. Idle delivery holds only a weak kernel
-  reference. Shared cwd reads live in
+  reference. A preparation unwind settles only its owned pair, or records a
+  no-run error when no pair exists, before the original panic reaches the worker.
+  Shutdown retains the claimed action's delivery seed without requesting another
+  turn. Shared cwd reads live in
   `runtime/shell_state.rs::context_cwd`.
 - SIGTERM/SIGINT await the command worker's thread before checkpointing and
   exiting. Joining is shared across callers and survives a cancelled waiter;
@@ -174,7 +177,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, and shutdown; in-progress block cleanup remains open |
-| Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, single-use claim, runtime ownership, startup readiness, cancellation and joined settlement; preparation-panic cleanup remains in the settlement audit |
+| Migrated | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup, and durable delivery before shutdown |
 | Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; abrupt drop and durable notification recovery remain in the settlement audit |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |

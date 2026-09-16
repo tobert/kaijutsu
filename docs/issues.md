@@ -143,13 +143,6 @@ Shutdown cancels preparation and commands and joins settlement. Transport-owned
 command tasks remain to migrate. Headless requests use direct runtime admission;
 per-turn leases own liveness and interrupts, including queued turns.
 
-Approved execution still has preparation paths before shared command capture.
-A panic after redeeming an ask but before entering command execution can leave
-its linked pair Waiting. Track that exact pair through preparation unwinding;
-retain the spent claim and never replay source. Cancellation settles linked
-pairs, but shutdown can suppress the follow-up seed for an unlinked ask whose
-preparation failed. Retain that no-run delivery fact without starting a new turn.
-
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
 aggregate liveness when polling the log but returns on the first terminal event,
 even if another accepted turn remains. Decide whether it joins one turn or an

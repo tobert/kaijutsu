@@ -287,6 +287,34 @@ fn needs_no_shell_turn_seed(linked: Option<(BlockId, BlockId, crate::PairOwner)>
     !matches!(linked, Some((_, _, crate::PairOwner::Session)))
 }
 
+/// Owns a spent approval until shared command capture takes over.
+struct ApprovalPreparation<'a> {
+    kernel: &'a Arc<Kernel>,
+    context: ContextId,
+    actor: PrincipalId,
+    pair: Option<(BlockId, BlockId)>,
+    armed: bool,
+}
+
+impl Drop for ApprovalPreparation<'_> {
+    fn drop(&mut self) {
+        if !self.armed || !std::thread::panicking() { return; }
+        let reason = "Approved action preparation panicked; nothing was run. The approval is spent.";
+        if let Some((command, output)) = self.pair {
+            settle_pair_error(self.kernel, self.context, &command, &output, reason.into());
+        } else {
+            let tail = self.kernel.blocks().last_block_id(self.context);
+            if let Err(error) = self.kernel.blocks().insert_block_as(
+                self.context, None, tail.as_ref(), kaijutsu_types::Role::System,
+                kaijutsu_types::BlockKind::Error, reason, Status::Error,
+                kaijutsu_types::ContentType::Plain, Some(self.actor),
+            ) {
+                tracing::error!("could not record approved preparation panic: {error}");
+            }
+        }
+    }
+}
+
 /// Preparation may stop immediately: its caller still owns the claimed ask
 /// and reports that no source ran. Execution uses cooperative command settlement.
 async fn prepare_while_running<T, E: std::fmt::Display>(
@@ -303,13 +331,10 @@ async fn prepare_while_running<T, E: std::fmt::Display>(
 /// Run an answered ask that carries executable source, or settle the blocks
 /// waiting on it when it was refused.
 ///
-/// **Redeem before execute, always.** The redemption row is the
-/// exactly-once claim (`approval_redemptions.request_id` is a primary key),
-/// so claiming it first means a crash between the claim and the run loses
-/// the action. That is the chosen side of the trade: an approved
-/// destructive action that runs twice is much the worse outcome, and
-/// nothing here is durable enough to resume — a pending ask is abandoned at
-/// boot. See `docs/gate-shape-b.md`.
+/// Claim before preparation or execution. The redemption primary key grants
+/// one owner; a spent claim never authorizes replay. A crash before execution
+/// can lose the action. Startup does not resume approved source across restart.
+/// See `docs/gate-shape-b.md`.
 async fn act_on_executable_answer(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
@@ -398,15 +423,13 @@ async fn act_on_executable_answer(
         }
     }
 
-    // The second archived check (`docs/gate-shape-b.md`, "Archived contexts
-    // are inert"). The driver checked before reading the row; a context can
-    // be archived in the gap, and an archived context runs nothing.
-    //
-    // Reaching this after the claim spends the answer without running
-    // anything. That is the narrow window the first check exists to keep
-    // narrow, and it is the correct direction to fail in: the context is
-    // archived, so the action can never run, and a spent answer is a
-    // recorded one.
+    let mut preparation = ApprovalPreparation {
+        kernel, context: context_id, actor: ask.actor,
+        pair: linked.map(|(command, output, _)| (command, output)), armed: true,
+    };
+
+    // Recheck Live after claiming: archive may race the initial delivery scan.
+    // A spent approval for an archived context runs nothing and stays spent.
     if !context_is_live(kernel, context_id) {
         tracing::info!(
             "gate-resume: {context_id} stopped being Live before ask {} could run; \
@@ -486,6 +509,7 @@ async fn act_on_executable_answer(
             }
         },
     };
+    preparation.pair = Some((command_block_id, output_block_id));
 
     // Restore captured inputs before execution. Cancellation after redemption
     // spends the approval but settles its pair without running the source.
@@ -532,6 +556,9 @@ async fn act_on_executable_answer(
         "gate-resume: running approved ask {} in {context_id}",
         answer.request_id
     );
+    // Shared capture owns unwinding after source execution can begin. Never
+    // replace its captured output with a preparation-only no-run result.
+    preparation.armed = false;
     if let Err(error) = crate::runtime::command::run_into_blocks(
         &kaish,
         source,
@@ -775,7 +802,7 @@ async fn run_delivery(
                 }
             };
 
-            if stop.is_cancelled() { return; }
+            if stop.is_cancelled() && executed_seed.is_none() { return; }
             let turn_in_flight = kernel.turn_in_flight(context_id);
 
             // A plain wake is skipped while a turn is already
@@ -830,6 +857,10 @@ async fn run_delivery(
                     continue;
                 }
             }
+
+            // The seed is part of settling work already claimed. Shutdown
+            // retains that fact, but never spends another model request on it.
+            if stop.is_cancelled() { return; }
 
             // A turn is already in flight: the seed just written is
             // the trace of the fill, read on that turn's next
@@ -927,6 +958,72 @@ async fn run_delivery(
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preparation_unwind_settles_only_its_owned_pair() {
+        use futures::FutureExt;
+        let kernel = Arc::new(Kernel::new_ephemeral("approval-preparation-panic").await);
+        let context = ContextId::new();
+        let actor = PrincipalId::new();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let owned = author_pair_for_ask(&kernel, context, actor, "echo approved").unwrap();
+        let other = author_pair_for_ask(&kernel, context, actor, "echo unrelated").unwrap();
+        let snapshot = |id: &BlockId| kernel.blocks().get_block_snapshot(context, id).unwrap().unwrap();
+        let before = snapshot(&other.1);
+        let panic = std::panic::AssertUnwindSafe(async {
+            let _preparation = ApprovalPreparation {
+                kernel: &kernel, context, actor, pair: Some(owned), armed: true,
+            };
+            tokio::task::yield_now().await;
+            panic!("preparation panic sentinel");
+        }).catch_unwind().await.unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"preparation panic sentinel"));
+        assert_eq!(snapshot(&owned.0).status, Status::Error);
+        let output = snapshot(&owned.1);
+        assert_eq!(output.status, Status::Error);
+        assert!(output.stderr.unwrap_or_default().contains("preparation panicked"));
+        assert_eq!(snapshot(&other.1).status, before.status);
+        assert_eq!(snapshot(&other.1).content, before.content);
+    }
+
+    #[tokio::test]
+    async fn preparation_unwind_without_a_pair_records_a_no_run_fact() {
+        let kernel = Arc::new(Kernel::new_ephemeral("approval-unlinked-panic").await);
+        let context = ContextId::new();
+        let actor = PrincipalId::new();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _preparation = ApprovalPreparation {
+                kernel: &kernel, context, actor, pair: None, armed: true,
+            };
+            panic!("unlinked preparation panic");
+        })).is_err());
+        let blocks = kernel.blocks().block_snapshots(context).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, kaijutsu_types::BlockKind::Error);
+        assert!(blocks[0].content.contains("nothing was run"));
+        assert!(blocks[0].content.contains("approval is spent"));
+    }
+
+    #[tokio::test]
+    async fn preparation_releases_ownership_before_command_capture() {
+        let kernel = Arc::new(Kernel::new_ephemeral("approval-capture-owner").await);
+        let context = ContextId::new();
+        let actor = PrincipalId::new();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let pair = author_pair_for_ask(&kernel, context, actor, "echo captured").unwrap();
+        kernel.blocks().set_status(context, &pair.1, Status::Done).unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut preparation = ApprovalPreparation {
+                kernel: &kernel, context, actor, pair: Some(pair), armed: true,
+            };
+            preparation.armed = false;
+            panic!("command capture owns this panic");
+        })).is_err());
+        let output = kernel.blocks().get_block_snapshot(context, &pair.1).unwrap().unwrap();
+        assert_eq!(output.status, Status::Done);
+        assert!(output.stderr.is_none());
+    }
 
     #[tokio::test]
     async fn worker_shutdown_removes_the_approval_subscription() {

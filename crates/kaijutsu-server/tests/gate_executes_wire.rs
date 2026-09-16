@@ -403,6 +403,28 @@ impl Seats {
 }
 
 #[test]
+fn shutdown_keeps_the_approved_turns_delivery_seed() {
+    run_local(async {
+        let scratch = Scratch::new("shutdown-seed");
+        let s = seats().await;
+        let marker = scratch.marker();
+        let code = format!("echo entered > {}\nsleep 10", marker.display());
+        let ask = s.raise(&code).await;
+        s.answer(&ask, true).await;
+        wait_for("approved execution to enter", || {
+            std::fs::read_to_string(&marker).is_ok_and(|content| content == "entered\n")
+        }).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2),
+            s.kernel.kernel.shutdown_command_worker()).await.unwrap().unwrap();
+        assert!(s.worker_blocks().iter().any(|block| block.kind == BlockKind::Text
+            && block.content.contains("approved the action")),
+            "shutdown discarded the durable delivery seed for the spent approval");
+        assert!(!s.undelivered(&ask));
+        s.close().await;
+    });
+}
+
+#[test]
 fn shutdown_settles_an_approved_command_before_returning() {
     run_local(async {
         let scratch = Scratch::new("shutdown");

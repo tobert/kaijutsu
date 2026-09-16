@@ -1706,6 +1706,13 @@ errors reaching the host and one owner per kernel. Idle delivery holds a weak
 kernel reference. Shutdown cancels shell preparation or running execution and
 waits for command settlement; a claimed action is never replayed.
 
+The remaining preparation gap now has an explicit owner: after redemption,
+unwinding settles only the claimed pair, or records a no-run error when no pair
+exists. Ownership transfers before shared command capture so cleanup cannot
+replace captured output. Shutdown also retains the spent approval's delivery
+seed before joining, while refusing any follow-up model turn. Regressions pin
+both gaps; the original panic still reaches the runtime worker.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

@@ -453,7 +453,10 @@ one subscription and snapshots old answers before returning; unreadable backlog
 refuses host startup. Shutdown stops new delivery, cancels preparation and
 execution, and joins command settlement. A claimed action is never replayed.
 Cancelled preparation reports that no source ran; commands already running use
-the shared command cancellation and settlement path.
+the shared command cancellation and settlement path. Preparation unwinding
+settles only the claimed pair, or records a no-run error if no pair exists, then
+propagates the original panic. Shutdown retains delivery seeds for claimed work
+before joining, without starting another model turn.
 
 On each `ledger.changed` the driver re-reads the undelivered answers and,
 for each it has not acted on: resolves the context and refuses anything not
