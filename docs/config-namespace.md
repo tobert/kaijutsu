@@ -42,8 +42,8 @@ Squatting `/etc` would have cost a guard drawing a line inside it that no
 other host path needs.
 
 **Not `/v`, because these are not virtual.** `/v` holds things the kernel
-synthesizes — `/v/cas`, `/v/ctx`, `/v/session`, `/v/swap`, `/v/docs`,
-`/v/input`. A config directory is a directory: no synthesis, no special
+synthesizes — `/v/cas`, `/v/ctx`, `/v/session`, `/v/swap`, `/v/docs`.
+A config directory is a directory: no synthesis, no special
 semantics, nothing the kernel generates. Filing it under `/v` would say it is
 one of those, and it is not. This keeps `docs/slash-v.md` principle 7's
 junk-drawer rule intact rather than bending it.

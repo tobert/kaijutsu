@@ -25,8 +25,8 @@ once, every surface gets the view. This is the "instrument you play" stance made
 literal: `grep`, `less`, `ls -l` over live kernel state.
 
 **The mount-table reality.** Two layers exist and they are not the same. `/v/docs`
-and `/v/input` are **kaish-side** mounts (`embedded_kaish.rs:300` — objects on each
-materialized kaish's own VFS), *not* kernel-`MountTable` backends, and therefore not
+is a **kaish-side** mount (`runtime/embedded_kaish.rs` — on each materialized
+kaish's own VFS), *not* a kernel-`MountTable` backend, and therefore not
 visible over SFTP. The surfaces in this doc mount on the **kernel `MountTable`**
 (like `/config/rc`'s `LocalBackend` and the shipped `/v/cas` `CasFs`), the table every
 surface reaches: SFTP serves it directly (`SftpSession::new(principal, vfs)`), kaish
@@ -534,7 +534,7 @@ Track B (`/v/cas`, landed):
 
 Track V (`/v/ctx` + `/v/session`, unbuilt):
 
-- `crates/kaijutsu-kernel/src/runtime/embedded_kaish.rs:300` — `/v/docs`, `/v/input` (**kaish-side** mounts, not kernel-`MountTable` — not SFTP-visible; see "The mount-table reality")
+- `crates/kaijutsu-kernel/src/runtime/embedded_kaish.rs` — `/v/docs` (**kaish-side** mount, not kernel-`MountTable` — not SFTP-visible; see "The mount-table reality")
 - `crates/kaijutsu-kernel/src/vfs/backends/cas.rs`, `roster.rs` — synthetic `VfsBackend`s to mirror the pattern of
 - `crates/kaijutsu-types/src/ids.rs:54` — all ids are `Uuid::now_v7()` (the trailing-byte sharding rule)
 - `crates/kaijutsu-kernel/src/peers.rs:55,115` — `PeerInfo` / `PeerRegistry` (the session seed; `PeerInfo` needs a `kind` field)

@@ -191,8 +191,8 @@ impl KjDispatcher {
 
     /// Like [`Self::materialize_context_kaish`] but the materialized shell is
     /// **read-only**: filesystem mutations and external commands are refused by
-    /// construction, while reads — real files and the `/v/docs` /
-    /// `/v/input` views — still work. Backs the toolie's (and, post-2026-08-17
+    /// construction, while reads — real files and the `/v/docs`
+    /// view — still work. Backs the toolie's (and, post-2026-08-17
     /// flag day, the default-unmarked) `shell` tool — the old name for this
     /// was `read_only_shell`, now retired (`docs/gate-and-shell-split.md`
     /// "Slice 3"). Unprivileged (the read-only role is never the rc control
@@ -443,6 +443,64 @@ mod tests {
             binding.grant(crate::mcp::Capability::Exec);
         }
         d.kernel().broker().set_binding(ctx, binding).await.unwrap();
+    }
+
+    async fn assert_model_shell_cannot_reach_compose_draft(command: &str) {
+        for read_only in [true, false] {
+            let d = dispatcher_with_full_broker().await;
+            let requester = PrincipalId::new();
+            let performer = PrincipalId::new();
+            let ctx = register_context(&d, Some("draft-isolation"), None, requester);
+            grant_broad_binding(&d, ctx, false).await;
+            d.block_store()
+                .create_document(ctx, kaijutsu_types::DocKind::Conversation, None)
+                .unwrap();
+            let drafts = [(requester, "requester unfinished draft"), (performer, "performer unfinished draft")];
+            for (principal, text) in drafts {
+                d.block_store().edit_draft(ctx, principal, 0, text, 0).unwrap();
+            }
+
+            let kaish = if read_only {
+                d.materialize_context_kaish_read_only_as(
+                    "draft-isolation", requester, performer, Some(requester),
+                    ctx, SessionId::new(), None, Arc::new(NoopBlockSource),
+                ).await
+            } else {
+                d.materialize_context_kaish_as(
+                    "draft-isolation", requester, performer, Some(requester),
+                    ctx, SessionId::new(), None, Arc::new(NoopBlockSource),
+                ).await
+            }.expect("materialize model shell");
+
+            let ready = kaish.execute_with_options("echo shell-ready", ExecuteOptions::default())
+                .await.unwrap();
+            assert!(ready.ok(), "model shell must otherwise work: {}", ready.err);
+            assert_eq!(ready.text_out().trim(), "shell-ready");
+
+            let result = kaish.execute_with_options(command, ExecuteOptions::default())
+                .await.expect("valid command must return an execution result");
+            assert!(!result.ok(), "read_only={read_only}: {command} must fail, got {result:?}");
+            for (principal, text) in drafts {
+                assert!(!result.text_out().contains(text), "read_only={read_only}: draft leaked");
+                let draft = d.block_store().draft_block(ctx, principal).unwrap().unwrap();
+                assert_eq!(draft.content, text, "read_only={read_only}: {command} changed a draft");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_shells_cannot_read_compose_draft() {
+        assert_model_shell_cannot_reach_compose_draft("cat /v/input").await;
+    }
+
+    #[tokio::test]
+    async fn model_shells_cannot_write_compose_draft() {
+        assert_model_shell_cannot_reach_compose_draft("echo replacement > /v/input").await;
+    }
+
+    #[tokio::test]
+    async fn model_shells_cannot_clear_compose_draft() {
+        assert_model_shell_cannot_reach_compose_draft("rm /v/input").await;
     }
 
     /// The invariant, exec-less flavor: an unknown command in a Deny context

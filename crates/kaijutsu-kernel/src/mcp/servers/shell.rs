@@ -142,7 +142,7 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
 
 // Read-only variant's kaijutsu-specific half: same return contract, plus what
 // makes it read-only (no mutation, no external commands) and the document views
-// it can still read (`/v/docs`, `/v/input`) that a host-only read-only shell
+// it can still read (`/v/docs`) that a host-only read-only shell
 // wouldn't have.
 //
 // Names `shell_write` as where external commands live. The refusal a model
@@ -158,7 +158,7 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
          installed and on PATH, so reach for `shell_write` when you need to \
          run one, rather than concluding it is missing. Use this tool to \
          inspect — read files, `grep`, `find`, walk the tree, and read the \
-         kernel document/input views under `/v/docs` and `/v/input`; `kj` is \
+         kernel document view under `/v/docs`; `kj` is \
          in scope for read-only context introspection. {}\n\n{}",
         RETURN_CONTRACT, &*COMPOSED_TOOL_DESCRIPTION
     )
@@ -779,7 +779,24 @@ mod tests {
     use crate::kj::test_helpers::{register_context, test_caller, test_dispatcher};
     use crate::mcp::binding::{Capability, ContextToolBinding};
     use crate::mcp::{InstancePolicy, KernelCallParams};
-    use kaijutsu_types::{PrincipalId, SessionId};
+    use kaijutsu_types::{ContextId, PrincipalId, SessionId};
+
+    #[tokio::test]
+    async fn emitted_shell_tools_do_not_advertise_compose_draft() {
+        let ctx = CallContext::new(
+            PrincipalId::new(), ContextId::new(), SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        );
+        for server in [ShellServer::new(Weak::new()), ShellServer::new_read_only(Weak::new())] {
+            let tools = server.list_tools(&ctx).await.unwrap();
+            assert_eq!(tools.len(), 1);
+            let tool = &tools[0];
+            let description = tool.description.as_deref().unwrap();
+            assert!(!description.contains("/v/input"), "{}: {description}", tool.name);
+            assert!(!tool.input_schema.to_string().contains("/v/input"));
+            println!("{} description: {description}\nschema: {}", tool.name, tool.input_schema);
+        }
+    }
 
     /// The composed half must carry real kaish-help content (a known rule)
     /// and must NOT carry the overlay paragraph — the assertion that would
@@ -831,7 +848,7 @@ mod tests {
             "read-only contract must survive: {ro_text}"
         );
         assert!(
-            ro_text.contains("/v/docs") && ro_text.contains("/v/input"),
+            ro_text.contains("/v/docs"),
             "read-only document views must survive: {ro_text}"
         );
         assert!(

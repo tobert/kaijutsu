@@ -1359,3 +1359,19 @@ cannot see: the zero-cursor-query probe caught `Terminal::clear` asking
 on every resume, which no reading found. And the crusoe cast timed out
 on transport twice mid-afternoon; the deepseek cast carried the last
 three reviews without a miss.
+
+## Retiring duplicated state (September 16)
+
+Amy asked for a whole-file architecture scan, then to "proceed with 1-3"
+from its bounded cleanup plan. The recurring problem was divided ownership:
+older representations retained responsibilities after their replacements
+arrived. Larger changes are marked at their implementation sites and tracked
+in `docs/issues.md`, "Architecture cleanup plan".
+
+The first deletion removes `/v/input`. Its adapter used the authenticated
+requester while nested shell commands carried a distinct performer, so a
+model's read-only shell could read the requester's unfinished draft. The
+writable shell could replace or clear it. Three regressions demonstrated those
+paths before the adapter and mount were deleted. Client compose remains on
+its RPC path; this deletion does not establish that generic block access or
+`/v/docs` excludes drafts. Those routes remain an explicit audit item.

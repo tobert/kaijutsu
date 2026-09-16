@@ -3,10 +3,9 @@
 //!
 //! The toolie's `read_only_shell` reaches the real filesystem and the shared
 //! `FileDocumentCache` through a read-only [`MountBackend`](super::mount_backend),
-//! but the *document views* `/v/docs` and `/v/input` are mounted directly
-//! onto the kaish VFS — they never route through `MountBackend`, so a read-only
-//! `MountBackend` alone would still let the toolie mutate the input doc and
-//! document views.
+//! but the document view `/v/docs` mounts directly onto the kaish VFS. It
+//! never routes through `MountBackend`, so a read-only `MountBackend` alone
+//! would still let the toolie mutate that view.
 //!
 //! This wrapper closes that gap the same way kaish's own read-only mounts do:
 //! reads delegate to the inner filesystem; every mutation is refused with

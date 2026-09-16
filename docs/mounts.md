@@ -50,7 +50,7 @@ profile). Named here so nobody reinvents it; deliberately not now.
 
 The kernel `MountTable` is **shared** (one kernel-owned table for every
 context), but each materialized shell gets its own kaish `VfsRouter`
-(where `/v/docs` / `/v/input` already mount per-shell,
+(where `/v/docs` already mounts per-shell,
 `embedded_kaish.rs`). That router is the curation seam: per-context bin
 mounts ride the shell's router, and the shared table keeps the
 project/config/kernel-owned mounts. Sketch of the per-type exposure:

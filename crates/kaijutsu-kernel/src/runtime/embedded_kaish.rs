@@ -43,11 +43,10 @@ use kaish_kernel::{
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::kernel_db::KernelDb;
-use kaijutsu_types::paths::{DOCS_ROOT, INPUT_ROOT, SWAP_ROOT};
+use kaijutsu_types::paths::{DOCS_ROOT, SWAP_ROOT};
 use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use super::docs_filesystem::KaijutsuFilesystem;
-use super::input_filesystem::InputFilesystem;
 use super::kaish_backend::KaijutsuBackend;
 use super::mount_backend::MountBackend;
 use super::read_only_fs::ReadOnlyFs;
@@ -268,7 +267,7 @@ impl EmbeddedKaish {
     /// Like [`Self::with_identity`] but the materialized shell is **read-only**:
     /// every filesystem mutation and every external command is refused by
     /// construction, while reads — real files *and* the kernel document views at
-    /// `/v/docs` / `/v/input` — still work. Backs the toolie's
+    /// `/v/docs` — still work. Backs the toolie's
     /// `read_only_shell` (see `mcp/servers/shell.rs`).
     // See with_identity's doc above for why this family's argument count is
     // what it is.
@@ -333,12 +332,6 @@ impl EmbeddedKaish {
         // Initialize session map entry if missing
         session_contexts.entry(session_id).or_insert(context_id);
 
-        let input_fs = Arc::new(InputFilesystem::new(
-            blocks.clone(),
-            session_contexts.clone(),
-            session_id,
-            principal_id,
-        ));
         // The kernel's own file cache — the same instance the MCP file tools
         // use, built once at kernel construction. Routing MountBackend
         // through it is the whole point of kaish — shell scripting on the
@@ -459,19 +452,12 @@ impl EmbeddedKaish {
             }
         }
 
-        // The kernel document views (`/v/docs`, `/v/input`) are mounted directly
-        // on the kaish VFS, bypassing MountBackend — so in read-only mode they
-        // get their own structural gate via `ReadOnlyFs` (reads delegate,
-        // writes refuse). Otherwise they mount writable.
+        // The kernel document view (`/v/docs`) mounts directly on the kaish VFS,
+        // bypassing MountBackend. ReadOnlyFs refuses writes in read-only mode.
         let docs_mount: Arc<dyn kaish_kernel::vfs::Filesystem> = if read_only {
             Arc::new(ReadOnlyFs::new(docs_fs))
         } else {
             docs_fs
-        };
-        let input_mount: Arc<dyn kaish_kernel::vfs::Filesystem> = if read_only {
-            Arc::new(ReadOnlyFs::new(input_fs))
-        } else {
-            input_fs
         };
 
         let ctx_for_tools = session_contexts.clone();
@@ -482,7 +468,6 @@ impl EmbeddedKaish {
             config,
             |vfs| {
                 vfs.mount_arc(DOCS_ROOT, docs_mount);
-                vfs.mount_arc(INPUT_ROOT, input_mount);
                 vfs.mount_arc(SWAP_ROOT, swap_fs);
                 if read_only {
                     vfs.mount_arc("/v/jobs", Arc::new(ReadOnlyFs::new(

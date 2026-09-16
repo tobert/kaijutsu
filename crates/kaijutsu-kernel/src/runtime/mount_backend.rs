@@ -54,9 +54,9 @@ pub struct MountBackend {
     /// `PermissionDenied` *before* it can reach the shared mount table or the
     /// document cache — the read-only invariant for the toolie's `read_only_shell`.
     /// Reads (real files and kernel documents) still pass through. This gates the
-    /// real-FS + `FileDocumentCache` surface; the kaish-VFS `/v/docs` and
-    /// `/v/input` mounts are gated separately by wrapping them in
-    /// [`super::read_only_fs::ReadOnlyFs`] (they don't route through here).
+    /// real-FS + `FileDocumentCache` surface; the kaish-VFS `/v/docs` mount
+    /// is gated separately by wrapping it in
+    /// [`super::read_only_fs::ReadOnlyFs`] (it doesn't route through here).
     read_only: bool,
 }
 

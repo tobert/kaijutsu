@@ -10,7 +10,6 @@
 //! - `kaish_backend` — bridges kaish ops to kaijutsu kernel state.
 //! - `mount_backend` — kaish's filesystem root, wires VFS mounts to kaish.
 //! - `docs_filesystem` — `/v/docs` (kernel blocks-as-files).
-//! - `input_filesystem` — `/v/input` (the compose draft block).
 //! - `read_only_fs` — read-only wrapper for the `/v/*` document mounts (toolie).
 //! - `context_engine` — per-session "current context" registry.
 //! - `kj_builtin` — the `kj` kaish Tool.
@@ -21,7 +20,6 @@ pub mod context_engine;
 pub mod curl_tool;
 pub mod docs_filesystem;
 pub mod embedded_kaish;
-pub mod input_filesystem;
 pub mod kaish_backend;
 pub mod kj_builtin;
 pub mod ps_builtin;

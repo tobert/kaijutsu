@@ -17,20 +17,12 @@ markers and corrected misleading comments, without changing behavior.
 
 Take these as separate changes so each has a clear verification boundary:
 
-1. **Remove `/v/input`.** First add a failing model-shell regression with
-   distinct requester and performer, covering read-only and writable shells
-   and read/write/clear attempts. Delete `InputFilesystem`, its mount,
-   exports, obsolete tests, and advertised tool guidance. Inspect emitted
-   shell schemas and run `user_input_identity` to preserve client compose
-   behavior. Completion means this VFS route is absent; the broader draft
-   invariant remains open until `/v/docs` and generic block access are audited.
-   See the existing "compose draft is the player's alone" decision below.
-2. **Consolidate kernel construction.** Make `Kernel::new` delegate to
+1. **Consolidate kernel construction.** Make `Kernel::new` delegate to
    `with_flows` with the same ID and flow-bus defaults. Preserve injected
    dependencies, broker defaults, receipt recovery, and ephemeral cleanup.
    Run existing kernel construction and shell-operation tests; check workspace
    compilation. Do not change identity or flow wiring as part of this deletion.
-3. **Remove the unused shell-state facade.** Recheck callers of `KernelState`,
+2. **Remove the unused shell-state facade.** Recheck callers of `KernelState`,
    `state_id`, variables, history, and checkpoints across the workspace,
    examples, and integration tests. Delete verified unused APIs, backing state,
    and tests that only exercise the retired API. Preserve the kernel name and
@@ -258,16 +250,11 @@ it: `resolve_editor_target` (`crates/kaijutsu-kernel/src/editor.rs`) binds to
 file-backed blocks only, and no dedicated `kj input` verb exists. The intended
 contract is no model VFS path for the draft and no editor session over it.
 
-**Correction from the architecture scan (2026-09-16): the VFS route remains.**
-`runtime/input_filesystem.rs` reads/writes/clears `/v/input`, and
-`EmbeddedKaish::with_identity_mode` mounts it in every shell. Read-only model
-shells can read it; writable shells can mutate it. The mount uses requester
-`principal_id`, while nested `kj` separately receives performer `actor_id`.
-The model shell constructor therefore selects the requester's draft. Remove
-the filesystem route and its advertised tool guidance; add a regression with
-distinct requester and performer. Also audit ordinary block mutation and
-`/v/docs` for draft access before claiming the broader invariant is enforced.
-This finding is from source tracing; no live draft was accessed.
+The `/v/input` adapter and mount are removed, with regressions for read,
+write, and clear attempts through both model-shell flavors using distinct
+requester and performer identities. Still open: audit ordinary block mutation
+and `/v/docs` for draft access before claiming the broader invariant is
+enforced. The dedicated pathname was only one possible route.
 
 The MCP bridge's `read_input`/`write_input`/`edit_input`/`submit_input` tools
 are gone as of today. A model that wants another player's attention uses `kj

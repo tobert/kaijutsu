@@ -147,18 +147,17 @@ embeds it.** See [overview](README.md#process--transport-model).
 
 Owns one `kaish_kernel::Kernel`, a `SessionContextMap`, a `SessionId`, and the
 timeout policy. `with_identity_mode` (`:265`) is the builder: registers the
-session→context pair, builds the input filesystem, gets the shared
+session→context pair, gets the shared
 `FileDocumentCache`, builds `KaijutsuBackend`, clones the `Arc<MountTable>`, wraps
 it in a `MountBackend` (writable or read-only), and constructs the kaish kernel
-with `/v/docs` and `/v/input` mounted. `execute_with_options` (`:463`) is the
+with `/v/docs` and `/v/swap` mounted. `execute_with_options` is the
 single entry. cwd persists in the kaish kernel and is restored from the DB via the
 **backend namespace**, not host-FS `is_dir()` (`restore_cwd_from_db`, `:556`).
 
 Backends: **`KaijutsuBackend`** (routes `/docs/{ctx}/{block}` into the block
 store + tool dispatch), **`MountBackend`** (the primary `KernelBackend`; routes
 file I/O through the document cache on writable mounts, raw VFS otherwise;
-`deny_if_read_only` gates mutations), **`KaijutsuFilesystem`** /
-**`InputFilesystem`** (adapt kernel documents and input to the kaish
+`deny_if_read_only` gates mutations), **`KaijutsuFilesystem`** (adapts kernel documents to the kaish
 `Filesystem` trait), **`ReadOnlyFs`** (refuses all mutations), **`SwapFilesystem`**
 (read-only view of unflushed file buffers at `/v/swap/<kernel-id>/<real-path>`,
 `docs/file-buffers.md`). `SessionContextMap` is a global `DashMap<SessionId, ContextId>`.

@@ -125,9 +125,6 @@ pub const CAS_ROOT: &str = "/v/cas";
 /// surface over conversation documents).
 pub const DOCS_ROOT: &str = "/v/docs";
 
-/// Root of the input-document view mount.
-pub const INPUT_ROOT: &str = "/v/input";
-
 /// Root of the read-only dirty-file-buffer ("swap") view mount
 /// (docs/file-buffers.md). Mirrors each unsaved buffer's real path under
 /// `/v/swap/<kernel_id>/...` — the kernel-id segment (`KernelId::to_hex()`)
