@@ -1,18 +1,6 @@
-//! `kj block` — inspect blocks in a context.
-//!
-//! First kj namespace migrated to clap_derive. Pattern: one `BlockArgs`
-//! struct + `BlockCommand` enum at the top, dispatch_block parses argv via
-//! `try_parse_from`, then matches the variant to the per-verb function. The
-//! existing function bodies stayed mostly intact — only argv extraction
-//! moved into the derive.
-//!
-//! Routes through the same `BlockStore::block_snapshots` surface that powers
-//! `block_list` / `block_inspect` MCP tools, exposed as kj subcommands so
-//! kaish scripts (rc lifecycle, the live-eval harness) can read block state
-//! without going through MCP. `read` closes the partial-parity gap with
-//! `block_read` (line numbers + range filtering).
+//! `kj block` — read and edit kernel-sequenced blocks.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use kaijutsu_cas::ContentStore;
 use kaijutsu_types::{BlockKind, ContentType, Role, Status, KIND_NAMES, ROLE_NAMES, STATUS_NAMES};
 use serde::Serialize;
@@ -25,7 +13,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "block",
-    about = "Inspect blocks in a context",
+    about = "Read and edit blocks in a context",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -254,28 +242,36 @@ enum BlockCommand {
         #[command(subcommand)]
         op: EditOp,
     },
-    /// Create a new block in a context. Mirrors MCP `block_create`. Status
-    /// defaults to Done and content_type to plain — matches the MCP shape.
-    Create {
-        /// Role: user|model|system|tool
-        #[arg(long)]
-        role: String,
-        /// Kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace
-        #[arg(long)]
-        kind: String,
-        /// Initial text content (empty if omitted)
-        #[arg(long)]
-        content: Option<String>,
-        /// Parent block id for DAG relationship (omit for root)
-        #[arg(long)]
-        parent: Option<String>,
-        /// Block id to insert after (for ordering)
-        #[arg(long)]
-        after: Option<String>,
-        /// Target context: . (default) | .parent | <label> | <hex prefix>
-        #[arg(long, short = 'c')]
-        context: Option<String>,
-    },
+    /// Create a Done block, authored by the invoking performer.
+    Create(BlockCreateArgs),
+}
+
+#[derive(Args, Debug)]
+struct BlockCreateArgs {
+    /// Role: user|model|system|tool
+    #[arg(long)]
+    role: String,
+    /// Kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace
+    #[arg(long)]
+    kind: String,
+    /// Initial text. When omitted, reads stdin in kaish; empty without input.
+    #[arg(long, allow_hyphen_values = true)]
+    content: Option<String>,
+    /// Content MIME type. Raster image content must be a CAS hash.
+    #[arg(long, default_value = "text/plain", value_parser = [
+        "text/plain", "text/markdown", "image/svg+xml", "text/vnd.abc", "text/x-diff",
+        "image/png", "image/jpeg", "image/webp", "image/gif", "image/avif",
+    ])]
+    content_type: String,
+    /// Parent block id for DAG relationship (omit for root)
+    #[arg(long)]
+    parent: Option<String>,
+    /// Block id to insert after (for ordering)
+    #[arg(long)]
+    after: Option<String>,
+    /// Target context: . (default) | .parent | <label> | <hex prefix>
+    #[arg(long, short = 'c')]
+    context: Option<String>,
 }
 
 impl KjDispatcher {
@@ -307,7 +303,7 @@ impl KjDispatcher {
         let block_write_tool = match &parsed.command {
             BlockCommand::Append { .. } => Some("block_append"),
             BlockCommand::Edit { .. } => Some("block_edit"),
-            BlockCommand::Create { .. } => Some("block_create"),
+            BlockCommand::Create(_) => Some("block_create"),
             BlockCommand::Status { .. } => Some("block_status"),
             // `reproject` rewrites a block's spans through the ordinary
             // sequenced mutation path, so it is gated exactly like the other
@@ -409,22 +405,7 @@ impl KjDispatcher {
                 block_id,
                 original,
             } => self.block_diff(&block_id, original.as_deref(), caller),
-            BlockCommand::Create {
-                role,
-                kind,
-                content,
-                parent,
-                after,
-                context,
-            } => self.block_create(
-                context.as_deref(),
-                &role,
-                &kind,
-                content.as_deref().unwrap_or(""),
-                parent.as_deref(),
-                after.as_deref(),
-                caller,
-            ),
+            BlockCommand::Create(args) => self.block_create(args, caller),
         }
     }
 
@@ -1692,28 +1673,17 @@ impl KjDispatcher {
         KjResult::ok_with_data(out, record)
     }
 
-    /// Create a new block. Mirrors `block_create` MCP tool semantics: status
-    /// defaults to Done, content_type to Plain. Returns the new block's id
-    /// in both the rendered text and the structured `data` payload so the
-    /// id is iterable (`for id in $(kj block create ...)`).
-    fn block_create(
-        &self,
-        ctx_ref: Option<&str>,
-        role: &str,
-        kind: &str,
-        content: &str,
-        parent: Option<&str>,
-        after: Option<&str>,
-        caller: &KjCaller,
-    ) -> KjResult {
+    /// Create a Done block and return its id as text and structured data.
+    fn block_create(&self, args: BlockCreateArgs, caller: &KjCaller) -> KjResult {
+        let BlockCreateArgs { role, kind, content, content_type, parent, after, context } = args;
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(ctx_ref, caller, &db) {
+            match resolve_context_arg(context.as_deref(), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj block create: {e}")),
             }
         };
-        let role_p = match Role::from_str(role) {
+        let role_p = match Role::from_str(&role) {
             Some(r) => r,
             None => {
                 return KjResult::Err(format!(
@@ -1721,7 +1691,7 @@ impl KjDispatcher {
                 ));
             }
         };
-        let kind_p = match BlockKind::from_str(kind) {
+        let kind_p = match BlockKind::from_str(&kind) {
             Some(k) => k,
             None => {
                 return KjResult::Err(format!(
@@ -1729,7 +1699,7 @@ impl KjDispatcher {
                 ));
             }
         };
-        let parent_id = match parent {
+        let parent_id = match parent.as_deref() {
             None => None,
             Some(s) => match kaijutsu_types::BlockId::from_key(s) {
                 Some(id) => Some(id),
@@ -1740,7 +1710,7 @@ impl KjDispatcher {
                 }
             },
         };
-        let after_id = match after {
+        let after_id = match after.as_deref() {
             None => None,
             Some(s) => match kaijutsu_types::BlockId::from_key(s) {
                 Some(id) => Some(id),
@@ -1759,9 +1729,9 @@ impl KjDispatcher {
             after_id.as_ref(),
             role_p,
             kind_p,
-            content,
+            content.unwrap_or_default(),
             Status::Done,
-            ContentType::Plain,
+            ContentType::from_mime(&content_type),
             Some(caller.actor_id),
         ) {
             Ok(id) => id,
@@ -1891,7 +1861,7 @@ impl Classify for BlockCommand {
             BlockCommand::Reproject { .. }
             | BlockCommand::Append { .. }
             | BlockCommand::Status { .. }
-            | BlockCommand::Create { .. } => Effect::Write,
+            | BlockCommand::Create(_) => Effect::Write,
             BlockCommand::Edit { op, .. } => op.effect(),
         }
     }
@@ -3261,6 +3231,28 @@ mod tests {
             parsed.principal_id, performer,
             "the new block's author must be the performer (actor_id), not the requester"
         );
+    }
+
+    #[tokio::test]
+    async fn block_create_explicit_content_type() {
+        let d = test_dispatcher().await;
+        let ctx = register_context_with_doc(&d, Some("typed"), PrincipalId::new());
+        let caller = caller_with_context(ctx);
+        let result = d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("system"), s("--kind"), s("text"),
+            s("--content-type"), s("text/markdown"), s("--content"), s("--literal\n\n"),
+        ], &caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].content_type, ContentType::Markdown);
+        assert_eq!(blocks[0].content, "--literal\n\n");
+        let result = d.dispatch(&[
+            s("block"), s("create"), s("--role"), s("system"), s("--kind"), s("text"),
+            s("--content-type"), s("text/markdwon"),
+        ], &caller).await;
+        assert!(!result.is_ok(), "invalid MIME type must fail");
+        assert_eq!(d.block_store().block_snapshots(ctx).unwrap().len(), 1);
     }
 
     #[tokio::test]

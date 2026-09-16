@@ -463,28 +463,17 @@ impl Tool for KjBuiltin {
         let confirmed = crate::kj::parse::has_flag(&argv, &["--confirm"]);
         crate::kj::parse::strip_flag(&mut argv, &["--confirm"]);
 
-        // Stdin → --content for `kj rc add`/`edit`. Lets shell pipelines
-        // author multi-line .md / .kai scripts without the
-        // `--content "$(cat …)"` dance:
-        //   cat prompt.md | kj rc add /config/rc/coder/create/S00-stance.md
-        // Only kicks in when --content was not given explicitly. `kj config
-        // set`/`edit` were here too until config stopped having write verbs;
-        // a config body now goes to `builtin.file:write` like any other file.
-        // If more kj subcommands grow
-        // stdin appetite, promote this to the dispatcher signature.
+        // Preserve stdin exactly when the command accepts content and no
+        // explicit --content was supplied. File redirection avoids command
+        // substitution's trailing-newline removal and stdout preview limits.
         if wants_stdin_content(&argv) && !crate::kj::parse::has_flag(&argv, &["--content"]) {
-            // kaish 0.13 split stdin reads into a `Result` so a read error
-            // (e.g. binary piped into a text-only verb) is explicit rather than
-            // folded into `None`. Surface it loudly instead of silently running
-            // without `--content` (which would fail downstream as a confusing
-            // "missing content").
             match ctx.read_stdin_to_text().await {
                 Ok(Some(body)) if !body.is_empty() => {
                     argv.push("--content".into());
                     argv.push(body);
                 }
                 Ok(_) => {} // no stdin (or empty) — nothing to inject
-                Err(e) => return ExecResult::failure(1, format!("kj: reading piped stdin: {e}")),
+                Err(e) => return ExecResult::failure(1, format!("kj: reading stdin: {e}")),
             }
         }
 
@@ -661,20 +650,14 @@ fn rc_depth_from_scope(scope: &kaish_kernel::interpreter::Scope) -> Result<u8, S
     })
 }
 
-/// Whether this `kj` invocation should have piped stdin promoted to
-/// `--content` when the flag was omitted. `argv` here is post-normalization
-/// (`--confirm`/`--json` already stripped).
-///
-/// Only `kj rc add`/`edit` want this now. `kj config set`/`edit` were on this
-/// list until config stopped having write verbs at all — pipe a body into
-/// `builtin.file:write` instead, the same way you would for any other file.
+/// Promote stdin to --content for these commands unless explicitly supplied.
 fn wants_stdin_content(argv: &[String]) -> bool {
     matches!(
         (
             argv.first().map(String::as_str),
             argv.get(1).map(String::as_str)
         ),
-        (Some("rc"), Some("add")) | (Some("rc"), Some("edit"))
+        (Some("rc"), Some("add")) | (Some("block"), Some("create"))
     )
 }
 

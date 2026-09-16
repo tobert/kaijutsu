@@ -518,6 +518,11 @@ impl EmbeddedKaish {
         self.kernel.get_var(name).await
     }
 
+    /// Set the invoked script name (`$0`) and its positional arguments.
+    pub async fn set_positional(&self, script_name: &str, args: Vec<String>) {
+        self.kernel.set_positional(script_name, args).await
+    }
+
     /// Set a variable value.
     pub async fn set_var(&self, name: &str, value: kaish_kernel::ast::Value) {
         self.kernel.set_var(name, value).await

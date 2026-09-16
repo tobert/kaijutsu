@@ -146,9 +146,9 @@ hydration. Printing a file therefore does not replace `.md` block creation.
 
 The locked kaish dependency is 0.17.2 at `a9807a64078f136b7a559e8fbde562086149889f`.
 Its public `Kernel::set_positional(script_name, args)` supplies `$0` and
-arguments. `EmbeddedKaish` does not expose that operation, and rc currently
-executes the captured body without setting the script name. No upstream API
-addition is established as necessary.
+arguments. `EmbeddedKaish::set_positional` exposes that operation, and rc
+sets the invoked VFS path before executing each captured body. No upstream
+API addition was needed.
 
 The proposed replacement has these acceptance conditions:
 
@@ -164,10 +164,12 @@ The proposed replacement has these acceptance conditions:
    creator attribution: "Use the invoking performer consistently with kj."
    Existing blocks keep their authors. Prove role, kind, author, status, content
    type, order, and content fidelity through the real `kj` path, including
-   distinct requester, performer, and context creator. `kj block create` currently defaults to plain text and has no content
-   type flag; `--content` with command substitution also needs a trailing-
-   newline and output-limit check. Choose an existing adequate block-authoring
-   path or fix its missing operation before deleting `run_md_script`.
+   distinct requester, performer, and context creator. `kj block create` accepts
+   stdin when `--content` is omitted and an explicit `--content-type`. Direct
+   file redirection preserves trailing newlines and bypasses stdout preview
+   limits; a regression covers more than 4 MiB of UTF-8 text through regular
+   and symlinked scripts. Missing files and invalid UTF-8 must produce an
+   error without authoring an instruction block.
 4. Executable bodies still snapshot at lifecycle start. Ordinary companion
    reads happen when the script runs. Document that change from automatic
    Markdown snapshotting; do not quietly recreate a dependency loader to hide

@@ -57,6 +57,28 @@ excluded, ephemeral, draft, and empty instruction blocks. A failed block read
 stops both preview and live turn preparation. An existing context with no
 instruction sections remains valid.
 
+## Explicit instruction scripts
+
+```sh
+kj block create --role system --kind text --content-type text/markdown < "$0.txt"
+```
+
+An rc script's `$0` is its invoked VFS path, including a symlink's name.
+The example reads a companion named `S00-instructions.kai.txt` when invoked
+as `S00-instructions.kai`. The file is ordinary data, read when the script
+runs. Missing files or invalid UTF-8 fail visibly. Redirection preserves
+trailing newlines and does not route instruction text through stdout limits.
+`--content` takes precedence over stdin when explicitly supplied.
+
+New blocks are Done and authored by the invoking performer, consistently
+with other `kj` writes. The context creator and requester may differ.
+`--content-type` defaults to `text/plain`; use `text/markdown` for Markdown.
+Existing instruction blocks retain their authors and content.
+
+Automatic `.md` loading remains supported during migration. Until that
+handler is removed, use a non-`.md` companion as above to avoid loading
+instructions twice. The shipped seeds have not moved to this path yet.
+
 ## Characters and lifecycle observations
 
 `kj context create ROOT-next --type director --cast ops --as banto` records

@@ -1502,6 +1502,15 @@ migration. Amy resolved its authorship split: "Use the invoking performer
 consistently with kj." The replacement must test a distinct context creator
 and performer; existing instruction blocks retain their authors.
 
+Rc now supplies the invoked VFS path as `$0`. `kj block create` accepts exact
+stdin text and an explicit content type, so scripts can author Markdown
+instructions through the ordinary performer-attributed write path. File
+redirection preserves trailing newlines and avoids stdout preview limits.
+Tests cover distinct creator/requester/performer identities, symlink-relative
+companions, input beyond the internal output ceiling, invalid UTF-8, missing
+files, empty input, and explicit content precedence. This enables the seed
+migration; automatic Markdown loading remains until those callers move.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

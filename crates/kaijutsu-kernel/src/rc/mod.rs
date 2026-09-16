@@ -602,6 +602,8 @@ async fn run_kai_script(
         vars.insert(k.clone(), kaish_kernel::ast::Value::String(v.clone()));
     }
 
+    kaish.set_positional(&script.path, Vec::new()).await;
+
     // Apply the kernel's rc timeout independently to each script.
     let timeout = kaish.timeouts().rc_script_timeout;
     let opts = kaish_kernel::ExecuteOptions::new()

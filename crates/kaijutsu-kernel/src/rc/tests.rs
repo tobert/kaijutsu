@@ -3,6 +3,95 @@
     use kaijutsu_types::{ContextId, PrincipalId};
 
     #[tokio::test]
+    async fn rc_explicit_instructions_preserve_input_and_performer() {
+        use crate::vfs::VfsOps;
+        for symlinked in [false, true] {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let creator = PrincipalId::new();
+            let ctx = register_context(&d, Some("explicit"), None, creator);
+            set_context_type(&d, ctx, "explicit");
+            let mut caller = caller_with_context(ctx);
+            caller.actor_id = PrincipalId::new();
+            assert_ne!(creator, caller.principal_id);
+            assert_ne!(creator, caller.actor_id);
+            assert_ne!(caller.principal_id, caller.actor_id);
+            let path = "/config/rc/explicit/create/S00-instructions.kai";
+            // Exceeds both the agent preview and internal output limits. Stdin
+            // is instruction data and must never be replaced with a preview.
+            let body = format!("--literal option\n{}\n\n", "頑張（がんば）って！\n".repeat(170_000));
+            install_rc_script_file(&d, &format!("{path}.txt"), &body).await;
+            let program = r#"kj block create --role system --kind text --content-type text/markdown < "$0.txt""#;
+            if symlinked {
+                install_rc_script_file(&d, "/config/rc/lib/create/S00-shared.kai", program).await;
+                d.kernel().vfs().symlink(
+                    std::path::Path::new(path),
+                    std::path::Path::new("../../lib/create/S00-shared.kai"),
+                ).await.expect("script symlink");
+            } else {
+                install_rc_script_file(&d, path, program).await;
+            }
+            crate::rc::run(&d, RcInvocation::new("create", ctx), &caller).await.unwrap();
+            let blocks = d.block_store().block_snapshots(ctx).unwrap();
+            let instructions: Vec<_> = blocks.iter()
+                .filter(|b| b.role == Role::System && b.kind == BlockKind::Text).collect();
+            assert_eq!(instructions.len(), 1, "expected one instruction block; kinds: {:?}",
+                blocks.iter().map(|b| (&b.kind, b.content.chars().take(2000).collect::<String>())).collect::<Vec<_>>());
+            let instruction = instructions[0];
+            assert_eq!(instruction.id.principal_id, caller.actor_id);
+            assert_eq!(instruction.status, Status::Done);
+            assert_eq!(instruction.content_type, ContentType::Markdown);
+            assert_eq!(instruction.content.len(), body.len());
+            assert!(instruction.content == body, "instruction bytes differ");
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_instruction_input_errors_do_not_author_blocks() {
+        use crate::vfs::VfsOps;
+        for invalid_utf8 in [false, true] {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let ctx = register_context(&d, Some("bad-input"), None, PrincipalId::new());
+            set_context_type(&d, ctx, "badinput");
+            let path = "/config/rc/badinput/create/S00-instructions.kai";
+            install_rc_script_file(&d, path,
+                r#"kj block create --role system --kind text --content-type text/markdown < "$0.txt""#,
+            ).await;
+            if invalid_utf8 {
+                d.kernel().vfs().write_all(std::path::Path::new(&format!("{path}.txt")),
+                    &[b'a', 0xff, b'\n']).await.unwrap();
+            }
+            crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+            let blocks = d.block_store().block_snapshots(ctx).unwrap();
+            assert!(!blocks.iter().any(|b| b.kind == BlockKind::Text));
+            assert!(blocks.iter().any(|b| b.kind == BlockKind::Error), "input failure must be visible");
+            let run = find_run_for_context(&d, ctx, "create").unwrap();
+            assert_eq!(run.outcome, Some(RcOutcome::Failed));
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_instruction_content_precedence_and_empty_input() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let ctx = register_context(&d, Some("input-precedence"), None, PrincipalId::new());
+        set_context_type(&d, ctx, "precedence");
+        install_rc_script_file(&d, "/config/rc/precedence/create/S00-instructions.kai", r#"
+            echo ignored | kj block create --role system --kind text --content 'explicit'
+            kj block create --role system --kind text < "$0.txt"
+        "#).await;
+        install_rc_script_file(&d, "/config/rc/precedence/create/S00-instructions.kai.txt", "").await;
+        crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let instructions: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Text).collect();
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].content, "explicit");
+        assert_eq!(instructions[1].content, "");
+        assert!(instructions.iter().all(|b| b.content_type == ContentType::Plain));
+    }
+
+    #[tokio::test]
     async fn unknown_lifecycle_verb_is_an_error() {
         let d = test_dispatcher().await;
         let caller = unjoined_caller();
