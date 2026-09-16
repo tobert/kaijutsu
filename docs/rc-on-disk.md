@@ -39,6 +39,28 @@ Shared prompt text is an ordinary rc file chosen through relative symlinks.
 Coder and default opt in; other context types keep their own instructions.
 See `docs/prompts.md` for composition and when edited text reaches a context.
 
+## Rc lifecycle and kaish execution
+
+Rc owns lifecycle discovery, lexical order, captured script bodies, lifecycle
+facts, recursion limits, run records, and failure reporting. Kaish integration
+owns constructing and executing a contextual shell. Broker hooks and editor
+commands use that integration with their own policies and result contracts.
+A hook file under `/config/rc/lib/hooks/` is interpreted by the broker's hook
+protocol, not dispatched as an rc lifecycle entry.
+
+Today both `.kai` and `.md` entries participate in lifecycle discovery. The
+link's filename controls ordering and dispatch; `.md` authors a system-text
+block, while `.kai` runs a program. Successful program output is diagnostic
+trace text, not an instruction block. The loader reads bodies directly through
+the VFS before the first script runs.
+
+[Kaish integration and rc lifecycle](kaish-integration.md) owns the complete
+migration plan. It calls for executing only `.kai` entries and treating
+Markdown as data explicitly read by those scripts. That proposal includes
+setting `$0` to the invoked VFS path, authoring instruction blocks explicitly,
+and documenting ordinary data reads separately from captured executable bodies.
+No loader, seed, or reseed behavior changes with this documentation update.
+
 ## The four decisions
 
 1. **Location: `~/.config/kaijutsu/config/rc/`** (`~/.config/kaijutsu/etc/rc/`

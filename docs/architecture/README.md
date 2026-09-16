@@ -12,6 +12,8 @@ say so (see [Stale docs & surprises](#stale-docs--surprises)).
 - **[overview](README.md)** — this file: the system in one read.
 - **[foundation.md](foundation.md)** — `kaijutsu-types` + the Cap'n Proto wire
   schema. The shared vocabulary and the block document model.
+- **[kaish integration and rc lifecycle](../kaish-integration.md)** — shared
+  execution ownership and the complete caller migration plan.
 - **[kernel.md](kernel.md)** — `kaijutsu-kernel`: the instrument's body (VFS,
   block store, MCP broker, LLM, drift, persistence, the embedded shell).
 - **[server.md](server.md)** — `kaijutsu-server`: SSH transport, the Cap'n Proto
@@ -87,17 +89,16 @@ capability allow-set on each context (see [Trust model](#trust-model)).
 
 ![Kernel anatomy](diagrams/02-kernel-anatomy.svg)
 
-`Kernel` (`kaijutsu-kernel/src/kernel.rs:41`) is the coordination center. Every
-field is `Arc`/`OnceLock`-wrapped for shared async ownership. It owns or wires
-together:
+`Kernel` (`kaijutsu-kernel/src/kernel.rs:41`) is the coordination center.
+It owns or wires together:
 
 | Subsystem | Type | Role |
 |---|---|---|
 | VFS | `Arc<MountTable>` | Path-routed multiplexer over Local/Memory backends; `Kernel` itself impls `VfsOps` so a kernel can be mounted. |
-| Block documents | `SharedBlockStore` | The durable, multi-writer conversation block log, one document per context. Registered into the broker at startup, not owned by `Kernel` directly. |
+| Block documents | `SharedBlockStore` | The durable, multi-writer conversation block log, one document per context. Owned by `Kernel` and shared with the broker and file cache. |
 | Tool dispatch | `Arc<Broker>` | The **single** MCP tool pipeline — builtins (virtual in-process servers) and external rmcp servers, with capability gating and hooks. |
 | Context registry | `SharedDriftRouter` | Single source of truth for live contexts; also the drift staging queue + dead-letter/lost+found. |
-| Events | `FlowBus` ×3 | Topic pub/sub for block events, input-doc events, and autonomous-turn requests. |
+| Events | `FlowBus` ×4 | Block, turn, editor, and ledger events. Compose drafts travel on the block feed. |
 | Models | `LlmRegistry` | Named providers + default; alias resolution. |
 | Peers | `PeerRegistry` | Reverse-RPC callbacks (the Bevy app, external MCP) for `invoke_peer`. |
 | Blobs | `Arc<FileStore>` (CAS) | Content-addressed binary store (images, large payloads). |
@@ -110,8 +111,11 @@ block storage, event broadcast, context lookup, hydration, and drift staging.
 
 **kaish**, the shell, runs embedded inside the kernel. `EmbeddedKaish`
 (`kaijutsu-kernel/src/runtime/embedded_kaish.rs:59`) runs the kaish interpreter
-**in-process** against the VFS and a kernel-owned file cache. There is no separate
-kaish process and no Unix socket.
+**in-process** against the VFS and a kernel-owned file cache. Each invocation
+gets a fresh contextual shell and shares its context's job manager. Rc lifecycle
+orchestration, broker hooks, and editor commands are distinct consumers of that
+execution mechanism. See
+[the migration plan](../kaish-integration.md) for the remaining ownership gaps.
 
 ---
 

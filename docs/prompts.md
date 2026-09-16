@@ -1,5 +1,11 @@
 # Prompts
 
+This document describes current behavior. The complete kaish/rc migration is
+planned in [Kaish integration and rc lifecycle](kaish-integration.md). It
+replaces automatic `.md` instruction loading with explicit `.kai`
+block authoring. The loader and examples below remain supported until that
+change migrates the seeds and verifies the instructions models receive.
+
 ## Context types choose their instructions
 
 ```text

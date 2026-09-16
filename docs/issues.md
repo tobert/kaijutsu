@@ -28,15 +28,19 @@ preserve context/conversation separation. See `docs/conversation-session.md`.
 
 ### Turn execution and shell settlement
 
-Move the headless turn driver, interruption,
-and resumption lifecycle from server `rpc.rs` into kernel runtime ownership.
-Keep connection/session subscriptions in the server. In a separate change,
-project one settled shell outcome into blocks, receipts, and job results;
-share it with the MCP shell path. Preserve read-only execution, explicit
-identity, output profiles, hooks, cwd/env persistence, and context switching.
-Require interactive/model/approval-resume parity tests for the shared outcome,
-including cancellation and PostCall substitution. Keep JobManager and durable
-receipts separate. Do not combine this with a constructor API redesign.
+The complete kaish/rc migration is planned in
+[Kaish integration and rc lifecycle](kaish-integration.md), including the
+caller inventory, implementation order, verification, and deletion criteria.
+Move contextual construction into runtime ownership and keep rc lifecycle
+orchestration distinct. Migrate every production entry path and relevant test;
+remove the old factory family and duplicate completion code after their final
+callers move. Clean adjacent comments and module docs with each change.
+
+Shared command settlement and headless turn ownership remain separate changes.
+Keep connection/session subscriptions in the server and preserve JobManager's
+execution lifetime separately from durable receipts. Replace rc
+`.md` handlers with explicit `.kai` block authoring; the new plan records the
+`$0`, symlink, content-fidelity, and data-read semantics that must be tested.
 
 ### Shared client recovery
 
@@ -73,16 +77,16 @@ checks, pinning, and swap acknowledgment. Start with restart/recovery and
 external-edit regressions from `docs/file-buffers.md`; only then remove clean
 read materialization. This remains a separate design change.
 
-**Order:** runtime settlement, shared recovery, rendering, then file-buffer
-persistence. Each requires its own reviewable change; the source TODOs point
-to these entries.
+**Order:** kaish/rc migration (construction, rc, settlement, then turn
+ownership), shared recovery, rendering, then file-buffer persistence. Each
+requires its own reviewable change; the source TODOs point to these entries.
 
 ### Kernel architecture overview needs a refresh
 
-`docs/architecture/kernel.md` still claims `Kernel` does not own `BlockStore`
-and describes input-document tables and buses that compose drafts no longer
-use. Recheck the overview against current field and schema owners; avoid
-using that inventory as a contract until it is reconciled.
+Finish the symbol and schema inventory review alongside the runtime migration.
+Keep the architecture overview's current implementation separate from the
+planned destination in `docs/kaish-integration.md`; update server ownership,
+lifecycle callers, and diagrams when the code moves.
 
 ## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
 
@@ -1883,23 +1887,6 @@ Still true: no `doctor`/`check` verb exists in
 something like `kj backend check <name>` (or `--check` on `kj backend
 list`) that probes a configured endpoint and reports reachability + model
 list.
-
----
-
-## Background exec → kaish's job system — doctrine now contradicts the code (2026-08-07)
-
-`background_exec.rs`'s module header (last touched 2026-09-04) now argues the
-migration is structurally wrong — a per-call `EmbeddedKaish` can't host a job
-that outlives the call, and kaish's job streams are ephemeral/in-process —
-and presents `spawn_background` as the deliberate, permanent design.
-AGENTS.md's "Config and execution" rule still names only the MCP
-stdio launch as the sanctioned exception; `background_exec.rs` isn't named
-there. The kaish-side worktree this entry was blocked on
-(`~/src/wt/kaish-jobs-embedder`) no longer exists.
-
-**Needs Amy's word:** either name `background_exec.rs` as a second
-sanctioned exception in CLAUDE.md, or reopen the migration. Nothing here
-decides it.
 
 ---
 

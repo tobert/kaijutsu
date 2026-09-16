@@ -1,8 +1,8 @@
 # The kernel
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-kernel` — the
-largest crate (~82k LOC) and the instrument's body. Code is truth: every
-pointer below names a symbol, not a line to trust blindly — `grep` it.*
+instrument's body. Source symbols identify implementation owners; numeric
+line references in older sections may have moved.*
 
 The kernel owns context data, model interactions, the VFS, and tools. It does
 **not** run an LLM turn (the server does); it supplies everything a turn needs.
@@ -11,21 +11,20 @@ The kernel owns context data, model interactions, the VFS, and tools. It does
 
 ## `Kernel` (`src/kernel.rs:41`)
 
-Every field is `Arc`/`OnceLock`-wrapped. The coordinator owns: `vfs:
-Arc<MountTable>`, `name: RwLock<String>`, `llm: RwLock<LlmRegistry>`,
-`peers: RwLock<PeerRegistry>`, `consent_mode`, three `FlowBus`es (`block_flows`,
-`turn_flows`, input via the broker), `drift: SharedDriftRouter`, `cas:
-Arc<FileStore>`, `image_backends`, `broker: Arc<Broker>`, `timeouts`,
-`file_cache: OnceLock<Arc<FileDocumentCache>>`, `nonce_stores`, `timelines:
-DashMap<ContextId, SharedTimeline>`, and `beat_ingress`.
+`Kernel` owns the shared `BlockStore`, `KernelDb` handle, VFS mount table,
+and `FileDocumentCache`. Constructors build these services together; callers
+use `blocks()`, `kernel_db()`, `vfs()`, and `file_cache()` to reach the same
+instances. `new` and `with_flows` share initialization.
 
-Notably the `Kernel` **does not own a `BlockStore`** — it receives one at
-`register_builtin_mcp_servers` (`kernel.rs:797`) and routes it into the broker.
-Key methods: `dispatch_tool_via_broker` (`:539`), `attach_peer`/`invoke_peer`
-(`:2064`/`:2078`), `arm_timeline`/`disarm_timeline` (`:1139`/`:1172`). `Kernel`
-impls `VfsOps` by forwarding to `self.vfs` (`:2300`) so a kernel can be mounted
-inside another — "everything is a kernel." (There is no `init_kv` — the KV
-store it once seeded was demolished; kaish's VFS is the shared-state path now.)
+Other owners include the model registry, broker, peer registry, drift router,
+CAS, timeout and consent policies, timelines, and audio registries. Four flow
+buses carry block, turn, editor, and ledger events. `ShellOperationRegistry`
+owns durable operation receipts and the per-context kaish job managers.
+
+The server still owns the headless turn and approval-resume drivers. The
+planned move into kernel runtime ownership is separate from shared shell
+construction and settlement; see `docs/kaish-integration.md`. `Kernel`
+implements `VfsOps` by forwarding to its mount table.
 
 ---
 
@@ -37,7 +36,7 @@ SQLite (WAL, `rusqlite`), one `Connection` behind `Arc<Mutex<KernelDb>>`. Full
 schema laid down on open (`SCHEMA`, `:500`); migrations are "bump = wipe" except
 additive `ALTER TABLE` guards (`apply_additive_migrations`, `:2012`) that
 propagate a genuine failure instead of swallowing it — only SQLite's
-"duplicate column" case is treated as already-migrated. ~20 tables:
+"duplicate column" case is treated as already-migrated. Selected tables:
 
 | Table(s) | Purpose |
 |---|---|
@@ -47,7 +46,6 @@ propagate a genuine failure instead of swallowing it — only SQLite's
 | `documents` | document registry |
 | `contexts`, `context_edges` | per-conversation metadata + DAG edges (fork/drift provenance) |
 | `oplog`, `doc_snapshots` | append-only op journal + compaction checkpoints |
-| `input_oplog`, `input_doc_snapshots` | same, for per-context compose input docs |
 | `context_shell`, `context_env` | per-context cwd + env overrides |
 | `context_bindings` (+5 children) | per-context capability allow-sets (deny by default) |
 | `hooks`, `hook_scripts` | match-action hooks + shared kaish bodies |
@@ -108,15 +106,15 @@ back when a write into the sink fails, so the flush cannot lose them.
 
 ### Events — `FlowBus<T>` (`src/flows.rs:1006`)
 
-Topic-partitioned pub/sub (`async-broadcast`, NATS-style `*`/`>` wildcards).
-Three buses: **block** (`BlockFlow`: Inserted, TextAppended, TextReplaced,
-Deleted, StatusChanged, CollapsedChanged, ExcludedChanged, Moved,
-OutputChanged, MetadataChanged, SpansChanged, ContextSwitched, RenderCue,
-BeatSync — each carrying `OpSource` Local/Remote to break echo loops).
-`TextAppended`/`TextReplaced` are the append-or-replace classification the
-per-context change feed carries instead of decoded text-engine operations
-(`docs/change-feed.md`); there is no `SyncReset` — a replica has nothing to
-reset. Also **input-doc**, and **turn** (`turn.requested`/`completed`/`failed`).
+Topic-partitioned publish/subscribe with NATS-style `*`/`>` wildcards. The
+kernel owns block, turn, editor, and ledger buses. Block mutations publish
+complete acceptance groups; ordered subscribers receive them without loss or
+are terminated for recovery. Timing directives use a separate lane.
+
+Compose input is a `Draft` block and travels on the block feed. There is no
+input-document bus. `TextAppended` and `TextReplaced` carry the kernel's text
+classification; clients do not decode storage operations. See
+`docs/change-feed.md` for grouping, ordering, and recovery.
 
 ### Peers — `PeerRegistry` (`src/peers.rs:115`)
 
@@ -142,27 +140,48 @@ directory. `seed_presets.rs`, `seed_scripts.rs`
 
 ## The embedded shell + VFS
 
-The old design ran kaish as a separate sandboxed process over a socket. **The code
-embeds it.** See [overview](README.md#process--transport-model).
+Kaish runs in-process against the kernel VFS and shared file cache. Rc is a
+separate lifecycle consumer of that interpreter. The complete caller migration
+and intended ownership are in [Kaish integration and rc lifecycle](../kaish-integration.md).
+The description here is the current implementation.
 
-### `EmbeddedKaish` (`src/runtime/embedded_kaish.rs:59`)
+### Construction and execution
 
-Owns one `kaish_kernel::Kernel`, a `SessionContextMap`, a `SessionId`, and the
-timeout policy. `with_identity_mode` (`:265`) is the builder: registers the
-session→context pair, gets the shared
-`FileDocumentCache`, builds `KaijutsuBackend`, clones the `Arc<MountTable>`, wraps
-it in a `MountBackend` (writable or read-only), and constructs the kaish kernel
-with `/v/docs` and `/v/swap` mounted. `execute_with_options` is the
-single entry. cwd persists in the kaish kernel and is restored from the DB via the
-**backend namespace**, not host-FS `is_dir()` (`restore_cwd_from_db`, `:556`).
+`runtime/embedded_kaish.rs::EmbeddedKaish` owns one kaish kernel, invocation
+session/context tracking, and timeout policy. Its common constructor wires
+`MountBackend`, `/v/docs`, `/v/swap`, host execution policy, output limits,
+and the context's shared JobManager. Foreground and background execution
+methods both propagate tracing. Background work can outlive the shell that
+started it.
 
-Backends: **`KaijutsuBackend`** (routes `/docs/{ctx}/{block}` into the block
-store + tool dispatch), **`MountBackend`** (the primary `KernelBackend`; routes
-file I/O through the document cache on writable mounts, raw VFS otherwise;
-`deny_if_read_only` gates mutations), **`KaijutsuFilesystem`** (adapts kernel documents to the kaish
-`Filesystem` trait), **`ReadOnlyFs`** (refuses all mutations), **`SwapFilesystem`**
-(read-only view of unflushed file buffers at `/v/swap/<kernel-id>/<real-path>`,
-`docs/file-buffers.md`). `SessionContextMap` is a global `DashMap<SessionId, ContextId>`.
+`kj/context_shell.rs` supplies the shared context-shell factory used by
+interactive commands, model shells, rc, hooks, and editor reads. Each invocation
+gets a fresh session map, explicit identity, registered Kaijutsu builtins, and
+restored durable environment/cwd. Restoration checks the backend namespace.
+Read-only shells refuse filesystem mutation and host subprocess execution by
+construction. Output profile and rc authority are separate choices.
+
+Rc, hook, and editor callers interpret their own results. Interactive commands
+and approval resume share server `shell_run.rs`; MCP shell completion has a
+separate path. Cwd/export write-back helpers still live in server `rpc.rs`.
+These are the ownership gaps the migration must close.
+
+`spawn_kaish_thread` in kernel `lib.rs` reserves a 16 MiB stack for dedicated
+threads that can enter kaish. Server `main.rs` configures the Tokio worker
+stack too. The requirement applies to any command that can re-enter rc through
+`kj`; the helper itself does not construct a shell or runtime.
+
+### Backends and builtin adapters
+
+`KaijutsuBackend` connects block access and tool dispatch to kernel state.
+`MountBackend` routes host-mounted file access through the kernel file cache
+where required. `KaijutsuFilesystem` implements `/v/docs`; `ReadOnlyFs`
+restricts mutations; `SwapFilesystem` exposes dirty buffers read-only at
+`/v/swap/<kernel-id>/<real-path>`. `KjBuiltin`, editor/job builtins, and the
+configured curl tool implement kaish's tool interface.
+
+A materialized shell uses an isolated `SessionContextMap`. A connection keeps
+its own map; the transport records a shell's context switch there when needed.
 
 ### VFS (`src/vfs/`)
 
@@ -268,13 +287,22 @@ server.
 
 ## Lifecycle: how fork/new/drift hook in
 
-Context creation writes `KernelDb` rows, then `DriftRouter::register[_fork]`, then
-runs the **rc lifecycle scripts** under `/config/rc/<context_type>/<verb>/` (kaish
-scripts, sort-key order): `create` on new, `fork` on fork, `drift` on drift,
-`tick` on each beat. These set cache breakpoints, tool bindings, and the
-hydration marker. On fork, `fork_document_filtered` copies the parent document,
-applying `ForkBlockFilter` to drop curated-out blocks — which is why exclude/edit
-take effect "at fork."
+`kj/lifecycle.rs` resolves `/config/rc/<context_type>/<verb>/`, snapshots
+selected bodies before execution, and runs them in lexical filename order.
+Wired verbs are `create`, `fork`, `attach`, `drift`, `tick`, `rotate`, and
+`submit`. It supplies lifecycle facts, enforces recursion limits, records runs,
+and emits error/trace blocks. A failed script marks the run failed while later
+scripts continue.
+
+Currently `.md` entries author durable system-text blocks and `.kai` entries
+execute through the shared factory with rc authority and internal output
+limits. Ordinary hooks and editor commands do not receive rc authority.
+Replacing the `.md` handler with explicit scripts is planned;
+see `docs/kaish-integration.md`, "Rc Markdown: explicit instruction authoring".
+
+Prompt composition and hydration rules live in `docs/prompts.md`. Fork copies
+and filters the parent's document before hydrating a new conversation; changing
+an rc source affects later lifecycle runs rather than existing instructions.
 
 ---
 
@@ -290,7 +318,7 @@ take effect "at fork."
   `Arc<MountTable>` directly. Harmless today (one shared table behind every
   clone), but nothing enforces that a future second table couldn't diverge.
 
-No silent fallbacks remain in this crate's core paths: `list_tool_defs_via_broker`
+Examples of explicit failure handling: `list_tool_defs_via_broker`
 propagates a broker error instead of returning an empty list (`kernel.rs:757`);
 `Broker::binding_checked` and `KjDispatcher::require_cap` (`mcp/broker.rs:1404`)
 distinguish a DB read failure from a genuine empty binding rather than

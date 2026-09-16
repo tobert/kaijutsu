@@ -129,7 +129,11 @@ Host execution policy belongs to kaish's `EmbeddedKaish` and its
 `ExternalExec::Allow{path}|Deny` setting in `kj/context_shell.rs`. MCP stdio
 server launch through `rmcp` is the sanctioned config-driven exception.
 A new `Command::new` or `/bin/sh -c` execution path needs a design conversation;
-see the existing `background_exec.rs` discrepancy in `docs/issues.md`.
+asynchronous shell work uses kaish jobs and durable Kaijutsu receipts.
+Read `docs/kaish-integration.md` before changing construction, execution, or rc
+orchestration. It owns the complete caller migration plan. Keep rc lifecycle
+policy distinct from the shared interpreter integration; migrate callers,
+delete superseded APIs, and correct adjacent comments as each area moves.
 
 ## Finding and checking code
 

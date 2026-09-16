@@ -1453,6 +1453,30 @@ or exposed on the wire. Three SSH regressions first reproduced lost typing
 while a hook paused submission, including editing back to the original text.
 Kernel tests cover guarded deletion, stale-token no-ops, and journal replay.
 
+Amy then asked where the recent kaish setup helper landed and whether rc and
+kaish integration needed clearer owners. `spawn_kaish_thread` centralizes stack
+reservation; the older context-shell factory already shares construction.
+Completion still crosses server RPC helpers and separate MCP projection code.
+Rc is an adjacent lifecycle owner, while hooks and editor commands use kaish
+under their own contracts.
+
+The next objective is to "*completely* migrate kaijutsu and clean up all the
+call sites," starting with documentation. `docs/kaish-integration.md` records
+the caller inventory, execution contracts, phased deletion, verification, and
+comment cleanup. This is planned work; the documentation commit changes no
+runtime behavior. The architecture summaries now identify the kernel-owned
+block store and four flow buses, and the stale background-exec exception was
+removed from the live issue list.
+
+Amy is "open to removing the .md feature" and confirmed "that's fine if the
+script uses kj." The plan calls for explicit `.kai`
+instruction authoring with `$0` naming the invoked VFS path. The locked kaish
+already supplies positional-parameter setup; the rc adapter does not call it.
+Printing Markdown currently produces diagnostic trace text, so replacement
+must author a block and verify its content, metadata, and rendered instructions.
+Ordinary companion-file reads also differ from the loader's current snapshot
+of all executable bodies; that choice must stay visible in the migration.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
