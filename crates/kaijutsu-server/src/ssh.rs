@@ -299,11 +299,9 @@ pub struct SshServer {
     config: SshServerConfig,
 }
 
-/// On SIGTERM or SIGINT, run a WAL checkpoint on the kernel database and
-/// exit 0. Holds only the database handle, never the `SharedKernel`, so the
-/// clean-exit `Drop` path stays reachable. A failed handler install is
-/// logged and the process keeps the default signal disposition.
-fn spawn_signal_checkpoint(kernel_db: Arc<Mutex<kaijutsu_kernel::kernel_db::KernelDb>>) {
+/// On SIGTERM or SIGINT, stop command admission, await settlement, then
+/// checkpoint the database and exit. A weak handle keeps host Drop reachable.
+fn spawn_signal_shutdown(kernel: std::sync::Weak<crate::rpc::SharedKernelState>) {
     use tokio::signal::unix::{SignalKind, signal};
     let (mut term, mut int) = match (
         signal(SignalKind::terminate()),
@@ -311,7 +309,7 @@ fn spawn_signal_checkpoint(kernel_db: Arc<Mutex<kaijutsu_kernel::kernel_db::Kern
     ) {
         (Ok(t), Ok(i)) => (t, i),
         (Err(e), _) | (_, Err(e)) => {
-            log::warn!("signal handler not installed; WAL is not checkpointed on stop: {e}");
+            log::warn!("signal handler not installed; commands cannot drain on stop: {e}");
             return;
         }
     };
@@ -320,15 +318,24 @@ fn spawn_signal_checkpoint(kernel_db: Arc<Mutex<kaijutsu_kernel::kernel_db::Kern
             _ = term.recv() => "SIGTERM",
             _ = int.recv() => "SIGINT",
         };
-        log::info!("{name} received; checkpointing the kernel database before exit");
-        match kernel_db.lock().checkpoint() {
+        let Some(kernel) = kernel.upgrade() else { return; };
+        log::info!("{name} received; settling accepted shell commands before exit");
+        kernel.shutdown.cancel();
+        let exit_code = match kernel.kernel.shutdown_command_worker().await {
+            Ok(()) => 0,
+            Err(error) => {
+                log::error!("{name} command worker shutdown failed: {error}");
+                1
+            }
+        };
+        match kernel.kernel_db.lock().checkpoint() {
             Ok((busy, _, _)) if busy != 0 => {
                 log::warn!("{name} wal_checkpoint(TRUNCATE) busy; WAL left for next open");
             }
             Ok(_) => {}
             Err(e) => log::warn!("{name} wal_checkpoint failed: {e}"),
         }
-        std::process::exit(0);
+        std::process::exit(exit_code);
     });
 }
 
@@ -455,10 +462,9 @@ impl SshServer {
             let _ = kernel_tx.send(shared_kernel.clone());
         }
 
-        // systemd `stop` and a terminal Ctrl-C arrive as signals, and the
-        // process dies without unwinding, so `SharedKernelState::drop` never
-        // runs there. Checkpoint the WAL on the signal, then exit.
-        spawn_signal_checkpoint(shared_kernel.kernel_db.clone());
+        // Signal-driven exit must await accepted command settlement; Drop can
+        // signal cancellation but cannot await the command worker.
+        spawn_signal_shutdown(Arc::downgrade(&shared_kernel));
 
         // External MCP servers (mcp.toml — kaibo, bevy_brp, …) start HERE,
         // not inside `create_shared_kernel`: they need the kernel's VFS
@@ -1176,6 +1182,82 @@ impl server::Handler for ConnectionHandler {
 mod tests {
     use super::*;
     use futures::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn signal_shutdown_waits_for_shell_settlement() {
+        const CHILD_DIR: &str = "KAIJUTSU_TEST_SIGNAL_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = PathBuf::from(dir);
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2)
+                .thread_stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK).enable_all().build().unwrap();
+            runtime.block_on(async {
+                use kaijutsu_kernel::mcp::{CallContext, Capability, ContextToolBinding, InstanceId, KernelCallParams};
+                let principal = PrincipalId::new();
+                let db = kaijutsu_kernel::KernelDb::open(dir.join("kernel.db")).unwrap();
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                    principal_id: principal, name: "signal-test".into(), created_at: 1,
+                    retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
+                }).unwrap();
+                db.set_embedding_config(&kaijutsu_kernel::kernel_db::EmbeddingConfigRow {
+                    enabled: false, endpoint: "http://127.0.0.1:9".into(), timeout_ms: 100,
+                    max_in_flight: 1, max_context_bytes: 2048,
+                }).unwrap();
+                drop(db);
+                let shared = crate::rpc::create_shared_kernel(None,
+                    &crate::config_mounts::ConfigMounts::new(dir.join("config")), Some(&dir)).await.unwrap();
+                let context = shared.kernel_db.lock().get_character(principal).unwrap().unwrap().root_ctx.unwrap();
+                let mut binding = ContextToolBinding::new();
+                binding.grant(Capability::Facade("shell".into()));
+                shared.kernel.broker().set_binding(context, binding).await.unwrap();
+                spawn_signal_shutdown(Arc::downgrade(&shared));
+                let call = CallContext::new(principal, context, kaijutsu_types::SessionId::new(), shared.id);
+                let result = shared.kernel.broker().call_tool(KernelCallParams {
+                    instance: InstanceId::new("builtin.shell"), tool: "shell".into(),
+                    arguments: serde_json::json!({"command": "echo started; sleep 30; echo never"}),
+                }, &call, tokio_util::sync::CancellationToken::new()).await.unwrap();
+                let id = result.structured.unwrap()["operation_id"].as_str().unwrap().to_owned();
+                let state = shared.kernel.shell_operations().get(&id, context).unwrap().unwrap();
+                let jobs = shared.kernel.context_job_manager(context);
+                let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while jobs.read_stdout(job.id).await.unwrap().is_empty() { tokio::task::yield_now().await; }
+                }).await.unwrap();
+                fs::write(dir.join("operation"), id).unwrap();
+                assert!(std::process::Command::new("kill").args(["-TERM", &std::process::id().to_string()]).status().unwrap().success());
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                panic!("signal handler did not exit");
+            });
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = fs::File::create(dir.path().join("child.log")).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ssh::tests::signal_shutdown_waits_for_shell_settlement", "--nocapture"])
+            .env(CHILD_DIR, dir.path()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() { break status; }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("signal shutdown stalled: {}", fs::read_to_string(dir.path().join("child.log")).unwrap());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "child failed: {}", fs::read_to_string(dir.path().join("child.log")).unwrap());
+        let id = fs::read_to_string(dir.path().join("operation")).unwrap();
+        let db = rusqlite::Connection::open_with_flags(dir.path().join("kernel.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        use rusqlite::OptionalExtension;
+        let envelope: Option<String> = db.query_row(
+            "SELECT envelope_json FROM shell_operations WHERE operation_id=?1 AND completed_at IS NOT NULL",
+            [&id], |row| row.get(0),
+        ).optional().unwrap();
+        let envelope: kaijutsu_types::shell_envelope::ShellEnvelope = serde_json::from_str(
+            &envelope.expect("SIGTERM exited before accepted shell settlement committed")).unwrap();
+        assert!(envelope.is_error());
+        assert_eq!(envelope.exit_code, Some(130));
+        assert!(!envelope.stdout.contains("never"));
+    }
 
     /// A test kernel must never reach a network classifier. The embedded
     /// seed installs the lfm2d advisory hook on every seat that holds a

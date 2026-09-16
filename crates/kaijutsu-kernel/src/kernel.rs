@@ -438,6 +438,16 @@ impl Kernel {
         if let Some(Ok(worker)) = self.command_worker.get() { worker.stop(); }
     }
 
+    /// Stop accepting commands and wait for their worker to finish settlement.
+    pub async fn shutdown_command_worker(&self) -> Result<(), String> {
+        self.stop_command_worker();
+        match self.command_worker.get() {
+            Some(Ok(worker)) => worker.join().await,
+            Some(Err(error)) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     /// Stable kernel identity.
     pub fn id(&self) -> kaijutsu_types::KernelId {
         self.id

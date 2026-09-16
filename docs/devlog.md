@@ -1643,6 +1643,14 @@ a review wait already committed its terminal record, the enclosing command uses
 that exact outcome for its job result. Already-cancelled admissions settle without
 entering kaish. Panics and abrupt destruction remain separate recovery work.
 
+The process signal path bypassed Drop and exited immediately after a WAL
+checkpoint. A subprocess SIGTERM regression proved that accepted shell receipts
+were still running on disk. The signal handler now waits for a shared worker
+join before checkpointing and exiting. Dropping one join waiter does not lose
+the join; repeated and concurrent callers observe the same completion. The
+same audit found that block pairs without receipts ignored explicit cancellation;
+all command runs now install that token before deciding whether to track a job.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

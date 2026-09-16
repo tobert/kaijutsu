@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 type Work = Box<dyn FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = ()>>> + Send>;
@@ -10,6 +11,8 @@ type Work = Box<dyn FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = ()>
 pub(crate) struct CommandWorker {
     sender: tokio::sync::mpsc::UnboundedSender<Work>,
     shutdown: CancellationToken,
+    thread_id: std::thread::ThreadId,
+    joined: futures::future::Shared<futures::future::BoxFuture<'static, Result<(), String>>>,
 }
 
 impl CommandWorker {
@@ -18,7 +21,7 @@ impl CommandWorker {
         let shutdown = CancellationToken::new();
         let stopped = shutdown.clone();
         let (started, ready) = std::sync::mpsc::sync_channel(1);
-        crate::spawn_kaish_thread("kernel-shell-tools", move || {
+        let thread = crate::spawn_kaish_thread("kernel-shell-tools", move || {
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(error) => { let _ = started.send(Err(error.to_string())); return; }
@@ -52,7 +55,12 @@ impl CommandWorker {
             });
         }).map_err(|e| e.to_string())?;
         ready.recv().map_err(|_| "shell worker stopped during startup".to_string())??;
-        Ok(Self { sender, shutdown })
+        let thread_id = thread.thread().id();
+        let joined = async move {
+            tokio::task::spawn_blocking(move || thread.join().map_err(|_| "shell worker thread panicked".to_string()))
+                .await.map_err(|error| format!("shell worker join failed: {error}"))?
+        }.boxed().shared();
+        Ok(Self { sender, shutdown, thread_id, joined })
     }
 
     pub(crate) fn submit<F, W>(&self, work: W) -> Result<(), String>
@@ -63,6 +71,13 @@ impl CommandWorker {
     }
 
     pub(crate) fn stop(&self) { self.shutdown.cancel(); }
+
+    pub(crate) async fn join(&self) -> Result<(), String> {
+        if std::thread::current().id() == self.thread_id {
+            return Err("shell worker cannot wait for its own shutdown".into());
+        }
+        self.joined.clone().await
+    }
 }
 
 impl Drop for CommandWorker {
@@ -71,6 +86,36 @@ impl Drop for CommandWorker {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_waits_for_work_even_when_a_waiter_is_dropped() {
+        let kernel = crate::Kernel::new_ephemeral("worker-drain").await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (task_entered, task_release, task_finished) = (entered.clone(), release.clone(), finished.clone());
+        kernel.spawn_command(move |stop| async move {
+            stop.cancelled().await;
+            task_entered.notify_one();
+            task_release.notified().await;
+            task_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        }).unwrap();
+        let mut shutdown = Box::pin(kernel.shutdown_command_worker());
+        tokio::select! {
+            result = &mut shutdown => panic!("shutdown returned before settlement: {result:?}"),
+            _ = entered.notified() => {}
+        }
+        drop(shutdown);
+        release.notify_one();
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(kernel.shutdown_command_worker(), kernel.shutdown_command_worker())
+        }).await.unwrap();
+        first.unwrap();
+        second.unwrap();
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        kernel.shutdown_command_worker().await.unwrap();
+        assert!(kernel.spawn_command(|_| async {}).is_err());
+    }
+
     #[tokio::test]
     async fn stopping_before_first_use_prevents_late_worker_startup() {
         let kernel = crate::Kernel::new_ephemeral("stopped-worker").await;

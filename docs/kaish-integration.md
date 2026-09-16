@@ -110,6 +110,11 @@ These are source observations, not promises that all paths behave alike.
   do not enter kaish. Read-only commands discard local cwd/export changes;
   writable commands persist them. Async completion notification reads the settled
   receipt instead of writing a second outcome.
+- SIGTERM/SIGINT await the command worker's thread before checkpointing and
+  exiting. Joining is shared across callers and survives a cancelled waiter;
+  a worker cannot join itself. Host Drop signals cancellation without waiting.
+  Remaining server-owned turn, resume, and transport tasks still need a shared
+  shutdown owner.
 - Live reporting/retry of persistence failures and headless turn ownership
   remain open. Panics and abrupt task destruction before capture still need a
   durable terminal outcome; cooperative worker shutdown now settles execution,

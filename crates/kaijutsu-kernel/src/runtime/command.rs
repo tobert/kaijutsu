@@ -205,6 +205,7 @@ pub async fn run_into_blocks(
     tokio::task::yield_now().await;
 
     let mut options = kaish_kernel::ExecuteOptions::default();
+    options.cancel_token = run.cancel.clone();
     if let Some(stdin) = run.stdin {
         options = options.with_stdin(stdin);
     }
@@ -442,6 +443,16 @@ mod fill_tests {
         assert!(matches!(outcome.execution, CommandExecution::NotRun), "cancelled admission must not start execution");
         assert!(outcome.envelope().is_error());
         assert!(kaish.get_var("SHOULD_NOT_RUN").await.is_none());
+
+        kernel.blocks().create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = kernel.blocks().insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = kernel.blocks().insert_tool_result(ctx, &command, Some(&command), "", false, None, None).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let outcome = run_into_blocks(&kaish, "echo should-not-run", ctx, &command, &output,
+            &kernel, &call, CommandRunOptions { cancel: Some(cancel), ..Default::default() }).await.unwrap();
+        assert!(matches!(outcome.execution, CommandExecution::NotRun), "a pair without a receipt must still honor cancellation");
+        assert_eq!(kernel.blocks().get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Error);
     }
 
     struct PausedHook {

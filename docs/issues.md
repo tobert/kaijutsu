@@ -119,11 +119,10 @@ worker shutdown now cancels and drains accepted work through settlement, includi
 paused hooks and retained review. Panics or abrupt task destruction before capture
 still need live terminal settlement and job/receipt agreement; startup currently
 reports interruption without replaying source.
-The host currently signals worker shutdown from Drop; add an awaitable shutdown
-join before process exit when moving the remaining runtime owners. An OS process
-exit cannot wait for an unjoined worker thread to drain. Also carry an explicit
-command cancellation token into block-pair runs that have no durable receipt;
-the current runner installs that token only when attaching a tracked job.
+SIGTERM/SIGINT now await the command worker before checkpointing and exiting;
+host Drop remains a cancellation signal without a wait. Extend shutdown ownership
+to headless turns, approval resumes, and transport-owned command tasks as those
+owners migrate. Command cancellation also reaches block pairs without receipts.
 
 ### Shared client recovery
 
