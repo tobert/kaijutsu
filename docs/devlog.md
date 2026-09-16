@@ -1423,6 +1423,12 @@ through the real oplog reproduced lost spans and checks text, spans,
 provenance, and the edited marker, including an empty append. The payload
 already carried the distinction, so this needs no storage migration.
 
+Compose now retains the document guard from draft selection through creation,
+editing, or clearing. Each write uses the same acceptance helper; there is no
+second compose lock. Draft creation journals both hydration exclusions in its
+initial snapshot. Controlled pauses reproduced all three released-guard
+windows; competing create/submit calls and journal replay check the result.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

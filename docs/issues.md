@@ -2298,16 +2298,6 @@ shipped. Still open, all verified against current code:
 - **Backgrounds/underlines bake color into vertices** — `ShapeKey::
   baked_theme_epoch` exists for exactly this reason.
 
-## Compose operation selection can race
-
-Block acceptance now holds one document guard through mutation, commit, and
-publication. `get_or_create_draft`, `edit_draft`, and `clear_draft` still select
-a block before entering that boundary. Concurrent first lookups can create
-two drafts for one principal; editing or clearing can race submission.
-Move selection into the same guarded operation, with a regression for each
-interleaving. `submit_draft` and whole-text replacement already read their
-inputs under the acceptance guard.
-
 ## Change-feed batching after ordered acceptance
 
 The block store now publishes in version order. `server/context_feed.rs`

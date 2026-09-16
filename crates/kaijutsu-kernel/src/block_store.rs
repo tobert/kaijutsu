@@ -238,6 +238,8 @@ pub struct BlockStore {
     before_journal: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_compose_selection: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl BlockStore {
@@ -257,6 +259,8 @@ impl BlockStore {
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
             before_publish: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            after_compose_selection: parking_lot::Mutex::new(None),
         }
     }
 
@@ -276,6 +280,8 @@ impl BlockStore {
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
             before_publish: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            after_compose_selection: parking_lot::Mutex::new(None),
         }
     }
 
@@ -299,6 +305,8 @@ impl BlockStore {
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
             before_publish: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            after_compose_selection: parking_lot::Mutex::new(None),
         }
     }
 
@@ -323,6 +331,8 @@ impl BlockStore {
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
             before_publish: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            after_compose_selection: parking_lot::Mutex::new(None),
         }
     }
 
@@ -990,12 +1000,23 @@ impl BlockStore {
         context_id: ContextId,
         mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
     ) -> BlockStoreResult<T> {
-        self.journaling_db()?;
         let mut entry = self.get_mut(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept_locked(context_id, &mut entry, mutate)
+    }
+
+    /// Accept a mutation selected under an existing document guard. Compose
+    /// operations keep this guard across draft lookup and every accepted write.
+    fn accept_locked<T>(
+        &self,
+        context_id: ContextId,
+        entry: &mut DocumentEntry,
+        mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
+    ) -> BlockStoreResult<T> {
+        self.journaling_db()?;
         let before = entry.doc.version();
         entry.poisoned = true;
-        let (payload, events, result) = match mutate(&mut entry) {
+        let (payload, events, result) = match mutate(entry) {
             Ok(prepared) => prepared,
             Err(error) => {
                 entry.poisoned = entry.doc.version() != before;
@@ -1003,7 +1024,7 @@ impl BlockStore {
                 return Err(error);
             }
         };
-        if let Err(error) = self.journal_op(context_id, &entry, payload) {
+        if let Err(error) = self.journal_op(context_id, entry, payload) {
             self.live_status.remove(&context_id);
             tracing::error!(%context_id, %error, "document acceptance failed; restart required");
             return Err(error);
@@ -2056,34 +2077,48 @@ impl BlockStore {
 
     /// This principal's draft block, created empty at the end of the document
     /// if they do not have one yet.
-    // TODO: Hold one compose-operation guard across draft lookup and creation,
-    // and across edit/clear selection. Individual block acceptance is atomic;
-    // these read-then-write helpers are not. See docs/issues.md,
-    // "Compose operation selection can race".
     pub fn get_or_create_draft(
         &self,
         context_id: ContextId,
         principal_id: PrincipalId,
     ) -> BlockStoreResult<BlockId> {
-        if let Some(existing) = self.draft_block(context_id, principal_id)? {
+        let mut entry = self.get_mut(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.get_or_create_draft_locked(context_id, principal_id, &mut entry)
+    }
+
+    fn get_or_create_draft_locked(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+        entry: &mut DocumentEntry,
+    ) -> BlockStoreResult<BlockId> {
+        if let Some(existing) = entry.doc.blocks_ordered().into_iter()
+            .find(|b| b.status == Status::Draft && b.id.principal_id == principal_id)
+        {
             return Ok(existing.id);
         }
-        let last = self.last_block_id(context_id);
-        let id = self.insert_block_as(
-            context_id,
-            None,
-            last.as_ref(),
-            Role::User,
-            BlockKind::Text,
-            "",
-            Status::Draft,
-            ContentType::Plain,
-            Some(principal_id),
-        )?;
-        // Belt and braces with the `Draft` status: hydration checks both, so a
-        // draft cannot reach a model on the strength of one flag.
-        self.set_ephemeral(context_id, &id, true)?;
-        Ok(id)
+        #[cfg(test)]
+        self.pause_after_compose_selection();
+        self.accept_locked(context_id, entry, |entry| {
+            let after_id = entry.doc.block_ids_ordered().last().copied();
+            entry.doc.set_principal_id(principal_id);
+            let id = entry.doc.insert_block(
+                None, after_id.as_ref(), Role::User, BlockKind::Text,
+                "", Status::Draft, ContentType::Plain,
+            )?;
+            // Both hydration exclusions belong to the initial accepted block.
+            entry.doc.set_ephemeral(&id, true)?;
+            entry.touch(principal_id);
+            let snapshot = entry.doc.get_block_snapshot(&id)
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
+            let payload = SyncPayload::from_new_block(snapshot.clone());
+            let events = vec![BlockFlow::Inserted {
+                context_id, block: Arc::new(snapshot), after_id,
+                version: entry.version(), source: OpSource::Local,
+            }];
+            Ok((payload, events, id))
+        })
     }
 
     /// Edit this principal's draft, creating it if absent. Character-indexed,
@@ -2096,8 +2131,14 @@ impl BlockStore {
         insert: &str,
         delete: usize,
     ) -> BlockStoreResult<BlockId> {
-        let id = self.get_or_create_draft(context_id, principal_id)?;
-        self.edit_text_as(context_id, &id, pos, insert, delete, Some(principal_id))?;
+        let mut entry = self.get_mut(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let id = self.get_or_create_draft_locked(context_id, principal_id, &mut entry)?;
+        #[cfg(test)]
+        self.pause_after_compose_selection();
+        self.accept_locked(context_id, &mut entry, |entry| {
+            self.prepare_text_edit(entry, context_id, &id, pos, insert, delete, Some(principal_id))
+        })?;
         Ok(id)
     }
 
@@ -2179,12 +2220,25 @@ impl BlockStore {
         context_id: ContextId,
         principal_id: PrincipalId,
     ) -> BlockStoreResult<String> {
-        let Some(draft) = self.draft_block(context_id, principal_id)? else {
+        let mut entry = self.get_mut(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let Some(draft) = entry.doc.blocks_ordered().into_iter()
+            .find(|b| b.status == Status::Draft && b.id.principal_id == principal_id)
+        else {
             return Ok(String::new());
         };
-        let text = draft.content.clone();
-        self.delete_block(context_id, &draft.id)?;
-        Ok(text)
+        #[cfg(test)]
+        self.pause_after_compose_selection();
+        self.accept_locked(context_id, &mut entry, |entry| {
+            self.prepare_deletion(entry, context_id, &draft.id)
+        })?;
+        Ok(draft.content)
+    }
+
+    #[cfg(test)]
+    fn pause_after_compose_selection(&self) {
+        let hook = self.after_compose_selection.lock().take();
+        if let Some(hook) = hook { hook(); }
     }
 
     /// Append text to a block.
@@ -2274,24 +2328,21 @@ impl BlockStore {
 
     /// Delete a block from a document.
     pub fn delete_block(&self, context_id: ContextId, block_id: &BlockId) -> BlockStoreResult<()> {
-        self.accept(context_id, |entry| {
-            let mut events = Vec::new();
-            let principal_id = self.principal_id();
-            entry.doc.delete_block(block_id)?;
-            entry.touch(principal_id);
-            let version = entry.version();
-            let ops = SyncPayload::from_deletion(*block_id);
+        self.accept(context_id, |entry| self.prepare_deletion(entry, context_id, block_id))
+    }
 
-            // Emit flow event
-            events.push(BlockFlow::Deleted {
-                context_id,
-                block_id: *block_id,
-                version,
-                source: OpSource::Local,
-            });
-
-            Ok((ops, events, ()))
-        })
+    fn prepare_deletion(
+        &self,
+        entry: &mut DocumentEntry,
+        context_id: ContextId,
+        block_id: &BlockId,
+    ) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, ())> {
+        entry.doc.delete_block(block_id)?;
+        entry.touch(self.principal_id());
+        let events = vec![BlockFlow::Deleted {
+            context_id, block_id: *block_id, version: entry.version(), source: OpSource::Local,
+        }];
+        Ok((SyncPayload::from_deletion(*block_id), events, ()))
     }
 
     // =========================================================================
@@ -7103,6 +7154,60 @@ mod tests {
     }
 
     // ── Compose drafts as blocks (Lane C) ────────────────────────────────
+
+    #[test]
+    fn compose_selection_create_keeps_ownership() { assert_compose_selection("create"); }
+
+    #[test]
+    fn compose_selection_edit_keeps_ownership() { assert_compose_selection("edit"); }
+
+    #[test]
+    fn compose_selection_clear_keeps_ownership() { assert_compose_selection("clear"); }
+
+    fn assert_compose_selection(action: &'static str) {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let store = Arc::new(store);
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        if action != "create" {
+            store.edit_draft(ctx, me, 0, "hello", 0).unwrap();
+        }
+        let (selected_tx, selected_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *store.after_compose_selection.lock() = Some(Box::new(move || {
+            selected_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }));
+        let writer = store.clone();
+        let first = std::thread::spawn(move || match action {
+            "create" => { writer.get_or_create_draft(ctx, me).unwrap(); }
+            "edit" => { writer.edit_draft(ctx, me, 5, " world", 0).unwrap(); }
+            "clear" => { assert_eq!(writer.clear_draft(ctx, me).unwrap(), "hello"); }
+            _ => unreachable!(),
+        });
+        selected_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let held = matches!(store.documents.try_get_mut(&ctx), dashmap::try_result::TryResult::Locked);
+        let contender = store.clone();
+        let second = std::thread::spawn(move || {
+            if action == "create" {
+                contender.get_or_create_draft(ctx, me).unwrap();
+            } else if action == "edit" {
+                assert_eq!(contender.submit_draft(ctx, me, None).unwrap().1, "hello world");
+            } else {
+                assert!(matches!(contender.submit_draft(ctx, me, None), Err(BlockStoreError::NoDraft(..))));
+            }
+        });
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(held, "{action} released the document after selecting its draft");
+        let live = store.block_snapshots(ctx).unwrap();
+        assert_eq!(live.len(), if action == "clear" { 0 } else { 1 });
+        let replayed = replay_journal(&db, ctx).blocks_ordered();
+        assert_eq!(live.len(), replayed.len());
+        for (a, b) in live.iter().zip(&replayed) { assert!(a.content_eq(b)); }
+    }
 
     /// The property the whole design exists for: **submit does not copy.**
     ///
