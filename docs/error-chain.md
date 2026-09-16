@@ -246,7 +246,7 @@ declining is already carried as ordinary data in
 | family | count | what it is |
 |---|---|---|
 | VFS permission / read-only | 14 | `Vfs` methods, all through one function |
-| caller-input validation | 4 | `getBlocks`, `createContext`, `renameContext`, `reportMidiPresence` |
+| caller-input validation | 3 | `getBlocks`, `renameContext`, `reportMidiPresence` |
 | gate / hook verdicts | 4 | `execute`, `shellExecute`, `executeKj`, `callMcpTool` |
 | policy and administrative | 4 | `mount` (frozen), `prompt` (quiesced), `setBlockExcluded` (state), `bindKernel` (wire version) |
 | editor writes reaching the VFS | 3 | `editorOpen`, `editorKeys`, `editorSave` — family 1 by another door |

@@ -57,6 +57,11 @@ struct Cli {
     #[arg(long, default_value = "coder")]
     context_type: String,
 
+    /// Parent, by label or id, for a context `--context` creates. Default:
+    /// the kernel's only live root context.
+    #[arg(long)]
+    parent: Option<String>,
+
     /// Seconds to wait for the kernel connection before giving up.
     ///
     /// The actor retries a failed handshake forever with backoff, so without
@@ -158,6 +163,7 @@ async fn run(cli: Cli) -> Result<()> {
     let bridge = KernelBridge::connect(
         config,
         cli.context_type,
+        cli.parent,
         std::time::Duration::from_secs(cli.connect_timeout),
     )
     .await?;

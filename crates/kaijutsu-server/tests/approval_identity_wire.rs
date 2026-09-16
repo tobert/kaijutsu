@@ -1,6 +1,7 @@
 //! Approval identity over the product SSH/RPC wire.
 
 mod common;
+use common::{create_context};
 
 use std::sync::Arc;
 
@@ -54,7 +55,15 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
     run_local(async {
         let temp = tempfile::tempdir().unwrap();
         let auth_path = temp.path().join("auth.db");
-        let amy = PrincipalId::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
+        let amy = kaijutsu_kernel::KernelDb::open(config.data_dir.as_ref().unwrap().join("kernel.db"))
+            .unwrap()
+            .get_character_by_name("amy")
+            .unwrap()
+            .expect("amy is the kernel's root character")
+            .principal_id;
         let coder = PrincipalId::new();
         let lead = PrincipalId::new();
         let judge = PrincipalId::new();
@@ -68,22 +77,18 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         auth.add_key(lead, lead_key.public_key(), Some("lead")).unwrap();
         auth.add_key(judge, judge_key.public_key(), Some("judge")).unwrap();
         drop(auth);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut config = SshServerConfig::ephemeral(addr.port());
         config.auth_db_path = Some(auth_path);
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_local(async move {
             SshServer::new(config).run_on_listener_with_kernel_sink(listener, tx).await.unwrap();
         });
         let kernel = rx.await.unwrap();
-        add_character(&kernel, amy, "amy");
         add_character(&kernel, coder, "coder");
         add_character(&kernel, lead, "lead");
         add_character(&kernel, judge, "judge");
         let lead_client = connect(addr, lead_key, "lead").await;
         let (lead_kj, _) = lead_client.bind_kernel().await.unwrap();
-        let work = lead_kj.create_context("coder-work").await.unwrap();
+        let work = create_context(&lead_kj, "coder-work").await.unwrap();
         let row = kernel.kernel_db.lock().get_context(work).unwrap().unwrap();
         assert_eq!(row.created_by, lead);
         assert_eq!(row.director_id, Some(lead));
@@ -110,7 +115,7 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         let (amy_kj, _) = amy_client.bind_kernel().await.unwrap();
         let judge_client = connect(addr, judge_key, "judge").await;
         let (judge_kj, _) = judge_client.bind_kernel().await.unwrap();
-        let lead_context = lead_kj.create_context("lead-review").await.unwrap();
+        let lead_context = create_context(&lead_kj, "lead-review").await.unwrap();
         lead_kj.join_context(lead_context, "lead-review").await.unwrap();
         kj_fails(&lead_kj, lead_context, &["ledger", "allow", &ask.request_id]).await;
         assert_eq!(kernel.kernel_db.lock().get_approval(&ask.request_id).unwrap().unwrap().status.as_str(), "pending");
@@ -162,7 +167,7 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         kj(&amy_kj, work, &["ledger", "allow", &reclaimed.request_id]).await;
         assert!(kernel.kernel_db.lock().get_approval(&reclaimed.request_id).unwrap().unwrap().status.is_allowed());
         kj(&amy_kj, work, &["ledger", "delegation", "revoke", "lead"]).await;
-        let other = coder_kj.create_context("coder-other").await.unwrap();
+        let other = create_context(&coder_kj, "coder-other").await.unwrap();
         coder_kj.join_context(work, "coder-work").await.unwrap();
         assert!(coder_kj.call_mcp_tool("shell_write", &serde_json::json!({"command":"false"})).await.is_err());
         let second = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();

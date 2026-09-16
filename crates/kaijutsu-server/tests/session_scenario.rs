@@ -69,6 +69,7 @@
 //!   (`crates/kaijutsu-kernel/src/kj/handoff.rs`, `resolve_caller_character`).
 
 mod common;
+use common::{create_context_typed};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -260,8 +261,7 @@ async fn boot() -> Scenario {
     // and the `drive`/`fork`/`drift` verb authorities — amy's own admin
     // seat needs the same loadout banto's seat gets, not the bare "default"
     // type's narrower grant (`assets/defaults/rc/director/create/S10-binding.kai`).
-    let amy_home = amy
-        .create_context_typed("amy-home", "director")
+    let amy_home = create_context_typed(&amy, "amy-home", "director")
         .await
         .expect("create amy-home");
     amy.join_context(amy_home, "amy").await.expect("join amy-home");

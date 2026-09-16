@@ -140,7 +140,9 @@ New ACP sessions select a kernel model performer at launch:
 kaijutsu-acp --character coder
 ```
 
-The connected character becomes its director; the reviewer follows the same
+`--parent <label>` names the context new sessions are created under; without
+it, the kernel's only live root context is used. The connected character
+becomes its director; the reviewer follows the same
 policy as other creation paths. Without `--character`, use ACP session loading
 to attach to an already configured context. The flag selects a character;
 `--context-type` still selects the rc bundle.

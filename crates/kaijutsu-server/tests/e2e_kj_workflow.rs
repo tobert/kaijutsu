@@ -101,7 +101,7 @@ fn test_fork_work_drift_merge_e2e() {
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // Create root context "main" and join it
-        let main_ctx = kernel.create_context("main").await.unwrap();
+        let main_ctx = create_context(&kernel, "main").await.unwrap();
         let _joined = kernel.join_context(main_ctx, "test").await.unwrap();
 
         // Work: run a command in main
@@ -249,8 +249,8 @@ fn test_drift_push_flush_between_siblings_e2e() {
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         // Create two sibling contexts
-        let alpha_id = kernel.create_context("alpha").await.unwrap();
-        let beta_id = kernel.create_context("beta").await.unwrap();
+        let alpha_id = create_context(&kernel, "alpha").await.unwrap();
+        let beta_id = create_context(&kernel, "beta").await.unwrap();
         kernel.join_context(alpha_id, "test").await.unwrap();
         kernel.join_context(beta_id, "test").await.unwrap();
 
@@ -299,7 +299,7 @@ fn test_two_clients_same_kernel_e2e() {
         // Client A creates and works in root context
         let client_a = connect_client(addr).await;
         let (kernel_a, kernel_id) = client_a.bind_kernel().await.unwrap();
-        let root_ctx = kernel_a.create_context("shared-root").await.unwrap();
+        let root_ctx = create_context(&kernel_a, "shared-root").await.unwrap();
         kernel_a.join_context(root_ctx, "client-a").await.unwrap();
 
         // Client A runs a command
@@ -347,9 +347,9 @@ fn test_context_list_e2e() {
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         // Create several contexts
-        let ctx_a = kernel.create_context("ctx-alpha").await.unwrap();
-        let _ctx_b = kernel.create_context("ctx-beta").await.unwrap();
-        let _ctx_c = kernel.create_context("ctx-gamma").await.unwrap();
+        let ctx_a = create_context(&kernel, "ctx-alpha").await.unwrap();
+        let _ctx_b = create_context(&kernel, "ctx-beta").await.unwrap();
+        let _ctx_c = create_context(&kernel, "ctx-gamma").await.unwrap();
         kernel.join_context(ctx_a, "test").await.unwrap();
 
         // List via kj
@@ -386,7 +386,7 @@ fn test_shell_echo_e2e() {
         let client = connect_client(addr).await;
 
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("shell-test").await.unwrap();
+        let ctx = create_context(&kernel, "shell-test").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 
         // Basic echo
@@ -430,7 +430,7 @@ fn test_shell_propagates_exit_code() {
         let addr = start_server_with_mock_llm().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("exit-code-test").await.unwrap();
+        let ctx = create_context(&kernel, "exit-code-test").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 
         // Success: `true` builtin → exit 0
@@ -503,7 +503,7 @@ fn test_shell_truncation_does_not_corrupt_exit_code() {
         let addr = start_server_with_mock_llm().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("truncation-exit-code-test").await.unwrap();
+        let ctx = create_context(&kernel, "truncation-exit-code-test").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 
         // seq 1 5000 prints far more than the 8 KB agent cap and always
@@ -553,7 +553,7 @@ fn test_shell_cd_and_export_persist_across_commands() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("cwd-persist-test").await.unwrap();
+        let ctx = create_context(&kernel, "cwd-persist-test").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 
         let target = env!("CARGO_MANIFEST_DIR");
@@ -612,7 +612,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let main_ctx = kernel.create_context("main").await.unwrap();
+        let main_ctx = create_context(&kernel, "main").await.unwrap();
         let _joined = kernel.join_context(main_ctx, "test").await.unwrap();
         let coder = PrincipalId::new();
         let lead = PrincipalId::new();
@@ -702,8 +702,7 @@ fn test_rpc_created_context_runs_rc_create() {
         // the same path the GUI app and MCP facade take. Its rc create
         // lifecycle (`/config/rc/coder/create/S00-stance.kai`) emits the coder
         // stance as a System/Text block via `kj block create`.
-        let ctx = kernel
-            .create_context_typed("rc-coder", "coder")
+        let ctx = create_context_typed(&kernel, "rc-coder", "coder")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
@@ -740,8 +739,7 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel
-            .create_context_typed("rc-assistant", "assistant")
+        let ctx = create_context_typed(&kernel, "rc-assistant", "assistant")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
@@ -779,7 +777,7 @@ fn test_rpc_default_context_type_is_default() {
 
         // Plain create_context (empty context_type on the wire) must still
         // land as "default" — no coder stance leaks in.
-        let ctx = kernel.create_context("plain").await.unwrap();
+        let ctx = create_context(&kernel, "plain").await.unwrap();
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let blocks = get_all_blocks(&kernel, ctx).await;
@@ -833,8 +831,7 @@ fn test_coder_stance_guided_for_rpc_created_fast_model() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel
-            .create_context_typed("rc-coder-guided", "coder")
+        let ctx = create_context_typed(&kernel, "rc-coder-guided", "coder")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
@@ -892,8 +889,7 @@ fn test_coder_stance_focused_for_a_frontier_model() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel
-            .create_context_typed("rc-coder-focused", "coder")
+        let ctx = create_context_typed(&kernel, "rc-coder-focused", "coder")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
@@ -955,8 +951,7 @@ fn test_coder_stance_guided_for_rpc_created_non_matching_model() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel
-            .create_context_typed("rc-coder-guided-nonmatch", "coder")
+        let ctx = create_context_typed(&kernel, "rc-coder-guided-nonmatch", "coder")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
@@ -1027,7 +1022,7 @@ fn test_coder_stance_guided_for_null_row_model_via_kj_dispatch() {
 
         // A bootstrap context to run the `kj` shell command from — its own
         // type is irrelevant, it's just where the command executes.
-        let boot_ctx = kernel.create_context("boot-kj-dispatch").await.unwrap();
+        let boot_ctx = create_context(&kernel, "boot-kj-dispatch").await.unwrap();
         let _ = kernel.join_context(boot_ctx, "test").await.unwrap();
 
         let (_, create_output, create_status) = shell_exec_wait(
@@ -1107,8 +1102,7 @@ fn test_rpc_created_context_does_not_stamp_the_registry_default() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel
-            .create_context_typed("rpc-unstamped", "default")
+        let ctx = create_context_typed(&kernel, "rpc-unstamped", "default")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
@@ -1157,7 +1151,7 @@ fn test_execute_kj_quiet_authors_no_blocks_e2e() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel.create_context("quiet-kj").await.unwrap();
+        let ctx = create_context(&kernel, "quiet-kj").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 
         let argv = vec!["ledger".to_string(), "list".to_string()];

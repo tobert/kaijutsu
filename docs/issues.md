@@ -174,7 +174,7 @@ slice green and committed:
    Callers: `kaijutsu-mcp` `register_session`, the tui bridge, the ACP
    bridge, and the client wrappers. The MCP chooses the context to run from:
    `--parent`/`KAIJUTSU_PARENT`, then the only live root context with a
-   warning, otherwise it refuses and lists the roots. No wire change. Amy:
+   warning, otherwise it refuses and lists the roots. No wire change. Shipped 2026-09-16. Amy:
    "we'll drop the RPC and push it to kj and then future changes like this
    get easier."
 5. **No default reviewer.** Resolution is override, delegation, then the

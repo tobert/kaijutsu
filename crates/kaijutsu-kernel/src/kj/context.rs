@@ -1372,6 +1372,12 @@ impl KjDispatcher {
                     None => None,
                 }
             };
+            // Only a character can direct: a characterless principal cannot
+            // hold a delegation.
+            let director_id = match self.kernel_db().lock().get_character(caller.actor_id) {
+                Ok(sheet) => sheet.map(|_| caller.actor_id),
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+            };
             if let Some(performer) = played_by {
                 // The context does not exist yet, so the walk starts where
                 // it would continue: at the parent the new row will name.
@@ -1404,7 +1410,7 @@ impl KjDispatcher {
                 origin_host: None,
                 played_by,
                 reviewer_id: None,
-                director_id: Some(caller.actor_id),
+                director_id,
             };
             let db = self.kernel_db().lock();
             if let Err(e) = insert_new_context_checked(&db, &row, parent_id) {
@@ -3184,6 +3190,33 @@ mod tests {
         let row = db.get_context(db.resolve_context("unassigned").unwrap()).unwrap().unwrap();
         assert_eq!(row.created_by, caller.principal_id);
         assert_eq!(row.played_by, None);
+    }
+
+    /// The caller becomes the director only when it has a character sheet;
+    /// a characterless principal cannot hold a delegation
+    /// (`docs/character.md`, "Current implementation", Client creation).
+    #[tokio::test]
+    async fn context_create_records_only_a_character_as_director() {
+        let d = test_dispatcher().await;
+        let mut characterless = test_caller();
+        characterless.context_id = None;
+        let result = d.dispatch(&[s("context"), s("create"), s("no-sheet")], &characterless).await;
+        assert!(result.is_ok(), "{}", result.message());
+
+        let mut character = test_caller();
+        character.context_id = None;
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: character.actor_id, name: s("lead"), created_at: 1,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let result = d.dispatch(&[s("context"), s("create"), s("with-sheet")], &character).await;
+        assert!(result.is_ok(), "{}", result.message());
+
+        let db = d.kernel_db().lock();
+        let no_sheet = db.get_context(db.resolve_context("no-sheet").unwrap()).unwrap().unwrap();
+        assert_eq!(no_sheet.director_id, None, "a characterless creator is not a director");
+        let with_sheet = db.get_context(db.resolve_context("with-sheet").unwrap()).unwrap().unwrap();
+        assert_eq!(with_sheet.director_id, Some(character.actor_id));
     }
 
     /// `--type` with no matching rc bucket is refused before any row lands

@@ -347,7 +347,7 @@ fn test_create_context_returns_valid_id() {
         let client = connect_client(addr).await;
 
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let context_id = kernel.create_context("test-ctx").await.unwrap();
+        let context_id = create_context(&kernel, "test-ctx").await.unwrap();
 
         assert!(
             !context_id.is_nil(),
@@ -368,7 +368,7 @@ fn test_create_context_appears_in_list() {
         let before = kernel.list_contexts().await.unwrap();
         let before_count = before.len();
 
-        let context_id = kernel.create_context("my-label").await.unwrap();
+        let context_id = create_context(&kernel, "my-label").await.unwrap();
 
         // Should appear in list with correct label
         let after = kernel.list_contexts().await.unwrap();
@@ -400,7 +400,7 @@ fn test_context_last_activity_at_populated_after_block_op() {
 
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("activity-stamp").await.unwrap();
+        let context_id = create_context(&kernel, "activity-stamp").await.unwrap();
         kernel
             .join_context(context_id, "test-instance")
             .await
@@ -455,7 +455,7 @@ fn test_create_context_joinable() {
         let client = connect_client(addr).await;
 
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let context_id = kernel.create_context("joinable").await.unwrap();
+        let context_id = create_context(&kernel, "joinable").await.unwrap();
 
         // Should be joinable
         let joined_id = kernel
@@ -487,7 +487,7 @@ fn test_create_context_invalid_label_is_hard_error() {
         let before = kernel.list_contexts().await.unwrap();
         let before_count = before.len();
 
-        let result = kernel.create_context("bad:label").await;
+        let result = create_context(&kernel, "bad:label").await;
         assert!(
             result.is_err(),
             "create_context with ':' in label must return Err (got {:?})",
@@ -528,8 +528,8 @@ fn test_create_context_unique_ids() {
         let client = connect_client(addr).await;
 
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let id1 = kernel.create_context("ctx-a").await.unwrap();
-        let id2 = kernel.create_context("ctx-b").await.unwrap();
+        let id1 = create_context(&kernel, "ctx-a").await.unwrap();
+        let id2 = create_context(&kernel, "ctx-b").await.unwrap();
 
         assert_ne!(id1, id2, "Each created context should have a unique ID");
     });
@@ -550,7 +550,7 @@ fn test_call_mcp_tool_dispatches_builtin_over_ssh() {
         let client = connect_client(addr).await;
 
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let ctx_id = kernel.create_context("mcp-remote-test").await.unwrap();
+        let ctx_id = create_context(&kernel, "mcp-remote-test").await.unwrap();
         kernel.join_context(ctx_id, "test-mcp").await.unwrap();
 
         let result = kernel
@@ -579,7 +579,7 @@ fn test_call_mcp_tool_unknown_tool_errors() {
         let client = connect_client(addr).await;
 
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let ctx_id = kernel.create_context("mcp-remote-error").await.unwrap();
+        let ctx_id = create_context(&kernel, "mcp-remote-error").await.unwrap();
         kernel.join_context(ctx_id, "test-mcp").await.unwrap();
 
         let result = kernel
@@ -667,7 +667,7 @@ async fn setup_execute_context(
 ) -> (kaijutsu_client::RpcClient, kaijutsu_client::KernelHandle) {
     let client = connect_client(addr).await;
     let (kernel, _) = client.bind_kernel().await.unwrap();
-    let ctx_id = kernel.create_context("exec-test").await.unwrap();
+    let ctx_id = create_context(&kernel, "exec-test").await.unwrap();
     kernel.join_context(ctx_id, "test-exec").await.unwrap();
     (client, kernel)
 }
@@ -685,6 +685,12 @@ async fn setup_execute_context(
 fn pre_call_deny_on_shell_write_blocks_shell_execute_end_to_end() {
     run_local(async {
         let (addr, kernel) = start_server_with_kernel_handle().await;
+
+        // Create the context before the hook: `kj context create` runs through
+        // the same shell_write gate the hook denies.
+        let client = connect_client(addr).await;
+        let (kj_kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+        let context_id = create_context(&kj_kernel, "gate-e2e").await.unwrap();
 
         kernel
             .kernel
@@ -705,9 +711,6 @@ fn pre_call_deny_on_shell_write_blocks_shell_execute_end_to_end() {
                 kaish_script_id: None,
             });
 
-        let client = connect_client(addr).await;
-        let (kj_kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let context_id = kj_kernel.create_context("gate-e2e").await.unwrap();
         kj_kernel.join_context(context_id, "gate-e2e").await.unwrap();
 
         let result = kj_kernel
@@ -920,7 +923,7 @@ fn test_drift_router_concurrent_access_does_not_wedge() {
         let make = |label: &'static str| async move {
             let client = connect_client(addr).await;
             let (kernel, _) = client.bind_kernel().await.unwrap();
-            let ctx = kernel.create_context(label).await.unwrap();
+            let ctx = create_context(&kernel, label).await.unwrap();
             let listed = kernel.list_contexts().await.unwrap();
             assert!(
                 listed.iter().any(|c| c.id == ctx),
@@ -950,7 +953,7 @@ fn test_subscribe_blocks_filtered_cleans_up_on_client_drop() {
         {
             let client = connect_client(addr).await;
             let (kernel, _) = client.bind_kernel().await.unwrap();
-            let ctx = kernel.create_context("subscribe-cleanup").await.unwrap();
+            let ctx = create_context(&kernel, "subscribe-cleanup").await.unwrap();
             kernel.join_context(ctx, "drop-test").await.unwrap();
             // Subscribe with no events expected — just register the callback,
             // then let `client` drop at end of scope.
@@ -1019,8 +1022,8 @@ fn test_context_cwd_is_addressed_and_vfs_validated() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let context_a = kernel.create_context("addressed-cwd-a").await.unwrap();
-        let context_b = kernel.create_context("addressed-cwd-b").await.unwrap();
+        let context_a = create_context(&kernel, "addressed-cwd-a").await.unwrap();
+        let context_b = create_context(&kernel, "addressed-cwd-b").await.unwrap();
 
         // Keep B as the ambient binding throughout every addressed operation.
         kernel.join_context(context_b, "addressed-cwd-test").await.unwrap();
@@ -1080,8 +1083,8 @@ fn test_kj_rpc_is_addressed_curated_and_keeps_ambient_context() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let context_a = kernel.create_context("addressed-kj-'a").await.unwrap();
-        let context_b = kernel.create_context("addressed-kj-b").await.unwrap();
+        let context_a = create_context(&kernel, "addressed-kj-'a").await.unwrap();
+        let context_b = create_context(&kernel, "addressed-kj-b").await.unwrap();
         kernel.join_context(context_b, "addressed-kj-test").await.unwrap();
 
         let catalog = kernel.get_kj_command_catalog(context_a).await.unwrap();
@@ -1124,8 +1127,8 @@ fn test_execute_kj_carries_structured_data_when_the_verb_produces_it() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let context_a = kernel.create_context("kj-data-a").await.unwrap();
-        let _context_b = kernel.create_context("kj-data-b").await.unwrap();
+        let context_a = create_context(&kernel, "kj-data-a").await.unwrap();
+        let _context_b = create_context(&kernel, "kj-data-b").await.unwrap();
 
         let list_argv = vec!["context".into(), "list".into()];
         let listed = kernel.execute_kj(context_a, &list_argv).await.unwrap();
@@ -1196,7 +1199,7 @@ fn test_shell_var_shared_across_connections() {
         // Connection A creates + joins a context and sets a var.
         let client_a = connect_client(addr).await;
         let (kernel_a, _) = client_a.bind_kernel().await.unwrap();
-        let ctx_id = kernel_a.create_context("shared-env").await.unwrap();
+        let ctx_id = create_context(&kernel_a, "shared-env").await.unwrap();
         kernel_a.join_context(ctx_id, "conn-a").await.unwrap();
         kernel_a
             .set_shell_var(
@@ -1284,7 +1287,7 @@ fn test_client_view_round_trips_over_rpc() {
             "no view recorded yet"
         );
 
-        let ctx_id = kernel.create_context("client-view-a").await.unwrap();
+        let ctx_id = create_context(&kernel, "client-view-a").await.unwrap();
         kernel.set_last_context(&client_id, ctx_id).await.unwrap();
 
         assert_eq!(
@@ -1304,8 +1307,8 @@ fn test_client_view_set_twice_returns_latest() {
         let (_client, kernel) = setup_execute_context(addr).await;
 
         let client_id = uuid::Uuid::new_v4().to_string();
-        let ctx_a = kernel.create_context("client-view-b").await.unwrap();
-        let ctx_b = kernel.create_context("client-view-c").await.unwrap();
+        let ctx_a = create_context(&kernel, "client-view-b").await.unwrap();
+        let ctx_b = create_context(&kernel, "client-view-c").await.unwrap();
 
         kernel.set_last_context(&client_id, ctx_a).await.unwrap();
         kernel.set_last_context(&client_id, ctx_b).await.unwrap();
@@ -1330,8 +1333,8 @@ fn test_client_view_is_namespaced_per_client() {
 
         let client_a = uuid::Uuid::new_v4().to_string();
         let client_b = uuid::Uuid::new_v4().to_string();
-        let ctx_a = kernel.create_context("client-view-d").await.unwrap();
-        let ctx_b = kernel.create_context("client-view-e").await.unwrap();
+        let ctx_a = create_context(&kernel, "client-view-d").await.unwrap();
+        let ctx_b = create_context(&kernel, "client-view-e").await.unwrap();
 
         kernel.set_last_context(&client_a, ctx_a).await.unwrap();
         kernel.set_last_context(&client_b, ctx_b).await.unwrap();
@@ -1355,7 +1358,7 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
         let addr = start_server().await;
         let (_client, kernel) = setup_execute_context(addr).await;
 
-        let ctx = kernel.create_context("ring-rider").await.unwrap();
+        let ctx = create_context(&kernel, "ring-rider").await.unwrap();
 
         let find = |contexts: &[kaijutsu_client::ContextInfo], id: kaijutsu_types::ContextId| {
             contexts.iter().find(|c| c.id == id).cloned()
@@ -1402,7 +1405,7 @@ fn test_promote_demote_pause_round_trip_over_rpc() {
         assert!(row.demoted_at.is_none());
 
         // Pause/resume are independent of ring placement.
-        let ctx2 = kernel.create_context("napper").await.unwrap();
+        let ctx2 = create_context(&kernel, "napper").await.unwrap();
         kernel.set_context_paused(ctx2, true).await.unwrap();
         let contexts = kernel.list_contexts().await.unwrap();
         assert!(find(&contexts, ctx2).unwrap().paused_at.is_some());
@@ -1420,7 +1423,7 @@ fn test_archive_context_rpc_is_single_context_and_idempotent() {
         let addr = start_server().await;
         let (_client, kernel) = setup_execute_context(addr).await;
 
-        let ctx = kernel.create_context("solo-archive").await.unwrap();
+        let ctx = create_context(&kernel, "solo-archive").await.unwrap();
         kernel.archive_context(ctx).await.unwrap();
 
         let contexts = kernel.list_contexts().await.unwrap();
@@ -1443,7 +1446,7 @@ fn test_set_last_context_auto_promotes_a_fresh_context_but_not_a_demoted_one() {
         let (_client, kernel) = setup_execute_context(addr).await;
         let client_id = uuid::Uuid::new_v4().to_string();
 
-        let fresh = kernel.create_context("auto-promote-me").await.unwrap();
+        let fresh = create_context(&kernel, "auto-promote-me").await.unwrap();
         kernel.set_last_context(&client_id, fresh).await.unwrap();
         let contexts = kernel.list_contexts().await.unwrap();
         let row = contexts.iter().find(|c| c.id == fresh).unwrap();
@@ -1452,7 +1455,7 @@ fn test_set_last_context_auto_promotes_a_fresh_context_but_not_a_demoted_one() {
             "a never-placed context should auto-promote on visit"
         );
 
-        let demoted = kernel.create_context("stay-demoted").await.unwrap();
+        let demoted = create_context(&kernel, "stay-demoted").await.unwrap();
         kernel.demote_context(demoted).await.unwrap();
         kernel.set_last_context(&client_id, demoted).await.unwrap();
         let contexts = kernel.list_contexts().await.unwrap();
@@ -1464,7 +1467,7 @@ fn test_set_last_context_auto_promotes_a_fresh_context_but_not_a_demoted_one() {
 
         // Archived is sticky too: visits never resurrect — only an explicit
         // promote opens the resurrection door.
-        let buried = kernel.create_context("stay-buried").await.unwrap();
+        let buried = create_context(&kernel, "stay-buried").await.unwrap();
         kernel.archive_context(buried).await.unwrap();
         kernel.set_last_context(&client_id, buried).await.unwrap();
         let contexts = kernel.list_contexts().await.unwrap();
@@ -1485,11 +1488,11 @@ fn test_active_ring_cap_enforced_over_rpc() {
         let (_client, kernel) = setup_execute_context(addr).await;
 
         for i in 0..10 {
-            let ctx = kernel.create_context(&format!("cap-seat-{i}")).await.unwrap();
+            let ctx = create_context(&kernel, &format!("cap-seat-{i}")).await.unwrap();
             kernel.promote_context(ctx).await.unwrap();
         }
 
-        let overflow = kernel.create_context("cap-overflow").await.unwrap();
+        let overflow = create_context(&kernel, "cap-overflow").await.unwrap();
         let err = kernel.promote_context(overflow).await.unwrap_err();
         assert!(matches!(err, kaijutsu_client::RpcError::ServerError(_)));
 
@@ -1528,7 +1531,7 @@ fn test_get_context_version_matches_get_blocks_versioned() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("context-version-probe").await.unwrap();
+        let context_id = create_context(&kernel, "context-version-probe").await.unwrap();
         kernel
             .join_context(context_id, "context-version-test")
             .await
@@ -1589,7 +1592,7 @@ fn test_get_blocks_returns_the_version_it_read_at() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("get-blocks-version").await.unwrap();
+        let context_id = create_context(&kernel, "get-blocks-version").await.unwrap();
         kernel
             .join_context(context_id, "get-blocks-version-test")
             .await
@@ -1655,7 +1658,7 @@ fn test_shell_ansi_output_arrives_stripped_with_spans_on_the_wire() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("ansi-ingest").await.unwrap();
+        let context_id = create_context(&kernel, "ansi-ingest").await.unwrap();
         kernel.join_context(context_id, "test-instance").await.unwrap();
 
         // A literal ESC byte in the code — the `[ OK ]`-in-green boot line.

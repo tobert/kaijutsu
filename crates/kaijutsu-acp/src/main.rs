@@ -65,6 +65,12 @@ struct Cli {
     #[arg(long)]
     character: Option<String>,
 
+    /// The context, by label or id, that new sessions are created under.
+    /// Default: the kernel's only live root context. With several root
+    /// contexts and no parent named, `session/new` fails and lists them.
+    #[arg(long)]
+    parent: Option<String>,
+
     /// Deprecated compatibility flag. ACP lifecycle requests supply the
     /// authoritative cwd; this value is accepted but never used as fallback.
     #[arg(long)]
@@ -159,6 +165,7 @@ async fn run(cli: Cli) -> Result<()> {
         config,
         cli.context_type,
         cli.character,
+        cli.parent,
         std::time::Duration::from_secs(cli.connect_timeout),
     )
     .await?;

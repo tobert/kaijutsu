@@ -1443,3 +1443,16 @@ the same `init`, so tests stopped relying on the anonymous path production
 never had. The lesson is the one the approval work keeps teaching: a fallback
 that names a specific person is configuration pretending to be a relation. The
 default reviewer comes out next, and the context tree answers who reviews.
+
+The same day, the parentless-context question turned into a smaller wire.
+Amy first wanted `--parent` required, *"explicit, discoverable, and
+discourages making piles of unrooted contexts"*, then asked whether
+`createContext` was a mistake. It was: `createContext @26` is retired, and a
+client runs `kj context create` through `executeKj` from the context that
+becomes the parent, so a parentless create cannot happen. Fork was the other
+candidate and the wrong one, since it copies history, type, and performer. A
+client with no context yet names `--parent` or takes the kernel's only root
+context; with several roots it refuses. Removing the RPC exposed that the `kj`
+path recorded a characterless caller as director, which the documented rule
+never allowed. A transport error and a kernel refusal stay distinct types, so
+the MCP's label-conflict retry cannot mistake a dropped connection for a race.

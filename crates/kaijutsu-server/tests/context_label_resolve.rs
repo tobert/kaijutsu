@@ -34,7 +34,7 @@ fn resolve_context_label_is_db_driven_not_registry_driven() {
         let miss = kernel.resolve_context_label("resolve-label-miss").await.unwrap();
         assert!(miss.is_none(), "an unused label must resolve to None");
 
-        let context_id = kernel.create_context("resolve-label-hit").await.unwrap();
+        let context_id = create_context(&kernel, "resolve-label-hit").await.unwrap();
         let hit = kernel
             .resolve_context_label("resolve-label-hit")
             .await
@@ -57,7 +57,7 @@ fn resolve_context_label_reports_concluded_state() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("resolve-label-concluded").await.unwrap();
+        let context_id = create_context(&kernel, "resolve-label-concluded").await.unwrap();
         kernel.conclude(context_id).await.unwrap();
 
         let row = kernel
@@ -102,7 +102,7 @@ fn list_contexts_recovers_live_context_after_restart() {
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
             let label = "restart-recovery-test".to_string();
-            let context_id = kernel.create_context(&label).await.unwrap();
+            let context_id = create_context(&kernel, &label).await.unwrap();
             (context_id, label)
         };
 
@@ -140,7 +140,7 @@ fn join_context_heals_registry_for_an_archived_context_after_restart() {
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
             let label = "restart-heal-archived-test".to_string();
-            let context_id = kernel.create_context(&label).await.unwrap();
+            let context_id = create_context(&kernel, &label).await.unwrap();
             kernel
                 .join_context(context_id, "pre-restart-instance")
                 .await
@@ -217,11 +217,11 @@ fn join_context_heals_an_archived_context_whose_label_a_live_context_holds() {
             let addr = start_server_with_state_dir(state_dir.clone()).await;
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-            let archived_id = kernel.create_context(&label).await.unwrap();
+            let archived_id = create_context(&kernel, &label).await.unwrap();
             kernel.archive_context(archived_id).await.unwrap();
             // The label is free again; a second context takes it while the
             // first is still archived.
-            let live_id = kernel.create_context(&label).await.unwrap();
+            let live_id = create_context(&kernel, &label).await.unwrap();
             assert_ne!(archived_id, live_id);
             (archived_id, live_id)
         };

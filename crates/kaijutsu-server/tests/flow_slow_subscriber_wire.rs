@@ -23,6 +23,7 @@
 //! queue would need a burst no unit test should be generating.
 
 mod common;
+use common::{create_context};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -147,8 +148,7 @@ fn a_client_that_cannot_keep_up_is_told_and_disconnected() {
         let driver = connect_client(addr).await;
         let (driver_kernel, _) = driver.bind_kernel().await.unwrap();
 
-        let context_id = driver_kernel
-            .create_context("flow-slow-subscriber-burst")
+        let context_id = create_context(&driver_kernel, "flow-slow-subscriber-burst")
             .await
             .expect("create_context");
         driver_kernel

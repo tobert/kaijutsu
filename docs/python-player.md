@@ -124,7 +124,7 @@ case or not at all.
 | Capability | ActorHandle basis | Serves |
 |---|---|---|
 | connect + auto-reconnect | `spawn_actor(config, …)` | both |
-| register/join context | `join_context`, `create_context_typed`, `resolve_context_label` | both |
+| register/join context | `join_context`, `create_context_under`, `resolve_context_label` | both |
 | `shell(cmd)` run + result | `shell_execute` + sync polling | agent, notebook |
 | `events()` async generator | `subscribe_events` | agent (must) |
 | block reads | `get_blocks_query`, `get_context_sync` | notebook (must) |

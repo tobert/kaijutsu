@@ -758,7 +758,12 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         let _ = whoami_with_retry(&writer, Duration::from_secs(5))
             .await
             .expect("writer connect");
-        let ctx = writer.create_context("resilience").await.expect("create ctx");
+        let contexts = writer.list_contexts().await.expect("list contexts");
+        let parent = kaijutsu_client::choose_parent(None, &contexts).expect("the root context");
+        let ctx = writer
+            .create_context_under(parent.context_id, "resilience", "default", None)
+            .await
+            .expect("create ctx");
         writer.join_context(ctx).await.expect("writer join");
 
         // Switch the writer's SHELL into ctx so its commands produce blocks

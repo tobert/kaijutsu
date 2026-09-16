@@ -13,6 +13,7 @@
 //! that is the point of making it a block.
 
 mod common;
+use common::{create_context};
 
 use std::time::Duration;
 
@@ -47,7 +48,7 @@ async fn draft(kernel: &KernelHandle, context_id: ContextId) -> Option<BlockSnap
 }
 
 async fn open_context(kernel: &KernelHandle, label: &str) -> ContextId {
-    let context_id = kernel.create_context(label).await.unwrap();
+    let context_id = create_context(&kernel, label).await.unwrap();
     kernel.join_context(context_id, "draft-test").await.unwrap();
     context_id
 }

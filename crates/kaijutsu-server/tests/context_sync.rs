@@ -12,7 +12,7 @@ fn test_rpc_join_updates_shell() {
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // 1. Create and join a context via RPC
-        let ctx_id = kernel.create_context("sync-test").await.unwrap();
+        let ctx_id = create_context(&kernel, "sync-test").await.unwrap();
         kernel.join_context(ctx_id, "test-instance").await.unwrap();
 
         // 2. Warm up EmbeddedKaish (ensures KjBuiltin is registered)
@@ -42,8 +42,8 @@ fn test_shell_switch_updates_rpc() {
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // 1. Create two contexts
-        let ctx_a = kernel.create_context("alpha").await.unwrap();
-        let ctx_b = kernel.create_context("beta").await.unwrap();
+        let ctx_a = create_context(&kernel, "alpha").await.unwrap();
+        let ctx_b = create_context(&kernel, "beta").await.unwrap();
 
         // 2. Join alpha initially
         kernel.join_context(ctx_a, "test-instance").await.unwrap();
@@ -110,13 +110,13 @@ fn test_session_isolation_unified() {
         // 1. Connect Client A and join 'alpha'
         let client_a = connect_client(addr).await;
         let (kernel_a, _) = client_a.bind_kernel().await.unwrap();
-        let ctx_a = kernel_a.create_context("alpha").await.unwrap();
+        let ctx_a = create_context(&kernel_a, "alpha").await.unwrap();
         kernel_a.join_context(ctx_a, "instance-a").await.unwrap();
 
         // 2. Connect Client B and join 'beta'
         let client_b = connect_client(addr).await;
         let (kernel_b, _) = client_b.bind_kernel().await.unwrap();
-        let ctx_b = kernel_b.create_context("beta").await.unwrap();
+        let ctx_b = create_context(&kernel_b, "beta").await.unwrap();
         kernel_b.join_context(ctx_b, "instance-b").await.unwrap();
 
         // 3. Verify Client A is still in alpha
@@ -143,7 +143,7 @@ fn test_session_isolation_unified() {
 
         // 6. Verify Session A moved, but Session B stayed in beta (wait, B is already in beta)
         // Let's have A switch to a third context 'gamma'
-        let _ctx_g = kernel_a.create_context("gamma").await.unwrap();
+        let _ctx_g = create_context(&kernel_a, "gamma").await.unwrap();
         let exec_g = kernel_a.execute("kj context switch gamma").await.unwrap();
         wait_for_exit_code(&mut rx_a, exec_g).await;
 

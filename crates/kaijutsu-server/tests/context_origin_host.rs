@@ -23,7 +23,7 @@ fn set_context_origin_host_round_trips_through_resolve_context_label() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("origin-host-wire-test").await.unwrap();
+        let context_id = create_context(&kernel, "origin-host-wire-test").await.unwrap();
 
         // Old-client / not-yet-set behavior: honest absence, not a
         // fabricated empty string vs. real unknown ambiguity.
@@ -63,7 +63,7 @@ fn set_context_origin_host_is_visible_in_list_contexts() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("origin-host-list-test").await.unwrap();
+        let context_id = create_context(&kernel, "origin-host-list-test").await.unwrap();
         kernel.set_context_origin_host(context_id, "moltar").await.unwrap();
 
         let contexts = kernel.list_contexts().await.unwrap();
@@ -86,7 +86,7 @@ fn set_context_origin_host_with_empty_string_clears_it() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("origin-host-clear-test").await.unwrap();
+        let context_id = create_context(&kernel, "origin-host-clear-test").await.unwrap();
         kernel.set_context_origin_host(context_id, "zorak").await.unwrap();
         kernel.set_context_origin_host(context_id, "").await.unwrap();
 
@@ -138,7 +138,7 @@ fn context_cwd_round_trips_through_resolve_context_label_and_list_contexts() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("cwd-wire-test").await.unwrap();
+        let context_id = create_context(&kernel, "cwd-wire-test").await.unwrap();
 
         // Unset: honest absence on both surfaces, same convention as
         // origin_host's "before" case above.
@@ -208,7 +208,7 @@ fn origin_host_survives_a_kernel_restart() {
             let addr = start_server_with_state_dir(state_dir.clone()).await;
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-            let context_id = kernel.create_context("origin-host-restart-test").await.unwrap();
+            let context_id = create_context(&kernel, "origin-host-restart-test").await.unwrap();
             kernel.set_context_origin_host(context_id, "zorak").await.unwrap();
             context_id
         };

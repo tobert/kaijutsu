@@ -31,7 +31,7 @@ fn create_context_leaves_played_by_unset() {
         let client = connect_client(addr).await;
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kj.create_context("played-by-root-test").await.unwrap();
+        let context_id = create_context(&kj, "played-by-root-test").await.unwrap();
 
         let root = kernel
             .kernel_db
@@ -128,7 +128,7 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
         client.retain_ssh_session(ssh_client);
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kj.create_context("played-by-null-test").await.unwrap();
+        let context_id = create_context(&kj, "played-by-null-test").await.unwrap();
 
         assert!(
             kernel.kernel_db.lock().get_character(unmapped).unwrap().is_none(),

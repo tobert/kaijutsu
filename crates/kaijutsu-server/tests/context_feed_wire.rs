@@ -16,6 +16,7 @@
 //! mid-text splice.
 
 mod common;
+use common::{create_context};
 
 use std::time::Duration;
 
@@ -130,7 +131,7 @@ fn appends_and_an_edit_reproduce_the_kernel_text() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("feed-stream").await.unwrap();
+        let context_id = create_context(&kernel, "feed-stream").await.unwrap();
         kernel.join_context(context_id, "feed-test").await.unwrap();
         let principal = PrincipalId::for_agent_session("feed-author");
         let block_id = author_empty_block(&kernel, context_id, principal).await;
@@ -196,7 +197,7 @@ fn subscribing_before_the_snapshot_does_not_double_apply() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("feed-recovery").await.unwrap();
+        let context_id = create_context(&kernel, "feed-recovery").await.unwrap();
         kernel.join_context(context_id, "feed-test").await.unwrap();
         let principal = PrincipalId::for_agent_session("feed-author");
         let block_id = author_empty_block(&kernel, context_id, principal).await;
@@ -246,7 +247,7 @@ fn status_changes_arrive_on_the_same_feed_as_text() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("feed-status").await.unwrap();
+        let context_id = create_context(&kernel, "feed-status").await.unwrap();
         kernel.join_context(context_id, "feed-test").await.unwrap();
         let principal = PrincipalId::for_agent_session("feed-author");
         let block_id = author_empty_block(&kernel, context_id, principal).await;
@@ -291,8 +292,8 @@ fn a_feed_carries_only_its_own_context() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let watched = kernel.create_context("feed-watched").await.unwrap();
-        let other = kernel.create_context("feed-other").await.unwrap();
+        let watched = create_context(&kernel, "feed-watched").await.unwrap();
+        let other = create_context(&kernel, "feed-other").await.unwrap();
         kernel.join_context(watched, "feed-test").await.unwrap();
         let principal = PrincipalId::for_agent_session("feed-author");
         let watched_block = author_empty_block(&kernel, watched, principal).await;
@@ -364,7 +365,7 @@ fn an_append_crosses_the_wire_as_a_suffix() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let context_id = kernel.create_context("feed-suffix").await.unwrap();
+        let context_id = create_context(&kernel, "feed-suffix").await.unwrap();
         kernel.join_context(context_id, "feed-test").await.unwrap();
         let principal = PrincipalId::for_agent_session("feed-author");
         let block_id = author_empty_block(&kernel, context_id, principal).await;

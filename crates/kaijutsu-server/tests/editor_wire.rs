@@ -9,6 +9,7 @@
 //! 1b (needs `EditorCore::apply_remote_ops`) and is tested there.
 
 mod common;
+use common::{create_context};
 
 use std::time::Duration;
 
@@ -453,7 +454,7 @@ fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         // The shell needs an active context to materialize `vi`.
-        let ctx = kernel.create_context("editor-signal").await.unwrap();
+        let ctx = create_context(&kernel, "editor-signal").await.unwrap();
         kernel.join_context(ctx, "app-instance").await.unwrap();
 
         // Attach as the app peer; a worker thread captures invocations onto a

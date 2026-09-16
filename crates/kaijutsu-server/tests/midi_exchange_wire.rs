@@ -15,6 +15,7 @@
 //! seat, which is exactly the seam the app's hardware worker occupies.
 
 mod common;
+use common::{create_context};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,7 +119,7 @@ fn identify_round_trips_over_the_wire_and_files_a_pulled_fact() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("main").await.unwrap();
+        let ctx = create_context(&kernel, "main").await.unwrap();
         let _ = kernel.join_context(ctx, "midi-exchange-wire").await.unwrap();
 
         let _slot = seat_a_sink(&kernel, Ok(IDENTITY_REPLY.to_vec())).await;
@@ -148,7 +149,7 @@ fn a_sinks_refusal_reaches_the_player_over_the_wire() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("main").await.unwrap();
+        let ctx = create_context(&kernel, "main").await.unwrap();
         let _ = kernel.join_context(ctx, "midi-exchange-wire").await.unwrap();
 
         let _slot = seat_a_sink(
@@ -173,7 +174,7 @@ fn a_client_with_no_sink_installed_refuses_immediately() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("main").await.unwrap();
+        let ctx = create_context(&kernel, "main").await.unwrap();
         let _ = kernel.join_context(ctx, "midi-exchange-wire").await.unwrap();
 
         let slot = seat_a_sink(&kernel, Ok(IDENTITY_REPLY.to_vec())).await;
@@ -199,7 +200,7 @@ fn identify_without_any_presence_report_is_an_unknown_state_error() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("main").await.unwrap();
+        let ctx = create_context(&kernel, "main").await.unwrap();
         let _ = kernel.join_context(ctx, "midi-exchange-wire").await.unwrap();
 
         let (out, status) = shell_exec_wait(&kernel, "kj midi identify keystep-pro", ctx).await;

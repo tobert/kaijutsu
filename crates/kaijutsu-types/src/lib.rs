@@ -108,7 +108,7 @@ pub const SSH_SHARE_SUBSYSTEM: &str = "kaijutsu-share";
 /// Starts at 1. 0 is reserved as the "old client that predates this field"
 /// sentinel (capnp's struct default for an unset `UInt32`) and must never be
 /// a real version.
-pub const WIRE_VERSION: u32 = 1;
+pub const WIRE_VERSION: u32 = 2;
 
 /// Build the human-facing diagnosis for a `bindKernel` [`WIRE_VERSION`]
 /// mismatch — names both sides and points the remedy at whichever one is

@@ -381,6 +381,12 @@ impl JoinedContext {
 /// Outcome of resolving a label to a context and (re)joining it — the
 /// `success` reply shape shared by `register_session` and, via
 /// `stabilize_context_label`, the hook listener's post-hoc label fixup.
+/// Where `register_session` creates a new context, and who performs it.
+struct SessionCreate {
+    parent: kaijutsu_client::ParentChoice,
+    performer: Option<String>,
+}
+
 pub(crate) struct JoinOutcome {
     pub context_id: ContextId,
     pub label: String,
@@ -668,6 +674,10 @@ pub struct KaijutsuMcp {
     /// Hosting agent name. Shared with the hook listener because a lifecycle
     /// event may identify the host when startup detection could not.
     agent_name: Arc<Mutex<Option<String>>>,
+    /// The context `register_session` creates its context under, by label or
+    /// id. `None` chooses the kernel's only live root context
+    /// (`kaijutsu_client::choose_parent`).
+    parent: Option<String>,
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -695,6 +705,7 @@ impl KaijutsuMcp {
             session_id: Arc::new(Mutex::new(None)),
             context_name: "local".to_string(),
             agent_name: Arc::new(Mutex::new(None)),
+            parent: None,
         }
     }
 
@@ -796,7 +807,14 @@ impl KaijutsuMcp {
             agent_name: Arc::new(Mutex::new(
                 cc_session_id.map(|_| "claude-code".to_string()),
             )),
+            parent: None,
         })
+    }
+
+    /// Name the context `register_session` creates its context under.
+    pub fn with_parent(mut self, parent: Option<String>) -> Self {
+        self.parent = parent;
+        self
     }
 
     /// Get the backend variant (for hook listener setup, etc.).
@@ -1850,27 +1868,12 @@ impl KaijutsuMcp {
         ))
     }
 
-    /// Whether a `create_context_typed` failure is the specific,
-    /// safe-to-retry label-uniqueness race `create_context_with_fresh_label`
-    /// exists to paper over — as opposed to any other RPC failure (auth,
-    /// connection loss, an unrelated server-side bug), which must propagate
-    /// unretried.
-    ///
-    /// There is no typed signal for this across the wire: the server folds
-    /// `KernelDbError::LabelConflict` into a plain `capnp::Error::failed`
-    /// string (`rpc.rs`), and the client folds that into `CallError::Rpc`
-    /// (`actor.rs`) — a capnp schema change would be the principled fix, but
-    /// capnp is owned by a parallel lane right now. Matching on
-    /// `CallError::Rpc` first is the load-bearing part: it already rules
-    /// out `NotReady`/`Timeout`/`Shutdown`/`PermanentlyFailed`, none of which
-    /// a retry could fix. The `"label conflict"` substring inside that
-    /// specific variant then narrows to the one `Rpc` failure retrying
-    /// actually helps with; "the string classification is only correct by
-    /// luck of the message text" is a known trap in this codebase
-    /// (`kernel_db.rs`'s `insert_document` classification history) — kept
-    /// narrow and commented rather than pretending it's a typed check.
-    fn is_retryable_label_conflict(err: &kaijutsu_client::CallError) -> bool {
-        matches!(err, kaijutsu_client::CallError::Rpc(msg) if msg.contains("label conflict"))
+    /// Whether a create failed only because a concurrent register claimed the
+    /// label, the one failure `create_context_with_fresh_label` retries. A
+    /// transport failure never retries, whatever its text
+    /// (`CreateContextError::is_label_conflict`).
+    fn is_retryable_label_conflict(err: &kaijutsu_client::CreateContextError) -> bool {
+        err.is_label_conflict()
     }
 
     /// Find a free suffixed label and create a context under it, retrying on
@@ -1890,12 +1893,16 @@ impl KaijutsuMcp {
         actor: &ActorHandle,
         base_label: &str,
         context_type: &str,
+        create: &SessionCreate,
     ) -> Result<(ContextId, String), String> {
         const MAX_RETRIES: u32 = 5;
         let mut last_conflict: Option<String> = None;
         for attempt in 1..=MAX_RETRIES {
             let candidate = Self::find_available_suffixed_label(actor, base_label).await?;
-            match actor.create_context_typed(&candidate, context_type).await {
+            match actor
+                .create_context_under(create.parent.context_id, &candidate, context_type, create.performer.as_deref())
+                .await
+            {
                 Ok(id) => return Ok((id, candidate)),
                 Err(e) if Self::is_retryable_label_conflict(&e) => {
                     tracing::warn!(
@@ -1919,6 +1926,32 @@ impl KaijutsuMcp {
              (last conflict: {})",
             last_conflict.unwrap_or_else(|| "<none>".to_string())
         ))
+    }
+
+    /// Choose the parent for a new session context and the performer to
+    /// record. The performer is this connection's character unless that
+    /// character is a root, which has no model and cannot be cast.
+    async fn prepare_session_create(&self, actor: &ActorHandle) -> Result<SessionCreate, String> {
+        let contexts = actor.list_contexts().await.map_err(|e| format!("could not list contexts: {e}"))?;
+        let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &contexts)?;
+        if parent.source == kaijutsu_client::ParentSource::OnlyRoot {
+            tracing::warn!(
+                parent = %parent.label,
+                "register_session: no parent named; creating under the kernel's only root context",
+            );
+        }
+        let me = actor.whoami().await.map_err(|e| format!("could not read this connection's identity: {e}"))?;
+        let sheet = actor
+            .execute_kj_quiet(parent.context_id, vec!["character".into(), "show".into(), me.username.clone()])
+            .await
+            .map_err(|e| format!("could not read character '{}': {e}", me.username))?;
+        let root = sheet
+            .data
+            .as_ref()
+            .and_then(|data| data.get("root"))
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| format!("character '{}' has no sheet: {}", me.username, sheet.stderr.trim()))?;
+        Ok(SessionCreate { parent, performer: (!root).then_some(me.username) })
     }
 
     async fn register_session_impl(&self, req: RegisterSessionRequest) -> String {
@@ -1968,6 +2001,7 @@ impl KaijutsuMcp {
 
         let mut resumed = false;
         let mut previous_context: Option<serde_json::Value> = None;
+        let mut parent: Option<kaijutsu_client::ParentChoice> = None;
         let (context_id, label) = match existing {
             Some(ctx) if ctx.concluded_at.is_none() && !ctx.archived => {
                 // Attach: the label already names a live context. Loud on
@@ -2002,6 +2036,10 @@ impl KaijutsuMcp {
                 (ctx.id, requested_label.clone())
             }
             Some(ctx) => {
+                let create = match self.prepare_session_create(&remote.actor).await {
+                    Ok(create) => create,
+                    Err(e) => return format!("Error choosing where to create the session context: {e}"),
+                };
                 // Concluded or archived — never silently resurrect. Create a
                 // fresh context under a deterministic suffixed label and tell
                 // the caller what happened to the old one. Retries internally
@@ -2011,6 +2049,7 @@ impl KaijutsuMcp {
                     &remote.actor,
                     &requested_label,
                     &context_type,
+                    &create,
                 )
                 .await
                 {
@@ -2034,6 +2073,7 @@ impl KaijutsuMcp {
                 if let Err(e) = remote.actor.join_context(new_id).await {
                     return format!("Error joining context: {e}");
                 }
+                parent = Some(create.parent);
                 previous_context = Some(serde_json::json!({
                     "context_id": ctx.id.to_hex(),
                     "context_short": ctx.id.short(),
@@ -2044,10 +2084,18 @@ impl KaijutsuMcp {
                 (new_id, fresh_label)
             }
             None => {
-                // No conflict — create as today.
+                let create = match self.prepare_session_create(&remote.actor).await {
+                    Ok(create) => create,
+                    Err(e) => return format!("Error choosing where to create the session context: {e}"),
+                };
                 let new_id = match remote
                     .actor
-                    .create_context_typed(&requested_label, &context_type)
+                    .create_context_under(
+                        create.parent.context_id,
+                        &requested_label,
+                        &context_type,
+                        create.performer.as_deref(),
+                    )
                     .await
                 {
                     Ok(id) => id,
@@ -2056,6 +2104,7 @@ impl KaijutsuMcp {
                 if let Err(e) = remote.actor.join_context(new_id).await {
                     return format!("Error joining context: {e}");
                 }
+                parent = Some(create.parent);
                 (new_id, requested_label.clone())
             }
         };
@@ -2175,6 +2224,14 @@ impl KaijutsuMcp {
             "label": outcome.label,
             "resumed": outcome.resumed,
             "previous_context": outcome.previous_context,
+            "parent": parent.map(|parent| serde_json::json!({
+                "context_id": parent.context_id.to_hex(),
+                "label": parent.label,
+                "source": match parent.source {
+                    kaijutsu_client::ParentSource::Explicit => "explicit",
+                    kaijutsu_client::ParentSource::OnlyRoot => "only_root",
+                },
+            })),
         })
         .to_string()
     }
@@ -3046,67 +3103,9 @@ mod tests {
     // Two concurrent `register_session` calls racing the same
     // concluded/archived base label
     // can both resolve the same suffixed candidate as free, then race
-    // `create_context_typed` — the loser used to get a raw DB constraint
-    // error surfaced straight to its caller instead of a clean retry. No
-    // end-to-end race test here: this crate's RPC path needs a real
-    // `ActorHandle` over a live SSH connection to a `kaijutsu-server`, and
-    // the project steers `--lib` runs away from that harness (russh teardown
-    // noise — see `llm_stream.rs`'s `publish_tests` doc comment for the same
-    // call elsewhere). `is_retryable_label_conflict` is the deterministic,
-    // pure piece that actually decides retry-or-propagate, so it's pinned
-    // directly instead.
-
-    use kaijutsu_client::CallError;
-    use kaijutsu_client::actor::NotReadyReason;
-
-    /// The real shape this exists for: the server wraps
-    /// `KernelDbError::LabelConflict` in `capnp::Error::failed`, and the
-    /// client folds that into `CallError::Rpc`. The "label conflict"
-    /// substring survives the wrapping (`rpc.rs`: `"KernelDb insert_context
-    /// failed for {}: {}"` around the DB error's own `"label conflict: {0}"`
-    /// Display).
-    #[test]
-    fn rpc_error_with_label_conflict_text_is_retryable() {
-        assert!(KaijutsuMcp::is_retryable_label_conflict(&CallError::Rpc(
-            "KernelDb insert_context failed for 019ec1: label conflict: mcp-42-2".to_string()
-        )));
-    }
-
-    /// An `Rpc` failure that ISN'T the label race must not be retried —
-    /// retrying a genuinely different server-side error would just loop
-    /// through suffixed candidates for no reason and eventually exhaust them
-    /// with a misleading "all taken" message.
-    #[test]
-    fn rpc_error_without_label_conflict_text_is_not_retryable() {
-        assert!(!KaijutsuMcp::is_retryable_label_conflict(&CallError::Rpc(
-            "Failed to resolve default workspace for context 019ec1: some other failure"
-                .to_string()
-        )));
-    }
-
-    /// The variant match comes FIRST, deliberately: a `PermanentlyFailed`
-    /// (or any non-`Rpc` variant) must never be retried even if its message
-    /// happens to contain the string "label conflict" — otherwise this
-    /// degrades into the exact string-only classification trap the codebase
-    /// already learned to avoid once (`kernel_db.rs`'s `insert_document`
-    /// classification history). A retry can't fix a connection that's
-    /// already gone.
-    #[test]
-    fn non_rpc_variants_are_never_retryable_even_with_matching_text() {
-        assert!(!KaijutsuMcp::is_retryable_label_conflict(
-            &CallError::PermanentlyFailed("label conflict: definitely not retryable".to_string())
-        ));
-        assert!(!KaijutsuMcp::is_retryable_label_conflict(&CallError::NotReady(
-            NotReadyReason::Cooldown {
-                until_ms: 0,
-                last_error: "label conflict: still not retryable".to_string(),
-            }
-        )));
-        assert!(!KaijutsuMcp::is_retryable_label_conflict(
-            &CallError::Timeout(std::time::Duration::from_secs(5))
-        ));
-        assert!(!KaijutsuMcp::is_retryable_label_conflict(&CallError::Shutdown));
-    }
+    // `kj context create`. The loser retries only on a kernel refusal naming
+    // a label conflict; `kaijutsu_client::CreateContextError` pins that
+    // classification with its own tests.
 
     // ========================================================================
     // ShellCompletion JSON envelope

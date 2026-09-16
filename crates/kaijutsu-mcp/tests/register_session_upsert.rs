@@ -123,6 +123,51 @@ async fn run_shell(mcp: &KaijutsuMcp, command: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("shell reply carried no structuredContent: {out:?}"))
 }
 
+/// A new session's context is created under the kernel's only root context,
+/// and the reply names the parent and why it was chosen.
+#[test]
+fn a_new_session_is_created_under_the_only_root_context() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let reg = register_with_retry(&mcp, "parent-test").await;
+        assert!(reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{reg}");
+        assert_eq!(reg["parent"]["label"].as_str(), Some(SshServerConfig::EPHEMERAL_ROOT), "{reg}");
+        assert_eq!(reg["parent"]["source"].as_str(), Some("only_root"), "{reg}");
+        assert!(reg["parent"]["context_id"].as_str().is_some_and(|id| id != reg["context_id"].as_str().unwrap()), "{reg}");
+    });
+}
+
+/// With several root contexts and no named parent, registration refuses and
+/// lists them instead of choosing one.
+#[test]
+fn several_roots_without_a_named_parent_refuse() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let first = register_with_retry(&mcp, "seat").await;
+        assert!(first.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{first}");
+        let out = run_shell(&mcp, "kj character create second-root --root").await;
+        assert_eq!(out["exit_code"].as_i64(), Some(0), "{out}");
+
+        let other = connect_mcp(addr).await;
+        let mut raw = String::new();
+        for _ in 0..100 {
+            raw = other
+                .register_session(Parameters(RegisterSessionRequest {
+                    label: Some("needs-a-parent".to_string()),
+                    context_type: None,
+                }))
+                .await;
+            if !raw.contains("not ready") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(raw.contains("second-root") && raw.contains("--parent"), "{raw}");
+    });
+}
+
 /// The core regression guard: a second MCP session (a fresh actor — the
 /// reconnect-after-a-dropped-session shape) registering with the SAME label
 /// as a still-live context must attach to it, not hard-fail on the

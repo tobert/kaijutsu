@@ -412,3 +412,25 @@ pub async fn connect_client(addr: SocketAddr) -> RpcClient {
         .await
         .expect("RPC client init failed")
 }
+
+/// Create `label` of type `default` through `kj context create`, run from
+/// the kernel's only root context (`kaijutsu_client::choose_parent`).
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn create_context(kernel: &KernelHandle, label: &str) -> Result<kaijutsu_types::ContextId, String> {
+    create_context_typed(kernel, label, "default").await
+}
+
+/// Create `label` of `context_type` through `kj context create`, run from
+/// the kernel's only root context.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn create_context_typed(
+    kernel: &KernelHandle,
+    label: &str,
+    context_type: &str,
+) -> Result<kaijutsu_types::ContextId, String> {
+    let contexts = kernel.list_contexts().await.map_err(|e| e.to_string())?;
+    let parent = kaijutsu_client::choose_parent(None, &contexts)?;
+    let argv = kaijutsu_client::context_create_argv(label, context_type, None);
+    let result = kernel.execute_kj_quiet(parent.context_id, &argv).await.map_err(|e| e.to_string())?;
+    kaijutsu_client::context_id_from_create_result(&result)
+}

@@ -3653,7 +3653,7 @@ fn write_context_row_to_handle_info(
 /// the durable KernelDb row if the in-memory registry has lost it. Returns
 /// the context's trace id (zeroed if truly unknown) on success.
 ///
-/// The registry is populated by `createContext`/`registerFork`, AND
+/// The registry is populated by `kj context create` and fork, AND
 /// `create_shared_kernel`'s boot-time recovery step already re-registers
 /// every context `KernelDb::list_active_contexts` returns (`WHERE
 /// archived_at IS NULL`) on every kernel start — so a live or concluded
@@ -3664,8 +3664,8 @@ fn write_context_row_to_handle_info(
 /// recovery does NOT cover is an ARCHIVED context: excluded from
 /// `list_active_contexts`, its registry entry does not survive a restart,
 /// even though its KernelDb row and BlockStore document both do. Before this
-/// fix, joining it after a restart was a hard failure here ("use
-/// createContext first") despite the context plainly existing. Healing
+/// fix, joining it after a restart was a hard failure here despite the
+/// context plainly existing. Healing
 /// here — the one place every attach/reconnect funnels through (the
 /// `joinContext` RPC handler, and via that RPC,
 /// `register_session`'s attach path) — fixes it generally: the join succeeds
@@ -3683,7 +3683,7 @@ async fn ensure_context_joinable(
     // Context must already exist — no auto-creation.
     if !kernel.documents.contains(context_id) {
         return Err(capnp::Error::failed(format!(
-            "context {} does not exist — use createContext first",
+            "context {} does not exist; create it with `kj context create`",
             context_id
         )));
     }
@@ -3703,7 +3703,7 @@ async fn ensure_context_joinable(
         let row = row.ok_or_else(|| {
             capnp::Error::failed(format!(
                 "context {context_id} not registered in drift router and has \
-                 no KernelDb row — use createContext first",
+                 no KernelDb row; create it with `kj context create`",
             ))
         })?;
         log::warn!(
@@ -3747,239 +3747,6 @@ async fn ensure_context_joinable(
         drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16])
     };
     Ok(trace_id)
-}
-
-/// The shared context-creation recipe, called by both the `createContext` RPC
-/// and the cold-start genesis bootstrap (`create_shared_kernel`).
-///
-/// Does, in order: create the Conversation document + input doc, write the
-/// KernelDb row with `provider`/`model` left `None` (rolling back the
-/// document on failure — see the "neither path stamps" note inside) and
-/// explicit model performer left unset; MCP contexts record their credential
-/// character (rolling back the same way on a lookup failure), register in the
-/// DriftRouter (rolling back the row + document on failure), run the
-/// `create` rc lifecycle for `context_type` (failure is logged, not fatal —
-/// it surfaces as Error blocks in the new context), and arm the beat for
-/// musician contexts. Hard failures (document / DB / drift) return `Err`;
-/// everything downstream is best-effort. Wire-result writing is the caller's
-/// job — this never touches capnp results.
-// The state handle, the new context's own identity (id/type/label/creator/
-// parent), and the session it's joining — none share a natural owner.
-#[allow(clippy::too_many_arguments)]
-async fn create_context_inner(
-    state: &SharedKernelState,
-    context_id: ContextId,
-    context_type: &str,
-    label: Option<&str>,
-    created_by: PrincipalId,
-    parent_ctx: Option<ContextId>,
-    session_id: SessionId,
-) -> Result<(), capnp::Error> {
-    // Create the conversation document for this context.
-    if let Err(e) =
-        state
-            .documents
-            .create_document(context_id, kaijutsu_types::DocKind::Conversation, None)
-    {
-        return Err(capnp::Error::failed(format!(
-            "Failed to create document for context {}: {}",
-            context_id, e
-        )));
-    }
-
-    // Neither creation path stamps provider/model onto the row.
-    // `row.provider`/`row.model` are the explicit per-context override
-    // only — leaving them `None` here matches `kj context create` and lets
-    // `resolve_context_model`'s ladder (explicit override → cast slot →
-    // registry default) do the one job it exists to do: resolve live, every
-    // call, so a later registry-default change reaches every context
-    // uniformly instead of stamped rows freezing whatever the default
-    // happened to be at creation time. A context with nothing configured
-    // anywhere still gets a clear "No LLM backend configured" error on use
-    // (llm_stream.rs) rather than a silently-injected hardcoded model.
-
-    // Write-through: KernelDb first, then DriftRouter. Both must succeed or we
-    // roll in-memory state back — never a ghost live-in-memory-but-missing-from-DB
-    // context (lost on restart), nor a DB row without a drift entry.
-    {
-        let db = state.kernel_db.lock();
-        // An external MCP model acts as its credential character. A context
-        // hosting a kernel model needs an explicit performer; the connected
-        // creator becomes its director, and the kernel resolves its effective
-        // reviewer from an explicit override, director delegation, or Amy's default.
-        let creator_has_sheet = match db.get_character(created_by) {
-            Ok(character) => character.is_some(),
-            Err(e) => {
-                drop(db);
-                let _ = state.documents.delete_document(context_id);
-                return Err(capnp::Error::failed(format!(
-                    "Failed to resolve character for {}: {}",
-                    created_by, e
-                )));
-            }
-        };
-        let (played_by, director_id) =
-            resolve_creator_identity(created_by, creator_has_sheet, context_type);
-        let row = ContextRow {
-            context_id,
-            label: label.map(|s| s.to_string()),
-            provider: None,
-            model: None,
-            system_prompt: None,
-            consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
-            context_state: kaijutsu_types::ContextState::Live,
-            context_type: context_type.to_string(),
-            created_at: kaijutsu_types::now_millis() as i64,
-            created_by,
-            forked_from: parent_ctx,
-            fork_kind: None,
-            archived_at: None,
-            workspace_id: None,
-            preset_id: None,
-            concluded_at: None,
-            last_activity_at: None,
-            promoted_at: None,
-            demoted_at: None,
-            paused_at: None,
-            cast_id: None,
-            origin_host: None,
-            played_by,
-            reviewer_id: None,
-            director_id,
-        };
-        // No `unwrap_or_else(WorkspaceId::new)` fallback: a fabricated id names
-        // no row in `workspaces`, so it only turns a legible workspace error
-        // into an FK violation reported as an insert failure one line later.
-        let default_ws = match db.get_or_create_default_workspace(row.created_by) {
-            Ok(ws) => ws,
-            Err(e) => {
-                drop(db);
-                let _ = state.documents.delete_document(context_id);
-                return Err(capnp::Error::failed(format!(
-                    "Failed to resolve default workspace for context {}: {}",
-                    context_id.short(),
-                    e
-                )));
-            }
-        };
-        if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-            drop(db);
-            let _ = state.documents.delete_document(context_id);
-            return Err(capnp::Error::failed(format!(
-                "KernelDb insert_context failed for {}: {}",
-                context_id.short(),
-                e
-            )));
-        }
-    }
-
-    {
-        let mut drift = state.kernel.drift().write();
-        if let Err(e) = drift.register(context_id, label, parent_ctx, created_by) {
-            drop(drift);
-            let _ = state.kernel_db.lock().delete_context(context_id);
-            let _ = state.documents.delete_document(context_id);
-            return Err(capnp::Error::failed(format!("label conflict: {e}")));
-        }
-        log::info!(
-            "Created context {} (label={:?}) in kernel DriftRouter",
-            context_id,
-            label
-        );
-    }
-
-    // Run rc create-lifecycle scripts for this context_type — the same hook
-    // `kj context create` fires. Failures surface as Error blocks in the new
-    // context; they don't abort creation.
-    let rc_caller = kaijutsu_kernel::KjCaller {
-        principal_id: created_by,
-        actor_id: created_by,
-        reviewer_id: None,
-        context_id: Some(context_id),
-        session_id,
-        confirmed: false,
-        rc_depth: 0,
-        // The privileged binding-write path is the rc kaish
-        // (materialize_context_kaish_rc), not this caller, so it stays unprivileged.
-        privileged: false,
-    };
-    if let Err(e) = state
-        .kj_dispatcher
-        .run_rc_lifecycle("create", context_id, parent_ctx, None, None, &rc_caller)
-        .await
-    {
-        log::warn!("rc create lifecycle for {}: {e}", context_id.short());
-    }
-
-    // The beat arm now lives in the musician's `create/` rc (run above via
-    // run_rc_lifecycle), not a Rust `context_type == "musician"` branch here —
-    // this used to duplicate the same arm logic the `kj context create` builtin
-    // carried. A context_type is a beat participant exactly when its `create/` rc
-    // calls `kj transport arm`, so new beat-bearing roles (funkMusician, …) need
-    // no kernel edit. See `docs/chameleon.md`, "context_type is an rc bundle".
-
-    Ok(())
-}
-
-/// Resolve a connecting principal's `played_by`/`director_id` for a newly
-/// created context. `has_sheet` says whether `created_by` names a live
-/// character (`KernelDb::get_character(created_by).is_some()`). A raw
-/// connection principal with no sheet can never hold a review delegation, so
-/// it becomes no one's director rather than a director that can never be
-/// reassigned or delegated to; `kj context create --as`/`context_set` are the
-/// only paths that turn it into a real director later, once a sheet exists.
-/// `played_by` additionally requires `context_type == "mcp"` — every other
-/// creation path leaves the performer unset (`docs/approval-identity.md`,
-/// "Regular client creation leaves the performer unset").
-fn resolve_creator_identity(
-    created_by: PrincipalId,
-    has_sheet: bool,
-    context_type: &str,
-) -> (Option<PrincipalId>, Option<PrincipalId>) {
-    let director_id = has_sheet.then_some(created_by);
-    let played_by = if context_type == "mcp" { director_id } else { None };
-    (played_by, director_id)
-}
-
-#[cfg(test)]
-mod resolve_creator_identity_tests {
-    use super::*;
-
-    #[test]
-    fn no_sheet_gets_no_director() {
-        let created_by = PrincipalId::new();
-        let (played_by, director_id) = resolve_creator_identity(created_by, false, "coder");
-        assert_eq!(played_by, None);
-        assert_eq!(
-            director_id, None,
-            "a raw connection principal with no character sheet can never \
-             hold a delegation, so it must not be stamped as director"
-        );
-    }
-
-    #[test]
-    fn sheet_becomes_director_but_not_played_by_outside_mcp() {
-        let created_by = PrincipalId::new();
-        let (played_by, director_id) = resolve_creator_identity(created_by, true, "coder");
-        assert_eq!(played_by, None, "non-mcp context types leave the performer unset");
-        assert_eq!(director_id, Some(created_by));
-    }
-
-    #[test]
-    fn mcp_context_with_sheet_gets_played_by_too() {
-        let created_by = PrincipalId::new();
-        let (played_by, director_id) = resolve_creator_identity(created_by, true, "mcp");
-        assert_eq!(played_by, Some(created_by));
-        assert_eq!(director_id, Some(created_by));
-    }
-
-    #[test]
-    fn mcp_context_with_no_sheet_gets_neither() {
-        let created_by = PrincipalId::new();
-        let (played_by, director_id) = resolve_creator_identity(created_by, false, "mcp");
-        assert_eq!(played_by, None);
-        assert_eq!(director_id, None);
-    }
 }
 
 impl kernel::Server for KernelImpl {
@@ -5621,76 +5388,9 @@ impl kernel::Server for KernelImpl {
         )
     }
 
-    /// Create a new context with the given label.
-    ///
-    /// Generates a fresh ContextId (UUIDv7), creates the document in the
-    /// block store, and registers it in the kernel's drift router.
-    fn create_context(
-        self: Rc<Self>,
-        params: kernel::CreateContextParams,
-        mut results: kernel::CreateContextResults,
-    ) -> Promise<(), capnp::Error> {
-        let label = pry!(pry!(pry!(params.get()).get_label()).to_str()).to_owned();
-        // Empty context_type on the wire (old clients, plain `create_context`)
-        // means "default" — the mode bundle whose rc create-scripts run below.
-        let context_type_raw = pry!(pry!(pry!(params.get()).get_context_type()).to_str()).to_owned();
-        let context_type = if context_type_raw.is_empty() {
-            "default".to_string()
-        } else {
-            context_type_raw
-        };
-
-        let kernel = self.kernel.clone();
-        let connection = self.connection.clone();
-
-        let session_id = connection.borrow().session_id;
-        let parent_ctx = connection
-            .borrow()
-            .session_contexts
-            .get(&session_id)
-            .map(|r| *r);
-
-        log::info!(
-            "create_context: label='{}' kernel='{}'",
-            label,
-            kernel.id.to_hex()
-        );
-
-        Promise::from_future(async move {
-            // Refuse an unlisted type before any row exists — a typo'd
-            // context_type must not silently create a context with no rc
-            // bucket to run.
-            if let Err(e) =
-                kaijutsu_kernel::kj::rc::check_context_type(kernel.kernel.vfs(), &context_type)
-                    .await
-            {
-                return Err(capnp::Error::failed(e));
-            }
-            let context_id = ContextId::new();
-            let created_by = connection.borrow().principal;
-            let label_ref = if label.is_empty() {
-                None
-            } else {
-                Some(label.as_str())
-            };
-            create_context_inner(
-                &kernel,
-                context_id,
-                &context_type,
-                label_ref,
-                created_by,
-                parent_ctx,
-                session_id,
-            )
-            .await?;
-            results.get().set_id(context_id.as_bytes());
-            Ok(())
-        })
-    }
-
     /// Join an existing context, returning its context_id.
     ///
-    /// The context must already exist (created via `createContext`). Returns an
+    /// The context must already exist (created by `kj context create`). Returns an
     /// error if the context doesn't exist — no auto-creation.
     fn join_context(
         self: Rc<Self>,

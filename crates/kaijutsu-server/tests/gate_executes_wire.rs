@@ -28,6 +28,7 @@
 //!     `Waiting` is the one that fills.
 
 mod common;
+use common::{create_context};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,8 +170,8 @@ async fn seats() -> Seats {
     let approver_client = connect(approver_key).await;
     let (worker_kj, _) = worker_client.bind_kernel().await.unwrap();
     let (approver_kj, _) = approver_client.bind_kernel().await.unwrap();
-    let worker = worker_kj.create_context("gate-exec-worker").await.unwrap();
-    let approver = approver_kj.create_context("gate-exec-approver").await.unwrap();
+    let worker = create_context(&worker_kj, "gate-exec-worker").await.unwrap();
+    let approver = create_context(&approver_kj, "gate-exec-approver").await.unwrap();
     kernel
         .kernel_db
         .lock()
@@ -1011,7 +1012,7 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
         // driver busy. Its performer cannot approve the ask, so the assigned
         // reviewer does — same as every other answer here.
         let kj = &s.worker_kj;
-        let blocker_ctx = kj.create_context("gate-exec-blocker").await.unwrap();
+        let blocker_ctx = create_context(&kj, "gate-exec-blocker").await.unwrap();
         let reviewer = s
             .kernel
             .kernel_db

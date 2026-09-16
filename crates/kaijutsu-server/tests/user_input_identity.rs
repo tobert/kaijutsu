@@ -24,6 +24,7 @@
 //!     reviewer cannot answer it either.
 
 mod common;
+use common::{create_context};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -196,7 +197,7 @@ async fn two_connections(mock_llm: bool) -> TwoConnections {
 fn the_draft_belongs_to_the_connection_not_the_request() {
     run_local(async {
         let conns = two_connections(true).await;
-        let ctx = conns.a.create_context("shared-draft").await.unwrap();
+        let ctx = create_context(&conns.a, "shared-draft").await.unwrap();
         // B's submit below is a chat prompt, which starts a turn and so
         // needs a resolvable performer/reviewer — irrelevant to what this
         // test pins, but required for the submit to succeed at all.
@@ -288,7 +289,7 @@ fn seed_turn_identity(server: &SharedKernel, ctx: ContextId) {
 fn submit_input_authors_the_connection_principal_and_starts_an_interactive_turn() {
     run_local(async {
         let conns = two_connections(true).await;
-        let ctx = conns.a.create_context("submit-identity").await.unwrap();
+        let ctx = create_context(&conns.a, "submit-identity").await.unwrap();
         seed_turn_identity(&conns.server, ctx);
         conns.a.join_context(ctx, "a").await.unwrap();
 
@@ -340,7 +341,7 @@ fn a_humans_own_shell_command_is_gated_like_a_models_and_user_initiated_grants_n
         let client = connect_client(addr).await;
         let principal = client.whoami().await.unwrap().principal_id;
         let (kernel, _) = client.bind_kernel().await.unwrap();
-        let ctx = kernel.create_context("human-shell-gate").await.unwrap();
+        let ctx = create_context(&kernel, "human-shell-gate").await.unwrap();
         kernel.join_context(ctx, "human").await.unwrap();
         // The gate needs a resolvable reviewer to raise an ask at all — the
         // shipped default reviewer name, unused by this test beyond that.
@@ -405,18 +406,18 @@ struct OneCredential {
     server: SharedKernel,
 }
 
+/// A kernel whose only root character is `name`, connected as that root.
 async fn one_credential(name: &str) -> OneCredential {
-    let tmp = tempfile::tempdir().unwrap();
-    let auth_db_path = tmp.path().join("auth.db");
-    let principal = PrincipalId::new();
-    let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).unwrap();
-    let auth_db = AuthDb::open(&auth_db_path).unwrap();
-    auth_db.add_key(principal, key.public_key(), Some(name)).unwrap();
-
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut config = SshServerConfig::ephemeral(addr.port());
-    config.auth_db_path = Some(auth_db_path);
+    let config = SshServerConfig::ephemeral_with_root(addr.port(), name);
+    let key = (*config.root_key()).clone();
+    let principal = kaijutsu_kernel::KernelDb::open(config.data_dir.as_ref().unwrap().join("kernel.db"))
+        .unwrap()
+        .get_character_by_name(name)
+        .unwrap()
+        .expect("the ephemeral root character")
+        .principal_id;
     let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
     tokio::task::spawn_local(async move {
         SshServer::new(config)
@@ -425,11 +426,6 @@ async fn one_credential(name: &str) -> OneCredential {
             .unwrap();
     });
     let server = kernel_rx.await.unwrap();
-    server
-        .kernel_db
-        .lock()
-        .insert_character(&character(principal, name))
-        .unwrap();
 
     let client = connect_with_key(addr, key, name).await;
     let (kj, _) = client.bind_kernel().await.unwrap();
@@ -449,12 +445,11 @@ fn output_after(server: &SharedKernel, ctx: ContextId, command_block_id: &kaijut
         .expect("a ToolResult block immediately follows its ToolCall")
 }
 
-/// **4. A root's own gated command is a self-confirmation.** A human whose
-/// character has nobody responsible above it — her context has no parent,
-/// no explicit reviewer, no `played_by`, and
-/// assets/defaults/approval.toml's shipped `default_reviewer = "amy"`
-/// resolves to the very character this test seeds at the connection's own
-/// principal — runs a gated shell command. Every resolution layer is
+/// **4. A root's own gated command is a self-confirmation.** amy is the
+/// kernel's root character; her context sits under her own root context,
+/// which she plays, and assets/defaults/approval.toml's shipped
+/// `default_reviewer = "amy"` names her too, so nobody else is above her
+/// when she runs a gated shell command. Every resolution layer is
 /// exhausted, so the ask is raised with amy as its own reviewer, amy alone
 /// may answer it, and her answer EXECUTES the command
 /// (`docs/approval-identity.md`).
@@ -472,8 +467,8 @@ fn a_root_humans_own_gated_command_is_a_self_confirmation_she_can_answer() {
     run_local(async {
         let amy = one_credential("amy").await;
         let amy_principal = amy.kj_principal;
-        let work = amy.kj.create_context("amy-self-review-work").await.unwrap();
-        let answering = amy.kj.create_context("amy-answering").await.unwrap();
+        let work = create_context(&amy.kj, "amy-self-review-work").await.unwrap();
+        let answering = create_context(&amy.kj, "amy-answering").await.unwrap();
         amy.kj.join_context(work, "amy").await.unwrap();
         install_ask_hook(&amy.server, work, "wire-amy-self-review").await;
 
@@ -576,8 +571,8 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         let (worker_kj, _) = worker_client.bind_kernel().await.unwrap();
         let (coder_kj, _) = coder_client.bind_kernel().await.unwrap();
 
-        let worker_ctx = worker_kj.create_context("coder-cannot-answer-worker").await.unwrap();
-        let coder_ctx = coder_kj.create_context("coder-cannot-answer-coder").await.unwrap();
+        let worker_ctx = create_context(&worker_kj, "coder-cannot-answer-worker").await.unwrap();
+        let coder_ctx = create_context(&coder_kj, "coder-cannot-answer-coder").await.unwrap();
         server
             .kernel_db
             .lock()

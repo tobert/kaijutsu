@@ -101,6 +101,13 @@ struct ServeArgs {
     /// (after resolving their variables) is also an error.
     #[arg(long)]
     key_file: Option<PathBuf>,
+
+    /// The context, by label or id, that new session contexts are created
+    /// under. Falls back to `KAIJUTSU_PARENT`; a flag wins over its
+    /// variable. Default: the kernel's only live root context. With several
+    /// root contexts and no parent named, registration fails and lists them.
+    #[arg(long)]
+    parent: Option<String>,
 }
 
 /// Hook client arguments.
@@ -208,7 +215,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 detected_session_id.as_deref(),
                 detected_agent_name,
                 key_source.clone(),
-            ).await?;
+            ).await?
+            .with_parent(args.parent.clone().or_else(|| {
+                std::env::var("KAIJUTSU_PARENT").ok().filter(|value| !value.trim().is_empty())
+            }));
 
             // Auto-register a session context so hook events land somewhere
             // without requiring a model to call register_session first.

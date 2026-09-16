@@ -438,11 +438,6 @@ enum RpcCommand {
         min_cluster_size: u32,
         reply: oneshot::Sender<Result<Vec<ContextCluster>, CallError>>,
     },
-    CreateContext {
-        label: String,
-        context_type: String,
-        reply: oneshot::Sender<Result<ContextId, CallError>>,
-    },
     /// DB-driven label lookup — bypasses the DriftRouter `ListContexts`
     /// reads. `None` reply payload means no context currently holds the
     /// label. See `KernelHandle::resolve_context_label`.
@@ -826,7 +821,6 @@ impl RpcCommand {
             Self::SearchSimilar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetClusters { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ResolveContextLabel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocksVersioned { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1281,29 +1275,6 @@ impl ActorHandle {
         min_cluster_size: u32,
     ) -> Result<Vec<ContextCluster>, CallError> {
         self.send(|reply| RpcCommand::GetClusters { min_cluster_size, reply }).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn create_context(&self, label: &str) -> Result<ContextId, CallError> {
-        self.create_context_typed(label, "").await
-    }
-
-    /// Create a context with an explicit `context_type` (mode bundle).
-    ///
-    /// The type selects which `/config/rc/<context_type>/create/*` scripts run
-    /// server-side. Empty `context_type` is treated as `"default"`.
-    #[tracing::instrument(skip(self))]
-    pub async fn create_context_typed(
-        &self,
-        label: &str,
-        context_type: &str,
-    ) -> Result<ContextId, CallError> {
-        self.send(|reply| RpcCommand::CreateContext {
-            label: label.into(),
-            context_type: context_type.into(),
-            reply,
-        })
-        .await
     }
 
     /// DB-driven label lookup — see `KernelHandle::resolve_context_label`.
@@ -3772,19 +3743,6 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetClusters { min_cluster_size, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_clusters(min_cluster_size));
-        }
-        RpcCommand::CreateContext {
-            label,
-            context_type,
-            reply,
-        } => {
-            dispatch!(
-                kernel,
-                reply,
-                close_tx,
-                k,
-                k.create_context_typed(&label, &context_type)
-            );
         }
         RpcCommand::ResolveContextLabel { label, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.resolve_context_label(&label));

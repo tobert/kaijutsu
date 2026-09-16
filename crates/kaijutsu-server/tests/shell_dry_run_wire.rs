@@ -10,6 +10,7 @@
 //! config-write authority `kj hook add` requires.
 
 mod common;
+use common::{create_context};
 
 use common::{connect_client, run_local, start_server_with_kernel_handle};
 use kaijutsu_client::ShellDryRunOutcome;
@@ -54,7 +55,7 @@ fn a_denying_hook_reports_a_would_deny_and_asks_nobody() {
         let (addr, kernel) = start_server_with_kernel_handle().await;
         let client = connect_client(addr).await;
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
-        let context_id = kj.create_context("dry-run-deny-wire").await.unwrap();
+        let context_id = create_context(&kj, "dry-run-deny-wire").await.unwrap();
 
         install_hook(
             &kernel,
@@ -106,7 +107,7 @@ fn an_asking_hook_reports_a_would_ask_and_leaves_no_pending_ask() {
         let client = connect_client(addr).await;
         let actor = client.whoami().await.unwrap().principal_id;
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
-        let context_id = kj.create_context("dry-run-ask-wire").await.unwrap();
+        let context_id = create_context(&kj, "dry-run-ask-wire").await.unwrap();
         let reviewer = PrincipalId::new();
         {
             let db = kernel.kernel_db.lock();
@@ -163,7 +164,7 @@ fn no_matching_hook_reports_a_would_proceed_and_records_nothing() {
         let (addr, kernel) = start_server_with_kernel_handle().await;
         let client = connect_client(addr).await;
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
-        let context_id = kj.create_context("dry-run-clean-wire").await.unwrap();
+        let context_id = create_context(&kj, "dry-run-clean-wire").await.unwrap();
 
         let report = kj
             .shell_dry_run(context_id, "echo hello")

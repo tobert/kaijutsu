@@ -30,6 +30,7 @@ fn tui_peer_instance() -> &'static str {
 pub struct KernelBridge {
     actor: ActorHandle,
     context_type: String,
+    parent: Option<String>,
 }
 
 impl KernelBridge {
@@ -42,6 +43,7 @@ impl KernelBridge {
     pub async fn connect(
         config: SshConfig,
         context_type: String,
+        parent: Option<String>,
         connect_timeout: std::time::Duration,
     ) -> Result<Self> {
         let client = connect_ssh(config.clone())
@@ -118,6 +120,7 @@ impl KernelBridge {
         Ok(Self {
             actor,
             context_type,
+            parent,
         })
     }
 
@@ -133,7 +136,7 @@ impl KernelBridge {
     #[cfg(test)]
     pub(crate) fn never_answers_for_test() -> Self {
         let (actor, _cmds) = ActorHandle::never_answers_for_test();
-        Self { actor, context_type: "default".to_string() }
+        Self { actor, context_type: "default".to_string(), parent: None }
     }
 
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>> {
@@ -141,7 +144,8 @@ impl KernelBridge {
     }
 
     /// Resolve a `--context` argument: a context id, then a label, then
-    /// create under that label.
+    /// create under that label, as a child of `--parent` or of the kernel's
+    /// only live root context.
     pub async fn open(&self, target: &str) -> Result<ContextInfo> {
         if let Ok(id) = ContextId::parse(target) {
             let contexts = self.list_contexts().await?;
@@ -158,11 +162,13 @@ impl KernelBridge {
             self.actor.join_context(info.id).await?;
             return Ok(info);
         }
+        let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &self.list_contexts().await?)
+            .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         let id = self
             .actor
-            .create_context_typed(target, &self.context_type)
+            .create_context_under(parent.context_id, target, &self.context_type, None)
             .await
-            .with_context(|| format!("create context {target}"))?;
+            .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         self.actor.join_context(id).await?;
         let contexts = self.list_contexts().await?;
         contexts

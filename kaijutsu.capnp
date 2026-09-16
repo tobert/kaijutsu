@@ -2001,7 +2001,9 @@ interface Kernel {
 
   listContexts @25 (trace :TraceContext) -> (contexts :List(ContextHandleInfo));
 
-  createContext @26 (label :Text, contextType :Text) -> (id :Data);
+  # Creating a context is `kj context create`, run through `executeKj` from
+  # the context that becomes its parent. There is no parentless create.
+  retired26 @26 ();
 
   joinContext @27 (contextId :Data, instance :Text, trace :TraceContext) -> (contextId :Data);
 
@@ -2057,10 +2059,9 @@ interface Kernel {
 
   # Set (or clear, on empty `originHost`) a context's advisory `originHost` —
   # see `ContextHandleInfo.originHost`'s doc comment. Called once, right
-  # after `createContext`, by a client that knows its own hostname
-  # (`register_session` on the kaijutsu-mcp side); NOT part of `createContext`
-  # itself, so every other creation path (genesis bootstrap, fork, the app)
-  # is unaffected and keeps shipping today's two-arg call. Shared-trust
+  # after context creation, by a client that knows its own hostname
+  # (`register_session` on the kaijutsu-mcp side); every other creation path
+  # (root context bootstrap, fork, `kj context create`) never sets it. Shared-trust
   # model: advisory metadata, not auth — the server trusts the client's
   # self-report, and a failed call here is non-fatal to the caller's own
   # registration (log-and-continue, never a hard failure over a hostname).

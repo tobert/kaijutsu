@@ -84,7 +84,7 @@ fn live_eval_wc_clone_skeleton() {
         let (kernel, _kernel_id) = client.bind_kernel().await.expect("bind_kernel");
 
         // Root context: where Haiku writes its first reply.
-        let main = kernel.create_context("main").await.expect("create_context");
+        let main = create_context(&kernel, "main").await.expect("create_context");
         kernel
             .join_context(main, "live_eval")
             .await
@@ -454,8 +454,7 @@ fn live_eval_conversation_session_slice_a() {
         let (kernel, _kernel_id) = client.bind_kernel().await.expect("bind_kernel");
 
         // ── Scenario 1: shell call between LLM turns is visible to turn 2 ──
-        let ctx_shell = kernel
-            .create_context("shell_visibility")
+        let ctx_shell = create_context(&kernel, "shell_visibility")
             .await
             .expect("create_context(shell_visibility)");
         kernel
@@ -581,8 +580,7 @@ fn live_eval_conversation_session_slice_a() {
         }
 
         // ── Scenario 2: exclude on a flushed block is a no-op ──
-        let ctx_excl = kernel
-            .create_context("exclude_noop")
+        let ctx_excl = create_context(&kernel, "exclude_noop")
             .await
             .expect("create_context(exclude_noop)");
         kernel
@@ -653,8 +651,7 @@ fn live_eval_conversation_session_slice_a() {
         // exclude is the *second* user turn — leaves the first user/assistant
         // pair intact so the forked wire history starts with a user message
         // (Anthropic requires user-first alternation).
-        let ctx_fork = kernel
-            .create_context("fork_pre_exclude")
+        let ctx_fork = create_context(&kernel, "fork_pre_exclude")
             .await
             .expect("create_context(fork_pre_exclude)");
         kernel

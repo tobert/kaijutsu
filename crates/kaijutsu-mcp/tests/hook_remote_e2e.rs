@@ -172,9 +172,11 @@ fn rename_context_rpc_renames_and_refuses_taken_labels() {
 
         // A second context may not take the same label — proves the first
         // rename really persisted (the uniqueness constraint sees it).
+        let contexts = remote.actor.list_contexts().await.expect("list contexts");
+        let parent = kaijutsu_client::choose_parent(None, &contexts).expect("the root context");
         let other = remote
             .actor
-            .create_context("rename-e2e-other")
+            .create_context_under(parent.context_id, "rename-e2e-other", "default", None)
             .await
             .expect("create second context");
         let err = remote

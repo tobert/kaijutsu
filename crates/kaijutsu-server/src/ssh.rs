@@ -201,6 +201,11 @@ impl SshServerConfig {
     /// [`Self::root_key`]. A test that sets its own `auth_db_path` binds its
     /// own keys; the root character still lets the kernel start.
     pub fn ephemeral(port: u16) -> Self {
+        Self::ephemeral_with_root(port, Self::EPHEMERAL_ROOT)
+    }
+
+    /// [`Self::ephemeral`] with the root character named `root_name`.
+    pub fn ephemeral_with_root(port: u16, root_name: &str) -> Self {
         // Use a fresh tempdir so no real configs (mcp.toml etc.) load. The name is
         // unique by construction: PID (cross-process) + timestamp (cross-run) + a
         // process-wide atomic counter so two `ephemeral()` calls that land in the
@@ -238,7 +243,7 @@ impl SshServerConfig {
             crate::init::init_root(
                 &kernel_db,
                 &auth_db,
-                Self::EPHEMERAL_ROOT,
+                root_name,
                 root_key.public_key(),
                 Some("ephemeral root"),
             )

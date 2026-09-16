@@ -16,6 +16,7 @@
 //! frontend most needs to hear about.
 
 mod common;
+use common::{create_context};
 
 use std::time::Duration;
 
@@ -110,7 +111,7 @@ fn interactive_turn_pushes_completed_with_its_output_block() {
         let actor = PrincipalId::new();
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel.create_context("turns").await.unwrap();
+        let ctx = create_context(&kernel, "turns").await.unwrap();
         assign_turn_identity(&server, ctx, actor);
         let _joined = kernel.join_context(ctx, "test").await.unwrap();
 
@@ -181,7 +182,7 @@ fn cancelled_turn_pushes_a_cancelled_stop_reason() {
         let actor = PrincipalId::new();
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let ctx = kernel.create_context("cancel").await.unwrap();
+        let ctx = create_context(&kernel, "cancel").await.unwrap();
         assign_turn_identity(&server, ctx, actor);
         let _joined = kernel.join_context(ctx, "test").await.unwrap();
 
@@ -253,7 +254,7 @@ fn autonomous_fork_turn_pushes_started_then_completed_for_the_child() {
         let actor = PrincipalId::new();
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
-        let main_ctx = kernel.create_context("parent").await.unwrap();
+        let main_ctx = create_context(&kernel, "parent").await.unwrap();
         assign_turn_identity(&server, main_ctx, actor);
         let _joined = kernel.join_context(main_ctx, "test").await.unwrap();
 
