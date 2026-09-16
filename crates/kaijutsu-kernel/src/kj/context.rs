@@ -2610,7 +2610,7 @@ mod tests {
         let context = register_context(&d, Some("repair-reviewer"), None, owner);
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired-reviewer".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None, root: false }).unwrap();
+            db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired-reviewer".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             db.set_default_approval_reviewer(amy).unwrap();
             db.update_context_review_assignment(context, None, Some(retired), None).unwrap();
         }
@@ -2637,7 +2637,7 @@ mod tests {
                     name: name.into(),
                     created_at: 0,
                     retired_at: None,
-                    handoff_ctx: None, root: false,
+                    handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
             db.update_context_review_assignment(context, None, Some(lead), Some(amy)).unwrap();
@@ -2680,7 +2680,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(coder, "coder"), (director, "lead")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
             db.set_default_approval_reviewer(amy).unwrap();
             db.update_context_review_assignment(context, Some(coder), Some(amy), None).unwrap();
@@ -2708,7 +2708,7 @@ mod tests {
         let context = register_context(&d, Some("broken-review"), None, owner);
         {
             let db = d.kernel_db().lock();
-            db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None, root: false }).unwrap();
+            db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             db.update_context_review_assignment(context, Some(owner), Some(retired), None).unwrap();
         }
         let caller = crate::kj::KjCaller { principal_id: owner, actor_id: owner, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
@@ -2732,7 +2732,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
             db.set_default_approval_reviewer(amy).unwrap();
             db.update_context_review_assignment(context, None, None, Some(lead)).unwrap();
@@ -2801,7 +2801,7 @@ mod tests {
         let lead = PrincipalId::new();
         for (principal_id, name) in [(coder, "coder"), (lead, "lead")] {
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
         let context = register_context(&d, Some("review-work"), None, amy.actor_id);
@@ -2835,7 +2835,7 @@ mod tests {
         let coder = PrincipalId::new();
         for (principal_id, name) in [(banto, "banto"), (coder, "coder")] {
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
         let context = register_context(&d, Some("banto-directed"), None, amy_id);
@@ -2860,7 +2860,7 @@ mod tests {
         let sovereign = PrincipalId::new();
         for (principal_id, name) in [(banto, "banto"), (sovereign, "sovereign")] {
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
         d.kernel_db().lock().update_character_root(sovereign, true).unwrap();
@@ -2897,7 +2897,7 @@ mod tests {
         let coder = PrincipalId::new();
         for (principal_id, name) in [(banto, "banto"), (sibling, "sibling"), (coder, "coder")] {
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
         let context = register_context(&d, Some("banto-directed-3"), None, amy_id);
@@ -2952,11 +2952,11 @@ mod tests {
             name: s("banto"),
             created_at: 1,
             retired_at: None,
-            handoff_ctx: None, root: false,
+            handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: caller.principal_id, name: s("amy"), created_at: 1,
-            retired_at: None, handoff_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let parent = register_context(&d, Some("parent-operator"), None, caller.principal_id);
         d.kernel_db().lock().update_played_by(parent, Some(caller.principal_id)).unwrap();
@@ -3012,13 +3012,13 @@ mod tests {
         caller.context_id = None;
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: caller.principal_id, name: s("amy"), created_at: 1,
-            retired_at: None, handoff_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         for (index, name) in ["two words", "O'Brien", "null", "$literal", "1.0"].into_iter().enumerate() {
             let actor = PrincipalId::new();
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: actor, name: s(name), created_at: 1,
-                retired_at: None, handoff_ctx: None, root: false,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             let note = d.dispatch(&[s("handoff"), s("note"), s("--for"), s(name), s("name-specific-history")], &caller).await;
             assert!(note.is_ok(), "{}", note.message());
@@ -3052,7 +3052,7 @@ mod tests {
         caller.context_id = None;
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: PrincipalId::new(), name: s("retired"), created_at: 1,
-            retired_at: Some(2), handoff_ctx: None, root: false,
+            retired_at: Some(2), handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let before = d.kernel_db().lock().list_documents().unwrap().len();
         for (name, expected) in [("missing", "no character named"), ("retired", "is retired")] {
@@ -3078,7 +3078,7 @@ mod tests {
                 name: s("retired-between-checks"),
                 created_at: 1,
                 retired_at: Some(2),
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.set_default_approval_reviewer(amy).unwrap();
         }
@@ -3129,7 +3129,7 @@ mod tests {
                 name: s("reviewer-changed-after-validation"),
                 created_at: 1,
                 retired_at: None,
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.set_default_approval_reviewer(amy).unwrap();
             db.grant_approval_delegation(performer, performer, amy).unwrap();
@@ -3176,7 +3176,7 @@ mod tests {
         caller.context_id = None;
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: caller.principal_id, name: s("requester"), created_at: 1,
-            retired_at: None, handoff_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         let result = d.dispatch(&[s("context"), s("create"), s("unassigned")], &caller).await;
         assert!(result.is_ok(), "{}", result.message());
@@ -5359,7 +5359,7 @@ mod tests {
 
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: create_caller.actor_id, name: s("amy"), created_at: 0,
-            retired_at: None, handoff_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
 
         let create = d

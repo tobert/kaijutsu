@@ -88,7 +88,7 @@ fn character(principal_id: PrincipalId, name: &str) -> CharacterRow {
         name: name.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,
         retired_at: None,
-        handoff_ctx: None,
+        handoff_ctx: None, root_ctx: None,
         root: false,
     }
 }

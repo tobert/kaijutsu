@@ -230,7 +230,7 @@ mod tests {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ids = names.iter().map(|name| {
             let principal_id = PrincipalId::new();
-            db.lock().insert_character(&crate::kernel_db::CharacterRow { principal_id, name: (*name).to_string(), created_at: 0, retired_at: None, handoff_ctx: None, root: false }).unwrap();
+            db.lock().insert_character(&crate::kernel_db::CharacterRow { principal_id, name: (*name).to_string(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             principal_id
         }).collect();
         let kernel = Kernel::new("approval-test", Path::new("/tmp"), shared_block_store(PrincipalId::system()), db).await;
@@ -358,7 +358,7 @@ mod tests {
             for (principal_id, name) in [(amy, "amy"), (lead, "lead"), (coder, "coder")] {
                 if db.get_character(principal_id).unwrap().is_none() {
                     db.insert_character(&crate::kernel_db::CharacterRow {
-                        principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                        principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                     }).unwrap();
                 }
             }

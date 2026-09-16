@@ -41,7 +41,7 @@ mod tests {
         let principal_id = PrincipalId::new();
         db.insert_character(&CharacterRow {
             principal_id, name: name.into(), created_at: 0,
-            retired_at: None, handoff_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         principal_id
     }

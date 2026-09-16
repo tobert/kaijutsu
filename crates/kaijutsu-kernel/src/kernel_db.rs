@@ -1206,9 +1206,9 @@ CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
 -- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
--- `handoff_ctx` and `root` have shipped; the rest of the sheet
--- (default_cast_id, rc_dir, memory_root, root_ctx) arrives with the slice
--- that reads it. See docs/character.md, "Character = principal + sheet".
+-- `handoff_ctx`, `root`, and `root_ctx` have shipped; the rest of the sheet
+-- (default_cast_id, rc_dir, memory_root) arrives with the slice that reads
+-- it. See docs/character.md, "Character = principal + sheet".
 CREATE TABLE IF NOT EXISTS characters (
     principal_id     BLOB NOT NULL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
@@ -1225,7 +1225,11 @@ CREATE TABLE IF NOT EXISTS characters (
     -- performer and it cannot be cast. Accountability itself is a relation
     -- between contexts, not a column here — see docs/character.md, "Roots
     -- and rotation".
-    root             INTEGER NOT NULL DEFAULT 0
+    root             INTEGER NOT NULL DEFAULT 0,
+    -- A root character's root context: type `root`, labeled with the
+    -- character's name, played by it, with no parent. NULL for an ordinary
+    -- character. SET NULL on delete for the same reason as `handoff_ctx`.
+    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
@@ -2443,6 +2447,7 @@ impl KernelDb {
                  CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0)",
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
         ];
         for sql in alters {
             match conn.execute(sql, []) {
@@ -6979,6 +6984,11 @@ pub struct CharacterRow {
     /// checked it was still unset (`docs/character.md`, "The handoff is an
     /// ordinary context").
     pub handoff_ctx: Option<ContextId>,
+    /// A root character's root context, where its person types `kj` and
+    /// where the seats it starts begin their lineage. `None` for an
+    /// ordinary character, and briefly for a root whose context the kernel
+    /// has not created yet (`docs/character.md`, "Roots and rotation").
+    pub root_ctx: Option<ContextId>,
     /// A root character has no model. It cannot be cast as a context's
     /// performer and turn identity refuses it, so a root is a place with
     /// hands on it rather than a seat a model plays
@@ -7541,8 +7551,8 @@ impl KernelDb {
         validate_label(&row.name)?;
         self.conn
             .execute(
-                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO characters (principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     blob_param(row.principal_id.as_bytes()),
                     row.name,
@@ -7550,6 +7560,7 @@ impl KernelDb {
                     row.retired_at,
                     row.handoff_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                     row.root,
+                    row.root_ctx.as_ref().map(|c| c.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| {
@@ -7561,7 +7572,7 @@ impl KernelDb {
     /// Fetch a character by its kernel-owned name.
     pub fn get_character_by_name(&self, name: &str) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx
              FROM characters WHERE name = ?1",
         )?;
         Ok(stmt.query_row(params![name], row_to_character_row).optional()?)
@@ -7572,7 +7583,7 @@ impl KernelDb {
     /// `played_by` (e.g. resolving the name to display in `kj context info`).
     pub fn get_character(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CharacterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx
              FROM characters WHERE principal_id = ?1",
         )?;
         Ok(stmt
@@ -7585,15 +7596,39 @@ impl KernelDb {
     /// ones by default.
     pub fn list_characters(&self, include_retired: bool) -> KernelDbResult<Vec<CharacterRow>> {
         let sql = if include_retired {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root \
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx \
              FROM characters ORDER BY name"
         } else {
-            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root \
+            "SELECT principal_id, name, created_at, retired_at, handoff_ctx, root, root_ctx \
              FROM characters WHERE retired_at IS NULL ORDER BY name"
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], row_to_character_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Set (or clear) a character's root context. The caller creates the
+    /// context and records it here under the same `KernelDb` lock that
+    /// confirmed the column was still NULL.
+    pub fn set_character_root_ctx(
+        &self,
+        principal_id: PrincipalId,
+        ctx: Option<ContextId>,
+    ) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE characters SET root_ctx = ?1 WHERE principal_id = ?2",
+            params![
+                ctx.as_ref().map(|c| c.as_bytes().to_vec()),
+                blob_param(principal_id.as_bytes())
+            ],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!(
+                "character {}",
+                principal_id.short()
+            )));
+        }
+        Ok(())
     }
 
     /// Set (or clear) a character's handoff-log context. Called exactly
@@ -7897,6 +7932,7 @@ fn row_to_character_row(row: &rusqlite::Row<'_>) -> SqliteResult<CharacterRow> {
         retired_at: row.get(3)?,
         handoff_ctx: read_opt_context_id(row, 4)?,
         root: row.get(5)?,
+        root_ctx: read_opt_context_id(row, 6)?,
     })
 }
 
@@ -10338,7 +10374,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None, root: false,
+            handoff_ctx: None, root_ctx: None, root: false,
         })
         .unwrap();
 
@@ -10373,7 +10409,7 @@ mod tests {
         db.set_default_approval_reviewer(reviewer).unwrap();
         assert_eq!(db.cached_default_approval_reviewer().unwrap(), None);
         db.insert_character(&CharacterRow {
-            principal_id: reviewer, name: "amy".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+            principal_id: reviewer, name: "amy".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         assert_eq!(db.cached_default_approval_reviewer().unwrap(), Some(reviewer));
         assert!(db.retire_character(reviewer, 1).unwrap());
@@ -10390,7 +10426,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None, root: false,
+            handoff_ctx: None, root_ctx: None, root: false,
         })
         .unwrap();
         let err = db
@@ -10399,7 +10435,7 @@ mod tests {
                 name: "hajime".to_string(),
                 created_at: 2000,
                 retired_at: None,
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             })
             .unwrap_err();
         assert!(matches!(err, KernelDbError::LabelConflict(_)), "got: {err}");
@@ -10466,11 +10502,11 @@ mod tests {
         let coder = PrincipalId::new();
         db.insert_character(&CharacterRow {
             principal_id: amy, name: "amy".into(), created_at: 0,
-            retired_at: None, handoff_ctx: None, root: true,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
         db.insert_character(&CharacterRow {
             principal_id: coder, name: "coder".into(), created_at: 0,
-            retired_at: None, handoff_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         assert!(db.get_character(amy).unwrap().unwrap().root, "a root inserts as a root");
         assert!(!db.get_character(coder).unwrap().unwrap().root);
@@ -10492,7 +10528,7 @@ mod tests {
             let principal_id = PrincipalId::new();
             db.insert_character(&CharacterRow {
                 principal_id, name: (*name).to_string(), created_at: 0,
-                retired_at: None, handoff_ctx: None, root: false,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             principal_id
         }).collect()
@@ -10778,7 +10814,7 @@ mod tests {
             name: "hajime".to_string(),
             created_at: 1000,
             retired_at: None,
-            handoff_ctx: None, root: false,
+            handoff_ctx: None, root_ctx: None, root: false,
         })
         .unwrap();
         assert_eq!(db.name_for(character), "hajime");
@@ -10808,7 +10844,7 @@ mod tests {
                 name: "hajime".to_string(),
                 created_at: 1000,
                 retired_at: None,
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             })
             .unwrap();
         }
@@ -10825,7 +10861,7 @@ mod tests {
                 name: "intruder".to_string(),
                 created_at: 2000,
                 retired_at: None,
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             })
             .unwrap_err();
         assert!(

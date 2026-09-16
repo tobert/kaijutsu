@@ -345,6 +345,30 @@ async fn root_role_is_a_model_less_admin_console() {
     );
 }
 
+/// `kj character create --root` runs the root bundle's create lifecycle on
+/// the root context it creates.
+#[tokio::test]
+async fn character_create_root_binds_its_root_context() {
+    let h = harness().await;
+    let caller = KjCaller {
+        principal_id: h.creator,
+        actor_id: h.creator,
+        reviewer_id: None,
+        context_id: None,
+        session_id: SessionId::new(),
+        confirmed: false,
+        rc_depth: 0,
+        privileged: true,
+    };
+    let argv: Vec<String> = ["character", "create", "keeper", "--root"].iter().map(|s| s.to_string()).collect();
+    let res = h.dispatcher.dispatch(&argv, &caller).await;
+    assert!(matches!(res, KjResult::Ok { .. }), "{}", res.message());
+
+    let root_ctx = h.db.lock().get_character_by_name("keeper").unwrap().unwrap().root_ctx.expect("root context");
+    let binding = h.kernel.broker().binding(&root_ctx).await.expect("the root rc bundle must bind it");
+    assert!(binding.is_admin(), "the root context must hold binding-admin");
+}
+
 #[tokio::test]
 async fn mcp_role_holds_config_governance() {
     // The `mcp` context_type is the producer/orchestrator voice (Claude Code

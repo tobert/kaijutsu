@@ -28,7 +28,7 @@ pub fn ensure_hajime(db: &mut KernelDb) -> KernelDbResult<CharacterRow> {
         name: HAJIME.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,
         retired_at: None,
-        handoff_ctx: None, root: false,
+        handoff_ctx: None, root_ctx: None, root: false,
     };
     db.insert_character(&row)?;
     Ok(row)

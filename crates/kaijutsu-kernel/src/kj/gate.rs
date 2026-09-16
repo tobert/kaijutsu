@@ -1095,7 +1095,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id: reviewer, name: "trace-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
         }
@@ -1255,7 +1255,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id: lead, name: "lead".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_context_review(context, Some(coder), Some(lead)).unwrap();
         }
@@ -1409,7 +1409,7 @@ mod tests {
                 name: "judge".into(),
                 created_at: 0,
                 retired_at: None,
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             })
             .unwrap();
             // judge directs the context, so the walk would resolve to

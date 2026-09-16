@@ -147,7 +147,7 @@ pub fn seed_turn_identity(
         name: name.to_string(),
         created_at: kaijutsu_types::now_millis() as i64,
         retired_at: None,
-        handoff_ctx: None, root: false,
+        handoff_ctx: None, root_ctx: None, root: false,
     };
     let performer = sheet("mock-performer");
     let db = kernel.kernel_db.lock();

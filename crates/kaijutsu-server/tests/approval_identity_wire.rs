@@ -25,7 +25,7 @@ async fn connect(addr: std::net::SocketAddr, key: PrivateKey, name: &str) -> Rpc
 
 fn add_character(kernel: &SharedKernel, id: PrincipalId, name: &str) {
     kernel.kernel_db.lock().insert_character(&CharacterRow {
-        principal_id: id, name: name.to_string(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+        principal_id: id, name: name.to_string(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
     }).expect("insert character");
 }
 

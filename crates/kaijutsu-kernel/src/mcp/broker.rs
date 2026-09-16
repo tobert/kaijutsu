@@ -10470,7 +10470,7 @@ mod tests {
         let db = kj.kernel_db();
         let db = db.lock();
         db.insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: reviewer, name: format!("{label}-reviewer"), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+            principal_id: reviewer, name: format!("{label}-reviewer"), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
         }).unwrap();
         db.update_context_review(context_id, Some(actor), Some(reviewer)).unwrap();
         CallContext::new(actor, context_id, kaijutsu_types::SessionId::new(), kj.kernel_id()).with_actor(actor, Some(reviewer))

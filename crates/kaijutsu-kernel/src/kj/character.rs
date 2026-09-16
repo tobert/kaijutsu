@@ -9,10 +9,14 @@
 //! (`docs/character.md`, "A context is played by a character").
 
 use clap::{Parser, Subcommand};
-use kaijutsu_types::{ContentType, ContextState, PrincipalId};
+use kaijutsu_types::{ContentType, ContextId, ContextState, PrincipalId, SessionId};
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
-use crate::kernel_db::CharacterRow;
+use crate::control::ConsentMode;
+use crate::kernel_db::{CharacterRow, ContextRow};
+
+/// The rc bundle a root context runs.
+pub const ROOT_CONTEXT_TYPE: &str = "root";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -116,11 +120,11 @@ impl KjDispatcher {
         }
 
         match parsed.command {
-            CharacterCommand::Create { name, root } => self.character_create(&name, root),
+            CharacterCommand::Create { name, root } => self.character_create(&name, root, caller).await,
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
             CharacterCommand::Set { name, root, no_root } => {
-                self.character_set(&name, root, no_root)
+                self.character_set(&name, root, no_root, caller).await
             }
             CharacterCommand::Retire { name } => self.character_retire(&name),
         }
@@ -131,38 +135,150 @@ impl KjDispatcher {
     /// hazard `add-key` avoids by binding instead of minting
     /// (`docs/character.md`, "Adding a key binds; it never mints") applies
     /// just as much to a repeated `create`.
-    fn character_create(&self, name: &str, root: bool) -> KjResult {
-        let db = self.kernel_db().lock();
-        match db.get_character_by_name(name) {
-            Ok(Some(existing)) => {
-                return KjResult::ok_with_data(
-                    format!("{name} already exists ({})", existing.principal_id.short()),
-                    character_to_json(&existing),
-                );
+    async fn character_create(&self, name: &str, root: bool, caller: &KjCaller) -> KjResult {
+        let row = {
+            let db = self.kernel_db().lock();
+            match db.get_character_by_name(name) {
+                Ok(Some(existing)) => {
+                    return KjResult::ok_with_data(
+                        format!("{name} already exists ({})", existing.principal_id.short()),
+                        character_to_json(&existing),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => return KjResult::Err(format!("kj character create: {e}")),
             }
-            Ok(None) => {}
-            Err(e) => return KjResult::Err(format!("kj character create: {e}")),
-        }
 
-        let row = CharacterRow {
-            principal_id: PrincipalId::new(),
-            name: name.to_string(),
-            created_at: kaijutsu_types::now_millis() as i64,
-            retired_at: None,
-            handoff_ctx: None,
-            root,
+            let row = CharacterRow {
+                principal_id: PrincipalId::new(),
+                name: name.to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                retired_at: None,
+                handoff_ctx: None, root_ctx: None,
+                root,
+            };
+            if let Err(e) = db.insert_character(&row) {
+                return KjResult::Err(format!("kj character create: {e}"));
+            }
+            row
         };
-        if let Err(e) = db.insert_character(&row) {
-            return KjResult::Err(format!("kj character create: {e}"));
+        if !root {
+            return KjResult::ok_with_data(
+                format!("created {name} ({})", row.principal_id.short()),
+                character_to_json(&row),
+            );
         }
+        let root_ctx = match self.ensure_root_context(row.principal_id, caller.principal_id).await {
+            Ok(ctx) => ctx,
+            Err(e) => return KjResult::Err(format!(
+                "kj character create: created {name} as a root, but not its root context: {e}"
+            )),
+        };
+        let row = CharacterRow { root_ctx: Some(root_ctx), ..row };
         KjResult::ok_with_data(
             format!(
-                "created {name} ({}){}",
+                "created {name} ({}) as a root, with root context '{name}' ({})",
                 row.principal_id.short(),
-                if root { " as a root" } else { "" }
+                root_ctx.short()
             ),
             character_to_json(&row),
         )
+    }
+
+    /// Create the root context of each live root character that has none.
+    /// The kernel calls this at start. Returns the contexts it created.
+    pub async fn ensure_root_contexts(&self, requester: PrincipalId) -> Result<Vec<ContextId>, String> {
+        let missing: Vec<PrincipalId> = self
+            .kernel_db()
+            .lock()
+            .list_characters(false)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|row| row.root && row.root_ctx.is_none())
+            .map(|row| row.principal_id)
+            .collect();
+        let mut created = Vec::with_capacity(missing.len());
+        for principal in missing {
+            created.push(self.ensure_root_context(principal, requester).await?);
+        }
+        Ok(created)
+    }
+
+    /// Return a live root character's root context, creating it when the
+    /// sheet has none: type `root`, labeled with the character's name,
+    /// played by it, with no parent. `requester` becomes `created_by`.
+    async fn ensure_root_context(&self, character: PrincipalId, requester: PrincipalId) -> Result<ContextId, String> {
+        let new_id = ContextId::new();
+        let name = {
+            let db = self.kernel_db().lock();
+            let sheet = db
+                .get_character(character)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("character {} has no sheet", character.short()))?;
+            if let Some(existing) = sheet.root_ctx {
+                return Ok(existing);
+            }
+            if !sheet.root {
+                return Err(format!("{} is not a root character", sheet.name));
+            }
+            if sheet.retired_at.is_some() {
+                return Err(format!("{} is retired", sheet.name));
+            }
+            let row = ContextRow {
+                context_id: new_id,
+                label: Some(sheet.name.clone()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                context_type: ROOT_CONTEXT_TYPE.to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: requester,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+                cast_id: None,
+                origin_host: None,
+                played_by: Some(character),
+                reviewer_id: None,
+                director_id: None,
+            };
+            db.in_transaction(|db| {
+                let default_ws = db.get_or_create_default_workspace(requester)?;
+                db.insert_context_with_document(&row, default_ws)?;
+                db.set_character_root_ctx(character, Some(new_id))
+            })
+            .map_err(|e| format!("could not create the root context '{}': {e}", sheet.name))?;
+            sheet.name
+        };
+
+        self.drift_router()
+            .write()
+            .register(new_id, Some(&name), None, requester)
+            .map_err(|e| format!("could not register the root context '{name}': {e}"))?;
+
+        let rc_caller = KjCaller {
+            principal_id: requester,
+            actor_id: character,
+            reviewer_id: None,
+            context_id: Some(new_id),
+            session_id: SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: false,
+        };
+        self.run_rc_lifecycle("create", new_id, None, None, None, &rc_caller)
+            .await
+            .map_err(|e| format!("root context '{name}' rc create lifecycle: {e}"))?;
+        Ok(new_id)
     }
 
     /// `list` → an array of full-id strings by default
@@ -232,27 +348,50 @@ impl KjDispatcher {
     /// Set or clear `root`. A root has no model: it cannot be cast as a
     /// context's performer and turn identity refuses it
     /// (`docs/character.md`, "Roots and rotation").
-    fn character_set(&self, name: &str, root: bool, no_root: bool) -> KjResult {
+    async fn character_set(&self, name: &str, root: bool, no_root: bool, caller: &KjCaller) -> KjResult {
         if !root && !no_root {
             return KjResult::Err("kj character set: specify --root or --no-root".to_string());
         }
-        let db = self.kernel_db().lock();
-        let row = match db.get_character_by_name(name) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return KjResult::Err(format!(
-                    "kj character set: no character named '{name}' — \
-                     `kj character list` to see who exists"
-                ));
+        let principal_id = {
+            let db = self.kernel_db().lock();
+            let row = match db.get_character_by_name(name) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return KjResult::Err(format!(
+                        "kj character set: no character named '{name}' — \
+                         `kj character list` to see who exists"
+                    ));
+                }
+                Err(e) => return KjResult::Err(format!("kj character set: {e}")),
+            };
+            if no_root && let Some(ctx) = row.root_ctx {
+                match db.get_context(ctx) {
+                    Ok(Some(context)) if !context.is_archived() => {
+                        return KjResult::Err(format!(
+                            "kj character set: {name} plays its live root context '{}' ({}), \
+                             and a root context is played by a root; archive it first",
+                            context.label.as_deref().unwrap_or(name),
+                            ctx.short()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return KjResult::Err(format!("kj character set: {e}")),
+                }
             }
-            Err(e) => return KjResult::Err(format!("kj character set: {e}")),
+            if let Err(e) = db.update_character_root(row.principal_id, root) {
+                return KjResult::Err(format!("kj character set: {e}"));
+            }
+            row.principal_id
         };
-        if let Err(e) = db.update_character_root(row.principal_id, root) {
-            return KjResult::Err(format!("kj character set: {e}"));
+        if root && let Err(e) = self.ensure_root_context(principal_id, caller.principal_id).await {
+            return KjResult::Err(format!(
+                "kj character set: {name} is now a root, but has no root context: {e}"
+            ));
         }
-        let updated = match db.get_character_by_name(name) {
+        let updated = match self.kernel_db().lock().get_character(principal_id) {
             Ok(Some(r)) => r,
-            Ok(None) | Err(_) => row,
+            Ok(None) => return KjResult::Err(format!("kj character set: {name} vanished")),
+            Err(e) => return KjResult::Err(format!("kj character set: {e}")),
         };
         let msg = if root {
             format!("{name} is now a root")
@@ -336,6 +475,7 @@ fn character_to_json(row: &CharacterRow) -> serde_json::Value {
         "created_at": row.created_at,
         "retired_at": row.retired_at,
         "root": row.root,
+        "root_ctx": row.root_ctx.map(|ctx| ctx.to_hex()),
     })
 }
 
@@ -598,6 +738,96 @@ mod tests {
         assert_eq!(row("coder")["root"], serde_json::Value::Bool(false));
     }
 
+    /// `create --root` creates the character's root context: type `root`,
+    /// labeled with its name, played by it, with no parent, recorded on the
+    /// sheet. `tests/rc_role_bindings.rs` checks that its rc bundle binds it.
+    #[tokio::test]
+    async fn create_root_makes_its_root_context() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
+        assert!(matches!(created, KjResult::Ok { .. }), "{created:?}");
+
+        let sheet = d.kernel_db().lock().get_character_by_name("sovereign").unwrap().unwrap();
+        let root_ctx = sheet.root_ctx.expect("a root character records its root context");
+        let row = d.kernel_db().lock().get_context(root_ctx).unwrap().unwrap();
+        assert_eq!(row.label.as_deref(), Some("sovereign"));
+        assert_eq!(row.context_type, "root");
+        assert_eq!(row.played_by, Some(sheet.principal_id));
+        assert_eq!(row.forked_from, None);
+        assert_eq!(row.created_by, caller.principal_id, "the requester stays the creator");
+        assert!(row.archived_at.is_none());
+
+        let KjResult::Ok { data: Some(data), .. } =
+            d.dispatch(&[s("character"), s("show"), s("sovereign")], &caller).await
+        else { panic!("show must succeed") };
+        assert_eq!(data["root_ctx"], serde_json::Value::String(root_ctx.to_hex()));
+
+        let again = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
+        assert!(matches!(again, KjResult::Ok { .. }), "{again:?}");
+        let live_roots = d.kernel_db().lock().list_all_contexts().unwrap()
+            .into_iter().filter(|c| c.context_type == "root" && c.archived_at.is_none()).count();
+        assert_eq!(live_roots, 1, "a repeated create must not make a second root context");
+    }
+
+    /// An ordinary character gets no context at create.
+    #[tokio::test]
+    async fn ordinary_create_makes_no_context() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        let before = d.kernel_db().lock().list_all_contexts().unwrap().len();
+        d.dispatch(&[s("character"), s("create"), s("coder")], &caller).await;
+        let sheet = d.kernel_db().lock().get_character_by_name("coder").unwrap().unwrap();
+        assert_eq!(sheet.root_ctx, None);
+        assert_eq!(d.kernel_db().lock().list_all_contexts().unwrap().len(), before);
+    }
+
+    /// `set --root` creates the root context the flag requires, and
+    /// `set --no-root` refuses while that context is live, since a root
+    /// context is played by a root.
+    #[tokio::test]
+    async fn set_root_makes_the_root_context_and_no_root_refuses_while_live() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        d.dispatch(&[s("character"), s("create"), s("laptop")], &caller).await;
+        let set = d.dispatch(&[s("character"), s("set"), s("laptop"), s("--root")], &caller).await;
+        assert!(matches!(set, KjResult::Ok { .. }), "{set:?}");
+        let sheet = d.kernel_db().lock().get_character_by_name("laptop").unwrap().unwrap();
+        let root_ctx = sheet.root_ctx.expect("set --root creates the root context");
+        assert_eq!(d.kernel_db().lock().get_context(root_ctx).unwrap().unwrap().label.as_deref(), Some("laptop"));
+
+        let cleared = d.dispatch(&[s("character"), s("set"), s("laptop"), s("--no-root")], &caller).await;
+        let KjResult::Err(message) = cleared else { panic!("expected a refusal, got {cleared:?}") };
+        assert!(message.contains("root context"), "{message}");
+        assert!(d.kernel_db().lock().get_character_by_name("laptop").unwrap().unwrap().root);
+    }
+
+    /// At start the kernel creates a missing root context for each live
+    /// root character, and a second pass creates nothing.
+    #[tokio::test]
+    async fn ensure_root_contexts_fills_missing_and_is_idempotent() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let keeper = PrincipalId::new();
+        let retired = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name, retired_at) in [(keeper, "keeper", None), (retired, "old", Some(1))] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id, name: name.into(), created_at: 0, retired_at,
+                    handoff_ctx: None, root_ctx: None, root: true,
+                }).unwrap();
+            }
+        }
+
+        let created = d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+        assert_eq!(created.len(), 1, "only the live root gets a context");
+        let sheet = d.kernel_db().lock().get_character(keeper).unwrap().unwrap();
+        assert_eq!(sheet.root_ctx, Some(created[0]));
+        assert_eq!(d.kernel_db().lock().get_character(retired).unwrap().unwrap().root_ctx, None);
+
+        assert!(d.ensure_root_contexts(PrincipalId::system()).await.unwrap().is_empty());
+    }
+
     /// `set --root` and `set --no-root` round-trip, and `set` with neither
     /// is a usage error rather than a silent no-op.
     #[tokio::test]
@@ -610,6 +840,8 @@ mod tests {
         assert!(matches!(set, KjResult::Ok { .. }), "{set:?}");
         assert!(d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().root);
 
+        let root_ctx = d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().root_ctx.unwrap();
+        assert!(d.kernel_db().lock().archive_context(root_ctx).unwrap());
         let cleared = d.dispatch(&[s("character"), s("set"), s("worker"), s("--no-root")], &caller).await;
         assert!(matches!(cleared, KjResult::Ok { .. }), "{cleared:?}");
         assert!(!d.kernel_db().lock().get_character_by_name("worker").unwrap().unwrap().root);

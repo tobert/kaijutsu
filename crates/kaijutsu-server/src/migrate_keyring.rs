@@ -83,7 +83,7 @@ pub fn migrate_legacy_names(
             retired_at: None,
             // A migrated character's handoff context is minted lazily, on
             // its first note or tail, like every other character's.
-            handoff_ctx: None, root: false,
+            handoff_ctx: None, root_ctx: None, root: false,
         })?;
         created += 1;
     }
@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS credentials (
                 name: "kaijutsu-lead".to_string(),
                 created_at: 1,
                 retired_at: None,
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             })
             .unwrap();
 
@@ -250,7 +250,7 @@ CREATE TABLE IF NOT EXISTS credentials (
                 name: "amy".to_string(),
                 created_at: 1,
                 retired_at: None,
-                handoff_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: false,
             })
             .unwrap();
 

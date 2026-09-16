@@ -2178,7 +2178,7 @@ mod tests {
         {
             let db = d.kernel_db.lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id: reviewer, name: "decision-reviewer".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_context_review(context, Some(actor), Some(reviewer)).unwrap();
         }
@@ -4167,7 +4167,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
-                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false }).unwrap();
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
             db.set_default_approval_reviewer(amy).unwrap();
         }
@@ -4190,7 +4190,7 @@ mod tests {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
                 db.insert_character(&crate::kernel_db::CharacterRow {
-                    principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                    principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
             db.update_context_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
@@ -4223,7 +4223,7 @@ mod tests {
         {
             let db = d.kernel_db().lock();
             db.insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root: false,
+                principal_id: banto, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
             db.update_context_review_assignment(root, None, None, Some(amy)).unwrap();
             db.update_context_review(lane, None, Some(banto)).unwrap();
