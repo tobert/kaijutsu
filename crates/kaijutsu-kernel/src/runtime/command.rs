@@ -1,7 +1,7 @@
-//! Execute a contextual command into an existing block pair.
+//! Execute contextual commands and settle their results through shared hooks.
 //!
-//! Interactive submission and approval resume share this owner. A transport
-//! may supply a context-switch callback; detached runs have no connection map.
+//! Callers choose an existing transcript pair or no transcript output. A
+//! transport may supply a context-switch callback and review notices.
 
 use std::sync::Arc;
 
@@ -198,7 +198,7 @@ pub async fn run_into_blocks(
             if let Err(error) = kernel.shell_operations().attach_job(&operation.receipt.operation_id, job, manager.clone()) {
                 let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
                 outcome.settlement_error = Some(error);
-                let failure = outcome.job_result();
+                let failure = outcome.exec_result();
                 let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
                 manager.finalize_streams(job, &failure).await;
                 let _ = sender.send(failure);
@@ -222,7 +222,7 @@ pub async fn run_into_blocks(
     let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
     if let Some((manager, job, sender)) = tracked_job {
         if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
-        let result = outcome.job_result();
+        let result = outcome.exec_result();
         manager.finalize_streams(job, &result).await;
         let _ = sender.send(result);
     }
@@ -230,19 +230,22 @@ pub async fn run_into_blocks(
 }
 
 /// Execute without transcript blocks. A result review retains an audit record
-/// only when it opens an ask; ordinary quiet calls create no review record.
-pub async fn run_quiet(
+/// only when it opens an ask; ordinary calls create no review record.
+pub async fn run_without_blocks(
     kaish: &EmbeddedKaish,
     code: &str,
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
-    notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
+    mut options: kaish_kernel::ExecuteOptions,
+    run: CommandRunOptions<'_>,
 ) -> Result<CommandOutcome, String> {
     let started = std::time::Instant::now();
-    let mut outcome = capture_command(kaish, code, kaish_kernel::ExecuteOptions::default(),
-        kernel, call_ctx.context_id, CommandContextSwitch::Pinned).await;
+    if let Some(stdin) = run.stdin { options = options.with_stdin(stdin); }
+    let cancel = options.cancel_token.clone().unwrap_or_default();
+    let mut outcome = capture_command(kaish, code, options,
+        kernel, call_ctx.context_id, run.context_switch).await;
     let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
-        None, outcome.clone(), tokio_util::sync::CancellationToken::new(), notices);
+        None, outcome.clone(), cancel, run.review_notices);
     apply_result_hooks(&mut outcome, code, kernel, call_ctx, Some(&review)).await;
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
     review.settle(&outcome)?;

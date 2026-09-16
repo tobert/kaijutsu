@@ -83,9 +83,15 @@ These are source observations, not promises that all paths behave alike.
   their task retains execution and continues after approval. Quiet calls share
   execution, result review, and projection without a transcript pair or ordinary
   operation receipt.
-- Settlement remains incomplete: streaming RPC and MCP completion still have
-  separate projection paths. Streaming RPC cannot honor all hook verdicts; live
-  reporting/retry of persistence failures also remains open.
+- Streaming RPC uses the same execution, state write-back, and retained review
+  owner without transcript blocks. Its adapter owns execution IDs, the single
+  active-execution slot, interrupts, history, and output subscriptions. All hook
+  replacements and denials affect delivered output. Result review holds the slot
+  until settled; approval continues hooks without executing source again.
+  Stream exit events preserve physical exits through output truncation; synthetic
+  replacements use 0/1 completion codes because the wire requires an integer.
+- MCP completion still projects independently. Live reporting/retry of
+  persistence failures and transport/task teardown also remain open.
 - `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
   PostCall or OnError ask. Approval continues the same ordered hook snapshot;
   neither the command nor earlier hooks run again. Result-review asks have
@@ -112,7 +118,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `runtime/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
 | Pending | Dedicated threads and startup runtime | kernel `lib.rs`; server `main.rs`, `ssh.rs`, `beat.rs`, turn/resume drivers | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
 | Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
-| Pending | Streaming execute RPC | server `rpc.rs::execute` | Execution IDs, connection cancellation and concurrency rules, output subscriptions; resolve its unsupported hook substitution explicitly |
+| Partial | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, and context switching migrated; disconnect/task teardown remains in the dedicated-thread audit |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
 | Partial | Approval resume | server resume drivers; kernel `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
 | Pending | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs` | Read-only/writable distinction, stdin, typed rejection, job ownership, receipts, cancellation, and async completion |
@@ -202,10 +208,9 @@ are still processing. The output shows both results, so a quiet caller can read
 its completed result without a transcript block. An earlier ask in a sequence
 still resolves the same invocation and optional operation receipt.
 
-Streaming RPC and generic MCP calls do not yet supply a result-review owner.
-Their result-phase Ask or kaish escalation returns GateUnavailable before
-creating an ask. Migrate those consumers to retained outcomes; do not restore
-executable asks as a fallback. Streaming RPC's unhandled verdicts remain open.
+Generic MCP calls do not yet supply a result-review owner. Their result-phase
+Ask or kaish escalation returns GateUnavailable before creating an ask. Migrate
+those consumers to retained outcomes; do not restore executable asks as a fallback.
 
 Preserve the distinction between parse/validation rejection (nothing ran) and
 an execution fault. Persistence failure must be visible and must not report a

@@ -185,8 +185,8 @@ impl ShellOperationRegistry {
         self.complete_record(id, envelope, None)
     }
 
-    /// Retain execution and link each ask to the same review. A quiet command
-    /// has no operation receipt; its call identity still scopes every ask.
+    /// Retain execution and link each ask to the same review. A command without
+    /// a transcript pair has no receipt; its call identity still scopes every ask.
     pub(crate) fn checkpoint_result_review(
         &self, review_id: &str, operation_id: Option<&str>, call: &crate::mcp::CallContext,
         outcome: &CommandOutcome,
@@ -243,8 +243,8 @@ impl ShellOperationRegistry {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Finish a quiet review if it opened an ask. Normal quiet calls retain no
-    /// record. A published review result is immutable, including on retry.
+    /// Finish a receipt-free review if it opened an ask. Calls without an ask
+    /// retain no record. A published result is immutable, including on retry.
     pub(crate) fn finish_result_review(&self, review_id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
         if !matches!(outcome.block_status(), kaijutsu_types::Status::Done | kaijutsu_types::Status::Error) {
             return Err("result review completion is not terminal".into());

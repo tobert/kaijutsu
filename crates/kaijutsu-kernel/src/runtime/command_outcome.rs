@@ -136,10 +136,11 @@ impl CommandOutcome {
         }
     }
 
-    /// Kaish jobs require an integer control-flow code. Preserve the executed
-    /// result intact when applicable. Synthetic results use 0/1 for job control
-    /// and identify themselves in baggage; receipts never claim a physical exit.
-    pub fn job_result(&self) -> ExecResult {
+    /// Project into an ExecResult for jobs and RPC adapters that require an
+    /// integer completion code. Preserve executed results when applicable;
+    /// synthetic results use 0/1 and identify themselves in baggage. Durable
+    /// envelopes never claim a physical exit for a synthetic result.
+    pub fn exec_result(&self) -> ExecResult {
         if self.hook.is_none() && self.settlement_error.is_none()
             && let CommandExecution::Completed(result) = &self.execution
         {
@@ -185,7 +186,7 @@ mod tests {
             assert_eq!(envelope.content_type.as_deref(), Some("text/markdown"));
             assert_eq!(envelope.ephemeral, Some(true));
             assert_eq!(envelope.elapsed_ms, Some(42));
-            assert_eq!(outcome.job_result(), result);
+            assert_eq!(outcome.exec_result(), result);
         }
     }
 
@@ -214,7 +215,7 @@ mod tests {
         assert_eq!(envelope.content_type.as_deref(), Some("text/plain"));
         assert_eq!(envelope.data, Some(data.clone()));
         assert_eq!(restored.output_data().unwrap().rich_json, Some(data.clone()));
-        let job = restored.job_result();
+        let job = restored.exec_result();
         assert_eq!(job.code, 0);
         assert_eq!(job.data, Some(kaish_kernel::ast::Value::Json(data)));
         assert_eq!(job.baggage.get("kaijutsu.synthetic").map(String::as_str), Some("true"));
@@ -230,7 +231,7 @@ mod tests {
         for outcome in [rejected, fault] {
             assert_eq!(outcome.envelope().exit_code, None);
             assert_eq!(outcome.block_status(), Status::Error);
-            assert!(outcome.job_result().code != 0);
+            assert!(outcome.exec_result().code != 0);
         }
     }
 }

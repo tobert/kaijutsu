@@ -40,8 +40,10 @@ Quiet structured calls use the same review owner without authoring transcript
 blocks. `kj ledger show <request-id>` includes the captured execution and final
 result; its structured data exposes `result_review.captured` and
 `result_review.settled`. Every ask in a sequence retains the same invocation link.
-Streaming RPC and MCP still need a retained review owner and currently fail
-escalation before creating an ask. See
+Streaming RPC retains review too; its execution ID stays active until the
+result is settled or interrupted, then subscribers receive the final output.
+Generic MCP calls still lack a review owner and fail escalation before creating
+an ask. See
 `docs/kaish-integration.md` for the caller inventory.
 
 ## Why blocking could never reach where Amy wants it

@@ -1,8 +1,9 @@
 //! Shared kaish integration for command, lifecycle, hook, and editor consumers.
 //!
 //! `context_shell` owns contextual construction and builtin wiring.
-//! `command` owns captured execution and block-pair settlement; `structured`
-//! owns addressed kj invocation. `command_outcome` retains execution and hook results. `command_result` and `shell_state` supply shared projections
+//! `command` owns captured execution, result review, and block-pair settlement;
+//! `structured` owns addressed kj invocation. `command_outcome` retains execution
+//! and hook results. `command_result` and `shell_state` supply shared projections
 //! and durable write-back.
 //! `embedded_kaish` owns the interpreter and its execution adapters. Backend,
 //! filesystem, and builtin modules implement kaish interfaces. Rc orchestration

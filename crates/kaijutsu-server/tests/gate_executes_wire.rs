@@ -1410,3 +1410,109 @@ fn quiet_result_review_keeps_its_result_without_a_transcript_pair() {
         s.close().await;
     });
 }
+
+async fn streaming_output(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<kaijutsu_client::OutputEvent>, id: u64,
+) -> (String, String, i32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        loop {
+            match rx.recv().await.expect("output subscription closed") {
+                kaijutsu_client::OutputEvent::Stdout { exec_id, text } if exec_id == id => stdout.push_str(&text),
+                kaijutsu_client::OutputEvent::Stderr { exec_id, text } if exec_id == id => stderr.push_str(&text),
+                kaijutsu_client::OutputEvent::ExitCode { exec_id, code } if exec_id == id => return (stdout, stderr, code),
+                event => panic!("unexpected output: {event:?}"),
+            }
+        }
+    }).await.expect("streaming command must finish")
+}
+
+#[test]
+fn streaming_hooks_replace_output_in_every_phase() {
+    run_local(async {
+        for phase in ["pre", "post", "error"] {
+            let scratch = Scratch::new("stream-replacement");
+            let s = seats().await;
+            s.worker_kj.join_context(s.worker, "stream-replacement").await.unwrap();
+            let mut rx = s.worker_kj.subscribe_output().await.unwrap();
+            let marker = scratch.marker();
+            let mut hooks = s.kernel.kernel.broker().hooks().write().await;
+            let table = match phase { "pre" => &mut hooks.pre_call, "post" => &mut hooks.post_call, _ => &mut hooks.on_error };
+            table.entries.push(HookEntry {
+                id: HookId("stream-replacement".into()), match_instance: None,
+                match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+                match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::ShortCircuit(kaijutsu_kernel::mcp::KernelToolResult::text("settled stream")),
+            });
+            drop(hooks);
+            let code = format!("echo once >> '{}'; echo raw; echo warning >&2; {}", marker.display(),
+                if phase == "error" { "if [[ nope -gt 2 ]]; then echo unexpected; fi" } else { "false" });
+            let id = s.worker_kj.execute(&code).await.unwrap();
+            assert_eq!(streaming_output(&mut rx, id).await, ("settled stream".into(), String::new(), 0), "{phase}");
+            if phase == "pre" { assert!(!marker.exists()); }
+            else { assert_eq!(std::fs::read_to_string(marker).unwrap(), "once\n"); }
+            s.close().await;
+        }
+    });
+}
+
+#[test]
+fn streaming_result_reviews_wait_for_answer_or_interrupt_without_reexecution() {
+    run_local(async {
+        for decision in ["allow", "deny", "interrupt"] {
+            let scratch = Scratch::new("stream-review");
+            let s = seats().await;
+            s.worker_kj.join_context(s.worker, "stream-review").await.unwrap();
+            let before = s.worker_blocks().len();
+            let mut rx = s.worker_kj.subscribe_output().await.unwrap();
+            let marker = scratch.marker();
+            let mut hooks = s.kernel.kernel.broker().hooks().write().await;
+            for (id, action, priority) in [
+                ("stream-review", HookAction::Ask(AskSpec { description: Some("Review stream".into()) }), 0),
+                ("stream-reviewed", HookAction::ShortCircuit(kaijutsu_kernel::mcp::KernelToolResult::text("approved stream")), 1),
+            ] {
+                hooks.post_call.entries.push(HookEntry {
+                    id: HookId(id.into()), match_instance: None, match_tool: Some(GlobPattern("shell_write".into())),
+                    match_context: Some(s.worker), match_principal: None, action, priority, kaish_script_id: None,
+                });
+            }
+            drop(hooks);
+            let id = s.worker_kj.execute(&format!("echo once >> '{}'; echo captured", marker.display())).await.unwrap();
+            wait_for("stream result review", || s.kernel.kernel_db.lock().list_pending_asks().unwrap().iter()
+                .any(|ask| ask.hook_id.as_deref() == Some("stream-review"))).await;
+            let ask = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()
+                .find(|ask| ask.hook_id.as_deref() == Some("stream-review")).unwrap();
+            assert!(ask.exec_source.is_none());
+            assert!(rx.try_recv().is_err(), "no output before the result review settles");
+            assert!(s.worker_kj.execute("echo concurrent").await.is_err(), "review retains the execution slot");
+            match decision {
+                "interrupt" => s.worker_kj.interrupt(id).await.unwrap(),
+                _ => s.answer(&ask.request_id, decision == "allow").await,
+            }
+            let (stdout, stderr, exit) = streaming_output(&mut rx, id).await;
+            if decision == "allow" { assert_eq!((stdout, stderr, exit), ("approved stream".into(), String::new(), 0)); }
+            else { assert!(stdout.is_empty()); assert!(!stderr.is_empty()); assert_ne!(exit, 0); }
+            let review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask.request_id, s.worker).unwrap().unwrap();
+            assert!(review.operation_id.is_none());
+            assert!(review.settled.is_some());
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "once\n");
+            assert_eq!(s.worker_blocks().len(), before, "stream review authors no transcript pair");
+            s.close().await;
+        }
+    });
+}
+
+#[test]
+fn streaming_output_limit_preserves_the_command_exit() {
+    run_local(async {
+        let s = seats().await;
+        s.worker_kj.join_context(s.worker, "stream-spill").await.unwrap();
+        let mut rx = s.worker_kj.subscribe_output().await.unwrap();
+        let id = s.worker_kj.execute("seq 1 5000").await.unwrap();
+        let (stdout, _, code) = streaming_output(&mut rx, id).await;
+        assert!(stdout.contains("[output truncated"), "the output limit must be visible");
+        assert_eq!(code, 0, "spilling output does not change the command's physical exit");
+        s.close().await;
+    });
+}

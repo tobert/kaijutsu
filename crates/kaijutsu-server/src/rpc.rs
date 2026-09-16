@@ -60,8 +60,6 @@
 
 use kaijutsu_kernel::runtime::command::{CommandContextSwitch, CommandRunOptions};
 use kaijutsu_kernel::runtime::structured::ExecutedKj;
-use kaijutsu_kernel::runtime::command_result::exec_result_to_hook_tool_result;
-use kaijutsu_kernel::runtime::shell_state::{snapshot_shell_state, persist_shell_state};
 
 use kaijutsu_kernel::runtime::context_shell::{ShellIdentity, ShellPolicy};
 use std::cell::RefCell;
@@ -1971,8 +1969,7 @@ impl ConnectionState {
     }
 
     /// Cancel every in-flight execution on this connection. The `execute`
-    /// path's `tokio::select!` arm observes the token and calls
-    /// `kaish.cancel()`, aborting the materialized shell mid-command.
+    /// owner passes this token to kaish execution and retained result review.
     fn cancel_running_executions(&self) {
         for running in self.running_executions.values() {
             running.cancel.cancel();
@@ -2397,7 +2394,7 @@ async fn dispatch_output_events(
             {
                 let mut event = req.get().init_event();
                 event.set_exec_id(exec_id);
-                event.init_event().set_exit_code(result.code as i32);
+                event.init_event().set_exit_code(result.original_code.unwrap_or(result.code) as i32);
             }
             ok = send_callback!(req);
         }
@@ -3793,53 +3790,31 @@ impl kernel::Server for KernelImpl {
                 let reviewer = context_reviewer(&kernel, started_ctx).await;
                 let kaish = materialize_context_shell(&kernel, &connection).await?;
 
-                // Same ruling as `execute_shell_command`/`execute_kj_command`
-                // (docs/gate-and-shell-split.md, "The three rpc.rs shell
-                // paths take the hook path"): this is the raw interactive
-                // exec path, running kaish directly with no hook watching it
-                // at all. Evaluate the same PreCall phase a `shell_write`
-                // tool call gets before the exec_id is even allocated, so a
-                // denied command never starts and never occupies the
-                // connection's one concurrent-execution slot.
-                //
-                // Narrower than the other two sites: `ShortCircuit` is
-                // treated as a denial here rather than synthesized into the
-                // streaming output-event path (`dispatch_output_events`)
-                // this RPC uses instead of writing context blocks — a real
-                // synthesis would need to fabricate an `ExecResult` and feed
-                // it through the same event dispatch a real exec uses. Filed
-                // as a known gap in this pass rather than built now.
-                {
-                    let (principal_id, session_id) = {
-                        let conn = connection.borrow();
-                        (conn.principal, conn.session_id)
-                    };
-                    let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
-                        principal_id,
-                        started_ctx,
-                        session_id,
-                        kernel.id,
-                    ).with_actor(principal_id, reviewer);
-                    match kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await {
-                        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
-                        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(_) => {
-                            return Err(capnp::Error::failed(
-                                "execute: denied by hook (short-circuit results are not yet \
-                                 synthesized on this path — see rpc.rs::execute)"
-                                    .into(),
-                            ));
-                        }
-                        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-                            // A verdict rides the result; only a fault still throws.
-                            let refusal = refusal_or_fault(err, "execute")?;
-                            let mut b = results.get().init_outcome().init_refused();
-                            set_refusal(&mut b, &refusal);
-                            return Ok(());
-                        }
+                let (principal, session) = {
+                    let conn = connection.borrow();
+                    (conn.principal, conn.session_id)
+                };
+                let call_ctx = kaijutsu_kernel::mcp::CallContext::new(principal, started_ctx, session, kernel.id)
+                    .with_actor(principal, reviewer);
+                // Refusal precedes admission. A synthetic result still gets an
+                // execution id and follows the same output subscription path.
+                let admission = kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await;
+                let replacement = match admission {
+                    kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => None,
+                    kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {
+                        use kaijutsu_kernel::runtime::command_outcome::{CommandExecution, CommandOutcome};
+                        let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
+                        outcome.apply_hook(kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result));
+                        Some(outcome)
                     }
-                }
+                    kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
+                        let refusal = refusal_or_fault(err, "execute")?;
+                        set_refusal(&mut results.get().init_outcome().init_refused(), &refusal);
+                        return Ok(());
+                    }
+                };
 
-                // Reject concurrent executions — kaish kernel is serial.
+                // Keep one active streaming execution per connection, including review.
                 {
                     let conn = connection.borrow();
                     if conn.has_running_execution() {
@@ -3870,113 +3845,32 @@ impl kernel::Server for KernelImpl {
                 // Return exec_id to the caller immediately.
                 results.get().init_outcome().set_ok(exec_id);
 
-                // Spawn background execution — Rc<EmbeddedKaish> is fine on LocalSet.
+                // Retain execution and any result review until output settles.
                 let connection_bg = connection.clone();
-                let kernel_db_for_persist = kernel.kernel_db.clone();
                 tokio::task::spawn_local(async move {
-                    // Yield so the RPC response is sent before we start executing.
                     tokio::task::yield_now().await;
-
-                    // Snapshot the shell's durable surface (cwd + exported env)
-                    // so we can persist what this command changes back to L1.
-                    let state_before = snapshot_shell_state(&kaish).await;
-
-                    // Same identity `shell_pre_call_hooks` used above, rebuilt here
-                    // for `PostCall`/`OnError` — the RPC response already went out
-                    // (`results.get().set_exec_id` above), so a hook that escalates
-                    // here only delays this background task's own completion, never
-                    // the client's `execute` call.
-                    let call_ctx = {
-                        let conn = connection_bg.borrow();
-                        kaijutsu_kernel::mcp::CallContext::new(
-                            conn.principal,
-                            started_ctx,
-                            conn.session_id,
-                            kernel.id,
-                        ).with_actor(conn.principal, reviewer)
-                    };
-
-                    let mut exec_result = tokio::select! {
-                        result = kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()) => {
-                            match result {
-                                Ok(r) => {
-                                    // PostCall — the real result this command produced,
-                                    // same pinch point `Broker::call_tool` evaluates
-                                    // after a real server call (docs/gate-and-shell-
-                                    // split.md, "The three rpc.rs shell paths take the
-                                    // hook path"). `Proceed` changes nothing. This
-                                    // streaming path has no block to rewrite and has
-                                    // already allocated `exec_id`, so `ShortCircuit`/
-                                    // `Denied` can't be synthesized into the output-
-                                    // event stream below (the same narrower-than-the-
-                                    // other-two-sites gap `shell_pre_call_hooks`'s
-                                    // ShortCircuit handling above already accepts for
-                                    // this function) — logged loudly, real output still
-                                    // delivered.
-                                    let hook_result = exec_result_to_hook_tool_result(&r);
-                                    log_shell_hook_verdict_if_unactionable(
-                                        "execute",
-                                        "PostCall",
-                                        kernel.kernel.broker()
-                                            .shell_post_call_hooks(&code, &call_ctx, &hook_result, None)
-                                            .await,
-                                    );
-                                    r
-                                }
-                                Err(e) => {
-                                    log::error!("kaish execute error: {}", e);
-                                    let mcp_err = kaijutsu_kernel::mcp::McpError::Protocol(e.to_string());
-                                    log_shell_hook_verdict_if_unactionable(
-                                        "execute",
-                                        "OnError",
-                                        kernel.kernel.broker()
-                                            .shell_on_error_hooks(&code, &call_ctx, &mcp_err, None)
-                                            .await,
-                                    );
-                                    kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
-                                }
-                            }
-                        }
-                        _ = cancel_token.cancelled() => {
-                            kaish.cancel();
-                            log_shell_hook_verdict_if_unactionable(
-                                "execute",
-                                "OnError",
-                                kernel.kernel.broker()
-                                    .shell_on_error_hooks(&code, &call_ctx, &kaijutsu_kernel::mcp::McpError::Cancelled, None)
-                                    .await,
-                            );
-                            kaish_kernel::interpreter::ExecResult::failure(130, "interrupted")
+                    let record = |new_id| record_context_switch(&connection_bg, new_id);
+                    let outcome = match replacement {
+                        Some(outcome) => Ok(outcome),
+                        None => {
+                            use kaijutsu_kernel::runtime::command::run_without_blocks;
+                            let mut options = kaish_kernel::ExecuteOptions::default();
+                            options.cancel_token = Some(cancel_token);
+                            run_without_blocks(&kaish, &code, &kernel.kernel, &call_ctx, options,
+                                CommandRunOptions { stdin: None, context_switch: CommandContextSwitch::Publish(Some(&record)),
+                                    review_notices: None }).await
                         }
                     };
-
-                    // Propagate any in-shell context switch (`kj context switch`
-                    // / `kj fork`) back to the connection's shared map — the
-                    // materialized shell's map is isolated, so without this the
-                    // switch would be invisible to subsequent RPCs. Done *before*
-                    // dispatching the exit-code event so the active context is
-                    // settled by the time the client learns the command finished
-                    // (otherwise a client firing its next RPC immediately could
-                    // observe a stale active context).
-                    // No switch: persist this command's cwd/export changes to
-                    // the context it ran in. On a switch the snapshots straddle
-                    // two contexts and the outgoing cwd is already saved inside
-                    // kaish, so we skip the write-back.
-                    if propagate_context_switch(&kaish, started_ctx, &connection_bg).is_none() {
-                        let state_after = snapshot_shell_state(&kaish).await;
-                        if let Err(error) = persist_shell_state(
-                            &kernel_db_for_persist, started_ctx, &state_before, &state_after,
-                        ) {
-                            exec_result = kaish_kernel::interpreter::ExecResult::failure(1, error);
+                    let result = match outcome {
+                        Ok(outcome) => outcome.exec_result(),
+                        Err(error) => {
+                            log::error!("streaming command settlement failed: {error}");
+                            kaish_kernel::interpreter::ExecResult::failure(1, error)
                         }
-                    }
-
-                    // Dispatch output events to all subscribers.
-                    dispatch_output_events(exec_id, &exec_result, &connection_bg).await;
-
-                    // Clean up execution tracking.
+                    };
+                    dispatch_output_events(exec_id, &result, &connection_bg).await;
                     connection_bg.borrow_mut().complete_execution(exec_id);
-                });
+                }.instrument(tracing::Span::current()));
 
                 Ok(())
             }
@@ -7931,10 +7825,9 @@ impl kernel::Server for KernelImpl {
 
         // Hard interrupt: kill this connection's in-flight kaish command(s).
         // The per-use shell holds no persistent handle, so we cancel via the
-        // running-execution registry — each `execute` spawns with a token whose
-        // `select!` arm calls `kaish.cancel()`. Gated on the target context
-        // matching the one this connection is driving; the old per-connection
-        // cancel fired regardless of which context was targeted.
+        // running-execution registry. The shared owner carries the token through
+        // execution and result review. Cancel only when the target context
+        // matches the one this connection is driving.
         if immediate {
             let conn = self.connection.borrow();
             if conn.require_context().ok() == Some(context_id) {
@@ -9676,25 +9569,6 @@ fn require_context_exists(
     }
 }
 
-/// After a materialized shell runs, propagate any in-shell context switch
-/// (`kj context switch` / `kj fork`) back to the connection's shared
-/// `session_contexts`. The materialized shell carries an isolated map, so
-/// without this an in-shell switch would be invisible to subsequent RPCs
-/// (`require_context`). Returns the new context id when a switch occurred.
-fn propagate_context_switch(
-    kaish: &EmbeddedKaish,
-    started_at: ContextId,
-    connection: &Rc<RefCell<ConnectionState>>,
-) -> Option<ContextId> {
-    match kaish.context_id() {
-        Some(new_id) if new_id != started_at => {
-            record_context_switch(connection, new_id);
-            Some(new_id)
-        }
-        _ => None,
-    }
-}
-
 /// Write a context switch into this connection's shared `session_contexts`.
 /// Runtime execution can hand the same write to a caller that has
 /// already detected the switch itself.
@@ -9912,38 +9786,6 @@ fn kj_command_catalog() -> Vec<KjCatalogEntry> {
         KjCatalogEntry { name: "model", description: "Show effective model information", input_hint: "[--context <context>]", argv_prefix: &["model"] },
         KjCatalogEntry { name: "models", description: "List available models", input_hint: "", argv_prefix: &["models"] },
     ]
-}
-
-/// `rpc.rs::execute`'s narrow spot: the streaming exec path has no context
-/// block to rewrite and has already returned `exec_id` to the caller by the
-/// time `PostCall`/`OnError` run, so a `ShortCircuit`/`Denied` verdict can't
-/// be synthesized into `dispatch_output_events` the way the other two shell
-/// paths synthesize it into a block — the same gap `shell_pre_call_hooks`'s
-/// own `ShortCircuit` handling in `execute` already accepts (see the
-/// `PreCall` comment there). Logs loudly instead of silently discarding the
-/// verdict; the real command output is still what gets delivered.
-fn log_shell_hook_verdict_if_unactionable(
-    rpc_fn: &str,
-    phase: &str,
-    verdict: kaijutsu_kernel::mcp::ShellHookVerdict,
-) {
-    match verdict {
-        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
-        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(_) => {
-            log::warn!(
-                "{rpc_fn}: {phase} hook short-circuited a result on the streaming exec path \
-                 — not synthesized into the output-event stream (known gap, see \
-                 rpc.rs::execute); delivering the real command output instead",
-            );
-        }
-        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            log::warn!(
-                "{rpc_fn}: {phase} hook denied a completed command's result on the streaming \
-                 exec path ({err}) — the command already ran; delivering the real command \
-                 output instead (known gap, see rpc.rs::execute)",
-            );
-        }
-    }
 }
 
 /// Transport lifetime: a pending result review releases the RPC while the

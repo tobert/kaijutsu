@@ -1598,6 +1598,15 @@ outcome preparation; quiet completion stores an immutable result on its own.
 Restart reports interrupted review for both, and the schema upgrade preserves
 checkpoints written before quiet reviews were supported.
 
+Streaming RPC then moved to the same command owner without transcript blocks.
+Its adapter keeps execution IDs, subscriptions, history, and concurrency; the
+runtime owns state write-back, result hooks, and retained review. Replacements
+and denials now affect delivered output in every phase. Cancellation reaches
+kaish through ExecuteOptions and remains active during result review. An SSH
+regression exposed the unresolved truncation code in exit events; streaming now
+reports the physical exit. Transport teardown still needs explicit ownership:
+a running command holds the connection beyond the RPC system's lifetime.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

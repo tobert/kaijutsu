@@ -92,7 +92,8 @@ Their review result remains inspectable through `kj ledger show`. Every ask in
 a sequence now retains its invocation and optional operation link.
 
 Still pending: MCP async completion projects independently and its broker hook timing needs reconciliation
-with job completion. Streaming RPC still logs unhandled hook verdicts. Startup now recovers retained pending
+with job completion. Streaming RPC now uses the shared outcome/review owner
+and honors every hook verdict. Startup recovers retained pending
 projections without rerunning commands or hooks, preserving edits made after
 terminal publication. Initial outcome-retention failures still need live
 reporting/retry: background interactive callers log the error and approval
@@ -105,9 +106,16 @@ Interactive/approved result reviews now checkpoint execution and continue the
 same hook snapshot after approval. Their non-executable `hook_result` asks stay
 out of the execution/resume queue; cancellation, dropped waits, and restart
 retain execution and report interrupted review. Authored structured calls use
-this owner too. Streaming RPC and MCP still lack a retained result-review owner: result-phase Ask/escalation returns GateUnavailable
+this owner too, as do quiet and streaming RPC. Generic MCP calls still lack a
+retained result-review owner: result-phase Ask/escalation returns GateUnavailable
 before minting an ask. Migrate these callers and their job projections while
 preserving the complete shared-outcome contract.
+
+Streaming commands hold a strong connection reference while executing or
+reviewing. `run_rpc` teardown currently relies on `ConnectionState::Drop`, so a
+retained command can outlive the transport and delay session cleanup. Audit
+explicit transport shutdown and task ownership with the dedicated-thread row;
+interrupting a live execution is verified separately.
 
 The new SSH/RPC regression passes but can print a russh teardown panic after
 its assertions (`there is no reactor running`). The common test helper drops
@@ -1890,7 +1898,7 @@ resize" cleanup.
 
 ---
 
-## kaish output limiting corrupts the durable exit code in three places (2026-08-15)
+## Kaish output limiting still hides physical exits in editor and rc (2026-08-15)
 
 **Shipped 2026-08-15:** `execute_shell_command` (`rpc.rs`) now persists
 `result.original_code.unwrap_or(result.code)` as the durable `exit_code`, so a
@@ -1906,11 +1914,11 @@ command that spills >8 KB of output but exits 0 no longer records
 - `crates/kaijutsu-kernel/src/rc/mod.rs` — rc-lifecycle `.kai`
   execution matches `exec.code == 0` raw and persists the unresolved code
   into a durable rc-failure block on the fallthrough arm.
-- `crates/kaijutsu-server/src/rpc.rs:2044` (`dispatch_output_events`, the
-  streaming `execute` RPC) ships `result.code as i32` unresolved to every
-  `on_output` subscriber.
 
-Fix for all three: the same `original_code.unwrap_or(code)` unwrap
+Streaming `execute` now resolves `original_code` before sending its terminal
+output event, covered by `streaming_output_limit_preserves_the_command_exit`.
+
+Fix for both remaining sites: the same `original_code.unwrap_or(code)` unwrap
 `execute_shell_command` already does. `mcp/broker.rs`'s hook-exit classifier
 (`classify_kaish_hook_exit`) already treats a remapped `3` as its own
 `Escalate` outcome rather than folding it into pass/fail, so that site is not
