@@ -63,6 +63,24 @@ Classifying at the wire is impossible: by then the change is opaque bytes, and
 defining "the text we last sent" per subscription would force the server to keep
 one `String` per block per subscriber.
 
+## Acceptance and storage failure
+
+`BlockStore::accept` holds the document guard while preparing a mutation,
+committing its durable operation, updating the live-status cache, and
+publishing its projected events. Metadata comes from that same guarded state.
+Compaction snapshots exactly the committed prefix while the guard is held.
+Journal counters advance after the database commit. Fork creation persists
+its document row and initial snapshot together before exposing the document.
+
+A persistence failure makes the document unusable until restart. The failed
+write returns an error and publishes no events; subsequent reads and writes
+panic rather than serve uncommitted memory. Restart recovers the durable
+prefix. Compaction can fail after the operation committed, so recovery may
+include that operation even when its caller received an error.
+
+Lock order is document, then database. A caller must release its database
+guard before entering block-store reads or writes.
+
 ## Normative rules
 
 Rules use Simplified-Technical-English style. One rule is one sentence. Each term

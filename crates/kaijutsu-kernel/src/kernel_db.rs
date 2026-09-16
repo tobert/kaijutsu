@@ -3650,25 +3650,26 @@ impl KernelDb {
     }
 
     /// Write a compaction snapshot and truncate the oplog up to that seq.
-    /// Must be called with exclusive access (the Mutex guarantees this).
+    /// Joins an existing transaction, or commits both writes in its own.
     pub fn write_snapshot_and_truncate(
-        &mut self,
+        &self,
         document_id: ContextId,
         seq: i64,
         version: i64,
         state: &[u8],
     ) -> KernelDbResult<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.write_snapshot_and_truncate(document_id, seq, version, state));
+        }
+        self.conn.execute(
             "INSERT OR REPLACE INTO doc_snapshots (document_id, seq, version, state)
              VALUES (?1, ?2, ?3, ?4)",
             params![blob_param(document_id.as_bytes()), seq, version, state],
         )?;
-        tx.execute(
+        self.conn.execute(
             "DELETE FROM oplog WHERE document_id = ?1 AND seq <= ?2",
             params![blob_param(document_id.as_bytes()), seq],
         )?;
-        tx.commit()?;
         Ok(())
     }
 

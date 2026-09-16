@@ -1219,15 +1219,6 @@ impl KjDispatcher {
                 if let Err(e) = db.insert_forked_context(&new_row, default_ws, row.context_id) {
                     return KjResult::Err(format!("kj fork --as: failed to create context: {e}"));
                 }
-
-                // Create empty document for each new context
-                if let Err(e) = self.block_store().create_document(
-                    new_id,
-                    crate::DocumentKind::Conversation,
-                    None,
-                ) {
-                    return KjResult::Err(format!("kj fork --as: failed to create document: {e}"));
-                }
             }
 
             // Insert structural edges mirroring the template
@@ -1274,6 +1265,16 @@ impl KjDispatcher {
             };
             if let Err(e) = db.insert_edge(&root_edge) {
                 return KjResult::Err(format!("kj fork --as: failed to insert root edge: {e}"));
+            }
+        }
+
+        // Document acceptance acquires the document before the database.
+        for (row, _depth) in &template_nodes {
+            let new_id = id_map[&row.context_id];
+            if let Err(e) = self.block_store().create_document(
+                new_id, crate::DocumentKind::Conversation, None,
+            ) {
+                return KjResult::Err(format!("kj fork --as: failed to create document: {e}"));
             }
         }
 
@@ -3397,6 +3398,31 @@ mod tests {
         let db = d.kernel_db().lock();
         let child = db.find_context_by_label("child").unwrap().unwrap();
         assert!(child.cast_id.is_none());
+    }
+
+    #[test]
+    fn subtree_fork_with_persistent_documents_finishes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let mut d = test_dispatcher().await;
+                let principal = PrincipalId::new();
+                let db = d.kernel_db().clone();
+                let ws = db.lock().get_or_create_default_workspace(principal).unwrap();
+                d.blocks = std::sync::Arc::new(crate::block_store::BlockStore::with_db(db, ws, principal));
+                let template = register_context(&d, Some("persistent-template"), None, principal);
+                d.block_store().create_document(template, crate::DocumentKind::Conversation, None).unwrap();
+                let result = d.dispatch(&[
+                    s("fork"), s("--as"), s("persistent-template"), s("--name"), s("persistent-child")
+                ], &caller_with_context(template)).await;
+                tx.send((result.is_ok(), result.message().to_string())).unwrap();
+            });
+        });
+        let (ok, message) = rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("subtree fork must not reacquire its held database mutex");
+        worker.join().unwrap();
+        assert!(ok, "{message}");
     }
 
     /// `--as` subtree fork copies the template's `cast_id` through with the

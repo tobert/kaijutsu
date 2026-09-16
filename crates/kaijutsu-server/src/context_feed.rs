@@ -23,15 +23,12 @@
 //! - **One clock.** The context's `version` replaces both the per-context op
 //!   counter and the per-subscription delivery counter.
 //!
-//! # Ordering, and why this module sorts
+//! # Ordering
 //!
-//! The kernel assigns a version under the document guard but publishes after
-//! releasing it, so two writers racing on one context can publish out of
-//! version order. Amy's ruling (2026-08-15) is that the bridge repairs it: hold
-//! a short window, sort the window by version, deliver. That is honest about
-//! its limit — a window cannot distinguish "late" from "never" — so the client
-//! also treats a version that goes backwards for a block as a signal to refetch
-//! rather than as text to apply.
+//! The block store holds the document guard through durable acceptance and
+//! publication. This bridge preserves that order and ends the feed if a
+//! delivery would move its version backward. Its legacy sort is now redundant;
+//! see `docs/issues.md`, "Change-feed batching after ordered acceptance".
 //!
 //! # What must never ride this feed
 //!
@@ -50,9 +47,8 @@ use crate::kaijutsu_capnp::{context_event, context_observer};
 
 /// How long a delivery stays open once its first event arrives.
 ///
-/// Two jobs at once: it coalesces a token burst into one call, and it gives a
-/// racing publisher time to land so the sort below can order them. Small enough
-/// that a lone edit still feels immediate.
+/// Coalesces a token burst into one call. Small enough that a lone edit
+/// still feels immediate.
 ///
 /// `pub(crate)` so `rpc.rs`'s `subscribe_ledger_events` can reuse the exact
 /// same latency budget rather than defining a second constant that could
@@ -99,7 +95,7 @@ pub(crate) async fn run_context_feed(
             }
         }
 
-        // 2. Hold the window open: coalesce, and let a racing publisher land.
+        // 2. Hold the window open to coalesce a burst.
         let deadline = tokio::time::Instant::now() + FEED_BATCH_WINDOW;
         while batch.len() < FEED_BATCH_MAX {
             let next = tokio::select! {
@@ -162,6 +158,8 @@ async fn deliver(
     // Version order within the delivery (rules 11, 13, 14). Stable, so two
     // events the kernel accepted at the same version keep the order it
     // published them in.
+    // TODO: Remove repair sorting and preserve complete acceptance groups.
+    // See docs/issues.md, "Change-feed batching after ordered acceptance".
     batch.sort_by_key(|flow| flow.version().unwrap_or(0));
     let version = batch.last().and_then(|flow| flow.version()).unwrap_or(0);
 

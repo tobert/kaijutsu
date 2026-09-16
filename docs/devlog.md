@@ -1402,3 +1402,18 @@ promote drafts. Historical reads reject draft-era text even after submission.
 The regressions reproduced reads through both model-shell flavors, `kj`, MCP,
 and journal replay; client compose and feed queries retain their draft view.
 The separate wire-facade identity question remains in `docs/issues.md`.
+
+Block mutations now have one acceptance owner. It retains the document guard
+through preparation, durable commit, compaction, and publication; metadata
+projections come from that same state. Controlled pauses reproduced the old
+released-guard window, and a failed database write reproduced readable
+uncommitted text. The failure policy is a poisoned document until restart,
+which recovers the durable prefix without copying the conversation for every
+token. Journal counters advance only after commit.
+
+The same audit caught failed forks visible before their initial snapshot.
+All three fork variants now share atomic row/snapshot persistence before
+publication. Keeping lock order explicit also exposed a subtree fork that
+reacquired its held database mutex; a persistent-store regression reproduced
+it where memory-only fixtures had not. Compound compose selection and complete
+change-feed acceptance groups remain separate, marked follow-ups.

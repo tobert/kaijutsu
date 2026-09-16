@@ -395,25 +395,14 @@ impl KjDispatcher {
             }
         };
 
-        let (kind_str, block_count) = {
-            let db = self.kernel_db().lock();
-            match db.get_document(ctx_id) {
-                Ok(Some(row)) => {
-                    let bc = self
-                        .blocks
-                        .get(ctx_id)
-                        .map(|e| e.doc.block_count())
-                        .unwrap_or(0);
-                    (row.doc_kind.as_str().to_string(), bc)
-                }
-                Ok(None) => {
-                    return KjResult::Err(format!(
-                        "kj doc delete: doc '{id_str}' not found"
-                    ));
-                }
-                Err(e) => return KjResult::Err(format!("kj doc delete: {e}")),
-            }
+        let row = self.kernel_db().lock().get_document(ctx_id);
+        let kind_str = match row {
+            Ok(Some(row)) => row.doc_kind.as_str().to_string(),
+            Ok(None) => return KjResult::Err(format!("kj doc delete: doc '{id_str}' not found")),
+            Err(e) => return KjResult::Err(format!("kj doc delete: {e}")),
         };
+        // Block acceptance acquires the document before the database.
+        let block_count = self.blocks.get(ctx_id).map(|e| e.doc.block_count()).unwrap_or(0);
 
         if let Err(e) = self.blocks.delete_document(ctx_id) {
             return KjResult::Err(format!("kj doc delete: {e}"));

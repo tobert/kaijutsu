@@ -99,6 +99,7 @@ const ACTIVITY_STAMP_INTERVAL_MS: i64 = 1_000;
 pub struct DocumentEntry {
     /// Per-block store (each block owns its content as a plain `String`).
     pub doc: BlockDocument,
+    poisoned: bool,
     /// Document metadata.
     pub kind: DocKind,
     /// Programming language (if code).
@@ -130,6 +131,7 @@ impl DocumentEntry {
     ) -> Self {
         Self {
             doc: BlockDocument::new(context_id, principal_id),
+            poisoned: false,
             kind,
             language,
             version: AtomicU64::new(0),
@@ -157,6 +159,7 @@ impl DocumentEntry {
         let version = store.version();
         Ok(Self {
             doc: store,
+            poisoned: false,
             kind,
             language,
             version: AtomicU64::new(version),
@@ -175,7 +178,7 @@ impl DocumentEntry {
     }
 
     /// Increment version and record agent.
-    pub fn touch(&self, principal_id: PrincipalId) {
+    fn touch(&self, principal_id: PrincipalId) {
         self.version.fetch_add(1, Ordering::SeqCst);
         *self.last_agent.write() = principal_id;
     }
@@ -231,6 +234,10 @@ pub struct BlockStore {
     /// (no-op) in production builds — the field is `#[cfg(test)]`-gated.
     #[cfg(test)]
     fail_insert_countdown: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    before_journal: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl BlockStore {
@@ -246,6 +253,10 @@ impl BlockStore {
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_journal: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            before_publish: parking_lot::Mutex::new(None),
         }
     }
 
@@ -261,6 +272,10 @@ impl BlockStore {
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_journal: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            before_publish: parking_lot::Mutex::new(None),
         }
     }
 
@@ -280,6 +295,10 @@ impl BlockStore {
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_journal: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            before_publish: parking_lot::Mutex::new(None),
         }
     }
 
@@ -300,6 +319,10 @@ impl BlockStore {
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_journal: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            before_publish: parking_lot::Mutex::new(None),
         }
     }
 
@@ -334,6 +357,11 @@ impl BlockStore {
 
     /// Emit a block flow event if the bus is configured.
     fn emit(&self, flow: BlockFlow) {
+        #[cfg(test)]
+        {
+            let hook = self.before_publish.lock().take();
+            if let Some(hook) = hook { hook(); }
+        }
         if let Some(bus) = &self.block_flows {
             bus.publish(flow);
         }
@@ -506,7 +534,7 @@ impl BlockStore {
         // number from `next_journal_seq`, which a fresh entry starts at 0.
         const FIRST_SEQ: i64 = 1;
 
-        let (block_id, snapshot, version, unjournaled) = match self.documents.entry(context_id) {
+        match self.documents.entry(context_id) {
             Entry::Occupied(_) => return Err(BlockStoreError::DocumentAlreadyExists(context_id)),
             Entry::Vacant(vacant) => {
                 let principal_id = self.principal_id();
@@ -534,7 +562,7 @@ impl BlockStore {
                 // `Some(payload)` once the document is resident means the op
                 // still has to be journaled: the recovery path below reached a
                 // row that was already persisted, so only the op is left to
-                // write, and `journal_op` does it outside this shard guard.
+                // write under this same shard guard.
                 let mut unjournaled = None;
                 if let Some(db) = self.journaling_db()? {
                     let payload_bytes = codec::encode(&payload)
@@ -576,27 +604,21 @@ impl BlockStore {
                     }
                 }
 
-                vacant.insert(entry);
-                (block_id, snapshot, version, unjournaled)
+                if let Some(payload) = unjournaled {
+                    self.journal_op(context_id, &entry, payload)?;
+                }
+                self.recompute_live_status(context_id, &[snapshot.status]);
+                let _entry = vacant.insert(entry);
+                self.emit(BlockFlow::Inserted {
+                    context_id,
+                    block: Arc::new(snapshot),
+                    after_id: None,
+                    version,
+                    source: OpSource::Local,
+                });
+                Ok(block_id)
             }
-        };
-
-        // Everything below runs after the shard guard is released: each takes
-        // its own lookup on `context_id` and would deadlock against a held
-        // entry.
-        match unjournaled {
-            Some(payload) => self.journal_op(context_id, payload)?,
-            None => self.recompute_live_status(context_id, &[snapshot.status]),
         }
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id: None,
-            version,
-            source: OpSource::Local,
-        });
-
-        Ok(block_id)
     }
 
     /// Create a document from a serialized store snapshot (for sync from server).
@@ -629,7 +651,9 @@ impl BlockStore {
         &self,
         context_id: ContextId,
     ) -> Option<dashmap::mapref::one::Ref<'_, ContextId, DocumentEntry>> {
-        self.documents.get(&context_id)
+        self.documents.get(&context_id).inspect(|entry| {
+            assert!(!entry.poisoned, "document {context_id} failed acceptance; restart to recover durable state");
+        })
     }
 
     /// Current document version for a context, or `DocumentNotFound` if the
@@ -637,18 +661,19 @@ impl BlockStore {
     /// when a missing document should be an error rather than silently
     /// collapsing to 0 — RPC acknowledgements, for example.
     pub fn version(&self, context_id: ContextId) -> BlockStoreResult<u64> {
-        self.documents
-            .get(&context_id)
+        self.get(context_id)
             .map(|entry| entry.version())
             .ok_or(BlockStoreError::DocumentNotFound(context_id))
     }
 
-    /// Get a document for writing.
-    pub fn get_mut(
+    /// Get a document for internal mutation.
+    fn get_mut(
         &self,
         context_id: ContextId,
     ) -> Option<dashmap::mapref::one::RefMut<'_, ContextId, DocumentEntry>> {
-        self.documents.get_mut(&context_id)
+        self.documents.get_mut(&context_id).inspect(|entry| {
+            assert!(!entry.poisoned, "document {context_id} failed acceptance; restart to recover durable state");
+        })
     }
 
     /// List all document IDs.
@@ -672,15 +697,16 @@ impl BlockStore {
 
     /// Delete a document.
     pub fn delete_document(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        if let Some(db) = &self.db {
-            let db_guard = db.lock();
-            db_guard
-                .delete_document(context_id)
+        use dashmap::mapref::entry::Entry;
+        let slot = self.documents.entry(context_id);
+        if let Some(db) = self.journaling_db()? {
+            db.lock().delete_document(context_id)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
-
-        self.documents.remove(&context_id);
-
+        if let Entry::Occupied(entry) = slot {
+            entry.remove();
+        }
+        self.live_status.remove(&context_id);
         Ok(())
     }
 
@@ -717,26 +743,10 @@ impl BlockStore {
         let language = source_entry.language.clone();
         drop(source_entry); // Release the read lock
 
-        // Persist metadata if we have a DB
-        if let Some(db) = &self.db {
-            let db_guard = db.lock();
-            let row = DocumentRow {
-                document_id: new_id,
-                                workspace_id: self.default_workspace_id.unwrap_or_default(),
-                doc_kind: kind,
-                language: language.clone(),
-                path: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-                created_by: principal_id,
-            };
-            db_guard
-                .insert_document(&row)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        }
-
         let version = forked_store.version();
         let entry = DocumentEntry {
             doc: forked_store,
+            poisoned: false,
             kind,
             language,
             version: AtomicU64::new(version),
@@ -747,10 +757,7 @@ impl BlockStore {
             uncompacted_bytes: AtomicU64::new(0),
             activity_stamped_at: AtomicI64::new(0),
         };
-        self.documents.insert(new_id, entry);
-        self.write_initial_snapshot(new_id)?;
-
-        Ok(())
+        self.publish_fork(new_id, entry)
     }
 
     /// Fork a document at a specific timestamp, creating a copy with only blocks up to that time.
@@ -798,26 +805,10 @@ impl BlockStore {
         let language = source_entry.language.clone();
         drop(source_entry); // Release the read lock
 
-        // Persist metadata if we have a DB
-        if let Some(db) = &self.db {
-            let db_guard = db.lock();
-            let row = DocumentRow {
-                document_id: new_id,
-                                workspace_id: self.default_workspace_id.unwrap_or_default(),
-                doc_kind: kind,
-                language: language.clone(),
-                path: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-                created_by: principal_id,
-            };
-            db_guard
-                .insert_document(&row)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        }
-
         let version = forked_store.version();
         let entry = DocumentEntry {
             doc: forked_store,
+            poisoned: false,
             kind,
             language,
             version: AtomicU64::new(version),
@@ -828,10 +819,7 @@ impl BlockStore {
             uncompacted_bytes: AtomicU64::new(0),
             activity_stamped_at: AtomicI64::new(0),
         };
-        self.documents.insert(new_id, entry);
-        self.write_initial_snapshot(new_id)?;
-
-        Ok(())
+        self.publish_fork(new_id, entry)
     }
 
     /// Fork a document at a specific timestamp with block filtering.
@@ -889,26 +877,10 @@ impl BlockStore {
         let language = source_entry.language.clone();
         drop(source_entry);
 
-        // Persist metadata if we have a DB
-        if let Some(db) = &self.db {
-            let db_guard = db.lock();
-            let row = DocumentRow {
-                document_id: new_id,
-                                workspace_id: self.default_workspace_id.unwrap_or_default(),
-                doc_kind: kind,
-                language: language.clone(),
-                path: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-                created_by: principal_id,
-            };
-            db_guard
-                .insert_document(&row)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        }
-
         let version = forked_store.version();
         let entry = DocumentEntry {
             doc: forked_store,
+            poisoned: false,
             kind,
             language,
             version: AtomicU64::new(version),
@@ -919,10 +891,7 @@ impl BlockStore {
             uncompacted_bytes: AtomicU64::new(0),
             activity_stamped_at: AtomicI64::new(0),
         };
-        self.documents.insert(new_id, entry);
-        self.write_initial_snapshot(new_id)?;
-
-        Ok(())
+        self.publish_fork(new_id, entry)
     }
 
     /// Get the number of documents.
@@ -1013,175 +982,125 @@ impl BlockStore {
         }
     }
 
-    /// Journal an op to the append-only oplog.
-    ///
-    /// Serializes the SyncPayload, appends it to the `oplog` table, and
-    /// triggers compaction if the uncompacted count or bytes exceed thresholds.
-    // TODO: Order memory mutation, durable commit, compaction, and publication
-    // at one acceptance boundary. Callers release the document guard before
-    // journaling, so this transaction alone cannot order accepted mutations.
-    // See docs/issues.md, "Document mutation and publication need one sequencer".
+    /// Accept one block mutation while holding its document guard through
+    /// persistence and publication. A failed write poisons the document:
+    /// callers must restart and recover from durable state before using it.
+    fn accept<T>(
+        &self,
+        context_id: ContextId,
+        mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
+    ) -> BlockStoreResult<T> {
+        self.journaling_db()?;
+        let mut entry = self.get_mut(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let before = entry.doc.version();
+        entry.poisoned = true;
+        let (payload, events, result) = match mutate(&mut entry) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                entry.poisoned = entry.doc.version() != before;
+                if entry.poisoned { self.live_status.remove(&context_id); }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.journal_op(context_id, &entry, payload) {
+            self.live_status.remove(&context_id);
+            tracing::error!(%context_id, %error, "document acceptance failed; restart required");
+            return Err(error);
+        }
+        self.recompute_live_status(context_id, &entry.doc.statuses_ordered());
+        for event in events {
+            self.emit(event);
+        }
+        entry.poisoned = false;
+        Ok(result)
+    }
+
+    /// Commit the operation and activity stamp before advancing the journal
+    /// counters. The caller holds the document guard through publication.
     fn journal_op(
         &self,
         context_id: ContextId,
+        entry: &DocumentEntry,
         payload: SyncPayload,
     ) -> BlockStoreResult<()> {
-        // Stage 1 (time-well) incremental live_status: recompute + cache this
-        // context's live status from its current (just-mutated) block
-        // statuses. Unconditional — non-persistent stores (app/client scratch,
-        // tests) need a correct cache too; only the DB journaling below is
-        // gated on `self.db`. (In practice `get` always hits here: every call
-        // site mutates via `get_mut` before calling journal_op, so the
-        // document is guaranteed to already exist.)
-        //
-        // Why not gate this on "the op changed a status" to skip the scan on
-        // streaming text deltas? The payload can't tell us: `ops_since` ALWAYS
-        // ships every known block's header (block_store.rs `ops_since`, "Always
-        // send header for known blocks so metadata changes propagate via LWW"),
-        // and `set_status` itself travels *only* as an updated header — so
-        // `updated_headers` is non-empty on every op and carries no signal that
-        // distinguishes a status change from a status-neutral edit. The scan is
-        // the cheapest thing that knows the new status, and it's dwarfed by the
-        // `append_op` SQLite write it sits beside, so leave it unconditional.
-        //
-        // `statuses_ordered()`, not `blocks_ordered()`: the latter builds a
-        // full `BlockSnapshot` per block, and `BlockSnapshot::content` calls
-        // `BlockContent::text()` — materializing every block's full text out
-        // of its DTE document on every journaled op, context-wide, just to
-        // read `.status` off the snapshot and throw the rest away. This is
-        // the streaming hot path (one call per token), so that cost was paid
-        // once per token per block. `statuses_ordered()` reads `.status`
-        // directly off each block's header, same document-order sort,
-        // without ever touching the text.
-        if let Some(entry) = self.get(context_id) {
-            let statuses = entry.doc.statuses_ordered();
-            drop(entry);
-            self.recompute_live_status(context_id, &statuses);
+        #[cfg(test)]
+        {
+            let hook = self.before_journal.lock().take();
+            if let Some(hook) = hook { hook(); }
         }
-
         let Some(db) = self.journaling_db()? else {
             return Ok(());
         };
-
         let payload_bytes = codec::encode(&payload)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
         let payload_len = payload_bytes.len() as u64;
-
-        // Stage 1 (time-well) kernel truth: this context's last_activity_at,
-        // re-stamped by mutating block ops at most once per
-        // `ACTIVITY_STAMP_INTERVAL_MS`. `now_millis()` is the SAME
-        // Unix-millis clock `created_at` is stamped with
-        // (`kaijutsu_types::now_millis`, mirrored by kernel_db's private
-        // helper of the same name/formula) - the app computes
-        // `now - last_activity_at` directly against it, so the epoch must
-        // match exactly.
         let now = kaijutsu_types::now_millis() as i64;
-        let (seq, count, bytes, stamp) = {
-            let entry = self
-                .get(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let seq = entry.next_journal_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let count = entry.uncompacted_count.fetch_add(1, Ordering::SeqCst) + 1;
-            let bytes = entry
-                .uncompacted_bytes
-                .fetch_add(payload_len, Ordering::SeqCst)
-                + payload_len;
-            let stamped_at = entry.activity_stamped_at.load(Ordering::SeqCst);
-            let stamp = now - stamped_at >= ACTIVITY_STAMP_INTERVAL_MS;
-            if stamp {
-                entry.activity_stamped_at.store(now, Ordering::SeqCst);
-            }
-            (seq, count, bytes, stamp)
-        };
-
-        {
-            let db_guard = db.lock();
-            // One transaction, not two autocommit statements: the op row and
-            // the activity stamp land together, so a single streamed delta
-            // pays for one fsync instead of two.
-            db_guard
-                .in_transaction(|db| {
-                    db.append_op(context_id, seq as i64, &payload_bytes)?;
-                    if stamp {
-                        db.touch_context_activity(context_id, now)?;
-                    }
-                    Ok(())
-                })
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        }
-
+        let seq = entry.next_journal_seq.load(Ordering::SeqCst) + 1;
+        let count = entry.uncompacted_count.load(Ordering::SeqCst) + 1;
+        let bytes = entry.uncompacted_bytes.load(Ordering::SeqCst) + payload_len;
+        let stamp = now - entry.activity_stamped_at.load(Ordering::SeqCst) >= ACTIVITY_STAMP_INTERVAL_MS;
+        db.lock().in_transaction(|db| {
+            db.append_op(context_id, seq as i64, &payload_bytes)?;
+            if stamp { db.touch_context_activity(context_id, now)?; }
+            Ok(())
+        }).map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        entry.next_journal_seq.store(seq, Ordering::SeqCst);
+        entry.uncompacted_count.store(count, Ordering::SeqCst);
+        entry.uncompacted_bytes.store(bytes, Ordering::SeqCst);
+        if stamp { entry.activity_stamped_at.store(now, Ordering::SeqCst); }
         if count >= COMPACTION_OP_THRESHOLD || bytes >= COMPACTION_BYTE_THRESHOLD {
-            self.compact_document(context_id)?;
+            self.compact_locked(context_id, entry)?;
         }
         Ok(())
     }
 
-    /// Run compaction: snapshot the current state and truncate the oplog.
-    fn compact_document(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let Some(db) = self.journaling_db()? else {
-            return Ok(());
-        };
-
-        let (snapshot_bytes, version, max_seq) = {
-            let entry = self
-                .get(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let snapshot = entry.doc.snapshot();
-            let version = entry.version() as i64;
-            let max_seq = entry.next_journal_seq.load(Ordering::SeqCst);
-            let snapshot_bytes = codec::encode(&snapshot)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            (snapshot_bytes, version, max_seq)
-        };
-
-        {
-            let mut db_guard = db.lock();
-            db_guard
-                .write_snapshot_and_truncate(context_id, max_seq as i64, version, &snapshot_bytes)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-            // Flush the just-truncated oplog out of the WAL so the main file
-            // stops lagging committed history. Best-effort: a busy checkpoint
-            // (a concurrent reader on another connection) is non-fatal.
-            if let Ok((busy, _, _)) = db_guard.checkpoint()
-                && busy != 0
-            {
-                tracing::debug!(
-                    document_id = %context_id.to_hex(),
-                    "wal_checkpoint(TRUNCATE) busy after doc compaction",
-                );
-            }
-        }
-
-        if let Some(entry) = self.get(context_id) {
-            entry.uncompacted_count.store(0, Ordering::SeqCst);
-            entry.uncompacted_bytes.store(0, Ordering::SeqCst);
-        }
-
-        Ok(())
-    }
-
-    /// Write an initial snapshot for a newly forked document (no oplog).
-    fn write_initial_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let Some(db) = self.journaling_db()? else {
-            return Ok(());
-        };
-
-        let entry = self
-            .get(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        let snapshot = entry.doc.snapshot();
-        let version = entry.version() as i64;
-
-        let snapshot_bytes = codec::encode(&snapshot)
+    /// Compact exactly the accepted journal prefix represented by this
+    /// document. The caller holds its guard until publication is complete.
+    fn compact_locked(&self, context_id: ContextId, entry: &DocumentEntry) -> BlockStoreResult<()> {
+        let Some(db) = self.journaling_db()? else { return Ok(()); };
+        let snapshot_bytes = codec::encode(&entry.doc.snapshot())
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-
-        drop(entry);
-
-        let mut db_guard = db.lock();
-        db_guard
-            .write_snapshot_and_truncate(context_id, 0, version, &snapshot_bytes)
+        let version = entry.version() as i64;
+        let max_seq = entry.next_journal_seq.load(Ordering::SeqCst);
+        let db_guard = db.lock();
+        db_guard.write_snapshot_and_truncate(context_id, max_seq as i64, version, &snapshot_bytes)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        if let Ok((busy, _, _)) = db_guard.checkpoint()
+            && busy != 0
+        {
+            tracing::debug!(document_id = %context_id.to_hex(), "wal_checkpoint(TRUNCATE) busy after doc compaction");
+        }
+        entry.uncompacted_count.store(0, Ordering::SeqCst);
+        entry.uncompacted_bytes.store(0, Ordering::SeqCst);
+        Ok(())
+    }
 
+    /// Persist a fork's row and initial snapshot together, then expose it.
+    fn publish_fork(&self, context_id: ContextId, entry: DocumentEntry) -> BlockStoreResult<()> {
+        use dashmap::mapref::entry::Entry;
+        let vacant = match self.documents.entry(context_id) {
+            Entry::Occupied(_) => return Err(BlockStoreError::DocumentAlreadyExists(context_id)),
+            Entry::Vacant(vacant) => vacant,
+        };
+        if let Some(db) = self.journaling_db()? {
+            let snapshot_bytes = codec::encode(&entry.doc.snapshot())
+                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+            let row = DocumentRow {
+                document_id: context_id,
+                workspace_id: self.default_workspace_id.unwrap_or_default(),
+                doc_kind: entry.kind,
+                language: entry.language.clone(),
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: entry.doc.principal_id(),
+            };
+            db.lock().in_transaction(|db| {
+                db.insert_document(&row)?;
+                db.write_snapshot_and_truncate(context_id, 0, entry.version() as i64, &snapshot_bytes)
+            }).map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        }
+        vacant.insert(entry);
         Ok(())
     }
 
@@ -1229,11 +1148,9 @@ impl BlockStore {
         content_type: ContentType,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        let after_id = after.cloned();
-        let (block_id, snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = after.cloned();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
 
             // Set the agent for this operation so BlockId gets the right author
@@ -1253,20 +1170,18 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        // Emit flow event with creation ops
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
+            // Emit flow event with creation ops
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Insert a tool call block into a document.
@@ -1303,11 +1218,9 @@ impl BlockStore {
         tool_use_id: Option<String>,
         role: Option<Role>,
     ) -> BlockStoreResult<BlockId> {
-        let after_id = after.cloned();
-        let (block_id, snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = after.cloned();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
@@ -1330,20 +1243,18 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        // Emit flow event with creation ops
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
+            // Emit flow event with creation ops
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Insert a tool result block into a document.
@@ -1386,11 +1297,9 @@ impl BlockStore {
         principal_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<BlockId> {
-        let after_id = after.cloned();
-        let (block_id, snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = after.cloned();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
@@ -1418,20 +1327,18 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        // Emit flow event with creation ops
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
+            // Emit flow event with creation ops
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Insert a block from a snapshot (used by drift flush and cross-context injection).
@@ -1455,25 +1362,23 @@ impl BlockStore {
         after: Option<&BlockId>,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        #[cfg(test)]
-        {
-            use std::sync::atomic::Ordering;
-            // TEST-ONLY fault injection (see field doc): a countdown of N fails the
-            // Nth insert (decrement each call; when the pre-decrement value is 1, the
-            // countdown hits 0 on THIS call → error). Single-threaded in the tests
-            // that use it, so a plain fetch_sub is sufficient.
-            if self.fail_insert_countdown.load(Ordering::SeqCst) > 0 {
-                let prev = self.fail_insert_countdown.fetch_sub(1, Ordering::SeqCst);
-                if prev == 1 {
-                    return Err(BlockStoreError::Db("injected insert fault (test)".into()));
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            #[cfg(test)]
+            {
+                use std::sync::atomic::Ordering;
+                // TEST-ONLY fault injection (see field doc): a countdown of N fails the
+                // Nth insert (decrement each call; when the pre-decrement value is 1, the
+                // countdown hits 0 on THIS call → error). Single-threaded in the tests
+                // that use it, so a plain fetch_sub is sufficient.
+                if self.fail_insert_countdown.load(Ordering::SeqCst) > 0 {
+                    let prev = self.fail_insert_countdown.fetch_sub(1, Ordering::SeqCst);
+                    if prev == 1 {
+                        return Err(BlockStoreError::Db("injected insert fault (test)".into()));
+                    }
                 }
             }
-        }
-        let after_id = after.cloned();
-        let (block_id, final_snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let after_id = after.cloned();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
@@ -1486,19 +1391,17 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(final_snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, final_snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(final_snapshot),
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(final_snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Set the status of a block.
@@ -1508,10 +1411,8 @@ impl BlockStore {
         block_id: &BlockId,
         status: Status,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let principal_id = self.principal_id();
             entry.doc.set_status(block_id, status)?;
             entry.touch(principal_id);
@@ -1519,21 +1420,21 @@ impl BlockStore {
             let header = entry.doc.get_block_header(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
-        };
-        self.journal_op(context_id, ops)?;
+            let ops = SyncPayload::from_updated_header(header);
 
-        // Emit flow event. Output is not carried here — it is a struct field
-        // that can't travel via DTE ops and rides its own `OutputChanged`
-        // event (see `set_output`).
-        self.emit(BlockFlow::StatusChanged {
-            context_id,
-            block_id: *block_id,
-            status,
-            version,
-            source: OpSource::Local,
-        });
+            // Emit flow event. Output is not carried here — it is a struct field
+            // that can't travel via DTE ops and rides its own `OutputChanged`
+            // event (see `set_output`).
+            events.push(BlockFlow::StatusChanged {
+                context_id,
+                block_id: *block_id,
+                status,
+                version,
+                source: OpSource::Local,
+            });
 
+            Ok((ops, events, ()))
+        })?;
         // Validate content when a block transitions to Done with a rich content type.
         // This is the primary hook for kernel-side ABC/SVG validation — it runs once
         // when streaming completes, not on every keystroke.
@@ -1579,15 +1480,10 @@ impl BlockStore {
         text: &str,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        // A missing block reads as empty here and then fails in
-        // `edit_text_as` with the document's own error.
-        let len = self
-            .get(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?
-            .doc
-            .block_content_len(block_id)
-            .unwrap_or(0);
-        self.edit_text_as(context_id, block_id, 0, text, len, principal_id)
+        self.accept(context_id, |entry| {
+            let len = entry.doc.block_content_len(block_id).unwrap_or(0);
+            self.prepare_text_edit(entry, context_id, block_id, 0, text, len, principal_id)
+        })
     }
 
     /// Edit text within a block with an explicit author identity.
@@ -1600,61 +1496,69 @@ impl BlockStore {
         delete: usize,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let (ops, change, after_text, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
-            entry.doc.set_principal_id(effective_agent);
-            // Classify inside the mutation lock (docs/change-feed.md): the
-            // before-length is only knowable here, and only here is it stable
-            // against another writer.
-            let len_before = entry.doc.block_content_len(block_id);
-            entry.doc.edit_text(block_id, pos, insert, delete)?;
-            entry.touch(effective_agent);
-            let len_before = len_before.expect(
-                "block must exist: the edit against it just succeeded under this same guard",
-            );
-            let change = classify_text_edit(len_before, pos, delete);
-            // A replace ships the whole after-text; an append ships only the
-            // inserted suffix, so it never reads the block back.
-            let after_text = match change {
-                TextChange::Appended => None,
-                TextChange::Replaced => Some(entry.doc.block_text(block_id).expect(
-                    "block must exist: the edit against it just succeeded under this same guard",
-                )),
-            };
-            let version = entry.version();
-            // The edit we just applied, journaled for the durable oplog
-            // exactly as it was applied — never shipped to the wire.
-            let ops = SyncPayload::from_text_edit(
-                *block_id,
-                TextEdit { pos: Some(pos), insert: insert.to_string(), delete },
-            );
-            (ops, change, after_text, version)
-        };
-        self.journal_op(context_id, ops)?;
-
-        self.emit_text_change(context_id, block_id, change, after_text, insert, version);
-
-        Ok(())
+        self.accept(context_id, |entry| {
+            self.prepare_text_edit(entry, context_id, block_id, pos, insert, delete, principal_id)
+        })
     }
 
-    /// Publish the classified text change for a mutation that has already been
-    /// journaled — commit first, publish second (docs/change-feed.md).
+    fn prepare_text_edit(
+        &self,
+        entry: &mut DocumentEntry,
+        context_id: ContextId,
+        block_id: &BlockId,
+        pos: usize,
+        insert: &str,
+        delete: usize,
+        principal_id: Option<PrincipalId>,
+    ) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, ())> {
+        let mut events = Vec::new();
+        let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+        entry.doc.set_principal_id(effective_agent);
+        // Classify inside the mutation lock (docs/change-feed.md): the
+        // before-length is only knowable here, and only here is it stable
+        // against another writer.
+        let len_before = entry.doc.block_content_len(block_id);
+        entry.doc.edit_text(block_id, pos, insert, delete)?;
+        entry.touch(effective_agent);
+        let len_before = len_before.expect(
+            "block must exist: the edit against it just succeeded under this same guard",
+        );
+        let change = classify_text_edit(len_before, pos, delete);
+        // A replace ships the whole after-text; an append ships only the
+        // inserted suffix, so it never reads the block back.
+        let after_text = match change {
+            TextChange::Appended => None,
+            TextChange::Replaced => Some(entry.doc.block_text(block_id).expect(
+                "block must exist: the edit against it just succeeded under this same guard",
+            )),
+        };
+        let version = entry.version();
+        // The edit we just applied, journaled for the durable oplog
+        // exactly as it was applied — never shipped to the wire.
+        let ops = SyncPayload::from_text_edit(
+            *block_id,
+            TextEdit { pos: Some(pos), insert: insert.to_string(), delete },
+        );
+
+        events.push(Self::text_change(context_id, block_id, change, after_text, insert, version));
+
+        Ok((ops, events, ()))
+    }
+
+    /// Prepare the text projection for acceptance (docs/change-feed.md).
+    /// The acceptance owner publishes it after the durable commit.
     ///
     /// `after_text` is `Some` exactly when `change` is
     /// [`TextChange::Replaced`]; `inserted` is the suffix for an append.
-    fn emit_text_change(
-        &self,
+    fn text_change(
         context_id: ContextId,
         block_id: &BlockId,
         change: TextChange,
         after_text: Option<String>,
         inserted: &str,
         version: u64,
-    ) {
-        let flow = match change {
+    ) -> BlockFlow {
+        match change {
             TextChange::Appended => BlockFlow::TextAppended {
                 context_id,
                 block_id: *block_id,
@@ -1674,8 +1578,7 @@ impl BlockStore {
                 version,
                 source: OpSource::Local,
             },
-        };
-        self.emit(flow);
+        }
     }
 
     /// Set the ephemeral flag on a block (excluded from LLM hydration).
@@ -1685,34 +1588,27 @@ impl BlockStore {
         block_id: &BlockId,
         ephemeral: bool,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             entry.doc.set_ephemeral(block_id, ephemeral)?;
             entry.touch(self.principal_id());
             let version = entry.version();
             let header = entry.doc.get_block_header(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_header(header);
+            let metadata = entry.doc.get_block_snapshot(block_id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: *block_id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set the excluded flag on a block (user-curated exclusion during staging).
@@ -1722,28 +1618,25 @@ impl BlockStore {
         block_id: &BlockId,
         excluded: bool,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             entry.doc.set_excluded(block_id, excluded)?;
             entry.touch(self.principal_id());
             let version = entry.version();
             let header = entry.doc.get_block_header(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
-        };
-        self.journal_op(context_id, ops)?;
-        self.emit(BlockFlow::ExcludedChanged {
-            context_id,
-            block_id: *block_id,
-            excluded,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_header(header);
+            events.push(BlockFlow::ExcludedChanged {
+                context_id,
+                block_id: *block_id,
+                excluded,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Move a block to a new position.
@@ -1757,11 +1650,9 @@ impl BlockStore {
         block_id: &BlockId,
         after: Option<&BlockId>,
     ) -> BlockStoreResult<()> {
-        let after_id = after.cloned();
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = after.cloned();
             entry.doc.move_block(block_id, after)?;
             entry.touch(self.principal_id());
             let version = entry.version();
@@ -1772,17 +1663,16 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_snapshot(snapshot), version)
-        };
-        self.journal_op(context_id, ops)?;
-        self.emit(BlockFlow::Moved {
-            context_id,
-            block_id: *block_id,
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
-        Ok(())
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
+            events.push(BlockFlow::Moved {
+                context_id,
+                block_id: *block_id,
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set the content_type hint on a block (e.g., Markdown, Svg, Abc).
@@ -1792,34 +1682,27 @@ impl BlockStore {
         block_id: &BlockId,
         content_type: ContentType,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             entry.doc.set_content_type(block_id, content_type)?;
             entry.touch(self.principal_id());
             let version = entry.version();
             let header = entry.doc.get_block_header(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_header(header);
+            let metadata = entry.doc.get_block_snapshot(block_id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: *block_id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set the task lifecycle status on a `BlockKind::Task` block (household-
@@ -1836,34 +1719,27 @@ impl BlockStore {
         block_id: &BlockId,
         status: TaskStatus,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             entry.doc.set_task_status(block_id, status)?;
             entry.touch(self.principal_id());
             let version = entry.version();
             let header = entry.doc.get_block_header(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_header(header);
+            let metadata = entry.doc.get_block_snapshot(block_id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: *block_id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set the kernel-derived summary on a `Thinking` block (docs/issues.md,
@@ -1879,34 +1755,27 @@ impl BlockStore {
         block_id: &BlockId,
         summary: String,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             entry.doc.set_summary(block_id, summary)?;
             entry.touch(self.principal_id());
             let version = entry.version();
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_snapshot(snapshot), version)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
+            let metadata = entry.doc.get_block_snapshot(block_id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: *block_id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Persist the real exit code on a ToolResult block. Shell execution
@@ -1919,34 +1788,27 @@ impl BlockStore {
         block_id: &BlockId,
         exit_code: Option<i32>,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             entry.doc.set_exit_code(block_id, exit_code)?;
             entry.touch(self.principal_id());
             let version = entry.version();
             let header = entry.doc.get_block_header(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_header(header);
+            let metadata = entry.doc.get_block_snapshot(block_id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: *block_id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Persist the standard-error stream on a ToolResult block. The shell
@@ -1960,10 +1822,8 @@ impl BlockStore {
         block_id: &BlockId,
         stderr: Option<String>,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             entry.doc.set_stderr(block_id, stderr)?;
             entry.touch(self.principal_id());
             let version = entry.version();
@@ -1974,24 +1834,19 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_snapshot(snapshot), version)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
+            let metadata = entry.doc.get_block_snapshot(block_id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: *block_id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set the reasoning-continuity token on a block (Thinking blocks).
@@ -2008,10 +1863,8 @@ impl BlockStore {
         block_id: &BlockId,
         signature: Option<String>,
     ) -> BlockStoreResult<()> {
-        let ops = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let events = Vec::new();
             entry.doc.set_signature(block_id, signature)?;
             entry.touch(self.principal_id());
             // `signature` is a write-once snapshot field, not part of
@@ -2019,10 +1872,9 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            SyncPayload::from_updated_snapshot(snapshot)
-        };
-        self.journal_op(context_id, ops)?;
-        Ok(())
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
+            Ok((ops, events, ()))
+        })
     }
 
     /// Record the pre-transform bytes for one (block, transform) in the
@@ -2031,9 +1883,8 @@ impl BlockStore {
     /// A thin delegate so ingest hook sites never reach for the raw
     /// [`crate::kernel_db::KernelDb`]: they already hold the store, and the
     /// store already owns the db handle. Deliberately NOT folded into
-    /// [`Self::set_style_spans`] — `journal_op` is not transactional today
-    /// (two autocommit statements under a mutex), so the provenance write is
-    /// its own statement either way, and hook sites order the two themselves
+    /// [`Self::set_style_spans`]: hook sites persist the original before
+    /// accepting the projected spans
     /// (row first, tag second: a crash between then leaves an orphan row,
     /// never a tag pointing at bytes that were never stored).
     ///
@@ -2072,10 +1923,8 @@ impl BlockStore {
         style_spans: Vec<kaijutsu_types::StyleSpan>,
         provenance: Option<kaijutsu_types::ProvenanceTag>,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let principal_id = self.principal_id();
             entry
                 .doc
@@ -2087,20 +1936,19 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_snapshot(snapshot), version)
-        };
-        // Commit first, publish second: the journal write is the acceptance.
-        self.journal_op(context_id, ops)?;
-        self.emit(BlockFlow::SpansChanged {
-            context_id,
-            block_id: *block_id,
-            style_spans,
-            provenance,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
+            // Commit first, publish second: the journal write is the acceptance.
+            events.push(BlockFlow::SpansChanged {
+                context_id,
+                block_id: *block_id,
+                style_spans,
+                provenance,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set structured output data on a block.
@@ -2114,10 +1962,8 @@ impl BlockStore {
         block_id: &BlockId,
         output: Option<&kaijutsu_types::OutputData>,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let principal_id = self.principal_id();
             entry.doc.set_output(block_id, output.cloned())?;
             entry.touch(principal_id);
@@ -2127,18 +1973,17 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_snapshot(snapshot), version)
-        };
-        self.journal_op(context_id, ops)?;
-        self.emit(BlockFlow::OutputChanged {
-            context_id,
-            block_id: *block_id,
-            output: output.cloned(),
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
+            events.push(BlockFlow::OutputChanged {
+                context_id,
+                block_id: *block_id,
+                output: output.cloned(),
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set the LLM-assigned tool invocation ID on a block.
@@ -2148,10 +1993,8 @@ impl BlockStore {
         block_id: &BlockId,
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let principal_id = self.principal_id();
             entry.doc.set_tool_use_id(block_id, tool_use_id)?;
             entry.touch(principal_id);
@@ -2161,24 +2004,19 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_snapshot(snapshot), version)
-        };
-        self.journal_op(context_id, ops)?;
-        let metadata = self
-            .get_block_snapshot(context_id, block_id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: *block_id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
+            let metadata = entry.doc.get_block_snapshot(block_id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: *block_id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     // =========================================================================
@@ -2218,6 +2056,10 @@ impl BlockStore {
 
     /// This principal's draft block, created empty at the end of the document
     /// if they do not have one yet.
+    // TODO: Hold one compose-operation guard across draft lookup and creation,
+    // and across edit/clear selection. Individual block acceptance is atomic;
+    // these read-then-write helpers are not. See docs/issues.md,
+    // "Compose operation selection can race".
     pub fn get_or_create_draft(
         &self,
         context_id: ContextId,
@@ -2278,25 +2120,23 @@ impl BlockStore {
         principal_id: PrincipalId,
         edge: Option<InputEdge>,
     ) -> BlockStoreResult<(BlockId, String)> {
-        let draft = self
-            .draft_block(context_id, principal_id)?
-            .ok_or(BlockStoreError::NoDraft(context_id, principal_id))?;
-        let text = draft.content.trim().to_string();
-        if text.is_empty() {
-            return Err(BlockStoreError::EmptyDraft(context_id));
-        }
-        // All three changes land under one lock and journal as ONE op, so a
-        // crash cannot promote the block without its edge or leave the edge
-        // on a block still marked Draft. `status`/`ephemeral` live on
-        // `BlockHeader`, but `edge_block`/`edge_shown` do not, so the full
-        // post-mutation snapshot is journaled (mirrors `set_summary`/
-        // `set_stderr`): a header-only payload cannot carry the edge through
-        // oplog replay. The events follow: `StatusChanged` then
-        // `MetadataChanged`, batched into one change-feed delivery.
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let (id, text, content_type) = self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let draft = entry.doc.blocks_ordered().into_iter()
+                .find(|block| block.status == Status::Draft && block.id.principal_id == principal_id)
+                .ok_or(BlockStoreError::NoDraft(context_id, principal_id))?;
+            let text = draft.content.trim().to_string();
+            if text.is_empty() {
+                return Err(BlockStoreError::EmptyDraft(context_id));
+            }
+            // All three changes land under one lock and journal as ONE op, so a
+            // crash cannot promote the block without its edge or leave the edge
+            // on a block still marked Draft. `status`/`ephemeral` live on
+            // `BlockHeader`, but `edge_block`/`edge_shown` do not, so the full
+            // post-mutation snapshot is journaled (mirrors `set_summary`/
+            // `set_stderr`): a header-only payload cannot carry the edge through
+            // oplog replay. The events follow: `StatusChanged` then
+            // `MetadataChanged`, batched into one change-feed delivery.
             entry.doc.set_ephemeral(&draft.id, false)?;
             entry.doc.set_status(&draft.id, Status::Done)?;
             entry.doc.set_edge(&draft.id, edge)?;
@@ -2305,41 +2145,31 @@ impl BlockStore {
             let snapshot = entry.doc.get_block_snapshot(&draft.id).expect(
                 "block must exist: the mutations against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_snapshot(snapshot), version)
-        };
-        self.journal_op(context_id, ops)?;
+            let ops = SyncPayload::from_updated_snapshot(snapshot);
 
-        self.emit(BlockFlow::StatusChanged {
-            context_id,
-            block_id: draft.id,
-            status: Status::Done,
-            version,
-            source: OpSource::Local,
-        });
-        let metadata = self
-            .get_block_snapshot(context_id, &draft.id)
-            .ok()
-            .flatten()
-            .map(|s| s.metadata())
-            .unwrap_or_default();
-        self.emit(BlockFlow::MetadataChanged {
-            context_id,
-            block_id: draft.id,
-            metadata,
-            version,
-            source: OpSource::Local,
-        });
+            events.push(BlockFlow::StatusChanged {
+                context_id,
+                block_id: draft.id,
+                status: Status::Done,
+                version,
+                source: OpSource::Local,
+            });
+            let metadata = entry.doc.get_block_snapshot(&draft.id)
+                .expect("the accepted block exists under this guard").metadata();
+            events.push(BlockFlow::MetadataChanged {
+                context_id,
+                block_id: draft.id,
+                metadata,
+                version,
+                source: OpSource::Local,
+            });
 
-        // The same Done hook `set_status` runs, so a promotion is not a
-        // second path around rich-content validation.
-        if matches!(
-            draft.content_type,
-            ContentType::Abc | ContentType::Svg | ContentType::Diff
-        ) {
-            let _ = self.validate_content_and_attach_errors(context_id, &draft.id);
+            Ok((ops, events, (draft.id, text, draft.content_type)))
+        })?;
+        if matches!(content_type, ContentType::Abc | ContentType::Svg | ContentType::Diff) {
+            let _ = self.validate_content_and_attach_errors(context_id, &id);
         }
-
-        Ok((draft.id, text))
+        Ok((id, text))
     }
 
     /// Discard this principal's draft. Returns the text that was thrown away,
@@ -2375,10 +2205,8 @@ impl BlockStore {
         text: &str,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
             entry.doc.append_text(block_id, text)?;
@@ -2392,33 +2220,25 @@ impl BlockStore {
                 *block_id,
                 TextEdit { pos: None, insert: text.to_string(), delete: 0 },
             );
-            (ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        // Classified as an append *by construction*, not by this function's
-        // name (docs/change-feed.md rules 4-5): the primitive underneath
-        // computes the end position and deletes nothing, so it satisfies
-        // `classify_text_edit`'s predicate for every input.
-        //
-        // Measuring the before-length here would materialize the whole block a
-        // SECOND time per streamed token. Not a second time in place of none:
-        // `BlockContent::append_text` already materializes it once to find the
-        // end (`blocks/content.rs`), which is a real per-token O(n) cost this
-        // classification neither causes nor cures — it belongs to the text
-        // engine, not here. What this avoids is doubling it.
-        // `append_emits_exact_suffix` pins the by-construction claim against
-        // the engine's real behavior.
-        self.emit_text_change(
-            context_id,
-            block_id,
-            TextChange::Appended,
-            None,
-            text,
-            version,
-        );
+            // Classified as an append *by construction*, not by this function's
+            // name (docs/change-feed.md rules 4-5): the primitive underneath
+            // computes the end position and deletes nothing, so it satisfies
+            // `classify_text_edit`'s predicate for every input.
+            //
+            // The cached character count keeps end-appends from copying or
+            // rescanning the accumulated text for each streamed token.
+            events.push(Self::text_change(
+                context_id,
+                block_id,
+                TextChange::Appended,
+                None,
+                text,
+                version,
+            ));
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Set collapsed state for a thinking block.
@@ -2428,10 +2248,8 @@ impl BlockStore {
         block_id: &BlockId,
         collapsed: bool,
     ) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let principal_id = self.principal_id();
             entry.doc.set_collapsed(block_id, collapsed)?;
             entry.touch(principal_id);
@@ -2439,45 +2257,41 @@ impl BlockStore {
             let header = entry.doc.get_block_header(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
-            (SyncPayload::from_updated_header(header), version)
-        };
-        self.journal_op(context_id, ops)?;
+            let ops = SyncPayload::from_updated_header(header);
 
-        // Emit flow event
-        self.emit(BlockFlow::CollapsedChanged {
-            context_id,
-            block_id: *block_id,
-            collapsed,
-            version,
-            source: OpSource::Local,
-        });
+            // Emit flow event
+            events.push(BlockFlow::CollapsedChanged {
+                context_id,
+                block_id: *block_id,
+                collapsed,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     /// Delete a block from a document.
     pub fn delete_block(&self, context_id: ContextId, block_id: &BlockId) -> BlockStoreResult<()> {
-        let (ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let principal_id = self.principal_id();
             entry.doc.delete_block(block_id)?;
             entry.touch(principal_id);
             let version = entry.version();
-            (SyncPayload::from_deletion(*block_id), version)
-        };
-        self.journal_op(context_id, ops)?;
+            let ops = SyncPayload::from_deletion(*block_id);
 
-        // Emit flow event
-        self.emit(BlockFlow::Deleted {
-            context_id,
-            block_id: *block_id,
-            version,
-            source: OpSource::Local,
-        });
+            // Emit flow event
+            events.push(BlockFlow::Deleted {
+                context_id,
+                block_id: *block_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(())
+            Ok((ops, events, ()))
+        })
     }
 
     // =========================================================================
@@ -2548,10 +2362,11 @@ impl BlockStore {
     /// document at all (never existed, or not yet hydrated from the DB) has
     /// no blocks to be `Running`/`Error` about, so `Pending` is correct there.
     pub fn live_status(&self, context_id: ContextId) -> Status {
+        let entry = self.get(context_id);
         if let Some(status) = self.live_status.get(&context_id) {
             return *status;
         }
-        let computed = match self.get(context_id) {
+        let computed = match entry.as_ref() {
             Some(entry) => {
                 // Status-only, same reasoning as `journal_op`'s recompute:
                 // no need to materialize every block's text for a one-time
@@ -2859,6 +2674,7 @@ impl BlockStore {
             let version = base_version + replayed;
             let entry = DocumentEntry {
                 doc: document,
+                poisoned: false,
                 kind: doc.doc_kind,
                 language: doc.language.clone(),
                 version: AtomicU64::new(version),
@@ -2990,6 +2806,7 @@ impl BlockStore {
         let version = base_version + oplog_entries.len() as u64;
         let entry = DocumentEntry {
             doc: document,
+            poisoned: false,
             kind: doc.doc_kind,
             language: doc.language.clone(),
             version: AtomicU64::new(version),
@@ -3099,13 +2916,8 @@ impl BlockStore {
             None => (BlockDocument::new(context_id, principal_id), 0),
         };
 
-        // Replay must be gapless from the snapshot to the requested point.
-        // `next_journal_seq` is claimed BEFORE the row commits under the db
-        // lock (`journal_op`), so a reader can pass the head bounds check
-        // while the row it needs is still in flight — and a failed
-        // `append_op` leaves the same hole permanently. Either way, folding
-        // whatever rows exist and labeling the result "seq N" would be a
-        // version that never existed. Enforce contiguity and fail loud.
+        // Reject a damaged or incomplete journal instead of labeling a
+        // partial reconstruction as the requested version.
         let mut expected = base_seq + 1;
         for (entry_seq, payload_bytes) in db_guard
             .load_oplog_since(context_id, base_seq)
@@ -3170,11 +2982,9 @@ impl BlockStore {
         drift_kind: kaijutsu_types::DriftKind,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        let after_id = after.cloned();
-        let (block_id, snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = after.cloned();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
@@ -3194,19 +3004,17 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Validate content and attach/update Error child blocks.
@@ -3312,11 +3120,9 @@ impl BlockStore {
         summary: impl Into<String>,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        let after_id = parent_id.copied();
-        let (block_id, snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = parent_id.copied();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
@@ -3332,19 +3138,17 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Insert a resource block (MCP resource read-through — Phase 3, D-43).
@@ -3361,11 +3165,9 @@ impl BlockStore {
         summary: impl Into<String>,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        let after_id = parent_id.copied();
-        let (block_id, snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
+            let after_id = parent_id.copied();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
@@ -3381,19 +3183,17 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id,
-            version,
-            source: OpSource::Local,
-        });
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Insert an error block attached to a parent.
@@ -3408,10 +3208,8 @@ impl BlockStore {
         summary: impl Into<String>,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
-        let (block_id, snapshot, ops, version) = {
-            let mut entry = self
-                .get_mut(context_id)
-                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept(context_id, |entry| {
+            let mut events = Vec::new();
             let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
             entry.doc.set_principal_id(effective_agent);
 
@@ -3427,19 +3225,17 @@ impl BlockStore {
             let ops = SyncPayload::from_new_block(snapshot.clone());
             entry.touch(effective_agent);
             let version = entry.version();
-            (block_id, snapshot, ops, version)
-        };
-        self.journal_op(context_id, ops)?;
 
-        self.emit(BlockFlow::Inserted {
-            context_id,
-            block: Arc::new(snapshot),
-            after_id: Some(*parent_id),
-            version,
-            source: OpSource::Local,
-        });
+            events.push(BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id: Some(*parent_id),
+                version,
+                source: OpSource::Local,
+            });
 
-        Ok(block_id)
+            Ok((ops, events, block_id))
+        })
     }
 
     /// Fail every block still `Running` at kernel cold start.
@@ -4665,8 +4461,12 @@ mod tests {
     /// Replay every journaled payload for `ctx` into a fresh document, the
     /// same primitive `load_from_db` uses. Returns the replayed document.
     fn replay_journal(db: &Arc<parking_lot::Mutex<KernelDb>>, ctx: ContextId) -> BlockDocument {
-        let mut client = BlockDocument::new(ctx, PrincipalId::new());
-        let oplog = db.lock().load_oplog_since(ctx, 0).unwrap();
+        let guard = db.lock();
+        let (mut client, base_seq) = match guard.load_latest_snapshot(ctx).unwrap() {
+            Some(row) => (BlockDocument::from_snapshot(codec::decode(&row.state).unwrap(), PrincipalId::new()).unwrap(), row.seq),
+            None => (BlockDocument::new(ctx, PrincipalId::new()), 0),
+        };
+        let oplog = guard.load_oplog_since(ctx, base_seq).unwrap();
         for (seq, payload_bytes) in &oplog {
             let payload: SyncPayload =
                 codec::decode(payload_bytes).unwrap_or_else(|e| panic!("decode oplog {seq}: {e}"));
@@ -4675,6 +4475,94 @@ mod tests {
                 .unwrap_or_else(|e| panic!("replay oplog {seq}: {e}"));
         }
         client
+    }
+
+    #[test]
+    fn acceptance_keeps_the_document_locked_through_commit_and_publication() {
+        for (before_publish, compact) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (store, bus, db, _dir) = store_with_db_and_flows();
+            let ctx = ContextId::new();
+            store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let block = store.insert_block(ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain).unwrap();
+            if compact {
+                store.get(ctx).unwrap().uncompacted_count.store(COMPACTION_OP_THRESHOLD - 1, Ordering::SeqCst);
+            }
+            let mut sub = bus.subscribe("block.>");
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            if before_publish {
+                *store.before_publish.lock() = Some(hook);
+            } else {
+                *store.before_journal.lock() = Some(hook);
+            }
+            let held = std::thread::scope(|scope| {
+                let first = scope.spawn(|| store.append_text(ctx, &block, "A"));
+                entered_rx.recv().unwrap();
+                let held = matches!(store.documents.try_get_mut(&ctx), dashmap::try_result::TryResult::Locked);
+                let second = scope.spawn(|| store.append_text(ctx, &block, "B"));
+                resume_tx.send(()).unwrap();
+                first.join().unwrap().unwrap();
+                second.join().unwrap().unwrap();
+                held
+            });
+            assert!(held, "acceptance guard was released before_publish={before_publish}");
+            let changes = drain_text_changes(&mut sub, &block);
+            let mut mirror = String::new();
+            let mut versions = Vec::new();
+            for change in changes {
+                match change {
+                    SeenChange::Appended { suffix, version } => {
+                        mirror.push_str(&suffix);
+                        versions.push(version);
+                    }
+                    _ => panic!("expected appends"),
+                }
+            }
+            assert_eq!(mirror, "AB");
+            assert_eq!(versions, vec![2, 3]);
+            assert_eq!(store.get_content(ctx).unwrap(), mirror);
+            assert_eq!(replay_journal(&db, ctx).full_text(), mirror);
+        }
+    }
+
+    #[test]
+    fn fork_failure_does_not_publish_a_document_without_its_snapshot() {
+        let (store, _bus, db, _dir) = store_with_db_and_flows();
+        let source = ContextId::new();
+        store.create_document(source, DocumentKind::Conversation, None).unwrap();
+        store.insert_block(source, None, None, Role::User, BlockKind::Text,
+            "source", Status::Done, ContentType::Plain).unwrap();
+        db.lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER reject_snapshot BEFORE INSERT ON doc_snapshots BEGIN SELECT RAISE(ABORT, 'injected snapshot failure'); END;"
+        ).unwrap();
+        let child = ContextId::new();
+        assert!(store.fork_document(source, child).is_err());
+        assert!(!store.contains(child), "a failed fork must not be served from memory");
+        assert!(db.lock().get_document(child).unwrap().is_none(), "a failed fork must not leave an empty durable document");
+        assert_eq!(store.get_content(source).unwrap(), "source");
+    }
+
+    #[test]
+    fn acceptance_failure_publishes_nothing_and_refuses_uncommitted_state() {
+        let (store, bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let block = store.insert_block(ctx, None, None, Role::User, BlockKind::Text,
+            "accepted", Status::Done, ContentType::Plain).unwrap();
+        let mut sub = bus.subscribe("block.>");
+        db.lock().set_query_only_for_test(true).unwrap();
+        assert!(store.append_text(ctx, &block, "uncommitted").is_err());
+        assert!(drain_text_changes(&mut sub, &block).is_empty());
+        assert_eq!(replay_journal(&db, ctx).full_text(), "accepted");
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.get_content(ctx)));
+        assert!(read.is_err(), "failed persistence must make uncommitted memory inaccessible");
+        let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.append_text(ctx, &block, "retry")));
+        assert!(write.is_err(), "a failed document cannot accept another mutation");
     }
 
     /// `set_output` must publish a dedicated `OutputChanged` flow event — not

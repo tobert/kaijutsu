@@ -73,10 +73,10 @@ checks, pinning, and swap acknowledgment. Start with restart/recovery and
 external-edit regressions from `docs/file-buffers.md`; only then remove clean
 read materialization. This remains a separate design change.
 
-**Order:** document sequencing (see "Document mutation
-and publication need one sequencer" below), runtime
-settlement, shared recovery, rendering, then file-buffer persistence. Each
-requires its own reviewable change; the source TODOs point to these entries.
+**Order:** runtime settlement, shared recovery, rendering, then file-buffer
+persistence. Compound compose operations and feed acceptance groups are
+tracked below. Each requires its own reviewable change; the source TODOs point
+to these entries.
 
 ### Kernel architecture overview needs a refresh
 
@@ -2278,21 +2278,26 @@ shipped. Still open, all verified against current code:
 - **Backgrounds/underlines bake color into vertices** — `ShapeKey::
   baked_theme_epoch` exists for exactly this reason.
 
-## Document mutation and publication need one sequencer
+## Compose operation selection can race
 
-`BlockStore::journal_op` now commits `append_op` and the activity stamp in one
-SQLite transaction; the earlier two-autocommit issue is fixed. The broader
-boundary is still split: setters such as `edit_text_as` mutate memory and
-advance the version under a document guard, release it, journal under a
-separate DB lock, then publish. Concurrent writers can cross those boundaries
-in different orders, and a journal error can leave changed memory behind.
-Compaction separately snapshots memory and the journal head before its write.
+Block acceptance now holds one document guard through mutation, commit, and
+publication. `get_or_create_draft`, `edit_draft`, and `clear_draft` still select
+a block before entering that boundary. Concurrent first lookups can create
+two drafts for one principal; editing or clearing can race submission.
+Move selection into the same guarded operation, with a regression for each
+interleaving. `submit_draft` and whole-text replacement already read their
+inputs under the acceptance guard.
 
-Give the existing block store one ordered acceptance path for the mutation,
-durable op, and projected event. Start with deterministic interleaving and
-commit-failure tests comparing live state, replay, and delivery. Structural
-finding from source, not a reproduced race. See the
-[architecture scan](audits/2026-09-16-architecture-debt.md).
+## Change-feed batching after ordered acceptance
+
+The block store now publishes in version order. `server/context_feed.rs`
+still sorts a delivery to repair the retired publisher race. Remove that
+repair with wire-level order tests. Also pin a mutation's multiple events at
+the batch limit: draft submission emits status and metadata at one version,
+and splitting them between deliveries currently ends the feed on the second
+one and forces a snapshot. Preserve complete acceptance groups before
+claiming transactional delivery; a four-millisecond window cannot guarantee
+it. Keep the existing recovery check until that contract is tested.
 
 ## Oplog replay clears spans that live appends keep (2026-08-19)
 
