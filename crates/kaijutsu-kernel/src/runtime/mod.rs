@@ -11,6 +11,7 @@
 pub mod command;
 pub mod command_result;
 pub mod command_outcome;
+mod result_review;
 pub mod shell_state;
 pub mod context_engine;
 pub mod context_shell;

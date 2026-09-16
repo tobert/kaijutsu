@@ -106,16 +106,15 @@ fn record_ask_identity(
     }
 }
 
-/// `--origin <origin>` on `list` — a `ValueEnum` so a typo fails at parse
-/// time with clap's own "possible values are..." message rather than
-/// coming back as a silently empty result. Values match `approvals.origin`'s
-/// own `CHECK`-constrained strings (`schema.rs` in `approval-ledger`)
-/// exactly — `shell_gate`/`kj_verb`, not clap's default kebab-case.
+/// Origin filters use the ledger's snake_case names. Clap rejects unknown
+/// values before querying, so a typo cannot look like an empty queue.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "snake_case")]
 enum OriginArg {
-    /// A hook's `ask` action fired.
+    /// A PreCall hook asks before execution.
     Hook,
+    /// A hook reviews a captured result without executing source.
+    HookResult,
     /// The shell tool gated a command before executing it.
     ShellGate,
     /// A privileged `kj` verb gated itself.
@@ -126,6 +125,7 @@ impl OriginArg {
     fn to_ledger(self) -> Origin {
         match self {
             Self::Hook => Origin::Hook,
+            Self::HookResult => Origin::HookResult,
             Self::ShellGate => Origin::ShellGate,
             Self::KjVerb => Origin::KjVerb,
         }
@@ -4284,6 +4284,17 @@ mod tests {
             "the default queue does not include claimed asks; help must not claim it does: {about}"
         );
         assert!(about.contains("pending"), "{about}");
+    }
+
+    #[test]
+    fn result_review_origin_is_listed_in_published_help_and_parses() {
+        use clap::CommandFactory;
+        let mut command = LedgerArgs::command();
+        let help = command.find_subcommand_mut("list").unwrap().render_long_help().to_string();
+        println!("{help}");
+        assert!(help.contains("hook_result"));
+        let parsed = LedgerArgs::try_parse_from(["list", "--origin", "hook_result"]);
+        assert!(parsed.is_ok(), "{parsed:?}");
     }
 
     mod dispatch_wiring {

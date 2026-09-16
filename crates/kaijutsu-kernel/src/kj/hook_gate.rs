@@ -1,9 +1,12 @@
-//! Builds a [`GateSpec`] for a hook's `Ask` action — the sibling of
-//! [`crate::kj::shell_gate`], for the other origin that opens a gate.
+//! Build phase-specific [`GateSpec`] values for hook asks.
+//!
+//! PreCall asks may authorize execution. PostCall and OnError asks bind the
+//! captured result and phase, carry no executable source, and grant only
+//! continued result processing. Their digest namespace is separate.
 //!
 //! ## What a hook ask can honestly describe
 //!
-//! `HookAction::Ask` fires from the PreCall phase of a tool call, so the one
+//! A PreCall `HookAction::Ask` runs before the tool call, so the one
 //! thing that exists to show a human is **the call itself**: the instance,
 //! the tool, and the arguments as they stand at fire time. That is the
 //! single [`GatedStatement`] this builds, and it is the whole of what the
@@ -27,7 +30,7 @@
 //!
 //! ## A shell-shaped call is source, and is treated as source
 //!
-//! When the hooked tool is `shell` or `shell_write`, the `command` argument
+//! For PreCall on `shell` or `shell_write`, the `command` argument
 //! is a kaish program. It is planned here exactly as
 //! [`crate::kj::shell_gate`] plans a direct submission, and the ask carries
 //! what that plan yields: the command as `exec_source`, so an approval runs
@@ -135,10 +138,52 @@ pub(crate) fn build_hook_gate_spec(
     }
 }
 
+/// Bind result approval to the observed phase, call, and captured result.
+/// It has no executable source, environment pins, or command-family policy.
+pub(crate) fn build_result_review_spec(
+    hook_id: &str,
+    phase: crate::mcp::McpHookPhase,
+    description: String,
+    params: &KernelCallParams,
+    captured: &str,
+) -> GateSpec {
+    assert!(matches!(phase, crate::mcp::McpHookPhase::PostCall | crate::mcp::McpHookPhase::OnError));
+    let label = format!("{phase:?} {}.{}", params.instance, params.tool);
+    GateSpec {
+        origin: Origin::HookResult, instance: params.instance.as_str().into(), tool: params.tool.clone(),
+        hook_id: Some(hook_id.into()), description, authorized_label: label.clone(),
+        statements: vec![GatedStatement {
+            rendered: format!("{label} {}\nCaptured result: {captured}", params.arguments),
+            statement_kind: "result_review".into(), vars: vec![], source_index: None,
+        }],
+        exec_source: None, exec_stdin: None, planned: vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mcp::types::InstanceId;
+
+    #[test]
+    fn result_review_binds_phase_and_captured_result_without_executable_authority() {
+        use crate::mcp::McpHookPhase;
+        let params = call("shell_write", serde_json::json!({"command": "echo $TARGET"}));
+        let post = build_result_review_spec("review", McpHookPhase::PostCall, "review".into(), &params, "first result");
+        let changed = build_result_review_spec("review", McpHookPhase::PostCall, "review".into(), &params, "second result");
+        let error = build_result_review_spec("review", McpHookPhase::OnError, "review".into(), &params, "first result");
+        let pre = build_hook_gate_spec("review", "review".into(), &params);
+        for spec in [&post, &changed, &error] {
+            assert_eq!(spec.origin, Origin::HookResult);
+            assert!(spec.exec_source.is_none() && spec.exec_stdin.is_none());
+            assert!(spec.planned.is_empty());
+            assert!(spec.statements.iter().all(|statement| statement.vars.is_empty()));
+        }
+        let digest = |spec: &GateSpec| crate::kj::gate::statement_digest(spec.origin, &spec.statements[0].rendered);
+        assert_ne!(digest(&post), digest(&changed));
+        assert_ne!(digest(&post), digest(&error));
+        assert_ne!(digest(&post), digest(&pre));
+    }
 
     fn call(tool: &str, arguments: serde_json::Value) -> KernelCallParams {
         KernelCallParams {

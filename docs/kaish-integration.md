@@ -76,8 +76,17 @@ These are source observations, not promises that all paths behave alike.
   from ordinary receipt polls, so a poll does not duplicate captured output.
 - Settlement remains incomplete: structured/streaming RPC and MCP completion
   still have separate projection paths. Their replacements need the same metadata
-  policy, and streaming RPC still cannot honor all hook verdicts. Result-hook
-  approval waits and live reporting/retry of persistence failures remain open.
+  policy, and streaming RPC still cannot honor all hook verdicts. Interactive
+  and approved commands now retain result-review waits; other callers and live
+  reporting/retry of persistence failures remain open.
+- `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
+  PostCall or OnError ask. Approval continues the same ordered hook snapshot;
+  neither the command nor earlier hooks run again. Result-review asks have
+  `hook_result` origin, no executable source, and a digest binding the phase,
+  call, and captured result. The generic execution/resume driver excludes them, and retry redemption
+  cannot consume another execution owner's answer.
+  Cancellation or dropping the wait abandons the ask and retains the outcome;
+  restart reports interrupted review without re-entering the lost hook snapshot.
 - `background_exec.rs` was removed in `8ea04fdf`. Asynchronous shell programs
   use kaish's job system with durable Kaijutsu receipts. Earlier notes claiming
   that a temporary shell cannot host work that outlives it are obsolete.
@@ -156,8 +165,21 @@ A command whose outcome was never retained remains subject to interrupted-run
 recovery: the kernel reports an unknown result and never reruns its source.
 Failure before the initial retention write still requires live reporting/retry;
 background interactive callers currently log that failure, and approval resumes
-report it to the model. Result-hook asks need durable retention of what already
-ran and must resume publication without treating approval as permission to rerun.
+report it to the model.
+
+Result-hook asks retain what already ran and resume hook processing without
+permission to rerun. Interactive/approved commands checkpoint the outcome and
+current ask before publishing Waiting blocks. Cwd/exports persist before review.
+Approval consumes the answer and continues the ordered hook snapshot; sequential
+asks update the checkpoint. Final settlement replaces it atomically with the
+terminal outcome. A dropped wait or cancellation abandons an unanswered ask;
+restart retains the execution and reports interrupted review even if the answer
+arrived before shutdown. It cannot reconstruct the in-memory hook snapshot.
+
+Structured/streaming RPC and generic MCP calls do not yet supply a result-review
+owner. Their result-phase Ask or kaish escalation returns GateUnavailable before
+creating an ask. Migrate those consumers to retained outcomes; do not restore
+executable asks as a fallback. Streaming RPC's unhandled verdicts remain open.
 
 Preserve the distinction between parse/validation rejection (nothing ran) and
 an execution fault. Persistence failure must be visible and must not report a

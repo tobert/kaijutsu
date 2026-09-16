@@ -1197,3 +1197,120 @@ fn shell_box_pair_settles_error_when_its_own_ask_is_denied() {
         s.close().await;
     });
 }
+
+struct CountResultHook(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl kaijutsu_kernel::mcp::Hook for CountResultHook {
+    async fn invoke(&self, _: &kaijutsu_kernel::mcp::KernelCallParams,
+        _: &kaijutsu_kernel::mcp::CallContext) -> kaijutsu_kernel::mcp::McpResult<()> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bool) {
+    let scratch = Scratch::new("post-call-review");
+    let s = seats().await;
+    let marker = scratch.marker();
+    let code = if on_error {
+        format!("echo once >> '{}'; if [[ nope -gt 2 ]]; then echo unexpected; fi", marker.display())
+    } else { format!("echo once >> '{}'", marker.display()) };
+    let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut hooks = s.kernel.kernel.broker().hooks().write().await;
+    let table = if on_error { &mut hooks.on_error } else { &mut hooks.post_call };
+    table.entries.push(HookEntry {
+        id: HookId("observe-once".into()), match_instance: None,
+        match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+        match_principal: None, action: HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Builtin {
+            name: "observe-once".into(), hook: Arc::new(CountResultHook(observed.clone())),
+        }), priority: -1, kaish_script_id: None,
+    });
+    table.entries.push(HookEntry {
+        id: HookId("review-result".into()), match_instance: None,
+        match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+        match_principal: None, action: if script {
+            HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Kaish("echo review >&2; exit 3".into()))
+        } else { HookAction::Ask(AskSpec { description: Some("Review captured result".into()) }) },
+        priority: 0, kaish_script_id: None,
+    });
+    if twice {
+        table.entries.push(HookEntry {
+            id: HookId("second-review".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Second result review".into()) }),
+            priority: 1, kaish_script_id: None,
+        });
+    }
+    table.entries.push(HookEntry {
+        id: HookId("after-review".into()), match_instance: None,
+        match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+        match_principal: None, action: HookAction::ShortCircuit(kaijutsu_kernel::mcp::KernelToolResult::text("reviewed result")),
+        priority: 2, kaish_script_id: None,
+    });
+    drop(hooks);
+    s.worker_kj.join_context(s.worker, "post-call-review").await.unwrap();
+    let submission = s.worker_kj.shell_submit(&code, s.worker, true).await.unwrap();
+    wait_for("the result review ask", || {
+        s.kernel.kernel_db.lock().list_pending_asks().unwrap().iter()
+            .any(|ask| ask.hook_id.as_deref() == Some("review-result"))
+    }).await;
+    let ask = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()
+        .find(|ask| ask.hook_id.as_deref() == Some("review-result")).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "once\n");
+    assert!(ask.exec_source.is_none(), "a result review must never authorize execution of its original command");
+    assert_eq!(ask.origin.as_str(), "hook_result");
+    s.answer(&ask.request_id, allow).await;
+    if twice {
+        wait_for("the second result review", || {
+            s.kernel.kernel_db.lock().list_pending_asks().unwrap().iter()
+                .any(|ask| ask.hook_id.as_deref() == Some("second-review"))
+        }).await;
+        let second = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()
+            .find(|ask| ask.hook_id.as_deref() == Some("second-review")).unwrap();
+        assert_ne!(second.request_id, ask.request_id);
+        s.answer(&second.request_id, true).await;
+    }
+    wait_for("reviewed operation completion", || {
+        s.kernel.kernel.shell_operations().get(&submission.operation_id, s.worker).unwrap().unwrap().completed_at.is_some()
+    }).await;
+    let completed = s.kernel.kernel.shell_operations().get(&submission.operation_id, s.worker).unwrap().unwrap();
+    let envelope = completed.envelope.unwrap();
+    if allow {
+        assert_eq!(envelope.stdout, "reviewed result", "remaining hooks must resume after approval");
+        assert_eq!(envelope.status, ShellStatus::Done);
+    } else {
+        assert_eq!(envelope.status, ShellStatus::Error);
+        assert_ne!(envelope.stdout, "reviewed result", "denial stops remaining hooks");
+    }
+    let captured = s.kernel.kernel.shell_operations().outcome(&submission.operation_id, s.worker).unwrap().unwrap();
+    assert_eq!(matches!(captured.execution, kaijutsu_kernel::runtime::command_outcome::CommandExecution::Fault(_)), on_error);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "once\n");
+    assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1, "earlier hooks must not rerun");
+    s.close().await;
+}
+
+#[test]
+fn post_call_approval_continues_hooks_without_executing_again() {
+    run_local(result_review_case(false, true, false, false));
+}
+
+#[test]
+fn denied_result_review_stops_remaining_hooks() {
+    run_local(result_review_case(false, false, false, false));
+}
+
+#[test]
+fn on_error_approval_continues_after_the_captured_fault() {
+    run_local(result_review_case(true, true, false, false));
+}
+
+#[test]
+fn kaish_result_hook_escalation_resumes_after_approval() {
+    run_local(result_review_case(false, true, true, false));
+}
+
+#[test]
+fn sequential_result_reviews_keep_the_same_hook_snapshot() {
+    run_local(result_review_case(false, true, false, true));
+}

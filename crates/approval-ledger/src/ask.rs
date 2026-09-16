@@ -998,10 +998,12 @@ pub struct UndeliveredAnswer {
     pub description: String,
 }
 
-/// Every ask a human has answered whose answer has not been redeemed,
-/// newest last.
+/// Unredeemed human answers for the execution/resume driver, newest last.
+/// Result-review answers belong to their retained execution owner and are
+/// excluded; waking a caller to retry could repeat an executed command.
 ///
-/// The predicate is [`find_redeemable`]'s, minus the statement matching:
+/// Apart from result-review ownership, the predicate follows
+/// [`find_redeemable`] without statement matching:
 /// decided, `auto_reason IS NULL`, and absent from `approval_redemptions`.
 /// The two must stay in step — this function decides who gets *told* an
 /// answer landed, and `find_redeemable` decides whether that answer still
@@ -1020,6 +1022,7 @@ pub fn undelivered_answers(conn: &Connection) -> Result<Vec<UndeliveredAnswer>> 
         "SELECT request_id, context_id, principal_id, status, description FROM approvals
          WHERE (status IN ('allowed', 'denied') OR (status = 'abandoned' AND decided_option = 'cancel'))
            AND auto_reason IS NULL
+           AND origin != 'hook_result'
            AND request_id NOT IN (SELECT request_id FROM approval_redemptions)
          ORDER BY created_at ASC",
     )?;

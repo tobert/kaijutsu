@@ -1694,7 +1694,7 @@ impl Broker {
                         McpHookPhase::PostCall,
                         &params,
                         ctx,
-                        PhasePayload::Result(&result),
+                        PhasePayload::Result(&result, None),
                     )
                     .await?
                 {
@@ -1781,7 +1781,7 @@ impl Broker {
                         McpHookPhase::PostCall,
                         &call_params_for_hooks,
                         ctx,
-                        PhasePayload::Result(&result),
+                        PhasePayload::Result(&result, None),
                     )
                     .await?
                 {
@@ -1828,7 +1828,7 @@ impl Broker {
         err: McpError,
     ) -> McpResult<KernelToolResult> {
         match self
-            .evaluate_phase(McpHookPhase::OnError, params, ctx, PhasePayload::Error(&err))
+            .evaluate_phase(McpHookPhase::OnError, params, ctx, PhasePayload::Error(&err, None))
             .await
         {
             Ok(PhaseOutcome::Continue) => Err(err),
@@ -1990,6 +1990,10 @@ impl Broker {
         let mut ordered = snapshot;
         ordered.sort_by_key(|(idx, e)| (e.priority, *idx));
 
+        let review = match &payload {
+            PhasePayload::Result(_, review) | PhasePayload::Error(_, review) => *review,
+            PhasePayload::None => None,
+        };
         for (_idx, entry) in ordered {
             match entry.action {
                 HookAction::Log(spec) => {
@@ -2095,7 +2099,7 @@ impl Broker {
                             self.dry_run_ask(&entry.id, description, params, ctx).await,
                         ));
                     }
-                    match self.run_permission_ask(&entry.id, &spec, params, ctx).await {
+                    match self.run_permission_ask(&entry.id, &spec, params, ctx, phase, &payload, review).await {
                         PermissionAskOutcome::Proceed => {}
                         PermissionAskOutcome::Denied { reason, ask } => {
                             return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
@@ -2146,7 +2150,7 @@ impl Broker {
                             .await;
                         if let Some(eval) = self
                             .resolve_kaish_hook_outcome_in_mode(
-                                mode, entry.id.clone(), outcome, params, ctx,
+                                mode, entry.id.clone(), outcome, params, ctx, phase, &payload, review,
                             )
                             .await
                         {
@@ -2180,7 +2184,7 @@ impl Broker {
                             .await;
                         if let Some(eval) = self
                             .resolve_kaish_hook_outcome_in_mode(
-                                mode, entry.id.clone(), outcome, params, ctx,
+                                mode, entry.id.clone(), outcome, params, ctx, phase, &payload, review,
                             )
                             .await
                         {
@@ -2318,10 +2322,13 @@ impl Broker {
         outcome: KaishHookOutcome,
         params: &KernelCallParams,
         ctx: &CallContext,
+        phase: McpHookPhase,
+        payload: &PhasePayload<'_>,
+        review: Option<&dyn ResultReview>,
     ) -> Option<PhaseEval> {
         if mode == PhaseMode::Enforce {
             return self
-                .resolve_kaish_hook_outcome(hook_id, outcome, params, ctx)
+                .resolve_kaish_hook_outcome(hook_id, outcome, params, ctx, phase, payload, review)
                 .await
                 .map(PhaseEval::Enforced);
         }
@@ -2336,52 +2343,19 @@ impl Broker {
         }
     }
 
-    /// Run one `HookAction::Ask` round trip (D-57), through the approval
-    /// ledger (`docs/gate-and-shell-split.md`, "The shared seam: one
-    /// ledger, one announcement, one write path"). This is now a thin
-    /// caller of [`crate::kj::gate::run_gate`] — the same function
-    /// `shell_write`'s gate uses (`mcp/servers/shell.rs`) — with
-    /// `Origin::Hook` and a [`crate::kj::hook_gate::build_hook_gate_spec`]
-    /// spec built from the firing hook and call params.
-    ///
-    /// One durable row before anyone is notified, keyed by the ledger's
-    /// own `request_id` — not a `Uuid::new_v4()` that correlated logs and
-    /// nothing else. The announcement is `LedgerEvents::onChanged @101`,
-    /// already a broadcast every connected client can subscribe to, so
-    /// there is no more per-ask subscriber handout to take once. The
-    /// answer is `kj ledger allow|deny <id>` from any surface — the
-    /// ledger's `claim` + `decide` transaction, exactly one answerer wins.
-    ///
-    /// Returns `PermissionAskOutcome::Proceed` when the gate resolves
-    /// `Allowed`; `Denied` when it resolves `Denied` — a real verdict; and
-    /// `Unavailable` when it resolves `Unavailable` (gate unavailable and
-    /// denied must stay distinguishable to a model — see
-    /// `McpError::gate_unavailable`) or when no `KjDispatcher` is wired at
-    /// all (a bare `Broker::new()` in a unit test, or a bootstrap ordering
-    /// bug — there is nowhere to run the gate, so this fails the same way
-    /// an expired/faulted gate does).
-    ///
-    /// **"Nobody was notified" is no longer the same as "nobody can
-    /// answer."** The old no-subscriber fail-closed default refused
-    /// instantly because there was genuinely nothing durable to point at;
-    /// now the ask row exists before this function even returns, so
-    /// `kj ledger list` shows it from any shell even if every connected
-    /// client is looking the other way. Two paths still refuse: a missing
-    /// dispatcher (this function's own misconfiguration case), and an ask
-    /// nobody has answered yet — the latter as `GatePending`, which says
-    /// the question is open rather than that anything failed.
-    ///
-    /// Both refusal paths log at `warn!` (not the plain `debug!` other
-    /// hook denials use) — a stuck ask usually means either a
-    /// misconfigured bootstrap (no dispatcher) or nobody having looked at
-    /// `kj ledger list` in time, either of which an operator needs to
-    /// notice, not just trace.
+    /// Record a durable ask with the phase's authority. PreCall approval can
+    /// execute its captured source. A result review is owned by the caller's
+    /// retained outcome and resumes this same hook snapshot after its answer.
+    /// Callers without a result-review owner fail before opening such an ask.
     async fn run_permission_ask(
         &self,
         hook_id: &HookId,
         spec: &AskSpec,
         params: &KernelCallParams,
         ctx: &CallContext,
+        phase: McpHookPhase,
+        payload: &PhasePayload<'_>,
+        review: Option<&dyn ResultReview>,
     ) -> PermissionAskOutcome {
         let description = spec
             .description
@@ -2415,7 +2389,22 @@ impl Broker {
             rc_depth: 0,
             privileged: false,
         };
-        let gate_spec = crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params);
+        let gate_spec = if matches!(phase, McpHookPhase::PostCall | McpHookPhase::OnError) {
+            if review.is_none() {
+                return PermissionAskOutcome::Unavailable {
+                    reason: "Execution has finished, but this caller cannot retain a result review. Do not rerun source to answer this review.".into(),
+                    ask: None,
+                };
+            }
+            let captured = match payload {
+                PhasePayload::Result(result, _) => result_to_hook_json(result),
+                PhasePayload::Error(error, _) => error_to_hook_json(error),
+                PhasePayload::None => unreachable!("a result phase must carry its result"),
+            };
+            crate::kj::hook_gate::build_result_review_spec(&hook_id.0, phase, description, params, &captured)
+        } else {
+            crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params)
+        };
         let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
         let outcome = crate::kj::gate::run_gate(
             dispatcher.kernel_db(),
@@ -2426,6 +2415,20 @@ impl Broker {
         )
         .await;
 
+        if outcome.verdict == crate::kj::gate::GateVerdict::Pending
+            && let Some(review) = review
+        {
+            let Some(ask) = outcome.ask else {
+                return PermissionAskOutcome::Unavailable { reason: "result review has no ask".into(), ask: None };
+            };
+            return match review.wait_for_review(&ask).await {
+                Ok(()) => PermissionAskOutcome::Proceed,
+                Err(error) => match error.as_refusal() {
+                    Some(refusal) => PermissionAskOutcome::Denied { reason: error.to_string(), ask: refusal.ask },
+                    None => PermissionAskOutcome::Unavailable { reason: error.to_string(), ask: Some(ask) },
+                },
+            };
+        }
         match outcome.verdict {
             crate::kj::gate::GateVerdict::Allowed => {
                 tracing::debug!(
@@ -2621,13 +2624,13 @@ impl Broker {
 
         match payload {
             PhasePayload::None => {}
-            PhasePayload::Result(r) => {
+            PhasePayload::Result(r, _) => {
                 vars.insert(
                     "KJ_TOOL_RESULT".into(),
                     kaish_kernel::ast::Value::String(result_to_hook_json(r)),
                 );
             }
-            PhasePayload::Error(e) => {
+            PhasePayload::Error(e, _) => {
                 vars.insert(
                     "KJ_TOOL_ERROR".into(),
                     kaish_kernel::ast::Value::String(error_to_hook_json(e)),
@@ -2854,6 +2857,9 @@ impl Broker {
         outcome: KaishHookOutcome,
         params: &KernelCallParams,
         ctx: &CallContext,
+        phase: McpHookPhase,
+        payload: &PhasePayload<'_>,
+        review: Option<&dyn ResultReview>,
     ) -> Option<PhaseOutcome> {
         match outcome {
             KaishHookOutcome::Continue => None,
@@ -2864,7 +2870,7 @@ impl Broker {
                 let ask_spec = AskSpec {
                     description: Some(description),
                 };
-                match self.run_permission_ask(&hook_id, &ask_spec, params, ctx).await {
+                match self.run_permission_ask(&hook_id, &ask_spec, params, ctx, phase, payload, review).await {
                     PermissionAskOutcome::Proceed => None,
                     PermissionAskOutcome::Denied { reason, ask } => {
                         Some(PhaseOutcome::Deny { hook_id, reason, ask })
@@ -3003,6 +3009,7 @@ impl Broker {
         command: &str,
         ctx: &CallContext,
         result: &KernelToolResult,
+        review: Option<&dyn ResultReview>,
     ) -> ShellHookVerdict {
         let params = Self::shell_write_hook_params(command);
         match self
@@ -3010,7 +3017,7 @@ impl Broker {
                 McpHookPhase::PostCall,
                 &params,
                 ctx,
-                PhasePayload::Result(result),
+                PhasePayload::Result(result, review),
             )
             .await
         {
@@ -3043,21 +3050,19 @@ impl Broker {
     /// result the caller should report in place of the error — the same
     /// override `call_tool`'s own `OnError` grants.
     ///
-    /// Shares `evaluate_phase` with every other phase call in this file, so
-    /// an `Escalate` in a kaish hook body blocks this call for up to the
-    /// gate's wait timeout exactly as it already does for `PreCall` on
-    /// these same shell paths and for `PostCall`/`OnError` inside
-    /// `call_tool` — this method adds no new Escalate wiring, it reuses
-    /// what's already there.
+    /// A result-review owner retains the failed execution while an Ask or
+    /// kaish escalation awaits its reviewer. Approval continues this hook
+    /// snapshot; it never submits the source program again.
     pub async fn shell_on_error_hooks(
         &self,
         command: &str,
         ctx: &CallContext,
         err: &McpError,
+        review: Option<&dyn ResultReview>,
     ) -> ShellHookVerdict {
         let params = Self::shell_write_hook_params(command);
         match self
-            .evaluate_phase(McpHookPhase::OnError, &params, ctx, PhasePayload::Error(err))
+            .evaluate_phase(McpHookPhase::OnError, &params, ctx, PhasePayload::Error(err, review))
             .await
         {
             Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
@@ -3549,6 +3554,12 @@ impl DryRunReport {
     }
 }
 
+/// Own a result-review wait without yielding its command for re-execution.
+#[async_trait::async_trait]
+pub trait ResultReview: Send + Sync {
+    async fn wait_for_review(&self, ask: &kaijutsu_types::AskRef) -> McpResult<()>;
+}
+
 /// Per-phase payload for hook evaluation. Carries the data a phase observes
 /// *in addition to* the call site (`(instance, tool, args, principal,
 /// context)`) — i.e. the prior call's result for `PostCall` and the prior
@@ -3562,10 +3573,10 @@ enum PhasePayload<'a> {
     /// PostCall: the result the prior server call produced (real or
     /// short-circuited synthetic). Surfaced as `KJ_TOOL_RESULT` to kaish
     /// hook bodies.
-    Result(&'a KernelToolResult),
+    Result(&'a KernelToolResult, Option<&'a dyn ResultReview>),
     /// OnError: the failure the prior call produced. Surfaced as
     /// `KJ_TOOL_ERROR` to kaish hook bodies.
-    Error(&'a McpError),
+    Error(&'a McpError, Option<&'a dyn ResultReview>),
 }
 
 /// Stable JSON encoding of a `KernelToolResult` for `KJ_TOOL_RESULT`.
@@ -10114,6 +10125,7 @@ mod tests {
                 "echo unmistakable-real-stdout; exit 7",
                 &CallContext::test(),
                 &real_result,
+                None,
             )
             .await;
         assert!(
@@ -10145,7 +10157,7 @@ mod tests {
 
         let real_err = McpError::Protocol("unmistakable-real-failure".into());
         let verdict = broker
-            .shell_on_error_hooks("false", &CallContext::test(), &real_err)
+            .shell_on_error_hooks("false", &CallContext::test(), &real_err, None)
             .await;
         assert!(
             matches!(verdict, ShellHookVerdict::Proceed),
@@ -10181,6 +10193,7 @@ mod tests {
                 "echo the-real-command-output",
                 &CallContext::test(),
                 &real_result,
+                None,
             )
             .await;
         match verdict {
@@ -10227,6 +10240,7 @@ mod tests {
                 "echo the-real-command-output",
                 &CallContext::test(),
                 &real_result,
+                None,
             )
             .await;
         match verdict {

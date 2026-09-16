@@ -81,6 +81,10 @@ impl ShellOperationRegistry {
              CREATE TABLE IF NOT EXISTS shell_operation_projections (
                 operation_id TEXT PRIMARY KEY REFERENCES shell_operation_outcomes(operation_id)
              );
+             CREATE TABLE IF NOT EXISTS shell_result_reviews (
+                operation_id TEXT PRIMARY KEY REFERENCES shell_operations(operation_id),
+                outcome_json TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS shell_operations_context ON shell_operations(context_id);
              CREATE UNIQUE INDEX IF NOT EXISTS shell_operations_ask ON shell_operations(ask_id);"
         ).map_err(|e| e.to_string())?;
@@ -134,6 +138,60 @@ impl ShellOperationRegistry {
         self.complete_record(id, envelope, None)
     }
 
+    /// Checkpoint captured execution while its result hook awaits a decision.
+    pub(crate) fn checkpoint_result_review(&self, id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
+        let envelope = outcome.envelope();
+        if envelope.status != ShellStatus::Waiting { return Err("result review checkpoint is not waiting".into()); }
+        let ask = envelope.ask_id.ok_or("result review checkpoint has no ask")?;
+        let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
+        let db = self.db.lock();
+        let tx = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
+        let valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM approvals a JOIN shell_operations o
+             ON a.context_id=o.context_id AND a.actor_id=o.actor_id AND a.principal_id=o.principal_id
+             WHERE o.operation_id=?1 AND a.request_id=?2 AND a.origin='hook_result' AND a.exec_source IS NULL)",
+            rusqlite::params![id, ask], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !valid { return Err("ask is not a result review for this operation".into()); }
+        let changed = tx.execute(
+            "UPDATE shell_operations SET ask_id=?2 WHERE operation_id=?1 AND completed_at IS NULL
+             AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)",
+            rusqlite::params![id, ask],
+        ).map_err(|e| e.to_string())?;
+        require_changed(changed, id)?;
+        tx.execute("INSERT INTO shell_result_reviews(operation_id,outcome_json) VALUES(?1,?2)
+                    ON CONFLICT(operation_id) DO UPDATE SET outcome_json=excluded.outcome_json",
+            rusqlite::params![id, json]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// A restart cannot resume the in-memory hook snapshot. Retain execution
+    /// and report interrupted review instead of executing or accepting it again.
+    pub(crate) fn recover_result_reviews(&self) -> OperationResult<()> {
+        let reviews: Vec<(String, String)> = {
+            let db = self.db.lock();
+            let mut stmt = db.conn_for_ledger().prepare("SELECT operation_id,outcome_json FROM shell_result_reviews")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?
+                .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?
+        };
+        for (id, json) in reviews {
+            let mut outcome: CommandOutcome = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let reason = "kernel restarted during result review; captured execution was retained and source was not run again";
+            if let Some(ask) = outcome.envelope().ask_id {
+                let db = self.db.lock();
+                if let Some(row) = db.get_approval(&ask).map_err(|e| e.to_string())?
+                    && matches!(row.status, approval_ledger::types::ApprovalStatus::Pending | approval_ledger::types::ApprovalStatus::Claimed)
+                {
+                    approval_ledger::decide::abandon(db.conn_for_ledger(), &ask, Some(reason)).map_err(|e| e.to_string())?;
+                }
+            }
+            outcome.settlement_error = Some(reason.into());
+            self.prepare_settlement(&id, &outcome)?;
+        }
+        Ok(())
+    }
+
     /// Retain a terminal outcome before its projections can fail. An existing
     /// record is immutable; a retry must carry exactly the same outcome.
     pub fn prepare_settlement(&self, id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
@@ -161,6 +219,7 @@ impl ShellOperationRegistry {
         }
         tx.execute("INSERT OR IGNORE INTO shell_operation_projections(operation_id) VALUES(?1)", [id])
             .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM shell_result_reviews WHERE operation_id=?1", [id]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -313,7 +372,8 @@ impl ShellOperationRegistry {
             let db = self.db.lock();
             let mut stmt = db.conn_for_ledger().prepare(
                 "SELECT operation_id FROM shell_operations WHERE completed_at IS NULL
-                 AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)",
+                 AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)
+                 AND operation_id NOT IN (SELECT operation_id FROM shell_result_reviews)",
             ).map_err(|e| e.to_string())?;
             stmt.query_map([], |row| row.get(0)).map_err(|e| e.to_string())?
                 .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?

@@ -2,11 +2,9 @@
 //!
 //! Enum shape follows `kaijutsu-types/src/enums.rs`: `strum::EnumString`
 //! for parsing (`FromStr`), a hand-written `as_str`/`Display` for the
-//! reverse direction, so the two can never quietly disagree. Every enum
-//! here also has a `CHECK` constraint on its column in `schema.rs` —
-//! belt (storage refuses the bad value) and suspenders (a value that
-//! somehow got in some other way still fails a clean, typed parse instead
-//! of being silently treated as a default).
+//! reverse direction. Row decoding rejects unknown values instead of
+//! silently substituting a default; schema columns do not duplicate the
+//! enum membership as SQL constraints.
 //!
 //! `context_id` / `principal_id` / `claimed_by` / `decided_by` / `actor` /
 //! `created_by` are plain `Vec<u8>` (BLOB), not a typed id, because this
@@ -69,8 +67,10 @@ impl fmt::Display for PairOwner {
 #[strum(ascii_case_insensitive, serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
-    /// A hook's `ask` action fired.
+    /// A PreCall hook asks before execution.
     Hook,
+    /// A result hook reviews captured output; approval never executes source.
+    HookResult,
     /// The shell tool gated a command before executing it.
     ShellGate,
     /// A privileged `kj` verb (e.g. `context archive`) gated itself.
@@ -81,6 +81,7 @@ impl Origin {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Hook => "hook",
+            Self::HookResult => "hook_result",
             Self::ShellGate => "shell_gate",
             Self::KjVerb => "kj_verb",
         }
@@ -498,9 +499,9 @@ pub struct NewAsk {
     /// context has since moved to. `None` when the caller had no persisted
     /// cwd to protect.
     pub cwd: Option<String>,
-    /// The text to run if this ask is allowed, verbatim. `None` means this
-    /// ask cannot be executed on approval and its caller must retry —
-    /// `docs/gate-shape-b.md`.
+    /// The text to run if this ask is allowed, verbatim. `None` grants no
+    /// execution: a result-review owner continues its captured result, while
+    /// other callers collect the answer on retry. See `docs/gate-shape-b.md`.
     pub exec_source: Option<String>,
     /// The separately supplied standard input replayed with `exec_source`.
     pub exec_stdin: Option<String>,

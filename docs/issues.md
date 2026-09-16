@@ -93,10 +93,17 @@ reporting/retry: background interactive callers log the error and approval
 resumes report it to the model. Also reconcile the runner's synthetic job failure
 on projection error with a receipt that may already have committed its outcome.
 Unmigrated interrupted operations still complete their receipts without repairing
-their blocks; extend recovery as those callers move. Result-hook approval waits
-must retain the executed outcome and resume publication, not rerun the command; their job status
-and durable record still need that distinction. Preserve this complete shared-
-outcome contract while replacing the remaining paths.
+their blocks; extend recovery as those callers move.
+
+Interactive/approved result reviews now checkpoint execution and continue the
+same hook snapshot after approval. Their non-executable `hook_result` asks stay
+out of the execution/resume queue; cancellation, dropped waits, and restart
+retain execution and report interrupted review. Structured/streaming RPC and
+MCP still lack this owner: result-phase Ask/escalation returns GateUnavailable
+before minting an ask. Migrate these callers and their job projections. Also
+retain explicit operation provenance for every ask in a sequence: the current
+receipt/checkpoint points to the latest ask, while earlier ledger rows remain
+without a direct operation link. Preserve the complete shared-outcome contract.
 
 The new SSH/RPC regression passes but can print a russh teardown panic after
 its assertions (`there is no reactor running`). The common test helper drops

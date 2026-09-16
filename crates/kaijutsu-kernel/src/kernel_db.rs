@@ -1907,11 +1907,6 @@ pub struct KernelDb {
 }
 
 impl KernelDb {
-    /// Narrow accessor for the DB-injected `approval-ledger` crate, whose
-    /// whole API borrows whatever connection the caller owns. Deliberately
-    /// the ONLY way kernel code reaches the raw connection — the ledger's
-    /// tables live in this DB (see [`Self::migrate_ledger`]), and its
-    /// functions are the sanctioned callers.
     /// Abandon every ask that has not reached a terminal state, once at
     /// kernel cold start. Returns how many rows moved.
     ///
@@ -1922,8 +1917,8 @@ impl KernelDb {
     /// than through the raw connection.
     ///
     /// `reason` is displayed by `kj ledger show`, so it should name the
-    /// condition and the next step: the kernel restarted, nothing ran, ask
-    /// again. See `docs/gate-resume.md`.
+    /// condition without claiming execution never occurred: result reviews
+    /// follow execution. See `docs/gate-resume.md`.
     pub fn abandon_unresolved_asks_on_restart(&self, reason: &str) -> KernelDbResult<usize> {
         Ok(approval_ledger::decide::abandon_unresolved_on_restart(
             self.conn_for_ledger(),
@@ -2281,8 +2276,8 @@ impl KernelDb {
         Ok(approval_ledger::ask::list_pending(self.conn_for_ledger())?)
     }
 
-    /// The public face of `approval_ledger::ask::undelivered_answers` — every
-    /// ask a human answered whose answer nobody has collected.
+    /// Uncollected human answers for the execution/resume driver.
+    /// Result reviews are consumed by their retained outcome owner.
     ///
     /// Wrapped here rather than handing out the connection: the gate-resume
     /// driver lives in `kaijutsu-server` and has no business knowing the
@@ -4143,8 +4138,7 @@ impl KernelDb {
             match approval_ledger::decide::abandon_unresolved_for_archived_context(
                 &self.conn,
                 id.as_bytes(),
-                "the context that raised this was archived; it runs nothing now — \
-                 nothing ran, and this ask cannot be acted on",
+                "the context that raised this was archived; this ask cannot authorize further work",
             ) {
                 Ok(0) => {}
                 Ok(swept) => {

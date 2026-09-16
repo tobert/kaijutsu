@@ -3240,7 +3240,7 @@ pub async fn create_shared_kernel(
     // this point in boot, so it would be an announcement to nobody.
     match kernel_db_arc
         .lock()
-        .abandon_unresolved_asks_on_restart("the kernel restarted before this was answered; nothing ran — ask again")
+        .abandon_unresolved_asks_on_restart("the kernel restarted before this was answered; this ask cannot authorize further work")
     {
         Ok(0) => {}
         Ok(n) => log::info!(
@@ -3921,7 +3921,7 @@ impl kernel::Server for KernelImpl {
                                         "execute",
                                         "PostCall",
                                         kernel.kernel.broker()
-                                            .shell_post_call_hooks(&code, &call_ctx, &hook_result)
+                                            .shell_post_call_hooks(&code, &call_ctx, &hook_result, None)
                                             .await,
                                     );
                                     r
@@ -3933,7 +3933,7 @@ impl kernel::Server for KernelImpl {
                                         "execute",
                                         "OnError",
                                         kernel.kernel.broker()
-                                            .shell_on_error_hooks(&code, &call_ctx, &mcp_err)
+                                            .shell_on_error_hooks(&code, &call_ctx, &mcp_err, None)
                                             .await,
                                     );
                                     kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
@@ -3946,7 +3946,7 @@ impl kernel::Server for KernelImpl {
                                 "execute",
                                 "OnError",
                                 kernel.kernel.broker()
-                                    .shell_on_error_hooks(&code, &call_ctx, &kaijutsu_kernel::mcp::McpError::Cancelled)
+                                    .shell_on_error_hooks(&code, &call_ctx, &kaijutsu_kernel::mcp::McpError::Cancelled, None)
                                     .await,
                             );
                             kaish_kernel::interpreter::ExecResult::failure(130, "interrupted")
@@ -10103,7 +10103,7 @@ async fn execute_kj_command(
             if let kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) = kernel
                 .kernel
                 .broker()
-                .shell_on_error_hooks(&code, &call_ctx, &mcp_err)
+                .shell_on_error_hooks(&code, &call_ctx, &mcp_err, None)
                 .await
             {
                 let text = shell_hook_result_text(&sc_result);
@@ -10213,7 +10213,7 @@ async fn execute_kj_command(
     match kernel
         .kernel
         .broker()
-        .shell_post_call_hooks(&code, &call_ctx, &hook_result)
+        .shell_post_call_hooks(&code, &call_ctx, &hook_result, None)
         .await
     {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {

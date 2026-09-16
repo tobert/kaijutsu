@@ -20,6 +20,23 @@ This supersedes the blocking wait that shipped in Slice 4.6
 (`gate-and-shell-split.md`), which was verified live holding 81.2s. Deleting
 it is the point, not a cost: see "What this deletes".
 
+## Captured result review (September 16)
+
+PostCall and OnError approval reviews work that already ran. Interactive and
+approved commands retain their execution and current ask in a durable checkpoint,
+publish Waiting blocks, and consume the answer inside their ordered hook
+snapshot. Approval continues remaining hooks; it never executes the command or
+earlier hooks again. These asks use `hook_result` origin, carry no executable
+source, and are excluded from generic retry redemption and the execution/resume
+queue. Only the retained execution owner consumes the answer. Inspect them
+with `kj ledger list --origin hook_result`.
+
+Cancellation or dropping the wait abandons an unanswered ask. Restart preserves
+the captured execution but reports interrupted review; it cannot recreate the
+in-memory hook snapshot. Structured/streaming RPC and MCP result reviews still
+need this owner and currently fail escalation before creating an ask. See
+`docs/kaish-integration.md` for the caller inventory.
+
 ## Why blocking could never reach where Amy wants it
 
 Amy also asked for waits that outlast a human errand: *"some of those blocks

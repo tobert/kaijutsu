@@ -404,6 +404,7 @@ impl Kernel {
             shell_operations: {
                 let operations = crate::shell_operations::ShellOperationRegistry::new(db.clone())
                     .expect("initialize shell operation registry");
+                operations.recover_result_reviews().expect("recover interrupted result reviews");
                 operations.abandon_unfinished().expect("settle interrupted shell operations");
                 Arc::new(operations)
             },

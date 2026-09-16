@@ -196,15 +196,9 @@ pub async fn run_into_blocks(
     let state_before = snapshot_shell_state(kaish).await;
 
     let started = std::time::Instant::now();
+    let review_cancel = options.cancel_token.clone().unwrap_or_default();
     let result = kaish.execute_with_options(code, options).await;
-    let verdict = match &result {
-        Ok(result) => kernel.broker().shell_post_call_hooks(
-            code, call_ctx, &exec_result_to_hook_tool_result(result)).await,
-        Err(error) => kernel.broker().shell_on_error_hooks(
-            code, call_ctx, &crate::mcp::McpError::Protocol(error.to_string())).await,
-    };
     let mut outcome = CommandOutcome::from_execution(result, started.elapsed().as_millis() as u64);
-    outcome.apply_hook(verdict);
 
     // A context switch saves the outgoing state itself. Its snapshots span
     // two contexts, so only runs that stayed put write back this diff.
@@ -227,6 +221,19 @@ pub async fn run_into_blocks(
             }
         }
     }
+
+    let review = super::result_review::CommandResultReview {
+        kernel: kernel.clone(), context: context_id, command: *command_block_id, output: *output_block_id,
+        captured: outcome.clone(), cancel: review_cancel,
+    };
+    let verdict = match &outcome.execution {
+        CommandExecution::Completed(result) => kernel.broker().shell_post_call_hooks(
+            code, call_ctx, &exec_result_to_hook_tool_result(result), Some(&review)).await,
+        CommandExecution::Rejected(error) | CommandExecution::Fault(error) => kernel.broker().shell_on_error_hooks(
+            code, call_ctx, &crate::mcp::McpError::Protocol(error.clone()), Some(&review)).await,
+        CommandExecution::NotRun => unreachable!("a completed invocation has an execution outcome"),
+    };
+    outcome.apply_hook(verdict);
 
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
     let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);

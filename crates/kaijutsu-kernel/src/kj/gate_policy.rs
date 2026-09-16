@@ -581,7 +581,7 @@ fn family_layer_per_gated_statement(
             spec.planned.iter().map(std::slice::from_ref).collect()
         }
         Origin::Hook if n == 1 && !spec.planned.is_empty() => vec![spec.planned.as_slice()],
-        Origin::ShellGate | Origin::Hook | Origin::KjVerb => return Ok(vec![PolicyVerdict::Uncovered; n]),
+        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb => return Ok(vec![PolicyVerdict::Uncovered; n]),
     };
     let mut out = Vec::with_capacity(n);
     for group in groups {
@@ -703,7 +703,7 @@ fn lower_layers_per_gated_statement(spec: &GateSpec, layers: Layers<'_>) -> Vec<
             let program = evaluate_planned(&spec.planned, layers);
             vec![fold_verdicts(program.per_statement)]
         }
-        Origin::ShellGate | Origin::Hook | Origin::KjVerb => {
+        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb => {
             vec![PolicyVerdict::Uncovered; n]
         }
     }

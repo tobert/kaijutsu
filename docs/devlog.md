@@ -1556,7 +1556,22 @@ edits and finishes only the remaining command status or marker cleanup. Another
 regression showed why terminal status alone is insufficient: an old placeholder
 can already be Done before a new outcome is projected. Preparation, completion,
 and cleanup reject transitions that would discard a retained outcome. Initial
-retention failure and result-hook approval continuation remain separate work.
+retention failure remains separate work.
+
+Result review exposed another execution hazard: PostCall/OnError asks carried
+the command source, so the generic approval driver could execute it again.
+Interactive and approved commands now retain a review checkpoint and consume
+the answer while holding the ordered hook snapshot. `hook_result` asks bind the
+phase and captured result, carry no executable source, and stay out of the
+generic resume queue. A second regression reproduced an identical later review
+collecting the retained owner's answer; result reviews now bypass generic retry
+redemption as well. Approval continues remaining hooks, including another
+review, without repeating earlier hooks. Cwd/exports persist before the wait.
+Cancellation, dropped waits, and restart retain execution and report interrupted
+review; restart cannot restore the in-memory hook snapshot. SSH regressions
+cover approval, denial, OnError, kaish escalation, and sequential reviews with
+one observed command side effect. Unmigrated consumers fail result escalation
+before creating an ask; structured/streaming RPC and MCP migration remains open.
 
 ## The kernel with no one to answer to (September 16)
 

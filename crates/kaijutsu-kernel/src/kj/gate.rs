@@ -259,9 +259,9 @@ pub(crate) struct GateSpec {
     /// lines that would run as commands. Reaching for either is a
     /// per-origin rule a fourth origin gets silently wrong.
     ///
-    /// `None` means this ask cannot be executed when it is answered and its
-    /// caller must retry instead. That is not a silent fallback: the
-    /// refusal's remedy says which of the two the caller is getting.
+    /// `None` grants no execution. Result-review owners continue processing
+    /// their captured outcome; other callers collect the answer on retry.
+    /// The pending reason tells the caller which contract applies.
     pub exec_source: Option<String>,
     /// The separately supplied stdin replayed with executable source.
     pub exec_stdin: Option<String>,
@@ -295,6 +295,7 @@ pub(crate) fn statement_digest(origin: Origin, rendered: &str) -> String {
         Origin::KjVerb => format!("kj-verb:v1:{rendered}"),
         Origin::ShellGate => format!("shell-stmt:v1:{rendered}"),
         Origin::Hook => format!("hook:v1:{rendered}"),
+        Origin::HookResult => format!("hook-result:v1:{rendered}"),
     }
 }
 
@@ -611,7 +612,9 @@ pub(crate) async fn run_gate(
     //    still wins. Single-use by construction: `redeem_ask` succeeds for
     //    exactly one caller, so an approval authorizes one execution and
     //    never becomes a standing permission — that is what rules are for.
-    if matches!(verdict, AskVerdict::Escalate) {
+    // Result-review answers belong to a retained execution owner. An identical
+    // later result must not collect that owner's answer through this retry path.
+    if matches!(verdict, AskVerdict::Escalate) && spec.origin != Origin::HookResult {
         let answered = {
             let db = db.lock();
             approval_ledger::ask::find_redeemable(
@@ -666,8 +669,7 @@ pub(crate) async fn run_gate(
                          it is now spent"
                             .to_string()
                     } else {
-                        "this exact request was already denied by its assigned reviewer; \
-                         nothing was run"
+                        "this exact request was already denied by its assigned reviewer"
                             .to_string()
                     },
                 };
@@ -773,24 +775,13 @@ pub(crate) async fn run_gate(
     //    client learns an answer is wanted the moment the row commits — an
     //    ask nothing points at is answerable and undiscoverable at once.
     announce_ledger_change(db, ledger_flows);
-    // The waiter can vanish without warning, and tuning budgets will never
-    // stop that: a harness kills its hook on its own schedule (Claude Code
-    // at five seconds, Codex at three for `SessionEnd`), a user interrupts,
-    // a client disconnects, `Broker::call_tool` loses its cancellation race
-    // and drops this future mid-poll. Any of those leaves the row `pending`
-    // with nobody behind it — indistinguishable, in `kj ledger list`, from
-    // an ask someone is actually waiting on. Its reviewer would answer it and
-    // nothing would run, having been told that answering did something.
-    //
-    // So the signal is taken from the drop itself rather than from any one
-    // cancellation path. The guard does not need to know WHY the waiter
-    // left, which is the point: the ways to be killed are a moving target
-    // and this catches the ones nobody has thought of yet.
     GateOutcome {
         verdict: GateVerdict::Pending,
         ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
         cwd: None,
-        reason: if spec.exec_source.is_some() {
+        reason: if spec.origin == Origin::HookResult {
+            "Captured execution awaits review; approval continues result processing without running source again.".into()
+        } else if spec.exec_source.is_some() {
             PENDING_REASON_EXECUTES.to_string()
         } else {
             PENDING_REASON_RETRY.to_string()
@@ -1198,6 +1189,35 @@ mod tests {
         assert_eq!(row.status, ApprovalStatus::Pending);
         assert_eq!(row.authorized_label.as_deref(), Some("kaijutsu-chan"));
         assert_eq!(row.origin, Origin::KjVerb);
+    }
+
+    #[tokio::test]
+    async fn another_result_review_cannot_collect_the_retained_owners_answer() {
+        let d = gate_dispatcher().await;
+        let caller = registered_caller(&d);
+        let spec = || super::super::hook_gate::build_result_review_spec(
+            "review", crate::mcp::McpHookPhase::PostCall, "Review result".into(),
+            &crate::mcp::KernelCallParams {
+                instance: crate::mcp::types::InstanceId::new("builtin.shell_write"),
+                tool: "shell_write".into(), arguments: serde_json::json!({"command": "echo repeated"}),
+            }, "identical captured result",
+        );
+        for allow in [true, false] {
+            let first = run_gate(&d.kernel_db, &caller, spec(), d.kernel.ledger_flows(),
+                &crate::kj::gate_policy::no_config()).await;
+            assert_eq!(first.verdict, GateVerdict::Pending);
+            let first_id = first.ask.unwrap().request_id;
+            answer(&d, &first_id, allow);
+            assert!(d.kernel_db.lock().undelivered_answers().unwrap().is_empty(),
+                "result answers belong to their retained owner, not the resume queue");
+            let second = run_gate(&d.kernel_db, &caller, spec(), d.kernel.ledger_flows(),
+                &crate::kj::gate_policy::no_config()).await;
+            assert_eq!(second.verdict, GateVerdict::Pending,
+                "a new result review must not collect another execution's answer");
+            assert_ne!(second.ask.unwrap().request_id, first_id);
+            assert!(d.kernel_db.lock().redeem_ask(&first_id).unwrap(),
+                "the retained owner must still be able to collect its answer");
+        }
     }
 
     /// The loop the redemption step exists to close: ask, get `Pending`,
