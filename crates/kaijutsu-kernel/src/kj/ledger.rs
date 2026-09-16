@@ -191,19 +191,19 @@ impl SignalVerdictArg {
 }
 
 /// `--verb <verb>` on `runs` — validated against
-/// [`super::lifecycle::RC_VERBS`] instead of its own duplicate `ValueEnum`.
+/// [`crate::rc::RC_VERBS`] instead of its own duplicate `ValueEnum`.
 /// That list is already documented as "the single source of truth" for
 /// which verbs the scheduler fires; a second, hand-maintained enum here
 /// would be exactly the drift hazard its own doc comment warns about. Still
 /// fails at clap parse time with a "possible values" style message — just
 /// sourced from the one place that's allowed to define the set.
 fn parse_verb_arg(s: &str) -> Result<String, String> {
-    if super::lifecycle::RC_VERBS.contains(&s) {
+    if crate::rc::RC_VERBS.contains(&s) {
         Ok(s.to_string())
     } else {
         Err(format!(
             "invalid value '{s}' for '--verb': possible values are: {}",
-            super::lifecycle::RC_VERBS.join(", ")
+            crate::rc::RC_VERBS.join(", ")
         ))
     }
 }

@@ -198,7 +198,7 @@ impl KjDispatcher {
         // not the requester that opened the connection
         // (`docs/approval-identity.md`, "Three identities"). Everything the
         // arrival then triggers (the target's `drift` rc scripts) belongs to
-        // the context owner instead — see `run_rc_lifecycle_inner`.
+        // the context owner instead — see `rc::run`.
         self.block_store()
             .insert_drift_block_as(
                 target_ctx,
@@ -231,20 +231,19 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = self
-            .run_rc_lifecycle(
-                super::lifecycle::VERB_DRIFT,
-                target_ctx,
-                None,
-                None,
-                Some(super::lifecycle::DriftInfo {
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                drift: Some(crate::rc::DriftInfo {
                     kind: drift_kind,
                     source_ctx,
                     target_ctx,
                     source_model,
                 }),
-                caller,
-            )
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, target_ctx)
+            },
+            caller,
+        )
             .await
         {
             tracing::warn!(
@@ -537,20 +536,19 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = self
-            .run_rc_lifecycle(
-                super::lifecycle::VERB_DRIFT,
-                context_id,
-                None,
-                None,
-                Some(super::lifecycle::DriftInfo {
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                drift: Some(crate::rc::DriftInfo {
                     kind: DriftKind::Pull,
                     source_ctx: source_id,
                     target_ctx: context_id,
                     source_model,
                 }),
-                caller,
-            )
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, context_id)
+            },
+            caller,
+        )
             .await
         {
             tracing::warn!("rc drift lifecycle (pull): {e}");
@@ -661,20 +659,19 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = self
-            .run_rc_lifecycle(
-                super::lifecycle::VERB_DRIFT,
-                target_id,
-                None,
-                None,
-                Some(super::lifecycle::DriftInfo {
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                drift: Some(crate::rc::DriftInfo {
                     kind: DriftKind::Merge,
                     source_ctx: context_id,
                     target_ctx: target_id,
                     source_model,
                 }),
-                caller,
-            )
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, target_id)
+            },
+            caller,
+        )
             .await
         {
             tracing::warn!("rc drift lifecycle (merge): {e}");
@@ -808,20 +805,19 @@ impl KjDispatcher {
                         }
                     }
 
-                    if let Err(e) = self
-                        .run_rc_lifecycle(
-                            super::lifecycle::VERB_DRIFT,
-                            drift.target_ctx,
-                            None,
-                            None,
-                            Some(super::lifecycle::DriftInfo {
+                    if let Err(e) = crate::rc::run(
+                        self,
+                        crate::rc::RcInvocation {
+                            drift: Some(crate::rc::DriftInfo {
                                 kind: drift.drift_kind,
                                 source_ctx,
                                 target_ctx: drift.target_ctx,
                                 source_model: drift.source_model.clone(),
                             }),
-                            caller,
-                        )
+                            ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, drift.target_ctx)
+                        },
+                        caller,
+                    )
                         .await
                     {
                         tracing::warn!(

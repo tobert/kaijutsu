@@ -32,7 +32,7 @@ does not become an instruction to use nonexistent features.
 
 Sources: `kernel_db.rs::CharacterRow`, `kernel_db.rs::effective_approval_reviewer`,
 `kj/context.rs::context_create`,
-`kj/character.rs`, `kj/handoff.rs`, `kj/lifecycle.rs::load_rc_scripts` in
+`kj/character.rs`, `kj/handoff.rs`, `rc/mod.rs::load_scripts` in
 `crates/kaijutsu-kernel/src/`; `crates/kaijutsu-server/src/rpc.rs::create_context_inner`;
 `assets/defaults/rc/director/create/S00-stance.kai` and
 `assets/defaults/rc/lib/create/S16-handoff.kai`.
@@ -259,7 +259,7 @@ other names.
 | id + given name | `Principal { id, username, display_name }` — the id half survives; the name half melts into the sheet ("`auth.db` is a keyring") | `kaijutsu-types/src/principal.rs:16`, `ids.rs:20` |
 | handles, many per character | `credentials(fingerprint → principal_id)`; `principals.username UNIQUE`; `add-key --nick` chooses which principal a key joins (default: a new hash-named one) | server `auth_db.rs:37`, `:44`; default path `~/.local/share/kaijutsu/auth.db` (`:104`) |
 | presence, derived | the roster: `RosterEntity::{Principal, Context}`, liveness `Bound`/`Recent`, self-reported `Availability {Active, Idle, Away, Dnd}`; four `roster_*` tables; `kj roster` | `kernel/src/roster.rs:103`, `:192`, `:250`; `kernel_db.rs:1189–1281`; `kj/roster.rs` |
-| a role's rc bundle | `context_type` → `/config/rc/<type>/<verb>/`, loaded and sorted by `SXX-name` | `kaijutsu-types/src/paths.rs:144`; `kj/lifecycle.rs:353` |
+| a role's rc bundle | `context_type` → `/config/rc/<type>/<verb>/`, loaded and sorted by `SXX-name` | `kaijutsu-types/src/paths.rs:144`; `rc/mod.rs` |
 | who plays | casts: one slot per role, keyed `(cast_id, role)`; per-context `cast_id` and `provider`/`model` override; resolution ladder explicit override → cast slot on `context_type` → registry default | `kernel_db.rs:1094`, `:1118`; `contexts.cast_id`; `kj/context.rs:704–722` |
 | a cadence that outlives contexts | a track: clock (`BeatPolicy`) + score context + attachments; `kj transport attach` creates the track stopped if absent; non-rotating attachments are first-class | `hyoushigi/mod.rs:45`, `:47`, `:125`; `kj/transport.rs:40–48`; `docs/tracks.md` §5 |
 | a window over a long log | `kj context hydrate --window N`: `[0, marker] ∪ last-N`, persisted per context | `kj/context.rs:1498`; `kernel_db.rs:5443` |
@@ -321,10 +321,10 @@ Two facts from that table drive the whole design:
   and never be deleted cannot rest on that as it stands. The keyring melt
   removes both verbs along with the columns they mutate: there is no
   username to rename, and removal is a key's business, not an identity's.
-- **rc reads one directory.** `load_rc_scripts` takes `(context_type, verb)`
+- **rc reads one directory.** `load_scripts` takes `(context_type, verb)`
   and nothing else. rc scripts see `KJ_CONTEXT`, `KJ_VERB`, `KJ_CONTEXT_TYPE`
   (seeded 2026-09-05), `KJ_RC_DEPTH`, `KJ_PARENT_CONTEXT`, `KJ_FORK_INFO`,
-  `KJ_PARENT_BLOCK_COUNT`, `KJ_DRIFT_INFO` (`kj/lifecycle.rs`, `run_kai_script`),
+  `KJ_PARENT_BLOCK_COUNT`, `KJ_DRIFT_INFO` (`rc/mod.rs`, `run_kai_script`),
   not a character.
 - **Drift addresses contexts only.** Push resolves through
   `refs::resolve_context_arg` (`kj/refs.rs:80`) with a `DriftRouter`
@@ -652,7 +652,7 @@ stamped where:
 | capability checks, drive origin, user prompt and seed, approval ask, `TurnFlow` | requester, unchanged |
 | provider-emitted thinking, model text, model tool call | effective actor (today `system`) |
 | tool result, structured tool error, kernel warning, error and interrupt markers | `system`, unchanged |
-| rc output | the context's `created_by`, unchanged (`kj/lifecycle.rs:196–199`) |
+| rc output | the context's `created_by`, unchanged (`rc/mod.rs`) |
 
 The criterion is **provenance, provider output versus kernel output, not
 role**. The max-iterations halt is `Role::Model` and kernel-generated, so it
@@ -803,11 +803,11 @@ bridge context's label.
 
 ### rc is a union
 
-`load_rc_scripts(context_type, verb)` becomes
-`load_rc_scripts(context_type, character, verb)`, following one rule in
+`load_scripts(context_type, verb)` becomes
+`load_scripts(context_type, character, verb)`, following one rule in
 order: enumerate `/config/rc/<type>/<verb>/` and `<rc_dir>/<verb>/`;
 validate every name in both (the invalid-name rule already fails the whole
-verb, `kj/lifecycle.rs:389–396`); **reject a canonical filename present on
+verb, `rc/mod.rs`); **reject a canonical filename present on
 both sides, loudly**, no shadowing; combine and sort once as one `Vec` by
 filename (`names.sort()` at `:401` is the existing sort; two pre-sorted lists
 concatenated would put a character `S05` after a type `S10`); snapshot every
@@ -831,7 +831,7 @@ compose up the accountability chain automatically.** A character script
 that wants its accountable character's stance reads it explicitly; a
 recursive merge would bring graph-ordering, cycle and provenance questions
 before the two-directory case has proven itself. rc output keeps its
-current author, the context's `created_by` (`kj/lifecycle.rs:196–199`);
+current author, the context's `created_by` (`rc/mod.rs`);
 `played_by` does not replace it.
 
 The frontier review argued for deferring the union entirely, since
@@ -936,7 +936,7 @@ Each slice is independently shippable and leaves the tree green.
    push and pull on one resolver (`kj/drift.rs:316`, `:456`, `:582`); the
    hook-listener `session.end` guard (`hook_listener.rs:232`); the roster's
    periodic refresh wired into the server (`rpc.rs:2990`);
-   `KJ_CONTEXT_TYPE` seeded for rc (`kj/lifecycle.rs:533`); and the bridge
+   `KJ_CONTEXT_TYPE` seeded for rc (`rc/mod.rs`); and the bridge
    identity above (`kaijutsu-mcp/src/main.rs:88–103`).
 1. **The sheet. Shipped 2026-09-06.** `characters` with its first four columns;
    `contexts.played_by`, copied by fork; `kj character

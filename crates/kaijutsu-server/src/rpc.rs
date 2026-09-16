@@ -7422,7 +7422,7 @@ impl kernel::Server for KernelImpl {
                     // liveness is read here, before `spawn_llm_for_prompt`
                     // marks this submit's own turn. A script failure is an
                     // Error block in the context, not a refused submit.
-                    let submit_info = kaijutsu_kernel::kj::lifecycle::SubmitInfo {
+                    let submit_info = kaijutsu_kernel::rc::SubmitInfo {
                         input_block: user_block_id,
                         edge_block: edge.map(|e| e.block),
                         edge_shown: edge.and_then(|e| e.shown),
@@ -7439,17 +7439,14 @@ impl kernel::Server for KernelImpl {
                         rc_depth: 0,
                         privileged: false,
                     };
-                    if let Err(e) = kernel
-                        .kj_dispatcher
-                        .run_rc_lifecycle_with_vars(
-                            kaijutsu_kernel::kj::lifecycle::VERB_SUBMIT,
-                            context_id,
-                            None,
-                            None,
-                            None,
-                            &submit_info.vars(),
-                            &rc_caller,
-                        )
+                    if let Err(e) = kaijutsu_kernel::rc::run(
+                        &kernel.kj_dispatcher,
+                        kaijutsu_kernel::rc::RcInvocation {
+                            vars: submit_info.vars(),
+                            ..kaijutsu_kernel::rc::RcInvocation::new(kaijutsu_kernel::rc::VERB_SUBMIT, context_id)
+                        },
+                        &rc_caller,
+                    )
                         .await
                     {
                         log::warn!("rc submit lifecycle for {}: {e}", context_id.short());

@@ -290,8 +290,9 @@ server.
 
 ## Lifecycle: how fork/new/drift hook in
 
-`kj/lifecycle.rs` resolves `/config/rc/<context_type>/<verb>/`, snapshots
-selected bodies before execution, and runs them in lexical filename order.
+`rc::run` takes `RcInvocation`, resolves `/config/rc/<context_type>/<verb>/`,
+snapshots selected bodies before execution, and runs them in lexical filename
+order. The rc module owns the path grammar shared with the `kj rc` adapter.
 Wired verbs are `create`, `fork`, `attach`, `drift`, `tick`, `rotate`, and
 `submit`. It supplies lifecycle facts, enforces recursion limits, records runs,
 and emits error/trace blocks. A failed script marks the run failed while later

@@ -1874,7 +1874,14 @@ mod tests {
         // Fire the rotate lifecycle exactly as the beat scheduler's fire_rotate does.
         let caller = caller_with_context(parent);
         let vars = HashMap::new(); // rotate cadence is inherited via attachment, not via env
-        d.run_rc_lifecycle_with_vars("rotate", parent, None, None, None, &vars, &caller)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation {
+                vars: vars.clone(),
+                ..crate::rc::RcInvocation::new("rotate", parent)
+            },
+            &caller,
+        )
             .await
             .expect("rotate lifecycle runs");
 

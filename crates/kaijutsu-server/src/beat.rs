@@ -2070,8 +2070,14 @@ impl BeatScheduler {
                 rc_depth: 0,
                 privileged: false,
             };
-            if let Err(e) = dispatcher
-                .run_rc_lifecycle_with_vars(verb, ctx, None, None, None, &vars, &caller)
+            if let Err(e) = kaijutsu_kernel::rc::run(
+                &dispatcher,
+                kaijutsu_kernel::rc::RcInvocation {
+                    vars: vars.clone(),
+                    ..kaijutsu_kernel::rc::RcInvocation::new(verb, ctx)
+                },
+                &caller,
+            )
                 .await
             {
                 log::warn!("beat: {verb} verb failed for context {ctx}: {e}");
@@ -2489,7 +2495,7 @@ pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     let documents = registry.kernel.documents.clone();
     let dispatcher = registry.kernel.kj_dispatcher.clone();
     // A `rotate` page-turn runs a deeply self-re-entrant rc chain on THIS
-    // thread (fire_rotate → run_rc_lifecycle → `kj fork` → the child's fork +
+    // thread (fire_rotate → rc::run → `kj fork` → the child's fork +
     // attach rc → `kj transport attach`/`play`, each `kj` re-entering kaish via
     // `.await`, so the whole nest accumulates on one stack). The default 2 MiB
     // thread stack is too small for that depth with kaish's interpreter — it

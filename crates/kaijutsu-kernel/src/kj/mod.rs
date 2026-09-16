@@ -50,7 +50,6 @@ pub mod effect;
 pub(crate) mod readonly;
 pub(crate) mod gate_policy;
 pub mod rc;
-pub mod lifecycle;
 pub mod roster;
 pub mod model;
 pub mod refs;
@@ -155,7 +154,7 @@ pub struct KjCaller {
     /// Recursion depth from rc lifecycle dispatch. The rc runner increments
     /// this before invoking nested kj from a script, so an rc-driven
     /// `kj context create` runs at depth 1, etc. Capped at MAX_RC_DEPTH to
-    /// prevent runaway recursion (see `kj/lifecycle.rs`).
+    /// prevent runaway recursion (see `rc/mod.rs`).
     pub rc_depth: u8,
     /// True when this caller originates from the rc lifecycle's privileged
     /// kaish (the trusted control plane that assigns loadouts). Stamped at

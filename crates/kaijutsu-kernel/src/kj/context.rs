@@ -1442,8 +1442,14 @@ impl KjDispatcher {
         // (Amy, 2026-08-12: a fresh context holds nothing worth saving, so
         // aborting buys little and destroys the Error blocks that explain the
         // failure; `kj context rebind` is the repair).
-        if let Err(e) = self
-            .run_rc_lifecycle("create", new_id, parent_id, None, None, caller)
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                parent: parent_id,
+                ..crate::rc::RcInvocation::new("create", new_id)
+            },
+            caller,
+        )
             .await
         {
             tracing::warn!("rc create lifecycle: {e}");
@@ -1554,8 +1560,14 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = self
-            .run_rc_lifecycle("create", target_id, row.forked_from, None, None, caller)
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                parent: row.forked_from,
+                ..crate::rc::RcInvocation::new("create", target_id)
+            },
+            caller,
+        )
             .await
         {
             return KjResult::Err(format!("kj context rebind: rc create lifecycle: {e}"));
@@ -2979,7 +2991,7 @@ mod tests {
                 requester: caller.principal_id, performer: caller.principal_id, reviewer: None,
                 context: parent, session: caller.session_id,
             },
-            crate::runtime::context_shell::ShellPolicy::Rc(crate::kj::lifecycle::RcAuthority::for_test()),
+            crate::runtime::context_shell::ShellPolicy::Rc(crate::rc::RcAuthority::for_test()),
             None,
             std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
         ).await.unwrap();
@@ -3053,7 +3065,7 @@ mod tests {
                     requester: caller.principal_id, performer: caller.principal_id, reviewer: None,
                     context: id, session: caller.session_id,
                 },
-                crate::runtime::context_shell::ShellPolicy::Rc(crate::kj::lifecycle::RcAuthority::for_test()),
+                crate::runtime::context_shell::ShellPolicy::Rc(crate::rc::RcAuthority::for_test()),
                 None,
                 std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
             ).await.unwrap();

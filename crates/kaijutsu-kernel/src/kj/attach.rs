@@ -72,14 +72,15 @@ impl KjDispatcher {
         // fail land Error blocks in the target context but don't block
         // the attach — same as create / fork / drift, which prefer
         // "alive but degraded" over "rolled back."
-        if let Err(e) = self
-            .run_rc_lifecycle("attach", target_id, None, None, None, caller)
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation::new("attach", target_id),
+            caller,
+        )
             .await
         {
-            // run_rc_lifecycle errors today only on missing context /
-            // DB read failures, not on script failures (those become
-            // Error blocks). Surface as Err so the user knows the
-            // attach was rejected at the lifecycle layer.
+            // Discovery and context failures reject attachment. Individual
+            // script failures are already recorded as Error blocks.
             return KjResult::Err(format!("kj attach: {e}"));
         }
 

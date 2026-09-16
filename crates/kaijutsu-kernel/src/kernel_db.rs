@@ -986,7 +986,7 @@ CREATE TABLE IF NOT EXISTS hook_scripts (
 
 -- rc lifecycle scripts are no longer table rows: they live as files under
 -- /config/rc (~/.config/kaijutsu/config/rc), seeded to disk at boot. See
--- crate::seed_scripts and kj/lifecycle.rs. A legacy `rc_scripts` table may
+-- crate::seed_scripts and rc/mod.rs. A legacy `rc_scripts` table may
 -- still exist in pre-files DBs; KernelDb::legacy_rc_scripts migrates it.
 
 -- ── Claude cache breakpoints (per-context policy) ───────────────
@@ -2978,7 +2978,7 @@ impl KernelDb {
     /// `ALTER TABLE ... ADD COLUMN` array (new columns land in both places).
     /// Anything beyond an additive column bump requires wiping the DB. rc
     /// lifecycle scripts are no longer table rows — they live as files under
-    /// `/config/rc` (see `seed_scripts` and `kj/lifecycle.rs`), seeded to disk
+    /// `/config/rc` (see `seed_scripts` and `rc/mod.rs`), seeded to disk
     /// at server boot.
     pub fn open<P: AsRef<Path>>(path: P) -> KernelDbResult<Self> {
         if let Some(parent) = path.as_ref().parent() {

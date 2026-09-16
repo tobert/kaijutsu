@@ -275,7 +275,11 @@ impl KjDispatcher {
             rc_depth: 0,
             privileged: false,
         };
-        self.run_rc_lifecycle("create", new_id, None, None, None, &rc_caller)
+        crate::rc::run(
+            self,
+            crate::rc::RcInvocation::new("create", new_id),
+            &rc_caller,
+        )
             .await
             .map_err(|e| format!("root context '{name}' rc create lifecycle: {e}"))?;
         Ok(new_id)

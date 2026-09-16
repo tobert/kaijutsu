@@ -715,7 +715,7 @@ mod tests {
     /// A `readdir` on a directory that was never created — not even its
     /// parent — must report the typed `VfsError::NotFound`, not
     /// `VfsError::Io` wrapping `ENOENT`. This is the exact shape
-    /// `kj::lifecycle::load_rc_scripts` matches on to treat "no rc
+    /// `rc::load_scripts` matches on to treat "no rc
     /// directory for this (type, verb)" as zero scripts rather than a
     /// failure; a host-backed mount reporting absence any other way defeats
     /// that match silently.

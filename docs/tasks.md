@@ -102,7 +102,7 @@ out-of-band-change notification companion described in "Hydration" below.
 brief because tasks — unlike almost everything else already in the block
 model — are edited frequently *mid-conversation*, and the kernel already has
 an established (if informal — see the "cache-placement rule" comment in
-`kj/lifecycle.rs`'s datetime-injection test) convention against anything
+`rc/mod.rs`'s datetime-injection test) convention against anything
 that would silently invalidate an LLM provider's prompt-cache prefix
 (`--target=system` breakpoint, Claude `cache_control`). The load-bearing
 precedent is `BlockKind::Notification`

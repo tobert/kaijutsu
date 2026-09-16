@@ -1,8 +1,8 @@
 # Kaish integration and rc lifecycle
 
-Status: migration in progress. Contextual construction has moved into runtime;
-rc separation, instruction loading, command settlement, and turn ownership
-remain open. The inventory distinguishes completed and pending work.
+Status: migration in progress. Contextual construction belongs to runtime and
+lifecycle orchestration belongs to rc. Instruction loading, command settlement,
+and turn ownership remain open. The inventory distinguishes completed and pending work.
 
 Amy's objective: "*completely* migrate kaijutsu and clean up all the call
 sites." Completion includes deleting superseded entry points and correcting
@@ -53,8 +53,11 @@ These are source observations, not promises that all paths behave alike.
   orchestration. Missing dispatcher registration fails construction.
 - `runtime/synthesis.rs` owns the block-source adapters used by contextual
   shells; hooks no longer depend on rc for synthesis wiring.
-- `kj/lifecycle.rs` owns rc loading, ordering, variables, recursion, run
-  records, `.md` block creation, and `.kai` execution.
+- `rc::run` accepts `RcInvocation` and owns loading, ordering, variables,
+  recursion, run records, `.md` block creation, and `.kai` execution. All
+  lifecycle callers use this entry point; dispatcher lifecycle methods are
+  deleted. `rc/script_path.rs` owns the shared filename/path grammar, and
+  `kj rc` remains a command adapter. Unknown lifecycle verbs fail explicitly.
 - Server `shell_run.rs` shares execution between interactive commands and
   approval resume, but imports result and state helpers from `rpc.rs`.
   It reconstructs job results and receipts from the output block.
@@ -80,7 +83,7 @@ remove the obsolete API in the same change as its final caller.
 | Pending | Structured `executeKj` | server `rpc.rs::execute_kj_command` | Addressed context, structured argv, gates/latches, quiet mode, data, and shell-state write-back |
 | Pending | Approval resume | server `rpc.rs` resume drivers and helpers | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
 | Pending | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs` | Read-only/writable distinction, stdin, typed rejection, job ownership, receipts, cancellation, and async completion |
-| Pending | Rc lifecycle | kernel `kj/lifecycle.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
+| Owner migrated; instruction loading pending | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Pending | Editor shell reads | kernel `kernel.rs::fetch_editor_io` | Opener identity/context, full text, and fail-before-splice behavior |
 | Pending | Environment setup and approved environment restore | `EmbeddedKaish::apply_context_config`, `apply_ask_env`, server state helpers, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |
@@ -134,7 +137,7 @@ the `.md` feature and confirmed: "that's fine if the script uses kj." Prove
 this path against the acceptance conditions below before deleting the handler.
 This is the intended migration, not current behavior.
 
-Today `load_rc_scripts` selects both `.kai` and `.md` before validating names,
+Today `load_scripts` selects both `.kai` and `.md` before validating names,
 snapshots their bodies before the first script runs, and sorts by the entry
 filename. A symlink's name determines its order and handler. `run_md_script`
 authors a `System` / `Text` / `Done` / `Markdown` block as the lifecycle owner.
@@ -156,9 +159,12 @@ The proposed replacement has these acceptance conditions:
    not a host path or resolved target. Companion lookup is relative to that
    entry. If a shared script needs data beside its target instead, it names
    that shared path explicitly. Test both regular and symlinked entries.
-3. Scripts explicitly create instruction blocks. Prove role, kind, author,
-   status, content type, order, and content fidelity through the real `kj`
-   path. `kj block create` currently defaults to plain text and has no content
+3. Scripts explicitly create instruction blocks through `kj`, authored by the
+   invoking performer. Amy chose this over the old Markdown handler's context-
+   creator attribution: "Use the invoking performer consistently with kj."
+   Existing blocks keep their authors. Prove role, kind, author, status, content
+   type, order, and content fidelity through the real `kj` path, including
+   distinct requester, performer, and context creator. `kj block create` currently defaults to plain text and has no content
    type flag; `--content` with command substitution also needs a trailing-
    newline and output-limit check. Choose an existing adequate block-authoring
    path or fix its missing operation before deleting `run_md_script`.
@@ -198,10 +204,10 @@ adapters must have a named deletion step and must not become permanent aliases.
    All factory callers now use `EmbeddedKaish::for_context`; the
    `materialize_context_kaish_*` family is deleted. Backend and builtin
    interfaces are preserved. Rc authority belongs to its lifecycle caller.
-3. **Separate rc orchestration.** Give lifecycle discovery, execution records,
-   recursion, and error/trace emission a clear module owner adjacent to runtime.
-   `kj rc` remains an administration adapter. Migrate every lifecycle caller.
-   Implement the Markdown replacement above in its own tested change.
+3. **Separate rc orchestration (ownership implemented).** `rc::run` owns
+   discovery, execution records, recursion, and diagnostics adjacent to runtime.
+   `kj rc` is an administration adapter; every lifecycle caller is migrated.
+   The Markdown replacement above remains a separate tested change.
 4. **Consolidate command settlement.** Introduce one outcome and projection
    path, then migrate interactive, streaming, structured `kj`, model foreground,
    model background, and approved-resume callers. Remove server-to-`rpc.rs`

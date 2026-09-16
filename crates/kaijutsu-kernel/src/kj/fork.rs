@@ -800,8 +800,15 @@ impl KjDispatcher {
 
         // Run rc fork-lifecycle scripts. Failures surface as Error
         // blocks in the new context — they don't abort the fork.
-        if let Err(e) = self
-            .run_rc_lifecycle("fork", new_id, Some(source_id), Some(fork_kind), None, caller)
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                parent: Some(source_id),
+                fork_kind: Some(fork_kind),
+                ..crate::rc::RcInvocation::new("fork", new_id)
+            },
+            caller,
+        )
             .await
         {
             tracing::warn!("rc fork lifecycle: {e}");
@@ -1062,15 +1069,15 @@ impl KjDispatcher {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
 
-        if let Err(e) = self
-            .run_rc_lifecycle(
-                "fork",
-                new_id,
-                Some(source_id),
-                Some(ForkKind::Compact),
-                None,
-                caller,
-            )
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                parent: Some(source_id),
+                fork_kind: Some(ForkKind::Compact),
+                ..crate::rc::RcInvocation::new("fork", new_id)
+            },
+            caller,
+        )
             .await
         {
             tracing::warn!("rc fork lifecycle (compact): {e}");
@@ -1337,15 +1344,15 @@ impl KjDispatcher {
         }
 
         inherit_parent_context_type(self, new_root_id, source_id);
-        if let Err(e) = self
-            .run_rc_lifecycle(
-                "fork",
-                new_root_id,
-                Some(source_id),
-                Some(ForkKind::Subtree),
-                None,
-                caller,
-            )
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                parent: Some(source_id),
+                fork_kind: Some(ForkKind::Subtree),
+                ..crate::rc::RcInvocation::new("fork", new_root_id)
+            },
+            caller,
+        )
             .await
         {
             tracing::warn!("rc fork lifecycle (subtree): {e}");
@@ -1530,7 +1537,7 @@ impl KjDispatcher {
                            stay idle until a turn is driven."
                 .to_string();
             // Same BlockKind::Error / insert_block_as idiom rc lifecycle uses
-            // (see kj/lifecycle.rs insert_rc_failure_block): a plain Error block
+            // (see rc/mod.rs insert_rc_failure_block): a plain Error block
             // anchored at the tail, no structured ErrorPayload parent required.
             let after = self.block_store().last_block_id(new_id);
             if let Err(insert_err) = self.block_store().insert_block_as(
@@ -2201,7 +2208,7 @@ mod tests {
         // next User turn (index 5), pulling in the answer (m1) too — but not
         // the following turn group (u1, m2). Membership checks, not an exact
         // vector, because the child also carries a trailing fork marker + rc
-        // lifecycle blocks (`inject_fork_marker` / `run_rc_lifecycle`) that
+        // lifecycle blocks (`inject_fork_marker` / `rc::run`) that
         // aren't part of what this test is verifying.
         let kid = ordered_contents(&d, child);
         for body in ["u0", "m0", "result", "m1"] {

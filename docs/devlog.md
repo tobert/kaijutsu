@@ -1491,6 +1491,17 @@ replaced with an explicit initialization error. Lifecycle test fixtures now wire
 the dispatcher as production does. Rc loading and command settlement retain
 their current behavior for the next migration steps.
 
+Lifecycle orchestration moved into `rc`, alongside the shared runtime. One
+`rc::run` entry takes the invocation facts; create, fork, attach, drift, beat,
+rotation, and submit callers all moved, and the dispatcher lifecycle methods
+were removed. Discovery and `kj rc` now share the rc module's path grammar.
+Tests live beside the lifecycle owner, with the unused-argument fixture adapter
+deleted. An unknown verb now returns an error; its regression first reproduced
+the previous silent success. Markdown loading remains unchanged for its own
+migration. Amy resolved its authorship split: "Use the invoking performer
+consistently with kj." The replacement must test a distinct context creator
+and performer; existing instruction blocks retain their authors.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

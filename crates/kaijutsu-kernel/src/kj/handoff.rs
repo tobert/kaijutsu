@@ -378,7 +378,7 @@ impl KjDispatcher {
 
         // `insert_context_with_document` commits the KernelDb document row
         // but doesn't seed the in-memory BlockStore — the same gap
-        // `kj/lifecycle.rs`'s rc runner papers over before its first block
+        // `rc/mod.rs`'s rc runner papers over before its first block
         // write. `DocumentAlreadyExists` means another path already seeded
         // it; anything else is a real failure.
         match self.block_store().create_document(

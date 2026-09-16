@@ -444,7 +444,7 @@ Consequences for implementation:
   is exactly an ergonomic-nudge capability in the CLAUDE.md sense.
 - **Prerequisite:** the rc lifecycle identity smear filed in `issues.md` —
   the rc kaish is materialized with the *sender's* principal
-  (`kj/lifecycle.rs:376,388`) while bound to the target's context. Capabilities
+  (`rc/mod.rs`) while bound to the target's context. Capabilities
   gate correctly, but block authorship and `privileged` ride in from the
   sender. Must be fixed before `--drive` ships, or a driven turn is attributed
   to whoever asked for it.

@@ -25,7 +25,7 @@
 //! embedded here via [`include_dir!`]. The embedded tree IS the manifest:
 //! adding or removing a seed is just adding or removing a file under
 //! `assets/defaults/rc/` — no Rust edit. Dispatch reads the deployed files;
-//! see `kj/lifecycle.rs`.
+//! see `rc/mod.rs`.
 //!
 //! ## Seed contract — bootstrap-once, not a floor
 //!
@@ -709,7 +709,7 @@ mod tests {
             "musician must seed a stance"
         );
         // The tick verb is wired into the rc path grammar.
-        let parts = crate::kj::rc::parse_rc_path("/config/rc/musician/tick/S10-drive.kai")
+        let parts = crate::rc::parse_rc_path("/config/rc/musician/tick/S10-drive.kai")
             .expect("tick rc path must parse");
         assert_eq!(parts.context_type, "musician");
         assert_eq!(parts.verb, "tick");

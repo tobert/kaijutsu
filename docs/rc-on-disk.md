@@ -109,7 +109,7 @@ No loader, seed, or reseed behavior changes with this documentation update.
 The execution path is already backend-agnostic and the disk path is already the
 one most tests run on.
 
-- **`load_rc_scripts` never learns what backs the mount.** `kj/lifecycle.rs:353`
+- **`load_scripts` never learns what backs the mount.** `rc/mod.rs`
   is `vfs.readdir` + `vfs.read_all`. It also reads every body into a
   `Vec<RcScript>` before the first script executes, so a run is snapshotted as a
   set and a script editing its neighbor mid-run cannot tear it. That is the

@@ -170,7 +170,7 @@ pub fn build_system_prompt(situational: &SituationalContext, rc_sections: &[Stri
 ///
 /// The result feeds `build_system_prompt`'s `rc_sections` parameter. rc
 /// `.md` lifecycle scripts produce blocks in exactly this shape (see
-/// `kj/lifecycle.rs::run_md_script`); any other producer that wants to
+/// `rc/mod.rs::run_md_script`); any other producer that wants to
 /// contribute system-prompt material can do the same.
 pub fn extract_system_prompt_sections(blocks: &[BlockSnapshot]) -> Vec<String> {
     blocks

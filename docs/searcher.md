@@ -24,11 +24,11 @@ scripts. So a `searcher` type needs **no kernel edit, no registration, no restar
 - **A missing rc dir is fine.** The lifecycle loader treats an absent
   `/config/rc/<type>/<verb>/` as "no scripts", not an error — so `searcher` exists as
   a type the moment its `create/` dir does.
-  ✓ `kaijutsu-kernel/src/kj/lifecycle.rs` `load_rc_scripts` (NotFound → empty).
+  ✓ `kaijutsu-kernel/src/rc/mod.rs` `load_scripts` (NotFound → empty).
 - **Script shape.** Filenames must be `SXX-name.{kai,md}` (lexical order = sort order);
   `.kai` executes as kaish, `.md` lands in the model's system-prompt slot; symlinks are
   followed, so shared scripts compose from `lib/` (init.d style).
-  ✓ same file + `kj/lifecycle.rs` doc comment.
+  ✓ same file + `rc/mod.rs` doc comment.
 - **Create-lifecycle runs privileged**, so `kj binding allow …` inside
   `S10-binding.kai` lands under a narrowed loadout.
   ✓ `musician/create/S20-arm.kai` comment; every type's `S10-binding.kai`.

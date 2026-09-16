@@ -236,7 +236,7 @@ Compact mode has its own retention policy. It rejects `--include`, `--exclude`,
 
 `submit` fires after the server promotes a player's chat submission to a
 durable user block, the way `drift` fires after a drift block lands
-(`kj/lifecycle.rs`, `run_rc_lifecycle_with_vars`). It runs awaited inline, so
+(`rc/mod.rs`, `rc::run`). It runs awaited inline, so
 anything a script writes is durable before `submitInput` returns.
 
 Its scripts read the submit facts as `KJ_*` variables. Every name is always

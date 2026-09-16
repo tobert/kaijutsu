@@ -8838,7 +8838,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: kaijutsu_types::ContextId::new(), session: kaijutsu_types::SessionId::new(),
             },
-            ShellPolicy::Rc(crate::kj::lifecycle::RcAuthority::for_test()),
+            ShellPolicy::Rc(crate::rc::RcAuthority::for_test()),
             None,
             Arc::new(crate::runtime::synthesis::NoopBlockSource),
         )

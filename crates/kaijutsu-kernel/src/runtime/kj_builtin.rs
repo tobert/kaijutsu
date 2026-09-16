@@ -489,7 +489,7 @@ impl Tool for KjBuiltin {
         }
 
         // Recursion depth from the rc runner's `KJ_RC_DEPTH` overlay var (see
-        // kj/lifecycle.rs "Recursion guard"). This read is what closes the
+        // rc/mod.rs "Recursion guard"). This read is what closes the
         // loop: without it every rc-driven `kj` reset depth to 0 and an rc
         // create-cycle recursed unbounded past MAX_RC_DEPTH. Absent is the
         // normal non-rc case (depth 0); present-but-garbage fails loud.
@@ -638,7 +638,7 @@ impl Tool for KjBuiltin {
 
 /// Read the rc recursion depth from the shell scope's `KJ_RC_DEPTH`.
 ///
-/// The rc runner (`kj/lifecycle.rs::run_kai_script`) seeds this overlay var
+/// The rc runner (`rc/mod.rs::run_kai_script`) seeds this overlay var
 /// with `child_depth` before every rc script; the builtin reads it back here
 /// so the depth survives the script's `kj` re-entry and the `MAX_RC_DEPTH`
 /// guard actually accumulates. Absent → 0 (the normal non-rc shell). A
@@ -810,7 +810,7 @@ mod tests {
     use kaish_kernel::ExecuteOptions;
 
     /// Build an `EmbeddedKaish` wired to a `KjBuiltin` rooted at the given
-    /// dispatcher. Mirrors the rc-lifecycle wiring in `kj/lifecycle.rs`
+    /// dispatcher. Mirrors the rc-lifecycle wiring in `rc/mod.rs`
     /// but without the script-execution scaffolding.
     async fn embedded_with_kj(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
         embedded_with_index(dispatcher, ctx, None, Arc::new(crate::runtime::synthesis::NoopBlockSource)).await
@@ -1013,7 +1013,7 @@ mod tests {
     /// and the inert `.md` banner never lands.
     #[tokio::test]
     async fn rc_depth_in_scope_reaches_recursion_guard() {
-        use crate::kj::lifecycle::MAX_RC_DEPTH;
+        use crate::rc::MAX_RC_DEPTH;
         use crate::kj::test_helpers::install_rc_script_file;
 
         let dispatcher = Arc::new(test_dispatcher().await);

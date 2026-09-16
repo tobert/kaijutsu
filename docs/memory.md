@@ -304,7 +304,7 @@ Verified against `main`. Re-verify before relying on any of it.
 
 **How `.md` reaches the model, three hops:** `run_md_script` inserts the body
 as one `Role::System` + `BlockKind::Text` block
-(`kernel/src/kj/lifecycle.rs:334-355`) → `extract_system_prompt_sections`
+(`kernel/src/rc/mod.rs`) → `extract_system_prompt_sections`
 filters exactly `System && Text && !ephemeral && !excluded && !empty`
 (`kernel/src/llm/system_prompt.rs:145-157`) → `build_system_prompt` emits
 base → rc sections in block order → `<situation>` (`:69`).
@@ -317,11 +317,11 @@ base → rc sections in block order → `<situation>` (`:69`).
 **rc script landmines** — four, all verified:
 
 - **No per-script timeout.** One kernel-wide budget, applied per call
-  (`kj/lifecycle.rs:496-502`); per-script overrides were dropped with the
+  (`rc/mod.rs`); per-script overrides were dropped with the
   move to files. A hung probe burns the whole budget on every create.
 - **Probes must never exit nonzero.** A nonzero exit produces a
   `BlockKind::Error` that is *deliberately non-ephemeral so the LLM sees it*
-  (`kj/lifecycle.rs:11-15`). Report failure via stdout, which lands in a
+  (`rc/mod.rs`). Report failure via stdout, which lands in a
   `Trace` block — Trace is skipped by hydrate (`llm/hydrate.rs:130`) and is
   genuinely model-hidden.
 - **External commands are loadout-gated.** `Capability::Exec` on the

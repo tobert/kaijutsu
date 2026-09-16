@@ -11,7 +11,7 @@ use anyhow::Result;
 use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use crate::kj::KjDispatcher;
-use crate::kj::lifecycle::RcAuthority;
+use crate::rc::RcAuthority;
 use super::context_engine::SessionContextMap;
 use super::embedded_kaish::{EmbeddedKaish, OutputProfile};
 

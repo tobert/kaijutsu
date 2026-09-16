@@ -1080,7 +1080,11 @@ mod tests {
             rc_depth: 0,
             privileged: false,
         };
-        d.run_rc_lifecycle("create", ctx, None, None, None, &caller)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation::new("create", ctx),
+            &caller,
+        )
             .await
             .expect("create lifecycle must not hard-fail");
 

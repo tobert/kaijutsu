@@ -45,6 +45,12 @@ audit. The synthesis block-source adapter also ignores hydration errors; retain
 that finding for the adapter audit instead of treating an empty result as proof
 that loading succeeded.
 
+Rc orchestration and its path grammar now belong to `rc`; every lifecycle caller
+uses `rc::run` with `RcInvocation`. The old dispatcher lifecycle methods and
+unused-argument fixture adapter are deleted. Explicit `.kai` instruction
+loading remains to implement. Amy chose invoking-performer authorship for the
+replacement, resolving the design question in the identity audit below.
+
 Shared command settlement and headless turn ownership remain separate changes.
 Keep connection/session subscriptions in the server and preserve JobManager's
 execution lifetime separately from durable receipts. Replace rc
@@ -254,11 +260,12 @@ draft/shell RPC read the identifier the doc names. Open:
 3. ROOT seeds `system()` as `created_by`/`director_id` (`rpc.rs:2534`);
    benign.
 5. Rc block authorship splits by file kind: `.kai` blocks are authored by
-   `caller.actor_id` (`kj/lifecycle.rs:390`) and `.md` blocks by the
+   `caller.actor_id` (`rc/mod.rs`) and `.md` blocks by the
    context's `created_by` (`:243-250`, `:376`), and the comment at
-   `kj/context.rs:1338` still says the requester owns rc output. Equal for
-   every create path today; a context created from a model turn's shell
-   would diverge. Decide one owner and say it in both places.
+   `kj/context.rs:1338` still says the requester owns rc output. Amy chose
+   invoking-performer authorship for instructions during the `.md` replacement.
+   Implement that choice and correct the comments; keep existing block authors
+   unchanged.
 4. `kj context create --as` is ungated (`kj/context.rs:579`) while
    `kj context set --as` needs Operator plus reviewer authority. A patch
    that gates `create --as` the same way exists
@@ -397,7 +404,7 @@ message that knew where the player was looking"). Left:
   input block with `--after`; the facts already carry both ids.
 - **Every chat submit writes a ledger run row**, even for a type with no
   `submit/` directory: `start_run` fires before the script list is loaded
-  (`kj/lifecycle.rs`). Consistent with the other verbs, but submit is a
+  (`rc/mod.rs`). Consistent with the other verbs, but submit is a
   hotter path than create or fork. Skip the row when no script exists, or
   accept it once measured.
 - **The edge never rides the change feed.** The promotion emits
@@ -1845,7 +1852,7 @@ command that spills >8 KB of output but exits 0 no longer records
 - `crates/kaijutsu-kernel/src/kernel.rs:1731` — vi's `:r !cmd`
   (`EditorIo::ReadShell`) checks `result.code != 0` raw; a spilled-but-
   successful command reports a spurious editor failure.
-- `crates/kaijutsu-kernel/src/kj/lifecycle.rs:604` — rc-lifecycle `.kai`
+- `crates/kaijutsu-kernel/src/rc/mod.rs` — rc-lifecycle `.kai`
   execution matches `exec.code == 0` raw and persists the unresolved code
   into a durable rc-failure block on the fallthrough arm.
 - `crates/kaijutsu-server/src/rpc.rs:2044` (`dispatch_output_events`, the

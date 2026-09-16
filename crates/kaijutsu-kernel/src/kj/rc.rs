@@ -12,7 +12,7 @@
 //! `kj rc list` reports. Editing a script in place is a plain file write —
 //! there is no rc verb for it, and restoring the shipped defaults is
 //! `kaijutsu-server rc reseed`, off the kernel. Lifecycle dispatch reads the
-//! latest body from disk on every run; see `kj/lifecycle.rs` and
+//! latest body from disk on every run; see `rc/mod.rs` and
 //! `docs/rc-on-disk.md`.
 
 use clap::{Parser, Subcommand};
@@ -20,6 +20,8 @@ use kaijutsu_types::ContentType;
 use kaijutsu_types::paths;
 use regex::Regex;
 use std::sync::OnceLock;
+
+use crate::rc::{RcPathParts, parse_rc_path};
 
 use super::effect::{Classify, Effect};
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
@@ -124,57 +126,6 @@ impl RcSeedStatus {
     }
 }
 
-/// Canonical rc path format. The verb alternation is built from
-/// [`crate::kj::lifecycle::RC_VERBS`] — the single source shared with the firing
-/// gate — so the validator can never reject a verb the scheduler fires.
-/// `tick` is the beat verb (fired by the beat scheduler on a context's OODA
-/// cadence); `rotate` is the page-turn verb.
-/// The filename half of a canonical rc path: `SXX-name.{kai,md}`. Shared
-/// with [`rc_path_pattern`] and with the lifecycle runner's own directory
-/// filter ([`is_rc_script_filename`]) so that "what counts as a script"
-/// has one definition. A runner that executes a file the validator would
-/// reject is the same class of trap as a verb the scheduler fires and the
-/// validator refuses.
-const RC_FILENAME_PATTERN: &str = r"(S\d{1,3})-([a-z][a-z0-9_-]*)\.(kai|md)";
-
-fn rc_path_pattern() -> String {
-    let verbs = crate::kj::lifecycle::RC_VERBS.join("|");
-    let root = paths::RC_ROOT;
-    let file = RC_FILENAME_PATTERN;
-    format!(r"^{root}/([a-z][a-z0-9_-]*)/({verbs})/{file}$")
-}
-
-fn rc_path_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(&rc_path_pattern()).expect("rc path regex compiles"))
-}
-
-/// Whether a bare filename is a canonical rc script name (`SXX-name.kai`
-/// or `SXX-name.md`).
-///
-/// The lifecycle runner uses this to decide what in a verb directory is a
-/// script. A `.kai` or `.md` file that fails this check is a hard error
-/// there rather than a silent skip: a `.md` in a verb directory reaches
-/// the model's system-prompt slot, so quietly ignoring an unexpected one
-/// hides exactly the mistake worth catching. Non-script data belongs
-/// outside a verb directory — see `docs/rc-on-disk.md`.
-pub fn is_rc_script_filename(name: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(&format!(r"^{RC_FILENAME_PATTERN}$")).expect("rc filename regex compiles")
-    })
-    .is_match(name)
-}
-
-/// Parsed components of a canonical rc path.
-pub struct RcPathParts {
-    pub context_type: String,
-    pub verb: String,
-    pub sort_key: String,
-    pub name: String,
-    pub extension: String,
-}
-
 /// The bucket and slot a hook body lives in: `/config/rc/lib/hooks/<name>.kai`.
 /// A hook body is not a lifecycle script (no verb, no sort key); the hook
 /// table reads it fresh at every fire (`HookBody::KaishPath`), and it ships
@@ -250,32 +201,6 @@ pub fn parse_rc_entry(path: &str) -> Result<RcEntry, String> {
             "{e}\n- or a hook body: {}/{HOOK_BUCKET}/{HOOK_SLOT}/<name>.kai",
             paths::RC_ROOT
         )
-    })
-}
-
-/// Validate and split a canonical rc path.
-///
-/// Format: `/config/rc/<context_type>/<verb>/SXX-name.{kai,md}`. Type and
-/// name are lowercase identifiers (`[a-z][a-z0-9_-]*`); sort_key matches
-/// `S\d{1,3}`. Valid verbs are [`crate::kj::lifecycle::RC_VERBS`].
-pub fn parse_rc_path(path: &str) -> Result<RcPathParts, String> {
-    let caps = rc_path_regex().captures(path).ok_or_else(|| {
-        let verbs = crate::kj::lifecycle::RC_VERBS.join(", ");
-        format!(
-            "invalid rc path: '{path}'\n\
-             expected /config/rc/<context_type>/<verb>/SXX-name.{{kai,md}}\n\
-             - context_type and name must be lowercase ([a-z][a-z0-9_-]*)\n\
-             - verb must be one of: {verbs}\n\
-             - sort_key must be S followed by 1-3 digits (e.g. S00, S05, S100)\n\
-             - extension must be 'kai' or 'md'"
-        )
-    })?;
-    Ok(RcPathParts {
-        context_type: caps[1].to_string(),
-        verb: caps[2].to_string(),
-        sort_key: caps[3].to_string(),
-        name: caps[4].to_string(),
-        extension: caps[5].to_string(),
     })
 }
 
@@ -367,7 +292,7 @@ impl KjDispatcher {
     /// Write `content` to the rc script at `path` straight through the VFS to
     /// whatever backend is mounted at `/config/rc` — a host file in
     /// production. No FileDocumentCache mirror sits in the way; dispatch
-    /// (`load_rc_scripts`) reads the same file through the same VFS.
+    /// (`load_scripts`) reads the same file through the same VFS.
     async fn write_rc_file(&self, path: &str, content: &str) -> Result<(), String> {
         use crate::vfs::VfsOps;
         self.kernel()
@@ -820,7 +745,7 @@ mod tests {
     /// This fails the moment a verb is added to one source but not the other.
     #[test]
     fn every_canonical_verb_parses() {
-        for verb in crate::kj::lifecycle::RC_VERBS {
+        for verb in crate::rc::RC_VERBS {
             let path = format!("/config/rc/musician/{verb}/S10-x.kai");
             let parts = parse_rc_path(&path)
                 .unwrap_or_else(|e| panic!("canonical verb {verb} must parse ({path}): {e}"));

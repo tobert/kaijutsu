@@ -1,1040 +1,18 @@
-//! Run-control (rc) lifecycle dispatch.
-//!
-//! Runs at create, fork, attach, drift, tick, rotate, and submit. Scripts under
-//! `/config/rc/<context_type>/<verb>/` run in lexical order. Markdown entries
-//! author instruction blocks; kaish entries use the shared runtime constructor
-//! with rc authority and `TimeoutPolicy::rc_script_timeout`.
-//!
-//! ## Failure semantics
-//!
-//! Scripts run after the context is committed. A script failure inserts a
-//! `BlockKind::Error` block into the new context with rc path, sort key,
-//! exit code, and last 4 KB of stderr/stdout. Subsequent scripts continue
-//! to run — the new context is "alive but degraded," matching SysV
-//! init.d. No rollback. The error block is non-ephemeral so the LLM sees
-//! it on next hydrate.
-//!
-//! ## Recursion guard
-//!
-//! `KjCaller.rc_depth` is bumped before each rc-driven invocation (via
-//! the `KJ_RC_DEPTH` overlay var, read by `KjBuiltin` when constructing
-//! its caller). When depth exceeds `MAX_RC_DEPTH`, the script is skipped
-//! and an error block is inserted in its place.
-//!
-
-use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
-use crate::runtime::embedded_kaish::EmbeddedKaish;
-use std::collections::HashMap;
-use crate::runtime::synthesis::NoopBlockSource;
-
-use approval_ledger::rc_runs;
-use approval_ledger::types::RcOutcome;
-use kaijutsu_types::paths;
-use kaijutsu_types::{
-    BlockId, BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
-};
-
-use super::{KjCaller, KjDispatcher};
-
-/// Authority to construct the lifecycle control-plane shell.
-///
-/// The private field keeps ordinary execution callers from selecting rc policy.
-///
-/// ```compile_fail
-/// use kaijutsu_kernel::kj::lifecycle::RcAuthority;
-/// let authority = RcAuthority { _private: () };
-/// ```
-pub struct RcAuthority {
-    _private: (),
-}
-
-#[cfg(test)]
-impl RcAuthority {
-    pub(crate) fn for_test() -> Self { Self { _private: () } }
-}
-
-/// One rc script resolved from the `/config/rc` file tree for a single
-/// lifecycle run. The path is canonical (`/config/rc/<type>/<verb>/SXX-name.ext`);
-/// `sort_key` and `extension` are parsed from the filename for ordering and
-/// dispatch. Bodies are read through the VFS before execution starts.
-pub(crate) struct RcScript {
-    pub path: String,
-    pub sort_key: String,
-    pub extension: String,
-    pub content: String,
-}
-
-/// Split an rc filename `SXX-name.ext` into `(sort_key, extension)`.
-/// `sort_key` is everything before the first `-`; `extension` is everything
-/// after the last `.`. Canonical seed/installed paths always match
-/// `parse_rc_path`, so these are well-formed; a stray file that doesn't is
-/// handled gracefully (empty sort_key / extension → skipped or errored by
-/// the caller's extension match).
-fn parse_rc_filename(name: &str) -> (String, String) {
-    let sort_key = name.split('-').next().unwrap_or("").to_string();
-    let extension = name.rsplit('.').next().unwrap_or("").to_string();
-    (sort_key, extension)
-}
-
-/// Per-drift metadata surfaced to rc scripts via `KJ_DRIFT_INFO`. Built by
-/// drift call sites and passed into `run_rc_lifecycle` as `drift_info`.
-#[derive(Clone, Debug)]
-pub struct DriftInfo {
-    pub kind: DriftKind,
-    pub source_ctx: ContextId,
-    pub target_ctx: ContextId,
-    pub source_model: Option<String>,
-}
-
-/// The facts a chat submit hands its rc scripts. See docs/prompts.md,
-/// "The submit verb".
-#[derive(Clone, Debug)]
-pub struct SubmitInfo {
-    /// The user block the draft became.
-    pub input_block: BlockId,
-    /// The newest block the client had shown when the player submitted, if it said.
-    pub edge_block: Option<BlockId>,
-    /// Characters of `edge_block` shown, if it was still streaming.
-    pub edge_shown: Option<u64>,
-    /// The newest durable block in the log before `input_block`, if any.
-    pub log_tail: Option<BlockId>,
-    /// Whether a model turn was running when the submit arrived.
-    pub turn_live: bool,
-}
-
-impl SubmitInfo {
-    /// The script environment: KJ_INPUT_BLOCK, KJ_EDGE_BLOCK, KJ_EDGE_SHOWN,
-    /// KJ_LOG_TAIL (each a block key via `BlockId::to_key`, "" when absent),
-    /// KJ_TURN_LIVE ("true"/"false"). Every name is always set so a script
-    /// can test emptiness without guarding definedness.
-    pub fn vars(&self) -> HashMap<String, String> {
-        let mut vars = HashMap::new();
-        vars.insert("KJ_INPUT_BLOCK".to_string(), self.input_block.to_key());
-        vars.insert(
-            "KJ_EDGE_BLOCK".to_string(),
-            self.edge_block.map(|b| b.to_key()).unwrap_or_default(),
-        );
-        vars.insert(
-            "KJ_EDGE_SHOWN".to_string(),
-            self.edge_shown.map(|n| n.to_string()).unwrap_or_default(),
-        );
-        vars.insert(
-            "KJ_LOG_TAIL".to_string(),
-            self.log_tail.map(|b| b.to_key()).unwrap_or_default(),
-        );
-        vars.insert("KJ_TURN_LIVE".to_string(), self.turn_live.to_string());
-        vars
-    }
-}
-
-/// Hard cap on rc-driven recursion depth. A script that hits this limit
-/// produces an error block and is skipped — its lifecycle does NOT run.
-pub const MAX_RC_DEPTH: u8 = 4;
-
-/// Last N bytes of stdout/stderr captured into the failure block.
-const RC_FAILURE_OUTPUT_TAIL_BYTES: usize = 4096;
-
-pub const VERB_CREATE: &str = "create";
-pub const VERB_FORK: &str = "fork";
-pub const VERB_ATTACH: &str = "attach";
-pub const VERB_DRIFT: &str = "drift";
-/// The beat verb: fired by the kernel beat scheduler on a context's coarse OODA
-/// cadence (e.g. every N bars for a musician). Its scripts are the per-beat work
-/// hook — typically `kj drive` to request the next OODA turn. Materialized the
-/// same throwaway-kaish way the other verbs are; no new runtime.
-pub const VERB_TICK: &str = "tick";
-/// The page-turn verb: fired by the beat scheduler when a context hits its rotate
-/// horizon (`phrase % rotate_every == 0`). The scheduler has ALREADY stopped the
-/// parent synchronously, so the rotate scripts (`kj fork --preset spawn` + arm +
-/// play the child) run race-free — fork-lineage becomes song form
-/// (`docs/chameleon.md`).
-pub const VERB_ROTATE: &str = "rotate";
-/// The submit verb: fired by the server after a chat submit has promoted the
-/// player's draft to a durable user block. Scripts see the submit facts as
-/// `KJ_*` variables ([`SubmitInfo::vars`]). Runs awaited inline like `drift`,
-/// so anything a script writes is durable before `submitInput` returns.
-pub const VERB_SUBMIT: &str = "submit";
-
-/// The canonical set of rc lifecycle verbs — the single source of truth for
-/// both the firing gate ([`verb_is_wired`]) and the path validator
-/// (`parse_rc_path`'s regex in `kj::rc`). They MUST agree: a verb the scheduler
-/// fires but the management surface rejects is a latent migration trap — exactly
-/// the rotate regression where an rc verb refused a path the beat
-/// scheduler runs. Derive both from here so they can't drift again.
-pub const RC_VERBS: &[&str] = &[
-    VERB_CREATE,
-    VERB_FORK,
-    VERB_ATTACH,
-    VERB_DRIFT,
-    VERB_TICK,
-    VERB_ROTATE,
-    VERB_SUBMIT,
-];
-
-fn verb_is_wired(verb: &str) -> bool {
-    RC_VERBS.contains(&verb)
-}
-
-impl KjDispatcher {
-    /// Run rc lifecycle scripts for `(context_type, verb)` against the
-    /// **new** context. See module docs for failure semantics.
-    pub async fn run_rc_lifecycle(
-        &self,
-        verb: &str,
-        new_id: ContextId,
-        parent_id: Option<ContextId>,
-        fork_kind: Option<ForkKind>,
-        drift_info: Option<DriftInfo>,
-        caller: &KjCaller,
-    ) -> Result<(), String> {
-        self.run_rc_lifecycle_inner(
-            verb, new_id, parent_id, fork_kind, drift_info, &HashMap::new(), caller,
-        )
-        .await
-    }
-
-    /// Like [`run_rc_lifecycle`](Self::run_rc_lifecycle), but seeds `extra_vars`
-    /// into every `.kai` script's kaish environment alongside the standard
-    /// `KJ_*` vars. The musician beat scheduler uses this to hand the `tick`
-    /// lifecycle its transport heartbeat (`$TICK` / `$PHRASE` / `$TEMPO`) so
-    /// `S10-drive.kai` can compose the turn's transport report. Bare names (no
-    /// `KJ_` prefix) per the heartbeat-var taxonomy in `docs/chameleon.md`.
-    #[allow(clippy::too_many_arguments)] // mirrors the lifecycle param shape
-    pub async fn run_rc_lifecycle_with_vars(
-        &self,
-        verb: &str,
-        new_id: ContextId,
-        parent_id: Option<ContextId>,
-        fork_kind: Option<ForkKind>,
-        drift_info: Option<DriftInfo>,
-        extra_vars: &HashMap<String, String>,
-        caller: &KjCaller,
-    ) -> Result<(), String> {
-        self.run_rc_lifecycle_inner(
-            verb, new_id, parent_id, fork_kind, drift_info, extra_vars, caller,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)] // mirrors the lifecycle param shape
-    #[tracing::instrument(
-        skip(self, drift_info, extra_vars, caller),
-        fields(verb = %verb, ctx = %new_id.short(), rc_depth = caller.rc_depth),
-    )]
-    async fn run_rc_lifecycle_inner(
-        &self,
-        verb: &str,
-        new_id: ContextId,
-        parent_id: Option<ContextId>,
-        fork_kind: Option<ForkKind>,
-        drift_info: Option<DriftInfo>,
-        extra_vars: &HashMap<String, String>,
-        caller: &KjCaller,
-    ) -> Result<(), String> {
-        if !verb_is_wired(verb) {
-            log_unwired_verb_once(verb);
-            return Ok(());
-        }
-
-        // `owner` is the identity every block this phase writes belongs to.
-        //
-        // rc scripts run *in* a context, on behalf of that context — never on
-        // behalf of whoever tripped the verb. A drift push from one principal
-        // into another's context fires the target's `drift` scripts; attributing
-        // their output to the sender smears the sender across a timeline they
-        // do not own, and the smear is worst exactly where it matters most
-        // (failure blocks name the wrong principal as the one who broke things).
-        //
-        // Safe because the rc principal is an *authorship* value and nothing
-        // else: `require_cap` authorizes against the caller's loadout keyed by
-        // `context_id` (`kj/mod.rs`), never against `principal_id`; rc shells
-        // are constructed privileged; and the host-exec policy is read from the
-        // *context's* binding in `EmbeddedKaish::for_context`. Moving this
-        // value changes who the blocks belong to and nothing about what the
-        // scripts may do.
-        let (context_type, owner) = {
-            let db = self.kernel_db().lock();
-            match db.get_context(new_id) {
-                Ok(Some(row)) => (row.context_type, row.created_by),
-                Ok(None) => {
-                    return Err(format!(
-                        "rc lifecycle: context {} not found",
-                        new_id.short()
-                    ));
-                }
-                Err(e) => return Err(format!("rc lifecycle: {e}")),
-            }
-        };
-
-        // The run log: a durable "checklist of what ran" row for this
-        // (context, verb) invocation — see `approval_ledger::rc_runs`'s module
-        // docs for the incident it answers (a startup rc sweep that silently
-        // never ran, and nothing recorded that). Started as soon as we know
-        // enough to make the row meaningful (`context_type`); every exit from
-        // here on finishes it through `run_guard`, never a bare `return` —
-        // `RunGuard::drop` is the backstop for a path someone adds later and
-        // forgets to wire, mirroring `AbandonOnDrop` in `kj/gate.rs`.
-        //
-        // A ledger write failure here degrades to `tracing::warn!` rather than
-        // failing the lifecycle: rc running is the primary job, the run log is
-        // observability riding alongside it, and refusing someone's
-        // create/fork scripts because a second database couldn't take a write
-        // would be strictly worse than an unlogged run. This is a deliberate,
-        // LOUD degrade — not the silent fallback CLAUDE.md warns against —
-        // because every failure to record is still visible in the logs.
-        let run_id = {
-            let db = self.kernel_db().lock();
-            match rc_runs::start_run(db.conn_for_ledger(), new_id.as_bytes(), &context_type, verb) {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    tracing::warn!(
-                        "rc lifecycle: run log start_run failed (continuing unlogged): {e}"
-                    );
-                    None
-                }
-            }
-        };
-        let mut run_guard = RunGuard::new(self, run_id);
-
-        let scripts = match self.load_rc_scripts(&context_type, verb).await {
-            Ok(s) => s,
-            Err(e) => {
-                // A loader error happens before the ordinary script path below
-                // ensures the in-memory document. Create it now so the
-                // diagnostic survives context creation and makes `rebind`
-                // actionable instead of disappearing into tracing.
-                match self
-                    .block_store()
-                    .create_document(new_id, kaijutsu_types::DocKind::Conversation, None)
-                {
-                    Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
-                        insert_rc_failure_block(
-                            self,
-                            new_id,
-                            &paths::rc_dir(&context_type, verb),
-                            "load",
-                            None,
-                            e.clone(),
-                            owner,
-                        );
-                        run_guard.finish(RcOutcome::Failed);
-                        return Err(e);
-                    }
-                    Err(document_error) => {
-                        run_guard.finish(RcOutcome::Failed);
-                        return Err(format!(
-                            "{e}; could not create the document for its diagnostic: {document_error}"
-                        ));
-                    }
-                }
-            }
-        };
-
-        // Recorded once, here: the set is snapshotted, so this is how many
-        // scripts the run intends to execute. Fewer script rows than this at
-        // read time means the run stopped early rather than that a script
-        // failed — the two are otherwise identical in the log, both landing
-        // as `Failed`.
-        run_guard.record_script_count(scripts.len());
-
-        if scripts.is_empty() {
-            run_guard.finish(RcOutcome::Ok);
-            return Ok(());
-        }
-
-        // The BlockStore document for this context may not exist yet —
-        // context_create commits the KernelDb document but doesn't seed
-        // the in-memory BlockStore (LLM stream / RPC handler creates it
-        // lazily on first block). rc scripts insert blocks now, so we
-        // must ensure the BlockStore doc exists.
-        match self
-            .block_store()
-            .create_document(new_id, kaijutsu_types::DocKind::Conversation, None)
-        {
-            Ok(()) => {}
-            Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {}
-            Err(e) => {
-                tracing::warn!("rc lifecycle: create_document failed: {e}");
-            }
-        }
-
-        if caller.rc_depth >= MAX_RC_DEPTH {
-            insert_rc_failure_block(
-                self,
-                new_id,
-                "<recursion-guard>",
-                "S00",
-                None,
-                format!(
-                    "rc depth limit exceeded ({} >= {}); refusing to run {}/* scripts",
-                    caller.rc_depth,
-                    MAX_RC_DEPTH,
-                    paths::rc_dir(&context_type, verb)
-                ),
-                owner,
-            );
-            // The recursion guard already inserted a failure block and ran
-            // NO scripts — that is a failed run, not a no-op.
-            run_guard.finish(RcOutcome::Failed);
-            return Ok(());
-        }
-
-        let child_depth = caller.rc_depth + 1;
-        let mut any_script_failed = false;
-
-        for script in &scripts {
-            let script_started_at = now_millis();
-            let result = match script.extension.as_str() {
-                "md" => run_md_script(self, new_id, script, owner),
-                "kai" => {
-                    run_kai_script(
-                        self,
-                        new_id,
-                        parent_id,
-                        fork_kind,
-                        drift_info.as_ref(),
-                        verb,
-                        &context_type,
-                        script,
-                        child_depth,
-                        extra_vars,
-                        owner,
-                        caller.actor_id,
-                        caller.reviewer_id,
-                    )
-                    .await
-                }
-                other => {
-                    insert_rc_failure_block(
-                        self,
-                        new_id,
-                        &script.path,
-                        &script.sort_key,
-                        None,
-                        format!("rc lifecycle: unknown extension '{other}'"),
-                        owner,
-                    );
-                    ScriptRunResult::Failed { exit_code: None }
-                }
-            };
-            if matches!(result, ScriptRunResult::Failed { .. }) {
-                any_script_failed = true;
-            }
-            run_guard.record_script(script, script_started_at, &result);
-        }
-
-        // SysV init.d semantics: one script failing does not stop the rest
-        // (module docs), so the run's own outcome is "did anything fail
-        // across the whole phase", not "did the last script fail".
-        run_guard.finish(if any_script_failed { RcOutcome::Failed } else { RcOutcome::Ok });
-        Ok(())
-    }
-
-    /// Load the rc scripts for `(context_type, verb)` from the `/config/rc`
-    /// file tree, ordered lexically by filename (which is exactly
-    /// `(sort_key, name)` order). A missing directory means "no scripts for
-    /// this verb" — the common case — and returns empty, not an error. A
-    /// read failure on a present file *is* surfaced: per the
-    /// crash-over-corruption stance an unreadable stance script is
-    /// corruption, not an empty default.
-    pub(crate) async fn load_rc_scripts(
-        &self,
-        context_type: &str,
-        verb: &str,
-    ) -> Result<Vec<RcScript>, String> {
-        use crate::vfs::{VfsError, VfsOps};
-
-        let dir = paths::rc_dir(context_type, verb);
-        let vfs = self.kernel().vfs();
-        let entries = match vfs.readdir(std::path::Path::new(&dir)).await {
-            Ok(e) => e,
-            // Directory absent → no scripts for this (type, verb).
-            Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => {
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(format!("rc lifecycle: readdir {dir}: {e}")),
-        };
-
-        // Include symlinks alongside regular files: an init.d-style link
-        // (`coder/create/S10-binding.kai → lib/create/binding.kai`) composes a
-        // shared script into this verb dir. The *link's* `SXX-name.ext` governs
-        // ordering and which extension-handler runs; `read_all` auto-follows the
-        // link to the target's content.
-        let candidates = entries
-            .into_iter()
-            .filter(|e| e.kind.is_file() || e.kind.is_symlink())
-            .map(|e| e.name)
-            .filter(|n| n.ends_with(".kai") || n.ends_with(".md"));
-
-        // A `.kai`/`.md` file here that is not a canonical `SXX-name.ext`
-        // fails the whole verb rather than being skipped. Both extensions
-        // are executable in the sense that matters: `.kai` runs as kaish and
-        // `.md` lands in the model's system-prompt slot, so a file nobody
-        // meant as a script must not be able to reach either by sitting in
-        // the directory. Non-script data belongs outside a verb directory.
-        let mut names: Vec<String> = Vec::new();
-        for name in candidates {
-            if !crate::kj::rc::is_rc_script_filename(&name) {
-                return Err(format!(
-                    "rc lifecycle: {dir}/{name} is not a valid rc script name; \
-                     expected SXX-name.kai or SXX-name.md — move non-script files \
-                     out of the verb directory"
-                ));
-            }
-            names.push(name);
-        }
-        // Lexical filename sort == (sort_key, name) order: the filename is
-        // `{sort_key}-{name}.{ext}`, so S00 < S10 and ties break on name.
-        names.sort();
-
-        let mut scripts = Vec::with_capacity(names.len());
-        for name in names {
-            let path = paths::rc_script_path(context_type, verb, &name);
-            // Read straight through the VFS to the host rc tree (no
-            // FileDocumentCache mirror). Any read failure on a file we just enumerated is
-            // corruption — boot WITHOUT the stance is worse than failing loud
-            // (stance = the model's ethical posture), so this stays fatal.
-            let bytes = match vfs.read_all(std::path::Path::new(&path)).await {
-                Ok(b) => b,
-                Err(e) => return Err(format!("rc lifecycle: read {path}: {e}")),
-            };
-            let content = String::from_utf8(bytes)
-                .map_err(|e| format!("rc lifecycle: read {path}: not valid UTF-8: {e}"))?;
-            let (sort_key, extension) = parse_rc_filename(&name);
-            scripts.push(RcScript {
-                path,
-                sort_key,
-                extension,
-                content,
-            });
-        }
-        Ok(scripts)
-    }
-}
-
-/// Whether one rc script's execution succeeded, for the run log
-/// (`RunGuard::record_script`) and for the whole run's own pass/fail outcome.
-/// `exit_code` is `None` wherever there is no process exit code to report —
-/// an `.md` insert failure, a kaish-init failure, an unsupported extension,
-/// or an exec error — the same shape `insert_rc_failure_block` already uses.
-enum ScriptRunResult {
-    Ok,
-    Failed { exit_code: Option<i32> },
-}
-
-fn run_md_script(
-    dispatcher: &KjDispatcher,
-    new_id: ContextId,
-    script: &RcScript,
-    principal: PrincipalId,
-) -> ScriptRunResult {
-    let after = dispatcher.block_store().last_block_id(new_id);
-    let result = dispatcher.block_store().insert_block_as(
-        new_id,
-        None,
-        after.as_ref(),
-        Role::System,
-        BlockKind::Text,
-        script.content.clone(),
-        Status::Done,
-        ContentType::Markdown,
-        Some(principal),
-    );
-    match result {
-        Ok(_) => ScriptRunResult::Ok,
-        Err(e) => {
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                None,
-                format!("rc .md insert failed: {e}"),
-                principal,
-            );
-            ScriptRunResult::Failed { exit_code: None }
-        }
-    }
-}
-
-// Three disjoint groups: the new context's identity (new_id/parent_id/
-// fork_kind/drift_info), the script's own identity (verb/script/child_depth),
-// and who's running it (extra_vars/principal) — none share a natural owner.
-#[allow(clippy::too_many_arguments)]
-async fn run_kai_script(
-    dispatcher: &KjDispatcher,
-    new_id: ContextId,
-    parent_id: Option<ContextId>,
-    fork_kind: Option<ForkKind>,
-    drift_info: Option<&DriftInfo>,
-    verb: &str,
-    context_type: &str,
-    script: &RcScript,
-    child_depth: u8,
-    extra_vars: &HashMap<String, String>,
-    principal: PrincipalId,
-    actor: PrincipalId,
-    reviewer: Option<PrincipalId>,
-) -> ScriptRunResult {
-    use kaijutsu_types::SessionId;
-
-    // Each rc script runs in its own single-use context shell — a snapshot of
-    // the context's durable state (env + cwd). Scripts evolve durable state
-    // only through the explicit `kj context set` channel, so later scripts in
-    // the phase see earlier ones' deliberate writes, never their transients.
-    // rc uses the bare kj surface (no semantic index): `NoopBlockSource`.
-    let kaish = match EmbeddedKaish::for_context(
-        &dispatcher,
-        "rc",
-        ShellIdentity {
-            requester: principal, performer: actor, reviewer: reviewer,
-            context: new_id, session: SessionId::new(),
-        },
-        ShellPolicy::Rc(RcAuthority { _private: () }),
-        None,
-        std::sync::Arc::new(NoopBlockSource),
-    )
-        .await
-    {
-        Ok(k) => k,
-        Err(e) => {
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                None,
-                format!("rc lifecycle: kaish init failed: {e}"),
-                principal,
-            );
-            return ScriptRunResult::Failed { exit_code: None };
-        }
-    };
-
-    let mut vars: HashMap<String, kaish_kernel::ast::Value> = HashMap::new();
-    vars.insert(
-        "KJ_CONTEXT".into(),
-        kaish_kernel::ast::Value::String(new_id.to_hex()),
-    );
-    vars.insert(
-        "KJ_VERB".into(),
-        kaish_kernel::ast::Value::String(verb.to_string()),
-    );
-    vars.insert(
-        "KJ_CONTEXT_TYPE".into(),
-        kaish_kernel::ast::Value::String(context_type.to_string()),
-    );
-    vars.insert(
-        "KJ_RC_DEPTH".into(),
-        kaish_kernel::ast::Value::String(child_depth.to_string()),
-    );
-    if let Some(pid) = parent_id {
-        vars.insert(
-            "KJ_PARENT_CONTEXT".into(),
-            kaish_kernel::ast::Value::String(pid.to_hex()),
-        );
-    }
-    if let Some(fk) = fork_kind {
-        let json = serde_json::json!({
-            "kind": fk.as_str(),
-            "parent": parent_id.map(|p| p.to_hex()),
-        });
-        vars.insert(
-            "KJ_FORK_INFO".into(),
-            kaish_kernel::ast::Value::String(json.to_string()),
-        );
-        // Parent's block count at fork time = the number of blocks
-        // copied into the child (for shallow/full forks; for compact
-        // forks the child has a summary, so this is the
-        // pre-summarization size). rc-on-fork scripts use it to
-        // compute `MessageIndex(KJ_PARENT_BLOCK_COUNT - 1)` for the
-        // fork-point cache breakpoint without parsing JSON. Captured
-        // from the *parent's* BlockStore because the child's count
-        // already includes the fork-marker block injected before
-        // this rc hook fires (see kj/fork.rs:274).
-        if let Some(pid) = parent_id {
-            let count = dispatcher
-                .block_store()
-                .block_snapshots(pid)
-                .map(|b| b.len())
-                .unwrap_or(0);
-            vars.insert(
-                "KJ_PARENT_BLOCK_COUNT".into(),
-                kaish_kernel::ast::Value::String(count.to_string()),
-            );
-        }
-    }
-    if let Some(di) = drift_info {
-        let json = serde_json::json!({
-            "kind": di.kind.as_str(),
-            "source": di.source_ctx.to_hex(),
-            "target": di.target_ctx.to_hex(),
-            "source_model": di.source_model,
-        });
-        vars.insert(
-            "KJ_DRIFT_INFO".into(),
-            kaish_kernel::ast::Value::String(json.to_string()),
-        );
-    }
-
-    // Caller-supplied vars (the musician's transport heartbeat: $TICK/$PHRASE/
-    // $TEMPO). Folded in last; a deliberate KJ_* collision would override, but
-    // the heartbeat names don't use that prefix.
-    for (k, v) in extra_vars {
-        vars.insert(k.clone(), kaish_kernel::ast::Value::String(v.clone()));
-    }
-
-    // Every `.kai` script runs under the kernel-wide `rc_script_timeout`
-    // budget. (Per-script overrides were dropped with the move to files;
-    // a `kj` knob can re-introduce them later via frontmatter/sidecar.)
-    let timeout = kaish.timeouts().rc_script_timeout;
-    let opts = kaish_kernel::ExecuteOptions::new()
-        .with_vars(vars)
-        .with_timeout(timeout);
-    match kaish.execute_with_options(&script.content, opts).await {
-        Ok(exec) if exec.code == 0 => {
-            // Capture stdout/stderr from a successful run into a Trace
-            // block. Hidden from the LLM (Trace skips hydrate) but kept
-            // in the conversation document for operator debugging and
-            // potential downstream UI surfaces. No block at all when the
-            // script was silent — avoids littering the doc with empties.
-            let stdout = exec.text_out();
-            if !stdout.is_empty() || !exec.err.is_empty() {
-                insert_rc_trace_block(
-                    dispatcher,
-                    new_id,
-                    &script.path,
-                    &script.sort_key,
-                    tail_output(&stdout, &exec.err),
-                    principal,
-                );
-            }
-            ScriptRunResult::Ok
-        }
-        Ok(exec) => {
-            let stdout = exec.text_out().into_owned();
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                Some(exec.code as i32),
-                tail_output(&stdout, &exec.err),
-                principal,
-            );
-            ScriptRunResult::Failed { exit_code: Some(exec.code as i32) }
-        }
-        Err(e) => {
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                None,
-                format!("rc kaish exec error: {e}"),
-                principal,
-            );
-            ScriptRunResult::Failed { exit_code: None }
-        }
-    }
-}
-
-fn tail_output(stdout: &str, stderr: &str) -> String {
-    let mut combined = String::new();
-    if !stdout.is_empty() {
-        combined.push_str("--- stdout ---\n");
-        combined.push_str(stdout);
-        combined.push('\n');
-    }
-    if !stderr.is_empty() {
-        combined.push_str("--- stderr ---\n");
-        combined.push_str(stderr);
-    }
-    if combined.len() <= RC_FAILURE_OUTPUT_TAIL_BYTES {
-        return combined;
-    }
-    let cut = combined.len() - RC_FAILURE_OUTPUT_TAIL_BYTES;
-    let mut start = cut;
-    while start < combined.len() && !combined.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("[truncated]\n{}", &combined[start..])
-}
-
-/// Current time as Unix milliseconds, for the run log's per-script
-/// `started_at`/`finished_at`. `approval_ledger::time::now_millis` (what
-/// `rc_runs::finish_run` uses for the run row itself) is `pub(crate)` to
-/// that crate, so this is a small local twin rather than a cross-crate
-/// visibility change for one call site. Both timestamps are captured here
-/// in Rust, not left to `rc_run_scripts.started_at`'s SQL `DEFAULT` — that
-/// default only fires at INSERT time, which is after the script already
-/// ran, so relying on it would make `started_at` always >= `finished_at`.
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// Guarantees the run-log row started in `run_rc_lifecycle_inner` gets a
-/// `finish_run` call on every exit from that function, mirroring
-/// `AbandonOnDrop` in `kj/gate.rs`: the outcome is set explicitly wherever
-/// it's known (via [`RunGuard::finish`]), and `Drop` is the backstop for a
-/// path someone adds later and forgets to wire. An unfinished row is exactly
-/// what this log exists to make visible, so the backstop marks it `Failed`,
-/// never `Ok` — silently leaving a run unfinished-looking-fine would recreate
-/// the very incident this crate was filed for.
-///
-/// `run_id` is `None` when `start_run` itself failed to record (a ledger
-/// write failure that must not block the lifecycle — see the call site's
-/// comment); every method here is then a harmless no-op, so the rest of
-/// `run_rc_lifecycle_inner` doesn't need its own "is the run log even up"
-/// branch.
-struct RunGuard<'a> {
-    dispatcher: &'a KjDispatcher,
-    run_id: Option<String>,
-}
-
-impl<'a> RunGuard<'a> {
-    fn new(dispatcher: &'a KjDispatcher, run_id: Option<String>) -> Self {
-        Self { dispatcher, run_id }
-    }
-
-    /// Record how many scripts this run intends to execute, best-effort for
-    /// the same reason [`RunGuard::record_script`] is: the run log rides
-    /// alongside the lifecycle and never gates it.
-    fn record_script_count(&self, count: usize) {
-        let Some(run_id) = self.run_id.as_deref() else {
-            return;
-        };
-        let db = self.dispatcher.kernel_db().lock();
-        if let Err(e) = rc_runs::set_run_script_count(db.conn_for_ledger(), run_id, count) {
-            tracing::warn!("rc lifecycle: run log set_run_script_count failed for {run_id}: {e}");
-        }
-    }
-
-    /// Record one script's execution in the run log, best-effort. A failure
-    /// here degrades to a `tracing::warn!` for the same reason `start_run`'s
-    /// does: this is observability riding alongside the lifecycle, not
-    /// gating it, so a second database's hiccup must never cost a context
-    /// its rc scripts.
-    ///
-    /// `started_at` must be captured by the caller immediately before the
-    /// script ran — this method (and the INSERT it drives) only happens
-    /// *after* the script has already finished, so leaving `started_at` to
-    /// the SQL `DEFAULT` would stamp it at insert time and make it
-    /// impossible for `started_at` to precede `finished_at`.
-    fn record_script(&self, script: &RcScript, started_at: i64, result: &ScriptRunResult) {
-        let Some(run_id) = self.run_id.as_deref() else {
-            return;
-        };
-        let db = self.dispatcher.kernel_db().lock();
-        let conn = db.conn_for_ledger();
-        let sha256 = match rc_runs::insert_script_body(conn, &script.content) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    "rc lifecycle: run log insert_script_body failed for {}: {e}",
-                    script.path
-                );
-                return;
-            }
-        };
-        let exit_code = match result {
-            ScriptRunResult::Ok => Some(0i64),
-            ScriptRunResult::Failed { exit_code } => exit_code.map(i64::from),
-        };
-        if let Err(e) = rc_runs::record_run_script(
-            conn,
-            run_id,
-            &script.path,
-            &sha256,
-            exit_code,
-            started_at,
-            Some(now_millis()),
-        ) {
-            tracing::warn!(
-                "rc lifecycle: run log record_run_script failed for {}: {e}",
-                script.path
-            );
-        }
-    }
-
-    /// Finish the run with `outcome`. Idempotent — the first call clears
-    /// `run_id`, so a later call (including the one from `Drop` on the
-    /// ordinary path) is a no-op rather than a second write against an
-    /// already-finished row (which `finish_run` refuses loudly; swallowing
-    /// that here would be exactly the silent-fallback CLAUDE.md warns
-    /// against, so this avoids it structurally instead).
-    fn finish(&mut self, outcome: RcOutcome) {
-        let Some(run_id) = self.run_id.take() else {
-            return;
-        };
-        let db = self.dispatcher.kernel_db().lock();
-        if let Err(e) = rc_runs::finish_run(db.conn_for_ledger(), &run_id, outcome) {
-            tracing::warn!("rc lifecycle: run log finish_run failed for {run_id}: {e}");
-        }
-    }
-}
-
-impl Drop for RunGuard<'_> {
-    fn drop(&mut self) {
-        // Only reached if some exit path forgot to call `finish` explicitly —
-        // see the struct doc for why the backstop outcome is `Failed`.
-        self.finish(RcOutcome::Failed);
-    }
-}
-
-fn insert_rc_failure_block(
-    dispatcher: &KjDispatcher,
-    new_id: ContextId,
-    rc_path: &str,
-    sort_key: &str,
-    exit_code: Option<i32>,
-    detail: String,
-    principal: PrincipalId,
-) {
-    // Hunk #1: emit a plain BlockKind::Error block with the diagnostic in
-    // content. Structured ErrorPayload requires a parent block, which the
-    // freshly-created context may not have. Tracked as a follow-up.
-    let summary = match exit_code {
-        Some(code) => format!(
-            "rc {sort_key} exit {code}: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\nexit_code: {code}\n\n{detail}"
-        ),
-        None => format!(
-            "rc {sort_key} failed: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\nexit_code: n/a\n\n{detail}"
-        ),
-    };
-    insert_rc_output_block(
-        dispatcher,
-        new_id,
-        BlockKind::Error,
-        summary,
-        Status::Error,
-        principal,
-        rc_path,
-        "failure",
-    );
-}
-
-/// Insert one rc capture block, projecting ANSI out of it first.
-///
-/// The RC boot aesthetic (docs/ansi-and-beyond.md) means these are the blocks
-/// most likely to be *deliberately* colorful — an rc script printing `[ OK ]`
-/// in green is the feature, not an accident. So the whole assembled `summary`
-/// (header lines plus the script's captured output) is what gets projected and
-/// what gets stored as the original: span offsets address block content, and
-/// the header prefix is part of that content. Projecting the detail alone
-/// would leave every offset short by the header's length.
-///
-/// The spans arrive as a follow-up `set_style_spans` rather than riding the
-/// inserted snapshot. That is one extra journal op on a path that runs once
-/// per context creation, and it buys the ordering rule stated in
-/// [`crate::ansi_ingest`] — text first, spans second — without every insert
-/// helper in the kernel needing to grow a spans argument.
-#[allow(clippy::too_many_arguments)]
-fn insert_rc_output_block(
-    dispatcher: &KjDispatcher,
-    new_id: ContextId,
-    kind: BlockKind,
-    summary: String,
-    status: Status,
-    principal: PrincipalId,
-    rc_path: &str,
-    what: &str,
-) {
-    let projection = crate::ansi_ingest::project(summary.as_bytes());
-    let original = projection.as_ref().map(|_| summary.clone());
-    let content = match projection {
-        Some(ref p) => p.text.clone(),
-        None => summary,
-    };
-    let after = dispatcher.block_store().last_block_id(new_id);
-    match dispatcher.block_store().insert_block_as(
-        new_id,
-        None,
-        after.as_ref(),
-        Role::System,
-        kind,
-        content,
-        status,
-        ContentType::Plain,
-        Some(principal),
-    ) {
-        Ok(block_id) => {
-            if let (Some(p), Some(original)) = (projection, original) {
-                crate::ansi_ingest::record(
-                    dispatcher.block_store(),
-                    new_id,
-                    &block_id,
-                    p.spans,
-                    original.as_bytes(),
-                );
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                "rc lifecycle: could not insert {what} block for {rc_path}: {e}"
-            );
-        }
-    }
-}
-
-/// Insert a `BlockKind::Trace` block capturing the stdout/stderr of a
-/// successful rc `.kai` script. Hidden from the LLM (the hydrator skips
-/// `Trace` unconditionally) but available in the conversation document
-/// for operator inspection.
-fn insert_rc_trace_block(
-    dispatcher: &KjDispatcher,
-    new_id: ContextId,
-    rc_path: &str,
-    sort_key: &str,
-    detail: String,
-    principal: PrincipalId,
-) {
-    let summary = format!(
-        "rc {sort_key} trace: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\n\n{detail}"
-    );
-    insert_rc_output_block(
-        dispatcher,
-        new_id,
-        BlockKind::Trace,
-        summary,
-        Status::Done,
-        principal,
-        rc_path,
-        "trace",
-    );
-}
-
-fn log_unwired_verb_once(verb: &str) {
-    // Every verb in RC_VERBS is wired to a call site. This stays a no-op
-    // so a future reserved verb can plug in here without touching the
-    // caller.
-    let _ = verb;
-}
-
-#[cfg(test)]
-mod tests {
     use super::*;
     use crate::kj::test_helpers::*;
     use kaijutsu_types::{ContextId, PrincipalId};
 
-    /// Install an rc script as a file in the mounted `/config/rc` tree. The
-    /// structural args (type/verb/sort/name/ext) are redundant now that the
-    /// path encodes them — kept so existing call sites stay unchanged — and
-    /// only `path` + `content` are used.
-    async fn install_script(
-        dispatcher: &KjDispatcher,
-        path: &str,
-        _context_type: &str,
-        _verb: &str,
-        _sort_key: &str,
-        _name: &str,
-        _ext: &str,
-        content: &str,
-    ) {
-        install_rc_script_file(dispatcher, path, content).await;
+    #[tokio::test]
+    async fn unknown_lifecycle_verb_is_an_error() {
+        let d = test_dispatcher().await;
+        let caller = unjoined_caller();
+        let result = crate::rc::run(
+            &d,
+            crate::rc::RcInvocation::new("cretae", ContextId::new()),
+            &caller,
+        ).await;
+        assert!(result.is_err(), "an unknown lifecycle verb must not succeed without running");
+        assert!(result.unwrap_err().contains("cretae"));
     }
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -1095,16 +73,7 @@ mod tests {
     async fn rc_create_md_inserts_block() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-prompt.md",
-            "test",
-            "create",
-            "S00",
-            "prompt",
-            "md",
-            "You are a test context. Be terse.",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-prompt.md", "You are a test context. Be terse.").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-md", "--type", "test"]), &caller)
@@ -1224,16 +193,7 @@ mod tests {
     async fn rc_create_kai_runs_script() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-noop.kai",
-            "test",
-            "create",
-            "S00",
-            "noop",
-            "kai",
-            "true",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-kai", "--type", "test"]), &caller)
@@ -1256,16 +216,7 @@ mod tests {
     async fn rc_kai_stdout_captured_as_trace_block() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-echo.kai",
-            "test",
-            "create",
-            "S00",
-            "echo",
-            "kai",
-            "echo \"hello from rc\"",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-echo.kai", "echo \"hello from rc\"").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -1313,7 +264,7 @@ mod tests {
     }
 
     /// The lifecycle resolves `context_type` before any script runs
-    /// (`row.context_type`, read once in `run_rc_lifecycle_inner`) but never
+    /// (`row.context_type`, read once in `rc::run`) but never
     /// told `.kai` scripts what it found. `KJ_CONTEXT_TYPE` closes that gap so
     /// a shared rc bucket can branch on it:
     /// `case "$KJ_CONTEXT_TYPE" in coder) ... esac`.
@@ -1321,16 +272,7 @@ mod tests {
     async fn rc_kai_receives_context_type() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-echo-type.kai",
-            "test",
-            "create",
-            "S00",
-            "echo-type",
-            "kai",
-            "echo \"type=$KJ_CONTEXT_TYPE\"",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-echo-type.kai", "echo \"type=$KJ_CONTEXT_TYPE\"").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-type", "--type", "test"]), &caller)
@@ -1369,18 +311,9 @@ mod tests {
         // nothing about the row.)
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-color.kai",
-            "test",
-            "create",
-            "S00",
-            "color",
-            "kai",
-            // A literal ESC byte in the script source — the classic
+        install_rc_script_file(&d, "/config/rc/test/create/S00-color.kai", // A literal ESC byte in the script source — the classic
             // `[ OK ]`-in-green boot line, in miniature.
-            "echo \"[ \u{1b}[32mOK\u{1b}[0m ] booted\"",
-        ).await;
+            "echo \"[ \u{1b}[32mOK\u{1b}[0m ] booted\"").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-color", "--type", "test"]), &caller)
@@ -1429,7 +362,7 @@ mod tests {
         );
     }
 
-    /// The musician transport seam: `run_rc_lifecycle_with_vars` must seed the
+    /// The musician transport seam: `rc::run` must seed the
     /// extra vars into the `.kai` env so a `tick` script can read `$TICK` /
     /// `$PHRASE` / `$TEMPO` and compose the turn's transport report. Echoes the
     /// vars and asserts they round-trip through the captured Trace block.
@@ -1437,16 +370,7 @@ mod tests {
     async fn rc_lifecycle_with_vars_seeds_kai_env() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/tick/S00-report.kai",
-            "test",
-            "tick",
-            "S00",
-            "report",
-            "kai",
-            "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"",
-        )
+        install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"")
         .await;
         let caller = unjoined_caller();
         let result = d
@@ -1462,7 +386,14 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        d.run_rc_lifecycle_with_vars("tick", new_id, None, None, None, &vars, &caller)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation {
+                vars: vars.clone(),
+                ..crate::rc::RcInvocation::new("tick", new_id)
+            },
+            &caller,
+        )
             .await
             .expect("tick lifecycle");
 
@@ -1485,16 +416,7 @@ mod tests {
     async fn rc_lifecycle_without_vars_leaves_heartbeat_empty() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/tick/S00-report.kai",
-            "test",
-            "tick",
-            "S00",
-            "report",
-            "kai",
-            "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"",
-        )
+        install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"")
         .await;
         let caller = unjoined_caller();
         let result = d
@@ -1504,7 +426,11 @@ mod tests {
         let new_id = lookup_context_id(&d, "ctx-novars");
 
         // The plain lifecycle (no extra vars) leaves the heartbeat unset.
-        d.run_rc_lifecycle("tick", new_id, None, None, None, &caller)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation::new("tick", new_id),
+            &caller,
+        )
             .await
             .expect("tick lifecycle");
 
@@ -1535,16 +461,7 @@ mod tests {
     async fn rc_md_block_is_authored_by_context_owner_not_caller() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/tick/S00-stance.md",
-            "test",
-            "tick",
-            "S00",
-            "stance",
-            "md",
-            "Play to the beat.",
-        )
+        install_rc_script_file(&d, "/config/rc/test/tick/S00-stance.md", "Play to the beat.")
         .await;
 
         // Owner creates the context; `created_by` follows the creating caller.
@@ -1565,7 +482,11 @@ mod tests {
             "fixture must use two distinct principals or the assertion is vacuous"
         );
 
-        d.run_rc_lifecycle("tick", new_id, None, None, None, &visitor)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation::new("tick", new_id),
+            &visitor,
+        )
             .await
             .expect("tick lifecycle");
 
@@ -1590,16 +511,7 @@ mod tests {
     async fn rc_kai_trace_block_is_authored_by_context_owner_not_caller() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/tick/S00-report.kai",
-            "test",
-            "tick",
-            "S00",
-            "report",
-            "kai",
-            "echo \"the beat goes on\"",
-        )
+        install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"the beat goes on\"")
         .await;
 
         let owner = unjoined_caller();
@@ -1618,7 +530,11 @@ mod tests {
             "fixture must use two distinct principals or the assertion is vacuous"
         );
 
-        d.run_rc_lifecycle("tick", new_id, None, None, None, &visitor)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation::new("tick", new_id),
+            &visitor,
+        )
             .await
             .expect("tick lifecycle");
 
@@ -1641,27 +557,9 @@ mod tests {
     async fn rc_nested_context_keeps_the_lead_as_director_and_its_reviewer() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-spawn-coder.kai",
-            "test",
-            "create",
-            "S00",
-            "spawn-coder",
-            "kai",
-            "kj context create child-work --type child --as coder",
-        )
+        install_rc_script_file(&d, "/config/rc/test/create/S00-spawn-coder.kai", "kj context create child-work --type child --as coder")
         .await;
-        install_script(
-            &d,
-            "/config/rc/child/create/S00-noop.kai",
-            "child",
-            "create",
-            "S00",
-            "noop",
-            "kai",
-            "true",
-        )
+        install_rc_script_file(&d, "/config/rc/child/create/S00-noop.kai", "true")
         .await;
 
         let mut caller = unjoined_caller();
@@ -1719,29 +617,11 @@ mod tests {
     async fn rc_failure_block_is_authored_by_context_owner_not_caller() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/tick/S00-broken.zzz",
-            "test",
-            "tick",
-            "S00",
-            "broken",
-            "zzz",
-            "this extension has no handler",
-        )
+        install_rc_script_file(&d, "/config/rc/test/tick/S00-broken.zzz", "this extension has no handler")
         .await;
         // `.zzz` is filtered out by the loader; use a `.kai` that exits nonzero
         // to reach the failure path through a supported extension.
-        install_script(
-            &d,
-            "/config/rc/test/tick/S01-fail.kai",
-            "test",
-            "tick",
-            "S01",
-            "fail",
-            "kai",
-            "exit 3",
-        )
+        install_rc_script_file(&d, "/config/rc/test/tick/S01-fail.kai", "exit 3")
         .await;
 
         let owner = unjoined_caller();
@@ -1757,7 +637,11 @@ mod tests {
         let visitor = unjoined_caller();
         assert_ne!(owner.principal_id, visitor.principal_id);
 
-        d.run_rc_lifecycle("tick", new_id, None, None, None, &visitor)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation::new("tick", new_id),
+            &visitor,
+        )
             .await
             .expect("tick lifecycle");
 
@@ -1823,7 +707,15 @@ mod tests {
             .unwrap();
 
         let caller = caller_with_context(child);
-        d.run_rc_lifecycle("fork", child, Some(parent), Some(fork_kind), None, &caller)
+        crate::rc::run(
+            &d,
+            crate::rc::RcInvocation {
+                parent: Some(parent),
+                fork_kind: Some(fork_kind),
+                ..crate::rc::RcInvocation::new("fork", child)
+            },
+            &caller,
+        )
             .await
             .expect("fork lifecycle");
         // The script must not have errored (e.g. a denied/failed `kj` call).
@@ -1864,16 +756,7 @@ mod tests {
     async fn rc_kai_silent_success_inserts_no_trace_block() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-silent.kai",
-            "test",
-            "create",
-            "S00",
-            "silent",
-            "kai",
-            "true",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-silent.kai", "true").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -1899,16 +782,7 @@ mod tests {
     async fn rc_kai_trace_block_is_hidden_from_llm_hydrate() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-echo.kai",
-            "test",
-            "create",
-            "S00",
-            "echo",
-            "kai",
-            "echo MODEL_MUST_NOT_SEE_THIS",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-echo.kai", "echo MODEL_MUST_NOT_SEE_THIS").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -1961,16 +835,7 @@ mod tests {
         // kaish `sleep` builtin honors `ctx.cancel`, so the timer-induced
         // cancel surfaces as exit 130; the kernel then maps the elapsed
         // timeout to exit 124 with a "timed out" message in stderr.
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-slow.kai",
-            "test",
-            "create",
-            "S00",
-            "slow",
-            "kai",
-            "sleep 10",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-slow.kai", "sleep 10").await;
 
         let caller = unjoined_caller();
         let started = std::time::Instant::now();
@@ -2037,16 +902,7 @@ mod tests {
 
         // Script asserts overlay vars are populated and that `kj` is
         // callable. Exit 0 → no error block; non-zero → error block.
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-introspect.kai",
-            "test",
-            "create",
-            "S00",
-            "introspect",
-            "kai",
-            "[[ -n \"$KJ_CONTEXT\" ]] && [[ -n \"$KJ_VERB\" ]] && kj context list",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-introspect.kai", "[[ -n \"$KJ_CONTEXT\" ]] && [[ -n \"$KJ_VERB\" ]] && kj context list").await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -2067,8 +923,8 @@ mod tests {
     /// `context_type = "nonexistent"` has an rc bucket (`/config/rc/nonexistent/`,
     /// which `context create` requires) but no `create/` verb directory under
     /// `test_dispatcher()`'s host-backed `LocalBackend` mount. `dispatch`'s own `Ok` and an empty
-    /// context alone don't distinguish "load_rc_scripts correctly saw zero
-    /// scripts" from "load_rc_scripts errored and `context.rs` swallowed it"
+    /// context alone don't distinguish "load_scripts correctly saw zero
+    /// scripts" from "load_scripts errored and `context.rs` swallowed it"
     /// (`context create` logs-and-continues on an rc-lifecycle `Err`, per the
     /// comment at its call site) — both leave the same block-free context and
     /// the same `Ok` dispatch result. The run row's typed outcome is what
@@ -2078,7 +934,7 @@ mod tests {
         use crate::vfs::VfsOps;
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        d.kernel
+        d.kernel()
             .vfs()
             .mkdir(std::path::Path::new("/config/rc/nonexistent"), 0o755)
             .await
@@ -2145,7 +1001,7 @@ mod tests {
         use crate::vfs::VfsOps;
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        let vfs = d.kernel.vfs();
+        let vfs = d.kernel().vfs();
         vfs.mkdir(std::path::Path::new("/config/rc/nothinghere"), 0o755)
             .await
             .expect("an rc bucket");
@@ -2245,26 +1101,8 @@ mod tests {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         // S00 returns non-zero; S10 is benign.
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-fail.kai",
-            "test",
-            "create",
-            "S00",
-            "fail",
-            "kai",
-            "exit 17",
-        ).await;
-        install_script(
-            &d,
-            "/config/rc/test/create/S10-after.md",
-            "test",
-            "create",
-            "S10",
-            "after",
-            "md",
-            "ran-after-failure",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-fail.kai", "exit 17").await;
+        install_rc_script_file(&d, "/config/rc/test/create/S10-after.md", "ran-after-failure").await;
 
         let caller = unjoined_caller();
         let result = d
@@ -2298,24 +1136,18 @@ mod tests {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         // `.md` script lands its content as a block on the target.
-        install_script(
-            &d,
-            "/config/rc/test/attach/S00-banner.md",
-            "test",
-            "attach",
-            "S00",
-            "banner",
-            "md",
-            "attach-banner-content",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/attach/S00-banner.md", "attach-banner-content").await;
 
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("attach-target"), None, principal);
         set_context_type(&d, target, "test");
 
         let caller = caller_with_context(target);
-        let res = d
-            .run_rc_lifecycle("attach", target, None, None, None, &caller)
+        let res = crate::rc::run(
+            &d,
+            crate::rc::RcInvocation::new("attach", target),
+            &caller,
+        )
             .await;
         assert!(res.is_ok(), "attach lifecycle should succeed, got: {res:?}");
 
@@ -2330,16 +1162,7 @@ mod tests {
     async fn rc_recursion_guard_caps_depth() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-noop.md",
-            "test",
-            "create",
-            "S00",
-            "noop",
-            "md",
-            "would-run",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.md", "would-run").await;
         let mut caller = unjoined_caller();
         caller.rc_depth = MAX_RC_DEPTH; // simulate already-deep invocation
 
@@ -2386,15 +1209,7 @@ mod tests {
         d.set_self_arc();
         // .kai script asserts overlay vars look right for a Pull drift.
         // No `kj` calls — so set_self_arc is unnecessary.
-        install_script(
-            &d,
-            "/config/rc/test/drift/S00-introspect.kai",
-            "test",
-            "drift",
-            "S00",
-            "introspect",
-            "kai",
-            r#"
+        install_rc_script_file(&d, "/config/rc/test/drift/S00-introspect.kai", r#"
 [[ -n "$KJ_VERB" ]] || exit 1
 [[ -n "$KJ_CONTEXT" ]] || exit 2
 [[ -n "$KJ_DRIFT_INFO" ]] || exit 3
@@ -2406,8 +1221,7 @@ case "$KJ_DRIFT_INFO" in
   *'"kind":"pull"'*) ;;
   *) exit 5 ;;
 esac
-"#,
-        ).await;
+"#).await;
 
         let principal = PrincipalId::new();
         let dst = register_context(&d, Some("dst"), None, principal);
@@ -2415,20 +1229,19 @@ esac
         let src = register_context(&d, Some("src"), None, principal);
 
         let caller = caller_with_context(dst);
-        let res = d
-            .run_rc_lifecycle(
-                "drift",
-                dst,
-                None,
-                None,
-                Some(DriftInfo {
+        let res = crate::rc::run(
+            &d,
+            crate::rc::RcInvocation {
+                drift: Some(DriftInfo {
                     kind: DriftKind::Pull,
                     source_ctx: src,
                     target_ctx: dst,
                     source_model: Some("claude-opus-4-7".into()),
                 }),
-                &caller,
-            )
+                ..crate::rc::RcInvocation::new("drift", dst)
+            },
+            &caller,
+        )
             .await;
         assert!(res.is_ok(), "drift rc errored: {res:?}");
 
@@ -2444,15 +1257,7 @@ esac
     async fn rc_drift_merge_runs_with_target_overlay() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/drift/S00-introspect.kai",
-            "test",
-            "drift",
-            "S00",
-            "introspect",
-            "kai",
-            r#"
+        install_rc_script_file(&d, "/config/rc/test/drift/S00-introspect.kai", r#"
 [[ -n "$KJ_VERB" ]] || exit 1
 case "$KJ_VERB" in
   drift) ;;
@@ -2462,8 +1267,7 @@ case "$KJ_DRIFT_INFO" in
   *'"kind":"merge"'*) ;;
   *) exit 3 ;;
 esac
-"#,
-        ).await;
+"#).await;
 
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
@@ -2471,20 +1275,19 @@ esac
         let child = register_context(&d, Some("child"), Some(parent), principal);
 
         let caller = caller_with_context(child);
-        let res = d
-            .run_rc_lifecycle(
-                "drift",
-                parent,
-                None,
-                None,
-                Some(DriftInfo {
+        let res = crate::rc::run(
+            &d,
+            crate::rc::RcInvocation {
+                drift: Some(DriftInfo {
                     kind: DriftKind::Merge,
                     source_ctx: child,
                     target_ctx: parent,
                     source_model: None,
                 }),
-                &caller,
-            )
+                ..crate::rc::RcInvocation::new("drift", parent)
+            },
+            &caller,
+        )
             .await;
         assert!(res.is_ok(), "drift rc errored: {res:?}");
 
@@ -2500,16 +1303,7 @@ esac
     async fn rc_drift_flush_fires_per_item() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/drift/S00-marker.md",
-            "test",
-            "drift",
-            "S00",
-            "marker",
-            "md",
-            "DRIFT-MARKER",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/drift/S00-marker.md", "DRIFT-MARKER").await;
 
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -2551,26 +1345,8 @@ esac
     async fn rc_drift_script_failure_inserts_error_continues_flush() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/drift/S00-fail.kai",
-            "test",
-            "drift",
-            "S00",
-            "fail",
-            "kai",
-            "exit 17",
-        ).await;
-        install_script(
-            &d,
-            "/config/rc/test/drift/S10-after.md",
-            "test",
-            "drift",
-            "S10",
-            "after",
-            "md",
-            "AFTER-MARKER",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/drift/S00-fail.kai", "exit 17").await;
+        install_rc_script_file(&d, "/config/rc/test/drift/S10-after.md", "AFTER-MARKER").await;
 
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -2613,26 +1389,8 @@ esac
     async fn rc_drift_compact_fork_does_not_double_fire() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/fork/S00-fork.md",
-            "test",
-            "fork",
-            "S00",
-            "fork-marker",
-            "md",
-            "FORK-MARKER",
-        ).await;
-        install_script(
-            &d,
-            "/config/rc/test/drift/S00-drift.md",
-            "test",
-            "drift",
-            "S00",
-            "drift-marker",
-            "md",
-            "DRIFT-MARKER",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/fork/S00-fork.md", "FORK-MARKER").await;
+        install_rc_script_file(&d, "/config/rc/test/drift/S00-drift.md", "DRIFT-MARKER").await;
 
         let caller = unjoined_caller();
         let r = d
@@ -2717,15 +1475,7 @@ esac
         // fork-marker block by the time this rc hook fires.
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/fork/S00-assert-parent-count.kai",
-            "test",
-            "fork",
-            "S00",
-            "assert-parent-count",
-            "kai",
-            // Three explicit assertions, each with a distinct exit code
+        install_rc_script_file(&d, "/config/rc/test/fork/S00-assert-parent-count.kai", // Three explicit assertions, each with a distinct exit code
             // so a regression points at the right one:
             //   exit 1 — env var missing
             //   exit 2 — env var not a positive integer
@@ -2739,8 +1489,7 @@ case "$KJ_PARENT_BLOCK_COUNT" in
   3) ;;
   *) exit 3 ;;
 esac
-"#,
-        ).await;
+"#).await;
 
         // Parent context, typed "test" so the fork hook above fires.
         let caller = unjoined_caller();
@@ -2815,21 +1564,12 @@ esac
         // parent, so the var must be absent (not "0", not "").
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-no-parent-count.kai",
-            "test",
-            "create",
-            "S00",
-            "no-parent-count",
-            "kai",
-            // Exit 99 if the var is set to anything. Empty/unset env
+        install_rc_script_file(&d, "/config/rc/test/create/S00-no-parent-count.kai", // Exit 99 if the var is set to anything. Empty/unset env
             // vars in kaish expand to empty string under `$VAR`, so
             // `[[ -z … ]]` catches both.
             r#"
 [[ -z "$KJ_PARENT_BLOCK_COUNT" ]] || exit 99
-"#,
-        ).await;
+"#).await;
 
         let caller = unjoined_caller();
         let r = d
@@ -2853,26 +1593,8 @@ esac
     async fn rc_fork_does_not_trigger_create_scripts() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-only-create.md",
-            "test",
-            "create",
-            "S00",
-            "only-create",
-            "md",
-            "CREATE-MARKER",
-        ).await;
-        install_script(
-            &d,
-            "/config/rc/test/fork/S00-only-fork.md",
-            "test",
-            "fork",
-            "S00",
-            "only-fork",
-            "md",
-            "FORK-MARKER",
-        ).await;
+        install_rc_script_file(&d, "/config/rc/test/create/S00-only-create.md", "CREATE-MARKER").await;
+        install_rc_script_file(&d, "/config/rc/test/fork/S00-only-fork.md", "FORK-MARKER").await;
 
         // Step 1: create parent (CREATE-MARKER appears in parent).
         let caller = unjoined_caller();
@@ -2932,16 +1654,7 @@ esac
         };
         let d = crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await;
 
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-slow.kai",
-            "test",
-            "create",
-            "S00",
-            "slow",
-            "kai",
-            "sleep 1 && echo never-reached",
-        )
+        install_rc_script_file(&d, "/config/rc/test/create/S00-slow.kai", "sleep 1 && echo never-reached")
         .await;
 
         let caller = unjoined_caller();
@@ -3224,16 +1937,7 @@ esac
     async fn a_failing_rc_script_leaves_a_finished_run_with_failed_outcome() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-fail.kai",
-            "test",
-            "create",
-            "S00",
-            "fail",
-            "kai",
-            "exit 9",
-        )
+        install_rc_script_file(&d, "/config/rc/test/create/S00-fail.kai", "exit 9")
         .await;
         let caller = unjoined_caller();
         let result = d
@@ -3266,16 +1970,7 @@ esac
     async fn a_successful_rc_lifecycle_records_a_finished_ok_run() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-noop.kai",
-            "test",
-            "create",
-            "S00",
-            "noop",
-            "kai",
-            "true",
-        )
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true")
         .await;
         let caller = unjoined_caller();
         let result = d
@@ -3301,27 +1996,9 @@ esac
     async fn rc_run_records_per_script_rows_in_order() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-first.kai",
-            "test",
-            "create",
-            "S00",
-            "first",
-            "kai",
-            "true",
-        )
+        install_rc_script_file(&d, "/config/rc/test/create/S00-first.kai", "true")
         .await;
-        install_script(
-            &d,
-            "/config/rc/test/create/S10-second.kai",
-            "test",
-            "create",
-            "S10",
-            "second",
-            "kai",
-            "exit 5",
-        )
+        install_rc_script_file(&d, "/config/rc/test/create/S10-second.kai", "exit 5")
         .await;
         let caller = unjoined_caller();
         let result = d
@@ -3365,16 +2042,7 @@ esac
     async fn a_recursion_guarded_run_still_finishes_as_failed() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
-        install_script(
-            &d,
-            "/config/rc/test/create/S00-noop.md",
-            "test",
-            "create",
-            "S00",
-            "noop",
-            "md",
-            "would-run",
-        )
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.md", "would-run")
         .await;
         let mut caller = unjoined_caller();
         caller.rc_depth = MAX_RC_DEPTH;
@@ -3478,4 +2146,3 @@ esac
         assert!(RC_VERBS.contains(&VERB_SUBMIT));
         assert!(verb_is_wired("submit"));
     }
-}

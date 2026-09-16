@@ -44,7 +44,7 @@ async fn harness() -> Harness {
 
     // Seed and mount a private `/config/rc` tree — the same setup the server RPC
     // boot path (kaijutsu-server/src/rpc.rs) and the unit-test helper
-    // (kj::test_helpers) perform. Without it, `load_rc_scripts` hits
+    // (kj::test_helpers) perform. Without it, `load_scripts` hits
     // `NoMountPoint`, finds no scripts, and the role lifecycle never runs —
     // which is exactly what these tests exist to exercise.
     let rc_dir = tmp.path().join("rc");

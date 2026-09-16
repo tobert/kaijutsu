@@ -41,6 +41,7 @@ pub mod model_resolution;
 pub mod peers;
 pub mod roster;
 pub mod roster_sources;
+pub mod rc;
 pub mod runtime;
 pub mod secret_source;
 pub mod seed_backends;
