@@ -165,9 +165,11 @@ authority supplied by lifecycle orchestration. Missing dispatcher registration
 fails construction.
 
 Rc, hook, and editor callers interpret their own results. Interactive commands
-and approval resume share server `shell_run.rs`; MCP shell completion has a
-separate path. Cwd/export write-back helpers still live in server `rpc.rs`.
-These are the ownership gaps the migration must close.
+and approval resume share `runtime/command.rs`. Result projections live in
+`runtime/command_result.rs`; `runtime/shell_state.rs` commits changed cwd/exports
+atomically and returns persistence errors. Block completion waits for result
+hooks. Unified outcome projection remains open: MCP asynchronous completion
+still settles separately, and command receipts are still rebuilt from blocks.
 
 `spawn_kaish_thread` in kernel `lib.rs` reserves a 16 MiB stack for dedicated
 threads that can enter kaish. Server `main.rs` configures the Tokio worker

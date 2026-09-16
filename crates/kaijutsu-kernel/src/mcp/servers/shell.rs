@@ -9,6 +9,7 @@
 //! `facade:shell_write` govern visibility and dispatch without a second grant.
 //! Rc selects each context type's loadout; see `docs/gate-and-shell-split.md`.
 
+use crate::runtime::command_result::shell_result_to_envelope;
 use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::sync::{Arc, LazyLock, Weak};
@@ -657,62 +658,6 @@ fn envelope_result(env: kaijutsu_types::shell_envelope::ShellEnvelope) -> Kernel
         content: vec![ToolContent::Json(value.clone())],
         structured: Some(value),
     }
-}
-
-/// Collapse a kaish `ExecResult` into the shared `ShellEnvelope`.
-///
-/// Every `shell` return travels this shape — `docs/shell-envelope.md` is
-/// canonical. The body used to be prose (stdout, with
-/// stderr and `[exit N]` appended) and the envelope a side channel, which made
-/// the model-facing shape depend on whether the body came out empty: a command
-/// with no output fell through to the pretty-printed envelope while every
-/// other command produced text.
-///
-/// A capped result (kaish `did_spill`: exit remapped to 3, real exit stashed
-/// in `original_code`) is judged by the command's REAL exit — truncation is
-/// not failure, and an error here tempts a model into re-running a command
-/// that already succeeded. The truncation stays unmissable as `did_spill`.
-fn shell_result_to_envelope(
-    result: kaish_kernel::interpreter::ExecResult,
-    elapsed_ms: u64,
-) -> kaijutsu_types::shell_envelope::ShellEnvelope {
-    use kaijutsu_types::shell_envelope::ShellEnvelope;
-
-    let exit_code = if result.did_spill {
-        result.original_code.unwrap_or(result.code)
-    } else {
-        result.code
-    };
-    let mut env = ShellEnvelope::new(ShellEnvelope::status_for_exit(exit_code));
-    env.stdout = result.text_out().into_owned();
-    env.stderr = result.err.clone();
-    env.exit_code = Some(exit_code);
-    env.did_spill = Some(result.did_spill);
-    env.elapsed_ms = Some(elapsed_ms);
-    // kj verbs (and any builtin that opts in) attach a structured `.data`
-    // payload — context-id arrays for list commands, records for inspect. Carry
-    // it so consumers don't scrape stdout. `null` when the command set no data
-    // (external commands, echo, …).
-    env.data = result
-        .data
-        .as_ref()
-        .map(kaish_kernel::interpreter::value_to_json);
-    // A `kj` confirmation gate (exit 2, e.g. `kj context remove`) rides
-    // kaish's opaque `baggage` channel, distinct from the data-plane `.data`.
-    // Surface it so a batch loop reads `latch.hint` and re-runs with
-    // `--confirm`, instead of scraping the confirmation prose out of stdout.
-    // `null` when the command didn't latch. kaish's own latch — the one that
-    // used to hold `rm` here on a typed `.latch` field — is gone as of 0.14,
-    // and was never enabled in kaijutsu anyway (`KaishConfig::named` defaults
-    // `latch_enabled` off, and we never called `with_latch`).
-    env.latch = crate::runtime::kj_builtin::latch_from_result(&result).map(|l| {
-        serde_json::json!({
-            "command": l.command,
-            "target": l.target,
-            "hint": l.hint,
-        })
-    });
-    env
 }
 
 #[cfg(test)]

@@ -1520,6 +1520,17 @@ used a symlink's own generation to judge its target's freshness. Scripts use
 supported `dirname`/`basename`; clean symlink reads refresh their targets.
 The remaining dirty-buffer/generation audit is recorded in `docs/issues.md`.
 
+The interactive/approved command owner moved from server `shell_run.rs` to
+`runtime/command.rs`. Result conversion and cwd/export snapshots moved out of
+RPC; MCP envelope construction uses the shared result module. The old server
+module and duplicate text-replacement helper are deleted. Paused result hooks
+reproduced premature Done publication in both interactive execution and the
+structured-kj wire path. Both now defer terminal blocks until hooks settle.
+A late export-write failure also reproduced partial cwd/environment persistence;
+the shared state owner now commits the diff atomically and returns errors.
+Receipts rebuilt from blocks, synthetic-result metadata, and MCP asynchronous
+completion remain unfinished parts of the common outcome contract.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

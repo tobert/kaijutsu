@@ -72,6 +72,25 @@ reads now refresh target content; preserve dirty work while fixing the remaining
 metadata/guard behavior in the file-cache audit. Also check stale-read error
 branches that remove cache entries without preserving editor pins.
 
+Command execution for interactive submissions and approval resume now lives in
+`runtime/command.rs`; server `shell_run.rs` is deleted. Result projections and
+shell-state persistence moved out of RPC too. Paused PostCall/OnError tests pin
+terminal publication after hooks, including a structured-kj SSH/RPC regression.
+Cwd/export changes now commit together and failed writes are returned.
+
+Still pending in settlement: `complete_operation_from_blocks` loses raw result
+facts; hook replacements retain stale exit/data/stderr metadata; block writes
+can still log errors and continue; MCP async completion projects independently
+and its broker hook timing needs reconciliation with job completion. Streaming
+RPC still logs unhandled hook verdicts. Preserve the complete shared-outcome
+contract while replacing these paths, not just their locations.
+
+The new SSH/RPC regression passes but can print a russh teardown panic after
+its assertions (`there is no reactor running`). The common test helper drops
+its LocalSet outside an entered runtime; verify orderly task/channel shutdown
+in the test-harness audit. This does not explain the reproduced Done-before-hook
+race, which fails inside the active runtime.
+
 ### Shared client recovery
 
 Give `kaijutsu-client` ownership of subscription, mirror, snapshot recovery,

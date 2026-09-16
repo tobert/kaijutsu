@@ -15,7 +15,6 @@ pub mod migrate_keyring;
 pub mod rpc;
 pub mod sftp;
 pub mod share;
-pub mod shell_run;
 pub mod ssh;
 mod turn_identity;
 

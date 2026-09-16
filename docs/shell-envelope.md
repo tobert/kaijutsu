@@ -18,7 +18,7 @@ The `shell` tool is reached two ways, and each way has its own builder:
 
 | | reaches it | has in hand |
 |---|---|---|
-| `kaijutsu-kernel` `mcp/servers/shell.rs` | the in-kernel model agent, the RPC seam, rc | a kaish `ExecResult` |
+| `kaijutsu-kernel` `runtime/command_result.rs` | the in-kernel model agent, the RPC seam, rc | a kaish `ExecResult` |
 | `kaijutsu-mcp` `lib.rs` | an external stdio MCP client (Claude Code) | a polled `BlockSnapshot` |
 
 They ran the same command under the same tool name and used to return

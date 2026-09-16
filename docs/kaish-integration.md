@@ -58,12 +58,20 @@ These are source observations, not promises that all paths behave alike.
   lifecycle callers use this entry point; dispatcher lifecycle methods are
   deleted. `rc/script_path.rs` owns the shared filename/path grammar, and
   `kj rc` remains a command adapter. Unknown lifecycle verbs fail explicitly.
-- Server `shell_run.rs` shares execution between interactive commands and
-  approval resume, but imports result and state helpers from `rpc.rs`.
-  It reconstructs job results and receipts from the output block.
-- Kernel `mcp/servers/shell.rs` separately converts foreground results and
-  projects asynchronous completion. Shared construction has not yet produced
-  shared command settlement.
+- `runtime/command.rs` owns execution into a block pair for interactive
+  commands and approval resume. Server `shell_run.rs` is deleted. Result
+  projections live in `runtime/command_result.rs`, used by command execution,
+  structured/streaming RPC, and MCP shell envelopes. The duplicate text-replace
+  helper is deleted; callers use the block store's atomic replacement operation.
+- `runtime/shell_state.rs` snapshots cwd/exports and commits their changed
+  values in one transaction. Failed writes roll back and reach the caller.
+  Interactive and structured `kj` block completion now waits for result hooks;
+  paused-hook regressions cover runtime execution and the SSH/RPC surface.
+- Settlement remains incomplete: command execution still reconstructs receipts
+  and jobs from blocks; MCP asynchronous completion still has a separate
+  projection path. Synthetic replacements need coherent metadata and raw-outcome
+  retention, and streaming RPC still cannot honor all hook verdicts. Moving
+  these owners is a migration step, not completion of the shared outcome contract.
 - `background_exec.rs` was removed in `8ea04fdf`. Asynchronous shell programs
   use kaish's job system with durable Kaijutsu receipts. Earlier notes claiming
   that a temporary shell cannot host work that outlives it are obsolete.
@@ -78,15 +86,15 @@ remove the obsolete API in the same change as its final caller.
 |---|---|---|---|
 | Migrated | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `runtime/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
 | Pending | Dedicated threads and startup runtime | kernel `lib.rs`; server `main.rs`, `ssh.rs`, `beat.rs`, turn/resume drivers | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
-| Pending | Interactive shell submission | server `rpc.rs::execute_shell_command`, `shell_run.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
+| Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
 | Pending | Streaming execute RPC | server `rpc.rs::execute` | Execution IDs, connection cancellation and concurrency rules, output subscriptions; resolve its unsupported hook substitution explicitly |
 | Pending | Structured `executeKj` | server `rpc.rs::execute_kj_command` | Addressed context, structured argv, gates/latches, quiet mode, data, and shell-state write-back |
-| Pending | Approval resume | server `rpc.rs` resume drivers and helpers | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
+| Partial | Approval resume | server resume drivers; kernel `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
 | Pending | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs` | Read-only/writable distinction, stdin, typed rejection, job ownership, receipts, cancellation, and async completion |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Pending | Editor shell reads | kernel `kernel.rs::fetch_editor_io` | Opener identity/context, full text, and fail-before-splice behavior |
-| Pending | Environment setup and approved environment restore | `EmbeddedKaish::apply_context_config`, `apply_ask_env`, server state helpers, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |
+| Partial | Environment setup and approved environment restore | `EmbeddedKaish::apply_context_config`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |
 | Pending | Job/receipt readers and controllers | kernel `shell_operations.rs`, `kj/wait.rs`, `kj/context.rs`, runtime job builtins | In-memory jobs and durable receipts keep their distinct lifetimes |
 | Pending | Integration backends and builtins | `runtime/*_backend.rs`, filesystem adapters, `kj_builtin`, `vi_builtin`, `curl_tool`, `ps_builtin`, synthesis | Use kaish's backend/tool interfaces directly where they implement those interfaces |
 | Pending | Gate planning and parsing | `kj/gate*`, `hook_gate`, `shell_gate`, `plan_clauses`, `readonly` | Kaish remains the syntax authority; preserve clause plans and approval semantics |
@@ -189,10 +197,12 @@ adapters must have a named deletion step and must not become permanent aliases.
    discovery, execution records, recursion, and diagnostics adjacent to runtime.
    `kj rc` is an administration adapter; every lifecycle caller is migrated.
    Markdown loading is replaced by the explicit instruction scripts above.
-4. **Consolidate command settlement.** Introduce one outcome and projection
+4. **Consolidate command settlement (owner migration in progress).** Runtime
+   owns block-pair execution, result projections, and atomic shell-state
+   write-back; server helper dependencies are removed. Introduce one outcome and projection
    path, then migrate interactive, streaming, structured `kj`, model foreground,
    model background, and approved-resume callers. Remove server-to-`rpc.rs`
-   helper dependencies and duplicate MCP completion logic. Preserve caller
+   helper dependencies (removed) and duplicate MCP completion logic. Preserve caller
    policies rather than erasing their differences to make parity tests pass.
 5. **Finish runtime ownership.** Move headless turn execution, interruption,
    and resumption ownership into the kernel as a separate change. Keep

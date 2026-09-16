@@ -58,6 +58,11 @@
 
 #![allow(refining_impl_trait)]
 
+use kaijutsu_kernel::runtime::command_result::{
+    block_output_data, exec_result_to_hook_tool_result, shell_hook_result_text,
+};
+use kaijutsu_kernel::runtime::shell_state::{snapshot_shell_state, persist_shell_state};
+
 use kaijutsu_kernel::runtime::context_shell::{ShellIdentity, ShellPolicy};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -914,7 +919,7 @@ fn settle_pair_error(
     let _ = documents.set_stderr(context_id, output_block_id, Some(reason));
     let _ = documents.set_status(context_id, output_block_id, Status::Error);
     let _ = documents.set_status(context_id, command_block_id, Status::Error);
-    if let Err(error) = crate::shell_run::complete_operation_from_blocks(&kernel.kernel, context_id, output_block_id) {
+    if let Err(error) = kaijutsu_kernel::runtime::command::complete_operation_from_blocks(&kernel.kernel, context_id, output_block_id) {
         log::error!("could not settle refused shell operation: {error}");
     }
     // The pair may already be cached from an earlier turn as `Waiting`;
@@ -1211,7 +1216,7 @@ async fn act_on_executable_answer(
         "gate-resume: running approved ask {} in {context_id}",
         answer.request_id
     );
-    crate::shell_run::run_into_blocks(
+    kaijutsu_kernel::runtime::command::run_into_blocks(
         &kaish,
         source,
         ask.stdin.clone(),
@@ -3893,7 +3898,7 @@ impl kernel::Server for KernelImpl {
                         ).with_actor(conn.principal, reviewer)
                     };
 
-                    let exec_result = tokio::select! {
+                    let mut exec_result = tokio::select! {
                         result = kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()) => {
                             match result {
                                 Ok(r) => {
@@ -3961,12 +3966,11 @@ impl kernel::Server for KernelImpl {
                     // kaish, so we skip the write-back.
                     if propagate_context_switch(&kaish, started_ctx, &connection_bg).is_none() {
                         let state_after = snapshot_shell_state(&kaish).await;
-                        persist_shell_state(
-                            &kernel_db_for_persist,
-                            started_ctx,
-                            &state_before,
-                            &state_after,
-                        );
+                        if let Err(error) = persist_shell_state(
+                            &kernel_db_for_persist, started_ctx, &state_before, &state_after,
+                        ) {
+                            exec_result = kaish_kernel::interpreter::ExecResult::failure(1, error);
+                        }
                     }
 
                     // Dispatch output events to all subscribers.
@@ -9254,114 +9258,6 @@ pub(crate) fn build_output_data(
     }
 }
 
-/// The `OutputData` to persist on a shell result block.
-///
-/// Prefer the result's own `.output` (a builtin that set real OutputData),
-/// but kaish's output limiter runs `materialize()` on every result that
-/// passes through `spill_if_needed` — which unconditionally drops `.output`
-/// even when `.out` carries independent text (kaish-types
-/// `ExecResult::materialize`, `result.rs`). So for `kj`/most builtins the
-/// structured payload survives ONLY on the `.data` sideband. Bridge that
-/// into a rich_json `OutputData` so the structured value still reaches the
-/// block (→ app + MCP `data`). See `docs/issues.md`.
-///
-/// The two sidebands are MERGED, not chosen between: a real node-tree
-/// `.output` (app-renderable) plus an independent `.data` sideband both
-/// survive on the one `OutputData` — the tree in `root`, `.data` back-filled
-/// into `rich_json` only when `.output` didn't already set it. Today
-/// `.output` is nearly always `None` by the time a result reaches here (the
-/// limiter clears it), so this mostly degenerates to the rich_json-only
-/// path — but the contract shouldn't rely on that staying broken. Per
-/// deepseek's review: this does mean the app (renders the node tree) and MCP
-/// (returns `rich_json` verbatim) can show divergent views of the same
-/// block when both are set — an accepted caveat, not a bug.
-pub(crate) fn block_output_data(
-    result: &kaish_kernel::interpreter::ExecResult,
-) -> Option<kaijutsu_types::OutputData> {
-    let output = result.output().cloned();
-    let needs_rich_json = output.as_ref().is_none_or(|od| od.rich_json.is_none());
-    if needs_rich_json && let Some(v) = result.data.as_ref() {
-        let rich_json = kaish_kernel::interpreter::value_to_json(v);
-        return Some(output.unwrap_or_default().with_rich_json(rich_json));
-    }
-    output
-}
-
-#[cfg(test)]
-mod block_output_data_tests {
-    //! `block_output_data` is the `.data`→block bridge that replaces the
-    //! dead-end `.output` write kj_builtin used to attempt (see
-    //! `kj_output_channel_does_not_survive_the_kaish_output_limiter` in
-    //! kaijutsu-kernel and `docs/issues.md`): kaish's output limiter drops
-    //! `.output` before a result like this ever reaches the persistence
-    //! seam, so `.data` is the channel that actually carries a kj command's
-    //! structured payload out.
-    use super::block_output_data;
-    use kaish_kernel::ast::Value;
-    use kaish_kernel::interpreter::ExecResult;
-
-    #[test]
-    fn prefers_real_output_data_when_present() {
-        let od = kaijutsu_types::OutputData::new().with_rich_json(serde_json::json!("x"));
-        let result = ExecResult::with_output(od.clone());
-
-        let bridged = block_output_data(&result).expect("expected Some");
-        assert_eq!(
-            bridged.rich_json, od.rich_json,
-            "a builtin that set real .output must be used verbatim"
-        );
-    }
-
-    #[test]
-    fn falls_back_to_data_sideband_as_rich_json() {
-        let data = Value::Json(serde_json::json!(["bass", "bassline"]));
-        let result = ExecResult::success_with_data("bass\nbassline", data);
-        assert!(
-            result.output().is_none(),
-            "test premise: no real .output, only .data"
-        );
-
-        let bridged = block_output_data(&result).expect("expected Some");
-        assert_eq!(
-            bridged.rich_json,
-            Some(serde_json::json!(["bass", "bassline"])),
-            "rich_json must equal the .data sideband, JSON-converted"
-        );
-    }
-
-    #[test]
-    fn neither_output_nor_data_yields_none() {
-        let result = ExecResult::success("plain text, no structure");
-        assert!(block_output_data(&result).is_none());
-    }
-
-    #[test]
-    fn merges_data_sideband_onto_a_real_output_tree() {
-        // A builtin can set BOTH a real node-tree `.output` (the
-        // app-renderable shape) AND an independent `.data` sideband. The
-        // resulting OutputData must carry both — the tree in `root`, `.data`
-        // back-filled into `rich_json` — not one clobbering the other.
-        let tree = kaijutsu_types::OutputData::nodes(vec![kaijutsu_types::OutputNode::new("row")]);
-        assert!(
-            tree.rich_json.is_none(),
-            "test premise: the real tree carries no rich_json of its own"
-        );
-        let mut result = ExecResult::with_output(tree.clone());
-        result.data = Some(Value::Json(serde_json::json!({"k": "v"})));
-
-        let bridged = block_output_data(&result).expect("expected Some");
-        assert_eq!(
-            bridged.root, tree.root,
-            "the real node tree must survive untouched"
-        );
-        assert_eq!(
-            bridged.rich_json,
-            Some(serde_json::json!({"k": "v"})),
-            "rich_json must be back-filled from .data since .output didn't set its own"
-        );
-    }
-}
-
 #[cfg(test)]
 mod build_output_data_tests {
     //! Encode-side coverage for the OutputData→capnp `richJson` wiring: the
@@ -9648,7 +9544,7 @@ fn context_cwd(kernel: &SharedKernelState, context_id: ContextId) -> Option<std:
 /// durable L1 state (`context_env` + `context_shell.cwd`).
 ///
 /// The instance is throwaway: run exactly one command against it and drop it.
-/// `kj context set` writes durable state explicitly; `shell_run` also writes
+/// `kj context set` writes durable state explicitly; runtime execution writes
 /// back changed cwd and exports after execution unless the context switched.
 /// In-flight scope belongs to this invocation. The factory hands back a kaish
 /// whose session→context map is *isolated* from the
@@ -9802,73 +9698,11 @@ fn propagate_context_switch(
 }
 
 /// Write a context switch into this connection's shared `session_contexts`.
-/// Split out so `shell_run` can hand the same write to a caller that has
+/// Runtime execution can hand the same write to a caller that has
 /// already detected the switch itself.
 fn record_context_switch(connection: &Rc<RefCell<ConnectionState>>, new_id: ContextId) {
     let conn = connection.borrow();
     conn.session_contexts.insert(conn.session_id, new_id);
-}
-
-/// The durable surface of a context shell: working directory + exported env.
-/// Snapshotted before and after a command so we can persist exactly what the
-/// command changed back to L1, the same way a real shell's `cd` / `export`
-/// outlive the command that ran them.
-pub(crate) struct ShellStateSnapshot {
-    cwd: std::path::PathBuf,
-    env: std::collections::BTreeMap<String, String>,
-}
-
-pub(crate) async fn snapshot_shell_state(kaish: &EmbeddedKaish) -> ShellStateSnapshot {
-    ShellStateSnapshot {
-        cwd: kaish.cwd().await,
-        env: kaish.exported_vars().await.into_iter().collect(),
-    }
-}
-
-/// Persist a command's effect on the shell's durable surface (cwd + exported
-/// env) back to L1, so the next materialized shell for this context lands where
-/// the last command left off. Diffs `before`/`after`: only a moved cwd or an
-/// added/changed/removed export is written — an `ls` touches nothing.
-/// Last-writer-wins across concurrent peers, matching `propagate_context_switch`.
-///
-/// Caller must skip this when the command switched context (`kj context switch`
-/// / `kj fork`): the snapshots straddle two contexts, and the outgoing cwd is
-/// already saved inside kaish on switch (`KjBuiltin::save_context_cwd`).
-pub(crate) fn persist_shell_state(
-    kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
-    context_id: ContextId,
-    before: &ShellStateSnapshot,
-    after: &ShellStateSnapshot,
-) {
-    let db = kernel_db.lock();
-
-    // cwd: write only when the command moved it, so we never clobber a
-    // concurrent peer's cwd with a value this command never touched.
-    if after.cwd != before.cwd
-        && let Err(e) = db.upsert_context_shell(&ContextShellRow {
-            context_id,
-            cwd: Some(after.cwd.to_string_lossy().into_owned()),
-            updated_at: kaijutsu_types::now_millis() as i64,
-        })
-    {
-        log::warn!("failed to persist context cwd: {}", e);
-    }
-
-    // exported env: upsert added/changed keys, delete keys the command unset.
-    for (key, value) in &after.env {
-        if before.env.get(key) != Some(value)
-            && let Err(e) = db.set_context_env(context_id, key, value)
-        {
-            log::warn!("failed to persist context env {}: {}", key, e);
-        }
-    }
-    for key in before.env.keys() {
-        if !after.env.contains_key(key)
-            && let Err(e) = db.delete_context_env(context_id, key)
-        {
-            log::warn!("failed to delete context env {}: {}", key, e);
-        }
-    }
 }
 
 struct ShellCommandSubmission {
@@ -9886,7 +9720,7 @@ async fn execute_shell_command(
     connection: &Rc<RefCell<ConnectionState>>,
 ) -> Result<ShellCommandSubmission, capnp::Error> {
     // Materialize a single-use context shell seeded from L1 (durable env + cwd).
-    // No caching: shell_run persists changed cwd and exports unless the context
+    // Runtime execution persists changed cwd and exports unless the context
     // switched; the remaining scope evaporates when this instance drops.
     let kaish = materialize_context_shell(kernel, connection).await?;
 
@@ -10006,7 +9840,7 @@ async fn execute_shell_command(
             };
             let _ = documents.set_status(context_id, &output_block_id, status);
             let _ = documents.set_status(context_id, &command_block_id, status);
-            crate::shell_run::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
+            kaijutsu_kernel::runtime::command::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
                 .map_err(|e| capnp::Error::failed(e))?;
             return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: None });
         }
@@ -10058,7 +9892,7 @@ async fn execute_shell_command(
                 kernel_arc.shell_operations().mark_waiting(&operation_id, ask_id)
                     .map_err(|e| capnp::Error::failed(format!("record shell ask: {e}")))?;
             } else {
-                crate::shell_run::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
+                kaijutsu_kernel::runtime::command::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
                     .map_err(capnp::Error::failed)?;
             }
             return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: Some(refusal) });
@@ -10081,7 +9915,7 @@ async fn execute_shell_command(
         let record_switch = |new_id: ContextId| {
             record_context_switch(&connection_switch, new_id);
         };
-        crate::shell_run::run_into_blocks(
+        kaijutsu_kernel::runtime::command::run_into_blocks(
             &kaish,
             &code,
             None,
@@ -10137,55 +9971,6 @@ struct ExecutedKj {
 
 struct ExecutedKjLatch { command: String, target: String, message: String }
 
-/// Flatten a `KernelToolResult`'s text content — used to render a
-/// `ShellHookVerdict::ShortCircuit` result as block output the way the
-/// text-content half of `error_to_hook_json`/`result_to_hook_json` do in
-/// `mcp/broker.rs`, minus the JSON wrapper (this becomes the block's plain
-/// text, not a hook-visible var).
-pub(crate) fn shell_hook_result_text(result: &kaijutsu_kernel::mcp::KernelToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            kaijutsu_kernel::mcp::ToolContent::Text(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Real kaish `ExecResult` → the `KernelToolResult` shape a `PostCall` hook
-/// sees — the same real-result contract `shell_result_to_envelope`
-/// (`mcp/servers/shell.rs`) builds for an actual `shell_write` tool call,
-/// reduced to what a hook body needs: text output and the `is_error`
-/// channel. Judged by the real exit the way `shell_result_to_envelope`
-/// judges it — a spilled-and-remapped `code=3` reads back as its
-/// `original_code`, not as truncation-flavored success.
-pub(crate) fn exec_result_to_hook_tool_result(
-    result: &kaish_kernel::interpreter::ExecResult,
-) -> kaijutsu_kernel::mcp::KernelToolResult {
-    let real_code = result.original_code.unwrap_or(result.code);
-    let is_error = real_code != 0;
-    let stdout = result.text_out().into_owned();
-    let mut body = stdout.clone();
-    if !result.err.is_empty() {
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push_str(&result.err);
-    }
-    kaijutsu_kernel::mcp::KernelToolResult {
-        is_error,
-        content: vec![kaijutsu_kernel::mcp::ToolContent::Text(body)],
-        structured: Some(serde_json::json!({
-            "stdout": stdout,
-            "stderr": result.err,
-            "exit_code": real_code,
-            "did_spill": result.did_spill,
-        })),
-    }
-}
-
 /// `rpc.rs::execute`'s narrow spot: the streaming exec path has no context
 /// block to rewrite and has already returned `exec_id` to the caller by the
 /// time `PostCall`/`OnError` run, so a `ShortCircuit`/`Denied` verdict can't
@@ -10224,127 +10009,6 @@ fn kaish_quote(word: &str) -> String {
         .replace('$', "\\$")
         .replace('`', "\\`");
     format!("\"{}\"", escaped)
-}
-
-/// Replace a block's full text — block edits are character-addressed
-/// (`blocks/content.rs::edit_text`: "`pos` and `delete` are CHARACTER
-/// offsets, never byte offsets"), so a full replace deletes the block's
-/// current char length before inserting the replacement, rather than
-/// prepending onto what's already there. Used to let a `PostCall`/`OnError`
-/// hook's `ShortCircuit` override a real command's output the block already
-/// carries, the same override `Broker::call_tool`'s own `PostCall` grants a
-/// hook over a real server result.
-pub(crate) fn overwrite_block_text(
-    documents: &SharedBlockStore,
-    context_id: ContextId,
-    block_id: &kaijutsu_types::BlockId,
-    text: &str,
-) -> kaijutsu_kernel::BlockStoreResult<()> {
-    let old_len = documents
-        .get_block_snapshot(context_id, block_id)?
-        .map(|s| s.content.chars().count())
-        .unwrap_or(0);
-    documents.edit_text_as(context_id, block_id, 0, text, old_len, Some(PrincipalId::system()))
-}
-
-#[cfg(test)]
-mod exec_result_to_hook_tool_result_tests {
-    use super::exec_result_to_hook_tool_result;
-    use kaijutsu_kernel::mcp::ToolContent;
-    use kaish_kernel::interpreter::ExecResult;
-
-    /// The audit item this closes: a `PostCall` hook watching a direct
-    /// kaish exec must see the REAL exit code and stdout, not a
-    /// synthesized placeholder.
-    #[test]
-    fn carries_the_real_exit_code_and_stdout() {
-        let mut result = ExecResult::success("unmistakable-real-stdout");
-        result.code = 0;
-        let hook_result = exec_result_to_hook_tool_result(&result);
-        assert!(!hook_result.is_error);
-        let text = match &hook_result.content[0] {
-            ToolContent::Text(t) => t.clone(),
-            other => panic!("expected text content, got {other:?}"),
-        };
-        assert!(
-            text.contains("unmistakable-real-stdout"),
-            "hook body must see the real stdout: {text}",
-        );
-        assert_eq!(
-            hook_result
-                .structured
-                .as_ref()
-                .and_then(|s| s.get("exit_code"))
-                .and_then(|v| v.as_i64()),
-            Some(0),
-        );
-    }
-
-    /// A spilled result remaps `code` to 3 (kaish's output-limit contract);
-    /// the hook must be judged by the REAL exit (`original_code`), the same
-    /// rule `shell_result_to_envelope` applies ("truncation is not failure").
-    /// Falsification: read `result.code` instead of `real_code` here and
-    /// this test goes red (`is_error` flips to `true`, `exit_code` reads 3).
-    #[test]
-    fn judges_a_spilled_result_by_its_real_original_exit_code() {
-        let mut result = ExecResult::success("partial output");
-        result.code = 3;
-        result.did_spill = true;
-        result.original_code = Some(0);
-        let hook_result = exec_result_to_hook_tool_result(&result);
-        assert!(
-            !hook_result.is_error,
-            "a spilled-but-successful command must not read back as an error to the hook",
-        );
-        assert_eq!(
-            hook_result
-                .structured
-                .as_ref()
-                .and_then(|s| s.get("exit_code"))
-                .and_then(|v| v.as_i64()),
-            Some(0),
-        );
-    }
-}
-
-#[cfg(test)]
-mod overwrite_block_text_tests {
-    use super::{overwrite_block_text, SharedBlockStore};
-    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
-    use kaijutsu_types::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
-
-    /// `edit_text` is character-addressed, so a naive `pos=0, delete=0`
-    /// second write PREPENDS onto the block's real output instead of
-    /// replacing it. This locks that a `PostCall`/`OnError` override
-    /// actually replaces the real command output, not concatenates onto
-    /// it. Falsification: hardcode `delete: 0` in `overwrite_block_text`
-    /// and this test goes red (content becomes
-    /// "synthetic-hook-resultthe-real-command-output").
-    #[test]
-    fn replaces_the_real_output_rather_than_prepending_onto_it() {
-        let store: SharedBlockStore = std::sync::Arc::new(BlockStore::new(PrincipalId::new()));
-        let ctx = ContextId::new();
-        store
-            .create_document(ctx, DocumentKind::Conversation, None)
-            .unwrap();
-        let block_id = store
-            .insert_block(
-                ctx,
-                None,
-                None,
-                Role::System,
-                BlockKind::ToolResult,
-                "the-real-command-output",
-                Status::Running,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        overwrite_block_text(&store, ctx, &block_id, "synthetic-hook-result").unwrap();
-
-        let snapshot = store.get_block_snapshot(ctx, &block_id).unwrap().unwrap();
-        assert_eq!(snapshot.content, "synthetic-hook-result");
-    }
 }
 
 /// Where `execute_kj_command` writes its tool-call/tool-result pair — or
@@ -10458,15 +10122,12 @@ async fn execute_kj_command(
         Ok(result) => result,
         Err(e) => {
             let stderr = format!("kj execution failed: {e}");
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+            if let KjBlockSink::Authored { output_block_id, .. } = &sink {
                 documents.set_stderr(context_id, output_block_id, Some(stderr.clone()))
                     .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
                 documents.set_exit_code(context_id, output_block_id, Some(1))
                     .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
-                documents.set_status(context_id, output_block_id, Status::Error)
-                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
-                documents.set_status(context_id, command_block_id, Status::Error)
-                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+
             }
 
             // OnError — hand the hook the real failure (mirrors
@@ -10485,7 +10146,7 @@ async fn execute_kj_command(
                 let text = shell_hook_result_text(&sc_result);
                 let status = if sc_result.is_error { Status::Error } else { Status::Done };
                 if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                    if let Err(e) = overwrite_block_text(&documents, context_id, output_block_id, &text) {
+                    if let Err(e) = documents.replace_text_as(context_id, output_block_id, &text, Some(PrincipalId::system())) {
                         log::error!("Failed to write OnError short-circuited kj output: {}", e);
                     }
                     let _ = documents.set_status(context_id, output_block_id, status);
@@ -10496,6 +10157,12 @@ async fn execute_kj_command(
                     exit_code: sc_exit_code, stdout: text, stderr: String::new(),
                     command_block_id: sink.command_block_id(), latch: None, data: None,
                 }));
+            }
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                for block in [output_block_id, command_block_id] {
+                    documents.set_status(context_id, block, Status::Error)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                }
             }
             return Ok(Ok(ExecutedKj {
                 exit_code: 1, stdout: String::new(), stderr,
@@ -10527,7 +10194,7 @@ async fn execute_kj_command(
     let stderr = result.err.clone();
     let exit_code = result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     let output_data = block_output_data(&result);
-    if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+    if let KjBlockSink::Authored { output_block_id, .. } = &sink {
         documents.edit_text_as(context_id, output_block_id, 0, &stdout, 0, Some(PrincipalId::system()))
             .map_err(|e| capnp::Error::failed(format!("failed to persist kj output: {e}")))?;
         // After the edit — `edit_text` clears style_spans.
@@ -10550,17 +10217,23 @@ async fn execute_kj_command(
         }
         documents.set_exit_code(context_id, output_block_id, Some(exit_code))
             .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
-        let status = if matches!(result.code, 0 | 2 | 3) { Status::Done } else { Status::Error };
-        documents.set_status(context_id, output_block_id, status)
-            .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
-        documents.set_status(context_id, command_block_id, status)
-            .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+
     }
     // Deliberately ignore kaish.context_id(): ACP sessions stay pinned even
     // when a (future or direct-RPC) kj command returns KjResult::Switch.
     let state_after = snapshot_shell_state(&kaish).await;
     if kaish.context_id() == Some(context_id) {
-        persist_shell_state(&kernel.kernel_db, context_id, &state_before, &state_after);
+        if let Err(error) = persist_shell_state(&kernel.kernel_db, context_id, &state_before, &state_after) {
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                documents.set_stderr(context_id, output_block_id, Some(error.clone()))
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                for block in [command_block_id, output_block_id] {
+                    documents.set_status(context_id, block, Status::Error)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                }
+            }
+            return Err(capnp::Error::failed(error));
+        }
     }
     let data = output_data.and_then(|od| od.rich_json);
 
@@ -10581,6 +10254,13 @@ async fn execute_kj_command(
         .await
     {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {
+            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
+                let status = if matches!(result.code, 0 | 2 | 3) { Status::Done } else { Status::Error };
+                documents.set_status(context_id, output_block_id, status)
+                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
+                documents.set_status(context_id, command_block_id, status)
+                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
+            }
             Ok(Ok(ExecutedKj {
                 exit_code, stdout, stderr, command_block_id: sink.command_block_id(), latch, data,
             }))
@@ -10589,7 +10269,7 @@ async fn execute_kj_command(
             let text = shell_hook_result_text(&sc_result);
             let status = if sc_result.is_error { Status::Error } else { Status::Done };
             if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                if let Err(e) = overwrite_block_text(&documents, context_id, output_block_id, &text) {
+                if let Err(e) = documents.replace_text_as(context_id, output_block_id, &text, Some(PrincipalId::system())) {
                     log::error!("Failed to write PostCall short-circuited kj output: {}", e);
                 }
                 let _ = documents.set_status(context_id, output_block_id, status);
