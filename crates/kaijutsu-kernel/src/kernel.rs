@@ -420,7 +420,7 @@ impl Kernel {
     }
 
     pub(crate) fn spawn_command<F, W>(&self, work: W) -> Result<(), String>
-    where F: std::future::Future<Output = ()> + 'static, W: FnOnce() -> F + Send + 'static {
+    where F: std::future::Future<Output = ()> + 'static, W: FnOnce(tokio_util::sync::CancellationToken) -> F + Send + 'static {
         if self.command_worker_shutdown.is_cancelled() { return Err("kernel command worker is shut down".into()); }
         let worker = self.command_worker.get_or_init(crate::runtime::worker::CommandWorker::start)
             .as_ref().map_err(Clone::clone)?;
@@ -431,8 +431,8 @@ impl Kernel {
         worker.submit(work)
     }
 
-    /// Stop accepted tool tasks when their kernel host shuts down. Transport
-    /// disconnects do not stop this worker; pending reviews retain their results.
+    /// Signal accepted tool tasks to cancel and settle before their worker exits.
+    /// This does not wait for the worker; transport disconnects do not stop it.
     pub fn stop_command_worker(&self) {
         self.command_worker_shutdown.cancel();
         if let Some(Ok(worker)) = self.command_worker.get() { worker.stop(); }

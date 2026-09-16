@@ -1635,6 +1635,14 @@ now follow those observations, including an empty stream when a silent command
 has its final result replaced by a hook. Receipts and job wait results carry
 the completed hook-processed outcome.
 
+Shutdown tests then exposed a lifetime gap: dropping the worker's LocalSet
+discarded running command owners before they could settle. The worker now tracks
+accepted tasks, cancels them on shutdown, and drains their settlement before its
+runtime exits. A paused result hook must also yield to cancellation. If dropping
+a review wait already committed its terminal record, the enclosing command uses
+that exact outcome for its job result. Already-cancelled admissions settle without
+entering kaish. Panics and abrupt destruction remain separate recovery work.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

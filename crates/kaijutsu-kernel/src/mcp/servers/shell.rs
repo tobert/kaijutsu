@@ -1600,6 +1600,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_shutdown_settles_running_shell_jobs() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("shutdown-tool"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let receipt = broker.call_tool(call_async("echo started; sleep 30; echo never"), &cc, CancellationToken::new()).await.unwrap();
+        let id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
+        let state = d.kernel().shell_operations().get(&id, context).unwrap().unwrap();
+        let jobs = d.kernel().context_job_manager(context);
+        let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while jobs.read_stdout(job.id).await.unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        d.kernel().stop_command_worker();
+        let state = wait_for_operation(&d, context, &id).await;
+        let envelope = state.envelope.unwrap();
+        assert!(envelope.is_error());
+        assert_eq!(envelope.exit_code, Some(130), "preserve kaish's cancellation result");
+        assert!(!envelope.stdout.contains("never"));
+        let outcome = d.kernel().shell_operations().outcome(&id, context).unwrap().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), jobs.wait(job.id)).await.unwrap().unwrap();
+        assert_eq!(result, outcome.exec_result(), "job and durable result must agree");
+        let streams = jobs.streams(job.id).await.unwrap();
+        assert!(streams.stdout.is_closed().await && streams.stderr.is_closed().await);
+        assert_eq!(streams.stdout.read().await, b"started\n");
+        for block in [&state.receipt.command_block_id, &state.receipt.output_block_id] {
+            assert_eq!(d.block_store().get_block_snapshot(context, block).unwrap().unwrap().status, kaijutsu_types::Status::Error);
+        }
+    }
+
+    #[tokio::test]
     async fn asynchronous_shell_keeps_live_statement_output() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
@@ -1662,6 +1697,58 @@ mod tests {
     }
 
     struct AfterCallerDrop(Arc<tokio::sync::Notify>);
+
+    #[tokio::test]
+    async fn worker_shutdown_settles_a_paused_result_hook() {
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId, GlobPattern};
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("shutdown-hook"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("shutdown-hook".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+            priority: 0, kaish_script_id: None, action: HookAction::Invoke(HookBody::Builtin {
+                name: "shutdown-hook".into(), hook: Arc::new(ShutdownHook { entered: entered.clone(), release: release.clone() }) }),
+        });
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let receipt = broker.call_tool(call_async("echo captured"), &cc, CancellationToken::new()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await.unwrap();
+        d.kernel().stop_command_worker();
+        let id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(outcome) = d.kernel().shell_operations().outcome(&id, context).unwrap() { break outcome; }
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        release.notify_one();
+        let outcome = settled.expect("shutdown must interrupt a hook that never returns");
+        assert!(outcome.envelope().is_error());
+        let crate::runtime::command_outcome::CommandExecution::Completed(raw) = outcome.execution
+            else { panic!("shutdown discarded captured execution") };
+        assert_eq!(raw.text_out(), "captured\n");
+        wait_for_operation(&d, context, &id).await;
+    }
+
+    struct ShutdownHook {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::mcp::Hook for ShutdownHook {
+        async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl crate::mcp::Hook for AfterCallerDrop {
@@ -1748,7 +1835,7 @@ mod tests {
     async fn tool_result_reviews_retain_execution_for_foreground_and_background_calls() {
         use crate::mcp::{HookAction, HookEntry, HookId, GlobPattern, AskSpec};
         for foreground in [false, true] {
-            for decision in ["deny", "allow", "cancel"] {
+            for decision in ["deny", "allow", "cancel", "shutdown"] {
                 let allow = decision == "allow";
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
@@ -1795,7 +1882,9 @@ mod tests {
                 let record = d.kernel().shell_operations().result_review_for_ask(&ask.request_id, context).unwrap().unwrap();
                 assert_eq!(record.operation_id, operation);
                 assert!(record.settled.is_none());
-                if decision == "cancel" {
+                if decision == "shutdown" {
+                    d.kernel().stop_command_worker();
+                } else if decision == "cancel" {
                     if let Some(operation) = &operation {
                         assert!(d.kernel().shell_operations().cancel(operation, context).await.unwrap());
                     } else { cancel.cancel(); }
@@ -1808,12 +1897,19 @@ mod tests {
                     }
                 }).await.unwrap();
                 let envelope = settled.envelope();
+                let expected_job = settled.exec_result();
                 assert_eq!(envelope.is_error(), !allow);
                 assert_eq!(envelope.stdout, if allow { "reviewed tool output" } else { "" });
                 let crate::runtime::command_outcome::CommandExecution::Completed(raw) = settled.execution
                     else { panic!("lost captured tool execution") };
                 assert_eq!(raw.text_out(), "captured\n");
-                if let Some(operation) = operation { wait_for_operation(&d, context, &operation).await; }
+                if let Some(operation) = operation {
+                    let state = wait_for_operation(&d, context, &operation).await;
+                    let jobs = d.kernel().context_job_manager(context);
+                    let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+                    let actual = tokio::time::timeout(std::time::Duration::from_secs(3), jobs.wait(job.id)).await.unwrap().unwrap();
+                    assert_eq!(actual, expected_job, "job completion must preserve the retained review outcome");
+                }
                 else { assert!(d.block_store().block_snapshots(context).unwrap().is_empty()); }
             }
         }

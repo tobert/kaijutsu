@@ -57,7 +57,8 @@ impl ToolCommand {
         let span = tracing::Span::current();
         let hook_depth = crate::mcp::broker::current_hook_depth();
         let host = self.kernel.clone();
-        let started = host.spawn_command(move || crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
+        let started = host.spawn_command(move |shutdown| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
+                let stop_command = task_cancel.clone();
                 let run = CommandRunOptions { stdin: self.stdin,
                     context_switch: CommandContextSwitch::Pinned,
                     hooks: Some(CommandHooks { broker: &self.broker, params: &self.params, max_result_bytes: policy.max_result_bytes }),
@@ -65,11 +66,20 @@ impl ToolCommand {
                     job_output: if foreground { CommandJobOutput::Settled } else { CommandJobOutput::LiveExecution },
                     cancel: Some(task_cancel), job_ready: Some(ready_tx), review_notices: Some(notices),
                 };
-                let outcome = match &completion_receipt {
+                let execute = async { match &completion_receipt {
                     Some(receipt) => command::run_into_blocks(&self.kaish, &self.code, context,
                         &receipt.command_block_id, &receipt.output_block_id, &self.kernel, &self.call, run).await,
                     None => command::run_without_blocks(&self.kaish, &self.code, &self.kernel, &self.call,
                         kaish_kernel::ExecuteOptions::default(), run).await,
+                } };
+                tokio::pin!(execute);
+                let outcome = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        stop_command.cancel();
+                        execute.await
+                    }
+                    outcome = &mut execute => outcome,
                 };
                 if let Some(receipt) = &completion_receipt {
                     match &outcome {

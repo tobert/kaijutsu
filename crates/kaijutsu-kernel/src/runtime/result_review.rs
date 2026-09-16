@@ -81,6 +81,25 @@ impl CommandResultReview {
         }
     }
 
+    /// A dropped review wait may already have retained its terminal result.
+    /// Preserve that exact record when the surrounding command is cancelled.
+    pub(super) fn interrupted_outcome(&self) -> Result<CommandOutcome, String> {
+        let settled = match self.pair {
+            Some((_, output)) => match self.kernel.shell_operations().get_by_output(&output, self.call.context_id)? {
+                Some(operation) => self.kernel.shell_operations().outcome(&operation.receipt.operation_id, self.call.context_id)?,
+                None => None,
+            },
+            None => self.kernel.shell_operations().settled_result_review(&self.review_id, self.call.context_id)?,
+        };
+        if let Some(outcome) = settled { return Ok(outcome); }
+        let mut outcome = self.captured.clone();
+        outcome.hook = Some(CommandHookEffect::Refused {
+            reason: "Result processing was cancelled; captured execution was not repeated.".into(),
+            refusal: None, waiting: false, ask_id: None,
+        });
+        Ok(outcome)
+    }
+
     async fn wait_inner(&self, ask: &AskRef) -> McpResult<()> {
         use approval_ledger::types::ApprovalStatus;
         let operation = match self.pair {

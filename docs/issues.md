@@ -115,9 +115,15 @@ returns GateUnavailable before minting an ask.
 The shell tool's async completion notification now reads its settled receipt.
 Make notification delivery recoverable and idempotent across failure/restart;
 it currently occurs once in the live execution owner after settlement. Kernel
-worker shutdown during result review preserves capture through its review guard.
-Shutdown/panic before capture still needs live terminal settlement and job/receipt
-agreement; startup currently reports interruption without replaying source.
+worker shutdown now cancels and drains accepted work through settlement, including
+paused hooks and retained review. Panics or abrupt task destruction before capture
+still need live terminal settlement and job/receipt agreement; startup currently
+reports interruption without replaying source.
+The host currently signals worker shutdown from Drop; add an awaitable shutdown
+join before process exit when moving the remaining runtime owners. An OS process
+exit cannot wait for an unjoined worker thread to drain. Also carry an explicit
+command cancellation token into block-pair runs that have no durable receipt;
+the current runner installs that token only when attaching a tracked job.
 
 ### Shared client recovery
 

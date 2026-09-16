@@ -242,9 +242,9 @@ pub async fn run_into_blocks(
 
     let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
         Some((*command_block_id, *output_block_id)), outcome.clone(), review_cancel, run.review_notices);
-    apply_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, Some(&review)).await;
-
-    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    if finish_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, &review).await? {
+        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    }
     let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
     if let Some((manager, job, sender)) = tracked_job {
         if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
@@ -277,8 +277,9 @@ pub async fn run_without_blocks(
         kernel, call_ctx.context_id, run.context_switch, run.state_writeback, None).await;
     let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
         None, outcome.clone(), cancel, run.review_notices);
-    apply_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, Some(&review)).await;
-    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    if finish_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, &review).await? {
+        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    }
     review.settle(&outcome)?;
     Ok(outcome)
 }
@@ -293,6 +294,11 @@ async fn capture_command(
     state_writeback: ShellStateWriteBack,
     streams: Option<kaish_kernel::scheduler::JobStreams>,
 ) -> CommandOutcome {
+    if options.cancel_token.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+        let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
+        outcome.settlement_error = Some("Command was cancelled before execution.".into());
+        return outcome;
+    }
     // Persist only this invocation's cwd/export changes to the context.
     let state_before = snapshot_shell_state(kaish).await;
 
@@ -364,6 +370,29 @@ async fn execute_with_job_output(
     result
 }
 
+async fn finish_result_hooks(
+    outcome: &mut CommandOutcome, code: &str, kernel: &Kernel,
+    call: &crate::mcp::CallContext, invocation: Option<CommandHooks<'_>>,
+    review: &super::result_review::CommandResultReview,
+) -> Result<bool, String> {
+    if review.cancel.is_cancelled() && match &outcome.execution {
+        CommandExecution::NotRun => true,
+        CommandExecution::Completed(result) => result.original_code.unwrap_or(result.code) == 130,
+        _ => false,
+    } {
+        // Cancellation already settled execution. Do not invent a hook refusal
+        // or start result hooks after their owner has stopped.
+        return Ok(true);
+    }
+    let completed = tokio::select! {
+        biased;
+        _ = review.cancel.cancelled() => false,
+        _ = Box::pin(apply_result_hooks(outcome, code, kernel, call, invocation, Some(review))) => true,
+    };
+    if !completed { *outcome = review.interrupted_outcome()?; }
+    Ok(completed)
+}
+
 async fn apply_result_hooks(
     outcome: &mut CommandOutcome,
     code: &str,
@@ -397,6 +426,23 @@ mod fill_tests {
     use super::*;
     use crate::Kernel;
     use crate::block_store::DocumentKind;
+
+    #[tokio::test]
+    async fn a_cancelled_admission_does_not_enter_kaish() {
+        let kernel = Arc::new(Kernel::new_ephemeral("cancelled-admission").await);
+        let ctx = ContextId::new();
+        let kaish = EmbeddedKaish::new("cancelled-admission", kernel.blocks().clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(ctx);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
+        let outcome = run_without_blocks(&kaish, "export SHOULD_NOT_RUN=yes", &kernel, &call,
+            kaish_kernel::ExecuteOptions::default(), CommandRunOptions { cancel: Some(cancel), ..Default::default() })
+            .await.unwrap();
+        assert!(matches!(outcome.execution, CommandExecution::NotRun), "cancelled admission must not start execution");
+        assert!(outcome.envelope().is_error());
+        assert!(kaish.get_var("SHOULD_NOT_RUN").await.is_none());
+    }
 
     struct PausedHook {
         entered: Arc<tokio::sync::Notify>,
