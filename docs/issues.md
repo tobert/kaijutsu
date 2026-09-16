@@ -130,35 +130,31 @@ Abrupt task destruction before capture still needs live terminal settlement and
 job/receipt agreement; startup reports interruption without replaying source.
 SIGTERM/SIGINT now await the command worker before checkpointing and exiting;
 host Drop remains a cancellation signal without a wait. Extend shutdown ownership
-to headless turns, approval resumes, and transport-owned command tasks as those
-owners migrate. Command cancellation also reaches block pairs without receipts.
+to approval resumes and transport-owned command tasks as those owners migrate. Command cancellation also reaches block pairs without receipts.
 
 Model streaming, identity resolution, conversation sessions, and interrupts now
 belong to kernel runtime modules. RPC translates startup errors but no longer
 owns those state fields. Accepted turns now run on the kernel worker; startup
 failures leave no interrupt. Normal exits, early failures, and panics share
 terminal-event cleanup; shutdown cancels and joins accepted work. Move the
-request/resume driver threads into the shared shutdown owner next; their logic
-now lives in `runtime/turn_driver.rs` and `runtime/approval_resume.rs`, with no
-server entry points. Startup must acknowledge its subscriptions before callers
-can request work, and failure must reach startup instead of only a thread log.
-Transport-owned command tasks remain to migrate.
+approval-resume thread into the shared shutdown owner next. Its logic lives in
+`runtime/approval_resume.rs`, with no server entry point. Startup must acknowledge
+its subscriptions before callers can submit answers, and failure must reach
+startup instead of only a thread log. Transport-owned command tasks remain to
+migrate. Headless requests now use direct runtime admission; no event subscriber
+count authorizes execution. Per-turn leases own liveness and interrupts for all
+accepted work, including queued turns.
 
-Headless admission must not use FlowBus delivery count as proof of execution.
-`kj/fork.rs::publish_turn_request` and the automatic continuation publishers count
-all subscribers; an RPC turn-event observer can make that count nonzero even
-with no execution driver. A runtime-owned request queue should admit work and
-then publish the observation. Audit fork/drive, approval continuation, and
-`shell_operations.rs` async completion together when replacing the driver.
+Audit context-level outcome consumers with overlapping turns. `kj wait` checks
+aggregate liveness when polling the log but returns on the first terminal event,
+even if another accepted turn remains. Decide whether it joins one turn or an
+idle context, then align the event and polling paths. Turn events currently have
+no request identifier; clients also clear context activity on a terminal event.
+Per-turn runtime leases fix ownership, not these consumer semantics.
 
 The shared `shell_state::context_cwd` read still returns None on storage errors,
 which is indistinguishable from an unset cwd. Preserve the no-cwd refusal but
 report failed reads through every caller; do not invent a default directory.
-
-Per-context turn liveness still uses one map entry while the conversation mutex
-can queue multiple turns. Ending one turn can clear the mark for another; the
-latest interrupt also hides older queued/running turns. Give admission, interrupt
-selection, and liveness one consistent rule before declaring turn ownership done.
 
 ### Shared client recovery
 

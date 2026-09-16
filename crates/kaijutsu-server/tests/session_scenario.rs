@@ -62,9 +62,8 @@
 //!   and a fork is directed by the actor that forked it
 //!   (`crates/kaijutsu-kernel/src/kj/fork.rs`), so the assignment happens
 //!   inside banto's own scripted turn; amy assigns nothing.
-//! - **Two defects this scenario found**, fixed the same day and pinned
-//!   here: the `"turn-driver"` thread now reserves `KAISH_RC_THREAD_STACK`
-//!   (`crates/kaijutsu-kernel/src/runtime/turn_driver.rs`, `spawn_turn_driver`), and
+//! - The kernel worker reserves `KAISH_RC_THREAD_STACK` for nested kaish
+//!   (`crates/kaijutsu-kernel/src/runtime/worker.rs`), and
 //!   `kj handoff note`/`signoff` without `--for` file under the performer
 //!   (`crates/kaijutsu-kernel/src/kj/handoff.rs`, `resolve_caller_character`).
 
@@ -188,9 +187,8 @@ async fn boot() -> Scenario {
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mock_scripts"),
         );
     }
-    // banto's turn nests `kj drive` inside a tool call; the turn-driver
-    // thread reserves the rc stack for exactly this (`rpc.rs`,
-    // `spawn_turn_driver`, pinned by `rc_thread_stack_tests`).
+    // Banto nests `kj drive` inside a tool call. The kernel worker uses
+    // spawn_kaish_thread to reserve enough stack for this rc recursion.
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let auth_db_path = tmp.path().join("auth.db");

@@ -1691,6 +1691,14 @@ runtime for all RPC and headless callers. The dedicated driver threads still
 need startup readiness and joined shutdown; moving source ownership makes those
 lifetimes independent of the server registry without claiming they are finished.
 
+Headless requests now enter the kernel worker directly. Counting FlowBus
+subscribers had let an observer appear to accept execution; events now report
+admitted work, with Requested guaranteed to precede its outcome. Fork/drive,
+approval continuation, and async shell completion all use the same admission.
+The request thread is deleted. Each queued or running turn owns a lease, so
+ending one cannot erase another's liveness or interrupt state. Context interrupts
+signal every accepted turn; automatic continuation reserves only idle contexts.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

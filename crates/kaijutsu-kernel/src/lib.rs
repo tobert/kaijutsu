@@ -65,7 +65,7 @@ pub const KAISH_RC_THREAD_STACK: usize = 16 * 1024 * 1024;
 /// Spawn an OS thread sized for kaish.
 ///
 /// Any thread that can run kaish — an rc lifecycle, a hook, a tool call, the
-/// turn driver, gate resume, the beat scheduler, or an SSH session thread —
+/// runtime worker, gate resume, the beat scheduler, or an SSH session thread —
 /// is spawned through this, never through `std::thread::Builder` directly, so
 /// none of them can regress to the default 2 MiB stack and abort the server
 /// on a deep rc nest. See [`KAISH_RC_THREAD_STACK`].

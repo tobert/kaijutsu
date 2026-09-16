@@ -14,7 +14,7 @@ drives the musician beat loop, and persists SSH identity.
 
 Startup (`SshServer::run_on_listener`, `:281`): load/generate the Ed25519 host
 key, open `AuthDb`, build a `russh` config with 30 s keepalive × 3 (≈90 s
-dead-peer window), call `create_shared_kernel`, spawn the **turn-driver** and
+dead-peer window), call `create_shared_kernel`, spawn the **gate-resume** and
 **beat-scheduler** threads, then run the russh server.
 
 Per connection (`ConnectionHandler`, `:480`): `channel_open_session` (`:839`)
@@ -93,13 +93,16 @@ KernelDb.
 ## Model turns (`kaijutsu-kernel/src/runtime/llm_stream.rs`)
 
 The kernel owns the stream loop, conversation sessions, and interrupt state.
-Server RPC and the headless turn driver call `spawn_llm_for_prompt`. It resolves
+Server RPC uses `spawn_llm_for_prompt`; headless callers use
+`Kernel::request_turn`. Both converge on shared startup, which resolves
 provider/model (explicit parameter > context override > cast slot > registry
 default), builds tools through the broker, assembles instructions and runtime
-facts, and admits `process_llm_stream` to the kernel worker. That worker owns
-cancellation, turn cleanup, and joining during shutdown. SSH startup starts the
-kernel's `runtime/turn_driver.rs` and `runtime/approval_resume.rs`; their dedicated
-threads still need joined shutdown. See `docs/kaish-integration.md`.
+facts, and admits `process_llm_stream` to the kernel worker. Each accepted turn
+owns a lease for its liveness and interrupt registration, including queue time.
+The worker owns cancellation, cleanup, and joining during shutdown. Headless
+admission publishes Requested before any terminal event; event observers never
+authorize execution. SSH still starts the dedicated approval-resume thread,
+which needs joined shutdown. See `docs/kaish-integration.md`.
 
 `process_llm_stream` is the agentic loop: acquire the per-context
 conversation lock, read hydration policy (full vs windowed), hydrate the mailbox
@@ -130,7 +133,8 @@ resume = +1, no rewind; a wakeup more than `GRID_RESEED_AFTER_PERIODS` late
 re-seeds the grid at the actual wakeup rather than catching up — missed beats
 are missed). Each wake, `fire_due` advances the playhead, materializes
 committed cells (ABC→MIDI), and drains failures to error blocks. The OODA
-boundary fires the `tick` rc verb then publishes `TurnFlow::Requested`. On
+boundary fires the `tick` rc verb, whose `kj drive` admits work to the kernel
+worker and publishes Requested. On
 `TurnFlow::Completed`, `on_turn_completed` (`:2155`) crystallizes the output as
 an ABC cell one phrase ahead — guarded by three checks (ephemeral/excluded, a
 track-bearing block already off the timeline, a `beat()`-authored legacy

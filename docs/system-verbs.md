@@ -29,25 +29,20 @@ resume that has to reopen anything.
 
 There is exactly one, and it is already load-bearing.
 
-`spawn_llm_for_prompt` (`kaijutsu-kernel/src/runtime/llm_stream.rs`) calls
-`mark_turn_begun` on its own stack before spawning the stream task. Its
-own comment records why that covers everything: the autonomous path is
-already marked by the time the function runs, so the mark there is a
-harmless re-insert, and the two interactive callers (`prompt` /
-`submit_input`) have no other mark. Every turn that reaches a provider
-passes through it.
+All turn startup converges on `spawn_admitted_turn` in
+`kaijutsu-kernel/src/runtime/llm_stream.rs`. Interactive calls enter through
+`spawn_llm_for_prompt`; headless calls enter through `Kernel::request_turn`.
+The shared startup checks the durable quiesce flag before provider work.
+An unreadable flag refuses startup too.
 
-So quiesce is a check at that one call, not a sweep. Three production
-sites mark a turn begun — `publish_turn_request`
-(`kaijutsu-kernel/src/kj/fork.rs`), the gate-resume driver
-(`kaijutsu-server/src/rpc.rs`), and `spawn_llm_for_prompt` — and only the
-last one is downstream of all of them.
+Admission owns a per-turn lease covering liveness and interruption. A headless
+request owns its lease before startup; refusal drops it and leaves the durable
+seed. Quiesce does not cancel turns already running.
 
-**Drivers keep running.** The turn driver, beat scheduler, editor
-reconciler, and gate-resume driver all keep draining their buses while
-quiesced; each turn start is refused with a legible error. Pausing them
-instead would make the beat scheduler's musical timeline drift, and
-`docs/midi.md` is explicit that we model a clock rather than chase one.
+**Drivers keep running.** The beat scheduler, editor reconciler, and gate-resume
+driver keep draining their buses while quiesced; each turn start is refused with
+a legible error. Pausing the beat scheduler would make its musical timeline drift;
+see `docs/midi.md`.
 
 ## The flag is durable, and that is the point
 
@@ -172,24 +167,11 @@ So `kj system stop <target>` fills the per-context cancel cell with a
 non-interactive door, and `<target>` can be either kind of row `ps`
 prints — a context (cancel its turn, kill its jobs) or a single job id.
 
-**Feasibility is split, and the split is a crate boundary.**
-
-- **The job half works today, directly.** `ShellOperationRegistry` lives in
-  `kaijutsu-kernel`; it owns the per-context kaish job manager and can cancel
-  an operation or every job in one context without a host-process path.
-- **The turn half cannot.** `ContextInterruptState` and `get_interrupt`
-  live in **`kaijutsu-server`** (`interrupt.rs`, `rpc.rs`), and
-  `kaijutsu-server` depends on `kaijutsu-kernel`, not the reverse. `kj`
-  cannot call up.
-
-That is the same wall `kj drive` hit, and its module docs already state
-the resolution: *"The kernel can't call the server's turn driver directly.
-It clocks a turn by publishing `TurnFlow::Requested` on the FlowBus."*
-An interrupt request should take the same route — `kj` publishes, a
-server-side subscriber calls `get_interrupt(...).soft()/.hard()`. Prefer
-that over moving the interrupt registry down into the kernel: the bus hop
-is the established pattern for exactly this direction, and it keeps the
-`!Send` per-connection machinery where it already lives.
+Both mechanisms now live in the kernel. `ShellOperationRegistry` owns each
+context's kaish jobs and can cancel one operation or every job in that context.
+`TurnState::interrupt(context, immediate)` signals every accepted model turn,
+including requests waiting for the conversation lock. A future `kj interrupt`
+can call these owners directly; no event-bus request bridge is needed.
 
 `interruptContext` stays regardless — it is the app's Ctrl+C path, which
 is interactive and chatty.

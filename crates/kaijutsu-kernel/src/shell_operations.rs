@@ -712,7 +712,7 @@ mod tests {
 impl crate::Kernel {
     /// Notify once after the execution owner has settled its durable receipt.
     pub(crate) async fn notify_async_shell_completion(
-        &self, id: &str, context: ContextId, principal: PrincipalId, actor: PrincipalId,
+        self: &Arc<Self>, id: &str, context: ContextId, principal: PrincipalId, actor: PrincipalId,
     ) -> OperationResult<()> {
         let state = self.shell_operations().get(id, context)?
             .ok_or_else(|| format!("shell operation {id} is missing"))?;
@@ -740,10 +740,10 @@ impl crate::Kernel {
                 context, epoch, kaijutsu_types::now_millis() as i64, window_ms,
             ).map_err(|e| e.to_string())?
         {
-            self.turn_flows().publish(crate::flows::TurnFlow::Requested {
+            self.request_turn(crate::runtime::turn_request::TurnRequest {
                 context_id: context, after_block_id: notification, content: message,
                 principal_id: principal, model: None, continuation_epoch: Some(epoch),
-            });
+            })?;
         }
         Ok(())
     }

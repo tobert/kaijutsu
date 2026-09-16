@@ -167,7 +167,7 @@ pub enum ServerEvent {
         entries: Vec<VfsActivityEntry>,
         global_total: u64,
     },
-    /// A turn reached an ending the server's turn driver arrived at on purpose:
+    /// A turn reached a deliberate ending:
     /// the model finished, a player cancelled, or a ceiling was hit.
     /// [`stop_reason`](TurnCompletedStopReason) says which.
     ///

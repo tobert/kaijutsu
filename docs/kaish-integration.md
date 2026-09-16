@@ -112,33 +112,36 @@ These are source observations, not promises that all paths behave alike.
   receipt instead of writing a second outcome.
 - Model streaming and identity resolution live in `runtime/llm_stream.rs` and
   `runtime/turn_identity.rs`. Kernel-owned `TurnState` holds conversation locks,
-  cached mailboxes, images, and generation-scoped interrupts. RPC and headless
-  callers use the same entry point; RPC translates startup errors into wire
-  errors. Accepted turns run on the kernel worker and survive the caller's
-  LocalSet. Startup checks finish before interrupt registration; rejected worker
-  admission removes its state. Every running exit clears interrupt/liveness and
-  records continuation yield before publishing its terminal event. A panic
-  publishes Failed, then resumes unwinding so worker shutdown reports failure.
-  Shutdown cancels queued turns and provider work and joins cleanup.
-- `runtime/turn_driver.rs` consumes headless requests and
+  cached mailboxes, images, and per-turn leases. Each accepted turn owns its
+  liveness and interrupt registration through startup, queuing, and inference.
+  Ending one cannot hide another turn; a context interrupt signals all accepted
+  turns. RPC translates startup errors into wire errors. Accepted turns run on
+  the kernel worker and survive the caller's LocalSet. Rejected admission drops
+  its lease. Every running exit drops its lease and records continuation yield
+  before publishing its terminal event. A panic publishes Failed, then resumes
+  unwinding so worker shutdown reports failure. Shutdown cancels queued turns
+  and provider work and joins cleanup.
+- `runtime/turn_request.rs` admits headless requests directly to the kernel
+  worker. Fork/drive, approval continuation, and async shell completion all call
+  it; FlowBus subscriber counts never authorize execution. Requested publishes
+  after admission and before any terminal event. Automatic continuation only
+  reserves an idle context. The dedicated request thread is deleted.
   `runtime/approval_resume.rs` owns answer delivery, claims, captured cwd/env,
-  approved execution, and follow-up seeds. Server entry points are deleted;
-  SSH startup passes `Arc<Kernel>` to the runtime. Both drivers still create
-  dedicated threads; startup readiness, stop admission, and joining remain open.
-  `runtime/shell_state.rs::context_cwd` is shared with RPC callers.
+  approved execution, and follow-up seeds. SSH starts its dedicated thread;
+  readiness and joined shutdown remain open. Shared cwd reads live in
+  `runtime/shell_state.rs::context_cwd`.
 - SIGTERM/SIGINT await the command worker's thread before checkpointing and
   exiting. Joining is shared across callers and survives a cancelled waiter;
   a worker cannot join itself. Host Drop signals cancellation without waiting.
-  Runtime request/resume driver threads and transport-owned command tasks still
+  The approval-resume thread and transport-owned command tasks still
   need a shared shutdown owner.
 - Shared capture/review catches unwinding panics only to settle before resuming
   the original panic. Execution without a captured result records a fault with
   unknown side effects. State-publication and result-hook panics retain captured
   execution; completed statement output drains before streams close. The worker
   stops admission after a task failure and returns an error from shutdown.
-- Live reporting/retry of persistence failures and headless turn ownership
-  remain open. Abrupt task destruction before capture still needs a durable
-  terminal outcome; cooperative worker shutdown settles execution, paused hooks,
+- Live reporting/retry of persistence failures remains open. Abrupt task
+  destruction before capture still needs a durable terminal outcome; cooperative worker shutdown settles execution, paused hooks,
   and review with matching job/receipt results and closed streams.
 - `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
   PostCall or OnError ask. Approval continues the same ordered hook snapshot;
@@ -164,11 +167,11 @@ remove the obsolete API in the same change as its final caller.
 | State | Caller or mechanism | Current location | Contract to retain |
 |---|---|---|---|
 | Migrated | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `runtime/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
-| Partial | Dedicated threads and startup runtime | kernel `lib.rs`, `runtime/worker.rs`, `runtime/turn_driver.rs`, `runtime/approval_resume.rs`; server `main.rs`, `ssh.rs`, `beat.rs` | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
+| Partial | Dedicated threads and startup runtime | kernel `lib.rs`, `runtime/worker.rs`, `runtime/approval_resume.rs`; server `main.rs`, `ssh.rs`, `beat.rs` | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
 | Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
 | Migrated | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
-| Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, interrupt generations, worker placement, and shutdown; request-driver joining and in-progress block cleanup remain open |
+| Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, and shutdown; in-progress block cleanup remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
 | Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; abrupt drop and durable notification recovery remain in the settlement audit |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |

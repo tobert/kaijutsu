@@ -309,7 +309,7 @@ fn chat_submit_reports_a_live_turn() {
         seed_turn_identity(&live_kernel, context_id);
 
         // The flag the server reads, set the way a running turn sets it.
-        live_kernel.kernel.mark_turn_begun(context_id);
+        let _turn_lease = live_kernel.kernel.turns().begin(context_id);
         kernel.edit_input(context_id, 0, "while you work", 0).await.unwrap();
         let input = kernel.submit_input(context_id, false).await.unwrap().block_id;
 

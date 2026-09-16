@@ -24,7 +24,7 @@
 //! `ooda_every` beats — and only when `playing && ooda_armed` — it fires the
 //! `tick` rc verb (`kj drive`) to request the next OODA turn, spawned
 //! fire-and-forget so the single driver never blocks (the model turn runs on the
-//! turn-driver thread, never here).
+//! kernel worker, never here).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -2086,8 +2086,7 @@ impl BeatScheduler {
     }
 
     /// Fire the `tick` rc verb — the OODA hook (`kj drive`). Its kaish only
-    /// *requests* a turn (publishes `TurnFlow::Requested`), returning fast; the
-    /// model turn runs on the turn-driver thread.
+    /// admits a turn to the kernel worker and returns before inference ends.
     fn fire_tick(&self, ctx: ContextId) {
         self.fire_lifecycle(ctx, "tick");
     }
@@ -2483,9 +2482,9 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
-/// Spawn the server-lifetime beat scheduler on its own thread (turn-driver
-/// pattern: dedicated current-thread runtime + LocalSet, since firing the `tick`
-/// verb uses `spawn_local`). Installs the ingress sender on the kernel so the rc
+/// Spawn the server-lifetime beat scheduler on a dedicated current-thread
+/// runtime and LocalSet, since firing the `tick`
+/// verb uses `spawn_local`. Installs the ingress sender on the kernel so the rc
 /// lifecycle and `kj transport` can arm/drive musician contexts.
 pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     let (tx, rx) = mpsc::unbounded_channel::<BeatRequest>();

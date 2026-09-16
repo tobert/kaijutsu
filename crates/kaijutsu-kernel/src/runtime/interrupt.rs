@@ -1,8 +1,7 @@
-//! Per-context interrupt state for cancelling LLM streams and shell jobs.
+//! Per-turn cancellation for provider streams and their tool calls.
 //!
-//! `ContextInterruptState` is created fresh at the start of each prompt and
-//! stored in `TurnState`. The `interruptContext`
-//! RPC method uses it to signal soft or hard interrupts.
+//! Each accepted turn owns fresh cancellation state in `TurnState`. Context
+//! interruption signals every outstanding turn, including queued requests.
 //!
 //! # Soft vs Hard
 //! - **Soft** (`immediate=false`): sets `stop_after_turn` flag → agentic loop
@@ -14,31 +13,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 
-/// Per-context cancellation state.
-///
-/// A fresh instance is created at the start of every `process_llm_stream`
-/// call (via `create_interrupt`). The `CancellationToken` cannot be
-/// reset, so re-creating on each prompt is the correct approach.
-///
-/// Each instance carries a `generation` counter to prevent a race where
-/// stream A's cleanup removes stream B's interrupt state. The cleanup
-/// path compares generations before removing.
+/// Cancellation state owned by one accepted turn's lease.
 pub struct ContextInterruptState {
     /// Soft interrupt: stop the agentic loop before the NEXT LLM call.
     pub stop_after_turn: AtomicBool,
     /// Hard interrupt: abort the current LLM stream immediately.
     pub cancel: CancellationToken,
-    /// Monotonically increasing generation counter. Assigned by
-    /// `TurnState::create_interrupt` from a per-map atomic.
-    pub generation: u64,
 }
 
 impl ContextInterruptState {
-    pub fn new(generation: u64) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             stop_after_turn: AtomicBool::new(false),
             cancel: CancellationToken::new(),
-            generation,
         })
     }
 

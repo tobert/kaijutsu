@@ -7,11 +7,10 @@
 //! the kernel worker owns accepted tasks and joins them during shutdown.
 //! See `docs/kaish-integration.md`.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use futures::FutureExt;
-
-use tokio::sync::RwLock as TokioRwLock;
 
 use kaijutsu_types::shell_envelope::ShellEnvelope;
 use kaijutsu_types::{BlockKind, ContentType, Role, Status, summarize_thinking};
@@ -29,7 +28,7 @@ use kaijutsu_types::ToolKind as TypesToolKind;
 use kaijutsu_types::{ConsentMode, ContextId, PrincipalId};
 
 use crate::runtime::interrupt::ContextInterruptState;
-use super::turn_state::ConversationCache;
+use super::turn_state::{ConversationCache, TurnLease};
 
 /// Record a startup failure after the prompt so readers see why no turn ran.
 fn insert_pre_stream_error_block(
@@ -278,6 +277,21 @@ pub async fn spawn_llm_for_prompt(
     // it. Every other request is an explicit drive and opens a fresh window.
     continuation_epoch: Option<i64>,
 ) -> Result<(), String> {
+    spawn_admitted_turn(kernel, context_id, model, after_block_id, tool_ctx,
+        user_principal_id, origin, continuation_epoch, None).await
+}
+
+pub(super) async fn spawn_admitted_turn(
+    kernel: &Arc<Kernel>,
+    context_id: ContextId,
+    model: Option<&str>,
+    after_block_id: &kaijutsu_types::BlockId,
+    tool_ctx: crate::ExecContext,
+    user_principal_id: PrincipalId,
+    origin: TurnOrigin,
+    continuation_epoch: Option<i64>,
+    admission: Option<TurnLease>,
+) -> Result<(), String> {
     let documents = kernel.blocks().clone();
     let kernel_arc = kernel.clone();
     let kernel_db = kernel.kernel_db().clone();
@@ -320,21 +334,9 @@ pub async fn spawn_llm_for_prompt(
     let reviewer = review.reviewer;
     let tool_ctx = tool_ctx.with_actor(identity.actor, Some(identity.reviewer));
 
-    // Quiesce: the kernel accepts writes but starts no turns. This is the one
-    // enforcement point — every turn that reaches a provider passes through
-    // here, autonomous and interactive alike (docs/system-verbs.md).
-    //
-    // Read fresh from disk, and checked before this function builds any
-    // per-turn state — no interrupt state, no system prompt, no turn mark.
-    // An autonomous turn is the exception and not this function's to fix:
-    // `publish_turn_request` marks the turn begun before publishing, so a
-    // refusal here leaves that mark for the turn driver to clear on the
-    // error path, and the seed block it already wrote stays. Turns already
-    // running are not touched; cancellation is rc's shutdown policy.
-    //
-    // A read failure refuses. A kernel that cannot answer "am I stopped?" is
-    // not one to start a turn on, and the flag is only ever set when
-    // something has already gone wrong.
+    // Every turn checks the durable quiesce flag before provider work. Refuse
+    // unreadable state. Headless admission already owns a lease; startup failure
+    // drops it while retaining the durable seed. Running turns are unaffected.
     let quiesce = {
         let db = kernel_db.lock();
         db.quiesce_state()
@@ -555,27 +557,19 @@ pub async fn spawn_llm_for_prompt(
 
     let after_block_id = *after_block_id;
 
-    // Mark the turn begun before spawning — synchronously, on this call's own
-    // stack, not inside the spawned task. This is the interactive counterpart
-    // of `publish_turn_request`'s mark (kaijutsu-kernel/src/kj/fork.rs): the
-    // autonomous path is already marked by the time this function runs (the
-    // turn driver only gets here after consuming a `Requested` that marked
-    // it), so this mark is a harmless re-insert there. For the two
-    // interactive callers (`prompt`/`submit_input` in rpc.rs), which publish
-    // no `TurnFlow::Requested`, this is the only mark — and it lands before
-    // this function returns to its RPC caller, so a `kj wait` issued right
-    // after the RPC response cannot race it. `process_llm_stream` always
-    // publishes exactly one terminal `TurnFlow` (§7 above), which clears it.
+    // Automatic continuation claims its epoch before starting inference.
     let continuation_epoch = match continuation_epoch {
         Some(epoch) => {
-            if kernel_arc.turn_in_flight(context_id) { return Ok(()); }
+            if admission.is_none() && kernel_arc.turn_in_flight(context_id) {
+                return Err("automatic continuation found another accepted turn".into());
+            }
             let window = kernel_arc.gate_resume_window().await?;
             let window_ms = i64::try_from(window.as_millis())
                 .map_err(|error| error.to_string())?;
             if !kernel_db.lock().claim_automatic_resume(
                 context_id, epoch, kaijutsu_types::now_millis() as i64, window_ms,
             ).map_err(|error| error.to_string())? {
-                return Ok(());
+                return Err("automatic continuation window closed before startup".into());
             }
             Some(epoch)
         },
@@ -590,12 +584,9 @@ pub async fn spawn_llm_for_prompt(
         ),
     };
 
-    // Register only after every fallible startup check and continuation claim.
-    // Submission itself is synchronous, so an accepted task owns cleanup before
-    // this function returns to its transport or driver.
-    let (interrupt, interrupt_generation) = kernel.turns().create_interrupt(context_id).await;
-    let context_interrupts = kernel.turns().context_interrupts.clone();
-    kernel_arc.mark_turn_begun(context_id);
+    let turn_lease = admission.unwrap_or_else(|| kernel.turns().begin(context_id));
+    assert_eq!(turn_lease.context(), context_id, "turn lease belongs to its request");
+    let interrupt = turn_lease.interrupt();
 
     let accepted = kernel.spawn_command(move |stop| async move {
         let cancel = interrupt.clone();
@@ -604,7 +595,7 @@ pub async fn spawn_llm_for_prompt(
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts,
             slot_tunables, conversation_cache, user_principal_id,
             Some(TurnSpanIdentity { performer, reviewer, director, review_source: review.source }),
-            tool_ctx, interrupt, interrupt_generation, context_interrupts, origin,
+            tool_ctx, interrupt, turn_lease, origin,
             continuation_epoch,
         );
         tokio::pin!(run);
@@ -615,8 +606,6 @@ pub async fn spawn_llm_for_prompt(
         }
     });
     if let Err(error) = accepted {
-        kernel.turns().remove_interrupt(context_id, interrupt_generation).await;
-        kernel.mark_turn_ended(context_id);
         return Err(error);
     }
 
@@ -1671,8 +1660,7 @@ async fn process_llm_stream(
     span_identity: Option<TurnSpanIdentity>,
     tool_ctx: crate::ExecContext,
     interrupt: Arc<ContextInterruptState>,
-    interrupt_generation: u64,
-    context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
+    turn_lease: TurnLease,
     // Who asked for the turn (see `spawn_llm_for_prompt`). Rides onto every
     // terminal `TurnFlow` this stream publishes; the publish itself is
     // unconditional. It fires at actual stream end with the real output block
@@ -1703,14 +1691,8 @@ async fn process_llm_stream(
         })
     };
 
-    {
-        let mut map = context_interrupts.write().await;
-        if map.get(&context_id).is_some_and(|state| state.generation == interrupt_generation) {
-            map.remove(&context_id);
-        }
-    }
     record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-    kernel.mark_turn_ended(context_id);
+    drop(turn_lease);
     match outcome {
         Ok(event) => { kernel.turn_flows().publish(event); }
         Err(panic) => {
@@ -3118,9 +3100,8 @@ mod publish_tests {
         let provider = Arc::new(provider);
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let conversation_cache = Arc::new(ConversationCache::new(8));
-        let interrupt = ContextInterruptState::new(1);
+        let interrupt = ContextInterruptState::new();
         arm_interrupt(&interrupt);
-        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
         let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
@@ -3129,6 +3110,7 @@ mod publish_tests {
             kernel.id(),
         );
 
+        let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
         process_llm_stream(
             provider,
             documents.clone(),
@@ -3147,8 +3129,7 @@ mod publish_tests {
             None,
             tool_ctx,
             interrupt,
-            1,
-            context_interrupts,
+            turn_lease,
             origin,
             None,
         )
@@ -3573,8 +3554,7 @@ mod publish_tests {
         let provider = Arc::new(Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n")));
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let conversation_cache = Arc::new(ConversationCache::new(8));
-        let interrupt = ContextInterruptState::new(1);
-        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let interrupt = ContextInterruptState::new();
         let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
@@ -3583,6 +3563,7 @@ mod publish_tests {
             kernel.id(),
         );
 
+        let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
         process_llm_stream(
             provider,
             documents,
@@ -3601,8 +3582,7 @@ mod publish_tests {
             None,
             tool_ctx,
             interrupt,
-            1,
-            context_interrupts,
+            turn_lease,
             origin,
             None,
         )
@@ -4573,8 +4553,7 @@ mod usage_tests {
             }
         }
         let conversation_cache = Arc::new(ConversationCache::new(8));
-        let interrupt = ContextInterruptState::new(1);
-        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let interrupt = ContextInterruptState::new();
         let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
@@ -4584,6 +4563,7 @@ mod usage_tests {
         )
         .with_actor(actor, Some(reviewer));
 
+        let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
         process_llm_stream(
             provider,
             documents.clone(),
@@ -4613,8 +4593,7 @@ mod usage_tests {
             }),
             tool_ctx,
             interrupt,
-            1,
-            context_interrupts,
+            turn_lease,
             TurnOrigin::Autonomous,
             None,
         )
@@ -5181,8 +5160,7 @@ mod error_child_anchor_tests {
         let provider = Arc::new(provider);
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let conversation_cache = Arc::new(ConversationCache::new(8));
-        let interrupt = ContextInterruptState::new(1);
-        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let interrupt = ContextInterruptState::new();
         let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
@@ -5191,6 +5169,7 @@ mod error_child_anchor_tests {
             kernel.id(),
         );
 
+        let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
         process_llm_stream(
             provider,
             documents.clone(),
@@ -5209,8 +5188,7 @@ mod error_child_anchor_tests {
             None,
             tool_ctx,
             interrupt,
-            1,
-            context_interrupts,
+            turn_lease,
             TurnOrigin::Autonomous,
             None,
         )
@@ -5388,8 +5366,7 @@ mod authorship_tests {
 
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let conversation_cache = Arc::new(ConversationCache::new(8));
-        let interrupt = ContextInterruptState::new(1);
-        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let interrupt = ContextInterruptState::new();
         let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
@@ -5398,6 +5375,7 @@ mod authorship_tests {
             kernel.id(),
         ).with_actor(actor, Some(player));
 
+        let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
         process_llm_stream(
             provider,
             documents.clone(),
@@ -5416,8 +5394,7 @@ mod authorship_tests {
             None,
             tool_ctx,
             interrupt,
-            1,
-            context_interrupts,
+            turn_lease,
             TurnOrigin::Autonomous,
             None,
         )
@@ -5534,8 +5511,7 @@ mod gate_resume_cache_eviction_tests {
         after: BlockId,
     ) {
         let provider = Arc::new(provider);
-        let interrupt = ContextInterruptState::new(1);
-        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let interrupt = ContextInterruptState::new();
         let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
@@ -5543,6 +5519,7 @@ mod gate_resume_cache_eviction_tests {
             SessionId::new(),
             kernel.id(),
         );
+        let turn_lease = kernel.clone().turns().begin_with_interrupt(ctx, interrupt.clone());
         process_llm_stream(
             provider,
             documents.clone(),
@@ -5561,8 +5538,7 @@ mod gate_resume_cache_eviction_tests {
             None,
             tool_ctx,
             interrupt,
-            1,
-            context_interrupts,
+            turn_lease,
             TurnOrigin::Autonomous,
             None,
         )
@@ -5796,12 +5772,75 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
+    async fn context_interrupt_cancels_all_queued_turns() {
+        // Any provider entry panics: both turns must cancel while the lock is held.
+        let (kernel, context, after, call) = fixture(Some(
+            MockClient::new("").with_scripted_stream(vec![]))).await;
+        let session = kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        for _ in 0..2 {
+            spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+                call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        }
+        assert_eq!(kernel.turns().active_count(context), 2);
+        assert!(kernel.turns().interrupt(context, true));
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(3), completed.recv()).await
+                .expect("every queued turn must observe interruption").unwrap();
+            assert!(matches!(event.payload, TurnFlow::Completed {
+                reason: TurnStopReason::Cancelled { immediate: true }, ..
+            }));
+        }
+        assert!(!kernel.turn_in_flight(context));
+        assert!(completed.try_recv().is_none());
+        drop(held);
+        kernel.shutdown_command_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headless_startup_failure_follows_requested_and_releases_ownership() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        let (kernel, context, after, call) = fixture(None).await;
+        let mut events = kernel.turn_flows().subscribe("turn.*");
+        assert_eq!(kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+        }).unwrap(), TurnAdmission::Accepted);
+        let first = events.recv().await.unwrap();
+        assert!(matches!(first.payload, TurnFlow::Requested { .. }));
+        let last = tokio::time::timeout(Duration::from_secs(3), events.recv()).await
+            .expect("startup refusal must reach observers").unwrap();
+        assert!(matches!(last.payload, TurnFlow::Failed { .. }));
+        assert!(!kernel.turn_in_flight(context));
+        kernel.shutdown_command_worker().await.unwrap();
+        assert!(events.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_admission_leaves_an_existing_turn_in_charge() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        let (kernel, context, after, call) = fixture(None).await;
+        let existing = kernel.turns().begin(context);
+        let mut events = kernel.turn_flows().subscribe("turn.*");
+        assert_eq!(kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: Some(1),
+        }).unwrap(), TurnAdmission::AlreadyActive);
+        assert_eq!(kernel.turns().active_count(context), 1);
+        assert!(events.try_recv().is_none());
+        drop(existing);
+        assert!(!kernel.turn_in_flight(context));
+        kernel.shutdown_command_worker().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_startup_leaves_no_interrupt() {
         let (kernel, context, after, call) = fixture(None).await;
         let error = spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("No LLM backend"), "{error}");
-        assert!(kernel.turns().get_interrupt(context).await.is_none(), "no task owns this interrupt");
+        assert!(kernel.turns().active_count(context) == 0, "no task owns this interrupt");
         assert!(!kernel.turn_in_flight(context));
     }
 
@@ -5822,7 +5861,7 @@ mod lifetime_tests {
         assert!(matches!(event.payload, TurnFlow::Completed { output_block_id: Some(_), .. }));
         kernel.shutdown_command_worker().await.unwrap();
         assert!(!kernel.turn_in_flight(context));
-        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(kernel.turns().active_count(context) == 0);
         assert!(completed.try_recv().is_none());
     }
 
@@ -5839,7 +5878,7 @@ mod lifetime_tests {
                 .expect("shutdown must drain accepted turns").unwrap();
         }).await;
         assert!(!kernel.turn_in_flight(context), "shutdown left a live turn");
-        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(kernel.turns().active_count(context) == 0);
         assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
             reason: TurnStopReason::Cancelled { immediate: true }, ..
         })));
@@ -5862,7 +5901,7 @@ mod lifetime_tests {
         }).await;
         assert!(kernel.shutdown_command_worker().await.is_err(), "panic must reach shutdown owner");
         assert!(!kernel.turn_in_flight(context));
-        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(kernel.turns().active_count(context) == 0);
         assert!(failed.try_recv().is_none());
         assert!(completed.try_recv().is_none());
     }
@@ -5874,7 +5913,7 @@ mod lifetime_tests {
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("shut down"), "{error}");
         assert!(!kernel.turn_in_flight(context));
-        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(kernel.turns().active_count(context) == 0);
     }
 
     #[tokio::test]
@@ -5894,7 +5933,7 @@ mod lifetime_tests {
             reason: TurnStopReason::Cancelled { immediate: true }, ..
         })));
         assert!(!kernel.turn_in_flight(context));
-        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(kernel.turns().active_count(context) == 0);
     }
 
     #[tokio::test]
@@ -5919,7 +5958,7 @@ mod lifetime_tests {
             reason: TurnStopReason::Cancelled { immediate: true }, ..
         })));
         assert!(!kernel.turn_in_flight(context));
-        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(kernel.turns().active_count(context) == 0);
         assert!(completed.try_recv().is_none());
     }
 
@@ -5947,7 +5986,7 @@ mod lifetime_tests {
             reason: TurnStopReason::Cancelled { immediate: true }, ..
         })));
         assert!(!kernel.turn_in_flight(context));
-        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(kernel.turns().active_count(context) == 0);
     }
 
 }

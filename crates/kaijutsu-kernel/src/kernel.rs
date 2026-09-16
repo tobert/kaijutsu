@@ -180,28 +180,6 @@ pub struct Kernel {
     /// `new`/`new_ephemeral`/`with_flows` call would race dozens of
     /// concurrently-running test kernels over the same runtime directory.
     cc_inbox: OnceLock<Arc<crate::cc_inbox::CcInboxHandle>>,
-    /// Contexts with a turn currently in flight — begun and not yet ended.
-    /// `kj wait` (`kj/wait.rs`) reads this instead of inferring liveness from
-    /// block status: an agentic turn alternates model block -> tool_call
-    /// (running) -> tool_result (done) -> model block, and the gap between a
-    /// tool result landing and the next model block appearing is a live LLM
-    /// round trip during which nothing anywhere is `Running`/`Pending` — the
-    /// old block-status inference read that gap as settled and reported
-    /// `completed` in the middle of a turn.
-    ///
-    /// Deliberately process-lifetime, not durable, and this is not a
-    /// durability gap: a turn runs on the turn driver thread
-    /// (`spawn_turn_driver`, `crates/kaijutsu-server/src/rpc.rs`) inside this
-    /// kernel process, so a turn cannot outlive the kernel. A restart
-    /// clearing this set is the truthful answer — there is no turn left to
-    /// resume — and it needs no schema migration and no startup sweep.
-    /// `parking_lot::Mutex` like `editor_sessions`: every access here is a
-    /// synchronous set op, never held across an await.
-    /// Value is when the turn was first marked begun, which is what makes a
-    /// process table useful — elapsed is the number an operator reads first.
-    turn_liveness: parking_lot::Mutex<
-        std::collections::HashMap<kaijutsu_types::ContextId, std::time::Instant>,
-    >,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -415,7 +393,6 @@ impl Kernel {
             command_worker: OnceLock::new(),
             command_worker_shutdown: tokio_util::sync::CancellationToken::new(),
             cc_inbox: OnceLock::new(),
-            turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
         kernel
@@ -998,58 +975,14 @@ impl Kernel {
         &self.drift
     }
 
-    /// Mark a context's turn as begun.
-    ///
-    /// Call this synchronously at the point a turn is committed to running —
-    /// the `TurnFlow::Requested` publish (`kj drive`, `kj fork --prompt`) or
-    /// the interactive prompt entry (`prompt`/`submit_input`, just before the
-    /// stream task is spawned) — never from the turn driver that later
-    /// consumes the request. The publisher/spawner returns to its caller
-    /// before the turn driver thread wakes, so marking here is what makes
-    /// "drive returned" imply "the flag is set"; marking downstream would let
-    /// a `kj wait` issued right after win the race and read the previous
-    /// turn's state.
-    pub fn mark_turn_begun(&self, context_id: kaijutsu_types::ContextId) {
-        // `or_insert`, not `insert`: an autonomous turn is marked twice —
-        // once by `publish_turn_request` and again by `spawn_llm_for_prompt`
-        // — and the FIRST mark is when the turn actually began. Overwriting
-        // would reset the clock at the point the driver picked it up and
-        // hide any time the turn spent queued, which is exactly the delay
-        // worth seeing.
-        self.turn_liveness
-            .lock()
-            .entry(context_id)
-            .or_insert_with(std::time::Instant::now);
-    }
-
-    /// Mark a context's turn as ended. Idempotent: ending a context with no
-    /// turn in flight — never begun, or already ended — is harmless.
-    pub fn mark_turn_ended(&self, context_id: kaijutsu_types::ContextId) {
-        self.turn_liveness.lock().remove(&context_id);
-    }
-
-    /// Whether a context has a turn in flight right now.
+    /// Whether any accepted turn is queued or running in this context.
     pub fn turn_in_flight(&self, context_id: kaijutsu_types::ContextId) -> bool {
-        self.turn_liveness.lock().contains_key(&context_id)
+        self.turn_state.active_count(context_id) != 0
     }
 
-    /// Every context with a turn in flight right now.
-    ///
-    /// A snapshot, not a subscription: a turn can begin or end the instant
-    /// after this returns. That is fine for what reads it — an operator
-    /// asking what the kernel is doing wants the shape of the moment, not a
-    /// consistent view to act on transactionally.
+    /// Outstanding contexts, ordered by their oldest accepted turn.
     pub fn turns_in_flight(&self) -> Vec<(kaijutsu_types::ContextId, std::time::Duration)> {
-        let now = std::time::Instant::now();
-        let mut rows: Vec<_> = self
-            .turn_liveness
-            .lock()
-            .iter()
-            .map(|(id, began)| (*id, now.saturating_duration_since(*began)))
-            .collect();
-        // Longest-running first: the runaway is what you are looking for.
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        rows
+        self.turn_state.in_flight()
     }
 
     /// Get the content-addressed store.
@@ -3315,31 +3248,16 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// The turn-liveness registry's whole contract: begin marks a context in
-    /// flight, end clears it, and ending a context that never began (or was
-    /// already ended) is a harmless no-op rather than a panic or an error.
     #[tokio::test]
-    async fn turn_liveness_begin_end_round_trips_and_a_bare_end_is_harmless() {
-        let kernel = Kernel::new_ephemeral("test").await;
-        let ctx = kaijutsu_types::ContextId::new();
-        let other = kaijutsu_types::ContextId::new();
-
-        assert!(!kernel.turn_in_flight(ctx), "nothing begun yet");
-
-        // Ending a context that never began must not panic and must not
-        // disturb any other context's state.
-        kernel.mark_turn_ended(ctx);
-        assert!(!kernel.turn_in_flight(ctx));
-
-        kernel.mark_turn_begun(ctx);
-        assert!(kernel.turn_in_flight(ctx), "begun context reads in flight");
-        assert!(!kernel.turn_in_flight(other), "a sibling context is untouched");
-
-        kernel.mark_turn_ended(ctx);
-        assert!(!kernel.turn_in_flight(ctx), "ended context reads settled");
-
-        // A second end on an already-ended context is still harmless.
-        kernel.mark_turn_ended(ctx);
-        assert!(!kernel.turn_in_flight(ctx));
+    async fn ending_one_turn_preserves_another_turn_in_the_same_context() {
+        let kernel = Kernel::new_ephemeral("overlapping-turns").await;
+        let context = kaijutsu_types::ContextId::new();
+        let first = kernel.turns().begin(context);
+        let second = kernel.turns().begin(context);
+        drop(first);
+        assert!(kernel.turn_in_flight(context), "the second turn still owns liveness");
+        drop(second);
+        assert!(!kernel.turn_in_flight(context));
     }
+
 }

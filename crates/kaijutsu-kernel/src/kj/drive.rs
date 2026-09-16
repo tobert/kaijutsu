@@ -1,18 +1,8 @@
 //! Drive subcommand: clock one autonomous turn on a context.
 //!
-//! POSIX mental model: `fork` is a snapshot, `drive` execs the child — it
-//! clocks a single turn. `kj drive` is the manual-repair handle for acting on
-//! a context that isn't currently driving itself: after pushing drift into it,
-//! after committing a staged child, or any time a human wants to advance a turn
-//! by hand.
-//!
-//! The kernel can't call the server's turn driver directly. It clocks a turn by
-//! publishing `TurnFlow::Requested` on the FlowBus; the server's turn driver
-//! subscribes to "turn.requested" and runs the LLM turn. Unlike `kj fork
-//! --prompt` (fire-and-forget — it writes an Error block into an inert child if
-//! nobody is listening), `kj drive` is an explicit user command, so when no
-//! turn driver is subscribed it reports the failure to the user directly rather
-//! than burying an Error block in the context.
+//! Admit a turn to the kernel runtime, optionally writing a durable seed first.
+//! Admission failure returns directly to the caller; accepted work reports its
+//! outcome through turn events and the context log.
 
 use clap::Parser;
 use kaijutsu_types::ContentType;
@@ -39,11 +29,8 @@ pub(crate) struct DriveArgs {
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_drive(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // NOTE: bare `kj drive` (empty sub-args) is a VALID operation — it
-        // drives the current context. Both DriveArgs fields are optional, so
-        // `try_parse_from(&[])` yields the all-default form; we must NOT treat
-        // empty argv as a help request the way subcommand-required tools (cas)
-        // do. Help comes only via `--help`/`-h` (clap's DisplayHelp).
+        // Both arguments are optional: bare `kj drive` drives this context.
+        // Only --help/-h requests help.
         let parsed = match DriveArgs::try_parse_from(argv) {
             Ok(p) => p,
             Err(e) => {
@@ -77,24 +64,8 @@ impl KjDispatcher {
             }
         };
 
-        // Only a `Live` context may be driven. Nothing enforced this before,
-        // which mattered in two directions:
-        //
-        //  * `Archived` — reachable in practice, because label resolution
-        //    filters archived rows but `KernelDb::resolve_context` parses a
-        //    full UUID first through `get_context`, which does not. Archived
-        //    contexts are *retained work* (referential integrity, later
-        //    search, research), so driving one mutates the record we are
-        //    keeping. This went live the moment `session.end` began archiving.
-        //  * `Staging` — already documented as "LLM blocked" on
-        //    `ContextState` (post-fork curation, while `excluded` is still
-        //    being toggled); the doc comment simply had no enforcement.
-        //
-        // `Concluded` is refused for the same reason as archived, one step
-        // softer: its documented recovery is `fork`, not a turn.
-        //
-        // `archived_at` is authoritative for archived-ness per `ContextState`'s
-        // own doc comment, so it is checked ahead of the enum.
+        // Only Live contexts accept turns. Check archived_at first because it
+        // is authoritative; concluded and archived work must be forked to resume.
         {
             let db = self.kernel_db().lock();
             if let Ok(Some(row)) = db.get_context(target) {
@@ -133,17 +104,9 @@ impl KjDispatcher {
             ));
         };
 
-        // --prompt is the optional seed. When given, WRITE it as a real
-        // User/Text block (authored by the caller) and anchor the turn after
-        // it, so the model hydrates it as the fresh user turn. This is the
-        // musician's transport-report seam: the beat fires `kj drive --prompt
-        // "<report>"`, and the report becomes a durable, hydrating block.
-        //
-        // When omitted, the turn runs against whatever is already in the log
-        // (the drift-then-drive path) — no block is written, and `after`
-        // anchors at the current tail. TurnFlow.content keeps the prompt string
-        // (or "") purely as a hydration-failure fallback; the turn driver reads
-        // the authoritative seed from the log, not from `content`.
+        // A prompt becomes a durable User/Text block authored by the caller.
+        // Without one, anchor at the existing tail. The model reads the log;
+        // event content is an observation, not another copy to insert.
         let seed: String = parsed.prompt.clone().unwrap_or_default();
         let after = match parsed.prompt.as_deref() {
             Some(prompt) => {
@@ -169,21 +132,11 @@ impl KjDispatcher {
             None => tail,
         };
 
-        let delivered =
-            self.publish_turn_request(target, after, seed.as_str(), caller.principal_id);
-
-        // Zero subscribers means no turn driver is listening. Because `kj drive`
-        // is an explicit command with the user right here, surface the failure
-        // directly — don't silently no-op, and don't write an Error block into
-        // the context (the user gets the error in their hand instead).
-        if delivered == 0 {
-            tracing::warn!(
-                context_id = %target,
-                "kj drive: no turn driver subscribed; turn was not started"
-            );
-            return KjResult::Err(
-                "kj drive: no turn driver is active; the turn was not started".to_string(),
-            );
+        if let Err(error) = self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
+            context_id: target, after_block_id: after, content: seed,
+            principal_id: caller.principal_id, model: None, continuation_epoch: None,
+        }) {
+            return KjResult::Err(format!("kj drive: turn was not admitted: {error}"));
         }
 
         // Identify the driven context by a compact handle in the message.
@@ -194,7 +147,7 @@ impl KjDispatcher {
             ephemeral: false,
             data: Some(serde_json::json!({
                 "context_id": target.to_hex(),
-                "delivered": delivered,
+                "accepted": true,
             })),
         }
     }
@@ -269,6 +222,33 @@ mod tests {
             }
             other => panic!("expected Requested, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn turn_observers_cannot_authorize_admission_after_shutdown() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("stopped"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        let mut observer = d.kernel().turn_flows().subscribe("turn.requested");
+        d.kernel().shutdown_command_worker().await.unwrap();
+        let result = d.dispatch(&[s("drive")], &caller_with_context(ctx)).await;
+        assert!(!result.is_ok(), "an observer accepted work for a stopped executor");
+        assert!(result.message().contains("shut down"), "{}", result.message());
+        assert!(observer.try_recv().is_none(), "rejected work is not announced as accepted");
+        assert!(!d.kernel().turn_in_flight(ctx));
+    }
+
+    #[tokio::test]
+    async fn headless_admission_does_not_require_event_observers() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("unobserved"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        let result = d.dispatch(&[s("drive")], &caller_with_context(ctx)).await;
+        assert!(result.is_ok(), "runtime admission should not need observers: {}", result.message());
+        d.kernel().shutdown_command_worker().await.unwrap();
+        assert!(!d.kernel().turn_in_flight(ctx));
     }
 
     /// An archived context must not be drivable. Archived contexts are
@@ -395,12 +375,8 @@ mod tests {
 
     #[tokio::test]
     async fn drive_with_prompt_writes_seed_block_and_anchors_turn() {
-        // The musician's transport report rides in as this seed block: a
-        // `kj drive --prompt "<report>"` must WRITE the prompt as a real
-        // User/Text block (authored by the caller) and anchor the turn after
-        // it, so the model hydrates it as the fresh user turn. Before this
-        // fix the prompt was dropped — it only rode TurnFlow.content, which the
-        // turn driver ignores (rpc.rs reads the seed from the log).
+        // The prompt must be a durable User/Text block authored by the caller,
+        // and the requested turn must anchor after that block.
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("here"), None, principal);
@@ -504,23 +480,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_no_subscriber_errors() {
+    async fn drive_stopped_runtime_errors() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("here"), None, principal);
         seed_with_block(&d, ctx, principal);
         let c = caller_with_context(ctx);
-        // Deliberately NO subscriber on "turn.requested".
+        d.kernel().shutdown_command_worker().await.unwrap();
 
         let result = d.dispatch(&[s("drive")], &c).await;
         assert!(
             !result.is_ok(),
-            "drive with no turn driver must error, got: {}",
+            "drive with a stopped runtime must error, got: {}",
             result.message()
         );
         assert!(
-            result.message().contains("no turn driver"),
-            "error should name the missing turn driver: {}",
+            result.message().contains("shut down"),
+            "error should explain stopped admission: {}",
             result.message()
         );
     }

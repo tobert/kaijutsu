@@ -719,7 +719,7 @@ mod tests {
 
     /// The bus is the fast path and must resolve a wait the log alone never
     /// would — here the turn is marked in flight, exactly as
-    /// `publish_turn_request`/`spawn_llm_for_prompt` mark a real one, so the
+    /// runtime admission owns a real one, so the
     /// log-poll leg can never resolve it on its own.
     #[tokio::test]
     async fn a_completion_event_resolves_a_wait_the_log_would_never_settle() {
@@ -735,7 +735,7 @@ mod tests {
                 (Role::Model, BlockKind::Text, Status::Running, "working"),
             ],
         );
-        d.kernel().mark_turn_begun(ctx);
+        let turn_lease = d.kernel().turns().begin(ctx);
         let c = caller_with_context(ctx);
 
         let d2 = std::sync::Arc::clone(&d);
@@ -753,7 +753,7 @@ mod tests {
                 reason: crate::flows::TurnStopReason::EndTurn,
                 origin: Default::default(),
             });
-        d.kernel().mark_turn_ended(ctx);
+        drop(turn_lease);
 
         let r = waiter.await.unwrap();
         let data = data_of(&r);
@@ -776,7 +776,7 @@ mod tests {
                 (Role::Model, BlockKind::Text, Status::Running, ""),
             ],
         );
-        d.kernel().mark_turn_begun(ctx);
+        let turn_lease = d.kernel().turns().begin(ctx);
         let c = caller_with_context(ctx);
 
         let d2 = std::sync::Arc::clone(&d);
@@ -793,7 +793,7 @@ mod tests {
                 error: "provider stream broke".to_string(),
                 origin: Default::default(),
             });
-        d.kernel().mark_turn_ended(ctx);
+        drop(turn_lease);
 
         let r = waiter.await.unwrap();
         let data = data_of(&r);

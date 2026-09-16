@@ -6432,17 +6432,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            let success = if let Some(interrupt) = kernel.kernel.turns().get_interrupt(context_id).await {
-                if immediate {
-                    interrupt.hard();
-                } else {
-                    interrupt.soft();
-                }
-                true
-            } else {
-                // No active stream for this context — no-op (idempotent).
-                false
-            };
+            let success = kernel.kernel.turns().interrupt(context_id, immediate);
 
             log::info!(
                 "interruptContext: context={}, immediate={}, success={}",

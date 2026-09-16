@@ -601,7 +601,7 @@ fn test_shell_cd_and_export_persist_across_commands() {
 }
 
 /// `kj fork --prompt` should drive an autonomous turn in the child: the fork
-/// publishes `turn.requested`, the server's turn driver consumes it and runs
+/// admits the request to the kernel runtime, which runs
 /// `spawn_llm_for_prompt` for the child, and the mock provider streams a
 /// response. We assert a Done assistant block appears in the *child* — it can
 /// only exist if that whole chain fired. The parent is untouched (POSIX fork).
@@ -633,7 +633,7 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
         }
 
         // Fork with a seed. POSIX-style: this returns immediately on the parent;
-        // the child starts acting on the seed via the turn driver.
+        // the child starts acting on the seed via the kernel runtime.
         let (_id, out, status) = shell_exec_wait(
             &kernel,
             r#"kj fork --name explorer --prompt "investigate the bug""#,

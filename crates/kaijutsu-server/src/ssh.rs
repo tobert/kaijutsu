@@ -482,11 +482,8 @@ impl SshServer {
 
         log::info!("Shared kernel created: {}", registry.kernel.name);
 
-        // Start one headless request driver and one approval-resume driver.
-        // Startup readiness and joined shutdown remain in docs/issues.md.
-        kaijutsu_kernel::runtime::turn_driver::spawn_turn_driver(registry.kernel.kernel.clone());
-
-        // Approval delivery can request another turn, so start it second.
+        // Headless requests enter the kernel worker directly. Approval delivery
+        // still has a dedicated driver; joined shutdown remains in docs/issues.md.
         kaijutsu_kernel::runtime::approval_resume::spawn_gate_resume_driver(registry.kernel.kernel.clone());
 
         // The single coalescing beat scheduler: drives per-context hyoushigi

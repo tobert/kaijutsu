@@ -1395,14 +1395,8 @@ impl<T: Clone + Send + 'static> std::fmt::Debug for Subscription<T> {
 
 /// Why a turn stopped — the structured half of the turn outcome.
 ///
-/// A turn that ran out of tokens, one a player cancelled, and one that simply
-/// finished are three different endings, and a consumer has to tell them apart
-/// to react correctly. Before this existed, a cancel arrived as
-/// `Failed { error: "turn interrupted before completion" }` — a string an
-/// observer had to pattern-match to learn anything, which is exactly the silent
-/// ambiguity the house style rejects. `Failed` now means *only* "the turn broke";
-/// every ending the turn driver reached on purpose is a `Completed` carrying its
-/// reason.
+/// Completed carries deliberate endings: normal completion, token/iteration
+/// limits, and cancellation. Failed means the turn could not run or broke.
 ///
 /// This is the substrate for the ACP adapter's `stopReason` (`end_turn`,
 /// `max_tokens`, `max_turn_requests`, `cancelled`) — the mapping is 1:1 by
@@ -1462,13 +1456,8 @@ impl TurnStopReason {
 
 /// Who asked for the turn — a human at a prompt, or the kernel driving itself.
 ///
-/// The turn driver used to encode this as an `announce_completion: bool`
-/// *producer-side gate*: interactive turns published nothing at all, because
-/// the one consumer (the beat scheduler's OODA Act) must never crystallize a
-/// human-prompted turn. That gate is now here, on the event, where it belongs —
-/// every turn announces, and the consumer that cares filters. Without the move,
-/// no wire subscriber could ever see an interactive turn complete, which is the
-/// case ACP frontends care about most.
+/// Every turn publishes an outcome. Consumers that act only on autonomous
+/// turns, such as the beat scheduler, filter by origin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnOrigin {
     /// A player submitted a prompt (`prompt` / `submitInput`). The default,
@@ -1493,28 +1482,15 @@ impl TurnOrigin {
 
 /// Turn-driving flow events.
 ///
-/// The keystone of headless autonomy: kernel-side code (which can't reach the
-/// server's turn driver directly) publishes a `Requested` event to ask the
-/// server to run an LLM turn for a context that has no interactive client
-/// attached. The first producer is `kj fork --prompt` (POSIX-style: the child
-/// starts acting immediately while the parent keeps running); later producers
-/// are drift delivery and the "cruise director". The server subscribes and
-/// calls `spawn_llm_for_prompt`.
-///
-/// The seed itself already lives in the context's block log (e.g. the fork
-/// note), so this carries only what the driver needs to anchor and attribute
-/// the turn — it does NOT re-insert the seed.
+/// `Kernel::request_turn` publishes Requested after runtime admission. Event
+/// observers do not execute requests or authorize admission. The durable seed
+/// already lives in the context log; Requested does not insert it again.
 ///
 /// # On the wire, but never journaled
 ///
-/// `Requested` stays in-process — it is a request *to* the server's turn
-/// driver, and nothing outside the kernel process can serve it. The two
-/// outcome variants are different: `Completed`/`Failed` cross the capnp
-/// boundary through the `TurnEvents` callback interface (`subscribeTurnEvents`,
-/// bridged in `kaijutsu-server::rpc`), because completion is the one turn fact
-/// every client needs and none can compute. Before that bridge existed, clients
-/// inferred completion by polling block status — a heuristic that cannot
-/// distinguish "finished" from "cancelled" from "still thinking".
+/// Requested reports admission; the editor callback projects it as turn-started.
+/// Completed and Failed cross the Cap'n Proto boundary through TurnEvents
+/// (`subscribeTurnEvents`).
 ///
 /// Still **never journaled**, and that is deliberate: blocks are the durable
 /// record of what a turn produced. These events are a live signal about a live
@@ -1532,18 +1508,17 @@ impl TurnOrigin {
 /// lossy + in-memory"), not a claim that the block log already covers it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TurnFlow {
-    /// Drive one autonomous turn for `context_id`.
+    /// One autonomous turn was admitted for `context_id`.
     Requested {
         /// The context that should take a turn.
         context_id: ContextId,
         /// Block to anchor the response after (typically the context's last
         /// block at request time — the seed and any fork markers precede it).
         after_block_id: BlockId,
-        /// Seed text. Only a hydration-failure fallback; the authoritative
-        /// seed is the block already in the log.
+        /// Seed text for observers. Execution reads the durable block log.
         content: String,
-        /// Principal the turn runs as — authors the seed half of the
-        /// exchange. The context's configured model answers.
+        /// Requester who supplied the seed. The assigned performer authors
+        /// model output and tools.
         principal_id: PrincipalId,
         /// Model override, or None to use the context's configured model.
         model: Option<String>,

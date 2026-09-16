@@ -1434,74 +1434,10 @@ impl KjDispatcher {
         }
     }
 
-    /// Publish a single `TurnFlow::Requested` and return how many subscribers
-    /// received it (the turn-driver count). This is the one shared bridge from
-    /// kernel-side commands (`kj fork --prompt`, `kj drive`) to the server's
-    /// turn driver — the kernel can't call the server directly, so it clocks a
-    /// turn by publishing on the FlowBus. A `delivered == 0` return means no
-    /// driver is listening; callers decide how to surface that (fork writes an
-    /// Error block; `kj drive` returns an error to the user directly).
-    ///
-    /// Marks the context's turn begun (`Kernel::mark_turn_begun`) before
-    /// publishing — synchronously, in this call, not in the turn driver that
-    /// later consumes the request. See that method's doc for why the ordering
-    /// matters: a caller that publishes and immediately `kj wait`s must
-    /// already observe the turn as in flight.
-    ///
-    /// `delivered == 0` means no turn driver will ever consume this request,
-    /// so no `Completed`/`Failed` will ever follow to clear the mark — this
-    /// clears it right back before returning, rather than leaving the context
-    /// stuck "in flight" until the kernel restarts.
-    pub(crate) fn publish_turn_request(
-        &self,
-        context_id: ContextId,
-        after_block_id: kaijutsu_types::BlockId,
-        content: &str,
-        principal_id: kaijutsu_types::PrincipalId,
-    ) -> usize {
-        self.kernel().mark_turn_begun(context_id);
-        let delivered =
-            self.kernel()
-                .turn_flows()
-                .publish(crate::flows::TurnFlow::Requested {
-                    context_id,
-                    after_block_id,
-                    content: content.to_string(),
-                    principal_id,
-                    model: None,
-                    continuation_epoch: None,
-                });
-        if delivered == 0 {
-            self.kernel().mark_turn_ended(context_id);
-        }
-        delivered
-    }
-
-    /// Ask the server to drive one autonomous turn in the freshly forked child,
-    /// so a `kj fork --prompt "…"` child starts acting immediately while the
-    /// parent's fork call returns and keeps running (POSIX fork()).
-    ///
-    /// No-op when there's no seed (a bare fork is an inert snapshot) or when the
-    /// child is staged (it's awaiting human curation). The seed already lives in
-    /// the child's block log as the fork note, so this only publishes the
-    /// request — it does not re-insert the seed. Must run after all fork-time
-    /// block injections so `after_block_id` anchors at the true tail.
-    ///
-    /// # The join seam
-    ///
-    /// Fire-and-forget by design: `fork()` returns on the parent immediately.
-    /// The **join** half now exists as a signal — the child's turn publishes
-    /// `TurnFlow::Completed`/`Failed` naming its context, in-process on the bus
-    /// and over capnp via `subscribeTurnEvents`. Anything that wants to block
-    /// on the child (the unimplemented `kj wait`, an ACP frontend's delegation
-    /// view) subscribes and matches on the child's `context_id`; nothing needs
-    /// to poll the child's block log any more.
-    ///
-    /// What is still missing is the *command* — `kj wait` itself. Deliberately
-    /// not half-built here: a waiter also needs a timeout policy, a story for
-    /// the turn that ends before the waiter subscribes, and a decision about
-    /// waiting on several children at once. The substrate is ready; the
-    /// semantics are a separate conversation.
+    /// Admit an autonomous child turn after all fork-time blocks are written.
+    /// Bare and staged forks stay idle. The request anchors at the final tail;
+    /// admission failure is visible in the child's log. `kj wait` joins through
+    /// kernel liveness and terminal turn events.
     fn request_child_turn(
         &self,
         new_id: ContextId,
@@ -1520,22 +1456,13 @@ impl KjDispatcher {
             );
             return;
         };
-        let delivered =
-            self.publish_turn_request(new_id, after, note, caller.principal_id);
-
-        // Zero subscribers means no turn driver is listening — the autonomous
-        // turn was requested but will never run. Don't silently no-op: warn and
-        // surface a visible Error block in the child (same API rc lifecycle uses)
-        // so the inert child is explained rather than mysterious.
-        if delivered == 0 {
-            tracing::warn!(
-                context_id = %new_id,
-                "kj fork --prompt: no turn driver subscribed; autonomous turn will not run"
-            );
-            let summary = "kj fork --prompt: no turn driver is active, so the requested \
-                           autonomous turn will not run. This child was seeded but will \
-                           stay idle until a turn is driven."
-                .to_string();
+        let admitted = self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
+            context_id: new_id, after_block_id: after, content: note.into(),
+            principal_id: caller.principal_id, model: None, continuation_epoch: None,
+        });
+        if let Err(error) = admitted {
+            tracing::warn!(context_id = %new_id, "fork turn was not admitted: {error}");
+            let summary = format!("kj fork --prompt: the child was seeded but its turn was not admitted: {error}");
             // Same BlockKind::Error / insert_block_as idiom rc lifecycle uses
             // (see rc/mod.rs insert_rc_failure_block): a plain Error block
             // anchored at the tail, no structured ErrorPayload parent required.
@@ -1553,7 +1480,7 @@ impl KjDispatcher {
             ) {
                 tracing::warn!(
                     context_id = %new_id,
-                    "kj fork --prompt: failed to insert no-driver error block: {insert_err}"
+                    "kj fork --prompt: failed to insert admission error block: {insert_err}"
                 );
             }
         }

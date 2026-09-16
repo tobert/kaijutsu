@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 use crate::{Kernel, KernelDb};
-use crate::flows::TurnFlow;
 use kaijutsu_types::{BlockId, ContextId, PrincipalId, SessionId, Status};
 use kaijutsu_types::ToolKind as TypesToolKind;
 use super::embedded_kaish::EmbeddedKaish;
@@ -589,7 +588,7 @@ pub fn spawn_gate_resume_driver(kernel: Arc<Kernel>) {
                 return;
             }
         };
-        // A LocalSet, like the turn driver: executing an approved ask
+        // A LocalSet, like the runtime worker: executing an approved ask
         // materializes an `EmbeddedKaish` on this thread, and kaish's own
         // execution path is not `Send`.
         let local = tokio::task::LocalSet::new();
@@ -937,20 +936,11 @@ pub fn spawn_gate_resume_driver(kernel: Arc<Kernel>) {
                         continue;
                     }
 
-                    let delivered =
-                        kernel.turn_flows().publish(TurnFlow::Requested {
-                            context_id,
-                            after_block_id: seed_block,
-                            content: seed,
-                            principal_id,
-                            model: None,
-                            continuation_epoch: Some(continuation_epoch),
-                        });
-                    if delivered == 0 {
-                        // Leave the answer uncollected when no driver can accept it.
-                        tracing::warn!(
-                            "gate-resume: no turn driver subscribed; {context_id} not woken"
-                        );
+                    if let Err(error) = kernel.request_turn(super::turn_request::TurnRequest {
+                        context_id, after_block_id: seed_block, content: seed,
+                        principal_id, model: None, continuation_epoch: Some(continuation_epoch),
+                    }) {
+                        tracing::warn!("gate-resume: {context_id} was not admitted: {error}");
                         continue;
                     }
                     woken.insert(answer.request_id.clone());

@@ -106,12 +106,13 @@ It owns or wires together:
 | Persistence | `KernelDb` (SQLite) | ~20 tables: contexts, edges, documents, oplog+snapshots, bindings, hooks. |
 
 The kernel owns the model turn loop (`runtime/llm_stream.rs`), conversation
-sessions, and interrupts (`runtime/turn_state.rs`). Server RPC and headless
-turn drivers call the same runtime entry point. Accepted turns run on the
-kernel worker, survive submitter teardown, and cancel and settle during worker
-shutdown. `runtime/turn_driver.rs` and `runtime/approval_resume.rs` handle
-headless requests and answered asks. Their dedicated threads still need joined
-shutdown; see `docs/kaish-integration.md`.
+sessions, and interrupts (`runtime/turn_state.rs`). Interactive and headless
+callers share startup and the kernel worker. Each accepted turn owns its own
+liveness and interrupt registration, survives submitter teardown, and cancels
+and settles during worker shutdown. `runtime/turn_request.rs` admits headless
+requests directly; its events report admission and outcomes.
+`runtime/approval_resume.rs` handles answered asks on a dedicated thread that
+still needs joined shutdown; see `docs/kaish-integration.md`.
 
 **kaish**, the shell, runs embedded inside the kernel. `EmbeddedKaish`
 (`kaijutsu-kernel/src/runtime/embedded_kaish.rs:59`) runs the kaish interpreter
@@ -191,7 +192,7 @@ The end-to-end path, prompt to pixels:
    over RPC. `KernelImpl::prompt` (`rpc.rs:4733`) checks the context's facade
    capability, inserts the user message as a block, and calls
    `spawn_llm_for_prompt` (`llm_stream.rs:274`).
-2. **Hydrate.** The turn driver acquires the per-context conversation lock,
+2. **Hydrate.** The model turn acquires the per-context conversation lock,
    reads the hydration policy (full vs windowed), and hydrates a
    `ConversationMailbox` from the block store. Image blocks are resolved from CAS.
 3. **Stream.** It resolves provider/model, builds the system prompt (static base

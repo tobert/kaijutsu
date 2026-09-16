@@ -3,15 +3,46 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::RwLock as TokioRwLock;
 use kaijutsu_types::ContextId;
 use crate::ConversationMailbox;
 use super::interrupt::ContextInterruptState;
 
+struct ActiveTurn {
+    began: std::time::Instant,
+    interrupt: Arc<ContextInterruptState>,
+}
+
+type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<u64, ActiveTurn>>;
+
+/// Owns one admitted turn's liveness and interrupt registration.
+/// Dropping one lease cannot clear another turn in the same context.
+#[must_use]
+pub struct TurnLease {
+    active: Arc<parking_lot::Mutex<ActiveTurns>>,
+    context: ContextId,
+    generation: u64,
+    interrupt: Arc<ContextInterruptState>,
+}
+
+impl TurnLease {
+    pub(super) fn interrupt(&self) -> Arc<ContextInterruptState> { self.interrupt.clone() }
+    pub(super) fn context(&self) -> ContextId { self.context }
+}
+
+impl Drop for TurnLease {
+    fn drop(&mut self) {
+        let mut active = self.active.lock();
+        if let Some(turns) = active.get_mut(&self.context) {
+            turns.remove(&self.generation);
+            if turns.is_empty() { active.remove(&self.context); }
+        }
+    }
+}
+
 /// Runtime state shared by interactive and headless model turns.
 pub struct TurnState {
     conversations: Arc<ConversationCache>,
-    pub(super) context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
+    active: Arc<parking_lot::Mutex<ActiveTurns>>,
     generation: AtomicU64,
 }
 
@@ -19,54 +50,62 @@ impl Default for TurnState {
     fn default() -> Self {
         Self {
             conversations: Arc::new(ConversationCache::new(64)),
-            context_interrupts: Arc::new(TokioRwLock::new(HashMap::new())),
+            active: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             generation: AtomicU64::new(0),
         }
     }
 }
 
 impl TurnState {
-    pub fn conversations(&self) -> &Arc<ConversationCache> {
-        &self.conversations
+    pub fn conversations(&self) -> &Arc<ConversationCache> { &self.conversations }
+
+    pub fn begin(&self, context: ContextId) -> TurnLease {
+        self.begin_with_interrupt(context, ContextInterruptState::new())
     }
 
-    /// Create a fresh `ContextInterruptState` for a new prompt, replacing any previous entry.
-    ///
-    /// `CancellationToken` cannot be reset — so each prompt gets a new one.
-    /// Returns the interrupt state and its generation number. The generation
-    /// must be passed to `remove_interrupt` to prevent the race where stream A's
-    /// cleanup removes stream B's newer interrupt.
-    pub async fn create_interrupt(
-        &self,
-        context_id: ContextId,
-    ) -> (Arc<ContextInterruptState>, u64) {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let state = ContextInterruptState::new(generation);
-        let mut map = self.context_interrupts.write().await;
-        map.insert(context_id, state.clone());
-        (state, generation)
+    /// Automatic continuation may reserve an idle context, never queue behind
+    /// another request that already owns that context's next turn.
+    pub(super) fn begin_if_idle(&self, context: ContextId) -> Option<TurnLease> {
+        self.register(context, ContextInterruptState::new(), true)
     }
 
-    /// Look up an existing interrupt state for a context.
-    ///
-    /// Returns `None` if the context has no active interrupt (nothing running).
-    pub async fn get_interrupt(&self, context_id: ContextId) -> Option<Arc<ContextInterruptState>> {
-        let map = self.context_interrupts.read().await;
-        map.get(&context_id).cloned()
+    pub(super) fn begin_with_interrupt(&self, context: ContextId, interrupt: Arc<ContextInterruptState>) -> TurnLease {
+        self.register(context, interrupt, false).expect("unconditional turn admission")
     }
 
-    /// Remove the interrupt state for a context (called when stream finishes).
-    ///
-    /// Only removes the entry if `generation` matches the current state's
-    /// generation, preventing a stale stream from removing a newer stream's
-    /// interrupt state.
-    pub async fn remove_interrupt(&self, context_id: ContextId, generation: u64) {
-        let mut map = self.context_interrupts.write().await;
-        if let Some(state) = map.get(&context_id)
-            && state.generation == generation
-        {
-            map.remove(&context_id);
+    fn register(&self, context: ContextId, interrupt: Arc<ContextInterruptState>, idle_only: bool) -> Option<TurnLease> {
+        let mut active = self.active.lock();
+        if idle_only && active.contains_key(&context) { return None; }
+        let generation = self.generation.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |value| value.checked_add(1)).expect("turn generation overflow");
+        active.entry(context).or_default().insert(generation, ActiveTurn {
+            began: std::time::Instant::now(), interrupt: interrupt.clone(),
+        });
+        Some(TurnLease { active: self.active.clone(), context, generation, interrupt })
+    }
+
+    pub fn active_count(&self, context: ContextId) -> usize {
+        self.active.lock().get(&context).map_or(0, |turns| turns.len())
+    }
+
+    /// Interrupt every accepted turn, including work waiting for the context lock.
+    pub fn interrupt(&self, context: ContextId, immediate: bool) -> bool {
+        let active = self.active.lock();
+        let Some(turns) = active.get(&context) else { return false; };
+        for turn in turns.values() {
+            if immediate { turn.interrupt.hard(); } else { turn.interrupt.soft(); }
         }
+        true
+    }
+
+    pub fn in_flight(&self) -> Vec<(ContextId, std::time::Duration)> {
+        let now = std::time::Instant::now();
+        let mut rows: Vec<_> = self.active.lock().iter().map(|(context, turns)| {
+            let began = turns.values().map(|turn| turn.began).min().expect("registered context has a turn");
+            (*context, now.saturating_duration_since(began))
+        }).collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        rows
     }
 }
 
@@ -158,6 +197,34 @@ impl ConversationCache {
                 session.reset_pending.store(true, Ordering::SeqCst);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_lease_tests {
+    use super::*;
+
+    #[test]
+    fn interruption_reaches_every_accepted_turn_and_ends_with_its_lease() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let first = state.begin(context);
+        let second = state.begin(context);
+        assert!(state.begin_if_idle(context).is_none());
+        assert!(state.interrupt(context, false));
+        for lease in [&first, &second] {
+            assert!(lease.interrupt.stop_after_turn.load(Ordering::Relaxed));
+            assert!(!lease.interrupt.cancel.is_cancelled());
+        }
+        drop(first);
+        assert_eq!(state.active_count(context), 1);
+        assert!(state.interrupt(context, true));
+        assert!(second.interrupt.cancel.is_cancelled());
+        drop(second);
+        assert!(!state.interrupt(context, true));
+        let next = state.begin_if_idle(context).unwrap();
+        assert!(!next.interrupt.cancel.is_cancelled());
+        assert!(!next.interrupt.stop_after_turn.load(Ordering::Relaxed));
     }
 }
 
