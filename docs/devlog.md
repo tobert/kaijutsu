@@ -1669,6 +1669,20 @@ in RPC. Existing model-loop and conversation-lock tests move with their owner.
 Task placement remains on the caller's LocalSet until admission and shutdown
 can move with terminal-event cleanup.
 
+Lifetime regressions then showed that accepted turns disappeared with their
+submitting LocalSet, rejected startup left an interrupt entry, and provider
+panics left subscribers waiting. Accepted turns now use the kernel worker.
+Startup finishes its checks before registering the interrupt; one finalization
+path clears state and records yield before publishing the terminal event.
+Panics publish failure before the original unwind reaches the worker.
+
+Shutdown cancels queued turns without acquiring their held conversation lock,
+and open streams retain their configured cancellation drain. A slow-connection
+regression found another uncancellable phase: opening the provider stream.
+Connection setup and retry backoff now race cancellation too. Request/resume
+drivers, multiple queued turns' liveness, and exact ownership of unfinished
+blocks remain separate pieces of the runtime migration.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

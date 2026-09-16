@@ -107,9 +107,10 @@ It owns or wires together:
 
 The kernel owns the model turn loop (`runtime/llm_stream.rs`), conversation
 sessions, and interrupts (`runtime/turn_state.rs`). Server RPC and headless
-turn drivers call the same runtime entry point. The task still runs on the
-caller's LocalSet; shared task placement and shutdown are the next migration
-step. See `docs/kaish-integration.md`.
+turn drivers call the same runtime entry point. Accepted turns run on the
+kernel worker, survive submitter teardown, and cancel and settle during worker
+shutdown. The request/resume drivers still need migration; see
+`docs/kaish-integration.md`.
 
 **kaish**, the shell, runs embedded inside the kernel. `EmbeddedKaish`
 (`kaijutsu-kernel/src/runtime/embedded_kaish.rs:59`) runs the kaish interpreter

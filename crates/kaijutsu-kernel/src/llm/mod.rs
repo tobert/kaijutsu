@@ -72,6 +72,8 @@ pub struct MockClient {
     /// can model a slow provider (e.g. exercising the distill `patient` hold).
     /// Zero by default; the streaming path ignores it.
     pub delay: std::time::Duration,
+    /// Artificial connection latency before a streaming call opens.
+    pub stream_start_delay: std::time::Duration,
     /// Optional scripted event sequence for the streaming path — lets a test
     /// drive a real multi-iteration agentic turn (e.g. tool call → tool
     /// result → final text, each `Done` carrying distinct usage numbers) to
@@ -117,6 +119,7 @@ impl MockClient {
         Self {
             canned_response: response.into(),
             delay: std::time::Duration::ZERO,
+            stream_start_delay: std::time::Duration::ZERO,
             scripted: None,
             hangs_when_exhausted: false,
             script_dir: None,
@@ -955,6 +958,9 @@ impl Provider {
             Self::CodexApp(client) => client.stream(opts, messages).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
+                if !mock.stream_start_delay.is_zero() {
+                    tokio::time::sleep(mock.stream_start_delay).await;
+                }
                 let events = if let Some(by_model) = &mock.script_by_model {
                     let mut map = by_model.lock();
                     let entry = map.get_mut(&opts.model).unwrap_or_else(|| {

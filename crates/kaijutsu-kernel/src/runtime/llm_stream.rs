@@ -4,10 +4,12 @@
 //! provider events into blocks and dispatch tool calls through the broker.
 //! Interactive and headless callers share `spawn_llm_for_prompt`.
 //! Conversation locks and interrupts belong to the kernel's `TurnState`;
-//! the caller's LocalSet owns the spawned task. See `docs/kaish-integration.md`.
+//! the kernel worker owns accepted tasks and joins them during shutdown.
+//! See `docs/kaish-integration.md`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use futures::FutureExt;
 
 use tokio::sync::RwLock as TokioRwLock;
 
@@ -253,7 +255,7 @@ async fn build_tool_definitions(
         .collect())
 }
 
-/// Resolve a turn and spawn its stream on the caller's LocalSet.
+/// Resolve a turn and admit its stream to the kernel worker.
 ///
 /// Interactive submissions and headless requests share identity checks,
 /// provider resolution, tool selection, and conversation state. Startup errors
@@ -374,12 +376,6 @@ pub async fn spawn_llm_for_prompt(
         return Err(
             "the kernel is quiesced — no turn starts; `kj system resume` clears it".into());
     }
-
-    // Create a fresh interrupt state for this prompt (replaces any previous entry).
-    // The generation counter prevents the race where stream A's cleanup removes
-    // stream B's interrupt state.
-    let (interrupt, interrupt_generation) = kernel.turns().create_interrupt(context_id).await;
-    let context_interrupts = kernel.turns().context_interrupts.clone();
 
     // Read per-context model from DriftRouter (quick read, release lock).
     // Capture label/state alongside for the situational system-prompt addendum.
@@ -594,31 +590,35 @@ pub async fn spawn_llm_for_prompt(
         ),
     };
 
+    // Register only after every fallible startup check and continuation claim.
+    // Submission itself is synchronous, so an accepted task owns cleanup before
+    // this function returns to its transport or driver.
+    let (interrupt, interrupt_generation) = kernel.turns().create_interrupt(context_id).await;
+    let context_interrupts = kernel.turns().context_interrupts.clone();
     kernel_arc.mark_turn_begun(context_id);
 
-    tokio::task::spawn_local(process_llm_stream(
-        provider,
-        documents,
-        context_id,
-        model_name,
-        kernel_arc,
-        kernel_db,
-        tools,
-        after_block_id,
-        system_prompt,
-        max_output_tokens,
-        stream_timeouts,
-        slot_tunables,
-        conversation_cache,
-        user_principal_id,
-        Some(TurnSpanIdentity { performer, reviewer, director, review_source: review.source }),
-        tool_ctx,
-        interrupt,
-        interrupt_generation,
-        context_interrupts,
-        origin,
-        continuation_epoch,
-    ));
+    let accepted = kernel.spawn_command(move |stop| async move {
+        let cancel = interrupt.clone();
+        let run = process_llm_stream(
+            provider, documents, context_id, model_name, kernel_arc, kernel_db,
+            tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts,
+            slot_tunables, conversation_cache, user_principal_id,
+            Some(TurnSpanIdentity { performer, reviewer, director, review_source: review.source }),
+            tool_ctx, interrupt, interrupt_generation, context_interrupts, origin,
+            continuation_epoch,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => { cancel.hard(); run.await; }
+            _ = &mut run => {}
+        }
+    });
+    if let Err(error) = accepted {
+        kernel.turns().remove_interrupt(context_id, interrupt_generation).await;
+        kernel.mark_turn_ended(context_id);
+        return Err(error);
+    }
 
     Ok(())
 }
@@ -1680,6 +1680,86 @@ async fn process_llm_stream(
     origin: TurnOrigin,
     continuation_epoch: Option<i64>,
 ) {
+    let panic_anchor = after_block_id.clone();
+    // Keep turn exclusion through cleanup and terminal publication, including
+    // unwinding. A queued cancellation does not need to acquire this lock.
+    let session = conversation_cache.get_or_create(context_id);
+    let mut mailbox = tokio::select! {
+        biased;
+        _ = interrupt.cancel.cancelled() => None,
+        mailbox = session.lock() => Some(mailbox),
+    };
+    let outcome = if let Some(mailbox) = mailbox.as_mut() {
+        std::panic::AssertUnwindSafe(run_llm_stream(
+            provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
+            tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, slot_tunables,
+            conversation_cache, user_principal_id, span_identity, tool_ctx, interrupt, origin,
+            continuation_epoch, mailbox,
+        )).catch_unwind().await
+    } else {
+        Ok(TurnFlow::Completed {
+            context_id, principal_id: user_principal_id, output_block_id: None,
+            reason: TurnStopReason::Cancelled { immediate: true }, origin,
+        })
+    };
+
+    {
+        let mut map = context_interrupts.write().await;
+        if map.get(&context_id).is_some_and(|state| state.generation == interrupt_generation) {
+            map.remove(&context_id);
+        }
+    }
+    record_continuation_yield(&kernel_db, context_id, continuation_epoch);
+    kernel.mark_turn_ended(context_id);
+    match outcome {
+        Ok(event) => { kernel.turn_flows().publish(event); }
+        Err(panic) => {
+            let error = "Model turn panicked; execution stopped and side effects may be incomplete.";
+            insert_pre_stream_error_block(&documents, context_id, &panic_anchor, error);
+            kernel.turn_flows().publish(TurnFlow::Failed {
+                context_id, principal_id: user_principal_id, error: error.into(), origin,
+            });
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_llm_stream(
+    provider: Arc<Provider>,
+    documents: SharedBlockStore,
+    context_id: ContextId,
+    model_name: String,
+    kernel: Arc<Kernel>,
+    kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
+    tools: Vec<ToolDefinition>,
+    after_block_id: kaijutsu_types::BlockId,
+    system_prompt: String,
+    max_output_tokens: u64,
+    // This backend's total and idle guards (`StreamTimeouts::resolve`).
+    stream_timeouts: StreamTimeouts,
+    // The context's resolved cast-seat tunables (`resolve_context_model`),
+    // already cascaded onto `llm_defaults`; `None` when no cast seat answered
+    // (the floor then applies at the `apply_slot_tunables` seam below).
+    slot_tunables: Option<SlotTunables>,
+    conversation_cache: Arc<ConversationCache>,
+    // The requester authors the TurnFlow outcome event; provider blocks
+    // use the performing character carried by tool_ctx.
+    user_principal_id: PrincipalId,
+    // Resolved once when the turn begins. Tool calls receive IDs in their
+    // CallContext, but character names belong on the turn span only: no
+    // per-tool character database reads.
+    span_identity: Option<TurnSpanIdentity>,
+    tool_ctx: crate::ExecContext,
+    interrupt: Arc<ContextInterruptState>,
+    // Who asked for the turn (see `spawn_llm_for_prompt`). Rides onto every
+    // terminal `TurnFlow` this stream publishes; the publish itself is
+    // unconditional. It fires at actual stream end with the real output block
+    // id, not at spawn racing the model.
+    origin: TurnOrigin,
+    continuation_epoch: Option<i64>,
+    mailbox: &mut crate::ConversationMailbox,
+) -> TurnFlow {
     if let Some(identity) = span_identity {
         let span = tracing::Span::current();
         span.record("actor.id", tracing::field::display(identity.performer.principal_id));
@@ -1720,14 +1800,6 @@ async fn process_llm_stream(
     // every tool call. A model change does not change this identity.
     let actor_principal = tool_ctx.actor_id;
 
-    // Get per-context mailbox lock — held for the entire stream,
-    // serializing concurrent prompts to the same context (Fix D+E).
-    // The mailbox holds the live conversation session (see
-    // docs/conversation-session.md); we own this lock for the
-    // duration of catch_up + snapshot.
-    let cache_lock = conversation_cache.get_or_create(context_id);
-    let mut mailbox = cache_lock.lock().await;
-
     // Catch the mailbox up against the current block log — folds in
     // any blocks that landed since the last turn (the user prompt
     // that triggered this call, plus shell commands, MCP tool calls,
@@ -1747,41 +1819,32 @@ async fn process_llm_stream(
             tracing::error!(
                 "Hydration policy read failed for context {context_id}: {e}; failing the turn"
             );
-            kernel.turn_flows().publish(TurnFlow::Failed {
+            return TurnFlow::Failed {
                 context_id,
                 principal_id: user_principal_id,
                 error: format!("hydration policy unreadable: {e}"),
                 origin,
-            });
-            record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-            kernel.mark_turn_ended(context_id);
-            return;
+            };
         }
     };
     let mut messages = match hydrate_messages(
         &documents,
         context_id,
         &after_block_id,
-        &mut mailbox,
+        mailbox,
         hydration_policy,
     ) {
         Ok(messages) => messages,
         // Hydration failed and surfaced a visible Error block; fail the turn
         // loudly rather than streaming against an empty/partial session. This is a
-        // terminal path like any other: an announced turn MUST publish exactly one
-        // terminal event (§7), so emit Failed before returning — otherwise the OODA
-        // Act handoff gets no signal and the turn silently falls off the bus while
-        // every other terminal path announces.
+        // terminal path: return Failed for the finalization owner to publish.
         Err(()) => {
-            kernel.turn_flows().publish(TurnFlow::Failed {
+            return TurnFlow::Failed {
                 context_id,
                 principal_id: user_principal_id,
                 error: "hydration failed: could not read conversation history".to_string(),
                 origin,
-            });
-            record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-            kernel.mark_turn_ended(context_id);
-            return;
+            };
         }
     };
     // mailbox lock is held through the rest of the stream — same
@@ -1869,8 +1932,12 @@ async fn process_llm_stream(
     // publishes exactly one terminal event either way.
     let mut stop_reason_out = TurnStopReason::EndTurn;
 
-    // Agentic loop - continue until model is done or max iterations
-    loop {
+    // Continue until completion, cancellation, or the iteration limit.
+    'agentic: loop {
+        if interrupt.cancel.is_cancelled() {
+            stop_reason_out = TurnStopReason::Cancelled { immediate: true };
+            break;
+        }
         iteration += 1;
         if iteration > max_iterations {
             // Consent-aware halt message (M1-A6): in Collaborative mode the
@@ -1983,7 +2050,14 @@ async fn process_llm_stream(
                     context_id, epoch, kaijutsu_types::now_millis() as i64,
                 )).transpose();
                 let started = match stamp {
-                    Ok(_) => provider.stream(build_opts.clone(), messages.clone()).await,
+                    Ok(_) => tokio::select! {
+                        biased;
+                        _ = interrupt.cancel.cancelled() => {
+                            stop_reason_out = TurnStopReason::Cancelled { immediate: true };
+                            break 'agentic;
+                        }
+                        result = provider.stream(build_opts.clone(), messages.clone()) => result,
+                    },
                     Err(error) => Err(LlmError::InvalidRequest(format!(
                         "Could not record inference request: {error}"
                     ))),
@@ -2006,7 +2080,14 @@ async fn process_llm_stream(
                             e,
                             delay_secs
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        tokio::select! {
+                            biased;
+                            _ = interrupt.cancel.cancelled() => {
+                                stop_reason_out = TurnStopReason::Cancelled { immediate: true };
+                                break 'agentic;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                        }
                     }
                     Err(e) => {
                         tracing::error!(
@@ -2032,18 +2113,13 @@ async fn process_llm_stream(
                             payload.summary_line(),
                             Some(PrincipalId::system()),
                         );
-                        // Terminal error — publish Failed so no waiter (the beat
-                        // scheduler, a `TurnEvents` subscriber) is left hanging
-                        // on a turn that will never end.
-                        kernel.turn_flows().publish(TurnFlow::Failed {
+                        // Finalization publishes this failure after cleanup.
+                        return TurnFlow::Failed {
                             context_id,
                             principal_id: user_principal_id,
                             error: format!("LLM stream failed to start: {e}"),
                             origin,
-                        });
-                        record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-                        kernel.mark_turn_ended(context_id);
-                        return;
+                        };
                     }
                 }
             }
@@ -2371,15 +2447,12 @@ async fn process_llm_stream(
                             payload.summary_line(),
                             Some(PrincipalId::system()),
                         );
-                        kernel.turn_flows().publish(TurnFlow::Failed {
+                        return TurnFlow::Failed {
                             context_id,
                             principal_id: user_principal_id,
                             error: detail,
                             origin,
-                        });
-                        record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-                        kernel.mark_turn_ended(context_id);
-                        return;
+                        };
                     }
                 }
 
@@ -2627,15 +2700,12 @@ async fn process_llm_stream(
                     );
                     // Terminal mid-stream error — Failed (not Completed) so an
                     // announced turn never leaves the scheduler waiting.
-                    kernel.turn_flows().publish(TurnFlow::Failed {
+                    return TurnFlow::Failed {
                         context_id,
                         principal_id: user_principal_id,
                         error: format!("LLM stream error: {err}"),
                         origin,
-                    });
-                    record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-                    kernel.mark_turn_ended(context_id);
-                    return;
+                    };
                 }
             }
         }
@@ -2953,48 +3023,16 @@ async fn process_llm_stream(
         context_id
     );
 
-    // Each mutation is now journaled via journal_op — no explicit save needed.
-
-    // Clean up interrupt state — only remove if our generation still matches.
-    // A newer stream may have replaced our entry; removing it would be a bug.
-    {
-        let mut map = context_interrupts.write().await;
-        if let Some(state) = map.get(&context_id)
-            && state.generation == interrupt_generation
-        {
-            map.remove(&context_id);
-        }
-    }
-
-    tracing::debug!("LLM stream processing complete for cell {}", context_id);
-
-    // Announce the turn outcome at ACTUAL stream end (design §7) — the publish
-    // sits here, not at the spawn site, so it carries the real `output_block_id`
-    // (the model's last text block) rather than firing at spawn and racing the
-    // model.
-    //
-    // EVERY turn announces, interactive and autonomous alike. The old
-    // `announce_completion` gate silenced interactive turns because the one
-    // consumer (the beat scheduler's OODA Act) must never crystallize a
-    // human-prompted turn — but that put a consumer's filter in the producer,
-    // and it made the completion of the turns a UI cares about most invisible to
-    // every wire subscriber. The filter now rides on `origin`, where the
-    // scheduler applies it (`beat.rs`) and a `TurnEvents` subscriber can ignore it.
-    //
-    // Exactly one terminal event per turn: the early-return paths above publish
-    // `Failed` and never reach here, so this is the sole `Completed`.
     let turn_span = tracing::Span::current();
     turn_span.record("turn.stop_reason", stop_reason_out.as_str());
     turn_span.record("turn.origin", origin.as_str());
-    kernel.turn_flows().publish(TurnFlow::Completed {
+    TurnFlow::Completed {
         context_id,
         principal_id: user_principal_id,
         output_block_id,
         reason: stop_reason_out,
         origin,
-    });
-    record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-    kernel.mark_turn_ended(context_id);
+    }
 }
 
 #[cfg(test)]
@@ -5706,4 +5744,210 @@ mod gate_resume_cache_eviction_tests {
             })
             .await;
     }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use crate::llm::MockClient;
+    use kaijutsu_types::{BlockId, ContextState, SessionId};
+    use crate::DocumentKind;
+    use std::time::Duration;
+
+    async fn fixture(mock: Option<MockClient>) -> (Arc<Kernel>, ContextId, BlockId, crate::ExecContext) {
+        let kernel = Arc::new(Kernel::new_ephemeral("turn-lifetime").await.with_timeouts(
+            kaijutsu_types::TimeoutPolicy {
+                llm_idle_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+        ));
+        let context = ContextId::new();
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        kernel.blocks().create_document(context, DocumentKind::Conversation, None).unwrap();
+        {
+            let db = kernel.kernel_db().lock();
+            for (id, name) in [(actor, "performer"), (reviewer, "reviewer")] {
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: id, name: name.into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+            db.insert_context(&crate::ContextRow {
+                context_id: context, label: None, provider: None, model: None, system_prompt: None,
+                consent_mode: ConsentMode::Collaborative, context_state: ContextState::Live,
+                context_type: "default".into(), created_at: 0, created_by: reviewer,
+                forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
+                preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
+                demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
+                played_by: Some(actor), reviewer_id: Some(reviewer), director_id: None,
+            }).unwrap();
+        }
+        if let Some(mock) = mock {
+            let mut registry = kernel.llm().write().await;
+            registry.register("mock", Arc::new(Provider::Mock(mock)));
+            assert!(registry.set_default("mock"));
+            registry.set_default_model("mock-model");
+        }
+        let after = kernel.blocks().insert_block_as(context, None, None, Role::User,
+            BlockKind::Text, "answer", Status::Done, ContentType::Plain, Some(reviewer)).unwrap();
+        let call = crate::ExecContext::new(reviewer, context, "/", SessionId::new(), kernel.id());
+        (kernel, context, after, call)
+    }
+
+    #[tokio::test]
+    async fn rejected_startup_leaves_no_interrupt() {
+        let (kernel, context, after, call) = fixture(None).await;
+        let error = spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
+        assert!(error.contains("No LLM backend"), "{error}");
+        assert!(kernel.turns().get_interrupt(context).await.is_none(), "no task owns this interrupt");
+        assert!(!kernel.turn_in_flight(context));
+    }
+
+    #[tokio::test]
+    async fn accepted_turn_survives_submitting_localset() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("durable answer"))).await;
+        let session = kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let local = tokio::task::LocalSet::new();
+        local.run_until(spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None)).await.unwrap();
+        assert!(kernel.turn_in_flight(context));
+        drop(local);
+        drop(held);
+        let event = tokio::time::timeout(Duration::from_secs(3), completed.recv()).await
+            .expect("accepted turn must outlive its submitter").unwrap();
+        assert!(matches!(event.payload, TurnFlow::Completed { output_block_id: Some(_), .. }));
+        kernel.shutdown_command_worker().await.unwrap();
+        assert!(!kernel.turn_in_flight(context));
+        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(completed.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_cancelled_turn_and_removes_interrupt() {
+        let mock = MockClient::new("").with_scripted_stream(vec![vec![]]).hangs_when_exhausted();
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+                call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_command_worker()).await
+                .expect("shutdown must drain accepted turns").unwrap();
+        }).await;
+        assert!(!kernel.turn_in_flight(context), "shutdown left a live turn");
+        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
+            reason: TurnStopReason::Cancelled { immediate: true }, ..
+        })));
+        assert!(completed.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_panic_publishes_failure_and_fails_worker() {
+        let mock = MockClient::new("").with_scripted_stream(vec![]);
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let mut failed = kernel.turn_flows().subscribe("turn.failed");
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+                call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(3), failed.recv()).await
+                .expect("a panicked turn must announce failure").unwrap();
+            assert!(matches!(event.payload, TurnFlow::Failed { .. }));
+        }).await;
+        assert!(kernel.shutdown_command_worker().await.is_err(), "panic must reach shutdown owner");
+        assert!(!kernel.turn_in_flight(context));
+        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(failed.try_recv().is_none());
+        assert!(completed.try_recv().is_none());
+    }
+    #[tokio::test]
+    async fn stopped_worker_refuses_turn_without_leaving_state() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("unused"))).await;
+        kernel.shutdown_command_worker().await.unwrap();
+        let error = spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
+        assert!(error.contains("shut down"), "{error}");
+        assert!(!kernel.turn_in_flight(context));
+        assert!(kernel.turns().get_interrupt(context).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_turn_waiting_for_the_conversation_lock() {
+        // Any inference would panic: cancellation must win before provider entry.
+        let mock = MockClient::new("").with_scripted_stream(vec![]);
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let session = kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_command_worker()).await
+            .expect("queued turn must cancel without acquiring the held lock").unwrap();
+        drop(held);
+        assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
+            reason: TurnStopReason::Cancelled { immediate: true }, ..
+        })));
+        assert!(!kernel.turn_in_flight(context));
+        assert!(kernel.turns().get_interrupt(context).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_an_open_provider_stream() {
+        let mock = MockClient::new("").with_scripted_stream(vec![vec![
+            StreamEvent::TextStart, StreamEvent::TextDelta("stream entered".into()),
+        ]]).hangs_when_exhausted();
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if kernel.blocks().block_snapshots(context).unwrap().iter()
+                    .any(|block| block.role == Role::Model && block.content == "stream entered") { break; }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.expect("provider must enter before shutdown");
+        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_command_worker()).await
+            .expect("shutdown must drain the cancelled provider").unwrap();
+        assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
+            reason: TurnStopReason::Cancelled { immediate: true }, ..
+        })));
+        assert!(!kernel.turn_in_flight(context));
+        assert!(kernel.turns().get_interrupt(context).await.is_none());
+        assert!(completed.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_provider_connection_before_it_opens() {
+        let mut mock = MockClient::new("must not finish connecting");
+        mock.stream_start_delay = Duration::from_secs(5);
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let started: bool = kernel.kernel_db().lock().conn_for_ledger().query_row(
+                    "SELECT last_request_at IS NOT NULL FROM context_continuations WHERE context_id = ?1",
+                    rusqlite::params![context.as_bytes().as_slice()], |row| row.get(0),
+                ).unwrap();
+                if started { break; }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.expect("provider connection must start before shutdown");
+        tokio::time::timeout(Duration::from_millis(500), kernel.shutdown_command_worker()).await
+            .expect("shutdown must cancel provider connection, not wait for it to open").unwrap();
+        assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
+            reason: TurnStopReason::Cancelled { immediate: true }, ..
+        })));
+        assert!(!kernel.turn_in_flight(context));
+        assert!(kernel.turns().get_interrupt(context).await.is_none());
+    }
+
 }

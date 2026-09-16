@@ -24,8 +24,9 @@ invariants this implements.
 
 The kernel's `TurnState` (`runtime/turn_state.rs`) owns conversation sessions,
 image caching, and interrupts. Interactive RPC and headless turn submission
-share `runtime/llm_stream.rs`. The server still supplies task placement while
-shutdown ownership migrates; see `docs/kaish-integration.md`.
+share `runtime/llm_stream.rs`. The kernel worker owns accepted turns through
+cancellation and shutdown; request/resume drivers still need migration.
+See `docs/kaish-integration.md`.
 
 ## Tool pairing at send
 

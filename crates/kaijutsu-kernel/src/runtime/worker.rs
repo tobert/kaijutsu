@@ -1,4 +1,4 @@
-//! Kernel-owned local executor for accepted shell tools. Its runtime outlives
+//! Kernel-owned local executor for accepted shell tools and model turns. Its runtime outlives
 //! submitting transports and supports reentrant calls on the reserved kaish stack.
 
 use std::future::Future;
@@ -49,8 +49,8 @@ impl CommandWorker {
                         }
                     }
                 }
-                // Accepted work owns durable receipts. Cancel queued and running
-                // commands, then keep their runtime alive through settlement.
+                // Cancel queued and running work, then keep the runtime alive
+                // through command settlement and turn finalization.
                 receiver.close();
                 stopped.cancel();
                 while let Some(work) = receiver.recv().await { tasks.spawn_local(work(stopped.child_token())); }

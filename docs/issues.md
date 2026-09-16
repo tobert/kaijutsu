@@ -135,10 +135,15 @@ owners migrate. Command cancellation also reaches block pairs without receipts.
 
 Model streaming, identity resolution, conversation sessions, and interrupts now
 belong to kernel runtime modules. RPC translates startup errors but no longer
-owns those state fields. The turn task still runs on its caller's LocalSet;
-migrate admission, task placement, terminal-event cleanup, and driver shutdown
-next. Startup failures after interrupt creation can leave an entry without a
-running task; cover that alongside cancellation and panic cleanup.
+owns those state fields. Accepted turns now run on the kernel worker; startup
+failures leave no interrupt. Normal exits, early failures, and panics share
+terminal-event cleanup; shutdown cancels and joins accepted work. Move the
+request/resume drivers and transport-owned command tasks next.
+
+Per-context turn liveness still uses one map entry while the conversation mutex
+can queue multiple turns. Ending one turn can clear the mark for another; the
+latest interrupt also hides older queued/running turns. Give admission, interrupt
+selection, and liveness one consistent rule before declaring turn ownership done.
 
 ### Shared client recovery
 
@@ -199,10 +204,6 @@ Read by the lead; each line re-checked before it went here.
   test serializes the same type it reads. A ten-line test that
   `serde_json::from_str`s `tests/mock_scripts/*.json` as `Vec<Vec<StreamEvent>>`
   catches a shape drift before the e2e's 30 s timeout does.
-- **A mock script panic surfaces as a timeout.** The panic happens inside
-  the spawned `process_llm_stream` task, so no `TurnFlow::Failed` is
-  published; the scenario reports "timed out waiting for a turn event". A
-  `Result` from `stream()` would reach the turn's own error path.
 - **`kj handoff tail <other>` refuses a reader with no sheet** because the
   caller is resolved before the target is chosen (`kj/handoff.rs:250-253`).
   Resolve the caller only on the no-target branch.
@@ -1336,14 +1337,12 @@ skip only the duplicate — a judgment call, not mechanical.
 
 ## A dying turn still orphans its blocks mid-run (2026-08-22, half shipped)
 
-Boot sweep shipped (`830711e9`): a cold-start `Running` block is failed with
-an `Error` child. **The panic case is still open** — `process_llm_stream`
-(`llm_stream.rs:1360`) is still `spawn_local`'d with no `catch_unwind`,
-confirmed. A panic mid-stream silently kills the task: nothing publishes
-`TurnFlow::Failed`, blocks stay `Running` until the next restart. Hazard to
-design around: `process_llm_stream` holds the per-context mailbox lock for
-the whole stream, so a naive catch that resumes without dropping it deadlocks
-every later turn on that context.
+Cold-start recovery fails stale `Running` blocks with an `Error` child. The
+runtime now catches turn panics, releases the conversation lock, clears
+interrupt/liveness, and publishes `TurnFlow::Failed` before resuming unwind.
+The worker reports failure and cancels its other accepted work. Live cleanup
+of blocks left `Running` by a mid-stream panic remains open: track the exact
+blocks owned by that turn; a context-wide sweep can corrupt another writer.
 
 ## Asks vs forms — decision open (2026-08-22)
 

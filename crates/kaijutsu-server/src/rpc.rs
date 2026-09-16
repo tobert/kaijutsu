@@ -236,8 +236,8 @@ fn register_subscription(
 /// Kernel state shared across all connections via Arc.
 /// Created once at server startup.
 // TODO: Move transport-independent turn ownership and drivers into the kernel
-// runtime. Conversation sessions and interrupts are kernel-owned; task placement
-// and shutdown still need migration. Keep session subscriptions in the server.
+// runtime. Accepted turns, conversations, and interrupts are kernel-owned;
+// request/resume drivers still need migration. Keep subscriptions in the server.
 // See docs/issues.md, "Turn execution and shell settlement".
 pub struct SharedKernelState {
     pub id: KernelId,
@@ -3040,11 +3040,10 @@ pub async fn create_shared_kernel(
         ),
     }
 
-    // Fail every block still `Running` at cold start. Same shape as the ask
-    // sweep just above: `process_llm_stream` is spawned with no retained
-    // `JoinHandle` and no `catch_unwind` (llm_stream.rs), so a panic between
-    // "insert Running" and "set terminal status" — or the kernel restarting
-    // mid-turn — leaves a block `Running` forever with nothing left to
+    // Fail every block still `Running` at cold start. A panic or process exit
+    // between insertion and terminal publication can leave unfinished blocks.
+    // Turn cleanup publishes failure, but live block cleanup still needs exact
+    // ownership so it cannot sweep another writer's work. Nothing remains to
     // finalize it. At cold start no writer can be mid-turn, so any `Running`
     // block found here is known-stale (docs/issues.md, "Blocks orphaned in
     // `Running` have no supervisor"). It also sweeps `Waiting`, and the ask

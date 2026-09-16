@@ -436,14 +436,14 @@ impl Kernel {
         worker.submit(work)
     }
 
-    /// Signal accepted tool tasks to cancel and settle before their worker exits.
+    /// Signal accepted commands and model turns to cancel before their worker exits.
     /// This does not wait for the worker; transport disconnects do not stop it.
     pub fn stop_command_worker(&self) {
         self.command_worker_shutdown.cancel();
         if let Some(Ok(worker)) = self.command_worker.get() { worker.stop(); }
     }
 
-    /// Stop accepting commands and wait for their worker to finish settlement.
+    /// Stop accepting work and join command settlement and turn finalization.
     pub async fn shutdown_command_worker(&self) -> Result<(), String> {
         self.stop_command_worker();
         match self.command_worker.get() {
