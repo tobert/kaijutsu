@@ -20,9 +20,9 @@ use super::shell_state::{persist_shell_state, snapshot_shell_state};
 /// session map to update.
 pub type ContextSwitchSink<'a> = Option<&'a dyn Fn(ContextId)>;
 
-/// Project the final outcome before publishing terminal block statuses.
-/// A receipt commits the raw execution and hook result before either block
-/// advertises completion. Projection failures reach the caller for recovery.
+/// Retain the outcome before projection and commit its receipt before terminal
+/// block publication. Failed projections keep their recovery marker and return
+/// an error; startup finishes them without executing the command again.
 pub fn settle_outcome(
     kernel: &Kernel,
     context_id: ContextId,
@@ -33,6 +33,12 @@ pub fn settle_outcome(
     let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
     if operation.as_ref().is_some_and(|operation| operation.receipt.command_block_id != *command_block_id) {
         return Err("shell operation command block does not match its receipt".into());
+    }
+    let status = outcome.block_status();
+    if let Some(operation) = &operation
+        && status != Status::Waiting
+    {
+        kernel.shell_operations().prepare_settlement(&operation.receipt.operation_id, outcome)?;
     }
     let documents = kernel.blocks();
     let envelope = outcome.envelope();
@@ -66,8 +72,7 @@ pub fn settle_outcome(
         documents.set_ephemeral(context_id, block, envelope.ephemeral.unwrap_or(false))
             .map_err(|e| e.to_string())?;
     }
-    let status = outcome.block_status();
-    if let Some(operation) = operation {
+    if let Some(operation) = &operation {
         if status == Status::Waiting {
             let ask = envelope.ask_id.as_deref().ok_or("waiting command outcome has no ask")?;
             kernel.shell_operations().mark_waiting(&operation.receipt.operation_id, ask)?;
@@ -78,7 +83,41 @@ pub fn settle_outcome(
     for block in [output_block_id, command_block_id] {
         documents.set_status(context_id, block, status).map_err(|e| e.to_string())?;
     }
+    if let Some(operation) = &operation
+        && status != Status::Waiting
+    {
+        kernel.shell_operations().finish_projection(&operation.receipt.operation_id)?;
+    }
     Ok(())
+}
+
+/// Finish retained projections at startup without invoking kaish or hooks.
+/// A committed receipt plus terminal output proves that output was projected;
+/// preserve any subsequent user edits.
+pub(crate) fn recover_settlements(kernel: &Kernel) -> Result<usize, String> {
+    let pending = kernel.shell_operations().pending_projections()?;
+    for operation in &pending {
+        let receipt = &operation.receipt;
+        let context = receipt.context_id;
+        let outcome = kernel.shell_operations().outcome(&receipt.operation_id, context)?
+            .ok_or_else(|| format!("shell operation {} lost its pending outcome", receipt.operation_id))?;
+        let blocks = kernel.blocks();
+        if !blocks.contains(context) { blocks.load_one_from_db(context).map_err(|e| e.to_string())?; }
+        let output = blocks.get_block_snapshot(context, &receipt.output_block_id).map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("shell operation {} lost its output block", receipt.operation_id))?;
+        if operation.completed_at.is_some() && matches!(output.status, Status::Done | Status::Error) {
+            kernel.shell_operations().complete_outcome(&receipt.operation_id, &receipt.output_block_id, &outcome)?;
+            let command = blocks.get_block_snapshot(context, &receipt.command_block_id).map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("shell operation {} lost its command block", receipt.operation_id))?;
+            if !matches!(command.status, Status::Done | Status::Error) {
+                blocks.set_status(context, &receipt.command_block_id, outcome.block_status()).map_err(|e| e.to_string())?;
+            }
+            kernel.shell_operations().finish_projection(&receipt.operation_id)?;
+        } else {
+            settle_outcome(kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome)?;
+        }
+    }
+    Ok(pending.len())
 }
 
 /// Detect an in-shell context switch, tell the sink about it, and report the
@@ -372,6 +411,100 @@ mod fill_tests {
         settle_outcome(&kernel, ctx, &command, &output, &outcome).unwrap();
         assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Done);
         assert_eq!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap().stdout, "executed-once");
+    }
+
+    async fn restart_after_settlement_failure(after_receipt: bool) {
+        let kernel = Arc::new(Kernel::new_ephemeral("settlement-recovery").await);
+        let documents = kernel.blocks();
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "waiting", false, None, None).unwrap();
+        for block in [&command, &output] { documents.set_status(ctx, block, Status::Running).unwrap(); }
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            command, output, "never-execute-this-source-on-recovery", None).unwrap();
+        let outcome = CommandOutcome::new(CommandExecution::Completed(
+            kaish_kernel::interpreter::ExecResult::success("captured before failure")), 13);
+        let db = kernel.kernel_db().clone();
+        db.lock().conn_for_ledger().execute_batch(if after_receipt {
+            "CREATE TRIGGER fail_settlement BEFORE INSERT ON oplog
+             WHEN EXISTS(SELECT 1 FROM shell_operations WHERE completed_at IS NOT NULL)
+             BEGIN SELECT RAISE(ABORT, 'terminal block write failed'); END;"
+        } else {
+            "CREATE TRIGGER fail_settlement BEFORE UPDATE OF completed_at ON shell_operations
+             BEGIN SELECT RAISE(ABORT, 'receipt write failed'); END;"
+        }).unwrap();
+        assert!(settle_outcome(&kernel, ctx, &command, &output, &outcome).is_err());
+        assert!(kernel.shell_operations().outcome(&receipt.operation_id, ctx).unwrap().is_some(),
+            "a failed receipt write must not discard the captured outcome");
+        db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_settlement;").unwrap();
+        let principal = documents.principal_id();
+        let workspace = db.lock().get_or_create_default_workspace(principal).unwrap();
+        let reloaded = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
+        let dir = tempfile::tempdir().unwrap();
+        let recovered = Kernel::new("recovered-settlement", dir.path(), reloaded, db).await;
+        recovered.blocks().load_one_from_db(ctx).unwrap();
+        for block in [&command, &output] {
+            assert_eq!(recovered.blocks().get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Done);
+        }
+        assert_eq!(recovered.blocks().get_block_snapshot(ctx, &output).unwrap().unwrap().content, "captured before failure");
+        let saved = recovered.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap();
+        assert_eq!(saved.envelope.unwrap().stdout, "captured before failure");
+    }
+
+    #[tokio::test]
+    async fn restart_retains_outcome_after_failed_receipt_commit() {
+        restart_after_settlement_failure(false).await;
+    }
+
+    #[tokio::test]
+    async fn restart_repairs_blocks_after_receipt_committed() {
+        restart_after_settlement_failure(true).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_mistake_an_old_terminal_block_for_a_finished_projection() {
+        let kernel = Arc::new(Kernel::new_ephemeral("unprojected-outcome").await);
+        let documents = kernel.blocks();
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "old placeholder", false, None, None).unwrap();
+        assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Done);
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            command, output, "do-not-execute", None).unwrap();
+        let outcome = CommandOutcome::new(CommandExecution::Completed(
+            kaish_kernel::interpreter::ExecResult::success("retained result")), 1);
+        kernel.shell_operations().prepare_settlement(&receipt.operation_id, &outcome).unwrap();
+        assert_eq!(recover_settlements(&kernel).unwrap(), 1);
+        assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().content, "retained result");
+        assert_eq!(recover_settlements(&kernel).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_edits_after_terminal_publication() {
+        let kernel = Arc::new(Kernel::new_ephemeral("edited-after-settlement").await);
+        let documents = kernel.blocks();
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "waiting", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            command, output, "do-not-execute", None).unwrap();
+        let outcome = CommandOutcome::new(CommandExecution::Completed(
+            kaish_kernel::interpreter::ExecResult::success("captured result")), 1);
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_projection_cleanup BEFORE DELETE ON shell_operation_projections
+             BEGIN SELECT RAISE(ABORT, 'cleanup failed'); END;"
+        ).unwrap();
+        assert!(settle_outcome(&kernel, ctx, &command, &output, &outcome).is_err());
+        assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Done);
+        documents.replace_text_as(ctx, &output, "later edit", Some(PrincipalId::system())).unwrap();
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_projection_cleanup;").unwrap();
+        assert_eq!(recover_settlements(&kernel).unwrap(), 1);
+        assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().content, "later edit");
+        assert_eq!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap().stdout, "captured result");
+        assert_eq!(recover_settlements(&kernel).unwrap(), 0);
     }
 
     #[tokio::test]

@@ -169,9 +169,11 @@ and approval resume share `runtime/command.rs`. `runtime/command_outcome.rs`
 retains raw execution and hook effects; blocks, receipts, and jobs project from
 it. Terminal receipts commit before blocks advertise completion. Shared result
 converters live in `runtime/command_result.rs`; `runtime/shell_state.rs` commits
-changed cwd/exports atomically and returns persistence errors. The remaining
-structured/streaming RPC and MCP callers still need this outcome owner, along
-with automatic recovery of failed projections.
+changed cwd/exports atomically and returns persistence errors. Terminal outcomes
+are retained before projection; startup repairs pending projections without
+executing commands or hooks again. The remaining structured/streaming RPC and
+MCP callers still need this outcome owner. Initial retention failures and
+result-hook approval waits remain in the migration inventory.
 
 `spawn_kaish_thread` in kernel `lib.rs` reserves a 16 MiB stack for dedicated
 threads that can enter kaish. Server `main.rs` configures the Tokio worker

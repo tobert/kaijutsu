@@ -70,13 +70,14 @@ These are source observations, not promises that all paths behave alike.
 - `runtime/command_outcome.rs` retains raw execution, a hook replacement or
   refusal, elapsed time, and shell-state write failures. Interactive and approved
   commands project blocks, receipts, and jobs from it; block reconstruction is
-  deleted. Terminal receipts commit the execution record and effective envelope
-  together before terminal block publication. Raw records are read separately
+  deleted. Terminal outcomes are retained before projection; receipts commit
+  against that record before terminal block publication. Startup finishes pending
+  projections without executing code or hooks. Raw records are read separately
   from ordinary receipt polls, so a poll does not duplicate captured output.
 - Settlement remains incomplete: structured/streaming RPC and MCP completion
   still have separate projection paths. Their replacements need the same metadata
-  policy, and streaming RPC still cannot honor all hook verdicts. Persistence
-  recovery and result-hook approval waits also need the audit below.
+  policy, and streaming RPC still cannot honor all hook verdicts. Result-hook
+  approval waits and live reporting/retry of persistence failures remain open.
 - `background_exec.rs` was removed in `8ea04fdf`. Asynchronous shell programs
   use kaish's job system with durable Kaijutsu receipts. Earlier notes claiming
   that a temporary shell cannot host work that outlives it are obsolete.
@@ -141,13 +142,22 @@ baggage; its public envelope has no physical exit code. Real command exits 2
 and 3 are errors, just like other nonzero exits; an output-limit remap is judged
 by the retained original exit.
 
-Interactive settlement returns projection failures explicitly and commits its
-receipt before publishing terminal blocks. Retrying `settle_outcome` with the
-same outcome does not rerun the command. The remaining recovery audit must wire
-this into accepted-operation handling: a failure before receipt commit leaves
-an unfinished operation; a failure after commit leaves a durable outcome whose
-block projection needs repair. Result-hook asks also need durable retention of
-what already ran without treating approval as permission to rerun it.
+Interactive settlement retains its terminal outcome and a pending-projection
+marker atomically before writing blocks. It commits the receipt against that
+immutable outcome before publishing terminal statuses, then clears the marker.
+A failed write returns an error. Startup hydrates the affected documents and
+finishes retained projections without invoking kaish or hooks. It repairs only
+unfinished publication: a committed receipt plus terminal output proves that
+output projection finished, so later edits are preserved. A terminal block alone
+is insufficient; it may predate this execution. Startup fails explicitly if a
+retained projection cannot be recovered.
+
+A command whose outcome was never retained remains subject to interrupted-run
+recovery: the kernel reports an unknown result and never reruns its source.
+Failure before the initial retention write still requires live reporting/retry;
+background interactive callers currently log that failure, and approval resumes
+report it to the model. Result-hook asks need durable retention of what already
+ran and must resume publication without treating approval as permission to rerun.
 
 Preserve the distinction between parse/validation rejection (nothing ran) and
 an execution fault. Persistence failure must be visible and must not report a

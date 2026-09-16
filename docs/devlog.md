@@ -1546,6 +1546,18 @@ streaming, and MCP paths still need this outcome owner. Automatic projection
 recovery and approval of already-executed result hooks remain explicit work;
 returning a persistence error does not by itself recover an accepted operation.
 
+Recovery tests then reproduced two crash windows: a failed receipt write lost
+captured execution, and a committed receipt could leave Running blocks after
+restart. Settlement now retains the immutable outcome and a pending-projection
+marker before any block writes. Startup hydrates and repairs those projections
+without entering kaish or invoking hooks. A committed receipt plus terminal
+output is proof that output publication finished; recovery preserves subsequent
+edits and finishes only the remaining command status or marker cleanup. Another
+regression showed why terminal status alone is insufficient: an old placeholder
+can already be Done before a new outcome is projected. Preparation, completion,
+and cleanup reject transitions that would discard a retained outcome. Initial
+retention failure and result-hook approval continuation remain separate work.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

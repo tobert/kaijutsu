@@ -62,9 +62,11 @@ already succeeded. The capping stays visible as `did_spill: true`.
 ## Runtime outcomes
 
 Interactive commands and approval resumes use `CommandOutcome`. The raw kaish
-result and any hook replacement or refusal remain distinct. Terminal receipts
-commit that record and the effective envelope together before blocks advertise
-completion. A hook replacement clears the old stderr, physical exit, content
+result and any hook replacement or refusal remain distinct. Terminal outcomes
+are retained before projection. Receipts commit against that record before
+blocks advertise completion. Startup finishes pending projections without
+executing the command or hooks again, and preserves edits made after terminal
+publication. A hook replacement clears the old stderr, physical exit, content
 type, ephemeral flag, and structured output. Its text/JSON content and structured
 payload supply the new result. Raw records are separate from ordinary receipt
 polls. Structured RPC, streaming RPC, and MCP completion are still being migrated;

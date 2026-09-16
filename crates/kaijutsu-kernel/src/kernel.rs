@@ -367,7 +367,7 @@ impl Kernel {
             db.clone(),
         ));
 
-        Self {
+        let kernel = Self {
             id,
             vfs,
             name: RwLock::new(name),
@@ -409,7 +409,9 @@ impl Kernel {
             },
             cc_inbox: OnceLock::new(),
             turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        }
+        };
+        crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
+        kernel
     }
 
     /// Stable kernel identity.

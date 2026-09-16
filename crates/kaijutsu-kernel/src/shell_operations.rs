@@ -78,6 +78,9 @@ impl ShellOperationRegistry {
                 operation_id TEXT PRIMARY KEY REFERENCES shell_operations(operation_id),
                 outcome_json TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS shell_operation_projections (
+                operation_id TEXT PRIMARY KEY REFERENCES shell_operation_outcomes(operation_id)
+             );
              CREATE INDEX IF NOT EXISTS shell_operations_context ON shell_operations(context_id);
              CREATE UNIQUE INDEX IF NOT EXISTS shell_operations_ask ON shell_operations(ask_id);"
         ).map_err(|e| e.to_string())?;
@@ -131,7 +134,59 @@ impl ShellOperationRegistry {
         self.complete_record(id, envelope, None)
     }
 
-    /// Commit the raw execution, hook decision, and public result together.
+    /// Retain a terminal outcome before its projections can fail. An existing
+    /// record is immutable; a retry must carry exactly the same outcome.
+    pub fn prepare_settlement(&self, id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
+        if matches!(outcome.envelope().status, ShellStatus::Running | ShellStatus::Waiting) {
+            return Err("cannot prepare terminal settlement for a running or waiting command".into());
+        }
+        let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
+        let db = self.db.lock();
+        let tx = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
+        let completed: Option<Option<i64>> = tx.query_row(
+            "SELECT completed_at FROM shell_operations WHERE operation_id=?1", [id], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let completed = completed.ok_or_else(|| format!("shell operation {id} is missing"))?;
+        let prior: Option<String> = tx.query_row(
+            "SELECT outcome_json FROM shell_operation_outcomes WHERE operation_id=?1", [id], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        match prior {
+            Some(prior) if prior != json => return Err(format!("shell operation {id} already has a different outcome")),
+            Some(_) => {}
+            None if completed.is_some() => return Err(format!("shell operation {id} completed without a recoverable outcome")),
+            None => {
+                tx.execute("INSERT INTO shell_operation_outcomes(operation_id,outcome_json) VALUES(?1,?2)",
+                    rusqlite::params![id, json]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute("INSERT OR IGNORE INTO shell_operation_projections(operation_id) VALUES(?1)", [id])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn pending_projections(&self) -> OperationResult<Vec<ShellOperationState>> {
+        let db = self.db.lock();
+        let mut stmt = db.conn_for_ledger().prepare(
+            &format!("{SELECT_STATE} WHERE operation_id IN (SELECT operation_id FROM shell_operation_projections) ORDER BY created_at,operation_id"),
+        ).map_err(|e| e.to_string())?;
+        stmt.query_map([], decode_state).map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
+    pub fn finish_projection(&self, id: &str) -> OperationResult<()> {
+        let db = self.db.lock();
+        let conn = db.conn_for_ledger();
+        let completed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM shell_operations WHERE operation_id=?1 AND completed_at IS NOT NULL)",
+            [id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !completed { return Err(format!("shell operation {id} has not committed its receipt")); }
+        conn.execute("DELETE FROM shell_operation_projections WHERE operation_id=?1", [id])
+            .map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Commit the public result against its immutable execution record.
+    /// A prepared record must match; an unprepared one is inserted atomically.
     pub fn complete_outcome(&self, id: &str, output: &BlockId, outcome: &CommandOutcome) -> OperationResult<bool> {
         let mut envelope = outcome.envelope();
         envelope.block_id = Some(output.to_key());
@@ -163,17 +218,21 @@ impl ShellOperationRegistry {
         }
         if let Some(outcome_json) = outcome_json {
             if changed == 1 {
-                conn.execute("INSERT INTO shell_operation_outcomes(operation_id,outcome_json) VALUES(?1,?2)",
+                conn.execute("INSERT OR IGNORE INTO shell_operation_outcomes(operation_id,outcome_json) VALUES(?1,?2)",
                     rusqlite::params![id, outcome_json]).map_err(|e| e.to_string())?;
-            } else {
-                let prior: Option<String> = conn.query_row(
-                    "SELECT outcome_json FROM shell_operation_outcomes WHERE operation_id=?1",
-                    [id], |row| row.get(0),
-                ).optional().map_err(|e| e.to_string())?;
-                if prior.as_deref() != Some(outcome_json.as_str()) {
-                    return Err(format!("shell operation {id} already has a different outcome"));
-                }
             }
+            let prior: Option<String> = conn.query_row(
+                "SELECT outcome_json FROM shell_operation_outcomes WHERE operation_id=?1",
+                [id], |row| row.get(0),
+            ).optional().map_err(|e| e.to_string())?;
+            if prior.as_deref() != Some(outcome_json.as_str()) {
+                return Err(format!("shell operation {id} already has a different outcome"));
+            }
+        } else if changed == 1 {
+            let prepared: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM shell_operation_outcomes WHERE operation_id=?1)", [id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if prepared { return Err(format!("shell operation {id} has a retained outcome; refusing to replace it")); }
         }
         conn.commit().map_err(|e| e.to_string())?;
         self.jobs.lock().remove(id);
@@ -253,7 +312,8 @@ impl ShellOperationRegistry {
         let ids: Vec<String> = {
             let db = self.db.lock();
             let mut stmt = db.conn_for_ledger().prepare(
-                "SELECT operation_id FROM shell_operations WHERE completed_at IS NULL",
+                "SELECT operation_id FROM shell_operations WHERE completed_at IS NULL
+                 AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)",
             ).map_err(|e| e.to_string())?;
             stmt.query_map([], |row| row.get(0)).map_err(|e| e.to_string())?
                 .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?
@@ -393,6 +453,39 @@ mod tests {
         outcome.execution = CommandExecution::NotRun;
         assert!(registry.complete_outcome(&receipt.operation_id, &receipt.output_block_id, &outcome).is_err(),
             "equal public results must not hide different execution records");
+    }
+
+    #[test]
+    fn prepared_settlement_is_atomic_and_cannot_be_abandoned_or_replaced() {
+        use crate::runtime::command_outcome::CommandExecution;
+        let db = Arc::new(Mutex::new(KernelDb::open(":memory:").unwrap()));
+        let registry = ShellOperationRegistry::new(db.clone()).unwrap();
+        let context = ContextId::new();
+        let receipt = register(&registry, context);
+        let outcome = CommandOutcome::new(CommandExecution::Completed(
+            kaish_kernel::interpreter::ExecResult::success("already executed")), 1);
+        db.lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_prepare BEFORE INSERT ON shell_operation_projections
+             BEGIN SELECT RAISE(ABORT, 'cannot track projection'); END;"
+        ).unwrap();
+        assert!(registry.prepare_settlement(&receipt.operation_id, &outcome).is_err());
+        assert!(registry.outcome(&receipt.operation_id, context).unwrap().is_none());
+        assert!(registry.pending_projections().unwrap().is_empty());
+        db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_prepare;").unwrap();
+        registry.prepare_settlement(&receipt.operation_id, &outcome).unwrap();
+        registry.prepare_settlement(&receipt.operation_id, &outcome).unwrap();
+        assert_eq!(registry.pending_projections().unwrap().len(), 1);
+        assert!(registry.finish_projection(&receipt.operation_id).is_err());
+        assert_eq!(registry.abandon_unfinished().unwrap(), 0, "restart must retain a known outcome");
+        assert!(registry.complete(&receipt.operation_id, ShellEnvelope::new(ShellStatus::Error)).is_err());
+        assert!(registry.get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_none());
+        let different = CommandOutcome::new(CommandExecution::Fault("different result".into()), 1);
+        assert!(registry.prepare_settlement(&receipt.operation_id, &different).is_err());
+        assert!(registry.complete_outcome(&receipt.operation_id, &receipt.output_block_id, &different).is_err());
+        assert_eq!(registry.outcome(&receipt.operation_id, context).unwrap().unwrap().envelope().stdout, "already executed");
+        registry.complete_outcome(&receipt.operation_id, &receipt.output_block_id, &outcome).unwrap();
+        registry.finish_projection(&receipt.operation_id).unwrap();
+        assert!(registry.pending_projections().unwrap().is_empty());
     }
 
     #[test]
