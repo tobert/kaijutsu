@@ -2859,13 +2859,22 @@ pub async fn create_shared_kernel(
         // configured", which is a far worse diagnostic than this error.
         kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        // Seed the bootstrap character. Every kernel seeds exactly one —
-        // `hajime` — so the anonymous auto-register path always has
-        // somewhere to bind an unknown key, and the lockout-recovery CLI
-        // (`kaijutsu-server list-characters`) always finds at least one row
-        // (`docs/character.md`, "Bootstrap: `hajime`").
-        kaijutsu_kernel::seed_character::ensure_hajime(&mut db)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        // A kernel belongs to a live root character, created by
+        // `kaijutsu-server init` before the first start (`docs/character.md`,
+        // "Bootstrap: the person creates themself"). Refuse before anything
+        // else runs.
+        let has_root = db
+            .list_characters(false)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?
+            .iter()
+            .any(|row| row.root);
+        if !has_root {
+            return Err(capnp::Error::failed(format!(
+                "no live root character in {}. Stop here and run \
+                 `kaijutsu-server init --as <name> --key <pubkey-file>`, then start again",
+                db_path.display()
+            )));
+        }
         ws
     };
 
@@ -3474,33 +3483,15 @@ pub async fn create_shared_kernel(
         shutdown,
     };
 
-    // ROOT bootstrap: a brand-new kernel (nothing recovered above) has no
-    // contexts. Seed a single `director` context, `ROOT` — the binding-admin
-    // root of the tree. ROOT deliberately *can't* drive LLM
-    // turns (a director loadout has no drive/fork authority); the operator
-    // creates a coder (or any other type) from it when a conversational context
-    // is needed. Trigger is strictly *zero contexts at cold start*; once any
-    // context exists this never fires. Fail-loud: a kernel that can't seed its
-    // root context is broken, same stance as the recovery read above.
-    if all_contexts.is_empty() {
-        let root_id = ContextId::new();
-        log::info!(
-            "No contexts at cold start — seeding ROOT director context {}",
-            root_id.short()
-        );
-        create_context_inner(
-            &shared,
-            root_id,
-            "director",
-            Some("ROOT"),
-            PrincipalId::system(),
-            None,
-            SessionId::new(),
-        )
+    // Each live root character has a root context: type `root`, labeled
+    // with its name, played by it. Create any that are missing.
+    let created = shared
+        .kj_dispatcher
+        .ensure_root_contexts(PrincipalId::system())
         .await
-        .map_err(|e| {
-            capnp::Error::failed(format!("failed to seed ROOT context: {e}"))
-        })?;
+        .map_err(|e| capnp::Error::failed(format!("failed to create a root context: {e}")))?;
+    for context_id in created {
+        log::info!("Created root context {}", context_id.short());
     }
 
     Ok(Arc::new(shared))
@@ -13769,6 +13760,20 @@ mod semantic_search_tests {
             db.set_embedding_config(&kaijutsu_kernel::kernel_db::EmbeddingConfigRow {
                 enabled: false, endpoint: "http://127.0.0.1:9".into(),
                 timeout_ms: 100, max_in_flight: 1, max_context_bytes: 2048,
+            }).unwrap();
+            // create_shared_kernel refuses to start without a live root
+            // character (docs/character.md, "Bootstrap: the person creates
+            // themself") — seed one directly, the way `kaijutsu-server init`
+            // would, since this test drives create_shared_kernel straight
+            // off a hand-built kernel.db.
+            db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                principal_id: PrincipalId::new(),
+                name: "tester".to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                retired_at: None,
+                handoff_ctx: None,
+                root_ctx: None,
+                root: true,
             }).unwrap();
             drop(db);
             let shared = create_shared_kernel(None,

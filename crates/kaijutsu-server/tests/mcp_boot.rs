@@ -47,6 +47,7 @@ transport = "carrier_pigeon"
     .unwrap();
 
     support::disable_embeddings(data_dir.path());
+    support::init_root(data_dir.path(), "tester");
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         Some(config_dir.path()),
         &kaijutsu_server::config_mounts::ConfigMounts::new(config_dir.path().join("config")),

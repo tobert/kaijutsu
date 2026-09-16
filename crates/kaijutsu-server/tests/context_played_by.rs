@@ -31,14 +31,14 @@ fn create_context_leaves_played_by_unset() {
         let client = connect_client(addr).await;
         let (kj, _kernel_id) = client.bind_kernel().await.unwrap();
 
-        let context_id = kj.create_context("played-by-hajime-test").await.unwrap();
+        let context_id = kj.create_context("played-by-root-test").await.unwrap();
 
-        let hajime = kernel
+        let root = kernel
             .kernel_db
             .lock()
-            .get_character_by_name(kaijutsu_kernel::seed_character::HAJIME)
+            .get_character_by_name(SshServerConfig::EPHEMERAL_ROOT)
             .unwrap()
-            .expect("every kernel seeds hajime at cold start");
+            .expect("the ephemeral server's init step creates its root character");
 
         let row = kernel
             .kernel_db
@@ -48,8 +48,9 @@ fn create_context_leaves_played_by_unset() {
             .expect("just-created context must have a row");
 
         assert_eq!(
-            row.created_by, hajime.principal_id,
-            "anonymous auto-register binds to hajime, so the connecting principal IS hajime"
+            row.created_by, root.principal_id,
+            "connect_client authenticates with the root character's own bound key, so the \
+             connecting principal IS the root character"
         );
         assert_eq!(
             row.played_by,
@@ -58,7 +59,7 @@ fn create_context_leaves_played_by_unset() {
         );
         assert_eq!(
             row.director_id,
-            Some(hajime.principal_id),
+            Some(root.principal_id),
             "ordinary context creation records the authenticated creator as director"
         );
         assert_eq!(
@@ -72,8 +73,8 @@ fn create_context_leaves_played_by_unset() {
     });
 }
 
-/// A principal with no character row (a real, authenticated, ordinarily
-/// bound key — never anonymous, so it never falls back to hajime) leaves
+/// A principal with no character row (a real, authenticated key bound to its
+/// own principal, not the root character `connect_client` uses) leaves
 /// `played_by` NULL. No character is minted and the request does not fail:
 /// `played_by` is metadata, not authority, and a principal without a sheet
 /// is a legitimate pre-character state.
@@ -87,8 +88,8 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
         {
             // Bind the key BEFORE the server opens the same file, so
             // `db.authenticate` finds it on the very first connection —
-            // never the anonymous branch, which would bind to hajime
-            // instead of proving the characterless case.
+            // it must resolve to `unmapped` directly, not the root
+            // character, to prove the characterless case.
             let auth_db = AuthDb::open(&auth_db_path).unwrap();
             auth_db
                 .add_key(unmapped, key.public_key(), Some("characterless-test"))
@@ -142,7 +143,7 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
             .expect("just-created context must have a row");
         assert_eq!(
             row.created_by, unmapped,
-            "the bound key must authenticate straight to its own principal, not anonymous/hajime"
+            "the bound key must authenticate straight to its own principal, not the root character"
         );
         assert_eq!(
             row.played_by, None,

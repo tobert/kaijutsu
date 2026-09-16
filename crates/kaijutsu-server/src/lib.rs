@@ -8,6 +8,7 @@ pub mod clock;
 pub mod config_mounts;
 pub mod constants;
 pub mod context_feed;
+pub mod init;
 pub mod interrupt;
 pub mod llm_stream;
 pub mod migrate_keyring;

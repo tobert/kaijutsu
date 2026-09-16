@@ -21,6 +21,7 @@ async fn boot_uses_discovered_dimensions_and_no_builtin_model_files() {
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
     db.set_embedding_config(&EmbeddingConfigRow { enabled: true, endpoint,
         timeout_ms: 2000, max_in_flight: 2, max_context_bytes: 2048 }).unwrap();
+    insert_root_character(&db);
     drop(db);
     let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path())).await.unwrap();
     let index = shared.semantic_index.as_ref().expect("service discovery must initialize the index");
@@ -38,7 +39,26 @@ async fn unavailable_service_leaves_index_unavailable() {
     let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
     db.set_embedding_config(&EmbeddingConfigRow { enabled: true, endpoint,
         timeout_ms: 100, max_in_flight: 1, max_context_bytes: 2048 }).unwrap();
+    insert_root_character(&db);
     drop(db);
     let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path())).await.unwrap();
     assert!(shared.semantic_index.is_none(), "must not substitute another embedding model");
+}
+
+/// `create_shared_kernel` refuses to start against a `kernel.db` with no
+/// live root character (`docs/character.md`, "Bootstrap: the person creates
+/// themself"). These tests drive `create_shared_kernel` directly on a
+/// hand-built `kernel.db`, so seed the root row the same way
+/// `kaijutsu-server init` would, without going through a real SSH boot.
+fn insert_root_character(db: &KernelDb) {
+    db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+        principal_id: kaijutsu_types::PrincipalId::new(),
+        name: "tester".to_string(),
+        created_at: kaijutsu_types::now_millis() as i64,
+        retired_at: None,
+        handoff_ctx: None,
+        root_ctx: None,
+        root: true,
+    })
+    .expect("insert root character for embedding_boot fixture");
 }

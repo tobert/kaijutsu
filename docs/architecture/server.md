@@ -153,12 +153,12 @@ clobber stream-B. Created fresh per prompt.
 (`auth.db`) with `principals` (UUIDv7 id, bare bookkeeping row) and
 `credentials` (SSH fingerprint → principal id, no name). `authenticate` is a
 single-table lookup on the hot path via `spawn_blocking`, returning a bare
-`PrincipalId`. Authorization is binary (key in DB = allowed); anonymous mode
-binds an unknown key to the seeded `hajime` character rather than minting.
+`PrincipalId`. Authorization is binary: a key in the DB is allowed, and an
+unknown key is rejected.
 The given name a player reads is `characters.name` in `kernel.db`, resolved
 through `KernelDb::name_for` (`docs/character.md`, "`auth.db` is a
-keyring"). Management CLI in `main.rs`: `add-key --as <character>
-[--rebind]`, `list-keys`, `list-characters`.
+keyring"). Management CLI in `main.rs`: `init --as <name> --key <file>`,
+`add-key --as <character> [--rebind]`, `list-keys`, `list-characters`.
 
 ---
 

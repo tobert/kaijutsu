@@ -1,6 +1,6 @@
 //! Shared harness for the isotest suite: boot a real `kaijutsu-server` child
-//! process, connect over loopback SSH with `kaijutsu-client`, join the
-//! genesis ROOT context. See `docs/isotest.md` for the rationale.
+//! process, connect over loopback SSH with `kaijutsu-client`, join the root
+//! character's root context. See `docs/isotest.md` for the rationale.
 //!
 //! `tests/common/mod.rs` (a subdirectory, not a bare `tests/common.rs`) is
 //! the standard Rust convention for code shared between integration test
@@ -59,8 +59,9 @@ pub fn run_local<F: std::future::Future<Output = ()>>(f: F) {
 }
 
 /// A kaijutsu-server child process on its own $HOME, plus the client key the
-/// server was taught to accept (`add-key` runs before boot — the shipped
-/// binary has allow_anonymous=false and there is no registration RPC).
+/// server was taught to accept (`kaijutsu-server init` runs before boot,
+/// binding it to the root character — unknown keys are always rejected and
+/// there is no registration RPC).
 pub struct TestKernel {
     pub child: Child,
     pub home: PathBuf,
@@ -76,16 +77,13 @@ impl TestKernel {
 
     /// Boot on an explicit $HOME — the restart test reuses one across boots.
     ///
-    /// `auth.db` is a keyring now: `add-key` binds to an EXISTING character
-    /// rather than minting one, so it needs `kernel.db` to already carry a
-    /// character to bind to. A fresh $HOME has neither database yet, and
-    /// only the server's own bootstrap creates `kernel.db` and seeds the
-    /// bootstrap character, `hajime` (`docs/character.md`, "Bootstrap:
-    /// `hajime`"). So the order inverts from the old mint-before-boot
-    /// shape: spawn the server first, wait for `kernel.db` to appear, THEN
-    /// `add-key --as hajime` — safe to run while the server is up, because
-    /// `auth.db` is WAL now and the server never caches a credential lookup
-    /// (`docs/character.md`, "`auth.db` moves to WAL").
+    /// The server refuses to start against a `kernel.db` with no live root
+    /// character (`docs/character.md`, "Bootstrap: the person creates
+    /// themself"), and there is no registration RPC to create one after the
+    /// fact. So the order is init-before-boot: run `kaijutsu-server init
+    /// --as <name> --key <pubfile>` (the same `$HOME`/XDG env the server
+    /// itself will use) to create the root character and bind this test's
+    /// key BEFORE the server process ever starts, then spawn it.
     pub fn boot_at(home: PathBuf, port: u16) -> Self {
         std::fs::create_dir_all(&home).expect("create test home");
 
@@ -105,6 +103,13 @@ impl TestKernel {
         )
         .expect("write client pubkey");
 
+        let status = Command::new(server_bin())
+            .args(["init", "--as", "tester", "--key", pub_path.to_str().unwrap()])
+            .env("HOME", &home)
+            .status()
+            .expect("run init");
+        assert!(status.success(), "init failed with {status}");
+
         // Server output goes to files under $HOME so `contrib/isotest --keep`
         // debugging can read the story after the fact.
         let out = std::fs::File::create(home.join("server.stdout.log")).unwrap();
@@ -119,35 +124,6 @@ impl TestKernel {
             .stderr(err)
             .spawn()
             .expect("spawn kaijutsu-server");
-
-        // `kernel.db` is the honest "bootstrap ran" signal for a server we
-        // can't yet authenticate to (allow_anonymous=false in production()
-        // and there is no registration RPC). It appears well before the
-        // server is ready to accept SSH — `create_shared_kernel` seeds it
-        // early in startup, long before the listener's auth path is live.
-        let kernel_db_path = home
-            .join(".local")
-            .join("share")
-            .join("kaijutsu")
-            .join("kernel")
-            .join("kernel.db");
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !kernel_db_path.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "kernel.db never appeared at {}\n--- server.stderr.log:\n{}",
-                kernel_db_path.display(),
-                std::fs::read_to_string(home.join("server.stderr.log")).unwrap_or_default()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        let status = Command::new(server_bin())
-            .args(["add-key", pub_path.to_str().unwrap(), "--as", "hajime"])
-            .env("HOME", &home)
-            .status()
-            .expect("run add-key");
-        assert!(status.success(), "add-key failed with {status}");
 
         TestKernel { child, home, port, key }
     }
@@ -218,18 +194,20 @@ impl TestKernel {
     }
 }
 
-/// Join the genesis ROOT context (a director: exec + facade:shell out of the
-/// box) and return the handle ready for tool calls.
+/// Join the root character's root context (admin: exec + facade:shell out of
+/// the box) and return the handle ready for tool calls. The context's label
+/// is the root character's name — `"tester"`, the name `TestKernel::boot_at`
+/// passes to `kaijutsu-server init`.
 pub async fn join_root(kernel: &KernelHandle) {
     let root = kernel
-        .resolve_context_label("ROOT")
+        .resolve_context_label("tester")
         .await
         .expect("resolve_context_label")
-        .expect("genesis ROOT context exists on a fresh kernel");
+        .expect("the root character's root context exists on a fresh kernel");
     kernel
         .join_context(root.id, "isotest")
         .await
-        .expect("join ROOT");
+        .expect("join root context");
 }
 
 /// Start an asynchronous shell operation and return its durable receipt ID.

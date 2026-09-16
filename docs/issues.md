@@ -124,17 +124,17 @@ covered; these are not:
    character or the reviewer's, as casting does.
 2. **`kj context remove` orphans children.** `forked_from` is
    `ON DELETE SET NULL`, so a removed context's children become forest
-   roots and their asks fall to the default with nothing recorded. Refuse
+   roots and their asks lose their reviewer with nothing recorded. Refuse
    while live children exist.
 3. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a
-   parentless context played by a model. Mint it from the character's
-   `root_ctx` once that exists, and from `ROOT` until then.
+   parentless context played by a model. The kernel must not guess a root
+   (Amy, 2026-09-16), so it needs an explicit parent. Decide with the
+   default-reviewer removal ("Roots, bootstrap, and rotation", slice 5).
 4. **Wire creates are parentless.** `create_context_inner` writes
    `forked_from: None` for the app, the tui, ACP with a character, and the
-   MCP bridge's per-session contexts. Take an optional parent on the wire
-   and default to the creator's `root_ctx`; belongs with the root_ctx
-   slice.
+   MCP bridge's per-session contexts. Resolved by dropping the RPC ("Roots,
+   bootstrap, and rotation", slice 4).
 
 Open question from the lane: the walk starts at the ask's own context,
 so an actor who is not that context's performer, a human typing in a
@@ -168,17 +168,26 @@ slice green and committed:
    root character and binds its key. A kernel with no live root character
    refuses to start. Remove `hajime` and `allow_anonymous`; tests bind keys
    explicitly.
-4. **No default reviewer.** Resolution is override, delegation, then the
-   `forked_from` walk. The authority the default held (routing changes,
-   delegation grant and revoke, escalation) belongs to the root character at
-   the top of the context's walk. `kj context create` with no parent forks
-   from the caller's root context. Remove `approval.toml` and its cache.
-5. **Rotation reads `root_ctx`.** `kj context rotate <character>`: creates
+4. **Drop the `createContext` RPC.** Clients run `kj context create` through
+   `executeKj` from a context, so its parent is that context and no unrooted
+   context can exist. Not fork: fork copies history, type, and performer.
+   Callers: `kaijutsu-mcp` `register_session`, the tui bridge, the ACP
+   bridge, and the client wrappers. The MCP chooses the context to run from:
+   `--parent`/`KAIJUTSU_PARENT`, then the only live root context with a
+   warning, otherwise it refuses and lists the roots. No wire change. Amy:
+   "we'll drop the RPC and push it to kj and then future changes like this
+   get easier."
+5. **No default reviewer.** Resolution is override, delegation, then the
+   `forked_from` walk. Only a root character self-confirms; a walk that ends
+   at a non-root actor refuses. Routing changes and ask escalation belong to
+   the root at the top of the context's walk; delegation grant and revoke to
+   any live root. Remove `approval.toml` and its cache.
+6. **Rotation reads `root_ctx`.** `kj context rotate <character>`: creates
    the successor from the predecessor's own parent with the same type, cast,
    and performer, sets `ROTATED_FROM`, moves the pointer, archives the
    predecessor, in one transaction. `docs/prompts.md`, "Rotating a director
    context" changes to the verb.
-6. **`create --as` asks instead of refusing.** Apply the held patch
+7. **`create --as` asks instead of refusing.** Apply the held patch
    (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
    turn its refusal into an ask to the responsible character above, and
    accept a redeemed approval for the exact statement as authority.
@@ -187,6 +196,17 @@ Migrate zorak by hand or in downtime after slice 4; keep it simple.
 
 Also open: `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
 is flaky under the parallel test runner and passes single-threaded.
+
+## isotest shell tests pend on their reviewer (2026-09-16)
+
+`contrib/isotest` fails 14 tests (8 in `filesystem.rs`, 6 in `isolation.rs`)
+with `gate for shell_write is waiting on its reviewer`. The same 14 failed
+at `13a4e62a`, before the bootstrap change, so the approval gate outgrew the
+harness earlier. The harness never answers an ask. Recheck after the
+default-reviewer removal ("Roots, bootstrap, and rotation", slice 5): the
+ephemeral root acts in its own root context, so its asks become
+self-confirmations it can answer with `kj ledger allow`, or the harness
+needs an allow rule for its commands.
 
 ## Split admin grants between `root` and `director` (2026-09-16)
 

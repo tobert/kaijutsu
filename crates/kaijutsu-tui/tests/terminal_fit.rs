@@ -36,7 +36,7 @@ const CONNECT: Duration = Duration::from_secs(15);
 fn spawn_session(rows: u16, cols: u16) -> (EphemeralServer, tempfile::TempDir, TuiSession) {
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let session = TuiSession::spawn(server.addr, &key_path, rows, cols);
     (server, key_dir, session)
 }
@@ -1095,7 +1095,7 @@ fn a_panic_restores_the_terminal_from_the_alternate_screen() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("key tempdir");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let mut session = TuiSession::spawn_with_env(server.addr, &key_path, 24, 80, &[("KAIJUTSU_TUI_PROBE_PANIC", "1")]);
     wait_for_attach(&session);
     open_copy_mode(&session);
@@ -1139,7 +1139,7 @@ fn a_panic_inside_a_frame_ends_the_synchronized_update() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("key tempdir");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let mut session =
         TuiSession::spawn_with_env(server.addr, &key_path, 24, 80, &[("KAIJUTSU_TUI_PROBE_PANIC", "frame")]);
     wait_for_attach(&session);
@@ -1199,7 +1199,8 @@ fn a_placement_verb_moves_the_row_while_the_picker_stays_open() {
     session.send("/seatme\r");
     let filtered = session.wait_until(Duration::from_secs(5), |screen| {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
-        picker_row_for(&rows, "seatme").is_some() && !screen_contains_str(screen, "ROOT")
+        picker_row_for(&rows, "seatme").is_some()
+            && picker_row_for(&rows, kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT).is_none()
     });
     assert!(filtered, "the filter never narrowed to the fork: {}", session.dump("filter"));
     for _ in 0..tabs_to_section(&session.screen_text(), "seatme") {
@@ -1528,7 +1529,8 @@ fn switching_through_the_picker_loads_the_new_contexts_draft() {
     session.send("/altseat\r");
     let filtered = session.wait_until(Duration::from_secs(5), |screen| {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
-        picker_row_for(&rows, "altseat").is_some() && !screen_contains_str(screen, "ROOT")
+        picker_row_for(&rows, "altseat").is_some()
+            && picker_row_for(&rows, kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT).is_none()
     });
     assert!(filtered, "the filter never narrowed to the fork: {}", session.dump("filter"));
     for _ in 0..tabs_to_section(&session.screen_text(), "altseat") {
@@ -1723,7 +1725,7 @@ fn a_promoted_context_goes_resident_before_any_switch_to_it() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("tempdir for the ephemeral key");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let session = TuiSession::spawn_with_env(
         server.addr,
         &key_path,
@@ -1851,7 +1853,7 @@ fn a_panic_inside_a_task_ends_the_client_and_restores_the_terminal() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("key tempdir");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let mut session = TuiSession::spawn_with_env(server.addr, &key_path, 24, 80, &[("KAIJUTSU_TUI_PROBE_PANIC", "task")]);
     wait_for_attach(&session);
     open_copy_mode(&session);
@@ -1921,7 +1923,7 @@ fn the_kitty_keyboard_is_taken_with_the_screen_and_given_back() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("key tempdir");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let mut session = TuiSession::spawn_with_args(server.addr, &key_path, 24, 80, &["--kitty-keyboard"]);
     wait_for_attach(&session);
     assert_eq!(
@@ -1990,7 +1992,7 @@ fn shift_enter_is_reserved_under_the_kitty_protocol() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("key tempdir");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let mut session = TuiSession::spawn_with_args(server.addr, &key_path, 24, 80, &["--kitty-keyboard"]);
     wait_for_attach(&session);
 
@@ -2033,7 +2035,7 @@ fn a_lone_escape_leaves_insert_mode_under_the_kitty_protocol() {
     let _serial = serial();
     let server = EphemeralServer::start();
     let key_dir = tempfile::tempdir().expect("key tempdir");
-    let key_path = write_ephemeral_key(key_dir.path());
+    let key_path = write_ephemeral_key(&server, key_dir.path());
     let mut session = TuiSession::spawn_with_args(server.addr, &key_path, 24, 80, &["--kitty-keyboard"]);
     wait_for_attach(&session);
 

@@ -43,6 +43,10 @@ pub fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// in turn), so probes never share state.
 pub struct EphemeralServer {
     pub addr: SocketAddr,
+    /// The root key `SshServerConfig::ephemeral` bound for this server; the
+    /// server rejects every other key. `write_ephemeral_key` writes it to a
+    /// file for the `kaijutsu-tui` binary.
+    pub root_key: Arc<russh::keys::PrivateKey>,
     cancel: Arc<tokio::sync::Notify>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -50,7 +54,7 @@ pub struct EphemeralServer {
 impl EphemeralServer {
     /// Start the server and block until it has actually bound a port.
     pub fn start() -> Self {
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(tokio::sync::Notify::new());
         let cancel_task = cancel.clone();
 
@@ -65,9 +69,9 @@ impl EphemeralServer {
                     .await
                     .expect("bind ephemeral port");
                 let bound = listener.local_addr().expect("read bound addr");
-                addr_tx.send(bound).expect("report bound addr");
 
                 let config = kaijutsu_server::SshServerConfig::ephemeral(bound.port());
+                ready_tx.send((bound, config.root_key())).expect("report bound addr + key");
                 let server = kaijutsu_server::SshServer::new(config);
                 tokio::select! {
                     res = server.run_on_listener(listener) => {
@@ -80,10 +84,10 @@ impl EphemeralServer {
             });
         });
 
-        let addr = addr_rx
+        let (addr, root_key) = ready_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("ephemeral server bound a port");
-        Self { addr, cancel, join: Some(join) }
+        Self { addr, root_key, cancel, join: Some(join) }
     }
 }
 
@@ -96,16 +100,15 @@ impl Drop for EphemeralServer {
     }
 }
 
-/// Generate an ephemeral Ed25519 key (the same generation
-/// `kaijutsu_client::KeySource::ephemeral()` does) and write it to
-/// `<dir>/id_ed25519` in OpenSSH format, for `kaijutsu-tui --key <path>`.
-/// Returns the key file path.
-pub fn write_ephemeral_key(dir: &Path) -> PathBuf {
-    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
+/// Write `server`'s root key to `<dir>/id_ed25519` in OpenSSH format, for
+/// `kaijutsu-tui --key <path>`. Returns the key file path.
+///
+/// Must be `server`'s own key: the server rejects any key its `init` step
+/// did not bind.
+pub fn write_ephemeral_key(server: &EphemeralServer, dir: &Path) -> PathBuf {
+    use russh::keys::ssh_key::LineEnding;
 
-    let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
-        .expect("generate ephemeral ed25519 key");
-    let encoded = key.to_openssh(LineEnding::LF).expect("encode key as OpenSSH");
+    let encoded = server.root_key.to_openssh(LineEnding::LF).expect("encode key as OpenSSH");
     let path = dir.join("id_ed25519");
     std::fs::write(&path, encoded.as_bytes()).expect("write key file");
     #[cfg(unix)]

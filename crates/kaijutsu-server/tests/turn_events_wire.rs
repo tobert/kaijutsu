@@ -105,7 +105,9 @@ fn interactive_turn_pushes_completed_with_its_output_block() {
     run_local(async {
         let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
-        let actor = client.whoami().await.unwrap().principal_id;
+        // The client connects as the root character, which cannot perform
+        // a turn, so the performer is a separate principal.
+        let actor = PrincipalId::new();
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         let ctx = kernel.create_context("turns").await.unwrap();
@@ -174,7 +176,9 @@ fn cancelled_turn_pushes_a_cancelled_stop_reason() {
     run_local(async {
         let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
-        let actor = client.whoami().await.unwrap().principal_id;
+        // The client connects as the root character, which cannot perform
+        // a turn, so the performer is a separate principal.
+        let actor = PrincipalId::new();
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         let ctx = kernel.create_context("cancel").await.unwrap();
@@ -244,7 +248,9 @@ fn autonomous_fork_turn_pushes_started_then_completed_for_the_child() {
     run_local(async {
         let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
-        let actor = client.whoami().await.unwrap().principal_id;
+        // The client connects as the root character, which cannot perform
+        // a turn, so the performer is a separate principal.
+        let actor = PrincipalId::new();
         let (kernel, _) = client.bind_kernel().await.unwrap();
 
         let main_ctx = kernel.create_context("parent").await.unwrap();

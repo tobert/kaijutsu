@@ -1417,3 +1417,29 @@ publication. Keeping lock order explicit also exposed a subtree fork that
 reacquired its held database mutex; a persistent-store regression reproduced
 it where memory-only fixtures had not. Compound compose selection and complete
 change-feed acceptance groups remain separate, marked follow-ups.
+## The kernel with no one to answer to (September 16)
+
+Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
+seeded `hajime`, the shipped `approval.toml` named `amy` as the default
+reviewer, and ROOT was a `director` context with no performer. Every `kj`
+call warned that `amy` had no sheet, and nobody could assign ROOT a performer,
+because that check resolves the reviewer first. The guide rc `hajime` was
+supposed to carry had never been written.
+
+Each piece had been reasonable alone. Together they asked a new kernel to
+know a person before any person had arrived. Amy's question went to the
+shape: *"maybe before the first connection the user creates themself and the
+rest is more mechanical?"* Then, in short order: drop `default_reviewer`;
+ROOT is *"a root for attaching bantos to, and a model-less place I can type kj
+admin commands"*; *"there should be no anonymous at all!"*; adding keys stays
+host-only; and *"equal roots. 1 will be typical, more than one just needs to
+be possible for now."*
+
+`kaijutsu-server init --as <name> --key <pubkey-file>` now creates the root
+character and binds its key before the first start, and a kernel with no live
+root refuses to start. Each root character gets a root context of the new
+model-less `root` type, labeled with its name. The ephemeral test config runs
+the same `init`, so tests stopped relying on the anonymous path production
+never had. The lesson is the one the approval work keeps teaching: a fallback
+that names a specific person is configuration pretending to be a relation. The
+default reviewer comes out next, and the context tree answers who reviews.

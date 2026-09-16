@@ -15,16 +15,16 @@ mod common;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::{run_local, start_server, start_server_with_state_dir};
+use common::{root_key_source, run_local, start_server, start_server_with_state_dir};
 use kaijutsu_cas::{ContentStore, FileStore};
-use kaijutsu_client::{CasResolver, KeySource, ResolveSource, SftpClient, SftpError, SshConfig};
+use kaijutsu_client::{CasResolver, ResolveSource, SftpClient, SftpError, SshConfig};
 
 fn ephemeral_config(addr: std::net::SocketAddr) -> SshConfig {
     SshConfig {
         host: addr.ip().to_string(),
         port: addr.port(),
         username: "test_user".to_string(),
-        key_source: KeySource::ephemeral(),
+        key_source: root_key_source(addr),
         insecure: true,
     }
 }

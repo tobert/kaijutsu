@@ -40,6 +40,9 @@ fn run_local<F: std::future::Future<Output = ()>>(f: F) {
 /// client gives up or the SSH layer times out).
 struct ServerHandle {
     addr: SocketAddr,
+    /// The root key this server's `auth.db` binds; `spawn_test_actor`
+    /// authenticates with it.
+    key: Arc<russh::keys::PrivateKey>,
     cancel: Arc<Notify>,
     join: JoinHandle<()>,
 }
@@ -58,7 +61,17 @@ impl ServerHandle {
 /// Start a server on the given address. If `addr` is `None`, picks an
 /// ephemeral port; otherwise re-binds the supplied address (used to
 /// simulate "kernel comes back on the same port").
-async fn start_server_on(addr: Option<SocketAddr>) -> ServerHandle {
+///
+/// `state_dir`, when given, is where the root character and key live —
+/// pass the SAME directory across two calls to simulate a real restart
+/// (durable `kernel.db`/`auth.db` surviving the bounce), so the root key
+/// bound on the first call still authenticates against the second. `None`
+/// gets an ordinary throwaway `SshServerConfig::ephemeral` tree, for tests
+/// that never restart the server.
+async fn start_server_on(
+    addr: Option<SocketAddr>,
+    state_dir: Option<std::path::PathBuf>,
+) -> ServerHandle {
     let bind = match addr {
         Some(a) => a,
         None => "127.0.0.1:0".parse().unwrap(),
@@ -80,7 +93,48 @@ async fn start_server_on(addr: Option<SocketAddr>) -> ServerHandle {
         }
     };
     let bound_addr = listener.local_addr().unwrap();
-    let server_config = SshServerConfig::ephemeral(bound_addr.port());
+
+    let (server_config, root_key) = match state_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir).expect("create reconnect-fsm state dir");
+            let auth_db_path = dir.join("auth.db");
+            let root_key = russh::keys::PrivateKey::random(
+                &mut rand_v10::rng(),
+                russh::keys::Algorithm::Ed25519,
+            )
+            .expect("generate root key for reconnect-fsm state dir");
+            {
+                let kernel_db =
+                    kaijutsu_kernel::kernel_db::KernelDb::open(dir.join("kernel.db"))
+                        .expect("open reconnect-fsm kernel db");
+                let auth_db = kaijutsu_server::AuthDb::open(&auth_db_path)
+                    .expect("open reconnect-fsm auth db");
+                // Idempotent on a second call against the same dir: the
+                // character is already root, and this call's fresh key is
+                // simply bound alongside whatever key an earlier call bound
+                // — so the FIRST call's key (the one a reconnecting actor is
+                // still holding) keeps authenticating after the "restart".
+                kaijutsu_server::init::init_root(
+                    &kernel_db,
+                    &auth_db,
+                    SshServerConfig::EPHEMERAL_ROOT,
+                    root_key.public_key(),
+                    Some("reconnect-fsm root"),
+                )
+                .expect("init reconnect-fsm root character");
+            }
+            let mut config = SshServerConfig::ephemeral(bound_addr.port());
+            config.config_dir = Some(dir.clone());
+            config.data_dir = Some(dir);
+            config.auth_db_path = Some(auth_db_path);
+            (config, Arc::new(root_key))
+        }
+        None => {
+            let config = SshServerConfig::ephemeral(bound_addr.port());
+            let key = config.root_key();
+            (config, key)
+        }
+    };
 
     let cancel = Arc::new(Notify::new());
     let cancel_clone = cancel.clone();
@@ -103,18 +157,20 @@ async fn start_server_on(addr: Option<SocketAddr>) -> ServerHandle {
     tokio::task::yield_now().await;
     ServerHandle {
         addr: bound_addr,
+        key: root_key,
         cancel,
         join,
     }
 }
 
-/// Spawn an actor pointed at the given server.
-fn spawn_test_actor(addr: SocketAddr, instance: &str) -> ActorHandle {
+/// Spawn an actor pointed at the given server, authenticating with `key` —
+/// the root key that server's `auth.db` recognizes (`ServerHandle::key`).
+fn spawn_test_actor(addr: SocketAddr, key: Arc<russh::keys::PrivateKey>, instance: &str) -> ActorHandle {
     let config = SshConfig {
         host: addr.ip().to_string(),
         port: addr.port(),
         username: "test_user".to_string(),
-        key_source: KeySource::ephemeral(),
+        key_source: KeySource::InMemory(key),
         insecure: true,
     };
     spawn_actor(config, None, instance.to_string(), false)
@@ -180,10 +236,10 @@ async fn whoami_with_retry(
 #[test]
 fn actor_connects_eagerly_without_a_command() {
     run_local(async {
-        let server = start_server_on(None).await;
+        let server = start_server_on(None, None).await;
         // Subscribe to status BEFORE the actor task gets a chance to run (the
         // LocalSet only advances when we await), so we can't miss a transition.
-        let actor = spawn_test_actor(server.addr, "test-eager-connect");
+        let actor = spawn_test_actor(server.addr, server.key.clone(), "test-eager-connect");
 
         // No command is ever sent here — the actor must reach Connected on its
         // own. If eager connect regressed to lazy, this wait would time out.
@@ -196,8 +252,9 @@ fn actor_connects_eagerly_without_a_command() {
         .await;
 
         // And the first call now succeeds straight away — no kick needed.
-        // Anonymous mode binds every unknown key to the seeded `hajime`
-        // character; the load-bearing assertion is that we GOT an identity.
+        // The actor authenticates with the server's own root key
+        // (`ServerHandle::key`), so this is a real bound identity, not an
+        // auto-registered one; the load-bearing assertion is that we GOT it.
         let id = actor.whoami().await.expect("whoami after eager connect");
         assert!(!id.username.is_empty(), "username should be non-empty");
     });
@@ -216,8 +273,8 @@ fn actor_connects_eagerly_without_a_command() {
 #[test]
 fn late_observer_reads_connected_as_level() {
     run_local(async {
-        let server = start_server_on(None).await;
-        let actor = spawn_test_actor(server.addr, "test-late-observer");
+        let server = start_server_on(None, None).await;
+        let actor = spawn_test_actor(server.addr, server.key.clone(), "test-late-observer");
 
         // Get the actor solidly into Connected. A successful whoami means the
         // handshake completed; from here the actor sits silently in Connected.
@@ -267,10 +324,16 @@ fn late_observer_reads_connected_as_level() {
 #[test]
 fn actor_reconnects_after_server_restart() {
     run_local(async {
+        // A real restart keeps its durable kernel.db/auth.db; simulate that
+        // here by pointing both start_server_on calls at the same state_dir,
+        // so the root key `actor` is holding still authenticates against v2.
+        let state = tempfile::tempdir().expect("state tempdir");
+        let state_dir = state.path().to_path_buf();
+
         // 1. Start server, connect, verify whoami works.
-        let server1 = start_server_on(None).await;
+        let server1 = start_server_on(None, Some(state_dir.clone())).await;
         let addr = server1.addr;
-        let actor = spawn_test_actor(addr, "test-reconnect");
+        let actor = spawn_test_actor(addr, server1.key.clone(), "test-reconnect");
 
         let id = whoami_with_retry(&actor, Duration::from_secs(5))
             .await
@@ -316,19 +379,19 @@ fn actor_reconnects_after_server_restart() {
         // 3. Restart server on the same port. The FSM's cooldown timer should
         //    fire and the next handshake should succeed.
         log::info!("restarting server v2 on {addr}");
-        let server2 = start_server_on(Some(addr)).await;
+        let server2 = start_server_on(Some(addr), Some(state_dir)).await;
 
         // 4. Reconnect should happen within the Cooldown + handshake window.
         //    Backoff after 1 failure is 1s; SSH dial + handshake is sub-second.
         let id2 = whoami_with_retry(&actor, Duration::from_secs(30))
             .await
             .expect("reconnect within 30s");
-        // Server v2 has a fresh in-memory auth db so the auto-registered
-        // username may differ from server v1's — but it must be non-empty.
-        assert!(!id2.username.is_empty(), "reconnect produced empty username");
-        log::info!(
-            "Reconnected successfully: v1 user '{bound_username}', v2 user '{}'",
-            id2.username,
+        // Server v2 reopened the SAME durable auth.db/kernel.db as v1 (that's
+        // the point of a restart), so the root character — and the username
+        // the actor sees — is identical across the bounce.
+        assert_eq!(
+            id2.username, bound_username,
+            "a restart onto the same state_dir must resolve to the same root character"
         );
 
         // Clean up.
@@ -342,8 +405,8 @@ fn actor_reconnects_after_server_restart() {
 #[test]
 fn status_broadcast_walks_fsm_states() {
     run_local(async {
-        let server = start_server_on(None).await;
-        let actor = spawn_test_actor(server.addr, "test-status");
+        let server = start_server_on(None, None).await;
+        let actor = spawn_test_actor(server.addr, server.key.clone(), "test-status");
 
         let mut rx = actor.subscribe_status();
 
@@ -398,7 +461,13 @@ fn black_hole_address_falls_into_cooldown_quickly() {
         // but never accept.
         let _hold = listener;
 
-        let actor = spawn_test_actor(addr, "test-blackhole");
+        // No real server is listening, so authentication never happens —
+        // any key will do.
+        let throwaway_key = Arc::new(
+            russh::keys::PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+                .expect("generate throwaway key"),
+        );
+        let actor = spawn_test_actor(addr, throwaway_key, "test-blackhole");
 
         // Kick off the connect attempt.
         let _ = actor.whoami().await;
@@ -428,8 +497,8 @@ fn black_hole_address_falls_into_cooldown_quickly() {
 #[test]
 fn join_context_to_missing_context_settles_terminal() {
     run_local(async {
-        let server = start_server_on(None).await;
-        let actor = spawn_test_actor(server.addr, "test-bad-context");
+        let server = start_server_on(None, None).await;
+        let actor = spawn_test_actor(server.addr, server.key.clone(), "test-bad-context");
 
         // Connect successfully so the actor reaches Connected.
         let _id = whoami_with_retry(&actor, Duration::from_secs(5))
@@ -460,8 +529,8 @@ fn join_context_to_missing_context_settles_terminal() {
 #[test]
 fn commands_concurrent_with_join_context_do_not_block() {
     run_local(async {
-        let server = start_server_on(None).await;
-        let actor = spawn_test_actor(server.addr, "test-concurrent");
+        let server = start_server_on(None, None).await;
+        let actor = spawn_test_actor(server.addr, server.key.clone(), "test-concurrent");
 
         // Get to Connected first.
         let _id = whoami_with_retry(&actor, Duration::from_secs(5))
@@ -504,18 +573,17 @@ fn commands_concurrent_with_join_context_do_not_block() {
 /// both connects succeed without errors — historically, double-subscribe
 /// caused server-side wedges.
 ///
-/// Note: each actor uses an ephemeral SSH key, but anonymous mode binds
-/// every unknown key to the same seeded `hajime` character, so both actors
-/// share one principal here — this exercises the dedupe path itself
-/// (same principal, same instance), not the no-dedupe path. Either way the
-/// test proves two simultaneous subscriptions don't wedge the server, which
-/// is the load-bearing invariant.
+/// Note: both actors authenticate with the same server root key
+/// (`server.key`), so they share one principal here — this exercises the
+/// dedupe path itself (same principal, same instance), not the no-dedupe
+/// path. Either way the test proves two simultaneous subscriptions don't
+/// wedge the server, which is the load-bearing invariant.
 #[test]
 fn duplicate_instance_subscribes_do_not_wedge() {
     run_local(async {
-        let server = start_server_on(None).await;
+        let server = start_server_on(None, None).await;
 
-        let actor1 = spawn_test_actor(server.addr, "shared-instance");
+        let actor1 = spawn_test_actor(server.addr, server.key.clone(), "shared-instance");
         let _id1 = whoami_with_retry(&actor1, Duration::from_secs(5))
             .await
             .expect("actor1 connect");
@@ -523,7 +591,7 @@ fn duplicate_instance_subscribes_do_not_wedge() {
         // Spawn a second actor with the same instance and (now) the same
         // principal — the server should accept the new subscription without
         // wedging on the prior one.
-        let actor2 = spawn_test_actor(server.addr, "shared-instance");
+        let actor2 = spawn_test_actor(server.addr, server.key.clone(), "shared-instance");
         let _id2 = whoami_with_retry(&actor2, Duration::from_secs(5))
             .await
             .expect("actor2 connect with dedupe");
@@ -681,12 +749,12 @@ async fn wait_for_blocks_at_least(
 #[test]
 fn reconnect_resyncs_blocks_appended_during_outage() {
     run_local(async {
-        let server = start_server_on(None).await;
+        let server = start_server_on(None, None).await;
         let proxy = CuttableProxy::start(server.addr).await;
 
         // Writer: connected DIRECTLY to the server, so it survives the cut and
         // can keep producing blocks during the reader's outage.
-        let writer = spawn_test_actor(server.addr, "direct-writer");
+        let writer = spawn_test_actor(server.addr, server.key.clone(), "direct-writer");
         let _ = whoami_with_retry(&writer, Duration::from_secs(5))
             .await
             .expect("writer connect");
@@ -724,7 +792,7 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
                 .await;
 
         // Reader: connected THROUGH the proxy — the one that will flake.
-        let reader = spawn_test_actor(proxy.addr, "flaky-reader");
+        let reader = spawn_test_actor(proxy.addr, server.key.clone(), "flaky-reader");
         let _ = whoami_with_retry(&reader, Duration::from_secs(5))
             .await
             .expect("reader connect");

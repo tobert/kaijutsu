@@ -16,7 +16,9 @@
 //! (see its doc comment), but a faithful e2e is still the only thing that
 //! would catch a regression back into that class of replication/ordering bug.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
 
 use rmcp::handler::server::wrapper::Parameters;
 use tokio::net::TcpListener;
@@ -36,11 +38,25 @@ fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     rt.block_on(local.run_until(f));
 }
 
+/// The root key each ephemeral server binds, keyed by its address —
+/// `SshServerConfig::ephemeral` mints a fresh one per call, so `connect_mcp`
+/// needs the exact key `start_server` registered here rather than an
+/// unrecognized ephemeral one of its own.
+static ROOT_KEYS: OnceLock<Mutex<HashMap<SocketAddr, KeySource>>> = OnceLock::new();
+
+fn root_keys() -> &'static Mutex<HashMap<SocketAddr, KeySource>> {
+    ROOT_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Start an ephemeral SSH server on a random port; return its address.
 async fn start_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = SshServerConfig::ephemeral(addr.port());
+    root_keys()
+        .lock()
+        .unwrap()
+        .insert(addr, KeySource::InMemory(config.root_key()));
 
     tokio::task::spawn_local(async move {
         let server = SshServer::new(config);
@@ -53,14 +69,20 @@ async fn start_server() -> SocketAddr {
     addr
 }
 
-/// Connect a `KaijutsuMcp` to the ephemeral server with the test key + insecure
-/// host-key policy, matching how the server-side integration tests connect.
+/// Connect a `KaijutsuMcp` to the ephemeral server, authenticating with the
+/// root key `start_server` bound for it.
 async fn connect_mcp(addr: SocketAddr) -> KaijutsuMcp {
+    let key_source = root_keys()
+        .lock()
+        .unwrap()
+        .get(&addr)
+        .cloned()
+        .expect("connect_mcp requires a server started through this file's start_server");
     let config = SshConfig {
         host: addr.ip().to_string(),
         port: addr.port(),
         username: "test_user".to_string(),
-        key_source: KeySource::ephemeral(),
+        key_source,
         insecure: true,
     };
     KaijutsuMcp::connect_with_config(config, "e2e-test", Some("e2e-session"))

@@ -3,8 +3,11 @@
 //! Provides `run_local`, `start_server`, `connect_client`, and utilities
 //! for exercising the full SSH + Cap'n Proto stack.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use russh::keys::PrivateKey;
 use tokio::task::LocalSet;
 
 use kaijutsu_client::{KernelHandle, KeySource, RpcClient, SshConfig};
@@ -21,6 +24,39 @@ pub fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     rt.block_on(local.run_until(f));
 }
 
+/// The root SSH key bound for each server this process has started, keyed by
+/// bound address. `SshServerConfig::ephemeral` mints a fresh root character
+/// and key per call (`SshServerConfig::root_key`), so `connect_client`
+/// cannot reuse a single well-known key — it needs the exact key bound for
+/// the server it's dialing. Every `start_server*` helper below registers its
+/// key here (before the config moves into the spawned server task) and
+/// `connect_client` looks it up by address, so none of this module's ~150
+/// callers had to change to pass a key through by hand.
+static ROOT_KEYS: OnceLock<Mutex<HashMap<SocketAddr, Arc<PrivateKey>>>> = OnceLock::new();
+
+fn root_keys() -> &'static Mutex<HashMap<SocketAddr, Arc<PrivateKey>>> {
+    ROOT_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record `key` as the way to authenticate against the server bound at
+/// `addr`. Call once per `start_server*` helper, before the config (and its
+/// key) moves into the spawned server task.
+fn register_root_key(addr: SocketAddr, key: Arc<PrivateKey>) {
+    root_keys().lock().unwrap().insert(addr, key);
+}
+
+/// The key registered for `addr` by a `start_server*` helper. Panics if none
+/// was registered — `connect_client` only works against a server started
+/// through this module, matching every other helper's fail-loud style.
+fn root_key_for(addr: SocketAddr) -> Arc<PrivateKey> {
+    root_keys().lock().unwrap().get(&addr).cloned().unwrap_or_else(|| {
+        panic!(
+            "no root key registered for {addr}: connect_client only works against a \
+             server started through one of this module's start_server* helpers"
+        )
+    })
+}
+
 /// Start an SSH server on an ephemeral port and return the address.
 ///
 /// The listener is pre-bound so connections queue during kernel initialization.
@@ -30,6 +66,7 @@ pub async fn start_server() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
 
     let config = SshServerConfig::ephemeral(addr.port());
+    register_root_key(addr, config.root_key());
 
     tokio::task::spawn_local(async move {
         let server = SshServer::new(config);
@@ -114,6 +151,7 @@ pub async fn start_server_with_mock_llm_kernel_handle(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = SshServerConfig::ephemeral(addr.port());
+    register_root_key(addr, config.root_key());
     if let Some(ref data_dir) = config.data_dir {
         seed_mock_backend_with_model(data_dir, "mock-model");
     }
@@ -172,6 +210,7 @@ pub async fn start_server_with_mock_llm_model(default_model: &str) -> SocketAddr
     let addr = listener.local_addr().unwrap();
 
     let config = SshServerConfig::ephemeral(addr.port());
+    register_root_key(addr, config.root_key());
     if let Some(ref data_dir) = config.data_dir {
         seed_mock_backend_with_model(data_dir, default_model);
     }
@@ -198,9 +237,40 @@ pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> Socke
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    // Unlike the other start_server* helpers, `state_dir` is caller-supplied
+    // and may already carry state from an earlier boot (the restart
+    // simulation in `context_label_resolve.rs` and `context_origin_host.rs`
+    // calls this twice against the same directory). So the root character
+    // and key are seeded directly into IT, not into the throwaway tempdir
+    // `SshServerConfig::ephemeral` would otherwise create and discard.
+    // `init_root` is idempotent on a name that's already root and binds this
+    // call's freshly generated key alongside any key an earlier call bound,
+    // so a second call against the same state_dir keeps the server bootable
+    // and hands back a key that also authenticates.
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    let auth_db_path = state_dir.join("auth.db");
+    let root_key = PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+        .expect("generate root key for state dir");
+    {
+        let kernel_db = kaijutsu_kernel::kernel_db::KernelDb::open(state_dir.join("kernel.db"))
+            .expect("open kernel db for state dir");
+        let auth_db =
+            kaijutsu_server::AuthDb::open(&auth_db_path).expect("open auth db for state dir");
+        kaijutsu_server::init::init_root(
+            &kernel_db,
+            &auth_db,
+            SshServerConfig::EPHEMERAL_ROOT,
+            root_key.public_key(),
+            Some("state dir root"),
+        )
+        .expect("init root character for state dir");
+    }
+    register_root_key(addr, Arc::new(root_key));
+
     let mut config = SshServerConfig::ephemeral(addr.port());
     config.config_dir = Some(state_dir.clone());
     config.data_dir = Some(state_dir);
+    config.auth_db_path = Some(auth_db_path);
 
     tokio::task::spawn_local(async move {
         let server = SshServer::new(config);
@@ -230,6 +300,7 @@ pub async fn start_server_with_kernel_handle() -> (SocketAddr, kaijutsu_server::
     let addr = listener.local_addr().unwrap();
 
     let config = SshServerConfig::ephemeral(addr.port());
+    register_root_key(addr, config.root_key());
     let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
 
     tokio::task::spawn_local(async move {
@@ -313,14 +384,25 @@ pub async fn shell_exec_wait(
     shell_exec_wait_timeout(kernel, code, context_id, 10_000).await
 }
 
-/// Connect to server with ephemeral key.
+/// The `KeySource` that authenticates against a server `start_server*`
+/// started at `addr`. For a test that needs to drive the SSH/RPC connection
+/// itself (a raw wire version, an unbound subsystem, an SFTP subsystem)
+/// rather than going through `connect_client`, but still wants to connect AS
+/// the real root character rather than an unknown, rejected key.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub fn root_key_source(addr: SocketAddr) -> KeySource {
+    KeySource::InMemory(root_key_for(addr))
+}
+
+/// Connect to a server started by one of this module's `start_server*`
+/// helpers, authenticating with the root key that helper bound for `addr`.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn connect_client(addr: SocketAddr) -> RpcClient {
     let config = SshConfig {
         host: addr.ip().to_string(),
         port: addr.port(),
         username: "test_user".to_string(),
-        key_source: KeySource::ephemeral(),
+        key_source: root_key_source(addr),
         insecure: true,
     };
 

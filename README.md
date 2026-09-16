@@ -76,12 +76,12 @@ cargo versions soon.
 ## Quick Start
 
 ```bash
-# Terminal 1: Server (first run seeds kernel.db and the bootstrap
-# character, `hajime` — see docs/character.md, "Bootstrap: hajime")
-cargo run -p kaijutsu-server
+# First time only: create your root character and bind your SSH key
+# (see docs/character.md, "Bootstrap: the person creates themself")
+cargo run -p kaijutsu-server -- init --as <your-name> --key ~/.ssh/id_ed25519.pub
 
-# First time: bind your SSH key to hajime
-cargo run -p kaijutsu-server -- add-key ~/.ssh/id_ed25519.pub --as hajime
+# Terminal 1: Server
+cargo run -p kaijutsu-server
 
 # Check what's registered
 cargo run -p kaijutsu-server -- list-keys

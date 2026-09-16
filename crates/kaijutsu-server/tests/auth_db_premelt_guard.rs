@@ -4,10 +4,10 @@
 //! existing `principals` table, so a binary carrying the keyring melt opens
 //! an unmigrated file without complaint: existing fingerprints keep
 //! authenticating (the lookup never reads the dropped columns), while every
-//! path that mints a principal — the seed character, anonymous
-//! auto-register — fails later on the legacy `NOT NULL username`
-//! constraint. That is a half-working kernel discovered at the worst
-//! moment. Refuse at boot instead, and name the migration that fixes it.
+//! path that mints a principal — `kaijutsu-server init`, `add-key` —
+//! fails later on the legacy `NOT NULL username` constraint. That is a
+//! half-working kernel discovered at the worst moment. Refuse at boot
+//! instead, and name the migration that fixes it.
 
 use std::time::Duration;
 

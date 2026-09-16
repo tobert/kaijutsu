@@ -7,11 +7,10 @@ use std::net::SocketAddr;
 mod common;
 use common::*;
 
-/// The ephemeral server's `allow_anonymous` mode binds an unknown key to the
-/// seeded `hajime` character rather than minting a principal from the SSH
-/// login name (`docs/character.md`, "Anonymous auto-register binds to
-/// `hajime` instead of minting") — the SSH username ("test_user") is not
-/// compared and does not appear in the resolved identity.
+/// The ephemeral server's `init` step binds the connecting key to a live
+/// root character named `SshServerConfig::EPHEMERAL_ROOT` ("tester") — the
+/// SSH username ("test_user") is not compared and does not appear in the
+/// resolved identity.
 #[test]
 fn test_whoami() {
     run_local(async {
@@ -19,33 +18,31 @@ fn test_whoami() {
         let client = connect_client(addr).await;
 
         let identity = client.whoami().await.unwrap();
-        assert_eq!(identity.username, "hajime");
-        assert_eq!(identity.display_name, "hajime");
+        assert_eq!(identity.username, kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT);
+        assert_eq!(identity.display_name, kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT);
     });
 }
 
-/// Two different unknown keys, connecting independently, both bind to the
-/// SAME seeded `hajime` principal — anonymous auto-register mints nothing
-/// (`docs/character.md`, "Anonymous auto-register binds to `hajime` instead
-/// of minting"). Under the old auto-mint behavior each connection would have
-/// received its own distinct principal.
+/// An unknown key, one never bound in the server's `auth.db`, is rejected
+/// (`ConnectionHandler::auth_publickey`, `Auth::Reject`); the server never
+/// mints or binds a character for it.
 #[test]
-fn anonymous_auto_register_binds_to_hajime_and_mints_nothing() {
+fn an_unknown_key_is_rejected_not_auto_registered() {
     run_local(async {
         let addr = start_server().await;
 
-        let client1 = connect_client(addr).await;
-        let id1 = client1.whoami().await.unwrap();
-
-        let client2 = connect_client(addr).await;
-        let id2 = client2.whoami().await.unwrap();
-
-        assert_eq!(id1.username, "hajime");
-        assert_eq!(id2.username, "hajime");
-        assert_eq!(
-            id1.principal_id, id2.principal_id,
-            "two different anonymous keys must resolve to the SAME hajime \
-             principal, never two distinct minted ones"
+        let config = kaijutsu_client::SshConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            username: "test_user".to_string(),
+            key_source: kaijutsu_client::KeySource::ephemeral(),
+            insecure: true,
+        };
+        let mut ssh = kaijutsu_client::SshClient::new(config);
+        let result = ssh.connect().await;
+        assert!(
+            result.is_err(),
+            "an unknown key must be rejected, not auto-registered: {result:?}"
         );
     });
 }
@@ -65,7 +62,7 @@ fn character_name_renders_identically_over_repeated_whoami_calls() {
         assert_eq!(first.username, second.username);
         assert_eq!(first.display_name, second.display_name);
         assert_eq!(first.principal_id, second.principal_id);
-        assert_eq!(first.username, "hajime");
+        assert_eq!(first.username, kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT);
     });
 }
 
@@ -83,7 +80,7 @@ fn test_unknown_subsystem_is_not_bound_to_rpc() {
             host: addr.ip().to_string(),
             port: addr.port(),
             username: "test_user".to_string(),
-            key_source: kaijutsu_client::KeySource::ephemeral(),
+            key_source: root_key_source(addr),
             insecure: true,
         };
         let mut ssh = kaijutsu_client::SshClient::new(config);
@@ -148,7 +145,7 @@ async fn bind_kernel_raw_expect_refused(addr: SocketAddr, client_wire_version: u
         host: addr.ip().to_string(),
         port: addr.port(),
         username: "test_user".to_string(),
-        key_source: kaijutsu_client::KeySource::ephemeral(),
+        key_source: root_key_source(addr),
         insecure: true,
     };
     let mut ssh = kaijutsu_client::SshClient::new(config);
@@ -625,9 +622,11 @@ fn test_call_mcp_tool_requires_joined_context() {
 /// empty content — silently dropping the reason on the one MCP entry point
 /// with no separate error field to fall back to (`execute_tool` sets a
 /// dedicated `error` field; the LLM tool-call path already reads `stderr`).
-/// `write` on the genesis ROOT context is a reliable, always-available
-/// failure: ROOT has no durable cwd until `kj context set --cwd` runs, so
-/// every file tool refuses up front (`refuse_missing_cwd`).
+/// `write` on the root character's own root context is a reliable,
+/// always-available failure: that context has no durable cwd until `kj
+/// context set --cwd` runs, so every file tool refuses up front
+/// (`refuse_missing_cwd`). The context's label is the root character's name
+/// (`SshServerConfig::EPHEMERAL_ROOT`, "tester" for an ephemeral server).
 #[test]
 fn test_call_mcp_tool_failure_message_reaches_the_wire() {
     run_local(async {
@@ -635,10 +634,10 @@ fn test_call_mcp_tool_failure_message_reaches_the_wire() {
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
         let root = kernel
-            .resolve_context_label("ROOT")
+            .resolve_context_label(kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT)
             .await
             .unwrap()
-            .expect("genesis ROOT context exists on a fresh kernel");
+            .expect("the root character's root context exists on a fresh kernel");
         kernel.join_context(root.id, "test-mcp-error").await.unwrap();
 
         let result = kernel

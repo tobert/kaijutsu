@@ -16,7 +16,9 @@ does not become an instruction to use nonexistent features.
 
 | Part | Implemented contract |
 |---|---|
-| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag; `kj character create [--root]\|list\|show\|set --root\|--no-root\|retire` |
+| Identity and sheet | `PrincipalId`, kernel-owned name, creation/retirement timestamps, optional `handoff_ctx`, a `root` flag, and `root_ctx`; `kj character create [--root]\|list\|show\|set --root\|--no-root\|retire` |
+| Bootstrap | `kaijutsu-server init --as <name> --key <pubkey-file>` creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
+| Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
 | Performer | `kj context create --as <character>` records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
 | Client creation | Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer |
@@ -227,10 +229,13 @@ is where a session spends its care.
   name in the system, `add-key` binds instead of minting, and bulk import
   is removed. `Principal` loses its name fields and `authenticate` returns
   a `PrincipalId`. Detail in "`auth.db` is a keyring".
-- **A fresh kernel seeds `hajime`, and its id is minted** (guidance, Amy,
-  2026-09-06). One bootstrap character that carries the rc for replacing
-  itself, with an ordinary minted id rather than a well-known one: *"deterministic
-  feels like a choice we'd regret."* Detail in "Bootstrap: `hajime`".
+- **The person creates themself before the first connection** (guidance,
+  Amy, 2026-09-16, replacing the seeded `hajime` of 2026-09-06). `init`
+  creates a root character with a minted id, not a well-known one:
+  *"deterministic feels like a choice we'd regret."* Roots are equal: *"1
+  will be typical, more than one just needs to be possible for now."*
+  Adding keys stays host-only, and *"there should be no anonymous at
+  all!"* Detail in "Bootstrap: the person creates themself".
 - **Retire takes its contexts with it** (guidance, Amy, 2026-09-06). A
   retired character's live contexts are concluded and archived by the same
   act. There is no reassignment, no orphan performance, and no verb for
@@ -539,17 +544,9 @@ design takes away, and there is no sensible character to bind a file of
 keys to. First run becomes two deliberate steps, `create` then `add-key`,
 which is the right shape for an act that establishes who someone is.
 
-**Anonymous auto-register binds to `hajime` instead of minting.** The
-server has a second, *runtime* minting path that the CLI review missed:
-with `allow_anonymous` set, an unknown key on connection calls
-`add_key_auto_principal` and mints a principal per key (`ssh.rs:1111`).
-It is not a production path — `production()` sets `allow_anonymous: false`
-(`ssh.rs:241`) and only the ephemeral test config turns it on, commented
-"Tests need to accept any key" (`ssh.rs:226`). Since every kernel seeds
-`hajime`, the mode keeps working by binding an unknown key to it rather
-than minting: tests still accept any key, and no minting path survives the
-melt. Removing `add_key_auto_principal` without this is a compile break,
-not just a design gap.
+**There is no anonymous auth.** An unknown key is rejected. The ephemeral
+test config runs `init` in its temporary directory and connects with the key
+it bound, so tests and production take the same path.
 
 **Three name reads break at compile time** when `Principal` loses its
 fields, and all three land in the same change: `answerer_name`
@@ -566,7 +563,7 @@ a person.
 **`add-key` never rebinds silently.** `credentials.fingerprint` is the
 primary key, so one key maps to one principal and the same key cannot be
 bound to two characters. Adding a key that is already bound refuses and
-names the current binding — `key SHA256:… is bound to hajime; move it with
+names the current binding — `key SHA256:… is bound to banto; move it with
 --rebind` — rather than issuing an UPDATE. A silent move would take a live
 session's identity out from under it.
 
@@ -582,57 +579,55 @@ connection (`ssh.rs:320`) and every lookup is a fresh query, with no
 `HashMap<PrincipalId, _>` anywhere, so a CLI side-write is visible to a
 running server on its next read once the lock allows it.
 
-### Bootstrap: `hajime`, a character that exists to be replaced
+### Bootstrap: the person creates themself
 
-A fresh kernel seeds exactly one character, `hajime` (始め — the beginning,
-and the word called to start a match). It holds the rc that walks a new
-user through making their own character, and it is built to be retired the
-same day.
-
-**Its principal id is minted, not derived** (guidance, Amy, 2026-09-06).
-The sentinels get a fixed `UUIDv5` because they are not anyone: `system`
-and `beat` are the kernel's own hand and are identical on every install by
-definition. `hajime` is someone — a sheet, contexts, a lineage — so a
-well-known id would make it the same character on every machine and one
-that could never be rotated. The cost is a single ordering constraint: the
-server must run once, to seed `hajime` and mint its id, before the first
-`add-key` can resolve a name.
+Before the first start, the person who runs the kernel creates their own
+root character and binds their key to it:
 
 ```sh
-systemctl --user start kaijutsu-server   # creates kernel.db, seeds hajime, mints its id
-#   log: no keys bound. bind one:
-#     kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as hajime
-kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as hajime
-ssh kaijutsu                             # you are hajime; its rc tells you what to do next
-kj character create amy
-kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as amy --rebind   # moves the key off hajime
-kj character retire hajime
+kaijutsu-server init --as amy --key ~/.ssh/id_ed25519.pub
+systemctl --user start kaijutsu-server   # creates the root context `amy`
+ssh kaijutsu                             # you are amy, in your root context
 ```
 
-**Taking your key back is the same act as retiring the guide.** Most people
-have one key, so the fourth line moves it rather than adding a second, and
-`hajime` ends up keyless — which is what a retired character should be. Its
-blocks and its lineage stay in the graph, archived, the way a rotated ROOT
-does.
+`init` writes `kernel.db` and `auth.db` directly, so run it with the service
+stopped. It checks before it writes: a different live root character, a
+retired name, or a key bound to another character refuses with no change.
+An existing live character of that name becomes the root and keeps its
+principal id. Running the same `init` again changes nothing.
+
+**The server refuses to start without a live root character**, and the
+error names `init`. At start it creates the root context of each live root
+character that has none.
+
+**A root context is a model-less admin console.** Its type is `root`, its
+label is the character's name, the character plays it, and it has no parent.
+The `root` rc bundle grants the operator authority (`admin`, `config-write`,
+`operator`, `exec`, the shell facades) and composes no instruction blocks.
+Seats a root starts, such as banto's, are created from it, so their lineage
+and accountability begin there.
+
+**Roots are equal, and one is typical.** A second person joins through a
+root: `kj character create bob --root` creates bob and bob's root context,
+then `kaijutsu-server add-key bob.pub --as bob` on the host binds the key.
+Every player is still inside one trust boundary (`docs/instrument-design.md`,
+"Many hands, one trust boundary"); a person you would not give a shell
+account belongs on a separate kernel.
 
 **A kernel wipe orphans every binding.** The schema stance is that a
 version bump wipes (`kernel_db.rs:1959`), which takes `characters` with it
 while `auth.db` keeps every credential bound to a principal id that now has
-no sheet. `name_for` renders those as `id.short()` — the loud failure the
-"missing mapped principal is corruption" rule wants — and recovery is the
-bootstrap path again: the wiped kernel seeds a fresh `hajime`, and
-`add-key --as` rebinds. Worth saying out loud because the keys still
-authenticate; it is the names that vanish.
+no sheet. `name_for` renders those as `id.short()`, the loud failure the
+"missing mapped principal is corruption" rule wants. Recovery is `init`
+again, with `add-key --rebind` for any key `init` refuses to move. The keys
+still authenticate; it is the names that vanish.
 
-**Lockout recovery is why the CLI lists characters.** Retire `hajime`
-before binding your own key and no character has a key, so nobody can
-connect — and `kj character list` is unreachable, because reaching it means
-connecting. `kaijutsu-server list-characters` reads `kernel.db` read-only
-and is the way back in, feeding either `--as <name>` or `--principal <id>`.
+**Lockout recovery works with the service stopped.** Retiring the last live
+root stops the next start. `kaijutsu-server list-characters` reads
+`kernel.db` read-only, and `init` with a new name or `add-key` gets back in.
 
-So the server CLI after the melt is three verbs — `add-key --as`,
-`list-keys`, `list-characters` — all of which read `kernel.db` at most, and
-all of which work with the service stopped.
+So the server CLI is four verbs: `init`, `add-key --as`, `list-keys`, and
+`list-characters`. All of them work with the service stopped.
 
 ### A context is played by a character
 
@@ -990,7 +985,9 @@ Each slice is independently shippable and leaves the tree green.
    (`kaijutsu-server::migrate_keyring`) turns pre-existing principals into
    characters carrying their old usernames, against a fixture mimicking a
    real `auth.db`, never against anything real; anonymous auto-register
-   binds to `hajime` and mints nothing.
+   binds to `hajime` and mints nothing. (2026-09-16: `init` replaced
+   `hajime` and anonymous auth; see "Bootstrap: the person creates
+   themself".)
 3. **Attribution.** Create-time performer selection (`kj context create --as`)
    is implemented separately; provider-output attribution remains open.
    Turn-start resolution of `played_by` to the effective actor; provider-emitted blocks authored by it. This is the slice that
@@ -1060,10 +1057,6 @@ it.
 
 ## Open
 
-- **What `hajime`'s rc actually says.** It is the only prose a new user
-  reads before knowing anything about kaijutsu, and it has to carry them to
-  `kj character create`, the rebind, and its own retirement. Written with
-  the slice, not designed here.
 - **A repository-wide audit of `PrincipalId` consumers** before slice 3
   lands: broker policy, hooks, telemetry, indexing, client caches. The
   reviews established the turn path, capabilities, ledger, roster, RPC, tui

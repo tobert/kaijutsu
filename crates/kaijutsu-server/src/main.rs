@@ -51,7 +51,11 @@ USAGE:
     kaijutsu-server [OPTIONS] [COMMAND]
 
 COMMANDS:
-    (default)                       Run the SSH server
+    (default)                       Run the SSH server. Refuses to start
+                                    until init has created a root character.
+    init --as <name> --key <file>   Create the kernel's root character and
+                                    bind its public key. Run once, with the
+                                    service stopped, before the first start.
     add-key <file> --as <name>      Bind a public key to an existing character.
                                     Refuses an already-bound fingerprint; pass
                                     --rebind to move it instead.
@@ -84,7 +88,7 @@ OPTIONS:
 EXAMPLES:
     kaijutsu-server                                    # Run server on port {port}
     kaijutsu-server --port 2222                        # Run server on port 2222
-    kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as hajime
+    kaijutsu-server init --as amy --key ~/.ssh/id_ed25519.pub   # before the first start
     kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as amy --rebind
     kaijutsu-server list-keys
     kaijutsu-server list-characters
@@ -176,6 +180,7 @@ async fn async_main() -> ExitCode {
                 .unwrap_or(DEFAULT_SSH_PORT);
             run_server(port, server_paths).await
         }
+        "init" => cmd_init(&args[2..]),
         "add-key" => cmd_add_key(&args[2..]),
         "list-keys" => cmd_list_keys(),
         "list-characters" => cmd_list_characters(),
@@ -339,6 +344,93 @@ fn cmd_rc(args: &[String]) -> ExitCode {
     }
 }
 
+const INIT_USAGE: &str = "Usage: kaijutsu-server init --as <name> --key <pubkey-file>";
+
+/// Parse `init --as <name> --key <pubkey-file>`.
+fn parse_init_args(args: &[String]) -> Result<(String, String), String> {
+    let mut name = None;
+    let mut key_file = None;
+    let mut i = 0;
+    while i < args.len() {
+        let slot = match args[i].as_str() {
+            "--as" => &mut name,
+            "--key" => &mut key_file,
+            other => return Err(format!("Unknown option: {other}\n{INIT_USAGE}")),
+        };
+        let Some(value) = args.get(i + 1) else {
+            return Err(format!("{} requires a value\n{INIT_USAGE}", args[i]));
+        };
+        *slot = Some(value.clone());
+        i += 2;
+    }
+    match (name, key_file) {
+        (Some(name), Some(key_file)) => Ok((name, key_file)),
+        _ => Err(INIT_USAGE.to_string()),
+    }
+}
+
+/// Create the kernel's root character and bind its key
+/// (`kaijutsu_server::init`). Run with the service stopped.
+fn cmd_init(args: &[String]) -> ExitCode {
+    let (name, key_file) = match parse_init_args(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let key_path: PathBuf = shellexpand::tilde(&key_file).as_ref().into();
+    let key_data = match std::fs::read_to_string(&key_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read {}: {e}", key_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let key = match ssh_key::PublicKey::from_openssh(key_data.trim()) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("Failed to parse public key {}: {e}", key_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let comment = extract_comment(key_data.trim());
+
+    let kernel_db_path = default_kernel_db_path();
+    let kernel_db = match KernelDb::open(&kernel_db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Failed to open {}: {e}", kernel_db_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let auth_db = match AuthDb::open(AuthDb::default_path()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Failed to open auth database: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match kaijutsu_server::init::init_root(&kernel_db, &auth_db, &name, &key, comment.as_deref()) {
+        Ok(report) => {
+            let character = if report.changed_character { "is now" } else { "was already" };
+            let key = if report.bound_key { "bound" } else { "was already bound" };
+            println!(
+                "{name} ({}) {character} the root character; key {} {key} to it.\n\
+                 Start the server; it creates the root context '{name}'.",
+                report.character.principal_id.short(),
+                report.fingerprint,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("init: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Parsed `add-key` arguments.
 struct AddKeyArgs {
     key_file: String,
@@ -422,7 +514,7 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!(
                 "Failed to open {} read-only: {e}\n\
-                 (start the server once first — it seeds the bootstrap character)",
+                 (run `kaijutsu-server init --as <name> --key <pubkey-file>` first)",
                 kernel_db_path.display()
             );
             return ExitCode::FAILURE;
@@ -575,7 +667,7 @@ fn cmd_list_characters() -> ExitCode {
         Err(e) => {
             eprintln!(
                 "Failed to open {} read-only: {e}\n\
-                 (start the server once first — it seeds the bootstrap character)",
+                 (run `kaijutsu-server init --as <name> --key <pubkey-file>` first)",
                 path.display()
             );
             return ExitCode::FAILURE;

@@ -109,9 +109,6 @@ pub struct SshServerConfig {
     pub key_source: KeySource,
     /// Path to auth database (None = in-memory for testing)
     pub auth_db_path: Option<PathBuf>,
-    /// Allow anonymous connections (auto-register unknown keys).
-    /// Only for testing - production should always be false.
-    pub allow_anonymous: bool,
     /// Config directory override. None = use XDG default (~/.config/kaijutsu).
     pub config_dir: Option<PathBuf>,
     /// Where every `/config` tree comes from (`crate::config_mounts`,
@@ -129,6 +126,9 @@ pub struct SshServerConfig {
     /// configs. `Arc` so the config stays `Clone` (the dir lives until the last
     /// clone drops).
     _cleanup: Option<std::sync::Arc<TempDirGuard>>,
+    /// The private key bound to the `ephemeral()` root character. `None` for
+    /// production configs.
+    root_key: Option<std::sync::Arc<russh::keys::PrivateKey>>,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `ephemeral()` test
@@ -191,9 +191,15 @@ fn blank_network_scorer(rc_root: &Path) {
 }
 
 impl SshServerConfig {
-    /// Create config with an ephemeral key (for testing).
+    /// The name of the root character `ephemeral()` creates.
+    pub const EPHEMERAL_ROOT: &'static str = "tester";
+
+    /// Create a test config in a fresh temporary directory.
     ///
-    /// Uses in-memory auth database and allows anonymous connections.
+    /// Runs `init` there: a root character named [`Self::EPHEMERAL_ROOT`]
+    /// with a generated key bound in an `auth.db` file. Connect with
+    /// [`Self::root_key`]. A test that sets its own `auth_db_path` binds its
+    /// own keys; the root character still lets the kernel start.
     pub fn ephemeral(port: u16) -> Self {
         // Use a fresh tempdir so no real configs (mcp.toml etc.) load. The name is
         // unique by construction: PID (cross-process) + timestamp (cross-run) + a
@@ -219,17 +225,44 @@ impl SshServerConfig {
         let config_mounts = crate::config_mounts::ConfigMounts::new(path.join("config"));
         blank_network_scorer(&config_mounts.host_dir(kaijutsu_types::paths::RC_ROOT));
 
+        let root_key = russh::keys::PrivateKey::random(
+            &mut rand_v10::rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .expect("generate the ephemeral root key");
+        let auth_db_path = path.join("auth.db");
+        {
+            let kernel_db = kaijutsu_kernel::kernel_db::KernelDb::open(path.join("kernel.db"))
+                .expect("open the ephemeral kernel.db");
+            let auth_db = AuthDb::open(&auth_db_path).expect("open the ephemeral auth.db");
+            crate::init::init_root(
+                &kernel_db,
+                &auth_db,
+                Self::EPHEMERAL_ROOT,
+                root_key.public_key(),
+                Some("ephemeral root"),
+            )
+            .expect("init the ephemeral root character");
+        }
+
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], port)),
             key_source: KeySource::Ephemeral,
-            auth_db_path: None,
-            allow_anonymous: true, // Tests need to accept any key
+            auth_db_path: Some(auth_db_path),
             config_dir: Some(path.clone()),
             config_mounts,
             data_dir: Some(path.clone()),
             max_connections: 100,
             _cleanup: Some(std::sync::Arc::new(TempDirGuard(path))),
+            root_key: Some(std::sync::Arc::new(root_key)),
         }
+    }
+
+    /// The private key bound to the `ephemeral()` root character.
+    ///
+    /// Panics on a production config, which has no generated key.
+    pub fn root_key(&self) -> std::sync::Arc<russh::keys::PrivateKey> {
+        self.root_key.clone().expect("root_key is set only by SshServerConfig::ephemeral")
     }
 
     /// Create production config with persistent host key and auth database.
@@ -238,7 +271,6 @@ impl SshServerConfig {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], port)),
             key_source: KeySource::Persistent(KeySource::default_path()),
             auth_db_path: Some(AuthDb::default_path()),
-            allow_anonymous: false,
             config_dir: None, // Use XDG default
             config_mounts: crate::config_mounts::ConfigMounts::new(
                 crate::config_mounts::ConfigMounts::default_root(),
@@ -246,6 +278,7 @@ impl SshServerConfig {
             data_dir: None,   // Use XDG default
             max_connections: 100,
             _cleanup: None,
+            root_key: None,
         }
     }
 
@@ -356,7 +389,7 @@ impl SshServer {
                 AuthDb::open(path).map_err(std::io::Error::other)?
             }
             None => {
-                log::warn!("Using ephemeral auth database (all keys accepted)");
+                log::warn!("Using an in-memory auth database with no keys; no one can connect");
                 AuthDb::temporary().map_err(std::io::Error::other)?
             }
         };
@@ -374,13 +407,10 @@ impl SshServer {
             ));
         }
 
-        // Check if database is empty
         if auth_db.is_empty().map_err(std::io::Error::other)? {
             log::warn!(
-                "Auth database is empty! Bind a key to the seeded '{}' character: \
-                 kaijutsu-server add-key <pubkey> --as {}",
-                kaijutsu_kernel::seed_character::HAJIME,
-                kaijutsu_kernel::seed_character::HAJIME,
+                "Auth database is empty, so no one can connect. Stop the server and run \
+                 kaijutsu-server init --as <name> --key <pubkey-file>"
             );
         }
 
@@ -403,11 +433,6 @@ impl SshServer {
             keepalive_max: 3,
             ..Default::default()
         };
-
-        let allow_anonymous = self.config.allow_anonymous;
-        if allow_anonymous {
-            log::warn!("Anonymous mode enabled - unknown keys will be auto-registered");
-        }
 
         // Create the shared kernel at server startup — 会の場所 (the meeting place).
         // All connections share this single kernel.
@@ -470,7 +495,6 @@ impl SshServer {
 
         let mut server = Server {
             auth_db,
-            allow_anonymous,
             registry,
             active_connections,
             max_connections: self.config.max_connections,
@@ -486,7 +510,6 @@ impl SshServer {
 /// Server factory - creates handlers for each connection
 struct Server {
     auth_db: Arc<Mutex<AuthDb>>,
-    allow_anonymous: bool,
     /// Shared kernel and MCP pool (created at server startup)
     registry: Arc<ServerRegistry>,
     /// Number of currently active SSH connections.
@@ -502,7 +525,6 @@ impl server::Server for Server {
         ConnectionHandler::new(
             self.auth_db.clone(),
             peer_addr,
-            self.allow_anonymous,
             self.registry.clone(),
             self.active_connections.clone(),
             self.max_connections,
@@ -532,7 +554,6 @@ impl server::Server for Server {
 struct ConnectionHandler {
     auth_db: Arc<Mutex<AuthDb>>,
     peer_addr: Option<SocketAddr>,
-    allow_anonymous: bool,
     identity: Option<PrincipalId>,
     /// Shared kernel and MCP pool (created at server startup)
     registry: Arc<ServerRegistry>,
@@ -552,7 +573,6 @@ impl ConnectionHandler {
     fn new(
         auth_db: Arc<Mutex<AuthDb>>,
         peer_addr: Option<SocketAddr>,
-        allow_anonymous: bool,
         registry: Arc<ServerRegistry>,
         active_connections: Arc<AtomicUsize>,
         max_connections: usize,
@@ -560,7 +580,6 @@ impl ConnectionHandler {
         Self {
             auth_db,
             peer_addr,
-            allow_anonymous,
             identity: None,
             registry,
             pending_channels: HashMap::new(),
@@ -1111,93 +1130,6 @@ impl server::Handler for ConnectionHandler {
                 Ok(Auth::Accept)
             }
             Ok(None) => {
-                // Anonymous mode binds an unknown key to the seeded `hajime`
-                // character rather than minting a principal for it
-                // (`docs/character.md`, "Anonymous auto-register binds to
-                // `hajime` instead of minting"). Every kernel seeds one, so
-                // there is always somewhere to bind to.
-                if self.allow_anonymous {
-                    let kernel_db = self.registry.kernel.kernel_db.clone();
-                    let hajime = tokio::task::spawn_blocking(move || {
-                        kernel_db
-                            .lock()
-                            .get_character_by_name(kaijutsu_kernel::seed_character::HAJIME)
-                    })
-                    .await
-                    .map_err(|e| {
-                        log::error!("spawn_blocking panicked: {}", e);
-                        russh::Error::Disconnect
-                    })?;
-
-                    let hajime_principal = match hajime {
-                        Ok(Some(row)) => row.principal_id,
-                        Ok(None) => {
-                            log::error!(
-                                "Anonymous auth rejected: no '{}' character seeded — every \
-                                 kernel seeds one at startup",
-                                kaijutsu_kernel::seed_character::HAJIME
-                            );
-                            return Ok(Auth::Reject {
-                                proceed_with_methods: None,
-                                partial_success: false,
-                            });
-                        }
-                        Err(e) => {
-                            log::error!("Failed to resolve '{}': {e}", kaijutsu_kernel::seed_character::HAJIME);
-                            return Ok(Auth::Reject {
-                                proceed_with_methods: None,
-                                partial_success: false,
-                            });
-                        }
-                    };
-
-                    log::info!(
-                        "Anonymous mode: binding key {} (ssh user={}) to {}",
-                        fingerprint,
-                        user,
-                        kaijutsu_kernel::seed_character::HAJIME,
-                    );
-
-                    // Clone for spawn_blocking - use OpenSSH format for serialization
-                    let db = self.auth_db.clone();
-                    let key_openssh = public_key.to_openssh().map_err(|e| {
-                        log::error!("Failed to serialize public key: {}", e);
-                        russh::Error::Disconnect
-                    })?;
-                    let comment = format!("ssh user {user}");
-
-                    let result = tokio::task::spawn_blocking(move || {
-                        // Reconstruct the key from OpenSSH format
-                        let key = ssh_key::PublicKey::from_openssh(&key_openssh).map_err(|e| {
-                            rusqlite::Error::ToSqlConversionFailure(Box::new(
-                                std::io::Error::other(format!("Failed to parse key: {}", e)),
-                            ))
-                        })?;
-                        db.lock().add_key(hajime_principal, &key, Some(&comment))
-                    })
-                    .await
-                    .map_err(|e| {
-                        log::error!("spawn_blocking panicked: {}", e);
-                        russh::Error::Disconnect
-                    })?;
-
-                    match result {
-                        Ok(bound_fingerprint) => {
-                            log::info!(
-                                "Auth accepted (anonymous): {} bound to {} from {}",
-                                kaijutsu_kernel::seed_character::HAJIME,
-                                bound_fingerprint,
-                                peer,
-                            );
-                            self.identity = Some(hajime_principal);
-                            return Ok(Auth::Accept);
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to bind anonymous key to {}: {e}", kaijutsu_kernel::seed_character::HAJIME);
-                        }
-                    }
-                }
-
                 log::warn!(
                     "Auth rejected: unknown key {} (ssh user={}) from {}",
                     fingerprint,
