@@ -7362,10 +7362,10 @@ impl kernel::Server for KernelImpl {
                     // what it was built from. Anything that fails in between
                     // leaves the typed text exactly where the player left it.
                     let draft = documents
-                        .draft_block(context_id, user_principal_id)
+                        .draft_for_submission(context_id, user_principal_id)
                         .map_err(|e| capnp::Error::failed(format!("read draft: {}", e)))?
                         .ok_or_else(|| capnp::Error::failed("input is empty".into()))?;
-                    let text = draft.content.trim().to_string();
+                    let text = draft.content().trim().to_string();
                     if text.is_empty() {
                         return Err(capnp::Error::failed("input is empty".into()));
                     }
@@ -7382,11 +7382,9 @@ impl kernel::Server for KernelImpl {
                     match submission.refusal {
                         None => {
                             let command_block_id = submission.command_block_id;
-                            // The command exists durably; the draft has done its job.
-                            // TODO: Consume only the revision used for this command.
-                            // See docs/issues.md, "Shell submission can clear a newer draft".
+                            // Keep typing that arrived while command submission awaited.
                             documents
-                                .clear_draft(context_id, user_principal_id)
+                                .consume_draft(&draft)
                                 .map_err(|e| capnp::Error::failed(format!("clear draft: {}", e)))?;
 
                             let mut b = results.get().init_outcome().init_ok();

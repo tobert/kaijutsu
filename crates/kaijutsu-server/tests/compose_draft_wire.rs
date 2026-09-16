@@ -605,6 +605,112 @@ fn shell_submit_authors_the_command_before_clearing_the_draft() {
     });
 }
 
+struct PauseShellSubmit {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl kaijutsu_kernel::mcp::Hook for PauseShellSubmit {
+    async fn invoke(
+        &self,
+        _params: &kaijutsu_kernel::mcp::KernelCallParams,
+        _ctx: &kaijutsu_kernel::mcp::CallContext,
+    ) -> kaijutsu_kernel::mcp::McpResult<()> {
+        self.entered.notify_one();
+        self.resume.notified().await;
+        Ok(())
+    }
+}
+
+async fn edit_during_shell_submit(replace: bool, restore_text: bool) {
+    use kaijutsu_kernel::mcp::{GlobPattern, HookAction, HookBody, HookEntry, HookId};
+    use std::sync::Arc;
+
+    let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+    let client = connect_client(addr).await;
+    let kernel = bind(&client).await;
+    let context_id = open_context(&kernel, "draft-shell-race").await;
+    let pause = Arc::new(PauseShellSubmit {
+        entered: tokio::sync::Notify::new(), resume: tokio::sync::Notify::new(),
+    });
+    live_kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
+        id: HookId("pause-shell-submit".into()),
+        match_instance: None, match_tool: Some(GlobPattern("shell_write".into())),
+        match_context: Some(context_id), match_principal: None,
+        action: HookAction::Invoke(HookBody::Builtin { name: "pause".into(), hook: pause.clone() }),
+        priority: 0, kaish_script_id: None,
+    });
+    kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();
+    let before = draft(&kernel, context_id).await.unwrap();
+    let submit_kernel = kernel.clone();
+    let submit = tokio::task::spawn_local(async move {
+        submit_kernel.submit_input(context_id, true).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified()).await
+        .expect("submission reaches the hook after reading its draft");
+    if replace {
+        kernel.clear_input(context_id).await.unwrap();
+        kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();
+    } else {
+        kernel.edit_input(context_id, 7, " later", 0).await.unwrap();
+        if restore_text {
+            kernel.edit_input(context_id, 7, "", 6).await.unwrap();
+        }
+    }
+    let edited = draft(&kernel, context_id).await.unwrap();
+    assert_eq!(edited.id == before.id, !replace);
+    pause.resume.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(5), submit).await.unwrap().unwrap().unwrap();
+    let after = draft(&kernel, context_id).await.expect("newer typing must survive submission");
+    assert_eq!(after.id, edited.id);
+    assert_eq!(after.content, edited.content);
+    let all = blocks(&kernel, context_id).await;
+    let command = all.iter().find(|b| b.id == result.block_id).unwrap();
+    let args: serde_json::Value = serde_json::from_str(command.tool_input.as_deref().unwrap()).unwrap();
+    assert_eq!(args["code"], "echo hi", "the command uses the draft read before the await");
+}
+
+#[test]
+fn shell_submit_preserves_edits_during_submission() {
+    run_local(edit_during_shell_submit(false, false));
+}
+
+#[test]
+fn shell_submit_preserves_a_replacement_draft_with_identical_text() {
+    run_local(edit_during_shell_submit(true, false));
+}
+
+#[test]
+fn shell_submit_preserves_edits_that_restore_the_original_text() {
+    run_local(edit_during_shell_submit(false, true));
+}
+
+#[test]
+fn refused_shell_submit_keeps_its_draft() {
+    run_local(async {
+        use kaijutsu_kernel::mcp::{GlobPattern, HookAction, HookEntry, HookId};
+
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-shell-refused").await;
+        live_kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
+            id: HookId("refuse-shell-submit".into()),
+            match_instance: None, match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: Some(context_id), match_principal: None,
+            action: HookAction::Deny("test refusal".into()), priority: 0, kaish_script_id: None,
+        });
+        kernel.edit_input(context_id, 0, "echo hi", 0).await.unwrap();
+        let before = draft(&kernel, context_id).await.unwrap();
+        let error = kernel.submit_input(context_id, true).await.unwrap_err();
+        assert!(matches!(error, kaijutsu_client::RpcError::Refused(_)), "{error:?}");
+        let after = draft(&kernel, context_id).await.expect("refusal preserves the draft");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.content, before.content);
+    });
+}
+
 /// `clearInput` discards the caller's draft.
 #[test]
 fn clearing_removes_the_draft_block() {

@@ -1443,8 +1443,15 @@ A refused or timed-out feed callback now ends the feed and disconnects for
 snapshot recovery. Only acknowledged deliveries advance the reported version;
 an uncertain append cannot be retried safely. Both regressions first reproduced
 a feed that kept running after failure. They also check that a refused or hung
-termination notice cannot prevent disconnect. Shell submission's async draft
-consumption remains a tracked follow-up.
+termination notice cannot prevent disconnect.
+
+Shell submission captures the draft text with a process-local revision token.
+After command acceptance, it deletes the draft only if that revision still
+matches under the document guard. Edits, replacement, promotion, and reload
+invalidate the token; unrelated output does not. The token is not persisted
+or exposed on the wire. Three SSH regressions first reproduced lost typing
+while a hook paused submission, including editing back to the original text.
+Kernel tests cover guarded deletion, stale-token no-ops, and journal replay.
 
 ## The kernel with no one to answer to (September 16)
 

@@ -170,6 +170,10 @@ impl BlockDocument {
             .map(|b| b.snapshot())
     }
 
+    pub(crate) fn draft_revision(&self, id: &BlockId) -> Option<uuid::Uuid> {
+        self.blocks.get(id).filter(|b| !b.is_deleted()).and_then(|b| b.draft_revision())
+    }
+
     /// Get one block's header, without materializing its text.
     ///
     /// `BlockHeader` is `Copy` — the header-only mutations (`set_status`,

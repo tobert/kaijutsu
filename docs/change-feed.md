@@ -229,21 +229,21 @@ is the intended end state, not a transitional wart — one is a change log where
 batching is a feature, the other is a directive channel where batching is
 forbidden.
 
-The compose input keeps its own surface, `editInput` and `getInputState`. It may
-simply be a block with a draft status, which would delete both endpoints — open
-question 2 below.
+The compose input keeps its interaction-rate RPC surface, `editInput` and
+`getInputState`. Its text lives in one `Draft` block per context and principal
+and rides the ordinary change feed. Chat submission promotes that block. Shell
+submission authors a command, then consumes the captured draft revision under
+the document guard. Newer typing survives, including edits back to the same
+text; a refusal leaves the draft in place. Revision tokens are process-local
+and are renewed on reload, so they need no storage or wire migration.
 
 ## Open questions
 
 1. **`ContextSwitched`** is published on the block flow but is a shell concern,
    not a block change. Decide whether it joins `ContextEvent` or gets its own
    method.
-2. **The input document is a parallel API surface** — `editInput` and
-   `getInputState`. It may simply be a block with a draft status, which would
-   delete both endpoints. Worth deciding before Lane C builds on the current
-   shape.
-3. **`BlockId` is a Lamport timestamp** (`{contextId, principalId, seq}`) —
+2. **`BlockId` is a Lamport timestamp** (`{contextId, principalId, seq}`) —
    multi-writer identity that a single sequencer does not need. A
    kernel-assigned UUIDv7 would do. Large blast radius; deliberately deferred.
-4. **`retired79 @79 ()` … `retired83 @83 ()`** are placeholder stubs from the KV
+3. **`retired79 @79 ()` … `retired83 @83 ()`** are placeholder stubs from the KV
    deletion. A flag day is when they could go, if we accept renumbering.

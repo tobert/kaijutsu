@@ -74,8 +74,8 @@ external-edit regressions from `docs/file-buffers.md`; only then remove clean
 read materialization. This remains a separate design change.
 
 **Order:** runtime settlement, shared recovery, rendering, then file-buffer
-persistence. Shell draft consumption is tracked below. Each requires its own reviewable change; the source TODOs point to
-these entries.
+persistence. Each requires its own reviewable change; the source TODOs point
+to these entries.
 
 ### Kernel architecture overview needs a refresh
 
@@ -2219,6 +2219,10 @@ context; resource/prompt handlers hardcode `kind: "Conversation"` for Remote
 
 ## Testing & Tooling
 
+- A failed SSH integration assertion can also panic in russh 0.61.1
+  `channels/io/mod.rs:37` during teardown, filling the log with backtraces.
+  Reproduced by the shell-draft red tests; investigate harness shutdown before
+  attributing the secondary panic to the behavior under test.
 - `vfs::backends::local::tests::test_normal_paths_succeed` is flaky under
   full-workspace parallelism (found 2026-08-02).
 - `contrib/kaijutsu-runner.sh` rebuilds only `kaijutsu-app`; a wire change
@@ -2296,15 +2300,6 @@ shipped. Still open, all verified against current code:
   a re-shape within a frame or two.
 - **Backgrounds/underlines bake color into vertices** — `ShapeKey::
   baked_theme_epoch` exists for exactly this reason.
-
-## Shell submission can clear a newer draft
-
-`rpc.rs::submit_input` in shell mode reads a draft, awaits command submission,
-then clears whichever draft that principal currently owns. Individual compose
-operations are guarded, but this async sequence is not. Typing or replacing the
-draft during the await can lose newer text. Consume only the draft revision used
-to author the command, and test concurrent edits and replacement across the
-await. Chat promotion already happens in one guarded operation.
 
 ## vte 0.15.0 drops a control byte after a chunked partial UTF-8 codepoint (2026-08-19)
 

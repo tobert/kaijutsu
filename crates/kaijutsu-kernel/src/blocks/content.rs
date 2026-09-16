@@ -209,6 +209,10 @@ pub struct BlockContent {
     /// instead of O(the token's own length) — see `append_text`.
     char_len: usize,
 
+    /// Process-local identity of this draft's text revision. Restoring a block
+    /// starts a new revision; an in-flight submission cannot survive a reload.
+    draft_revision: Option<uuid::Uuid>,
+
     /// Fractional index for sibling ordering (base-62 lexicographic).
     /// Calculated via order_midpoint() on insertion (or derived from `tick`).
     order_key: String,
@@ -300,6 +304,7 @@ impl BlockContent {
             header,
             text: String::new(),
             char_len: 0,
+            draft_revision: (header.status == Status::Draft).then(uuid::Uuid::new_v4),
             order_key,
             tick: None,
             track: None,
@@ -413,6 +418,7 @@ impl BlockContent {
         let byte_end = Self::char_to_byte(&self.text, pos + delete);
         self.text.replace_range(byte_start..byte_end, insert);
         self.char_len = self.char_len - delete + insert.chars().count();
+        self.refresh_draft_revision();
         // `style_spans` are byte offsets into the PRE-edit content; any edit
         // through this char-addressed path can shift or invalidate them, so
         // they're dropped rather than left to lie. `provenance` is untouched —
@@ -445,6 +451,7 @@ impl BlockContent {
     pub fn append_text(&mut self, text: &str) {
         self.text.push_str(text);
         self.char_len += text.chars().count();
+        if !text.is_empty() { self.refresh_draft_revision(); }
         if self.provenance.is_some() {
             self.edited_since_ingest = true;
         }
@@ -454,6 +461,14 @@ impl BlockContent {
     /// `edit_text`/`append_text` maintain incrementally, not a rescan.
     pub fn content_len(&self) -> usize {
         self.char_len
+    }
+
+    pub(crate) fn draft_revision(&self) -> Option<uuid::Uuid> {
+        self.draft_revision
+    }
+
+    fn refresh_draft_revision(&mut self) {
+        self.draft_revision = (self.header.status == Status::Draft).then(uuid::Uuid::new_v4);
     }
 
     // ── Metadata access ─────────────────────────────────────────────────
@@ -491,6 +506,7 @@ impl BlockContent {
     /// Set the status.
     pub fn set_status(&mut self, status: Status) {
         self.header.status = status;
+        self.refresh_draft_revision();
         self.header.updated_at = now_millis();
     }
 
@@ -781,6 +797,7 @@ impl BlockContent {
     /// replaces the current one; there is no concurrent write to arbitrate.
     pub fn replace_header(&mut self, header: BlockHeader) {
         self.header = header;
+        self.refresh_draft_revision();
     }
 }
 

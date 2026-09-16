@@ -82,6 +82,18 @@ pub enum BlockStoreError {
 /// Result type alias for BlockStore operations.
 pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 
+/// Text captured for shell submission, tied to one draft revision. This is
+/// process-local: it is neither a persisted receipt nor a wire credential.
+pub struct DraftSubmission {
+    block_id: BlockId,
+    revision: uuid::Uuid,
+    content: String,
+}
+
+impl DraftSubmission {
+    pub fn content(&self) -> &str { &self.content }
+}
+
 /// Thread-safe database handle (unified KernelDb).
 pub type DbHandle = Arc<parking_lot::Mutex<KernelDb>>;
 
@@ -2072,6 +2084,40 @@ impl BlockStore {
             .blocks_ordered()
             .into_iter()
             .find(|b| b.status == Status::Draft && b.id.principal_id == principal_id))
+    }
+
+    /// Capture shell input and its revision under the same document guard.
+    pub fn draft_for_submission(
+        &self,
+        context_id: ContextId,
+        principal_id: PrincipalId,
+    ) -> BlockStoreResult<Option<DraftSubmission>> {
+        let entry = self.get(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        Ok(entry.doc.blocks_ordered().into_iter()
+            .find(|b| b.status == Status::Draft && b.id.principal_id == principal_id)
+            .map(|draft| DraftSubmission {
+                block_id: draft.id,
+                revision: entry.doc.draft_revision(&draft.id).expect("a draft has a revision"),
+                content: draft.content,
+            }))
+    }
+
+    /// Discard only the draft revision used for an accepted shell command.
+    /// Returns false without a mutation if the draft changed or was removed.
+    pub fn consume_draft(&self, draft: &DraftSubmission) -> BlockStoreResult<bool> {
+        let context_id = draft.block_id.context_id;
+        let mut entry = self.get_mut(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        if entry.doc.draft_revision(&draft.block_id) != Some(draft.revision) {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        self.pause_after_compose_selection();
+        self.accept_locked(context_id, &mut entry, |entry| {
+            self.prepare_deletion(entry, context_id, &draft.block_id)
+        })?;
+        Ok(true)
     }
 
     /// This principal's draft block, created empty at the end of the document
@@ -7163,6 +7209,9 @@ mod tests {
     #[test]
     fn compose_selection_clear_keeps_ownership() { assert_compose_selection("clear"); }
 
+    #[test]
+    fn compose_selection_consume_keeps_ownership() { assert_compose_selection("consume"); }
+
     fn assert_compose_selection(action: &'static str) {
         let (store, _bus, db, _dir) = store_with_db_and_flows();
         let store = Arc::new(store);
@@ -7183,6 +7232,10 @@ mod tests {
             "create" => { writer.get_or_create_draft(ctx, me).unwrap(); }
             "edit" => { writer.edit_draft(ctx, me, 5, " world", 0).unwrap(); }
             "clear" => { assert_eq!(writer.clear_draft(ctx, me).unwrap(), "hello"); }
+            "consume" => {
+                let draft = writer.draft_for_submission(ctx, me).unwrap().unwrap();
+                assert!(writer.consume_draft(&draft).unwrap());
+            }
             _ => unreachable!(),
         });
         selected_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
@@ -7202,10 +7255,60 @@ mod tests {
         second.join().unwrap();
         assert!(held, "{action} released the document after selecting its draft");
         let live = store.block_snapshots(ctx).unwrap();
-        assert_eq!(live.len(), if action == "clear" { 0 } else { 1 });
+        assert_eq!(live.len(), if matches!(action, "clear" | "consume") { 0 } else { 1 });
         let replayed = replay_journal(&db, ctx).blocks_ordered();
         assert_eq!(live.len(), replayed.len());
         for (a, b) in live.iter().zip(&replayed) { assert!(a.content_eq(b)); }
+    }
+
+    #[test]
+    fn draft_consumption_ignores_unrelated_writes_and_journals_deletion() {
+        let (store, bus, db, _dir) = store_with_db_and_flows();
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        let other = PrincipalId::new();
+        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let id = store.edit_draft(ctx, me, 0, "echo hi", 0).unwrap();
+        let draft = store.draft_for_submission(ctx, me).unwrap().unwrap();
+        store.edit_draft(ctx, other, 0, "other input", 0).unwrap();
+        store.insert_block(ctx, None, None, Role::Tool, BlockKind::ToolResult,
+            "output", Status::Done, ContentType::Plain).unwrap();
+        let mut sub = bus.subscribe("block.>");
+        assert!(store.consume_draft(&draft).unwrap());
+        let version = store.version(ctx).unwrap();
+        assert!(matches!(sub.try_recv().unwrap().payload, BlockFlow::Deleted { block_id, .. } if block_id == id));
+        assert!(!store.consume_draft(&draft).unwrap(), "consumption is idempotent");
+        assert_eq!(store.version(ctx).unwrap(), version);
+        assert!(sub.try_recv().is_none(), "a stale token publishes no mutation");
+        assert_eq!(store.draft_block(ctx, other).unwrap().unwrap().content, "other input");
+        assert!(replay_journal(&db, ctx).get_block_snapshot(&id).is_none());
+    }
+
+    #[test]
+    fn draft_consumption_rejects_generic_text_edits_promotion_and_reload() {
+        for action in ["edit", "append", "promote", "reload"] {
+            let (store, _bus, db, _dir) = store_with_db_and_flows();
+            let ctx = ContextId::new();
+            let me = PrincipalId::new();
+            store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let id = store.edit_draft(ctx, me, 0, "echo hi", 0).unwrap();
+            let draft = store.draft_for_submission(ctx, me).unwrap().unwrap();
+            match action {
+                "edit" => { store.edit_text(ctx, &id, 0, "echo hi", 7).unwrap(); }
+                "append" => { store.append_text(ctx, &id, " later").unwrap(); }
+                "promote" => { store.submit_draft(ctx, me, None).unwrap(); }
+                "reload" => {
+                    store.documents.remove(&ctx);
+                    assert!(store.load_one_from_db(ctx).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            let version = store.version(ctx).unwrap();
+            assert!(!store.consume_draft(&draft).unwrap(), "{action} invalidates the captured revision");
+            assert_eq!(store.version(ctx).unwrap(), version);
+            assert!(store.get_block_snapshot(ctx, &id).unwrap().is_some());
+            assert!(replay_journal(&db, ctx).get_block_snapshot(&id).is_some());
+        }
     }
 
     /// The property the whole design exists for: **submit does not copy.**
