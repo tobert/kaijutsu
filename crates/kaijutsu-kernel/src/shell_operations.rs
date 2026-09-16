@@ -702,14 +702,14 @@ mod tests {
 }
 
 impl crate::Kernel {
-    /// Record completion separately from the receipt and resume an eligible model.
-    pub async fn complete_async_shell_operation(
+    /// Notify once after the execution owner has settled its durable receipt.
+    pub(crate) async fn notify_async_shell_completion(
         &self, id: &str, context: ContextId, principal: PrincipalId, actor: PrincipalId,
-        envelope: ShellEnvelope,
     ) -> OperationResult<()> {
         let state = self.shell_operations().get(id, context)?
             .ok_or_else(|| format!("shell operation {id} is missing"))?;
-        if !self.shell_operations().complete(id, envelope.clone())? { return Ok(()); }
+        if state.completed_at.is_none() { return Err("shell notification requires a completed receipt".into()); }
+        let envelope = state.envelope.as_ref().ok_or("completed shell receipt has no result")?;
         let row = self.kernel_db().lock().get_context(context).map_err(|e| e.to_string())?
             .ok_or_else(|| format!("shell operation context {context} is missing"))?;
         if row.is_archived() || row.played_by != Some(actor) { return Ok(()); }

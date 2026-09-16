@@ -496,21 +496,16 @@ impl EmbeddedKaish {
         self.kernel.execute_with_options(code, opts).await
     }
 
-    /// Start a complete kaish program as a context-owned background job.
-    ///
-    /// The underlying kaish API parses and validates before returning the job
-    /// receipt. Its shared manager is injected at construction, so callers
-    /// can observe, wait for, or cancel the receipt after this materialized
-    /// shell drops.
-    pub async fn execute_background_with_options(
-        &self,
-        code: &str,
-        opts: ExecuteOptions,
-    ) -> std::result::Result<kaish_kernel::scheduler::JobId, kaish_kernel::KernelError> {
+    /// Capture the final result and report each completed statement to the
+    /// command owner's raw job stream. Hooks consume the final capture.
+    pub(crate) async fn execute_with_options_streaming(
+        &self, code: &str, opts: ExecuteOptions,
+        on_output: &mut (dyn FnMut(&ExecResult) + Send),
+    ) -> std::result::Result<ExecResult, kaish_kernel::KernelError> {
         let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
         let context_id = self.context_id().map(|cid| cid.to_string());
         let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
-        self.kernel.execute_background_with_options(code, opts).await
+        self.kernel.execute_with_options_streaming(code, opts, on_output).await
     }
 
     /// Get a variable value.

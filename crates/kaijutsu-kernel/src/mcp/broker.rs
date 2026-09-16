@@ -76,6 +76,14 @@ tokio::task_local! {
     static HOOK_DEPTH: std::cell::Cell<u32>;
 }
 
+pub(crate) fn current_hook_depth() -> u32 {
+    HOOK_DEPTH.try_with(|depth| depth.get()).unwrap_or(0)
+}
+
+pub(crate) async fn inherit_hook_depth<F: std::future::Future>(depth: u32, work: F) -> F::Output {
+    HOOK_DEPTH.scope(std::cell::Cell::new(depth), work).await
+}
+
 #[cfg(test)]
 pub(crate) static HOOK_DEPTH_OVERRIDE: std::sync::OnceLock<u32> =
     std::sync::OnceLock::new();
@@ -110,10 +118,8 @@ fn enter_hook_depth() -> McpResult<HookDepthGuard> {
     if next > max_hook_depth() {
         return Err(McpError::HookRecursionLimit { depth: next });
     }
-    // Best-effort: if the scope isn't installed (caller bypassed
-    // `call_tool`), the guard won't have anything to decrement — acceptable
-    // because the only path that increments is the call_tool → evaluate_phase
-    // → Invoke arm, and call_tool installs the scope.
+    // Enforcing evaluation and retained workers install the scope. Dry-run
+    // callers may lack one and never authorize execution.
     let _ = HOOK_DEPTH.try_with(|d| d.set(next));
     Ok(HookDepthGuard)
 }
@@ -321,11 +327,8 @@ fn no_hook_matched(mode: PhaseMode) -> PhaseEval {
     }
 }
 
-/// What running the `shell_write` hook phases against a direct kaish exec
-/// decided (`Broker::shell_pre_call_hooks` / `shell_post_call_hooks`,
-/// `docs/gate-and-shell-split.md`, "The three rpc.rs shell paths take the
-/// hook path"). Mirrors `PhaseOutcome` collapsed to the three shapes a
-/// caller outside `call_tool` needs to act on.
+/// A command hook verdict. The execution owner applies replacement/refusal
+/// to its captured outcome before publishing any terminal projection.
 #[derive(Debug)]
 pub enum ShellHookVerdict {
     /// No hook fired, or every matching hook let the call through.
@@ -1747,6 +1750,7 @@ impl Broker {
         if let Some(reviewer) = ctx.reviewer_id {
             span.record("reviewer.id", tracing::field::display(reviewer));
         }
+        let execution_owns_hooks = server.result_hook_owner() == super::server_like::ResultHookOwner::Execution;
         let call_fut = server.call_tool(params, ctx, cancel_for_call).instrument(span);
 
         // Race the call against (a) the per-instance timeout and (b) an
@@ -1776,6 +1780,7 @@ impl Broker {
                 if size > policy.max_result_bytes {
                     truncate_result_to_budget(&mut result, policy.max_result_bytes);
                 }
+                if execution_owns_hooks { return Ok(result); }
                 match self
                     .evaluate_phase(
                         McpHookPhase::PostCall,
@@ -1805,10 +1810,12 @@ impl Broker {
                 }
             }
             Ok(Err(e)) => {
+                if execution_owns_hooks { return Err(e); }
                 self.run_on_error_then_err(&call_params_for_hooks, ctx, e)
                     .await
             }
             Err(timeout_err) => {
+                if execution_owns_hooks { return Err(timeout_err); }
                 self.run_on_error_then_err(&call_params_for_hooks, ctx, timeout_err)
                     .await
             }
@@ -1878,10 +1885,12 @@ impl Broker {
         ctx: &CallContext,
         payload: PhasePayload<'_>,
     ) -> McpResult<PhaseOutcome> {
-        match self
-            .evaluate_phase_with_mode(PhaseMode::Enforce, phase, params, ctx, payload)
-            .await?
-        {
+        // Keep the scope wrapper from carrying the full recursive evaluator
+        // on every enclosing rc/command future's stack.
+        let evaluation = Box::pin(self.evaluate_phase_with_mode(PhaseMode::Enforce, phase, params, ctx, payload));
+        let result = if HOOK_DEPTH.try_with(|_| ()).is_ok() { evaluation.await }
+            else { inherit_hook_depth(0, evaluation).await };
+        match result? {
             PhaseEval::Enforced(outcome) => Ok(outcome),
             // Unreachable by construction — `PhaseMode::Enforce` produces no
             // dry-run finding. An error rather than a fallback: honoring a
@@ -2914,7 +2923,7 @@ impl Broker {
     const SHELL_WRITE_INSTANCE: &'static str = "builtin.shell_write";
     const SHELL_WRITE_TOOL: &'static str = "shell_write";
 
-    fn shell_write_hook_params(command: &str) -> KernelCallParams {
+    pub(crate) fn shell_write_hook_params(command: &str) -> KernelCallParams {
         KernelCallParams {
             instance: InstanceId::new(Self::SHELL_WRITE_INSTANCE),
             tool: Self::SHELL_WRITE_TOOL.to_string(),
@@ -3000,22 +3009,19 @@ impl Broker {
         }
     }
 
-    /// Run `PostCall` against `command`'s produced `result`, same identity
-    /// as [`Self::shell_pre_call_hooks`]. Lets a hook observe (or override)
-    /// what a direct kaish exec actually produced, the way `PostCall`
-    /// observes a real `shell_write` tool call's result.
-    pub async fn shell_post_call_hooks(
+    /// Apply PostCall to captured execution using its original tool invocation.
+    /// The execution owner retains the result while review waits.
+    pub async fn result_post_call_hooks(
         &self,
-        command: &str,
+        params: &KernelCallParams,
         ctx: &CallContext,
         result: &KernelToolResult,
         review: Option<&dyn ResultReview>,
     ) -> ShellHookVerdict {
-        let params = Self::shell_write_hook_params(command);
         match self
             .evaluate_phase(
                 McpHookPhase::PostCall,
-                &params,
+                params,
                 ctx,
                 PhasePayload::Result(result, review),
             )
@@ -3042,27 +3048,17 @@ impl Broker {
         }
     }
 
-    /// Run `OnError` against `command`'s real execution failure, same
-    /// identity as [`Self::shell_pre_call_hooks`]. Lets a hook observe (or
-    /// convert) what a direct kaish exec actually failed with, the way
-    /// `OnError` observes a real `shell_write` tool call's failure in
-    /// `call_tool`. `ShortCircuit` converts the failure into a synthetic
-    /// result the caller should report in place of the error — the same
-    /// override `call_tool`'s own `OnError` grants.
-    ///
-    /// A result-review owner retains the failed execution while an Ask or
-    /// kaish escalation awaits its reviewer. Approval continues this hook
-    /// snapshot; it never submits the source program again.
-    pub async fn shell_on_error_hooks(
+    /// Apply OnError to captured execution failure using its original invocation.
+    /// Approval resumes the hook snapshot without executing source again.
+    pub async fn result_error_hooks(
         &self,
-        command: &str,
+        params: &KernelCallParams,
         ctx: &CallContext,
         err: &McpError,
         review: Option<&dyn ResultReview>,
     ) -> ShellHookVerdict {
-        let params = Self::shell_write_hook_params(command);
         match self
-            .evaluate_phase(McpHookPhase::OnError, &params, ctx, PhasePayload::Error(err, review))
+            .evaluate_phase(McpHookPhase::OnError, params, ctx, PhasePayload::Error(err, review))
             .await
         {
             Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
@@ -4322,7 +4318,7 @@ fn log_level_to_types(l: LogLevel) -> kaijutsu_types::LogLevel {
     }
 }
 
-fn estimate_result_size(result: &KernelToolResult) -> usize {
+pub(crate) fn estimate_result_size(result: &KernelToolResult) -> usize {
     let mut total = 0usize;
     for c in &result.content {
         match c {
@@ -4403,7 +4399,7 @@ fn elision_marker(n: usize) -> String {
 /// (~90 bytes) still applies; this mirrors the previous footer-based
 /// implementation's same fixed overhead and is inherent to any
 /// marker-based truncation scheme, not a new regression.
-fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize) {
+pub(crate) fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize) {
     use super::types::ToolContent;
 
     // A lone JSON object body is the model's entire reading of the call, so
@@ -10086,19 +10082,9 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // shell_post_call_hooks / shell_on_error_hooks: PostCall/OnError on the
-    // rpc.rs direct-exec paths. `shell_pre_call_hooks` already had callers;
-    // these two did not (`shell_post_call_hooks` had zero, and
-    // `shell_on_error_hooks` didn't exist) until this pass wired them into
-    // `rpc.rs::execute`/`execute_shell_command`/`execute_kj_command`.
-    // -------------------------------------------------------------------
-
-    /// A PostCall hook watching a direct kaish exec must see the REAL exit
-    /// code and stdout the command produced, not a synthesized
-    /// placeholder — the gap this pass closes.
+    /// Result hooks receive the command's physical exit and captured output.
     #[tokio::test]
-    async fn shell_post_call_hooks_delivers_the_real_exit_code_and_output() {
+    async fn result_post_call_hooks_deliver_the_real_exit_code_and_output() {
         let (broker, _kernel, _kj) = wired_kaish_broker("shell-post-call-real-result").await;
 
         let body = "case \"$KJ_TOOL_RESULT\" in \
@@ -10121,8 +10107,8 @@ mod tests {
             structured: Some(json!({"exit_code": 7})),
         };
         let verdict = broker
-            .shell_post_call_hooks(
-                "echo unmistakable-real-stdout; exit 7",
+            .result_post_call_hooks(
+                &Broker::shell_write_hook_params("echo unmistakable-real-stdout; exit 7"),
                 &CallContext::test(),
                 &real_result,
                 None,
@@ -10138,7 +10124,7 @@ mod tests {
     /// An OnError hook watching a direct kaish exec must see the REAL
     /// failure, not a synthesized one.
     #[tokio::test]
-    async fn shell_on_error_hooks_delivers_the_real_error() {
+    async fn result_error_hooks_deliver_the_real_error() {
         let (broker, _kernel, _kj) = wired_kaish_broker("shell-on-error-real-error").await;
 
         let body = "case \"$KJ_TOOL_ERROR\" in \
@@ -10157,7 +10143,7 @@ mod tests {
 
         let real_err = McpError::Protocol("unmistakable-real-failure".into());
         let verdict = broker
-            .shell_on_error_hooks("false", &CallContext::test(), &real_err, None)
+            .result_error_hooks(&Broker::shell_write_hook_params("false"), &CallContext::test(), &real_err, None)
             .await;
         assert!(
             matches!(verdict, ShellHookVerdict::Proceed),
@@ -10189,8 +10175,8 @@ mod tests {
 
         let real_result = KernelToolResult::text("the-real-command-output");
         let verdict = broker
-            .shell_post_call_hooks(
-                "echo the-real-command-output",
+            .result_post_call_hooks(
+                &Broker::shell_write_hook_params("echo the-real-command-output"),
                 &CallContext::test(),
                 &real_result,
                 None,
@@ -10236,8 +10222,8 @@ mod tests {
 
         let real_result = KernelToolResult::text("the-real-command-output");
         let verdict = broker
-            .shell_post_call_hooks(
-                "echo the-real-command-output",
+            .result_post_call_hooks(
+                &Broker::shell_write_hook_params("echo the-real-command-output"),
                 &CallContext::test(),
                 &real_result,
                 None,

@@ -472,6 +472,7 @@ impl Drop for SharedKernelState {
         // `KernelDb` Arcs — deliberately NOT an `Arc<SharedKernelState>`,
         // which would be a cycle that kept this `Drop` from ever running.
         self.shutdown.cancel();
+        self.kernel.stop_command_worker();
 
         // Best-effort WAL checkpoint on clean teardown so the main `.db` file
         // doesn't linger behind committed history after exit. This fires only
@@ -3859,7 +3860,7 @@ impl kernel::Server for KernelImpl {
                             options.cancel_token = Some(cancel_token);
                             run_without_blocks(&kaish, &code, &kernel.kernel, &call_ctx, options,
                                 CommandRunOptions { stdin: None, context_switch: CommandContextSwitch::Publish(Some(&record)),
-                                    review_notices: None }).await
+                                    review_notices: None, ..Default::default() }).await
                         }
                     };
                     let result = match outcome {

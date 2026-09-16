@@ -1612,6 +1612,29 @@ cancelled on connection drop, and local tasks dropped outside an entered runtime
 Connection teardown now cancels those tokens; both production and the shared SSH
 test helper keep the runtime entered through LocalSet destruction.
 
+MCP shells followed the same command owner. A regression showed PostCall could
+replace the admission receipt and erase its operation ID before execution had
+finished. Result-hook ownership is now explicit: ordinary servers use the
+broker, while shell commands apply their hooks at execution completion using
+the original tool identity and arguments. Background blocks, receipts, and jobs
+share one outcome; foreground review releases the tool call without rerunning.
+Read-only shells discard local shell state; writable shells persist changes.
+
+Worker tests caught two handoff errors: resetting recursive hook depth and
+borrowing a runtime that could shut down before accepted work finished. The
+kernel now owns a lazy local executor on the reserved kaish stack, carries hook
+depth across admission, and stops it with the kernel host. Shutdown also forbids
+late startup. Completion notification reads the settled receipt; durable retry
+for that notification and interruption before capture remain in the audit.
+
+The scope wrapper enlarged nested rc futures enough to overflow their stack.
+Boxing the evaluator fixed the existing context-creation regression without
+raising stack limits. Background output tests also caught a lost contract:
+jobs expose each completed statement before execution finishes. Raw streams
+now follow those observations, including an empty stream when a silent command
+has its final result replaced by a hook. Receipts and job wait results carry
+the completed hook-processed outcome.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

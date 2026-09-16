@@ -11,6 +11,8 @@
 
 pub mod command;
 pub mod structured;
+pub(crate) mod tool_command;
+pub(crate) mod worker;
 pub mod command_result;
 pub mod command_outcome;
 mod result_review;

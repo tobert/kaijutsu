@@ -91,9 +91,11 @@ review, and projection without creating a transcript pair or ordinary receipt.
 Their review result remains inspectable through `kj ledger show`. Every ask in
 a sequence now retains its invocation and optional operation link.
 
-Still pending: MCP async completion projects independently and its broker hook timing needs reconciliation
-with job completion. Streaming RPC now uses the shared outcome/review owner
-and honors every hook verdict. Startup recovers retained pending
+MCP shell commands now use the shared execution and settlement owner. Their
+result hooks run at actual completion, preserving read-only/writable invocation
+identity; the broker no longer applies PostCall to admission receipts. A kernel
+worker owns accepted tasks beyond caller-runtime and transport shutdown.
+Streaming RPC also honors every hook verdict. Startup recovers retained pending
 projections without rerunning commands or hooks, preserving edits made after
 terminal publication. Initial outcome-retention failures still need live
 reporting/retry: background interactive callers log the error and approval
@@ -106,10 +108,16 @@ Interactive/approved result reviews now checkpoint execution and continue the
 same hook snapshot after approval. Their non-executable `hook_result` asks stay
 out of the execution/resume queue; cancellation, dropped waits, and restart
 retain execution and report interrupted review. Authored structured calls use
-this owner too, as do quiet and streaming RPC. Generic MCP calls still lack a
-retained result-review owner: result-phase Ask/escalation returns GateUnavailable
-before minting an ask. Migrate these callers and their job projections while
-preserving the complete shared-outcome contract.
+this owner too, as do quiet, streaming, and MCP shell calls. Non-shell MCP
+calls still lack a retained result-review owner: result-phase Ask/escalation
+returns GateUnavailable before minting an ask.
+
+The shell tool's async completion notification now reads its settled receipt.
+Make notification delivery recoverable and idempotent across failure/restart;
+it currently occurs once in the live execution owner after settlement. Kernel
+worker shutdown during result review preserves capture through its review guard.
+Shutdown/panic before capture still needs live terminal settlement and job/receipt
+agreement; startup currently reports interruption without replaying source.
 
 ### Shared client recovery
 

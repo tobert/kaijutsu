@@ -94,8 +94,24 @@ These are source observations, not promises that all paths behave alike.
   command/review tasks, abandons pending review, and preserves captured output.
   The runtime stays entered through task destruction; connection teardown also
   cancels registered execution tokens and removes the session binding.
-- MCP completion still projects independently. Live reporting/retry of
-  persistence failures and kernel worker ownership also remain open.
+- MCP shell execution uses `runtime/tool_command.rs` and the shared command
+  owner. Its server declares execution-owned result hooks; other MCP servers
+  keep broker-owned hooks. PreCall stays in the broker. PostCall/OnError observe
+  actual execution using the original tool name and arguments, not an admission
+  receipt. Background calls return only after job attachment; foreground result
+  reviews return a typed Pending refusal while retaining execution.
+  Background job streams expose raw output after each completed statement;
+  final job results and receipts include result-hook effects. A hook replacement
+  never fills an otherwise empty raw stream.
+- `runtime/worker.rs` supplies one lazy kernel-owned LocalSet on a reserved kaish
+  stack. Accepted tool work survives the submitting runtime or transport. Hook
+  recursion depth crosses the handoff. Host shutdown stops the worker and
+  forbids late startup. Read-only commands discard local cwd/export changes;
+  writable commands persist them. Async completion notification reads the settled
+  receipt instead of writing a second outcome.
+- Live reporting/retry of persistence failures and headless turn ownership
+  remain open. Interrupting execution before capture still needs a durable
+  terminal outcome; review interruption already preserves captured execution.
 - `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
   PostCall or OnError ask. Approval continues the same ordered hook snapshot;
   neither the command nor earlier hooks run again. Result-review asks have
@@ -120,12 +136,12 @@ remove the obsolete API in the same change as its final caller.
 | State | Caller or mechanism | Current location | Contract to retain |
 |---|---|---|---|
 | Migrated | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `runtime/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
-| Pending | Dedicated threads and startup runtime | kernel `lib.rs`; server `main.rs`, `ssh.rs`, `beat.rs`, turn/resume drivers | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
+| Partial | Dedicated threads and startup runtime | kernel `lib.rs`, `runtime/worker.rs`; server `main.rs`, `ssh.rs`, `beat.rs`, turn/resume drivers | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
 | Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
 | Migrated | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
 | Partial | Approval resume | server resume drivers; kernel `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
-| Pending | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs` | Read-only/writable distinction, stdin, typed rejection, job ownership, receipts, cancellation, and async completion |
+| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, and completion notification migrated; interruption before capture and durable notification recovery remain in the settlement audit |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Pending | Editor shell reads | kernel `kernel.rs::fetch_editor_io` | Opener identity/context, full text, and fail-before-splice behavior |
@@ -212,7 +228,7 @@ are still processing. The output shows both results, so a quiet caller can read
 its completed result without a transcript block. An earlier ask in a sequence
 still resolves the same invocation and optional operation receipt.
 
-Generic MCP calls do not yet supply a result-review owner. Their result-phase
+Non-shell MCP calls do not yet supply a result-review owner. Their result-phase
 Ask or kaish escalation returns GateUnavailable before creating an ask. Migrate
 those consumers to retained outcomes; do not restore executable asks as a fallback.
 
@@ -287,7 +303,7 @@ adapters must have a named deletion step and must not become permanent aliases.
    write-back; server helper dependencies are removed. Introduce one outcome and projection
    path, then migrate interactive, streaming, structured `kj`, model foreground,
    model background, and approved-resume callers. Remove server-to-`rpc.rs`
-   helper dependencies (removed) and duplicate MCP completion logic. Preserve caller
+   helper dependencies and duplicate MCP completion logic (both removed). Preserve caller
    policies rather than erasing their differences to make parity tests pass.
 5. **Finish runtime ownership.** Move headless turn execution, interruption,
    and resumption ownership into the kernel as a separate change. Keep

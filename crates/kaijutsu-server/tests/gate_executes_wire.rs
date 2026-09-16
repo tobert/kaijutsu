@@ -1552,3 +1552,51 @@ fn disconnect_settles_retained_stream_review_and_removes_the_session() {
         tokio::task::yield_now().await;
     });
 }
+
+#[test]
+fn mcp_result_review_survives_rpc_disconnect() {
+    run_local(async {
+        use kaijutsu_kernel::mcp::{Capability, ContextToolBinding, KernelToolResult};
+        let s = seats().await;
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        s.kernel.kernel.broker().set_binding(s.worker, binding).await.unwrap();
+        s.worker_kj.join_context(s.worker, "mcp-retained-review").await.unwrap();
+        let mut hooks = s.kernel.kernel.broker().hooks().write().await;
+        for (id, action, priority) in [
+            ("mcp-retained-review", HookAction::Ask(AskSpec { description: Some("Review retained MCP output".into()) }), 0),
+            ("mcp-reviewed", HookAction::ShortCircuit(KernelToolResult::text("reviewed after disconnect")), 1),
+        ] {
+            hooks.post_call.entries.push(HookEntry { id: HookId(id.into()), match_instance: None,
+                match_tool: Some(GlobPattern("shell".into())), match_context: Some(s.worker), match_principal: None,
+                action, priority, kaish_script_id: None });
+        }
+        drop(hooks);
+        let receipt = s.worker_kj.call_mcp_tool("shell", &serde_json::json!({"command": "echo captured MCP output"})).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&receipt.content).unwrap();
+        assert_eq!(body["status"], "running");
+        let operation = body["operation_id"].as_str().unwrap().to_owned();
+        wait_for("MCP result checkpoint", || s.kernel.kernel.shell_operations().get(&operation, s.worker).unwrap().unwrap()
+            .receipt.ask_id.is_some()).await;
+        let ask = s.kernel.kernel.shell_operations().get(&operation, s.worker).unwrap().unwrap().receipt.ask_id.unwrap();
+        let session = *s.kernel.session_contexts.iter().find(|entry| *entry.value() == s.worker).unwrap().key();
+        let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, approver } = s;
+        drop(worker_kj);
+        drop(_worker_client);
+        wait_for("MCP submitting session to close", || !kernel.session_contexts.contains_key(&session)).await;
+        let answer = approver_kj.execute_kj_quiet(approver, &["ledger".into(), "allow".into(), ask.clone()]).await.unwrap();
+        assert_eq!(answer.exit_code, 0, "{}", answer.stderr);
+        wait_for("MCP review completion after disconnect", || kernel.kernel.shell_operations()
+            .get(&operation, worker).unwrap().unwrap().completed_at.is_some()).await;
+        let result = kernel.kernel.shell_operations().get(&operation, worker).unwrap().unwrap().envelope.unwrap();
+        assert_eq!(result.stdout, "reviewed after disconnect");
+        assert_eq!(result.status, ShellStatus::Done);
+        let captured = kernel.kernel.shell_operations().outcome(&operation, worker).unwrap().unwrap();
+        let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = captured.execution
+            else { panic!("lost MCP execution") };
+        assert_eq!(raw.text_out(), "captured MCP output\n");
+        drop(approver_kj);
+        drop(_approver_client);
+        tokio::task::yield_now().await;
+    });
+}

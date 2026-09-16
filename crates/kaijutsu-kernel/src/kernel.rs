@@ -169,6 +169,8 @@ pub struct Kernel {
     ledger_flows: SharedLedgerFlowBus,
     /// Durable shell receipts and context-owned kaish jobs.
     shell_operations: Arc<crate::shell_operations::ShellOperationRegistry>,
+    command_worker: OnceLock<Result<crate::runtime::worker::CommandWorker, String>>,
+    command_worker_shutdown: tokio_util::sync::CancellationToken,
     /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
     /// "Order from here: kernel wiring of the inbox"). `OnceLock` like
     /// `beat_ingress`/`file_cache`: the server binds the real socket and
@@ -408,11 +410,32 @@ impl Kernel {
                 operations.abandon_unfinished().expect("settle interrupted shell operations");
                 Arc::new(operations)
             },
+            command_worker: OnceLock::new(),
+            command_worker_shutdown: tokio_util::sync::CancellationToken::new(),
             cc_inbox: OnceLock::new(),
             turn_liveness: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
         kernel
+    }
+
+    pub(crate) fn spawn_command<F, W>(&self, work: W) -> Result<(), String>
+    where F: std::future::Future<Output = ()> + 'static, W: FnOnce() -> F + Send + 'static {
+        if self.command_worker_shutdown.is_cancelled() { return Err("kernel command worker is shut down".into()); }
+        let worker = self.command_worker.get_or_init(crate::runtime::worker::CommandWorker::start)
+            .as_ref().map_err(Clone::clone)?;
+        if self.command_worker_shutdown.is_cancelled() {
+            worker.stop();
+            return Err("kernel command worker is shut down".into());
+        }
+        worker.submit(work)
+    }
+
+    /// Stop accepted tool tasks when their kernel host shuts down. Transport
+    /// disconnects do not stop this worker; pending reviews retain their results.
+    pub fn stop_command_worker(&self) {
+        self.command_worker_shutdown.cancel();
+        if let Some(Ok(worker)) = self.command_worker.get() { worker.stop(); }
     }
 
     /// Stable kernel identity.

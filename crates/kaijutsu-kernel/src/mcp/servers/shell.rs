@@ -9,7 +9,9 @@
 //! `facade:shell_write` govern visibility and dispatch without a second grant.
 //! Rc selects each context type's loadout; see `docs/gate-and-shell-split.md`.
 
+#[cfg(test)]
 use crate::runtime::command_result::shell_result_to_envelope;
+use crate::runtime::command_result::shell_envelope_to_tool_result as envelope_result;
 use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::sync::{Arc, LazyLock, Weak};
@@ -19,7 +21,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 
 use super::super::broker::Broker;
 use super::super::context::CallContext;
@@ -27,7 +28,9 @@ use super::super::error::{McpError, McpResult};
 use kaijutsu_types::RefusalKind;
 use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
 use super::super::server_like::{McpServerLike, ServerNotification};
-use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult, ToolContent};
+use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
+#[cfg(test)]
+use super::super::types::ToolContent;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -41,13 +44,15 @@ pub struct ShellParams {
     /// stdin ignores it.
     #[serde(default)]
     pub stdin: Option<String>,
-    /// Wait for `command` to finish before returning. Defaults to `false`.
+    /// Wait for command completion and result hooks. Defaults to `false`.
+    /// A result review returns a pending refusal; inspect its captured and
+    /// final results with `kj ledger show` after the reviewer answers.
     ///
     /// An asynchronous command runs the same complete kaish program as a
     /// foreground command, with the same context identity, tools, mounts,
     /// variables, working directory, and external-command policy. It returns
-    /// a stable job receipt before execution starts; read, wait, or cancel it
-    /// through the shell operation API.
+    /// a stable operation receipt without waiting for completion; read, wait,
+    /// or cancel it through the shell operation API.
     #[serde(default)]
     pub foreground: bool,
 }
@@ -96,8 +101,8 @@ const RETURN_CONTRACT: &str = "Returns one JSON object, always the same \
      keys: {stdout, stderr, exit_code, status, did_spill, data, latch, \
      block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error}. \
      `stdout` and `stderr` are separate and are empty strings when the \
-     command wrote none. Detect failure with `exit_code != 0` rather than \
-     matching text. `status` is done, error, rejected, running, timeout or \
+     command wrote none. Read `status` to distinguish completion, failure, \
+     and pending work. `status` is done, error, rejected, running, waiting, timeout or \
      stream_closed — `rejected` means kaish refused the program and nothing \
      ran, so fix the command text and retry. `exit_code` is null exactly \
      when there is no code to report; null is never evidence of success. \
@@ -200,6 +205,10 @@ impl ShellServer {
 
 #[async_trait]
 impl McpServerLike for ShellServer {
+    fn result_hook_owner(&self) -> super::super::server_like::ResultHookOwner {
+        super::super::server_like::ResultHookOwner::Execution
+    }
+
     fn instance_id(&self) -> &InstanceId {
         &self.instance_id
     }
@@ -218,7 +227,7 @@ impl McpServerLike for ShellServer {
         &self,
         params: KernelCallParams,
         ctx: &CallContext,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
         if params.tool != self.tool {
             return Err(McpError::ToolNotFound {
@@ -227,14 +236,10 @@ impl McpServerLike for ShellServer {
             });
         }
         let parsed: ShellParams =
-            serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
+            serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
 
-        // Reach the shared dispatcher (wired at bootstrap via
-        // `Broker::set_kj_dispatcher`) and materialize the SAME per-context
-        // kaish the RPC seam and rc lifecycle use. Kernel-side callers pass no
-        // semantic index + a no-op block source, so `kj`'s synthesis/search
-        // tools are degraded here (matching rc/hooks); the core `kj` verbs and
-        // shell work. Wiring the real index is a follow-up.
+        // The dispatcher supplies the same context policy, index, and block
+        // source used by other runtime callers.
         let broker = self.broker()?;
         let dispatcher = broker
             .kj_dispatcher()
@@ -244,23 +249,9 @@ impl McpServerLike for ShellServer {
                 reason: "kj dispatcher not wired (Broker::set_kj_dispatcher)".to_string(),
             })?;
 
-        // Both shell flavors pass the same gate before dispatch. The safe
-        // shell's policy still prevents external commands and mutations, but
-        // its kaish program is planned and recorded by the same path.
-        //
-        // The gate is all-or-nothing per submission (kaish has no
-        // per-command interception hook — `kj::shell_gate`'s module docs
-        // explain why) and covers exactly what `plan_program` can see: the
-        // kaish source text of `parsed.command`. It does NOT cover a
-        // program handed to an interpreter as a string argument or over
-        // `parsed.stdin` — see `kj::shell_gate`'s module docs for the full,
-        // honest list.
-        // Populated only when `run_gate` redeems an escalated ask: the cwd
-        // the human's approval was actually asked about. `None` on every
-        // other path (the safe read-only tool, a rule-matched auto-allow,
-        // or a synthetic caller the gate never pinned) — those all keep
-        // running in the context's current cwd, unchanged from before this
-        // pin existed.
+        // Writable submissions pass the source-program gate. Read-only shells
+        // enforce their policy structurally and do not need execution approval.
+        // An approved writable submission carries the directory it authorized.
         let mut pinned_cwd: Option<std::path::PathBuf> = None;
         if !self.read_only {
             // A submission that does not parse is refused here, before the
@@ -287,15 +278,8 @@ impl McpServerLike for ShellServer {
                 rc_depth: 0,
                 privileged: false,
             };
-            // Nothing here waits. `run_gate` records a durable ask and
-            // returns; a human answers from `kj ledger` whenever they
-            // answer, and the next attempt at this same command redeems
-            // that answer once. See `docs/gate-resume.md`.
-            //
-            // The four-hop timeout ladder this call used to sit inside
-            // still exists (`kaijutsu_types::timeout::gate`) and is now
-            // load-bearing for nothing here — it comes out with slice 4,
-            // after the kernel can resume an approved action on its own.
+            // The gate records a durable ask without waiting. The approval
+            // driver or a matching retry consumes its answer once.
             let gate_config =
                 crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
             let outcome = crate::kj::gate::run_gate(
@@ -324,46 +308,9 @@ impl McpServerLike for ShellServer {
                 };
                 if kind == RefusalKind::Pending && !parsed.foreground {
                     let ask = outcome.ask.as_ref().expect("a pending gate outcome has an ask");
-                    let blocks = dispatcher.block_store();
-                    let command_block_id = blocks
-                        .insert_block_as(
-                            ctx.context_id, None, None,
-                            kaijutsu_types::Role::Tool,
-                            kaijutsu_types::BlockKind::ToolCall,
-                            parsed.command.clone(),
-                            kaijutsu_types::Status::Waiting,
-                            kaijutsu_types::ContentType::Plain,
-                            Some(ctx.actor_id),
-                        )
-                        .map_err(|error| McpError::Protocol(format!(
-                            "create waiting shell command block: {error}"
-                        )))?;
-                    let output_block_id = blocks
-                        .insert_block_as(
-                            ctx.context_id, Some(&command_block_id), Some(&command_block_id),
-                            kaijutsu_types::Role::Tool,
-                            kaijutsu_types::BlockKind::ToolResult,
-                            String::new(), kaijutsu_types::Status::Waiting,
-                            kaijutsu_types::ContentType::Plain,
-                            Some(ctx.principal_id),
-                        )
-                        .map_err(|error| McpError::Protocol(format!(
-                            "create waiting shell output block: {error}"
-                        )))?;
-                    for block_id in [&command_block_id, &output_block_id] {
-                        blocks.set_excluded(ctx.context_id, block_id, true).map_err(|error| {
-                            McpError::Protocol(format!("exclude waiting shell block: {error}"))
-                        })?;
-                    }
-                    let epoch = dispatcher.kernel_db().lock().continuation_epoch(ctx.context_id)
-                        .map_err(|error| McpError::Protocol(format!("snapshot shell continuation epoch: {error}")))?;
-                    let receipt = dispatcher.kernel().shell_operations().register(
-                        ctx.context_id, ctx.principal_id, ctx.actor_id,
-                        command_block_id, output_block_id, &parsed.command,
-                        epoch,
-                    ).map_err(|error| McpError::Protocol(format!(
-                        "register waiting shell operation: {error}"
-                    )))?;
+                    let receipt = crate::runtime::tool_command::create_operation(
+                        dispatcher.kernel(), ctx, &parsed.command, kaijutsu_types::Status::Waiting,
+                    ).map_err(McpError::Protocol)?;
                     dispatcher.kernel().shell_operations().mark_waiting(
                         &receipt.operation_id, &ask.request_id,
                     ).map_err(|error| McpError::Protocol(format!(
@@ -394,12 +341,8 @@ impl McpServerLike for ShellServer {
                 }
                 return Err(McpError::refused_gate(kind, self.tool, outcome.ask.clone(), &outcome.reason));
             }
-            // An approval authorizes THAT operation, not a similar one run
-            // wherever the context's cwd has drifted to since the ask was
-            // asked (`docs/gate-resume.md`, "Staleness"). `outcome.cwd` is
-            // the pin `run_gate` captured at escalation time; carry it
-            // through so the command below runs there, not in whatever
-            // directory `EmbeddedKaish::for_context` would otherwise land in.
+            // Preserve the directory attached to the approval; current context
+            // state may have changed while its reviewer was deciding.
             pinned_cwd = outcome.cwd;
         }
 
@@ -419,15 +362,8 @@ impl McpServerLike for ShellServer {
         .await
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
-        // The pinned directory is validated against the shell's own backend
-        // (host paths and VFS-only paths like `/v/docs` alike — the same
-        // namespace `cd` resolves against, exactly what
-        // `EmbeddedKaish::try_set_cwd` checks). A pin that no longer
-        // resolves — the directory was removed, or was VFS-only and this
-        // context's mounts changed — fails closed and loud here: it never
-        // falls back to the context's current cwd, because that fallback is
-        // the exact bug this pin exists to close (approve in directory A,
-        // run in directory B).
+        // Validate the approved directory against the shell's backend. A
+        // removed path or changed mount must not redirect approved execution.
         if let Some(cwd) = &pinned_cwd {
             if !kaish.try_set_cwd(cwd.clone()).await {
                 return Err(McpError::Protocol(format!(
@@ -438,225 +374,14 @@ impl McpServerLike for ShellServer {
             }
         }
 
-        let mut opts = kaish_kernel::ExecuteOptions::default();
-        if let Some(stdin) = parsed.stdin {
-            opts = opts.with_stdin(stdin);
-        }
-        if let Some(cwd) = pinned_cwd {
-            opts = opts.with_cwd(cwd);
-        }
-        if !parsed.foreground {
-            let blocks = dispatcher.block_store();
-            let command_block_id = blocks
-                .insert_block_as(
-                    ctx.context_id,
-                    None,
-                    None,
-                    kaijutsu_types::Role::Tool,
-                    kaijutsu_types::BlockKind::ToolCall,
-                    parsed.command.clone(),
-                    kaijutsu_types::Status::Running,
-                    kaijutsu_types::ContentType::Plain,
-                    Some(ctx.actor_id),
-                )
-                .map_err(|error| McpError::Protocol(format!(
-                    "create asynchronous shell command block: {error}"
-                )))?;
-            let output_block_id = blocks
-                .insert_block_as(
-                    ctx.context_id,
-                    Some(&command_block_id),
-                    Some(&command_block_id),
-                    kaijutsu_types::Role::Tool,
-                    kaijutsu_types::BlockKind::ToolResult,
-                    String::new(),
-                    kaijutsu_types::Status::Running,
-                    kaijutsu_types::ContentType::Plain,
-                    Some(ctx.principal_id),
-                )
-                .map_err(|error| McpError::Protocol(format!(
-                    "create asynchronous shell output block: {error}"
-                )))?;
-            for block_id in [&command_block_id, &output_block_id] {
-                blocks.set_excluded(ctx.context_id, block_id, true).map_err(|error| {
-                    McpError::Protocol(format!("exclude asynchronous shell block: {error}"))
-                })?;
-            }
-            let epoch = dispatcher.kernel_db().lock().continuation_epoch(ctx.context_id)
-                .map_err(|error| McpError::Protocol(format!("snapshot shell continuation epoch: {error}")))?;
-            let receipt = dispatcher
-                .kernel()
-                .shell_operations()
-                .register(
-                    ctx.context_id,
-                    ctx.principal_id,
-                    ctx.actor_id,
-                    command_block_id,
-                    output_block_id,
-                    &parsed.command,
-                    epoch,
-                )
-                .map_err(|error| McpError::Protocol(format!(
-                    "register asynchronous shell operation: {error}"
-                )))?;
-            let job_id = match kaish.execute_background_with_options(&parsed.command, opts).await {
-                Ok(job_id) => job_id,
-                Err(error) => {
-                    let mut envelope = ShellEnvelope::new(if error.is_rejected() {
-                        ShellStatus::Rejected
-                    } else {
-                        ShellStatus::Error
-                    });
-                    envelope.operation_id = Some(receipt.operation_id.clone());
-                    envelope.block_id = Some(receipt.output_block_id.to_key());
-                    envelope.error = Some(error.to_string());
-                    for block_id in [&receipt.command_block_id, &receipt.output_block_id] {
-                        let _ = blocks.set_status(ctx.context_id, block_id, kaijutsu_types::Status::Error);
-                    }
-                    dispatcher.kernel().shell_operations().complete(&receipt.operation_id, envelope.clone())
-                        .map_err(|failure| McpError::Protocol(format!(
-                            "settle rejected asynchronous shell operation: {failure}"
-                        )))?;
-                    if error.is_rejected() {
-                        return Ok(envelope_result(envelope));
-                    }
-                    return Err(McpError::Protocol(format!(
-                        "shell asynchronous execution failed: {error}"
-                    )));
-                }
-            };
-            dispatcher
-                .kernel()
-                .shell_operations()
-                .attach_job(
-                    &receipt.operation_id,
-                    job_id,
-                    dispatcher.kernel().context_job_manager(ctx.context_id),
-                )
-                .map_err(|error| McpError::Protocol(format!(
-                    "attach asynchronous shell job: {error}"
-                )))?;
-            let operation_id = receipt.operation_id.clone();
-            let completion_kernel = dispatcher.kernel().clone();
-            let completion_principal = ctx.principal_id;
-            let completion_actor = ctx.actor_id;
-            let job_manager = dispatcher.kernel().context_job_manager(ctx.context_id);
-            let completion_blocks = blocks.clone();
-            let completion_context = ctx.context_id;
-            let completion_command = receipt.command_block_id;
-            let completion_output = receipt.output_block_id;
-            tokio::spawn(async move {
-                let mut envelope = match job_manager.wait(job_id).await {
-                    Some(result) => shell_result_to_envelope(result, 0),
-                    None => {
-                        let mut envelope = ShellEnvelope::new(ShellStatus::Error);
-                        envelope.error = Some("asynchronous kaish job stopped before it settled".to_string());
-                        envelope
-                    }
-                };
-                envelope.operation_id = Some(operation_id.clone());
-                envelope.block_id = Some(completion_output.to_key());
-                if let Err(error) = completion_blocks.replace_text_as(
-                    completion_context,
-                    &completion_output,
-                    &envelope.stdout,
-                    Some(kaijutsu_types::PrincipalId::system()),
-                ) {
-                    tracing::error!("asynchronous shell operation {operation_id}: write output block: {error}");
-                }
-                if let Err(error) = completion_blocks.set_stderr(
-                    completion_context,
-                    &completion_output,
-                    (!envelope.stderr.is_empty()).then_some(envelope.stderr.clone()),
-                ) {
-                    tracing::error!("asynchronous shell operation {operation_id}: write stderr: {error}");
-                }
-                let exit_code = envelope.exit_code.and_then(|code| i32::try_from(code).ok());
-                if let Err(error) = completion_blocks.set_exit_code(
-                    completion_context,
-                    &completion_output,
-                    exit_code,
-                ) {
-                    tracing::error!("asynchronous shell operation {operation_id}: write exit code: {error}");
-                }
-                let status = if envelope.is_error() {
-                    kaijutsu_types::Status::Error
-                } else {
-                    kaijutsu_types::Status::Done
-                };
-                for block_id in [&completion_command, &completion_output] {
-                    if let Err(error) = completion_blocks.set_status(completion_context, block_id, status) {
-                        tracing::error!("asynchronous shell operation {operation_id}: settle block: {error}");
-                    }
-                }
-                if let Err(error) = completion_kernel.complete_async_shell_operation(
-                    &operation_id,
-                    completion_context,
-                    completion_principal,
-                    completion_actor,
-                    envelope,
-                ).await {
-                    tracing::error!("asynchronous shell operation {operation_id}: persist completion: {error}");
-                }
-            }.instrument(tracing::Span::current()));
-            let mut env = ShellEnvelope::new(ShellStatus::Running);
-            env.operation_id = Some(receipt.operation_id);
-            env.block_id = Some(receipt.output_block_id.to_key());
-            env.stderr = format!(
-                "asynchronous kaish job {job_id} started; use shell operation {} to read, wait, or cancel it",
-                env.operation_id.as_deref().unwrap_or_default()
-            );
-            return Ok(envelope_result(env));
-        }
-        // A REJECTED program is not a plumbing fault. kaish refuses parse and
-        // validation failures before anything runs, and that is the model's
-        // own mistake to read and fix — so it travels the D-28 `is_error`
-        // channel with kaish's text verbatim, the same way a nonzero exit
-        // does. Wrapping it in `McpError::Protocol` prepended `mcp protocol
-        // error:`, which is broker-internal vocabulary its own doc comment
-        // says must be converted at the LLM boundary, and it read like
-        // kaijutsu was broken rather than like the command was rejected.
-        //
-        // `Execution` keeps the fault channel: a statement started and
-        // something under it broke, which is not a rejection the model can
-        // fix by rewriting the command. `is_rejected()` is kaish's own
-        // predicate for the split; do not re-derive it from the message text.
-        let started = std::time::Instant::now();
-        let result = match kaish.execute_with_options(&parsed.command, opts).await {
-            Ok(result) => result,
-            Err(e) if e.is_rejected() => {
-                let mut env = ShellEnvelope::new(ShellStatus::Rejected);
-                env.error = Some(e.to_string());
-                env.elapsed_ms = Some(started.elapsed().as_millis() as u64);
-                return Ok(envelope_result(env));
-            }
-            Err(e) => {
-                return Err(McpError::Protocol(format!("shell execution failed: {e}")));
-            }
-        };
-
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        Ok(envelope_result(shell_result_to_envelope(result, elapsed_ms)))
+        crate::runtime::tool_command::ToolCommand {
+            kernel: dispatcher.kernel().clone(), broker, kaish, params, call: ctx.clone(),
+            code: parsed.command, stdin: parsed.stdin, foreground: parsed.foreground, read_only: self.read_only,
+        }.execute(cancel).await
     }
 
     fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
         self.notif_tx.subscribe()
-    }
-}
-
-/// Wrap a `ShellEnvelope` as the tool result. The envelope is the
-/// model-facing body — `ToolContent::Json`, not text, so the broker's
-/// oversize truncation shrinks the strings inside it and re-serializes
-/// instead of cutting the serialization in half.
-///
-/// `is_error` comes from the envelope's status, so the flag and the `status`
-/// field can never disagree.
-fn envelope_result(env: kaijutsu_types::shell_envelope::ShellEnvelope) -> KernelToolResult {
-    let value = env.to_value();
-    KernelToolResult {
-        is_error: env.is_error(),
-        content: vec![ToolContent::Json(value.clone())],
-        structured: Some(value),
     }
 }
 
@@ -726,7 +451,7 @@ mod tests {
         assert!(text.contains("`kj` is in scope"), "{text}");
         assert!(
             text.contains("one JSON object, always the same keys")
-                && text.contains("exit_code != 0"),
+                && text.contains("Read `status`"),
             "return contract must survive: {text}"
         );
 
@@ -741,7 +466,7 @@ mod tests {
         );
         assert!(
             ro_text.contains("one JSON object, always the same keys")
-                && ro_text.contains("exit_code != 0"),
+                && ro_text.contains("Read `status`"),
             "return contract must survive on the read-only variant too: {ro_text}"
         );
         // The runtime refusal names its condition and stops, by design, so
@@ -1871,6 +1596,273 @@ mod tests {
             assert!(started.elapsed() < std::time::Duration::from_secs(5),
                 "timed out waiting for shell operation {operation_id}");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn asynchronous_shell_keeps_live_statement_output() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("live-tool"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let receipt = broker.call_tool(call_async("echo first; sleep 30; echo last"), &cc, CancellationToken::new()).await.unwrap();
+        let id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
+        let state = d.kernel().shell_operations().get(&id, context).unwrap().unwrap();
+        let jobs = d.kernel().context_job_manager(context);
+        let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let output = jobs.read_stdout(job.id).await.unwrap();
+                if !output.is_empty() { break output; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await;
+        assert!(d.kernel().shell_operations().get(&id, context).unwrap().unwrap().completed_at.is_none());
+        assert!(d.kernel().shell_operations().cancel(&id, context).await.unwrap());
+        wait_for_operation(&d, context, &id).await;
+        assert_eq!(progress.expect("running jobs expose completed statement output"), b"first\n");
+    }
+
+    #[tokio::test]
+    async fn shell_state_writeback_respects_read_only_policy() {
+        for read_only in [true, false] {
+            for foreground in [true, false] {
+                let (broker, d) = wired().await;
+                let principal = PrincipalId::new();
+                let context = register_context(&d, Some("tool-state"), None, principal);
+                d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+                let mut binding = ContextToolBinding::new();
+                binding.grant(Capability::Facade(if read_only { "shell" } else { "shell_write" }.into()));
+                broker.set_binding(context, binding).await.unwrap();
+                let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id())
+                    .with_actor(principal, Some(PrincipalId::new()));
+                let code = "export TOOL_STATE=kept; echo $TOOL_STATE";
+                if !read_only {
+                    let pending = broker.call_tool(call_write(code), &cc, CancellationToken::new()).await.unwrap_err();
+                    assert!(matches!(pending, McpError::Refused(ref r) if r.kind == RefusalKind::Pending));
+                    answer_pending_ask(d.kernel_db().clone(), true);
+                }
+                let mut params = if read_only { call(code) } else { call_write(code) };
+                params.arguments["foreground"] = foreground.into();
+                let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
+                let body = body_of(&result);
+                let envelope = if foreground { body } else {
+                    wait_for_operation(&d, context, body["operation_id"].as_str().unwrap()).await.envelope.unwrap().to_value()
+                };
+                assert_eq!(envelope["stdout"], "kept\n");
+                let env = d.kernel_db().lock().get_context_env(context).unwrap();
+                assert_eq!(env.iter().find(|row| row.key == "TOOL_STATE").map(|row| row.value.as_str()),
+                    if read_only { None } else { Some("kept") });
+            }
+        }
+    }
+
+    struct AfterCallerDrop(Arc<tokio::sync::Notify>);
+
+    #[async_trait]
+    impl crate::mcp::Hook for AfterCallerDrop {
+        async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {
+            self.0.notified().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn asynchronous_shell_outlives_the_submitting_runtime() {
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId, GlobPattern};
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("detached-tool"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("after-caller-drop".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+            priority: 0, kaish_script_id: None, action: HookAction::Invoke(HookBody::Builtin {
+                name: "after-caller-drop".into(), hook: Arc::new(AfterCallerDrop(release.clone())) }),
+        });
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let (sent, received) = std::sync::mpsc::channel();
+        crate::spawn_kaish_thread("tool-caller-test", move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let receipt = rt.block_on(broker.call_tool(call_async("echo caller-gone"), &cc, CancellationToken::new())).unwrap();
+            sent.send(receipt).unwrap();
+        }).unwrap().join().unwrap();
+        let receipt = received.recv().unwrap();
+        release.notify_one();
+        let id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
+        let result = wait_for_operation(&d, context, &id).await.envelope.unwrap();
+        assert_eq!(result.stdout, "caller-gone\n");
+        assert_eq!(result.status, ShellStatus::Done);
+    }
+
+    struct ReenterShell {
+        broker: Weak<Broker>,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::mcp::Hook for ReenterShell {
+        async fn invoke(&self, params: &KernelCallParams, ctx: &CallContext) -> McpResult<()> {
+            let count = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if count >= 8 { return Err(McpError::Protocol("test stopped unbounded shell hook recursion".into())); }
+            let result = self.broker.upgrade().unwrap().call_tool(params.clone(), ctx, CancellationToken::new()).await?;
+            if result.is_error { Err(McpError::Protocol("nested shell tool failed".into())) } else { Ok(()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_shell_workers_preserve_the_hook_recursion_limit() {
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId, GlobPattern};
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("shell-hook-depth"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("reenter-shell".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+            priority: 0, kaish_script_id: None,
+            action: HookAction::Invoke(HookBody::Builtin { name: "reenter-shell".into(),
+                hook: Arc::new(ReenterShell { broker: Arc::downgrade(&broker), count: count.clone() }) }),
+        });
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let result = broker.call_tool(call("echo depth"), &cc, CancellationToken::new()).await;
+        assert!(count.load(std::sync::atomic::Ordering::SeqCst) <= crate::mcp::broker::MAX_HOOK_DEPTH as usize,
+            "moving execution to a worker must not reset recursive hook depth");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_result_reviews_retain_execution_for_foreground_and_background_calls() {
+        use crate::mcp::{HookAction, HookEntry, HookId, GlobPattern, AskSpec};
+        for foreground in [false, true] {
+            for decision in ["deny", "allow", "cancel"] {
+                let allow = decision == "allow";
+                let (broker, d) = wired().await;
+                let principal = PrincipalId::new();
+                let reviewer = PrincipalId::new();
+                let context = register_context(&d, Some("tool-review"), None, principal);
+                d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+                d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: reviewer, name: "tool-reviewer".into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+                let mut binding = ContextToolBinding::new();
+                binding.grant(Capability::Facade("shell".into()));
+                broker.set_binding(context, binding).await.unwrap();
+                let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id()).with_actor(principal, Some(reviewer));
+                let mut hooks = broker.hooks().write().await;
+                for (id, action, priority) in [
+                    ("tool-review", HookAction::Ask(AskSpec { description: Some("Review captured shell".into()) }), 0),
+                    ("after-review", HookAction::ShortCircuit(KernelToolResult::text("reviewed tool output")), 1),
+                ] {
+                    hooks.post_call.entries.push(HookEntry { id: HookId(id.into()), match_instance: None,
+                        match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+                        action, priority, kaish_script_id: None });
+                }
+                drop(hooks);
+                let params = if foreground { call("echo captured") } else { call_async("echo captured") };
+                let cancel = CancellationToken::new();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5),
+                    broker.call_tool(params, &cc, cancel.clone())).await.expect("review releases the tool call");
+                let operation = if foreground {
+                    assert!(matches!(result, Err(McpError::Refused(ref r)) if r.kind == RefusalKind::Pending));
+                    None
+                } else { Some(body_of(&result.unwrap())["operation_id"].as_str().unwrap().to_owned()) };
+                let ask = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let asks = d.kernel_db().lock().list_pending_asks().unwrap();
+                        if let Some(ask) = asks.into_iter().find(|row| row.hook_id.as_deref() == Some("tool-review"))
+                            && d.kernel().shell_operations().result_review_for_ask(&ask.request_id, context).unwrap().is_some() {
+                            break ask;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.unwrap();
+                assert!(ask.exec_source.is_none());
+                let record = d.kernel().shell_operations().result_review_for_ask(&ask.request_id, context).unwrap().unwrap();
+                assert_eq!(record.operation_id, operation);
+                assert!(record.settled.is_none());
+                if decision == "cancel" {
+                    if let Some(operation) = &operation {
+                        assert!(d.kernel().shell_operations().cancel(operation, context).await.unwrap());
+                    } else { cancel.cancel(); }
+                } else { answer_pending_ask(d.kernel_db().clone(), allow); }
+                let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Some(outcome) = d.kernel().shell_operations().result_review_for_ask(&ask.request_id, context)
+                            .unwrap().unwrap().settled { break outcome; }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.unwrap();
+                let envelope = settled.envelope();
+                assert_eq!(envelope.is_error(), !allow);
+                assert_eq!(envelope.stdout, if allow { "reviewed tool output" } else { "" });
+                let crate::runtime::command_outcome::CommandExecution::Completed(raw) = settled.execution
+                    else { panic!("lost captured tool execution") };
+                assert_eq!(raw.text_out(), "captured\n");
+                if let Some(operation) = operation { wait_for_operation(&d, context, &operation).await; }
+                else { assert!(d.block_store().block_snapshots(context).unwrap().is_empty()); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn result_hooks_settle_the_command_instead_of_replacing_its_receipt() {
+        use crate::mcp::{HookAction, HookEntry, HookId, GlobPattern};
+        for (foreground, input) in [(false, ""), (false, "captured input"), (true, "captured input")] {
+            let (broker, d) = wired().await;
+            let principal = PrincipalId::new();
+            let context = register_context(&d, Some("settled-tool"), None, principal);
+            d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+            let mut binding = ContextToolBinding::new();
+            binding.grant(Capability::Facade("shell".into()));
+            broker.set_binding(context, binding).await.unwrap();
+            let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+            let replacement = serde_json::json!({"reviewed": true});
+            broker.hooks().write().await.post_call.entries.push(HookEntry {
+                id: HookId("replace-shell-result".into()), match_instance: Some(GlobPattern(ShellServer::INSTANCE.into())),
+                match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+                priority: 0, kaish_script_id: None,
+                action: HookAction::ShortCircuit(KernelToolResult { is_error: false,
+                    content: vec![ToolContent::Text("replacement".into())], structured: Some(replacement.clone()) }),
+            });
+            let params = KernelCallParams { instance: InstanceId::new(ShellServer::INSTANCE), tool: "shell".into(),
+                arguments: serde_json::json!({"command": "cat", "stdin": input, "foreground": foreground}) };
+            let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
+            let body = body_of(&result);
+            let settled = if foreground { body } else {
+                assert_eq!(body["status"], "running", "PostCall must not replace an admission receipt");
+                let id = body["operation_id"].as_str().unwrap();
+                let state = wait_for_operation(&d, context, id).await;
+                let captured = d.kernel().shell_operations().outcome(id, context).unwrap().unwrap();
+                let crate::runtime::command_outcome::CommandExecution::Completed(raw) = captured.execution
+                    else { panic!("lost captured execution") };
+                assert_eq!(raw.text_out(), input);
+                let jobs = d.kernel().context_job_manager(context);
+                let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+                assert_eq!(jobs.read_stdout(job.id).await.unwrap(), input.as_bytes(), "job streams retain raw observations");
+                assert_eq!(jobs.wait(job.id).await.unwrap().text_out(), "replacement", "final job result honors hooks");
+                let output = d.block_store().get_block_snapshot(context, &state.receipt.output_block_id).unwrap().unwrap();
+                assert_eq!(output.content, "replacement");
+                assert_eq!(output.output.unwrap().rich_json, Some(replacement.clone()));
+                state.envelope.unwrap().to_value()
+            };
+            assert_eq!(settled["stdout"], "replacement");
+            assert_eq!(settled["data"], replacement);
+            assert!(settled["exit_code"].is_null(), "replacement has no physical exit");
         }
     }
 

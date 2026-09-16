@@ -212,3 +212,11 @@ pub fn shell_result_to_envelope(
     });
     env
 }
+
+/// Keep the shell envelope structural so tool output limiting can shrink its
+/// text fields without cutting a serialized JSON document in half.
+pub fn shell_envelope_to_tool_result(env: kaijutsu_types::shell_envelope::ShellEnvelope) -> crate::mcp::KernelToolResult {
+    let value = env.to_value();
+    crate::mcp::KernelToolResult { is_error: env.is_error(),
+        content: vec![crate::mcp::ToolContent::Json(value.clone())], structured: Some(value) }
+}

@@ -65,10 +65,10 @@ pub async fn execute_kj(
         crate::mcp::ShellHookVerdict::Proceed => match pair {
             Some((command, output)) => command::run_into_blocks(&kaish, &code, context, &command, &output,
                 kernel, &call_ctx, CommandRunOptions { stdin: None,
-                    context_switch: CommandContextSwitch::Pinned, review_notices }).await?,
+                    context_switch: CommandContextSwitch::Pinned, review_notices, ..Default::default() }).await?,
             None => command::run_without_blocks(&kaish, &code, kernel, &call_ctx,
                 kaish_kernel::ExecuteOptions::default(), CommandRunOptions { stdin: None,
-                    context_switch: CommandContextSwitch::Pinned, review_notices }).await?,
+                    context_switch: CommandContextSwitch::Pinned, review_notices, ..Default::default() }).await?,
         },
         verdict => {
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);

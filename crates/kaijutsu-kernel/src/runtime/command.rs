@@ -27,15 +27,36 @@ pub enum CommandContextSwitch<'a> {
     Pinned,
 }
 
+/// Tool commands retain their original invocation and broker policy. Direct
+/// interactive commands use the normalized shell_write invocation instead.
+pub struct CommandHooks<'a> {
+    pub broker: &'a crate::mcp::Broker,
+    pub params: &'a crate::mcp::KernelCallParams,
+    pub max_result_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum ShellStateWriteBack { Persist, Discard }
+
+/// Live job streams are raw execution observations. Final job results and
+/// receipts carry the hook-processed outcome instead.
+#[derive(Clone, Copy)]
+pub enum CommandJobOutput { Settled, LiveExecution }
+
 pub struct CommandRunOptions<'a> {
     pub stdin: Option<String>,
+    pub hooks: Option<CommandHooks<'a>>,
+    pub state_writeback: ShellStateWriteBack,
+    pub job_output: CommandJobOutput,
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
+    pub job_ready: Option<tokio::sync::oneshot::Sender<()>>,
     pub context_switch: CommandContextSwitch<'a>,
     pub review_notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
 }
 
 impl Default for CommandRunOptions<'_> {
     fn default() -> Self {
-        Self { stdin: None, context_switch: CommandContextSwitch::Publish(None), review_notices: None }
+        Self { stdin: None, hooks: None, state_writeback: ShellStateWriteBack::Persist, job_output: CommandJobOutput::Settled, cancel: None, job_ready: None, context_switch: CommandContextSwitch::Publish(None), review_notices: None }
     }
 }
 
@@ -192,7 +213,7 @@ pub async fn run_into_blocks(
             let manager = kernel.context_job_manager(context_id);
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let job = manager.register(code.to_owned(), receiver).await;
-            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel = run.cancel.clone().unwrap_or_default();
             manager.set_cancel_token(job, cancel.clone()).await;
             options.cancel_token = Some(cancel);
             if let Err(error) = kernel.shell_operations().attach_job(&operation.receipt.operation_id, job, manager.clone()) {
@@ -210,20 +231,29 @@ pub async fn run_into_blocks(
         Err(error) => return Err(error),
     };
 
+    let streams = if matches!(run.job_output, CommandJobOutput::LiveExecution) {
+        let (manager, job, _) = tracked_job.as_ref().ok_or("live command output requires a tracked job")?;
+        Some(manager.streams(*job).await.ok_or("tracked command lost its output streams")?)
+    } else { None };
+    if let Some(ready) = run.job_ready { let _ = ready.send(()); }
     let started = std::time::Instant::now();
     let review_cancel = options.cancel_token.clone().unwrap_or_default();
-    let mut outcome = capture_command(kaish, code, options, kernel, context_id, run.context_switch).await;
+    let mut outcome = capture_command(kaish, code, options, kernel, context_id, run.context_switch, run.state_writeback, streams).await;
 
     let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
         Some((*command_block_id, *output_block_id)), outcome.clone(), review_cancel, run.review_notices);
-    apply_result_hooks(&mut outcome, code, kernel, call_ctx, Some(&review)).await;
+    apply_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, Some(&review)).await;
 
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
     let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
     if let Some((manager, job, sender)) = tracked_job {
         if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
         let result = outcome.exec_result();
-        manager.finalize_streams(job, &result).await;
+        let streams_result = match run.job_output {
+            CommandJobOutput::LiveExecution => CommandOutcome::new(outcome.execution.clone(), outcome.elapsed_ms).exec_result(),
+            CommandJobOutput::Settled => result.clone(),
+        };
+        manager.finalize_streams(job, &streams_result).await;
         let _ = sender.send(result);
     }
     settled.map(|()| outcome)
@@ -241,12 +271,13 @@ pub async fn run_without_blocks(
 ) -> Result<CommandOutcome, String> {
     let started = std::time::Instant::now();
     if let Some(stdin) = run.stdin { options = options.with_stdin(stdin); }
+    if let Some(cancel) = run.cancel { options.cancel_token = Some(cancel); }
     let cancel = options.cancel_token.clone().unwrap_or_default();
     let mut outcome = capture_command(kaish, code, options,
-        kernel, call_ctx.context_id, run.context_switch).await;
+        kernel, call_ctx.context_id, run.context_switch, run.state_writeback, None).await;
     let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
         None, outcome.clone(), cancel, run.review_notices);
-    apply_result_hooks(&mut outcome, code, kernel, call_ctx, Some(&review)).await;
+    apply_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, Some(&review)).await;
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
     review.settle(&outcome)?;
     Ok(outcome)
@@ -259,12 +290,17 @@ async fn capture_command(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
     context_switch: CommandContextSwitch<'_>,
+    state_writeback: ShellStateWriteBack,
+    streams: Option<kaish_kernel::scheduler::JobStreams>,
 ) -> CommandOutcome {
     // Persist only this invocation's cwd/export changes to the context.
     let state_before = snapshot_shell_state(kaish).await;
 
     let started = std::time::Instant::now();
-    let result = kaish.execute_with_options(code, options).await;
+    let result = match streams {
+        Some(streams) => Box::pin(execute_with_job_output(kaish, code, options, streams)).await,
+        None => kaish.execute_with_options(code, options).await,
+    };
     let mut outcome = CommandOutcome::from_execution(result, started.elapsed().as_millis() as u64);
 
     // A context switch saves the outgoing state itself. Its snapshots span
@@ -282,16 +318,50 @@ async fn capture_command(
                 kernel.block_flows().publish(crate::flows::BlockFlow::ContextSwitched { context_id: new_context_id });
             }
         }
-        None => {
+        None if matches!(state_writeback, ShellStateWriteBack::Persist) => {
             let state_after = snapshot_shell_state(kaish).await;
             if let Err(error) = persist_shell_state(kernel.kernel_db(), context_id, &state_before, &state_after) {
                 tracing::error!("shell state write failed: {error}");
                 outcome.settlement_error = Some(error);
             }
         }
+        None => {}
     }
 
     outcome
+}
+
+async fn execute_with_job_output(
+    kaish: &EmbeddedKaish, code: &str, options: kaish_kernel::ExecuteOptions,
+    streams: kaish_kernel::scheduler::JobStreams,
+) -> Result<kaish_kernel::interpreter::ExecResult, kaish_kernel::KernelError> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<kaish_kernel::interpreter::ExecResult>();
+    let mut on_output = move |result: &kaish_kernel::interpreter::ExecResult| {
+        sender.send(result.clone()).expect("command output receiver lives through execution");
+    };
+    let execute = async {
+        let result = kaish.execute_with_options_streaming(code, options, &mut on_output).await;
+        drop(on_output);
+        result
+    };
+    let write = async {
+        while let Some(result) = receiver.recv().await {
+            match result.out_bytes() {
+                Some(bytes) => streams.stdout.write(bytes).await,
+                None => streams.stdout.write(result.text_out().as_bytes()).await,
+            }
+            streams.stderr.write(result.err.as_bytes()).await;
+        }
+    };
+    let (result, ()) = tokio::join!(execute, write);
+    if let Ok(result) = &result {
+        match result.code {
+            124 => streams.stderr.write(b"background job timed out\n").await,
+            130 => streams.stderr.write(b"background job cancelled\n").await,
+            _ => {}
+        }
+    }
+    result
 }
 
 async fn apply_result_hooks(
@@ -299,17 +369,27 @@ async fn apply_result_hooks(
     code: &str,
     kernel: &Kernel,
     call_ctx: &crate::mcp::CallContext,
+    invocation: Option<CommandHooks<'_>>,
     review: Option<&dyn crate::mcp::broker::ResultReview>,
 ) {
+    let direct = crate::mcp::Broker::shell_write_hook_params(code);
+    let (broker, params) = invocation.as_ref().map_or((kernel.broker().as_ref(), &direct), |hook| (hook.broker, hook.params));
     let verdict = match &outcome.execution {
-        CommandExecution::Completed(result) => kernel.broker().shell_post_call_hooks(
-            code, call_ctx, &exec_result_to_hook_tool_result(result), review).await,
-        CommandExecution::Rejected(error) | CommandExecution::Fault(error) => kernel.broker().shell_on_error_hooks(
-            code, call_ctx, &crate::mcp::McpError::Protocol(error.clone()), review).await,
+        CommandExecution::Completed(result) => {
+            let result = if let Some(hook) = &invocation {
+                let mut result = super::command_result::shell_envelope_to_tool_result(outcome.envelope());
+                if crate::mcp::broker::estimate_result_size(&result) > hook.max_result_bytes {
+                    crate::mcp::broker::truncate_result_to_budget(&mut result, hook.max_result_bytes);
+                }
+                result
+            } else { exec_result_to_hook_tool_result(result) };
+            broker.result_post_call_hooks(params, call_ctx, &result, review).await
+        }
+        CommandExecution::Rejected(error) | CommandExecution::Fault(error) => broker.result_error_hooks(
+            params, call_ctx, &crate::mcp::McpError::Protocol(error.clone()), review).await,
         CommandExecution::NotRun => unreachable!("a completed invocation has an execution outcome"),
     };
     outcome.apply_hook(verdict);
-
 }
 
 #[cfg(test)]

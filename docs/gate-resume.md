@@ -42,8 +42,10 @@ result; its structured data exposes `result_review.captured` and
 `result_review.settled`. Every ask in a sequence retains the same invocation link.
 Streaming RPC retains review too; its execution ID stays active until the
 result is settled or interrupted, then subscribers receive the final output.
-Generic MCP calls still lack a review owner and fail escalation before creating
-an ask. See
+MCP shell commands use the same review owner. Async calls keep their operation
+receipt; foreground calls return typed Pending while execution remains retained.
+Their kernel worker survives caller disconnect. Other MCP tools still lack a
+review owner and fail escalation before creating an ask. See
 `docs/kaish-integration.md` for the caller inventory.
 
 ## Why blocking could never reach where Amy wants it
