@@ -20,7 +20,7 @@
 //! merge conflict surface, it just reshuffles it.
 //!
 //! If a specific chunk of code grows its own identity (the LLM agentic
-//! loop is the obvious example — see [`crate::llm_stream`]), extract it.
+//! loop is the obvious example — see [`kaijutsu_kernel::runtime::llm_stream`]), extract it.
 //! Don't decompose the file just to have smaller files.
 //!
 //! # Navigation
@@ -28,7 +28,7 @@
 //! Section banners use `// ========` and are grep-able with `rg '^// ='`.
 //! Top-level sections, in order:
 //!
-//! - **Server State** — [`ConnectionState`], [`ConversationCache`],
+//! - **Server State** — [`ConnectionState`],
 //!   [`SharedKernelState`], execution tracking helpers.
 //! - **Execute Output Dispatch** — background fan-out of `execute()`
 //!   output events to subscribers.
@@ -54,7 +54,7 @@
 //! - **Synthesis** — Rhai-driven keyword extraction.
 //!
 //! LLM streaming (`process_llm_stream` and its agentic loop) lives in
-//! [`crate::llm_stream`], not in this file.
+//! [`kaijutsu_kernel::runtime::llm_stream`], not in this file.
 
 #![allow(refining_impl_trait)]
 
@@ -68,18 +68,15 @@ use std::path::Path;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::RwLock as TokioRwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
-// tokio::sync::Mutex used inside ConversationCache for per-context locking
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 
 use kaijutsu_kernel::runtime::embedded_kaish::EmbeddedKaish;
-use crate::interrupt::ContextInterruptState;
 use crate::kaijutsu_capnp::*;
-use crate::llm_stream::spawn_llm_for_prompt;
+use kaijutsu_kernel::runtime::llm_stream::spawn_llm_for_prompt;
 
 use kaijutsu_types::{BlockKind, ContentType, Role, Status, TaskStatus};
 // `derive_context_live_status` moved to kaijutsu-kernel (single source of
@@ -95,8 +92,6 @@ use kaijutsu_kernel::kernel_db::{
 use kaijutsu_kernel::{
     // FlowBus
     BlockFlow,
-    // Conversation session
-    ConversationMailbox,
     InvokeRequest,
     InvokeResponse,
     Kernel,
@@ -157,162 +152,6 @@ fn extract_rpc_trace(
 // ============================================================================
 // Server State
 // ============================================================================
-
-/// A context's turn lock and live conversation. Reset waits for the next
-/// lock acquisition; an active turn keeps its mailbox until it finishes.
-pub struct ConversationSession {
-    mailbox: tokio::sync::Mutex<ConversationMailbox>,
-    reset_pending: AtomicBool,
-}
-
-impl ConversationSession {
-    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ConversationMailbox> {
-        let mut mailbox = self.mailbox.lock().await;
-        if self.reset_pending.swap(false, Ordering::SeqCst) {
-            *mailbox = ConversationMailbox::new();
-        }
-        mailbox
-    }
-}
-
-/// Per-context turn ownership and cached conversations.
-///
-/// Lookup and eviction share one registry lock. An entry can leave the
-/// registry only when no caller holds it, so every active or waiting turn
-/// for a context uses the same mutex. Idle LRU eviction still causes cold
-/// hydration on next use; see `docs/conversation-session.md`.
-///
-/// Also owns the content-hash image cache used by the LLM stream.
-pub struct ConversationCache {
-    entries: parking_lot::Mutex<HashMap<ContextId, (Arc<ConversationSession>, std::time::Instant)>>,
-    max_contexts: usize,
-    image_cache: Arc<kaijutsu_kernel::llm::image_cache::ImageBase64Cache>,
-}
-
-impl ConversationCache {
-    /// Create a cache with the given idle conversation capacity.
-    /// Active sessions may temporarily exceed it.
-    pub fn new(max_contexts: usize) -> Self {
-        let max_images = max_contexts.saturating_mul(4).max(16);
-        Self {
-            entries: parking_lot::Mutex::new(HashMap::new()),
-            max_contexts,
-            image_cache: Arc::new(kaijutsu_kernel::llm::image_cache::ImageBase64Cache::new(
-                max_images,
-            )),
-        }
-    }
-
-    /// Borrow the per-hash image cache shared across contexts.
-    pub fn image_cache(&self) -> &kaijutsu_kernel::llm::image_cache::ImageBase64Cache {
-        &self.image_cache
-    }
-
-    /// Get the context's session. Hold its lock for the entire turn.
-    pub fn get_or_create(&self, ctx: ContextId) -> Arc<ConversationSession> {
-        let mut entries = self.entries.lock();
-        if let Some((session, accessed)) = entries.get_mut(&ctx) {
-            *accessed = std::time::Instant::now();
-            return session.clone();
-        }
-
-        if entries.len() >= self.max_contexts {
-            let oldest = entries.iter()
-                .filter(|(_, (session, _))| Arc::strong_count(session) == 1)
-                .min_by_key(|(_, (_, accessed))| *accessed)
-                .map(|(ctx, _)| *ctx);
-            if let Some(ctx) = oldest {
-                entries.remove(&ctx);
-            }
-        }
-
-        let session = Arc::new(ConversationSession {
-            mailbox: tokio::sync::Mutex::new(ConversationMailbox::new()),
-            reset_pending: AtomicBool::new(false),
-        });
-        entries.insert(ctx, (session.clone(), std::time::Instant::now()));
-        session
-    }
-
-    /// Make the next turn hydrate cold without replacing an active turn's
-    /// lock. Use after filling a previously hydrated block in place:
-    /// `ConversationMailbox::catch_up` only sees blocks it has not folded.
-    pub fn evict(&self, ctx: ContextId) {
-        let mut entries = self.entries.lock();
-        if let Some((session, _)) = entries.get(&ctx) {
-            if Arc::strong_count(session) == 1 {
-                entries.remove(&ctx);
-            } else {
-                session.reset_pending.store(true, Ordering::SeqCst);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod conversation_cache_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn reset_waits_for_the_active_turn_without_replacing_its_lock() {
-        use futures::FutureExt;
-
-        let cache = ConversationCache::new(4);
-        let ctx = ContextId::new();
-        let first = cache.get_or_create(ctx);
-        let mut active = first.lock().await;
-        active.catch_up(&[]);
-
-        cache.evict(ctx);
-        let second = cache.get_or_create(ctx);
-        assert!(Arc::ptr_eq(&first, &second), "reset must preserve turn exclusion");
-        assert!(second.lock().now_or_never().is_none(), "next turn must wait");
-        assert!(active.is_materialized(), "reset must not interrupt the active turn");
-        drop(active);
-
-        let mut next = second.lock().await;
-        assert!(!next.is_materialized(), "next turn must hydrate cold");
-        next.catch_up(&[]);
-        drop(next);
-        assert!(first.lock().await.is_materialized(), "reset is consumed once");
-    }
-
-    #[test]
-    fn simultaneous_first_lookups_share_one_turn_lock() {
-        let cache = ConversationCache::new(4);
-        let ctx = ContextId::new();
-        let barrier = std::sync::Barrier::new(16);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..16).map(|_| scope.spawn(|| {
-                barrier.wait();
-                cache.get_or_create(ctx)
-            })).collect();
-            let sessions: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            assert!(sessions.iter().all(|session| Arc::ptr_eq(&sessions[0], session)));
-        });
-    }
-
-    #[tokio::test]
-    async fn cache_pressure_preserves_active_turns_and_resets_idle_conversations() {
-        let cache = ConversationCache::new(1);
-        let ctx = ContextId::new();
-        let first = cache.get_or_create(ctx);
-        first.lock().await.catch_up(&[]);
-        let other_ctx = ContextId::new();
-        let other = cache.get_or_create(other_ctx);
-        other.lock().await.catch_up(&[]);
-        assert!(Arc::ptr_eq(&first, &cache.get_or_create(ctx)));
-        assert!(first.lock().await.is_materialized());
-        drop(other);
-        drop(first);
-
-        let third = cache.get_or_create(ContextId::new());
-        let cold = cache.get_or_create(other_ctx);
-        assert!(!cold.lock().await.is_materialized());
-        drop(third);
-    }
-
-}
 
 /// One live FlowBus block-event subscription in the per-(principal, instance)
 /// dedupe registry — see [`SharedKernelState::subscription_registry`].
@@ -397,27 +236,20 @@ fn register_subscription(
 /// Kernel state shared across all connections via Arc.
 /// Created once at server startup.
 // TODO: Move transport-independent turn ownership and drivers into the kernel
-// runtime. Conversation sessions, interrupts, and shutdown belong to the same
-// owner even when no connection exists. Keep session subscriptions in the server.
+// runtime. Conversation sessions and interrupts are kernel-owned; task placement
+// and shutdown still need migration. Keep session subscriptions in the server.
 // See docs/issues.md, "Turn execution and shell settlement".
 pub struct SharedKernelState {
     pub id: KernelId,
     pub name: String,
     pub kernel: Arc<Kernel>,
     pub documents: SharedBlockStore,
-    pub conversation_cache: Arc<ConversationCache>,
     /// SQLite persistence for context metadata, edges, presets, workspaces.
     /// Arc<parking_lot::Mutex> (not tokio) — shared with KjDispatcher, all ops sync and sub-ms.
     pub kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     /// Semantic vector index for context search/clustering.
     /// None if embedding model not configured or unavailable.
     pub semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
-    /// Per-context interrupt state. Created fresh at the start of each
-    /// `process_llm_stream` call; looked up by `interruptContext` RPC.
-    pub context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
-    /// Monotonically increasing generation counter for interrupt state.
-    /// Prevents race where stream A's cleanup removes stream B's interrupt.
-    pub interrupt_generation: AtomicU64,
     /// kj command dispatcher — shared across all connections.
     pub kj_dispatcher: Arc<kaijutsu_kernel::KjDispatcher>,
     /// Per-session current-context tracking for the `context` shell command.
@@ -488,47 +320,6 @@ impl Drop for SharedKernelState {
             }
             Ok(_) => {}
             Err(e) => log::warn!("shutdown wal_checkpoint failed: {e}"),
-        }
-    }
-}
-
-impl SharedKernelState {
-    /// Create a fresh `ContextInterruptState` for a new prompt, replacing any previous entry.
-    ///
-    /// `CancellationToken` cannot be reset — so each prompt gets a new one.
-    /// Returns the interrupt state and its generation number. The generation
-    /// must be passed to `remove_interrupt` to prevent the race where stream A's
-    /// cleanup removes stream B's newer interrupt.
-    pub async fn create_interrupt(
-        &self,
-        context_id: ContextId,
-    ) -> (Arc<ContextInterruptState>, u64) {
-        let generation = self.interrupt_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let state = ContextInterruptState::new(generation);
-        let mut map = self.context_interrupts.write().await;
-        map.insert(context_id, state.clone());
-        (state, generation)
-    }
-
-    /// Look up an existing interrupt state for a context.
-    ///
-    /// Returns `None` if the context has no active interrupt (nothing running).
-    pub async fn get_interrupt(&self, context_id: ContextId) -> Option<Arc<ContextInterruptState>> {
-        let map = self.context_interrupts.read().await;
-        map.get(&context_id).cloned()
-    }
-
-    /// Remove the interrupt state for a context (called when stream finishes).
-    ///
-    /// Only removes the entry if `generation` matches the current state's
-    /// generation, preventing a stale stream from removing a newer stream's
-    /// interrupt state.
-    pub async fn remove_interrupt(&self, context_id: ContextId, generation: u64) {
-        let mut map = self.context_interrupts.write().await;
-        if let Some(state) = map.get(&context_id)
-            && state.generation == generation
-        {
-            map.remove(&context_id);
         }
     }
 }
@@ -635,7 +426,7 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     ),
                 };
                 match spawn_llm_for_prompt(
-                    kernel,
+                    &kernel.kernel,
                     context_id,
                     model.as_deref(),
                     &after_block_id,
@@ -924,8 +715,8 @@ fn settle_pair_error(
     }
     // The pair may already be cached from an earlier turn as `Waiting`;
     // this settles it in place, so the next turn must hydrate cold to see
-    // it (see `ConversationCache::evict`).
-    kernel.conversation_cache.evict(context_id);
+    // it (see `kaijutsu_kernel::runtime::turn_state::ConversationCache::evict`).
+    kernel.kernel.turns().conversations().evict(context_id);
 }
 
 /// Tell a model whose own tool pair was settled without execution. A turn's
@@ -1228,7 +1019,7 @@ async fn act_on_executable_answer(
         CommandRunOptions { stdin: ask.stdin.clone(), ..Default::default() },
     )
     .await {
-        kernel.conversation_cache.evict(context_id);
+        kernel.kernel.turns().conversations().evict(context_id);
         return ExecAction::Tell(format!("Approved command settlement failed: {error}. Inspect operation output {} before retrying.", output_block_id.to_key()));
     }
 
@@ -1236,7 +1027,7 @@ async fn act_on_executable_answer(
     // already `Waiting` in a cached mailbox, that edit is invisible to
     // `catch_up`; evict so the next turn hydrates cold and reads the real
     // output instead of the stale "waiting" text.
-    kernel.conversation_cache.evict(context_id);
+    kernel.kernel.turns().conversations().evict(context_id);
 
     if tell {
         // Either the output blocks reach the model as new blocks in its
@@ -3473,11 +3264,8 @@ pub async fn create_shared_kernel(
         name: id_str,
         kernel: kernel_arc,
         documents,
-        conversation_cache: Arc::new(ConversationCache::new(64)),
         kernel_db: kernel_db_arc,
         semantic_index,
-        context_interrupts: Arc::new(TokioRwLock::new(HashMap::new())),
-        interrupt_generation: AtomicU64::new(0),
         kj_dispatcher,
         session_contexts,
         subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -4958,7 +4746,7 @@ impl kernel::Server for KernelImpl {
                 // consumer now, so a `subscribeTurnEvents` client still hears
                 // this turn finish.
                 spawn_llm_for_prompt(
-                    &kernel,
+                    &kernel.kernel,
                     context_id,
                     model.as_deref(),
                     &user_block_id,
@@ -4967,7 +4755,7 @@ impl kernel::Server for KernelImpl {
                     TurnOrigin::Interactive,
                     None,
                 )
-                .await?;
+                .await.map_err(capnp::Error::failed)?;
 
                 // Return immediately with prompt_id - streaming happens in background
                 results.get().set_prompt_id(&prompt_id);
@@ -7381,7 +7169,7 @@ impl kernel::Server for KernelImpl {
                     // `subscribeTurnEvents` client — this is the turn an ACP
                     // frontend is waiting on.
                     spawn_llm_for_prompt(
-                        &kernel,
+                        &kernel.kernel,
                         context_id,
                         None,
                         &user_block_id,
@@ -7390,7 +7178,7 @@ impl kernel::Server for KernelImpl {
                         TurnOrigin::Interactive,
                         None,
                     )
-                    .await?;
+                    .await.map_err(capnp::Error::failed)?;
 
                     let mut b = results.get().init_outcome().init_ok();
                     set_block_id_builder(&mut b, &user_block_id);
@@ -7840,7 +7628,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            let success = if let Some(interrupt) = kernel.get_interrupt(context_id).await {
+            let success = if let Some(interrupt) = kernel.kernel.turns().get_interrupt(context_id).await {
                 if immediate {
                     interrupt.hard();
                 } else {
@@ -9385,10 +9173,6 @@ fn set_peer_info(builder: &mut peer_info::Builder, info: &PeerInfo) {
 // Shell Execution Dispatch
 // ============================================================================
 //
-// LLM streaming + agentic loop moved to `crate::llm_stream`
-// (build_tool_definitions, spawn_llm_for_prompt, tool_kind_for_category,
-// process_llm_stream all live there).
-
 /// Create kaish, insert ToolCall + ToolResult blocks, spawn execution.
 ///
 /// Shared by `shell_execute` (direct RPC) and `submit_input` (shell mode).

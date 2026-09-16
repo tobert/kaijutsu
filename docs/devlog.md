@@ -1662,6 +1662,13 @@ panicked; the output writer now drains that queue before unwinding. The worker
 stops admission on task failure, cancels remaining work, and returns a failed
 shutdown result. The kaish thread helper now carries that result through its join.
 
+The next ownership move puts the model loop, turn identity resolution,
+conversation sessions, and interrupts in kernel runtime modules. Interactive
+and headless callers now use `Arc<Kernel>`; Cap'n Proto error translation stays
+in RPC. Existing model-loop and conversation-lock tests move with their owner.
+Task placement remains on the caller's LocalSet until admission and shutdown
+can move with terminal-event cleanup.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

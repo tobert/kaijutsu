@@ -29,7 +29,7 @@ resume that has to reopen anything.
 
 There is exactly one, and it is already load-bearing.
 
-`spawn_llm_for_prompt` (`kaijutsu-server/src/llm_stream.rs`) calls
+`spawn_llm_for_prompt` (`kaijutsu-kernel/src/runtime/llm_stream.rs`) calls
 `mark_turn_begun` on its own stack before spawning the stream task. Its
 own comment records why that covers everything: the autonomous path is
 already marked by the time the function runs, so the mark there is a

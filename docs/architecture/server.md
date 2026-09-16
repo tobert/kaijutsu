@@ -1,12 +1,12 @@
 # The server
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-server` — SSH
-transport, the Cap'n Proto RPC surface, LLM streaming, the beat scheduler, auth.
+transport, the Cap'n Proto RPC surface, turn submission, the beat scheduler, auth.
 Code is truth: every pointer below names a symbol — `grep` it.*
 
 `kaijutsu-server` is the only process that holds a live `Kernel`. It authenticates
-SSH clients, multiplexes many RPC sessions onto the one shared kernel, streams LLM
-tokens into blocks, drives the musician beat loop, and persists SSH identity.
+SSH clients, multiplexes RPC sessions onto the shared kernel, submits model turns,
+drives the musician beat loop, and persists SSH identity.
 
 ---
 
@@ -90,18 +90,16 @@ KernelDb.
 
 ---
 
-## LLM streaming (`src/llm_stream.rs`)
+## Model turns (`kaijutsu-kernel/src/runtime/llm_stream.rs`)
 
-`spawn_llm_for_prompt` (`:274`): resolve provider/model (explicit param >
-per-context > kernel default), build tool defs via the broker, assemble the
-system prompt (static base + rc sections + situational addendum), create a
-fresh `ContextInterruptState`, and `spawn_local` `process_llm_stream`. There is
-no automatic compaction — a block-count-triggered summarize-and-mark-compacted
-pass would silently melt history; instead `process_llm_stream` records usage
-from every `StreamEvent::Done` into a token-usage gauge the user reads
-(`kj context info`).
+The kernel owns the stream loop, conversation sessions, and interrupt state.
+Server RPC and the headless turn driver call `spawn_llm_for_prompt`. It resolves
+provider/model (explicit parameter > context override > cast slot > registry
+default), builds tools through the broker, assembles instructions and runtime
+facts, and starts `process_llm_stream` on the caller's LocalSet. Task placement
+and shutdown still need migration; see `docs/kaish-integration.md`.
 
-`process_llm_stream` (`:1360`) is the agentic loop: acquire the per-context
+`process_llm_stream` is the agentic loop: acquire the per-context
 conversation lock, read hydration policy (full vs windowed), hydrate the mailbox
 (`catch_up` or `rehydrate_windowed`), resolve image blocks from CAS, then loop
 (consent-capped: `COLLABORATIVE_MAX_ITERATIONS` = 50 / `AUTONOMOUS_MAX_ITERATIONS`
@@ -111,10 +109,8 @@ a two-layer timeout (per-chunk idle + total wall-clock). Tokens write directly
 to the block store; clients observe via `BlockFlow`. Tool calls run
 concurrently via `dispatch_tool_via_broker_with_cancel`, racing the broker's
 own per-instance `call_timeout` (live-configurable, `kj policy set`) against
-the interrupt token — there is no second, hardcoded timeout ceiling; one used
-to clamp every policy timeout to 120s and was removed as redundant with the
-cancel-token race. On completion it publishes
-`TurnFlow::Completed { output_block_id }` for autonomous turns.
+the interrupt token. On completion it publishes
+`TurnFlow::Completed { output_block_id }` for interactive and autonomous turns.
 
 ---
 
@@ -144,7 +140,7 @@ before the cell is skipped and the failure surfaces as an error block.
 
 ## Interrupt + auth
 
-`ContextInterruptState` (`src/interrupt.rs:26`): per-context `stop_after_turn`
+`ContextInterruptState` (`kaijutsu-kernel/src/runtime/interrupt.rs`): per-context `stop_after_turn`
 (soft, checked before each iteration), `cancel: CancellationToken` (hard, selects
 against the stream loop), and a `generation` counter so stream-A cleanup can't
 clobber stream-B. Created fresh per prompt.

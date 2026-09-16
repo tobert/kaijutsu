@@ -105,9 +105,11 @@ It owns or wires together:
 | Timelines | `DashMap<ContextId, SharedTimeline>` | Per-context hyoushigi beat engines (armed musician contexts only). |
 | Persistence | `KernelDb` (SQLite) | ~20 tables: contexts, edges, documents, oplog+snapshots, bindings, hooks. |
 
-The kernel **does not run an LLM turn itself** — that is the server's job
-(`llm_stream.rs`). The kernel supplies everything a turn needs: tool dispatch,
-block storage, event broadcast, context lookup, hydration, and drift staging.
+The kernel owns the model turn loop (`runtime/llm_stream.rs`), conversation
+sessions, and interrupts (`runtime/turn_state.rs`). Server RPC and headless
+turn drivers call the same runtime entry point. The task still runs on the
+caller's LocalSet; shared task placement and shutdown are the next migration
+step. See `docs/kaish-integration.md`.
 
 **kaish**, the shell, runs embedded inside the kernel. `EmbeddedKaish`
 (`kaijutsu-kernel/src/runtime/embedded_kaish.rs:59`) runs the kaish interpreter

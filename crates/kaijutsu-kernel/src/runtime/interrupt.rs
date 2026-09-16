@@ -1,7 +1,7 @@
 //! Per-context interrupt state for cancelling LLM streams and shell jobs.
 //!
 //! `ContextInterruptState` is created fresh at the start of each prompt and
-//! stored in `SharedKernelState.context_interrupts`. The `interruptContext`
+//! stored in `TurnState`. The `interruptContext`
 //! RPC method uses it to signal soft or hard interrupts.
 //!
 //! # Soft vs Hard
@@ -29,7 +29,7 @@ pub struct ContextInterruptState {
     /// Hard interrupt: abort the current LLM stream immediately.
     pub cancel: CancellationToken,
     /// Monotonically increasing generation counter. Assigned by
-    /// `SharedKernelState::create_interrupt` from a per-map atomic.
+    /// `TurnState::create_interrupt` from a per-map atomic.
     pub generation: u64,
 }
 

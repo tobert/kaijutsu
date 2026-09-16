@@ -9,14 +9,11 @@ pub mod config_mounts;
 pub mod constants;
 pub mod context_feed;
 pub mod init;
-pub mod interrupt;
-pub mod llm_stream;
 pub mod migrate_keyring;
 pub mod rpc;
 pub mod sftp;
 pub mod share;
 pub mod ssh;
-mod turn_identity;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {

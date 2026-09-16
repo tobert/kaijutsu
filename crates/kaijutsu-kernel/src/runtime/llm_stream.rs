@@ -1,14 +1,10 @@
-//! LLM streaming + agentic tool-call loop.
+//! Model streaming and the tool-call loop.
 //!
-//! This module owns the background task that talks to a `Provider`, parses
-//! `StreamEvent`s into kernel blocks, dispatches tool calls, and re-prompts until
-//! the model stops. Extracted from `rpc.rs` so the stream semantics sit in one
-//! file rather than interleaved with the RPC dispatch surface.
-//!
-//! Entry point: [`spawn_llm_for_prompt`], called by the `prompt` and
-//! `submit_input` RPC handlers after they have inserted the user's message
-//! block. It resolves the provider/model, builds the effective tool filter,
-//! and spawns [`process_llm_stream`] as a local task.
+//! Resolve a turn's identity, provider, tools, and instructions, then stream
+//! provider events into blocks and dispatch tool calls through the broker.
+//! Interactive and headless callers share `spawn_llm_for_prompt`.
+//! Conversation locks and interrupts belong to the kernel's `TurnState`;
+//! the caller's LocalSet owns the spawned task. See `docs/kaish-integration.md`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,32 +13,23 @@ use tokio::sync::RwLock as TokioRwLock;
 
 use kaijutsu_types::shell_envelope::ShellEnvelope;
 use kaijutsu_types::{BlockKind, ContentType, Role, Status, summarize_thinking};
-use kaijutsu_kernel::flows::{TurnFlow, TurnOrigin, TurnStopReason};
-use kaijutsu_kernel::kernel_db::KernelDb;
-use kaijutsu_kernel::llm::stream::{
+use crate::flows::{TurnFlow, TurnOrigin, TurnStopReason};
+use crate::kernel_db::KernelDb;
+use crate::llm::stream::{
     BuildOpts, CacheTarget, InlineToolResult, StreamEvent, apply_slot_tunables,
     longest_cache_ttl_secs,
 };
-use kaijutsu_kernel::llm::SlotTunables;
-use kaijutsu_kernel::llm::{ContentBlock, LlmError, ToolDefinition};
-use kaijutsu_kernel::mcp::{McpError, PolicyError};
-use kaijutsu_kernel::{Kernel, LlmMessage, Provider, SharedBlockStore};
+use crate::llm::SlotTunables;
+use crate::llm::{ContentBlock, LlmError, ToolDefinition};
+use crate::mcp::{McpError, PolicyError};
+use crate::{Kernel, LlmMessage, Provider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
 use kaijutsu_types::{ConsentMode, ContextId, PrincipalId};
 
-use crate::interrupt::ContextInterruptState;
-use crate::rpc::{ConversationCache, SharedKernelState};
+use crate::runtime::interrupt::ContextInterruptState;
+use super::turn_state::ConversationCache;
 
-/// Build tool definitions visible to the LLM in this context.
-///
-/// Phase 5 M4: `ToolFilter` retired (D-54). Per-context tool curation is
-/// expressed by the `ContextToolBinding`'s `allowed_instances` and by
-/// `McpHookPhase::ListTools` hooks (D-56) — both applied inside
-/// `Broker::list_visible_tools` via `list_tool_defs_via_broker`. This
-/// function now pass-throughs the broker output unmodified.
-/// Surface a configuration / pre-stream failure as a visible error block so the
-/// user gets feedback in the conversation, not just a capnp error returned to
-/// the (typically silent) RPC client. Anchored after the user's message block.
+/// Record a startup failure after the prompt so readers see why no turn ran.
 fn insert_pre_stream_error_block(
     documents: &SharedBlockStore,
     context_id: ContextId,
@@ -65,12 +52,12 @@ fn insert_pre_stream_error_block(
         summary,
         Some(PrincipalId::system()),
     ) {
-        log::warn!("Failed to insert pre-stream error block: {}", e);
+        tracing::warn!("Failed to insert pre-stream error block: {}", e);
     }
 }
 
 /// Fraction of a model's context window at which the pre-flight size
-/// estimate (`kaijutsu_kernel::estimate_tokens`) triggers a visible warning.
+/// estimate (`crate::estimate_tokens`) triggers a visible warning.
 /// 0.9, not 1.0: the estimator's bytes/4 conversion undercounts code-heavy
 /// text (real BPE tokenizers run denser on structured content than plain
 /// prose), and a non-blocking warning is most useful *before* the provider's
@@ -111,7 +98,7 @@ fn warn_if_near_context_window(
         // fabricated denominator just to produce a number.
         return;
     };
-    let estimate = kaijutsu_kernel::estimate_tokens(messages);
+    let estimate = crate::estimate_tokens(messages);
     let threshold = (window as f64 * CONTEXT_WARNING_THRESHOLD) as u64;
     if estimate < threshold {
         return;
@@ -130,11 +117,11 @@ fn warn_if_near_context_window(
          is wrong, re-pin it with \
          `kj backend model set {provider_name} {model_name} --context-window <N>`."
     );
-    log::warn!("{detail}");
+    tracing::warn!("{detail}");
 
     // Telemetry-only insert: unlike the loud-failure paths elsewhere in this
     // file, a failed Trace insert here must never fail or stall the turn —
-    // the `log::warn!` above already surfaced the warning operator-side, and
+    // the `tracing::warn!` above already surfaced the warning operator-side, and
     // this is a WARN-AND-SEND path by design, exempt from the fail-loudly-
     // and-stop pattern that governs the hydration/provider-resolution/tool
     // failures above. The in-conversation copy is best-effort.
@@ -149,7 +136,7 @@ fn warn_if_near_context_window(
         kaijutsu_types::ContentType::Plain,
         Some(PrincipalId::system()),
     ) {
-        log::warn!("Failed to insert context-size warning Trace block: {e}");
+        tracing::warn!("Failed to insert context-size warning Trace block: {e}");
     }
 }
 
@@ -172,7 +159,7 @@ fn hydrate_messages(
     documents: &SharedBlockStore,
     context_id: ContextId,
     after_block_id: &kaijutsu_types::BlockId,
-    mailbox: &mut kaijutsu_kernel::ConversationMailbox,
+    mailbox: &mut crate::ConversationMailbox,
     // The hydration window policy `(marker, window)`, or `None` to hydrate the
     // whole history (the default; every non-musician context). When set, the
     // turn hydrates only `[0, marker] ∪ last-window` — the cost guard for
@@ -193,8 +180,8 @@ fn handle_hydration_outcome(
     documents: &SharedBlockStore,
     context_id: ContextId,
     after_block_id: &kaijutsu_types::BlockId,
-    read: kaijutsu_kernel::BlockStoreResult<Vec<kaijutsu_types::BlockSnapshot>>,
-    mailbox: &mut kaijutsu_kernel::ConversationMailbox,
+    read: crate::BlockStoreResult<Vec<kaijutsu_types::BlockSnapshot>>,
+    mailbox: &mut crate::ConversationMailbox,
     policy: Option<(kaijutsu_types::BlockId, u32)>,
 ) -> Result<Vec<LlmMessage>, ()> {
     match read {
@@ -208,7 +195,7 @@ fn handle_hydration_outcome(
                 Some((marker, window)) => {
                     mailbox.rehydrate_windowed(&blocks, marker, window as usize);
                     let snapshot = mailbox.snapshot();
-                    log::debug!(
+                    tracing::debug!(
                         "Mailbox windowed-rehydrated (marker {marker}, window {window}): \
                          {} blocks in log → {} messages on the wire for context {context_id}",
                         blocks.len(),
@@ -219,7 +206,7 @@ fn handle_hydration_outcome(
                 None => {
                     let new_blocks = mailbox.catch_up(&blocks);
                     let snapshot = mailbox.snapshot();
-                    log::debug!(
+                    tracing::debug!(
                         "Mailbox caught up: +{} new blocks, {} messages on the wire for context {}",
                         new_blocks,
                         snapshot.len(),
@@ -234,7 +221,7 @@ fn handle_hydration_outcome(
             // appended user message — an empty/stale session means the model
             // sees no history and responds out of nowhere. Surface the failure
             // and fail the turn.
-            log::error!(
+            tracing::error!(
                 "Hydration failed for context {}: {} — failing the turn loudly",
                 context_id,
                 e
@@ -253,7 +240,7 @@ async fn build_tool_definitions(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
     principal_id: PrincipalId,
-) -> Result<Vec<ToolDefinition>, kaijutsu_kernel::mcp::McpError> {
+) -> Result<Vec<ToolDefinition>, crate::mcp::McpError> {
     Ok(kernel
         .list_tool_defs_via_broker(context_id, principal_id)
         .await?
@@ -266,17 +253,17 @@ async fn build_tool_definitions(
         .collect())
 }
 
-/// Resolve LLM provider and spawn streaming for a user prompt.
+/// Resolve a turn and spawn its stream on the caller's LocalSet.
 ///
-/// Shared by `prompt` and `submit_input` handlers. Creates the assistant response
-/// flow (thinking -> text -> tool calls -> results) as background blocks via
-/// `process_llm_stream`.
-pub(crate) async fn spawn_llm_for_prompt(
-    kernel: &SharedKernelState,
+/// Interactive submissions and headless requests share identity checks,
+/// provider resolution, tool selection, and conversation state. Startup errors
+/// return to the caller; the running task publishes a terminal turn event.
+pub async fn spawn_llm_for_prompt(
+    kernel: &Arc<Kernel>,
     context_id: ContextId,
     model: Option<&str>,
     after_block_id: &kaijutsu_types::BlockId,
-    tool_ctx: kaijutsu_kernel::ExecContext,
+    tool_ctx: crate::ExecContext,
     user_principal_id: PrincipalId,
     // Who asked for this turn. Rides onto the `TurnFlow` outcome the stream
     // publishes at its end, so the one consumer that must ignore human turns
@@ -288,44 +275,43 @@ pub(crate) async fn spawn_llm_for_prompt(
     // An answered gate preserves the epoch that started the turn which raised
     // it. Every other request is an explicit drive and opens a fresh window.
     continuation_epoch: Option<i64>,
-) -> Result<(), capnp::Error> {
-    let documents = kernel.documents.clone();
-    let kernel_arc = kernel.kernel.clone();
-    let kernel_db = kernel.kernel_db.clone();
-    let conversation_cache = kernel.conversation_cache.clone();
+) -> Result<(), String> {
+    let documents = kernel.blocks().clone();
+    let kernel_arc = kernel.clone();
+    let kernel_db = kernel.kernel_db().clone();
+    let conversation_cache = kernel.turns().conversations().clone();
 
     let (actor, director) = {
         let db = kernel_db.lock();
         let row = db.get_context(context_id)
-            .map_err(|e| capnp::Error::failed(format!("Could not read performer assignment: {e}")))?
-            .ok_or_else(|| capnp::Error::failed(format!("No such context: {context_id}")))?;
+            .map_err(|e| format!("Could not read performer assignment: {e}"))?
+            .ok_or_else(|| format!("No such context: {context_id}"))?;
         (row.played_by, row.director_id)
     };
     let review = kernel_arc
         .resolve_context_review(context_id)
-        .await
-        .map_err(capnp::Error::failed)?;
+        .await?;
     let identity = {
         let db = kernel_db.lock();
-        crate::turn_identity::resolve(&db, actor, review.reviewer.principal_id)
+        super::turn_identity::resolve(&db, actor, review.reviewer.principal_id)
     };
     let identity = match identity {
         Ok(identity) => identity,
         Err(detail) => {
             insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
-            return Err(capnp::Error::failed(detail));
+            return Err(detail);
         }
     };
     let performer = {
         let db = kernel_db.lock();
-        let character = |principal_id: PrincipalId| -> Result<kaijutsu_kernel::CharacterIdentity, capnp::Error> {
+        let character = |principal_id: PrincipalId| -> Result<crate::CharacterIdentity, String> {
             let sheet = db.get_character(principal_id)
-                .map_err(|e| capnp::Error::failed(format!("Could not read assigned character: {e}")))?
-                .ok_or_else(|| capnp::Error::failed(format!("Assigned character {principal_id} has no sheet")))?;
+                .map_err(|e| format!("Could not read assigned character: {e}"))?
+                .ok_or_else(|| format!("Assigned character {principal_id} has no sheet"))?;
             if sheet.retired_at.is_some() {
-                return Err(capnp::Error::failed(format!("Assigned character {} is retired", sheet.name)));
+                return Err(format!("Assigned character {} is retired", sheet.name));
             }
-            Ok(kaijutsu_kernel::CharacterIdentity { principal_id, name: sheet.name })
+            Ok(crate::CharacterIdentity { principal_id, name: sheet.name })
         };
         character(identity.actor)?
     };
@@ -354,10 +340,10 @@ pub(crate) async fn spawn_llm_for_prompt(
     let quiesced = match quiesce {
         Ok(q) => q,
         Err(e) => {
-            log::error!("quiesce flag read failed: {e}; refusing the turn");
-            return Err(capnp::Error::failed(format!(
+            tracing::error!("quiesce flag read failed: {e}; refusing the turn");
+            return Err(format!(
                 "cannot read the quiesce flag, so no turn starts: {e}"
-            )));
+            ));
         }
     };
     if let Some(state) = quiesced {
@@ -385,16 +371,15 @@ pub(crate) async fn spawn_llm_for_prompt(
                 Some(PrincipalId::system()),
             )
             .and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
-        return Err(capnp::Error::failed(
-            "the kernel is quiesced — no turn starts; `kj system resume` clears it".into(),
-        ));
+        return Err(
+            "the kernel is quiesced — no turn starts; `kj system resume` clears it".into());
     }
 
     // Create a fresh interrupt state for this prompt (replaces any previous entry).
     // The generation counter prevents the race where stream A's cleanup removes
     // stream B's interrupt state.
-    let (interrupt, interrupt_generation) = kernel.create_interrupt(context_id).await;
-    let context_interrupts = kernel.context_interrupts.clone();
+    let (interrupt, interrupt_generation) = kernel.turns().create_interrupt(context_id).await;
+    let context_interrupts = kernel.turns().context_interrupts.clone();
 
     // Read per-context model from DriftRouter (quick read, release lock).
     // Capture label/state alongside for the situational system-prompt addendum.
@@ -418,9 +403,8 @@ pub(crate) async fn spawn_llm_for_prompt(
                     Some(PrincipalId::system()),
                 )
                 .and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
-            return Err(capnp::Error::failed(
-                "context is in staging mode — commit to enable LLM prompts".into(),
-            ));
+            return Err(
+                "context is in staging mode — commit to enable LLM prompts".into());
         }
         match drift.get(context_id) {
             Some(h) => (
@@ -438,7 +422,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     // Priority: explicit param > per-context (DriftRouter) > cast slot on
     // this context's context_type > registry default. The context_type and
     // cast label are read once per turn here; the pure resolution itself
-    // lives in `kaijutsu_kernel::model_resolution` where it's unit-tested.
+    // lives in `crate::model_resolution` where it's unit-tested.
     let (context_type, cast_label) = {
         let db = kernel_db.lock();
         match db.get_context(context_id) {
@@ -450,14 +434,14 @@ pub(crate) async fn spawn_llm_for_prompt(
                     // default — resolution handles None; log it so the
                     // fallthrough is observable.
                     Ok(None) => {
-                        log::warn!(
+                        tracing::warn!(
                             "context {context_id} carries cast_id {id} with no cast row; \
                              falling through to default resolution"
                         );
                         None
                     }
                     Err(e) => {
-                        log::warn!("cast lookup for context {context_id} failed: {e}");
+                        tracing::warn!("cast lookup for context {context_id} failed: {e}");
                         None
                     }
                 });
@@ -468,7 +452,7 @@ pub(crate) async fn spawn_llm_for_prompt(
             // matches no slot role, which is the honest answer.
             Ok(None) => (String::new(), None),
             Err(e) => {
-                log::warn!("context row lookup for {context_id} failed: {e}");
+                tracing::warn!("context row lookup for {context_id} failed: {e}");
                 (String::new(), None)
             }
         }
@@ -481,7 +465,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         // "the context row's own model" as far as resolution is concerned.
         let effective_model = model.or(ctx_model.as_deref());
 
-        match kaijutsu_kernel::resolve_context_model(
+        match crate::resolve_context_model(
             &context_type,
             ctx_provider_name.as_deref(),
             effective_model,
@@ -490,7 +474,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         ) {
             Some(resolved) => match registry.get(&resolved.backend) {
                 Some(p) => {
-                    log::debug!(
+                    tracing::debug!(
                         "model resolution for {context_id}: {}/{} via {:?}",
                         resolved.backend,
                         resolved.model,
@@ -502,10 +486,8 @@ pub(crate) async fn spawn_llm_for_prompt(
                     );
                     Ok((p, resolved.model, max_tokens, resolved.tunables, timeouts))
                 }
-                // The backend name resolved but nothing registered under it
-                // (missing key, failed init). The old code silently fell
-                // back to the default provider while keeping the pinned
-                // model — a wrong-model-to-wrong-provider shape. Loud now.
+                // A resolved backend must be registered; falling back would
+                // send the pinned model name to a different provider.
                 None => Err(format!(
                     "backend '{}' for this context is not registered (missing key? \
                      see `kj backend list` / `kj backend show {}`)",
@@ -518,27 +500,24 @@ pub(crate) async fn spawn_llm_for_prompt(
     let (provider, model_name, max_output_tokens, slot_tunables, stream_timeouts) = match provider_resolution {
         Ok(v) => v,
         Err(detail) => {
-            log::error!("LLM resolution failed for context {context_id}: {detail}");
+            tracing::error!("LLM resolution failed for context {context_id}: {detail}");
             insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
-            return Err(capnp::Error::failed(detail));
+            return Err(detail);
         }
     };
 
-    // Build tool definitions via the broker (binding + ListTools filter do
-    // the curation — D-54 retired the legacy post-filter). A broker failure
-    // here used to silently collapse to an empty tool list — the model would
-    // run with no tools and no indication why. Fail the turn loudly instead,
-    // same as the provider-resolution and hydration failures above.
+    // The broker applies bindings and ListTools hooks. Refuse the turn on
+    // failure so a configuration error cannot silently remove its tools.
     let tools = match build_tool_definitions(&kernel_arc, context_id, user_principal_id).await {
         Ok(tools) => tools,
         Err(e) => {
-            log::error!("Failed to build tool definitions for context {context_id}: {e}");
+            tracing::error!("Failed to build tool definitions for context {context_id}: {e}");
             let detail = format!(
                 "Could not resolve this context's tool bindings: {e}. \
                  The turn was stopped instead of running the model with no tools."
             );
             insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
-            return Err(capnp::Error::failed(detail));
+            return Err(detail);
         }
     };
 
@@ -549,7 +528,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     // rc sections come from `(Role::System, BlockKind::Text)` blocks in the
     // conversation — typically dropped in by rc-on-create/-on-fork. They
     // land before the `<situation>` addendum.
-    let situational = kaijutsu_kernel::SituationalContext {
+    let situational = crate::SituationalContext {
         context_id: Some(context_id),
         context_label: ctx_label,
         context_state: ctx_state,
@@ -559,20 +538,20 @@ pub(crate) async fn spawn_llm_for_prompt(
         reviewer: Some(reviewer.clone()),
         tool_names: tools.iter().map(|t| t.name.clone()).collect(),
     };
-    let rc_sections = match kaijutsu_kernel::read_system_prompt_sections(&documents, context_id) {
+    let rc_sections = match crate::read_system_prompt_sections(&documents, context_id) {
         Ok(sections) => sections,
         Err(e) => {
             let detail = format!(
                 "Could not read this context's instruction blocks: {e}. The turn was stopped."
             );
-            log::error!("System prompt read failed for context {context_id}: {e}");
+            tracing::error!("System prompt read failed for context {context_id}: {e}");
             insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
-            return Err(capnp::Error::failed(detail));
+            return Err(detail);
         }
     };
-    let system_prompt = kaijutsu_kernel::build_system_prompt(&situational, &rc_sections);
+    let system_prompt = crate::build_system_prompt(&situational, &rc_sections);
 
-    log::info!(
+    tracing::info!(
         "Spawning LLM stream: context={}, model={}",
         context_id,
         model_name
@@ -594,12 +573,12 @@ pub(crate) async fn spawn_llm_for_prompt(
     let continuation_epoch = match continuation_epoch {
         Some(epoch) => {
             if kernel_arc.turn_in_flight(context_id) { return Ok(()); }
-            let window = kernel_arc.gate_resume_window().await.map_err(capnp::Error::failed)?;
+            let window = kernel_arc.gate_resume_window().await?;
             let window_ms = i64::try_from(window.as_millis())
-                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                .map_err(|error| error.to_string())?;
             if !kernel_db.lock().claim_automatic_resume(
                 context_id, epoch, kaijutsu_types::now_millis() as i64, window_ms,
-            ).map_err(|error| capnp::Error::failed(error.to_string()))? {
+            ).map_err(|error| error.to_string())? {
                 return Ok(());
             }
             Some(epoch)
@@ -608,9 +587,9 @@ pub(crate) async fn spawn_llm_for_prompt(
             kernel_db
                 .lock()
                 .begin_continuation(context_id, kaijutsu_types::now_millis() as i64)
-                .map_err(|error| capnp::Error::failed(format!(
+                .map_err(|error| format!(
                     "Could not open continuation window: {error}"
-                )))?
+                ))?
                 .epoch,
         ),
     };
@@ -657,7 +636,7 @@ pub struct StreamTimeouts {
 impl StreamTimeouts {
     pub fn resolve(
         policy: &kaijutsu_types::TimeoutPolicy,
-        backend: Option<&kaijutsu_kernel::BackendConfig>,
+        backend: Option<&crate::BackendConfig>,
     ) -> Self {
         let secs = |v: Option<u64>, fallback: std::time::Duration| {
             v.map(std::time::Duration::from_secs).unwrap_or(fallback)
@@ -700,7 +679,7 @@ mod stream_timeout_tests {
         let none = StreamTimeouts::from_policy(&policy);
         assert_eq!(none.idle, policy.llm_idle_timeout);
         assert_eq!(none.request, policy.llm_request_timeout);
-        let mut slow = kaijutsu_kernel::BackendConfig::new("tenchi", kaijutsu_kernel::BackendKind::OpenAi);
+        let mut slow = crate::BackendConfig::new("tenchi", crate::BackendKind::OpenAi);
         slow.idle_timeout_secs = Some(600);
         let t = StreamTimeouts::resolve(&policy, Some(&slow));
         assert_eq!(t.idle, Duration::from_secs(600), "the backend's idle limit");
@@ -729,7 +708,7 @@ mod consent_tests {
 #[cfg(test)]
 mod hydration_tests {
     use super::*;
-    use kaijutsu_kernel::{BlockStoreError, DocumentKind, shared_block_store};
+    use crate::{BlockStoreError, DocumentKind, shared_block_store};
 
     /// When the block-log read fails during mailbox catch-up, the turn must
     /// fail loudly: a `BlockKind::Error` block lands in the conversation and the
@@ -759,7 +738,7 @@ mod hydration_tests {
             )
             .expect("insert user block");
 
-        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+        let mut mailbox = crate::ConversationMailbox::new();
 
         // Inject a failing read (the real failure mode: DocumentNotFound).
         let read = Err(BlockStoreError::DocumentNotFound(context_id));
@@ -820,7 +799,7 @@ mod hydration_tests {
             )
             .expect("insert user block");
 
-        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+        let mut mailbox = crate::ConversationMailbox::new();
         let result =
             hydrate_messages(&documents, context_id, &user_block_id, &mut mailbox, None);
         let messages = result.expect("successful hydration");
@@ -864,7 +843,7 @@ mod hydration_tests {
         insert(Role::User, "q2");
         let last = insert(Role::Model, "a2"); // tail (window 2) = [q2, a2]
 
-        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+        let mut mailbox = crate::ConversationMailbox::new();
         let messages =
             hydrate_messages(&documents, context_id, &last, &mut mailbox, Some((marker, 2)))
                 .expect("windowed hydration");
@@ -886,7 +865,7 @@ mod hydration_tests {
 #[cfg(test)]
 mod context_window_warning_tests {
     use super::*;
-    use kaijutsu_kernel::{DocumentKind, shared_block_store};
+    use crate::{DocumentKind, shared_block_store};
 
     /// When the estimated turn size is at/above `CONTEXT_WARNING_THRESHOLD`
     /// of a *known* model window, a visible `BlockKind::Trace` block lands in
@@ -1063,27 +1042,10 @@ mod context_window_warning_tests {
     }
 }
 
-/// Map a tool-dispatch outcome into the `(content, is_error, error_payload)`
-/// triple used both for the model-visible `ToolResult` and the block-store
-/// write. Pure/sync so it's unit-testable without spinning up a kernel.
+/// One tool dispatch, projected into the conversation and its block pair.
 ///
-/// A broker policy timeout (`McpError::Policy(PolicyError::Timeout { .. })`,
-/// raised by `Broker::call_tool` racing `policy.call_timeout` — mcp/broker.rs)
-/// gets its own arm so the model still sees a clear `code: "tool.timeout"`
-/// error, using the *real* `timeout_ms` from the broker instead of a
-/// hardcoded number. This preserves the shape the old outer
-/// `tokio::time::timeout` wrapper used to produce (see
-/// `dispatch_and_map_tool_result`'s doc for why that wrapper is gone) so any
-/// existing consumer matching on `code == "tool.timeout"` keeps working.
-/// What one tool dispatch produced, for the conversation and for the blocks.
-///
-/// `status` is separate from `is_error` because they answer different
-/// questions. `is_error` is the D-28 channel the model reads: a refusal is
-/// loud, always. `status` is what the ToolCall/ToolResult pair settles to,
-/// and a gate that recorded a durable ask settles `Waiting` — an unanswered
-/// question is not a refusal, and a block left `Error` says it was.
-/// Deriving one from the other is what left this path settling a pending ask
-/// as a failed tool call.
+/// `is_error` tells the model about a refusal; `status` records whether the
+/// pair is settled. An unanswered gate leaves the pair `Waiting`.
 struct ToolDispatch {
     content: String,
     is_error: bool,
@@ -1105,11 +1067,11 @@ struct ToolDispatch {
 
 fn map_tool_dispatch_result(
     tool_name: &str,
-    result: Result<kaijutsu_kernel::ExecResult, McpError>,
+    result: Result<crate::ExecResult, McpError>,
 ) -> ToolDispatch {
     match result {
         Ok(r) if r.success => {
-            log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
+            tracing::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
             ToolDispatch {
                 content: r.stdout,
                 is_error: false,
@@ -1129,7 +1091,7 @@ fn map_tool_dispatch_result(
             } else {
                 r.stdout.clone()
             };
-            log::warn!("Tool {} failed: {}", tool_name, content);
+            tracing::warn!("Tool {} failed: {}", tool_name, content);
             let payload = kaijutsu_types::ErrorPayload {
                 category: kaijutsu_types::ErrorCategory::Tool,
                 severity: kaijutsu_types::ErrorSeverity::Error,
@@ -1155,7 +1117,7 @@ fn map_tool_dispatch_result(
         Err(e) if e.as_refusal().is_some() => {
             let status = e.settled_block_status();
             let refusal = e.as_refusal().expect("guarded by the arm above");
-            log::info!("Tool {} refused: {}", tool_name, refusal);
+            tracing::info!("Tool {} refused: {}", tool_name, refusal);
             let code = match refusal.kind {
                 kaijutsu_types::RefusalKind::Denied => "gate.denied",
                 kaijutsu_types::RefusalKind::Pending => "gate.pending",
@@ -1190,7 +1152,7 @@ fn map_tool_dispatch_result(
             }
         }
         Err(McpError::Policy(PolicyError::Timeout { timeout_ms, .. })) => {
-            log::error!(
+            tracing::error!(
                 "Tool {} timed out after {}ms (per-instance policy call_timeout)",
                 tool_name,
                 timeout_ms
@@ -1213,7 +1175,7 @@ fn map_tool_dispatch_result(
             }
         }
         Err(e) => {
-            log::error!("Tool {} execution error: {}", tool_name, e);
+            tracing::error!("Tool {} execution error: {}", tool_name, e);
             let payload = kaijutsu_types::ErrorPayload {
                 category: kaijutsu_types::ErrorCategory::Tool,
                 severity: kaijutsu_types::ErrorSeverity::Error,
@@ -1236,25 +1198,13 @@ fn map_tool_dispatch_result(
 /// Dispatch one tool call through the broker and map the outcome for the
 /// conversation.
 ///
-/// There is deliberately **no** timeout wrapper here. `Broker::call_tool`
-/// (mcp/broker.rs) already enforces the per-instance `InstancePolicy.call_
-/// timeout` itself — configurable live via `kj policy set` /
-/// `Broker::update_policy` — and races it against `cancel` with `select!
-/// { biased; ... }` so an externally-triggered hard interrupt (M2-B5) wins
-/// over a timeout that's about to fire and aborts the in-flight call
-/// promptly regardless of how long `call_timeout` is set to. A second,
-/// hardcoded ceiling here would silently override whatever the user
-/// configured — which is exactly what used to happen: a
-/// `const TOOL_TIMEOUT_SECS: u64 = 120` wrapped this call and clamped every
-/// policy timeout above 120s to 120s, with no way to raise it. Removing it
-/// does not reintroduce the wedge that const was guarding against: the
-/// interrupt-latency guarantee it protected comes from the cancel token
-/// racing the broker's own timeout, not from this now-removed second timer.
+/// The broker enforces the instance's live `call_timeout` policy and races
+/// it against cancellation. A hard interrupt wins when both are ready.
 async fn dispatch_and_map_tool_result(
     kernel: &Arc<Kernel>,
     tool_name: &str,
     params: &str,
-    tool_ctx: &kaijutsu_kernel::ExecContext,
+    tool_ctx: &crate::ExecContext,
     cancel: tokio_util::sync::CancellationToken,
 ) -> ToolDispatch {
     let result = kernel
@@ -1327,9 +1277,9 @@ fn link_waiting_pair_to_ask(
         ask_id,
         tool_call_block_id,
         output_block_id,
-        kaijutsu_kernel::PairOwner::Turn,
+        crate::PairOwner::Turn,
     ) {
-        log::error!("ask {ask_id}: could not record the blocks waiting on it: {e}");
+        tracing::error!("ask {ask_id}: could not record the blocks waiting on it: {e}");
     }
 }
 
@@ -1337,7 +1287,7 @@ fn pending_shell_operation_receipt(
     kernel: &Arc<Kernel>,
     documents: &SharedBlockStore,
     context_id: ContextId,
-    tool_ctx: &kaijutsu_kernel::ExecContext,
+    tool_ctx: &crate::ExecContext,
     source: &str,
     ask_id: &str,
 ) -> Result<String, String> {
@@ -1369,14 +1319,14 @@ fn pending_shell_operation_receipt(
     kernel.shell_operations().mark_waiting(&receipt.operation_id, ask_id)?;
     kernel.kernel_db().lock().link_ask_blocks(
         ask_id, &receipt.command_block_id, &receipt.output_block_id,
-        kaijutsu_kernel::PairOwner::Turn,
+        crate::PairOwner::Turn,
     ).map_err(|error| error.to_string())?;
     Ok(receipt.operation_id)
 }
 
 fn make_pending_shell_receipt(
     kernel: &Arc<Kernel>, documents: &SharedBlockStore, context_id: ContextId,
-    tool_ctx: &kaijutsu_kernel::ExecContext, tool_name: &str, params: &str,
+    tool_ctx: &crate::ExecContext, tool_name: &str, params: &str,
     ask_id: Option<&str>, content: &mut String, is_error: &mut bool, status: &mut Status,
 ) {
     if !matches!(tool_name, "shell" | "shell_write") || *status != Status::Waiting {
@@ -1421,7 +1371,7 @@ async fn dispatch_inline_tool_result(
     kernel: &Arc<Kernel>,
     tool_name: &str,
     input: serde_json::Value,
-    tool_ctx: &kaijutsu_kernel::ExecContext,
+    tool_ctx: &crate::ExecContext,
     cancel: tokio_util::sync::CancellationToken,
     tool_use_id: &str,
     // PROVIDER-OUTPUT: this ToolCall block records the model's own callback
@@ -1448,7 +1398,7 @@ async fn dispatch_inline_tool_result(
             id
         }
         Err(error) => {
-            log::error!(
+            tracing::error!(
                 "Failed to insert inline tool call block for {} ({}): {}",
                 tool_name,
                 tool_use_id,
@@ -1483,7 +1433,7 @@ async fn dispatch_inline_tool_result(
             // Match the ordinary agentic path: execute and return a real
             // result even when the UI block could not be created, but make the
             // missing durable representation loud in logs.
-            log::warn!(
+            tracing::warn!(
                 "Failed to insert inline tool result block for {} ({}): {}",
                 tool_name,
                 tool_use_id,
@@ -1513,7 +1463,7 @@ async fn dispatch_inline_tool_result(
 
     // ANSI ingest, same policy as the agentic path above: the projection is
     // what the block stores AND what the model reads back.
-    let ansi = kaijutsu_kernel::ansi_ingest::project(content.as_bytes());
+    let ansi = crate::ansi_ingest::project(content.as_bytes());
     let raw_result = ansi.as_ref().map(|_| content.clone());
     let content = match ansi {
         Some(ref p) => p.text.clone(),
@@ -1531,11 +1481,11 @@ async fn dispatch_inline_tool_result(
                 Some(PrincipalId::system()),
             )
         {
-            log::error!("Failed to write inline tool result text: {}", error);
+            tracing::error!("Failed to write inline tool result text: {}", error);
         }
         // After the edit — `edit_text` clears style_spans.
         if let (Some(p), Some(raw)) = (ansi, raw_result) {
-            kaijutsu_kernel::ansi_ingest::record(
+            crate::ansi_ingest::record(
                 documents,
                 context_id,
                 &result_block_id,
@@ -1558,7 +1508,7 @@ async fn dispatch_inline_tool_result(
                 Some(PrincipalId::system()),
             ) {
                 Ok(child_id) => anchor = child_id,
-                Err(error) => log::warn!(
+                Err(error) => tracing::warn!(
                     "Failed to insert inline tool error block for {}: {}",
                     tool_name,
                     error
@@ -1642,10 +1592,10 @@ impl Drop for TurnUsageOnSpan {
 /// land on every turn.
 #[derive(Debug, Clone)]
 struct TurnSpanIdentity {
-    performer: kaijutsu_kernel::CharacterIdentity,
-    reviewer: kaijutsu_kernel::CharacterIdentity,
+    performer: crate::CharacterIdentity,
+    reviewer: crate::CharacterIdentity,
     director: Option<PrincipalId>,
-    review_source: kaijutsu_kernel::approval_identity::ReviewSource,
+    review_source: crate::approval_identity::ReviewSource,
 }
 
 // The full turn context (provider, target block, interrupt/cache/kernel
@@ -1663,7 +1613,7 @@ fn record_continuation_yield(
         .lock()
         .record_continuation_yield(context_id, epoch, kaijutsu_types::now_millis() as i64)
     {
-        log::error!(
+        tracing::error!(
             "Could not record continuation yield for {context_id} epoch {epoch}: {error}"
         );
     }
@@ -1719,7 +1669,7 @@ async fn process_llm_stream(
     // CallContext, but character names belong on the turn span only: no
     // per-tool character database reads.
     span_identity: Option<TurnSpanIdentity>,
-    tool_ctx: kaijutsu_kernel::ExecContext,
+    tool_ctx: crate::ExecContext,
     interrupt: Arc<ContextInterruptState>,
     interrupt_generation: u64,
     context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
@@ -1738,11 +1688,11 @@ async fn process_llm_stream(
             span.record("director.id", tracing::field::display(director));
         }
         let review_source = match identity.review_source {
-            kaijutsu_kernel::approval_identity::ReviewSource::Explicit => "explicit",
-            kaijutsu_kernel::approval_identity::ReviewSource::Delegation => "delegation",
-            kaijutsu_kernel::approval_identity::ReviewSource::Walk => "walk",
-            kaijutsu_kernel::approval_identity::ReviewSource::Default => "default",
-            kaijutsu_kernel::approval_identity::ReviewSource::SelfConfirmation => "self_confirmation",
+            crate::approval_identity::ReviewSource::Explicit => "explicit",
+            crate::approval_identity::ReviewSource::Delegation => "delegation",
+            crate::approval_identity::ReviewSource::Walk => "walk",
+            crate::approval_identity::ReviewSource::Default => "default",
+            crate::approval_identity::ReviewSource::SelfConfirmation => "self_confirmation",
         };
         span.record("review.source", review_source);
         span.record("actor.name", identity.performer.name.as_str());
@@ -1794,7 +1744,7 @@ async fn process_llm_stream(
     let hydration_policy = match kernel_db.lock().get_hydration_policy(context_id) {
         Ok(p) => p,
         Err(e) => {
-            log::error!(
+            tracing::error!(
                 "Hydration policy read failed for context {context_id}: {e}; failing the turn"
             );
             kernel.turn_flows().publish(TurnFlow::Failed {
@@ -1852,8 +1802,8 @@ async fn process_llm_stream(
     // disk + base64 work for hashes already resolved this session,
     // so a 20-image conversation doesn't re-encode every turn.
     {
-        let cas: std::sync::Arc<dyn kaijutsu_kernel::ContentStore> = kernel.cas().clone();
-        kaijutsu_kernel::resolve_image_blocks_from_cas(
+        let cas: std::sync::Arc<dyn crate::ContentStore> = kernel.cas().clone();
+        crate::resolve_image_blocks_from_cas(
             &mut messages,
             cas,
             Some(conversation_cache.image_cache()),
@@ -1883,7 +1833,7 @@ async fn process_llm_stream(
         );
     }
 
-    log::debug!(
+    tracing::debug!(
         "Sending {} messages for context {}",
         messages.len(),
         context_id
@@ -1935,7 +1885,7 @@ async fn process_llm_stream(
                     "⚠️ Maximum tool iterations reached ({max_iterations})."
                 ),
             };
-            log::warn!(
+            tracing::warn!(
                 "Agentic loop hit max iterations ({}, consent={}), stopping",
                 max_iterations,
                 consent,
@@ -1962,7 +1912,7 @@ async fn process_llm_stream(
             .stop_after_turn
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            log::info!(
+            tracing::info!(
                 "Soft interrupt requested for {}, stopping agentic loop",
                 context_id
             );
@@ -1970,7 +1920,7 @@ async fn process_llm_stream(
             break;
         }
 
-        log::debug!(
+        tracing::debug!(
             "Agentic loop iteration {} with {} messages, {} tools",
             iteration,
             messages.len(),
@@ -1993,7 +1943,7 @@ async fn process_llm_stream(
             match db.list_cache_breakpoints(context_id) {
                 Ok(bps) => bps,
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "Failed to read cache breakpoints for {context_id}: {e} — proceeding without caching"
                     );
                     Vec::new()
@@ -2041,15 +1991,15 @@ async fn process_llm_stream(
                 match started {
                     Ok(s) => {
                         if attempt > 1 {
-                            log::debug!("LLM stream started on attempt {}", attempt);
+                            tracing::debug!("LLM stream started on attempt {}", attempt);
                         } else {
-                            log::debug!("LLM stream started successfully");
+                            tracing::debug!("LLM stream started successfully");
                         }
                         break s;
                     }
                     Err(e) if attempt <= MAX_LLM_RETRIES && !matches!(&e, LlmError::InvalidRequest(_)) => {
                         let delay_secs = attempt as u64;
-                        log::warn!(
+                        tracing::warn!(
                             "LLM stream failed (attempt {}/{}): {}, retrying in {}s",
                             attempt,
                             MAX_LLM_RETRIES + 1,
@@ -2059,7 +2009,7 @@ async fn process_llm_stream(
                         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     }
                     Err(e) => {
-                        log::error!(
+                        tracing::error!(
                             "Failed to start LLM stream after {} attempts: {}",
                             attempt,
                             e
@@ -2121,7 +2071,7 @@ async fn process_llm_stream(
         // serialize identically.
         let mut assistant_reasoning: Vec<(String, Option<String>)> = Vec::new();
 
-        log::debug!("Entering stream event loop");
+        tracing::debug!("Entering stream event loop");
         let mut stream_cancelled = false;
         // Two-layer timeout: total wall-clock cap on the entire completion,
         // and a per-chunk idle guard for providers that open the connection
@@ -2153,7 +2103,7 @@ async fn process_llm_stream(
                         // set `Cancelled { immediate: true }` as it would for
                         // any other confirmed hard cancel — the flush this
                         // drain was waiting for was never going to arrive.
-                        log::warn!(
+                        tracing::warn!(
                             "LLM stream idle for {:?} during post-cancel drain — hung \
                              provider, no confirming flush; treating as a confirmed \
                              cancel, not a failure ({})",
@@ -2165,13 +2115,13 @@ async fn process_llm_stream(
             } else {
                 tokio::select! {
                     _ = interrupt.cancel.cancelled() => {
-                        log::info!("Hard interrupt: cancelling LLM stream for {}", context_id);
+                        tracing::info!("Hard interrupt: cancelling LLM stream for {}", context_id);
                         stream.cancel();  // signals rig's AbortHandle → HTTP stream drops
                         stream_cancelled = true;
                         continue 'stream;  // drain one Done event for confirmation
                     }
                     _ = &mut total_deadline => {
-                        log::warn!(
+                        tracing::warn!(
                             "LLM stream exceeded total request timeout {:?} ({})",
                             request_timeout, context_id
                         );
@@ -2185,7 +2135,7 @@ async fn process_llm_stream(
                             Ok(Some(ev)) => ev,
                             Ok(None) => break 'stream,
                             Err(_) => {
-                                log::warn!(
+                                tracing::warn!(
                                     "LLM stream idle for {:?} ({})",
                                     idle_timeout, context_id
                                 );
@@ -2198,7 +2148,7 @@ async fn process_llm_stream(
                     }
                 }
             };
-            log::debug!("Received stream event: {:?}", event);
+            tracing::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
                     // Open a fresh reasoning entry for this block (its deltas
@@ -2219,7 +2169,7 @@ async fn process_llm_stream(
                             last_block_id = block_id;
                             current_block_id = Some(block_id);
                         }
-                        Err(e) => log::error!("Failed to insert thinking block: {}", e),
+                        Err(e) => tracing::error!("Failed to insert thinking block: {}", e),
                     }
                 }
 
@@ -2241,7 +2191,7 @@ async fn process_llm_stream(
                             Some(actor_principal),
                         )
                     {
-                        log::error!("Failed to append thinking text: {}", e);
+                        tracing::error!("Failed to append thinking text: {}", e);
                     }
                 }
 
@@ -2266,7 +2216,7 @@ async fn process_llm_stream(
                             && let Err(e) =
                                 documents.set_signature(context_id, block_id, Some(sig.clone()))
                         {
-                            log::warn!("Failed to persist thinking signature: {}", e);
+                            tracing::warn!("Failed to persist thinking signature: {}", e);
                         }
                     }
                     if let Some(ref block_id) = current_block_id {
@@ -2281,7 +2231,7 @@ async fn process_llm_stream(
                             .and_then(|(text, _)| summarize_thinking(text))
                             && let Err(e) = documents.set_summary(context_id, block_id, summary)
                         {
-                            log::warn!("Failed to persist thinking summary: {}", e);
+                            tracing::warn!("Failed to persist thinking summary: {}", e);
                         }
                         let _ = documents.set_status(context_id, block_id, Status::Done);
                     }
@@ -2308,7 +2258,7 @@ async fn process_llm_stream(
                             // carries the LAST one, the model's final say.
                             output_block_id = Some(block_id);
                         }
-                        Err(e) => log::error!("Failed to insert text block: {}", e),
+                        Err(e) => tracing::error!("Failed to insert text block: {}", e),
                     }
                 }
 
@@ -2324,7 +2274,7 @@ async fn process_llm_stream(
                             Some(actor_principal),
                         )
                     {
-                        log::error!("Failed to append text: {}", e);
+                        tracing::error!("Failed to append text: {}", e);
                     }
                 }
 
@@ -2363,7 +2313,7 @@ async fn process_llm_stream(
                             tool_call_blocks.insert(id.clone(), Some(block_id));
                         }
                         Err(e) => {
-                            log::error!("Failed to insert tool call block for {}: {}", name, e);
+                            tracing::error!("Failed to insert tool call block for {}: {}", name, e);
                             tool_call_blocks.insert(id.clone(), None);
                         }
                     }
@@ -2376,7 +2326,7 @@ async fn process_llm_stream(
                     // content boundary; still close a malformed open block
                     // defensively so it never stays stuck Running.
                     if let Some(block_id) = current_block_id.take() {
-                        log::warn!(
+                        tracing::warn!(
                             "inline tool {} arrived with an open content block; closing it defensively",
                             id
                         );
@@ -2405,7 +2355,7 @@ async fn process_llm_stream(
                         let detail = format!(
                             "failed to return inline tool result for {name} ({id}): {error}"
                         );
-                        log::error!("{}", detail);
+                        tracing::error!("{}", detail);
                         let payload = kaijutsu_types::ErrorPayload {
                             category: kaijutsu_types::ErrorCategory::Stream,
                             severity: kaijutsu_types::ErrorSeverity::Error,
@@ -2435,7 +2385,7 @@ async fn process_llm_stream(
 
                 StreamEvent::ToolResult { .. } => {
                     // This shouldn't happen during streaming - tool results are generated by us
-                    log::warn!("Unexpected ToolResult event during streaming");
+                    tracing::warn!("Unexpected ToolResult event during streaming");
                 }
 
                 StreamEvent::Done {
@@ -2448,7 +2398,7 @@ async fn process_llm_stream(
                     // TokenCounts shape. DeepSeek reports an automatic-cache
                     // hit/miss split + reasoning tokens; Anthropic reports
                     // cache read/creation. Unknown / absent → zeros.
-                    use kaijutsu_kernel::llm::UsageExtra;
+                    use crate::llm::UsageExtra;
                     let (cache_read, cache_write, reasoning) = match &extra {
                         Some(UsageExtra::OpenAiCompat(d)) => {
                             (d.prompt_cache_hit_tokens, 0, d.reasoning_tokens)
@@ -2529,7 +2479,7 @@ async fn process_llm_stream(
                     // want and the reason this guard checks for the total
                     // absence of data rather than keying off cancellation.
                     if input_tokens.is_none() && output_tokens.is_none() {
-                        log::debug!(
+                        tracing::debug!(
                             "context usage not recorded for {context_id}: provider \
                              reported no token counts (stream ended before usage \
                              arrived); keeping the previous snapshot"
@@ -2550,7 +2500,7 @@ async fn process_llm_stream(
                         } else {
                             0
                         };
-                        let usage_row = kaijutsu_kernel::ContextUsageRow {
+                        let usage_row = crate::ContextUsageRow {
                             context_id,
                             provider: provider.name().to_string(),
                             model: model_name.clone(),
@@ -2568,7 +2518,7 @@ async fn process_llm_stream(
                             // silent) so a persistently-failing write is
                             // observable, but the conversation must not fail
                             // because a telemetry-adjacent counter didn't write.
-                            log::warn!(
+                            tracing::warn!(
                                 "Failed to persist context usage for {context_id}: {e}"
                             );
                         }
@@ -2577,7 +2527,7 @@ async fn process_llm_stream(
                     if stream_cancelled {
                         // Hard interrupt confirmation: rig flushed its buffer cleanly.
                         // stop_reason is None on cancel (vs "end_turn"/"tool_use" normally).
-                        log::info!(
+                        tracing::info!(
                             "LLM stream cancelled: tokens_in={:?}, tokens_out={:?}",
                             input_tokens,
                             output_tokens
@@ -2631,7 +2581,7 @@ async fn process_llm_stream(
                     // operationally worth a `warn`, not a `debug`.
                     match stop_reason.as_deref() {
                         Some("refusal") => {
-                            log::warn!(
+                            tracing::warn!(
                                 "LLM stream ended with stop_reason=refusal for {context_id} \
                                  — the model declined to answer; reported to the turn \
                                  outcome as EndTurn until the wire has a dedicated \
@@ -2639,7 +2589,7 @@ async fn process_llm_stream(
                             );
                         }
                         Some("stop_sequence") => {
-                            log::info!(
+                            tracing::info!(
                                 "LLM stream ended with stop_reason=stop_sequence for \
                                  {context_id}; reported to the turn outcome as EndTurn"
                             );
@@ -2650,7 +2600,7 @@ async fn process_llm_stream(
                         Some("max_tokens") | Some("length") => TurnStopReason::MaxTokens,
                         _ => TurnStopReason::EndTurn,
                     };
-                    log::info!(
+                    tracing::info!(
                         "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
                         stop_reason,
                         input_tokens,
@@ -2659,7 +2609,7 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::Error(err) => {
-                    log::error!("LLM stream error: {}", err);
+                    tracing::error!("LLM stream error: {}", err);
                     let payload = kaijutsu_types::ErrorPayload {
                         category: kaijutsu_types::ErrorCategory::Stream,
                         severity: kaijutsu_types::ErrorSeverity::Error,
@@ -2711,12 +2661,12 @@ async fn process_llm_stream(
             if !assistant_text.is_empty() {
                 messages.push(LlmMessage::assistant(&assistant_text));
             }
-            log::debug!("Agentic loop complete - no tool calls this iteration");
+            tracing::debug!("Agentic loop complete - no tool calls this iteration");
             break;
         }
 
         // Execute tools concurrently — the kernel sequences concurrent block inserts
-        log::debug!("Executing {} tool calls concurrently", tool_calls.len());
+        tracing::debug!("Executing {} tool calls concurrently", tool_calls.len());
 
         // Build assistant tool uses (for conversation history)
         let assistant_tool_uses: Vec<ContentBlock> = tool_calls
@@ -2743,7 +2693,7 @@ async fn process_llm_stream(
                 let tool_call_entry = tool_call_blocks.get(&tool_use_id).cloned();
                 async move {
                     let params = input.to_string();
-                    log::debug!("Executing tool: {} with params: {}", tool_name, params);
+                    tracing::debug!("Executing tool: {} with params: {}", tool_name, params);
 
                     let tool_call_block_id = match tool_call_entry {
                         Some(Some(id)) => Some(id),
@@ -2751,7 +2701,7 @@ async fn process_llm_stream(
                             // ToolCall block insertion failed — the model should
                             // know its tool infrastructure is broken rather than
                             // getting a phantom result with no call.
-                            log::warn!(
+                            tracing::warn!(
                                 "Tool {} (id={}) has no ToolCall block — \
                                  returning error to model",
                                 tool_name,
@@ -2791,7 +2741,7 @@ async fn process_llm_stream(
                                 let _ = documents.set_status(context_id, &id, Status::Running);
                                 result_block_id = Some(id);
                             }
-                            Err(e) => log::warn!(
+                            Err(e) => tracing::warn!(
                                 // TODO: surface this in the UI — the model continues with a result
                                 // the user never sees, which is confusing to debug. One option:
                                 // insert a System/Text block with an error notice so the gap is
@@ -2853,7 +2803,7 @@ async fn process_llm_stream(
                     // six characters `\u001b`, so projecting the envelope
                     // would strip nothing and hand the model the escapes it
                     // exists to remove.
-                    let ansi = kaijutsu_kernel::ansi_ingest::project(block_source.as_bytes());
+                    let ansi = crate::ansi_ingest::project(block_source.as_bytes());
                     let raw_result = ansi.as_ref().map(|_| block_source.clone());
                     let block_content = match ansi {
                         Some(ref p) => p.text.clone(),
@@ -2879,11 +2829,11 @@ async fn process_llm_stream(
                                 Some(PrincipalId::system()),
                             )
                         {
-                            log::error!("Failed to write tool result text: {}", e);
+                            tracing::error!("Failed to write tool result text: {}", e);
                         }
                         // After the edit — `edit_text` clears style_spans.
                         if let (Some(p), Some(raw)) = (ansi, raw_result) {
-                            kaijutsu_kernel::ansi_ingest::record(
+                            crate::ansi_ingest::record(
                                 &documents,
                                 context_id,
                                 rb_id,
@@ -2938,7 +2888,7 @@ async fn process_llm_stream(
                             Some(PrincipalId::system()),
                         ) {
                             Ok(child_id) => anchor_block_id = Some(child_id),
-                            Err(e) => log::warn!(
+                            Err(e) => tracing::warn!(
                                 "Failed to insert error block for tool {}: {}",
                                 tool_name,
                                 e
@@ -2997,7 +2947,7 @@ async fn process_llm_stream(
 
     // Conversation history is already persisted in the per-context lock.
     // The MutexGuard drops when this function returns.
-    log::debug!(
+    tracing::debug!(
         "Conversation cache updated: {} messages for cell {}",
         messages.len(),
         context_id
@@ -3016,7 +2966,7 @@ async fn process_llm_stream(
         }
     }
 
-    log::debug!("LLM stream processing complete for cell {}", context_id);
+    tracing::debug!("LLM stream processing complete for cell {}", context_id);
 
     // Announce the turn outcome at ACTUAL stream end (design §7) — the publish
     // sits here, not at the spawn site, so it carries the real `output_block_id`
@@ -3068,14 +3018,14 @@ mod publish_tests {
     //! real ephemeral kernel + block store, so the publish is exercised end to
     //! end through the actual stream loop, not a stub.
     use super::*;
-    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
-    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
-    use kaijutsu_kernel::kernel_db::KernelDb;
-    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use crate::block_store::{BlockStore, DocumentKind};
+    use crate::flows::{FlowBus, SharedBlockFlowBus};
+    use crate::kernel_db::KernelDb;
+    use crate::llm::{MockClient, Provider};
     use kaijutsu_types::SessionId;
 
-    use crate::interrupt::ContextInterruptState;
-    use crate::rpc::ConversationCache;
+    use crate::runtime::interrupt::ContextInterruptState;
+    use crate::runtime::turn_state::ConversationCache;
 
     /// Build the args and run one `process_llm_stream` against a Mock provider.
     /// Returns the documents store and the principal so the caller can inspect
@@ -3133,7 +3083,7 @@ mod publish_tests {
         let interrupt = ContextInterruptState::new(1);
         arm_interrupt(&interrupt);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
             std::path::PathBuf::from("/"),
@@ -3391,12 +3341,12 @@ mod publish_tests {
                 let mut completed = kernel.turn_flows().subscribe("turn.completed");
                 let mut failed = kernel.turn_flows().subscribe("turn.failed");
 
-                let mut events = vec![kaijutsu_kernel::llm::StreamEvent::TextStart];
+                let mut events = vec![crate::llm::StreamEvent::TextStart];
                 events.extend(
-                    (0..64).map(|_| kaijutsu_kernel::llm::StreamEvent::TextDelta("C".into())),
+                    (0..64).map(|_| crate::llm::StreamEvent::TextDelta("C".into())),
                 );
-                events.push(kaijutsu_kernel::llm::StreamEvent::TextEnd);
-                events.push(kaijutsu_kernel::llm::StreamEvent::Done {
+                events.push(crate::llm::StreamEvent::TextEnd);
+                events.push(crate::llm::StreamEvent::Done {
                     stop_reason: Some("end_turn".into()),
                     input_tokens: Some(0),
                     output_tokens: Some(0),
@@ -3472,9 +3422,9 @@ mod publish_tests {
                 // catches the already-armed hard cancel before the script
                 // runs dry on its own (same reasoning as
                 // `hard_interrupt_completes_as_an_immediate_cancel` above).
-                let mut events = vec![kaijutsu_kernel::llm::StreamEvent::TextStart];
+                let mut events = vec![crate::llm::StreamEvent::TextStart];
                 events.extend(
-                    (0..64).map(|_| kaijutsu_kernel::llm::StreamEvent::TextDelta("C".into())),
+                    (0..64).map(|_| crate::llm::StreamEvent::TextDelta("C".into())),
                 );
 
                 let (_documents, ctx, _player) = drive_turn_with(
@@ -3530,10 +3480,10 @@ mod publish_tests {
                 let mut completed = kernel.turn_flows().subscribe("turn.completed");
 
                 let events = vec![
-                    kaijutsu_kernel::llm::StreamEvent::TextStart,
-                    kaijutsu_kernel::llm::StreamEvent::TextDelta("X:1\nK:C\nCD".into()),
-                    kaijutsu_kernel::llm::StreamEvent::TextEnd,
-                    kaijutsu_kernel::llm::StreamEvent::Done {
+                    crate::llm::StreamEvent::TextStart,
+                    crate::llm::StreamEvent::TextDelta("X:1\nK:C\nCD".into()),
+                    crate::llm::StreamEvent::TextEnd,
+                    crate::llm::StreamEvent::Done {
                         stop_reason: Some("max_tokens".into()),
                         input_tokens: Some(10),
                         output_tokens: Some(1024),
@@ -3587,7 +3537,7 @@ mod publish_tests {
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
             std::path::PathBuf::from("/"),
@@ -3681,12 +3631,7 @@ mod publish_tests {
     }
 }
 
-/// Lane A1: the removed redundant `TOOL_TIMEOUT_SECS: u64 = 120` outer
-/// wrapper. `map_tool_dispatch_result` is tested directly (pure, sync — no
-/// kernel needed); `dispatch_and_map_tool_result` is tested against a real
-/// ephemeral `Kernel` + broker with a custom slow `McpServerLike`, using
-/// tokio's paused clock (`start_paused = true`) so multi-minute scenarios
-/// run instantly instead of burning real wall-clock time.
+/// Broker timeouts and interrupts use a paused clock for long-running calls.
 #[cfg(test)]
 mod tool_dispatch_timeout_tests {
     use std::path::PathBuf;
@@ -3696,7 +3641,7 @@ mod tool_dispatch_timeout_tests {
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
-    use kaijutsu_kernel::mcp::{
+    use crate::mcp::{
         CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
         KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification,
     };
@@ -3721,7 +3666,7 @@ mod tool_dispatch_timeout_tests {
             )
         };
         let body = envelope.to_value().to_string();
-        let failed = kaijutsu_kernel::ExecResult {
+        let failed = crate::ExecResult {
             stdout: body.clone(),
             stderr: String::new(),
             exit_code: 1,
@@ -3755,14 +3700,14 @@ mod tool_dispatch_timeout_tests {
 
         // Projecting the envelope directly is the no-op that made this a bug.
         assert!(
-            kaijutsu_kernel::ansi_ingest::project(tool_body.as_bytes()).is_none(),
+            crate::ansi_ingest::project(tool_body.as_bytes()).is_none(),
             "the envelope's JSON has no raw ESC to find — this is why 4a exists"
         );
 
         // Step 4a → 4b, as the loop does it.
         let recovered = ShellEnvelope::from_tool_result(&tool_body).expect("a shell envelope");
         let block_source = recovered.readable_output();
-        let ansi = kaijutsu_kernel::ansi_ingest::project(block_source.as_bytes());
+        let ansi = crate::ansi_ingest::project(block_source.as_bytes());
         let block_content = match ansi {
             Some(ref p) => p.text.clone(),
             None => block_source,
@@ -3802,7 +3747,7 @@ mod tool_dispatch_timeout_tests {
     fn a_failing_tool_with_only_stderr_still_gets_the_prefix() {
         let out = map_tool_dispatch_result(
             "something",
-            Ok(kaijutsu_kernel::ExecResult::failure(1, "it broke")),
+            Ok(crate::ExecResult::failure(1, "it broke")),
         );
         assert!(out.is_error);
         assert_eq!(out.content, "Error: it broke");
@@ -3813,7 +3758,7 @@ mod tool_dispatch_timeout_tests {
     #[test]
     fn map_success_passes_stdout_through() {
         let ToolDispatch { content, is_error, payload, .. } =
-            map_tool_dispatch_result("echo", Ok(kaijutsu_kernel::ExecResult::success("hi")));
+            map_tool_dispatch_result("echo", Ok(crate::ExecResult::success("hi")));
         assert_eq!(content, "hi");
         assert!(!is_error);
         assert!(payload.is_none());
@@ -3823,7 +3768,7 @@ mod tool_dispatch_timeout_tests {
     fn map_tool_failure_sets_generic_error_no_code() {
         let ToolDispatch { content, is_error, payload, .. } = map_tool_dispatch_result(
             "grep",
-            Ok(kaijutsu_kernel::ExecResult::failure(1, "no matches")),
+            Ok(crate::ExecResult::failure(1, "no matches")),
         );
         assert!(is_error);
         assert_eq!(content, "Error: no matches");
@@ -4045,7 +3990,7 @@ mod tool_dispatch_timeout_tests {
         name: &str,
         sleep_for: Duration,
         call_timeout: Duration,
-    ) -> (Arc<Kernel>, kaijutsu_kernel::ExecContext) {
+    ) -> (Arc<Kernel>, crate::ExecContext) {
         let kernel = Arc::new(Kernel::new_ephemeral(name).await);
         let ctx = ContextId::new();
         let server = Arc::new(SleepyServer::new("napper", sleep_for));
@@ -4068,7 +4013,7 @@ mod tool_dispatch_timeout_tests {
                 ContextToolBinding::with_instances(vec![InstanceId::new("napper")]),
             )
             .await.unwrap();
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             PrincipalId::new(),
             ctx,
             PathBuf::from("/"),
@@ -4226,14 +4171,14 @@ mod tool_dispatch_timeout_tests {
         Arc<Kernel>,
         SharedBlockStore,
         ContextId,
-        kaijutsu_kernel::ExecContext,
+        crate::ExecContext,
         kaijutsu_types::BlockId,
     ) {
         let kernel = Arc::new(Kernel::new_ephemeral(name).await);
         let ctx = ContextId::new();
         let documents = kernel.blocks().clone();
         documents
-            .create_document(ctx, kaijutsu_kernel::DocumentKind::Conversation, None)
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
             .expect("create document");
         let anchor = documents
             .insert_block_as(
@@ -4270,7 +4215,7 @@ mod tool_dispatch_timeout_tests {
             )
             .await
             .unwrap();
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             PrincipalId::new(),
             ctx,
             PathBuf::from("/"),
@@ -4445,16 +4390,16 @@ mod usage_tests {
     //!    auto-compaction (`kj/compact.rs`, removed along with its only call
     //!    site in `spawn_llm_for_prompt`).
     use super::*;
-    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
-    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
-    use kaijutsu_kernel::kernel_db::KernelDb;
-    use kaijutsu_kernel::llm::{
+    use crate::block_store::{BlockStore, DocumentKind};
+    use crate::flows::{FlowBus, SharedBlockFlowBus};
+    use crate::kernel_db::KernelDb;
+    use crate::llm::{
         ClaudeUsageExtra, MockClient, OpenAiCompatUsageExtra, Provider, UsageExtra,
     };
     use kaijutsu_types::SessionId;
 
-    use crate::interrupt::ContextInterruptState;
-    use crate::rpc::ConversationCache;
+    use crate::runtime::interrupt::ContextInterruptState;
+    use crate::runtime::turn_state::ConversationCache;
 
     /// Build-and-drive helper: like `publish_tests::drive_one_turn` but takes
     /// an explicit `Provider` (so a test can script `StreamEvent`s via
@@ -4547,7 +4492,7 @@ mod usage_tests {
         {
             let db = kernel_db.lock();
             let ws_id = db.get_or_create_default_workspace(player).unwrap();
-            db.insert_document(&kaijutsu_kernel::kernel_db::DocumentRow {
+            db.insert_document(&crate::kernel_db::DocumentRow {
                 document_id: ctx,
                 workspace_id: ws_id,
                 doc_kind: kaijutsu_types::DocKind::Conversation,
@@ -4557,7 +4502,7 @@ mod usage_tests {
                 created_by: player,
             })
             .unwrap();
-            db.insert_context(&kaijutsu_kernel::ContextRow {
+            db.insert_context(&crate::ContextRow {
                 context_id: ctx,
                 label: None,
                 provider: None,
@@ -4592,7 +4537,7 @@ mod usage_tests {
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
             std::path::PathBuf::from("/"),
@@ -4617,16 +4562,16 @@ mod usage_tests {
             conversation_cache,
             player,
             Some(TurnSpanIdentity {
-                performer: kaijutsu_kernel::CharacterIdentity {
+                performer: crate::CharacterIdentity {
                     principal_id: actor,
                     name: "Coder".to_string(),
                 },
-                reviewer: kaijutsu_kernel::CharacterIdentity {
+                reviewer: crate::CharacterIdentity {
                     principal_id: reviewer,
                     name: "Lead".to_string(),
                 },
                 director: Some(player),
-                review_source: kaijutsu_kernel::approval_identity::ReviewSource::Default,
+                review_source: crate::approval_identity::ReviewSource::Default,
             }),
             tool_ctx,
             interrupt,
@@ -4720,8 +4665,8 @@ mod usage_tests {
                     0,
                     kernel.clone(),
                     &[
-                        CacheTarget::Tools(kaijutsu_kernel::llm::CacheTtl::Ephemeral),
-                        CacheTarget::System(kaijutsu_kernel::llm::CacheTtl::Extended),
+                        CacheTarget::Tools(crate::llm::CacheTtl::Ephemeral),
+                        CacheTarget::System(crate::llm::CacheTtl::Extended),
                     ],
                 )
                 .await;
@@ -4767,7 +4712,7 @@ mod usage_tests {
                     provider,
                     0,
                     kernel.clone(),
-                    &[CacheTarget::Tools(kaijutsu_kernel::llm::CacheTtl::Extended)],
+                    &[CacheTarget::Tools(crate::llm::CacheTtl::Extended)],
                 )
                 .await;
 
@@ -5060,7 +5005,7 @@ mod usage_tests {
         tracing::subscriber::set_global_default(
             tracing_subscriber::registry().with(counter.clone()),
         )
-        .expect("this is the only global subscriber the server test binary installs");
+        .expect("this is the only global subscriber the kernel test binary installs");
         let here = std::thread::current().id();
 
         let local = tokio::task::LocalSet::new();
@@ -5160,14 +5105,14 @@ mod error_child_anchor_tests {
     //! agentic turn through `process_llm_stream` end to end and pins
     //! document order across the whole loop, not just the anchor variable.
     use super::*;
-    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
-    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
-    use kaijutsu_kernel::kernel_db::KernelDb;
-    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use crate::block_store::{BlockStore, DocumentKind};
+    use crate::flows::{FlowBus, SharedBlockFlowBus};
+    use crate::kernel_db::KernelDb;
+    use crate::llm::{MockClient, Provider};
     use kaijutsu_types::SessionId;
 
-    use crate::interrupt::ContextInterruptState;
-    use crate::rpc::ConversationCache;
+    use crate::runtime::interrupt::ContextInterruptState;
+    use crate::runtime::turn_state::ConversationCache;
 
     /// Drive one `process_llm_stream` turn against a scripted Mock provider,
     /// same shape as `publish_tests::drive_turn_with` and
@@ -5200,7 +5145,7 @@ mod error_child_anchor_tests {
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
             std::path::PathBuf::from("/"),
@@ -5329,14 +5274,14 @@ mod authorship_tests {
     //!   category — regression coverage against a `None` author or a block
     //!   landing with an unrelated principal;
     use super::*;
-    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
-    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
-    use kaijutsu_kernel::kernel_db::KernelDb;
-    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use crate::block_store::{BlockStore, DocumentKind};
+    use crate::flows::{FlowBus, SharedBlockFlowBus};
+    use crate::kernel_db::KernelDb;
+    use crate::llm::{MockClient, Provider};
     use kaijutsu_types::SessionId;
 
-    use crate::interrupt::ContextInterruptState;
-    use crate::rpc::ConversationCache;
+    use crate::runtime::interrupt::ContextInterruptState;
+    use crate::runtime::turn_state::ConversationCache;
 
     /// Drive one turn against a scripted Mock provider that emits a Thinking
     /// block, a Text block, and a tool call against a tool that doesn't
@@ -5407,7 +5352,7 @@ mod authorship_tests {
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new(1);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
             std::path::PathBuf::from("/"),
@@ -5523,14 +5468,14 @@ mod gate_resume_cache_eviction_tests {
     //! `process_llm_stream` against one shared `ConversationCache` and
     //! inspects what the second turn actually hydrated.
     use super::*;
-    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
-    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
-    use kaijutsu_kernel::kernel_db::KernelDb;
-    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use crate::block_store::{BlockStore, DocumentKind};
+    use crate::flows::{FlowBus, SharedBlockFlowBus};
+    use crate::kernel_db::KernelDb;
+    use crate::llm::{MockClient, Provider};
     use kaijutsu_types::{BlockId, SessionId};
 
-    use crate::interrupt::ContextInterruptState;
-    use crate::rpc::ConversationCache;
+    use crate::runtime::interrupt::ContextInterruptState;
+    use crate::runtime::turn_state::ConversationCache;
 
     /// Drive one scripted turn against a caller-owned `documents` /
     /// `conversation_cache`, so a test can inspect what a *later* turn
@@ -5553,7 +5498,7 @@ mod gate_resume_cache_eviction_tests {
         let provider = Arc::new(provider);
         let interrupt = ContextInterruptState::new(1);
         let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             player,
             ctx,
             std::path::PathBuf::from("/"),

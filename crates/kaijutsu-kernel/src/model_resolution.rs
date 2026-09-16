@@ -1,8 +1,7 @@
 //! "What model does this context play?" — the one function that answers
 //! that question.
 //!
-//! Track D (2026-08-03, cast-on-context renovation): a context now has THREE
-//! possible sources for its effective model, in priority order:
+//! Resolve a context's effective model from three sources, in priority order:
 //!
 //! 1. An explicit **per-context override** — the context row's own
 //!    `provider`/`model` columns, set via `kj context set --model` (or at
@@ -16,16 +15,9 @@
 //!    `llm_defaults` row) — the same fallback `kj model` already reports as
 //!    `source: "default"`.
 //!
-//! This module is deliberately NOT under `llm/` (that tree is a concurrent
-//! Track B change) and takes no `KernelDb`/lock — it is a pure function over
-//! already-resolved primitives, so it is trivially unit tested here and easy
-//! to splice into the turn path later. The splice site is
-//! `kaijutsu-server/src/llm_stream.rs`'s `spawn_llm_for_prompt`, in the
-//! `provider_resolution` block (currently: explicit param > per-context
-//! DriftRouter fields > registry default — see the module doc there). A
-//! caller there would resolve `cast_label` from `ContextRow::cast_id` (via
-//! `KernelDb::get_cast`) once per turn, then call this function with the
-//! context's `context_type` in hand.
+//! Resolution uses already-read values and holds no database lock. The turn
+//! entry point in `runtime/llm_stream.rs` resolves the cast label and context
+//! type once, then passes them here with any explicit model override.
 
 use crate::llm::{LlmRegistry, SlotTunables};
 

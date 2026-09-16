@@ -169,6 +169,7 @@ pub struct Kernel {
     ledger_flows: SharedLedgerFlowBus,
     /// Durable shell receipts and context-owned kaish jobs.
     shell_operations: Arc<crate::shell_operations::ShellOperationRegistry>,
+    turn_state: crate::runtime::turn_state::TurnState,
     command_worker: OnceLock<Result<crate::runtime::worker::CommandWorker, String>>,
     command_worker_shutdown: tokio_util::sync::CancellationToken,
     /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
@@ -410,6 +411,7 @@ impl Kernel {
                 operations.abandon_unfinished().expect("settle interrupted shell operations");
                 Arc::new(operations)
             },
+            turn_state: crate::runtime::turn_state::TurnState::default(),
             command_worker: OnceLock::new(),
             command_worker_shutdown: tokio_util::sync::CancellationToken::new(),
             cc_inbox: OnceLock::new(),
@@ -418,6 +420,9 @@ impl Kernel {
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
         kernel
     }
+
+    /// Conversation ownership and interrupts shared by all model entry paths.
+    pub fn turns(&self) -> &crate::runtime::turn_state::TurnState { &self.turn_state }
 
     pub(crate) fn spawn_command<F, W>(&self, work: W) -> Result<(), String>
     where F: std::future::Future<Output = ()> + 'static, W: FnOnce(tokio_util::sync::CancellationToken) -> F + Send + 'static {

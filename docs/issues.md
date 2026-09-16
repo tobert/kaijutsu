@@ -72,6 +72,13 @@ reads now refresh target content; preserve dirty work while fixing the remaining
 metadata/guard behavior in the file-cache audit. Also check stale-read error
 branches that remove cache entries without preserving editor pins.
 
+A full kernel run during the turn-owner move exposed an intermittent empty read
+in `read_all_follows_symlink_without_truncating` (3055 passed, one failed;
+a repeat passed all 3056). `LocalBackend::write` awaits Tokio `File::write_all` but drops the handle without
+`flush`; buffered write completion is a contributing factor to investigate.
+Pin visibility through a separately opened reader and late write errors before
+changing this adapter. Evidence: `/tmp/kaijutsu-turn-owner-kernel.log`.
+
 Command execution for interactive submissions and approval resume now lives in
 `runtime/command.rs`; server `shell_run.rs` is deleted. Result projections and
 shell-state persistence moved out of RPC too. Paused PostCall/OnError tests pin
@@ -125,6 +132,13 @@ SIGTERM/SIGINT now await the command worker before checkpointing and exiting;
 host Drop remains a cancellation signal without a wait. Extend shutdown ownership
 to headless turns, approval resumes, and transport-owned command tasks as those
 owners migrate. Command cancellation also reaches block pairs without receipts.
+
+Model streaming, identity resolution, conversation sessions, and interrupts now
+belong to kernel runtime modules. RPC translates startup errors but no longer
+owns those state fields. The turn task still runs on its caller's LocalSet;
+migrate admission, task placement, terminal-event cleanup, and driver shutdown
+next. Startup failures after interrupt creation can leave an entry without a
+running task; cover that alongside cancellation and panic cleanup.
 
 ### Shared client recovery
 

@@ -1,6 +1,6 @@
 //! Resolve the performer and reviewer before starting model work.
 
-use kaijutsu_kernel::kernel_db::KernelDb;
+use crate::kernel_db::KernelDb;
 use kaijutsu_types::PrincipalId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub(crate) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::kernel_db::CharacterRow;
+    use crate::kernel_db::CharacterRow;
 
     fn character(db: &KernelDb, name: &str) -> PrincipalId {
         let principal_id = PrincipalId::new();

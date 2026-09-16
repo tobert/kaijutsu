@@ -20,6 +20,13 @@ multi-writer record but no longer drives wire history per-turn.
 See `CLAUDE.md` and the `architecture_context_invariants` memory for the
 invariants this implements.
 
+## Runtime owner
+
+The kernel's `TurnState` (`runtime/turn_state.rs`) owns conversation sessions,
+image caching, and interrupts. Interactive RPC and headless turn submission
+share `runtime/llm_stream.rs`. The server still supplies task placement while
+shutdown ownership migrates; see `docs/kaish-integration.md`.
+
 ## Tool pairing at send
 
 `ConversationMailbox::catch_up` discovers new blocks by reading the durable

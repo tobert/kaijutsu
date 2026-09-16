@@ -595,7 +595,7 @@ fn kaijutsu_session_scenario() {
         // ------------------------------------------------------------
         // Turn 4: banto signs off — reached by the kernel's own automatic
         // resume, not another explicit `kj drive`. Approving the ask opens
-        // a continuation epoch (`crates/kaijutsu-server/src/llm_stream.rs`'s
+        // a continuation epoch (`crates/kaijutsu-kernel/src/runtime/llm_stream.rs`'s
         // gate-resume path) and the approved command's completion resumes
         // banto's conversation on it directly: the mock queue's evidence
         // (the "handoff signoff" round trip was already consumed by the

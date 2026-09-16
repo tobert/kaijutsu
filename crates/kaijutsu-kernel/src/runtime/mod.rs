@@ -1,6 +1,7 @@
-//! Shared kaish integration for command, lifecycle, hook, and editor consumers.
+//! Contextual command execution and model turns.
 //!
-//! `context_shell` owns contextual construction and builtin wiring.
+//! `llm_stream` owns model turns; `turn_state` owns their conversations and
+//! interrupts. `context_shell` owns contextual construction and builtin wiring.
 //! `command` owns captured execution, result review, and block-pair settlement;
 //! `structured` owns addressed kj invocation. `command_outcome` retains execution
 //! and hook results. `command_result` and `shell_state` supply shared projections
@@ -9,6 +10,10 @@
 //! filesystem, and builtin modules implement kaish interfaces. Rc orchestration
 //! remains a distinct owner; see `docs/kaish-integration.md`.
 
+pub mod turn_state;
+pub mod interrupt;
+pub mod llm_stream;
+mod turn_identity;
 pub mod command;
 pub mod structured;
 pub(crate) mod tool_command;
