@@ -90,8 +90,12 @@ These are source observations, not promises that all paths behave alike.
   until settled; approval continues hooks without executing source again.
   Stream exit events preserve physical exits through output truncation; synthetic
   replacements use 0/1 completion codes because the wire requires an integer.
+  Each SSH RPC channel owns a dedicated LocalSet. Disconnect drops its retained
+  command/review tasks, abandons pending review, and preserves captured output.
+  The runtime stays entered through task destruction; connection teardown also
+  cancels registered execution tokens and removes the session binding.
 - MCP completion still projects independently. Live reporting/retry of
-  persistence failures and transport/task teardown also remain open.
+  persistence failures and kernel worker ownership also remain open.
 - `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
   PostCall or OnError ask. Approval continues the same ordered hook snapshot;
   neither the command nor earlier hooks run again. Result-review asks have
@@ -118,7 +122,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `runtime/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
 | Pending | Dedicated threads and startup runtime | kernel `lib.rs`; server `main.rs`, `ssh.rs`, `beat.rs`, turn/resume drivers | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
 | Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
-| Partial | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, and context switching migrated; disconnect/task teardown remains in the dedicated-thread audit |
+| Migrated | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
 | Partial | Approval resume | server resume drivers; kernel `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
 | Pending | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs` | Read-only/writable distinction, stdin, typed rejection, job ownership, receipts, cancellation, and async completion |

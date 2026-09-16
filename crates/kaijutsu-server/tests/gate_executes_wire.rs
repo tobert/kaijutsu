@@ -1516,3 +1516,39 @@ fn streaming_output_limit_preserves_the_command_exit() {
         s.close().await;
     });
 }
+
+#[test]
+fn disconnect_settles_retained_stream_review_and_removes_the_session() {
+    run_local(async {
+        let s = seats().await;
+        s.worker_kj.join_context(s.worker, "disconnect-review").await.unwrap();
+        s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("disconnect-review".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_principal: None, priority: 0, kaish_script_id: None,
+            action: HookAction::Ask(AskSpec { description: Some("Review before disconnect".into()) }),
+        });
+        s.worker_kj.execute("echo retained-before-disconnect").await.unwrap();
+        wait_for("review before disconnect", || s.kernel.kernel_db.lock().list_pending_asks().unwrap().iter()
+            .any(|ask| ask.hook_id.as_deref() == Some("disconnect-review"))).await;
+        let ask = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()
+            .find(|ask| ask.hook_id.as_deref() == Some("disconnect-review")).unwrap();
+        let session = *s.kernel.session_contexts.iter().find(|entry| *entry.value() == s.worker).unwrap().key();
+        let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, .. } = s;
+        drop(worker_kj);
+        drop(_worker_client);
+        wait_for("disconnected review settlement", || kernel.kernel.shell_operations()
+            .result_review_for_ask(&ask.request_id, worker).unwrap().unwrap().settled.is_some()).await;
+        let review = kernel.kernel.shell_operations().result_review_for_ask(&ask.request_id, worker).unwrap().unwrap();
+        assert_eq!(review.settled.unwrap().block_status(), Status::Error);
+        assert_eq!(kernel.kernel_db.lock().get_approval(&ask.request_id).unwrap().unwrap().status,
+            kaijutsu_kernel::ApprovalStatus::Abandoned);
+        assert!(!kernel.session_contexts.contains_key(&session));
+        let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = review.captured.execution
+            else { panic!("disconnect lost captured execution") };
+        assert_eq!(raw.text_out(), "retained-before-disconnect\n");
+        drop(approver_kj);
+        drop(_approver_client);
+        tokio::task::yield_now().await;
+    });
+}

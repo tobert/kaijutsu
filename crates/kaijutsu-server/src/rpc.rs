@@ -2007,6 +2007,7 @@ impl Drop for ConnectionState {
         // release their references. Without this, a wedged capnp callback
         // can pin those tasks indefinitely on the LocalSet.
         self.conn_cancel.cancel();
+        self.cancel_running_executions();
         // Un-know whatever this connection told us about the rig
         // (`docs/midi-next.md` "Presence is sink-fed"). Presence is
         // connection-bound for the case the sink cannot cover: a crash, a
@@ -12047,21 +12048,21 @@ mod shell_value_conversion_tests {
 
 #[cfg(test)]
 mod connection_state_tests {
-    //! Drop semantics for `ConnectionState`.
-    //!
-    //! These exist to lock in the wedge defenses added in 2026-05-10:
-    //!   * Dropping the connection cancels `conn_cancel` so background
-    //!     `spawn_local` tasks (FlowBus bridges, peer-invoke bridge) exit
-    //!     promptly via `tokio::select!` rather than pinning the LocalSet.
-    //!   * Dropping the connection removes the per-session entry from
-    //!     `session_contexts` even if `run_rpc` never completes — the
-    //!     explicit remove used to live at the tail of `run_rpc` and was
-    //!     skipped when the RPC system wedged.
+    //! Connection teardown cancels execution and subscription tasks, removes
+    //! session bindings, and withdraws connection-owned registrations.
     use super::*;
     use kaijutsu_kernel::runtime::context_engine::session_context_map;
 
     fn test_principal() -> PrincipalId {
         PrincipalId::new()
+    }
+
+    #[test]
+    fn drop_cancels_registered_streaming_executions() {
+        let mut state = ConnectionState::new(test_principal(), session_context_map());
+        let cancel = state.register_execution(1);
+        drop(state);
+        assert!(cancel.is_cancelled(), "connection teardown must stop its execution");
     }
 
     #[test]

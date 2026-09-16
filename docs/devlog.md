@@ -1604,8 +1604,13 @@ runtime owns state write-back, result hooks, and retained review. Replacements
 and denials now affect delivered output in every phase. Cancellation reaches
 kaish through ExecuteOptions and remains active during result review. An SSH
 regression exposed the unresolved truncation code in exit events; streaming now
-reports the physical exit. Transport teardown still needs explicit ownership:
-a running command holds the connection beyond the RPC system's lifetime.
+reports the physical exit. A disconnect test corrected the initial lifetime
+inference: each SSH channel drops its dedicated LocalSet when RPC ends, so the
+retained review guard already settles interruption and preserves execution.
+Teardown tests did expose two omissions: registered execution tokens were not
+cancelled on connection drop, and local tasks dropped outside an entered runtime.
+Connection teardown now cancels those tokens; both production and the shared SSH
+test helper keep the runtime entered through LocalSet destruction.
 
 ## The kernel with no one to answer to (September 16)
 

@@ -636,6 +636,9 @@ impl ConnectionHandler {
                     return;
                 }
             };
+            // Channel and task destructors may spawn cleanup work during unwind.
+            // Keep the runtime entered until the LocalSet has dropped.
+            let _entered = rt.enter();
             let local = tokio::task::LocalSet::new();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 local.block_on(&rt, async move {

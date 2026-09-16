@@ -1729,3 +1729,25 @@ fn test_shell_ansi_output_arrives_stripped_with_spans_on_the_wire() {
         assert!(cmd.style_spans.is_empty() && cmd.provenance.is_none());
     });
 }
+
+#[test]
+fn test_local_task_teardown_keeps_the_runtime_entered() {
+    struct RuntimeAtDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for RuntimeAtDrop {
+        fn drop(&mut self) {
+            self.0.store(tokio::runtime::Handle::try_current().is_ok(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = entered.clone();
+    run_local(async move {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_local(async move {
+            let _guard = RuntimeAtDrop(observed);
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+    });
+    assert!(entered.load(std::sync::atomic::Ordering::SeqCst), "task destructors need the runtime during LocalSet teardown");
+}

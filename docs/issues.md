@@ -111,18 +111,6 @@ retained result-review owner: result-phase Ask/escalation returns GateUnavailabl
 before minting an ask. Migrate these callers and their job projections while
 preserving the complete shared-outcome contract.
 
-Streaming commands hold a strong connection reference while executing or
-reviewing. `run_rpc` teardown currently relies on `ConnectionState::Drop`, so a
-retained command can outlive the transport and delay session cleanup. Audit
-explicit transport shutdown and task ownership with the dedicated-thread row;
-interrupting a live execution is verified separately.
-
-The new SSH/RPC regression passes but can print a russh teardown panic after
-its assertions (`there is no reactor running`). The common test helper drops
-its LocalSet outside an entered runtime; verify orderly task/channel shutdown
-in the test-harness audit. This does not explain the reproduced Done-before-hook
-race, which fails inside the active runtime.
-
 ### Shared client recovery
 
 Give `kaijutsu-client` ownership of subscription, mirror, snapshot recovery,

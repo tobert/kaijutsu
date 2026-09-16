@@ -20,6 +20,8 @@ pub fn run_local<F: std::future::Future<Output = ()>>(f: F) {
         .enable_all()
         .build()
         .unwrap();
+    // Retained channel/task destructors still need the runtime during teardown.
+    let _entered = rt.enter();
     let local = LocalSet::new();
     rt.block_on(local.run_until(f));
 }
