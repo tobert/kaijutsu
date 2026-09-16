@@ -1573,6 +1573,21 @@ cover approval, denial, OnError, kaish escalation, and sequential reviews with
 one observed command side effect. Unmigrated consumers fail result escalation
 before creating an ask; structured/streaming RPC and MCP migration remains open.
 
+Structured `executeKj` then moved out of RPC into `runtime/structured.rs` and the
+shared command owner. Its separate settlement path dropped replacement data and
+retained failed command metadata after a successful hook replacement. Regressions
+reproduced both that data loss and unavailable result review. Authored calls now
+register durable receipts, return Pending without holding the RPC open, and keep
+the command task alive through review. Quiet calls share captured execution and
+result projection without authoring a pair or receipt; their result-review
+retention remains open. Context switches stay pinned for structured callers.
+Typed refusals travel in retained outcomes, with absent fields omitted to preserve
+the encoding of earlier immutable records. Literal argv and requester/performer
+separation are checked at the kernel entry point. The literal-argument test
+also exposed Bash-style backtick escaping that kaish preserved as extra text;
+quoting now follows the pinned kaish parser. Its native argv API lacks per-call
+execution options, so this path retains source execution and cancellation.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

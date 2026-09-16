@@ -1314,3 +1314,36 @@ fn kaish_result_hook_escalation_resumes_after_approval() {
 fn sequential_result_reviews_keep_the_same_hook_snapshot() {
     run_local(result_review_case(false, true, false, true));
 }
+
+#[test]
+fn structured_result_review_returns_pending_then_continues_without_repeating_kj() {
+    run_local(async {
+        let s = seats().await;
+        s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("structured-review".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review kj result".into()) }),
+            priority: 0, kaish_script_id: None,
+        });
+        let argv: Vec<String> = ["block", "create", "--role", "user", "--kind", "text", "--content", "structured-review-once"]
+            .into_iter().map(str::to_owned).collect();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5),
+            s.worker_kj.execute_kj(s.worker, &argv)).await.expect("result review must release the RPC").unwrap_err();
+        let kaijutsu_client::RpcError::Refused(refusal) = error else { panic!("expected typed pending review: {error}") };
+        assert_eq!(refusal.kind, kaijutsu_types::RefusalKind::Pending);
+        let ask = refusal.ask.unwrap();
+        let operation = s.kernel.kernel.shell_operations().get_by_ask(&ask.request_id, s.worker)
+            .unwrap().expect("structured review has a durable receipt");
+        assert_eq!(s.block(&operation.receipt.output_block_id).status, Status::Waiting);
+        s.answer(&ask.request_id, true).await;
+        wait_for("structured result publication", || {
+            s.kernel.kernel.shell_operations().get(&operation.receipt.operation_id, s.worker)
+                .unwrap().unwrap().completed_at.is_some()
+        }).await;
+        let output = s.block(&operation.receipt.output_block_id);
+        assert_eq!(output.status, Status::Done, "{output:?}");
+        let blocks = s.kernel.documents.block_snapshots(s.worker).unwrap();
+        assert_eq!(blocks.iter().filter(|block| block.content == "structured-review-once").count(), 1);
+        s.close().await;
+    });
+}

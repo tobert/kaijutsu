@@ -21,7 +21,11 @@ pub enum CommandExecution {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandHookEffect {
     Replacement(KernelToolResult),
-    Refused { reason: String, waiting: bool, ask_id: Option<String> },
+    Refused {
+        reason: String, waiting: bool, ask_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<kaijutsu_types::Refusal>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,10 +56,18 @@ impl CommandOutcome {
             ShellHookVerdict::ShortCircuit(result) => Some(CommandHookEffect::Replacement(result)),
             ShellHookVerdict::Denied(error) => Some(CommandHookEffect::Refused {
                 reason: error.to_string(),
+                refusal: error.as_refusal(),
                 waiting: error.settled_block_status() == Status::Waiting,
                 ask_id: error.as_refusal().and_then(|refusal| refusal.ask_id().map(str::to_owned)),
             }),
         };
+    }
+
+    pub fn refusal(&self) -> Option<&kaijutsu_types::Refusal> {
+        match &self.hook {
+            Some(CommandHookEffect::Refused { refusal, .. }) => refusal.as_ref(),
+            _ => None,
+        }
     }
 
     /// The public result reports a physical exit only when it still describes
@@ -70,7 +82,7 @@ impl CommandOutcome {
                 envelope.ephemeral = Some(false);
                 envelope
             }
-            Some(CommandHookEffect::Refused { reason, waiting, ask_id }) => {
+            Some(CommandHookEffect::Refused { reason, waiting, ask_id, .. }) => {
                 let mut envelope = ShellEnvelope::new(if *waiting { ShellStatus::Waiting } else { ShellStatus::Error });
                 envelope.error = Some(reason.clone());
                 envelope.ask_id = ask_id.clone();

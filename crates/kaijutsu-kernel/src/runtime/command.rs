@@ -20,6 +20,25 @@ use super::shell_state::{persist_shell_state, snapshot_shell_state};
 /// session map to update.
 pub type ContextSwitchSink<'a> = Option<&'a dyn Fn(ContextId)>;
 
+/// A structured command stays addressed to its context; interactive commands
+/// publish an in-shell switch and may update a connection's session map.
+pub enum CommandContextSwitch<'a> {
+    Publish(ContextSwitchSink<'a>),
+    Pinned,
+}
+
+pub struct CommandRunOptions<'a> {
+    pub stdin: Option<String>,
+    pub context_switch: CommandContextSwitch<'a>,
+    pub review_notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
+}
+
+impl Default for CommandRunOptions<'_> {
+    fn default() -> Self {
+        Self { stdin: None, context_switch: CommandContextSwitch::Publish(None), review_notices: None }
+    }
+}
+
 /// Retain the outcome before projection and commit its receipt before terminal
 /// block publication. Failed projections keep their recovery marker and return
 /// an error; startup finishes them without executing the command again.
@@ -151,14 +170,13 @@ fn context_switched(
 pub async fn run_into_blocks(
     kaish: &EmbeddedKaish,
     code: &str,
-    stdin: Option<String>,
     context_id: ContextId,
     command_block_id: &BlockId,
     output_block_id: &BlockId,
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
-    on_context_switch: ContextSwitchSink<'_>,
-) -> Result<(), String> {
+    run: CommandRunOptions<'_>,
+) -> Result<CommandOutcome, String> {
     // Yield to let the event loop flush BlockInserted events to clients
     // before we start producing text ops. Without this, fast commands
     // (like `ls`) can emit edit_text before the client has processed the
@@ -166,7 +184,7 @@ pub async fn run_into_blocks(
     tokio::task::yield_now().await;
 
     let mut options = kaish_kernel::ExecuteOptions::default();
-    if let Some(stdin) = stdin {
+    if let Some(stdin) = run.stdin {
         options = options.with_stdin(stdin);
     }
     let tracked_job = match kernel.shell_operations().get_by_output(output_block_id, context_id) {
@@ -184,7 +202,7 @@ pub async fn run_into_blocks(
                 let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
                 manager.finalize_streams(job, &failure).await;
                 let _ = sender.send(failure);
-                return settled;
+                return settled.map(|()| outcome);
             }
             Some((manager, job, sender))
         }
@@ -192,26 +210,72 @@ pub async fn run_into_blocks(
         Err(error) => return Err(error),
     };
 
+    let started = std::time::Instant::now();
+    let review_cancel = options.cancel_token.clone().unwrap_or_default();
+    let mut outcome = capture_command(kaish, code, options, kernel, context_id, run.context_switch).await;
+
+    let review = super::result_review::CommandResultReview {
+        kernel: kernel.clone(), context: context_id, command: *command_block_id, output: *output_block_id,
+        captured: outcome.clone(), cancel: review_cancel, notices: run.review_notices,
+    };
+    apply_result_hooks(&mut outcome, code, kernel, call_ctx, Some(&review)).await;
+
+    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
+    if let Some((manager, job, sender)) = tracked_job {
+        if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
+        let result = outcome.job_result();
+        manager.finalize_streams(job, &result).await;
+        let _ = sender.send(result);
+    }
+    settled.map(|()| outcome)
+}
+
+/// Execute a receipt-free command with the same state and hook policy. Quiet
+/// callers author no blocks; result escalation requires a retained review owner.
+pub async fn run_quiet(
+    kaish: &EmbeddedKaish,
+    code: &str,
+    kernel: &Arc<Kernel>,
+    call_ctx: &crate::mcp::CallContext,
+) -> CommandOutcome {
+    let started = std::time::Instant::now();
+    let mut outcome = capture_command(kaish, code, kaish_kernel::ExecuteOptions::default(),
+        kernel, call_ctx.context_id, CommandContextSwitch::Pinned).await;
+    apply_result_hooks(&mut outcome, code, kernel, call_ctx, None).await;
+    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    outcome
+}
+
+async fn capture_command(
+    kaish: &EmbeddedKaish,
+    code: &str,
+    options: kaish_kernel::ExecuteOptions,
+    kernel: &Arc<Kernel>,
+    context_id: ContextId,
+    context_switch: CommandContextSwitch<'_>,
+) -> CommandOutcome {
     // Persist only this invocation's cwd/export changes to the context.
     let state_before = snapshot_shell_state(kaish).await;
 
     let started = std::time::Instant::now();
-    let review_cancel = options.cancel_token.clone().unwrap_or_default();
     let result = kaish.execute_with_options(code, options).await;
     let mut outcome = CommandOutcome::from_execution(result, started.elapsed().as_millis() as u64);
 
     // A context switch saves the outgoing state itself. Its snapshots span
     // two contexts, so only runs that stayed put write back this diff.
-    match context_switched(kaish, context_id, on_context_switch) {
+    match if let CommandContextSwitch::Publish(sink) = context_switch {
+        context_switched(kaish, context_id, sink)
+    } else { kaish.context_id().filter(|id| *id != context_id) } {
         Some(new_context_id) => {
             tracing::info!(
                 "shell_execute: context switched {} → {}",
                 context_id,
                 new_context_id
             );
-            kernel.block_flows().publish(crate::flows::BlockFlow::ContextSwitched {
-                context_id: new_context_id,
-            });
+            if matches!(context_switch, CommandContextSwitch::Publish(_)) {
+                kernel.block_flows().publish(crate::flows::BlockFlow::ContextSwitched { context_id: new_context_id });
+            }
         }
         None => {
             let state_after = snapshot_shell_state(kaish).await;
@@ -222,28 +286,25 @@ pub async fn run_into_blocks(
         }
     }
 
-    let review = super::result_review::CommandResultReview {
-        kernel: kernel.clone(), context: context_id, command: *command_block_id, output: *output_block_id,
-        captured: outcome.clone(), cancel: review_cancel,
-    };
+    outcome
+}
+
+async fn apply_result_hooks(
+    outcome: &mut CommandOutcome,
+    code: &str,
+    kernel: &Kernel,
+    call_ctx: &crate::mcp::CallContext,
+    review: Option<&dyn crate::mcp::broker::ResultReview>,
+) {
     let verdict = match &outcome.execution {
         CommandExecution::Completed(result) => kernel.broker().shell_post_call_hooks(
-            code, call_ctx, &exec_result_to_hook_tool_result(result), Some(&review)).await,
+            code, call_ctx, &exec_result_to_hook_tool_result(result), review).await,
         CommandExecution::Rejected(error) | CommandExecution::Fault(error) => kernel.broker().shell_on_error_hooks(
-            code, call_ctx, &crate::mcp::McpError::Protocol(error.clone()), Some(&review)).await,
+            code, call_ctx, &crate::mcp::McpError::Protocol(error.clone()), review).await,
         CommandExecution::NotRun => unreachable!("a completed invocation has an execution outcome"),
     };
     outcome.apply_hook(verdict);
 
-    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
-    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
-    if let Some((manager, job, sender)) = tracked_job {
-        if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
-        let result = outcome.job_result();
-        manager.finalize_streams(job, &result).await;
-        let _ = sender.send(result);
-    }
-    settled
 }
 
 #[cfg(test)]
@@ -296,8 +357,8 @@ mod fill_tests {
             kaish.set_context_id(ctx);
             let call_ctx = crate::mcp::CallContext::new(
                 PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
-            let run = run_into_blocks(&kaish, code, None, ctx, &command, &output,
-                &kernel, &call_ctx, None);
+            let run = run_into_blocks(&kaish, code, ctx, &command, &output,
+                &kernel, &call_ctx, CommandRunOptions::default());
             let observe = async {
                 tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await.unwrap();
                 let command_status = documents.get_block_snapshot(ctx, &command).unwrap().unwrap().status;
@@ -337,9 +398,9 @@ mod fill_tests {
         });
         let kaish = EmbeddedKaish::new("replacement-projections", documents.clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(ctx);
-        run_into_blocks(&kaish, "echo warning >&2; false", None, ctx, &command, &output,
+        run_into_blocks(&kaish, "echo warning >&2; false", ctx, &command, &output,
             &kernel,
-            &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), None).await.unwrap();
+            &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), CommandRunOptions::default()).await.unwrap();
         let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
         assert_eq!(block.status, Status::Done);
         assert_eq!(block.exit_code, None, "a replacement has no command exit code");
@@ -379,9 +440,9 @@ mod fill_tests {
                 command, output, &code, None).unwrap();
             let kaish = EmbeddedKaish::new("real-exit", documents.clone(), kernel.clone(), None).unwrap();
             kaish.set_context_id(ctx);
-            run_into_blocks(&kaish, &code, None, ctx, &command, &output,
+            run_into_blocks(&kaish, &code, ctx, &command, &output,
                 &kernel,
-                &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), None).await.unwrap();
+                &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), CommandRunOptions::default()).await.unwrap();
             let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
             assert_eq!(block.status, Status::Error, "exit {exit} is a command failure");
             let envelope = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap();
@@ -526,8 +587,8 @@ mod fill_tests {
             command, output, "echo '", None).unwrap();
         let kaish = EmbeddedKaish::new("rejected-command", documents.clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(ctx);
-        run_into_blocks(&kaish, "echo '", None, ctx, &command, &output, &kernel,
-            &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), None).await.unwrap();
+        run_into_blocks(&kaish, "echo '", ctx, &command, &output, &kernel,
+            &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), CommandRunOptions::default()).await.unwrap();
         let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
         assert_eq!(block.status, Status::Error);
         assert!(block.content.is_empty());
@@ -567,7 +628,6 @@ mod fill_tests {
         run_into_blocks(
             &kaish,
             "echo replaced",
-            None,
             ctx,
             &call,
             &result,
@@ -575,7 +635,7 @@ mod fill_tests {
             &crate::mcp::CallContext::new(
                 PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id(),
             ),
-            None,
+            CommandRunOptions::default(),
         )
         .await.unwrap();
 

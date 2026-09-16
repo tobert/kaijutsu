@@ -58,9 +58,9 @@
 
 #![allow(refining_impl_trait)]
 
-use kaijutsu_kernel::runtime::command_result::{
-    block_output_data, exec_result_to_hook_tool_result, shell_hook_result_text,
-};
+use kaijutsu_kernel::runtime::command::{CommandContextSwitch, CommandRunOptions};
+use kaijutsu_kernel::runtime::structured::ExecutedKj;
+use kaijutsu_kernel::runtime::command_result::exec_result_to_hook_tool_result;
 use kaijutsu_kernel::runtime::shell_state::{snapshot_shell_state, persist_shell_state};
 
 use kaijutsu_kernel::runtime::context_shell::{ShellIdentity, ShellPolicy};
@@ -1220,16 +1220,13 @@ async fn act_on_executable_answer(
     if let Err(error) = kaijutsu_kernel::runtime::command::run_into_blocks(
         &kaish,
         source,
-        ask.stdin.clone(),
         context_id,
         &command_block_id,
         &output_block_id,
         &kernel.kernel,
         &kaijutsu_kernel::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id)
             .with_actor(ask.actor, Some(ask.reviewer)),
-        // Nothing to move a context switch onto: this run has no session
-        // map of its own and no connection behind it.
-        None,
+        CommandRunOptions { stdin: ask.stdin.clone(), ..Default::default() },
     )
     .await {
         kernel.conversation_cache.evict(context_id);
@@ -5764,7 +5761,7 @@ impl kernel::Server for KernelImpl {
                     if let Some(latch) = executed.latch {
                         out.set_latch_command(&latch.command);
                         out.set_latch_target(&latch.target);
-                        out.set_latch_message(&latch.message);
+                        out.set_latch_message(&latch.hint);
                         out.set_has_latch(true);
                     } else {
                         out.set_latch_command("");
@@ -9826,7 +9823,7 @@ async fn execute_shell_command(
             let mut outcome = kaijutsu_kernel::runtime::command_outcome::CommandOutcome::new(
                 kaijutsu_kernel::runtime::command_outcome::CommandExecution::NotRun, 0);
             outcome.hook = Some(kaijutsu_kernel::runtime::command_outcome::CommandHookEffect::Refused {
-                reason: err.to_string(), waiting: err.settled_block_status() == Status::Waiting,
+                reason: err.to_string(), refusal: err.as_refusal(), waiting: err.settled_block_status() == Status::Waiting,
                 ask_id: err.as_refusal().and_then(|refusal| refusal.ask_id().map(str::to_owned)),
             });
             kaijutsu_kernel::runtime::command::settle_outcome(
@@ -9882,13 +9879,12 @@ async fn execute_shell_command(
         if let Err(error) = kaijutsu_kernel::runtime::command::run_into_blocks(
             &kaish,
             &code,
-            None,
             context_id,
             &command_block_id_clone,
             &output_block_id_clone,
             &kernel_arc_for_hooks,
             &call_ctx,
-            Some(&record_switch),
+            CommandRunOptions { context_switch: CommandContextSwitch::Publish(Some(&record_switch)), ..Default::default() },
         )
         .await {
             log::error!("shell command settlement failed: {error}");
@@ -9917,22 +9913,6 @@ fn kj_command_catalog() -> Vec<KjCatalogEntry> {
         KjCatalogEntry { name: "models", description: "List available models", input_hint: "", argv_prefix: &["models"] },
     ]
 }
-
-struct ExecutedKj {
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
-    /// `None` for a quiet run, which authors no blocks — see `KjBlockSink`.
-    command_block_id: Option<kaijutsu_types::BlockId>,
-    latch: Option<ExecutedKjLatch>,
-    /// `KjResult::Ok`'s structured data (via `block_output_data`'s
-    /// `rich_json`), carried alongside the block-persistence path that
-    /// already wrote it onto the output block. `None` when the verb
-    /// produced no structured payload.
-    data: Option<serde_json::Value>,
-}
-
-struct ExecutedKjLatch { command: String, target: String, message: String }
 
 /// `rpc.rs::execute`'s narrow spot: the streaming exec path has no context
 /// block to rewrite and has already returned `exec_id` to the caller by the
@@ -9966,41 +9946,8 @@ fn log_shell_hook_verdict_if_unactionable(
     }
 }
 
-fn kaish_quote(word: &str) -> String {
-    let escaped = word.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-        .replace('`', "\\`");
-    format!("\"{}\"", escaped)
-}
-
-/// Where `execute_kj_command` writes its tool-call/tool-result pair — or
-/// nowhere, for a quiet run (`quiet` on `executeKj`, kaijutsu.capnp). Every
-/// block-store write past the pair's creation guards on this, so a quiet run
-/// executes the verb and returns its outcome without touching the store.
-enum KjBlockSink {
-    Authored { command_block_id: BlockId, output_block_id: BlockId },
-    Quiet,
-}
-
-impl KjBlockSink {
-    fn command_block_id(&self) -> Option<BlockId> {
-        match self {
-            Self::Authored { command_block_id, .. } => Some(*command_block_id),
-            Self::Quiet => None,
-        }
-    }
-}
-
-/// Execute exactly one `kj` builtin against an addressed context. This is a
-/// sibling of shell execution, not a call through its facade: the context's
-/// materialized kaish supplies kj's rc, persistence and latch semantics while
-/// structured argv prevents this RPC from becoming a general shell escape.
-///
-/// `quiet` skips the tool-call/tool-result pair: the verb still runs with
-/// the same context, principal, capability checks and gate, but nothing
-/// lands in the transcript. For a client's own bookkeeping (polling the
-/// ledger), never for a player's command.
+/// Transport lifetime: a pending result review releases the RPC while the
+/// command task retains execution and publishes its eventual block outcome.
 async fn execute_kj_command(
     context_id: ContextId,
     principal: PrincipalId,
@@ -10009,264 +9956,29 @@ async fn execute_kj_command(
     connection: &Rc<RefCell<ConnectionState>>,
     quiet: bool,
 ) -> Result<Result<ExecutedKj, kaijutsu_types::Refusal>, capnp::Error> {
-    require_context_exists(kernel, context_id)?;
-    let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
-    let documents = kernel.documents.clone();
-    if documents.get(context_id).is_none() {
-        return Err(capnp::Error::failed(format!("context {} is not materialized", context_id)));
-    }
-    let sink = if quiet {
-        KjBlockSink::Quiet
-    } else {
-        let last = documents.last_block_id(context_id);
-        let command_block_id = documents.insert_tool_call_as(
-            context_id, None, last.as_ref(), "kj", serde_json::json!({"argv": argv}),
-            Some(TypesToolKind::Builtin), Some(principal), None, Some(Role::User),
-        ).map_err(|e| capnp::Error::failed(format!("failed to insert kj command: {e}")))?;
-        let output_block_id = documents.insert_tool_result_as(
-            context_id, &command_block_id, Some(&command_block_id), "", false, None,
-            Some(TypesToolKind::Builtin), Some(PrincipalId::system()), None,
-        ).map_err(|e| capnp::Error::failed(format!("failed to insert kj output: {e}")))?;
-        let _ = documents.set_status(context_id, &output_block_id, Status::Running);
-        KjBlockSink::Authored { command_block_id, output_block_id }
-    };
-
-    let mut code = String::from("kj");
-    for arg in argv {
-        code.push(' ');
-        code.push_str(&kaish_quote(arg));
-    }
-
-    // Same ruling as `execute_shell_command` (docs/gate-and-shell-split.md,
-    // "The three rpc.rs shell paths take the hook path"): this also runs
-    // kaish directly, so it gets the same PreCall verdict a `shell_write`
-    // tool call would.
-    let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
-        principal,
-        context_id,
-        connection.borrow().session_id,
-        kernel.id,
-    ).with_actor(principal, context_reviewer(kernel, context_id).await);
-    match kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await {
-        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
-        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
-            let text = shell_hook_result_text(&sc_result);
-            let status = if sc_result.is_error { Status::Error } else { Status::Done };
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                let _ = documents.edit_text_as(context_id, output_block_id, 0, &text, 0, Some(PrincipalId::system()));
-                let _ = documents.set_status(context_id, output_block_id, status);
-                let _ = documents.set_status(context_id, command_block_id, status);
-            }
-            let exit_code = if sc_result.is_error { 1 } else { 0 };
-            return Ok(Ok(ExecutedKj {
-                exit_code, stdout: text, stderr: String::new(),
-                command_block_id: sink.command_block_id(), latch: None, data: None,
-            }));
+    let session = connection.borrow().session_id;
+    let reviewer = context_reviewer_for(kernel, context_id, principal).await;
+    let identity = ShellIdentity { requester: principal, performer: principal, reviewer, context: context_id, session };
+    let kernel = kernel.kernel.clone();
+    let argv = argv.to_vec();
+    let (notices, mut reviews) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, completed) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_local(async move {
+        let result = kaijutsu_kernel::runtime::structured::execute_kj(&kernel, identity, &argv, quiet, Some(notices)).await;
+        if let Err(Err(error)) = reply.send(result) {
+            log::error!("structured command settlement failed after its RPC departed: {error}");
         }
-        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            // No "denied" prefix, for the reason the shell path states at the
-            // sibling arm: this carries `Denied`, `GateUnavailable` and
-            // `GatePending`, and only the first is a no. Each variant's
-            // Display already names what happened.
-            let reason = err.to_string();
-            let settled = err.settled_block_status();
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                let _ = documents.set_stderr(context_id, output_block_id, Some(reason.clone()));
-                let _ = documents.set_status(context_id, output_block_id, settled);
-                let _ = documents.set_status(context_id, command_block_id, settled);
-            }
-            // A verdict rides the result; only a fault still throws.
-            return Ok(Err(refusal_or_fault(err, "kj")?));
-        }
-    }
-
-    let state_before = snapshot_shell_state(&kaish).await;
-    let result = match kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()).await {
-        Ok(result) => result,
-        Err(e) => {
-            let stderr = format!("kj execution failed: {e}");
-            if let KjBlockSink::Authored { output_block_id, .. } = &sink {
-                documents.set_stderr(context_id, output_block_id, Some(stderr.clone()))
-                    .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
-                documents.set_exit_code(context_id, output_block_id, Some(1))
-                    .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
-
-            }
-
-            // OnError — hand the hook the real failure (mirrors
-            // `call_tool`'s own OnError pinch point). `ShortCircuit` can
-            // convert the failure into a synthetic success, same as
-            // `call_tool`'s OnError; `Proceed`/`Deny` both leave the real
-            // error above standing — a failed command is already the
-            // terminal state a `Deny` would produce.
-            let mcp_err = kaijutsu_kernel::mcp::McpError::Protocol(e.to_string());
-            if let kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) = kernel
-                .kernel
-                .broker()
-                .shell_on_error_hooks(&code, &call_ctx, &mcp_err, None)
-                .await
-            {
-                let text = shell_hook_result_text(&sc_result);
-                let status = if sc_result.is_error { Status::Error } else { Status::Done };
-                if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                    if let Err(e) = documents.replace_text_as(context_id, output_block_id, &text, Some(PrincipalId::system())) {
-                        log::error!("Failed to write OnError short-circuited kj output: {}", e);
-                    }
-                    let _ = documents.set_status(context_id, output_block_id, status);
-                    let _ = documents.set_status(context_id, command_block_id, status);
-                }
-                let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
-                return Ok(Ok(ExecutedKj {
-                    exit_code: sc_exit_code, stdout: text, stderr: String::new(),
-                    command_block_id: sink.command_block_id(), latch: None, data: None,
-                }));
-            }
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                for block in [output_block_id, command_block_id] {
-                    documents.set_status(context_id, block, Status::Error)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                }
-            }
-            return Ok(Ok(ExecutedKj {
-                exit_code: 1, stdout: String::new(), stderr,
-                command_block_id: sink.command_block_id(), latch: None, data: None,
-            }));
-        }
-    };
-    // kj's confirmation gate rides kaish's opaque `baggage` channel as of
-    // kaish 0.14 (which deleted the typed `ExecResult.latch`). Same three
-    // fields on the wire — `hasLatch`/`latchCommand`/`latchTarget`/
-    // `latchMessage` are unchanged.
-    let latch =
-        kaijutsu_kernel::runtime::kj_builtin::latch_from_result(&result).map(|latch| {
-            ExecutedKjLatch {
-                command: latch.command,
-                target: latch.target,
-                message: latch.hint,
-            }
-        });
-    // Same ANSI ingest as interactive shell stdout (docs/ansi-and-beyond.md):
-    // `kj` verbs colorize too, and the RPC caller gets the same clean
-    // projection the block does — one text, one set of byte offsets.
-    let raw_out = kaijutsu_kernel::ansi_ingest::raw_stdout(&result);
-    let projection = kaijutsu_kernel::ansi_ingest::project(&raw_out);
-    let stdout = match projection {
-        Some(ref p) => p.text.clone(),
-        None => result.text_out().into_owned(),
-    };
-    let stderr = result.err.clone();
-    let exit_code = result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    let output_data = block_output_data(&result);
-    if let KjBlockSink::Authored { output_block_id, .. } = &sink {
-        documents.edit_text_as(context_id, output_block_id, 0, &stdout, 0, Some(PrincipalId::system()))
-            .map_err(|e| capnp::Error::failed(format!("failed to persist kj output: {e}")))?;
-        // After the edit — `edit_text` clears style_spans.
-        if let Some(p) = projection {
-            kaijutsu_kernel::ansi_ingest::record(
-                &documents,
-                context_id,
-                output_block_id,
-                p.spans,
-                &raw_out,
-            );
-        }
-        if !stderr.is_empty() {
-            documents.set_stderr(context_id, output_block_id, Some(stderr.clone()))
-                .map_err(|e| capnp::Error::failed(format!("failed to persist kj stderr: {e}")))?;
-        }
-        if let Some(output) = &output_data {
-            documents.set_output(context_id, output_block_id, Some(output))
-                .map_err(|e| capnp::Error::failed(format!("failed to persist kj data: {e}")))?;
-        }
-        documents.set_exit_code(context_id, output_block_id, Some(exit_code))
-            .map_err(|e| capnp::Error::failed(format!("failed to persist kj exit code: {e}")))?;
-
-    }
-    // Deliberately ignore kaish.context_id(): ACP sessions stay pinned even
-    // when a (future or direct-RPC) kj command returns KjResult::Switch.
-    let state_after = snapshot_shell_state(&kaish).await;
-    if kaish.context_id() == Some(context_id) {
-        if let Err(error) = persist_shell_state(&kernel.kernel_db, context_id, &state_before, &state_after) {
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                documents.set_stderr(context_id, output_block_id, Some(error.clone()))
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                for block in [command_block_id, output_block_id] {
-                    documents.set_status(context_id, block, Status::Error)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                }
-            }
-            return Err(capnp::Error::failed(error));
-        }
-    }
-    let data = output_data.and_then(|od| od.rich_json);
-
-    // PostCall — hand the hook the real result this command produced
-    // (docs/gate-and-shell-split.md, "The three rpc.rs shell paths take
-    // the hook path"): mirrors `Broker::call_tool`'s own PostCall pinch
-    // point. `Proceed` changes nothing — the real output above already
-    // stands. `ShortCircuit` overrides it the same way `call_tool`'s
-    // PostCall can override a real server result; `Deny` settles both
-    // blocks to `Error` and reports the hook's reason instead of the real
-    // output, same as a `call_tool` caller getting `Denied` instead of the
-    // result it actually produced.
-    let hook_result = exec_result_to_hook_tool_result(&result);
-    match kernel
-        .kernel
-        .broker()
-        .shell_post_call_hooks(&code, &call_ctx, &hook_result, None)
-        .await
-    {
-        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                let status = if matches!(result.code, 0 | 2 | 3) { Status::Done } else { Status::Error };
-                documents.set_status(context_id, output_block_id, status)
-                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj output: {e}")))?;
-                documents.set_status(context_id, command_block_id, status)
-                    .map_err(|e| capnp::Error::failed(format!("failed to settle kj command: {e}")))?;
-            }
-            Ok(Ok(ExecutedKj {
-                exit_code, stdout, stderr, command_block_id: sink.command_block_id(), latch, data,
-            }))
-        }
-        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
-            let text = shell_hook_result_text(&sc_result);
-            let status = if sc_result.is_error { Status::Error } else { Status::Done };
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                if let Err(e) = documents.replace_text_as(context_id, output_block_id, &text, Some(PrincipalId::system())) {
-                    log::error!("Failed to write PostCall short-circuited kj output: {}", e);
-                }
-                let _ = documents.set_status(context_id, output_block_id, status);
-                let _ = documents.set_status(context_id, command_block_id, status);
-            }
-            let sc_exit_code = if sc_result.is_error { 1 } else { 0 };
-            Ok(Ok(ExecutedKj {
-                exit_code: sc_exit_code, stdout: text, stderr: String::new(),
-                command_block_id: sink.command_block_id(), latch: None, data: None,
-            }))
-        }
-        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            // "on ...", not "denied by ...": see the shell path's twin.
-            //
-            // This arm used to dress the refusal as a synthetic success
-            // (`ExecutedKj { exit_code: 1, .. }`) — a caller checking only
-            // the exit code could never tell a denial from a command that
-            // legitimately failed. It now rides the same `refused` arm
-            // every other verdict here does.
-            let reason = format!("on kj command result: {err}");
-            let settled = err.settled_block_status();
-            if let KjBlockSink::Authored { command_block_id, output_block_id } = &sink {
-                let _ = documents.set_stderr(context_id, output_block_id, Some(reason.clone()));
-                let _ = documents.set_status(context_id, output_block_id, settled);
-                let _ = documents.set_status(context_id, command_block_id, settled);
-            }
-            Ok(Err(refusal_or_fault(err, "kj")?))
-        }
+    }.instrument(tracing::Span::current()));
+    tokio::select! {
+        Some(refusal) = reviews.recv() => Ok(Err(refusal)),
+        result = completed => result.map_err(|_| capnp::Error::failed("structured command task stopped before replying".into()))?
+            .map_err(capnp::Error::failed),
     }
 }
 
 #[cfg(test)]
 mod kj_rpc_tests {
-    use super::{kaish_quote, kj_command_catalog};
+    use super::kj_command_catalog;
 
     #[test]
     fn static_catalog_excludes_attach_and_context_switch() {
@@ -10280,13 +9992,7 @@ mod kj_rpc_tests {
         assert_eq!(catalog[0].argv_prefix, &["help"]);
     }
 
-    #[test]
-    fn structured_argv_cannot_escape_the_single_kj_invocation() {
-        let hostile = "x'; context switch victim; echo '";
-        let quoted = kaish_quote(hostile);
-        assert_eq!(quoted, "\"x'; context switch victim; echo '\"");
-        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
-    }
+
 }
 
 // ============================================================================

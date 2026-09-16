@@ -22,9 +22,10 @@ pub enum RefusalKind {
     /// A human or a rule decided no. Retrying the same call gets the same
     /// answer.
     Denied,
-    /// A durable ask is recorded and **nothing ran**. The action runs when
-    /// the answer lands, not when this call returned. Do other work and come
-    /// back; do not retry in a loop.
+    /// A durable ask awaits a decision. PreCall asks stop execution; result
+    /// reviews retain work that already ran and stop its publication. The
+    /// reason identifies which action continues when answered. Do other work
+    /// and come back; do not retry in a loop.
     Pending,
     /// An ask hook fired and never reached a verdict — no dispatcher was
     /// wired, or the ledger could not be reached. Fails closed like a

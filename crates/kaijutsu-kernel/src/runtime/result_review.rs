@@ -12,6 +12,7 @@ pub(super) struct CommandResultReview {
     pub output: BlockId,
     pub captured: CommandOutcome,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
 }
 
 struct ReviewGuard<'a> {
@@ -44,7 +45,7 @@ impl Drop for ReviewGuard<'_> {
         let mut outcome = self.owner.captured.clone();
         outcome.hook = Some(CommandHookEffect::Refused {
             reason: "Result review was interrupted; captured execution was not repeated.".into(),
-            waiting: false, ask_id: Some(self.ask.request_id.clone()),
+            refusal: None, waiting: false, ask_id: Some(self.ask.request_id.clone()),
         });
         if let Err(error) = super::command::settle_outcome(&self.owner.kernel, self.owner.context,
             &self.owner.command, &self.owner.output, &outcome)
@@ -73,12 +74,19 @@ impl CommandResultReview {
         let mut waiting = self.captured.clone();
         waiting.hook = Some(CommandHookEffect::Refused {
             reason: "Captured execution awaits result review; approval continues processing without running source again.".into(),
-            waiting: true, ask_id: Some(ask.request_id.clone()),
+            refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()),
         });
         self.kernel.shell_operations().checkpoint_result_review(&operation.receipt.operation_id, &waiting)
             .map_err(McpError::Protocol)?;
         super::command::settle_outcome(&self.kernel, self.context, &self.command, &self.output, &waiting)
             .map_err(McpError::Protocol)?;
+        if let Some(notices) = &self.notices {
+            let refusal = McpError::gate_pending(None, Some(ask.clone()),
+                "Captured execution awaits result review; approval continues processing without running source again.".into())
+                .as_refusal().expect("a pending gate is a refusal");
+            // The command keeps its owner when its RPC receiver has departed.
+            let _ = notices.send(refusal);
+        }
         let mut changes = self.kernel.ledger_flows().subscribe("ledger.changed");
         loop {
             let row = self.kernel.kernel_db().lock().get_approval(&ask.request_id)
@@ -148,7 +156,7 @@ mod tests {
         let review = CommandResultReview { kernel, context, command, output,
             captured: CommandOutcome::new(CommandExecution::Completed(
                 kaish_kernel::interpreter::ExecResult::success("already ran")), 1),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel: tokio_util::sync::CancellationToken::new(), notices: None,
         };
         (review, ask, operation.operation_id)
     }
@@ -188,7 +196,7 @@ mod tests {
         let (review, ask, operation) = fixture().await;
         let mut checkpoint = review.captured.clone();
         checkpoint.hook = Some(CommandHookEffect::Refused { reason: "awaiting result review".into(),
-            waiting: true, ask_id: Some(ask.request_id.clone()) });
+            refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()) });
         review.kernel.shell_operations().checkpoint_result_review(&operation, &checkpoint).unwrap();
         let db = review.kernel.kernel_db().clone();
         let principal = review.kernel.blocks().principal_id();

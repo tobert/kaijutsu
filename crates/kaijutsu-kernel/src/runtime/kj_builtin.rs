@@ -568,17 +568,9 @@ impl Tool for KjBuiltin {
                 // can read JSON objects. See `KjResult::Ok::data` for the
                 // shape conventions.
                 //
-                // This is the ONLY channel kj populates: the `.output`
-                // channel (OutputData::rich_json) looked like the right home
-                // for block persistence, but kaish's output limiter runs
-                // `ExecResult::materialize()` on every result that passes
-                // through `spill_if_needed` (kaish-types result.rs), which
-                // unconditionally drops `.output` even when `.out` already
-                // carries independent text (as it always does here, via
-                // `message`). So `.output` never survives to the caller —
-                // `.data` is the only channel that does. The server bridges
-                // `.data` into the block's OutputData at the persistence seam
-                // instead (`block_output_data` in kaijutsu-server/src/rpc.rs).
+                // Kaish's output limiter can clear the output tree while
+                // preserving the data sideband. Runtime command_result's
+                // block_output_data restores that data into block output.
                 if let Some(json) = data {
                     result.data = Some(kaish_kernel::interpreter::json_to_value(json));
                 }

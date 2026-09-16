@@ -107,3 +107,46 @@ fn interactive_hook_replacements_agree_with_durable_receipts() {
         }
     });
 }
+
+#[test]
+fn structured_kj_replacements_preserve_data_and_clear_execution_metadata() {
+    run_local(async {
+        use kaijutsu_kernel::mcp::{KernelToolResult, ToolContent};
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let contexts = kj.list_contexts().await.unwrap();
+        let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        let replacement = serde_json::json!({"reviewed": true});
+        for pre_call in [false, true] {
+            let mut hooks = kernel.kernel.broker().hooks().write().await;
+            hooks.pre_call.entries.clear();
+            hooks.post_call.entries.clear();
+            let table = if pre_call { &mut hooks.pre_call } else { &mut hooks.post_call };
+            table.entries.push(HookEntry {
+                id: HookId("replace-kj".into()), match_instance: None, match_tool: None,
+                match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::ShortCircuit(KernelToolResult { is_error: false,
+                    content: vec![ToolContent::Text("reviewed".into())], structured: Some(replacement.clone()) }),
+            });
+            drop(hooks);
+            for quiet in [false, true] {
+                let argv = ["no-such-kj-verb".into()];
+                let result = if quiet { kj.execute_kj_quiet(context, &argv).await }
+                    else { kj.execute_kj(context, &argv).await }.unwrap();
+                assert_eq!(result.exit_code, 0);
+                assert_eq!(result.data, Some(replacement.clone()), "hook replacement data reaches the RPC caller");
+                assert_eq!(result.stdout, "reviewed");
+                assert!(result.stderr.is_empty());
+                if let Some(command) = result.command_block_id {
+                    let output = kernel.documents.block_snapshots(context).unwrap().into_iter()
+                        .find(|block| block.tool_call_id == Some(command)).unwrap();
+                    assert_eq!(output.status, Status::Done);
+                    assert_eq!(output.exit_code, None, "a synthetic replacement has no physical exit");
+                    assert!(output.stderr.is_none());
+                    assert_eq!(output.output.unwrap().rich_json, Some(replacement.clone()));
+                }
+            }
+        }
+    });
+}

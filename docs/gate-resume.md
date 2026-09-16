@@ -23,7 +23,8 @@ it is the point, not a cost: see "What this deletes".
 ## Captured result review (September 16)
 
 PostCall and OnError approval reviews work that already ran. Interactive and
-approved commands retain their execution and current ask in a durable checkpoint,
+approved commands, including authored structured kj calls, retain execution and
+the current ask in a durable checkpoint,
 publish Waiting blocks, and consume the answer inside their ordered hook
 snapshot. Approval continues remaining hooks; it never executes the command or
 earlier hooks again. These asks use `hook_result` origin, carry no executable
@@ -33,8 +34,10 @@ with `kj ledger list --origin hook_result`.
 
 Cancellation or dropping the wait abandons an unanswered ask. Restart preserves
 the captured execution but reports interrupted review; it cannot recreate the
-in-memory hook snapshot. Structured/streaming RPC and MCP result reviews still
-need this owner and currently fail escalation before creating an ask. See
+in-memory hook snapshot. Authored structured calls return a typed Pending
+refusal while their task retains the review; the RPC does not wait for a human.
+Quiet structured calls, streaming RPC, and MCP still need a retained review
+owner and currently fail escalation before creating an ask. See
 `docs/kaish-integration.md` for the caller inventory.
 
 ## Why blocking could never reach where Amy wants it
