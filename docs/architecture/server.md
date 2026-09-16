@@ -90,6 +90,15 @@ KernelDb.
 
 ---
 
+## Structured commands
+
+`executeKj` resolves connection identity and calls `runtime/structured.rs` in the
+kernel. Runtime admission owns contextual construction, literal argv, receipts,
+hooks and pending/result channels on the kernel worker. A Pending result releases
+the RPC while retained execution waits for review; disconnect cannot destroy
+that work. Shutdown cancels preparation and hooks, then joins settlement. Quiet
+calls use the same owner without transcript pairs or operation receipts.
+
 ## Model turns (`kaijutsu-kernel/src/runtime/llm_stream.rs`)
 
 The kernel owns the stream loop, conversation sessions, and interrupt state.

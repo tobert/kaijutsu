@@ -61,8 +61,9 @@ These are source observations, not promises that all paths behave alike.
 - `runtime/command.rs` owns execution into a block pair for interactive
   commands, authored structured `kj`, and approval resume. Server `shell_run.rs`
   is deleted. `runtime/structured.rs` owns addressed `kj` construction, quoting,
-  pair/receipt creation, and response projection. RPC only decodes, supplies
-  identity, owns its response lifetime, and encodes the reply. Result
+  pair/receipt creation, response projection, and pending/result channels. It
+  admits accepted commands to the kernel worker; RPC only supplies identity and
+  translates the immediate outcome. Result
   projections live in `runtime/command_result.rs`, used by command execution,
   structured/streaming RPC, and MCP shell envelopes. The duplicate text-replace
   helper is deleted; callers use the block store's atomic replacement operation.
@@ -80,9 +81,11 @@ These are source observations, not promises that all paths behave alike.
 - Structured `executeKj` now shares command outcomes and settlement. Hook
   replacements preserve structured data and clear obsolete stderr/exits. Authored
   calls register durable receipts and release the RPC on a pending result review;
-  their task retains execution and continues after approval. Quiet calls share
-  execution, result review, and projection without a transcript pair or ordinary
-  operation receipt.
+  their kernel task retains execution through caller disconnect and continues
+  after approval. Shutdown cancels preparation, pre-call hooks, execution and
+  result review, then joins settlement. Pre-call panic settles unrun pairs before
+  the original unwind reaches the worker. Hook recursion depth crosses admission.
+  Quiet calls share this owner without a transcript pair or ordinary receipt.
 - Streaming RPC uses the same execution, state write-back, and retained review
   owner without transcript blocks. Its adapter owns execution IDs, the single
   active-execution slot, interrupts, history, and output subscriptions. All hook
@@ -139,7 +142,7 @@ These are source observations, not promises that all paths behave alike.
 - SIGTERM/SIGINT await the command worker's thread before checkpointing and
   exiting. Joining is shared across callers and survives a cancelled waiter;
   a worker cannot join itself. Host Drop signals cancellation without waiting.
-  Transport-owned command tasks still need a shared shutdown owner.
+  Interactive shell and streaming RPC tasks still need a shared shutdown owner.
 - Shared capture/review catches unwinding panics only to settle before resuming
   the original panic. Execution without a captured result records a fault with
   unknown side effects. State-publication and result-hook panics retain captured
@@ -175,7 +178,7 @@ remove the obsolete API in the same change as its final caller.
 | Partial | Dedicated threads and startup runtime | kernel `lib.rs`, `runtime/worker.rs`; server `main.rs`, `ssh.rs`, `beat.rs` | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
 | Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
 | Migrated | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified |
-| Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
+| Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, state write-back, disconnect survival, and joined shutdown |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, and shutdown; in-progress block cleanup remains open |
 | Migrated | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup, and durable delivery before shutdown |
 | Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; abrupt drop and durable notification recovery remain in the settlement audit |

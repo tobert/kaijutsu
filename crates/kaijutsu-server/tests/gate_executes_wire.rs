@@ -1370,6 +1370,75 @@ fn sequential_result_reviews_keep_the_same_hook_snapshot() {
 }
 
 #[test]
+fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
+    run_local(async {
+        for quiet in [false, true] {
+            let s = seats().await;
+            s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+                id: HookId("structured-shutdown-review".into()), match_instance: None,
+                match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+                match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review kj shutdown result".into()) }),
+                priority: 0, kaish_script_id: None,
+            });
+            let argv = ["block", "create", "--role", "user", "--kind", "text", "--content", "structured-before-shutdown"]
+                .into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let error = if quiet { s.worker_kj.execute_kj_quiet(s.worker, &argv).await }
+                else { s.worker_kj.execute_kj(s.worker, &argv).await }.unwrap_err();
+            let kaijutsu_client::RpcError::Refused(refusal) = error else { panic!("expected pending review: {error}") };
+            assert_eq!(refusal.kind, kaijutsu_types::RefusalKind::Pending);
+            let ask = refusal.ask.unwrap().request_id;
+            tokio::time::timeout(std::time::Duration::from_secs(3), s.kernel.kernel.shutdown_command_worker())
+                .await.expect("shutdown must settle retained structured review").unwrap();
+            assert_eq!(s.kernel.kernel_db.lock().get_approval(&ask).unwrap().unwrap().status, kaijutsu_kernel::ApprovalStatus::Abandoned);
+            let review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask, s.worker).unwrap().unwrap();
+            assert_eq!(review.operation_id.is_none(), quiet);
+            let outcome = review.settled.expect("shutdown left structured review unsettled");
+            assert_eq!(outcome.block_status(), Status::Error);
+            assert!(matches!(outcome.execution, kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(_)),
+                "cancellation must retain already captured execution");
+            assert_eq!(s.worker_blocks().iter().filter(|block| block.content == "structured-before-shutdown").count(), 1);
+            s.close().await;
+        }
+    });
+}
+
+#[test]
+fn structured_result_review_survives_rpc_disconnect() {
+    run_local(async {
+        let s = seats().await;
+        s.worker_kj.join_context(s.worker, "structured-retained-review").await.unwrap();
+        s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("structured-retained-review".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review retained kj result".into()) }),
+            priority: 0, kaish_script_id: None,
+        });
+        let argv = ["block", "create", "--role", "user", "--kind", "text", "--content", "retained-structured-once"]
+            .into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let error = s.worker_kj.execute_kj(s.worker, &argv).await.unwrap_err();
+        let kaijutsu_client::RpcError::Refused(refusal) = error else { panic!("expected pending review: {error}") };
+        assert_eq!(refusal.kind, kaijutsu_types::RefusalKind::Pending);
+        let ask = refusal.ask.unwrap().request_id;
+        let operation = s.kernel.kernel.shell_operations().get_by_ask(&ask, s.worker).unwrap().unwrap();
+        let session = *s.kernel.session_contexts.iter().find(|entry| *entry.value() == s.worker).unwrap().key();
+        let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, approver } = s;
+        drop(worker_kj);
+        drop(_worker_client);
+        wait_for("structured submitting session to close", || !kernel.session_contexts.contains_key(&session)).await;
+        let answer = approver_kj.execute_kj_quiet(approver, &["ledger".into(), "allow".into(), ask]).await.unwrap();
+        assert_eq!(answer.exit_code, 0, "{}", answer.stderr);
+        wait_for("structured review completion after disconnect", || kernel.kernel.shell_operations()
+            .get(&operation.receipt.operation_id, worker).unwrap().unwrap().completed_at.is_some()).await;
+        let blocks = kernel.documents.block_snapshots(worker).unwrap();
+        assert_eq!(blocks.iter().filter(|block| block.content == "retained-structured-once").count(), 1);
+        assert_eq!(blocks.iter().find(|block| block.id == operation.receipt.output_block_id).unwrap().status, Status::Done);
+        drop(approver_kj);
+        drop(_approver_client);
+        kernel.kernel.shutdown_command_worker().await.unwrap();
+    });
+}
+
+#[test]
 fn structured_result_review_returns_pending_then_continues_without_repeating_kj() {
     run_local(async {
         let s = seats().await;

@@ -35,7 +35,9 @@ with `kj ledger list --origin hook_result`.
 Cancellation or dropping the wait abandons an unanswered ask. Restart preserves
 the captured execution but reports interrupted review; it cannot recreate the
 in-memory hook snapshot. Authored structured calls return a typed Pending
-refusal while their task retains the review; the RPC does not wait for a human.
+refusal while the kernel worker retains review; the RPC does not wait for a
+human. Disconnect leaves accepted structured work running. Kernel shutdown
+cancels retained review and joins settlement without repeating execution.
 Quiet structured calls use the same review owner without authoring transcript
 blocks. `kj ledger show <request-id>` includes the captured execution and final
 result; its structured data exposes `result_review.captured` and

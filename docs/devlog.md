@@ -1713,6 +1713,14 @@ replace captured output. Shutdown also retains the spent approval's delivery
 seed before joining, while refusing any follow-up model turn. Regressions pin
 both gaps; the original panic still reaches the runtime worker.
 
+Structured kj execution now enters that worker too. Three regressions exposed
+its transport-owned lifetime: execution after stopped admission, loss on LocalSet
+destruction, and result hooks left unsettled by kernel shutdown. Runtime owns
+pending/result channels and carries hook recursion depth across admission; RPC
+only resolves identity and translates replies. Shutdown cancels preparation and
+pre-call hooks as well as captured result review. Pre-call panics settle unrun
+pairs before propagating; accepted review survives a real SSH disconnect.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

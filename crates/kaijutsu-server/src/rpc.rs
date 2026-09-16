@@ -8350,8 +8350,8 @@ fn kj_command_catalog() -> Vec<KjCatalogEntry> {
     ]
 }
 
-/// Transport lifetime: a pending result review releases the RPC while the
-/// command task retains execution and publishes its eventual block outcome.
+/// The runtime retains accepted execution and result review; RPC only resolves
+/// connection identity and translates the immediate result or typed Pending.
 async fn execute_kj_command(
     context_id: ContextId,
     principal: PrincipalId,
@@ -8363,21 +8363,8 @@ async fn execute_kj_command(
     let session = connection.borrow().session_id;
     let reviewer = context_reviewer_for(kernel, context_id, principal).await;
     let identity = ShellIdentity { requester: principal, performer: principal, reviewer, context: context_id, session };
-    let kernel = kernel.kernel.clone();
-    let argv = argv.to_vec();
-    let (notices, mut reviews) = tokio::sync::mpsc::unbounded_channel();
-    let (reply, completed) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_local(async move {
-        let result = kaijutsu_kernel::runtime::structured::execute_kj(&kernel, identity, &argv, quiet, Some(notices)).await;
-        if let Err(Err(error)) = reply.send(result) {
-            log::error!("structured command settlement failed after its RPC departed: {error}");
-        }
-    }.instrument(tracing::Span::current()));
-    tokio::select! {
-        Some(refusal) = reviews.recv() => Ok(Err(refusal)),
-        result = completed => result.map_err(|_| capnp::Error::failed("structured command task stopped before replying".into()))?
-            .map_err(capnp::Error::failed),
-    }
+    kaijutsu_kernel::runtime::structured::execute_kj(&kernel.kernel, identity, argv, quiet)
+        .await.map_err(capnp::Error::failed)
 }
 
 #[cfg(test)]

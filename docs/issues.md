@@ -130,7 +130,10 @@ Abrupt task destruction before capture still needs live terminal settlement and
 job/receipt agreement; startup reports interruption without replaying source.
 SIGTERM/SIGINT now await the command worker before checkpointing and exiting;
 host Drop remains a cancellation signal without a wait. Extend shutdown ownership
-to transport-owned command tasks as those owners migrate. Command cancellation also reaches block pairs without receipts.
+to interactive shell and streaming RPC tasks as those owners migrate. Command
+cancellation also reaches block pairs without receipts. Structured kj now admits
+work to the kernel worker and owns its pending/result channels there; shutdown
+settles pre-call cancellation and retained result reviews.
 
 Model streaming, identity resolution, conversation sessions, and interrupts now
 belong to kernel runtime modules. RPC translates startup errors but no longer
@@ -139,8 +142,8 @@ failures leave no interrupt. Normal exits, early failures, and panics share
 terminal-event cleanup; shutdown cancels and joins accepted work. Approval
 execution and delivery now use that worker too. Startup subscribes and snapshots
 old answers synchronously, reports failure to the host, and admits one owner.
-Shutdown cancels preparation and commands and joins settlement. Transport-owned
-command tasks remain to migrate. Headless requests use direct runtime admission;
+Shutdown cancels preparation and commands and joins settlement. Interactive shell
+and streaming RPC tasks remain to migrate. Headless requests use direct runtime admission;
 per-turn leases own liveness and interrupts, including queued turns.
 
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
