@@ -90,6 +90,16 @@ KernelDb.
 
 ---
 
+## Interactive commands
+
+Shell RPC and shell compose submission call `runtime/interactive.rs` with an
+addressed context and explicit identity. The kernel worker owns construction,
+pair/receipt authorship, hooks, execution and settlement through disconnect or
+shutdown. It consumes accepted draft revisions without discarding later typing.
+A channel returns context switches to the RPC thread, which updates its session
+binding and acknowledges before runtime publishes the switch and completion.
+Disconnect and shutdown release that acknowledgement wait.
+
 ## Structured commands
 
 `executeKj` resolves connection identity and calls `runtime/structured.rs` in the

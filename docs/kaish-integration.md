@@ -78,6 +78,15 @@ These are source observations, not promises that all paths behave alike.
   against that record before terminal block publication. Startup finishes pending
   projections without executing code or hooks. Raw records are read separately
   from ordinary receipt polls, so a poll does not duplicate captured output.
+- `runtime/interactive.rs` admits shell submissions, constructs the addressed
+  context's shell, authors the pair/receipt, and applies PreCall on the kernel
+  worker. Accepted work survives RPC teardown. Runtime consumes the captured
+  compose draft revision after acceptance; later edits and refused drafts remain.
+  Shutdown cancels preparation, execution and review, then joins settlement.
+  Preparation failure after receipt registration settles its pair before
+  propagating. Context switches
+  await the RPC adapter's acknowledgement before publication; a departed adapter
+  or kernel shutdown releases that wait. Connection state stays on the RPC thread.
 - Structured `executeKj` now shares command outcomes and settlement. Hook
   replacements preserve structured data and clear obsolete stderr/exits. Authored
   calls register durable receipts and release the RPC on a pending result review;
@@ -142,7 +151,7 @@ These are source observations, not promises that all paths behave alike.
 - SIGTERM/SIGINT await the command worker's thread before checkpointing and
   exiting. Joining is shared across callers and survives a cancelled waiter;
   a worker cannot join itself. Host Drop signals cancellation without waiting.
-  Interactive shell and streaming RPC tasks still need a shared shutdown owner.
+  Streaming RPC tasks still need a shared shutdown owner.
 - Shared capture/review catches unwinding panics only to settle before resuming
   the original panic. Execution without a captured result records a fault with
   unknown side effects. State-publication and result-hook panics retain captured
@@ -176,8 +185,8 @@ remove the obsolete API in the same change as its final caller.
 |---|---|---|---|
 | Migrated | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `runtime/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
 | Partial | Dedicated threads and startup runtime | kernel `lib.rs`, `runtime/worker.rs`; server `main.rs`, `ssh.rs`, `beat.rs` | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
-| Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
-| Migrated | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified |
+| Migrated | Interactive shell submission | kernel `runtime/interactive.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, draft revision consumption, addressed identity/context, command/output pair, hooks, write-back, acknowledged context switches, disconnect survival, and joined shutdown |
+| Partial | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified; task ownership still belongs to RPC |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, state write-back, disconnect survival, and joined shutdown |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, and shutdown; in-progress block cleanup remains open |
 | Migrated | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup, and durable delivery before shutdown |

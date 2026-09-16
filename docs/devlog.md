@@ -1721,6 +1721,16 @@ only resolves identity and translates replies. Shutdown cancels preparation and
 pre-call hooks as well as captured result review. Pre-call panics settle unrun
 pairs before propagating; accepted review survives a real SSH disconnect.
 
+Interactive submission now has the same lifetime. Real SSH regressions exposed
+unsettled work after both disconnect and shutdown; the kernel worker now owns
+construction, PreCall and execution. Draft consumption moved with acceptance so
+caller teardown cannot leave an accepted command ready to resubmit; revision
+checks preserve later typing. Explicit context addressing also removes a split
+where the pair used the requested context but construction used the connection's
+ambient context. The adapter acknowledges context switches before runtime
+publishes completion, with disconnect/shutdown releasing the wait. PreCall
+unwinds settle the unrun pair and preserve the original panic.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

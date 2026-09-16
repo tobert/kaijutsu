@@ -115,8 +115,6 @@ use kaijutsu_kernel::{
 };
 use kaijutsu_types::paths;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
-// Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
-use kaijutsu_types::ToolKind as TypesToolKind;
 use serde_json;
 use tracing::Instrument;
 
@@ -2443,7 +2441,10 @@ impl kernel::Server for KernelImpl {
                 let connection_bg = connection.clone();
                 tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
-                    let record = |new_id| record_context_switch(&connection_bg, new_id);
+                    let record = |new_id| -> futures::future::LocalBoxFuture<'_, ()> {
+                        record_context_switch(&connection_bg, new_id);
+                        Box::pin(std::future::ready(()))
+                    };
                     let outcome = match replacement {
                         Some(outcome) => Ok(outcome),
                         None => {
@@ -4083,7 +4084,8 @@ impl kernel::Server for KernelImpl {
                 }
 
                 let submission = execute_shell_command(
-                    &code, context_id, user_principal_id, user_initiated, &kernel, &connection,
+                    kaijutsu_kernel::runtime::interactive::ShellSource::Code(code),
+                    context_id, user_principal_id, user_initiated, &kernel, &connection,
                 ).await?;
                 let mut outcome = results.get().init_outcome();
                 outcome.set_operation_id(&submission.operation_id);
@@ -4405,13 +4407,9 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let _span = tracing::info_span!("rpc", method = "get_last_result").entered();
 
-        // `$?` was read off the per-connection persistent kaish. Under the
-        // per-use materialization model there is no persistent shell to hold a
-        // "last exit code" — each command runs in a throwaway instance — so this
-        // always returns the empty/zero result. The wire method stays for
-        // compatibility; shell exit codes now live on the ToolResult block
-        // (`set_exit_code` in `execute_shell_command`), which is the durable,
-        // multi-writer-safe home for them.
+        // Invocations have independent scope. This legacy method returns an
+        // empty result; durable exit codes belong to command output blocks and
+        // operation receipts, settled by runtime::command.
         let mut result_builder = results.get().init_result();
         result_builder.set_code(0);
         result_builder.set_ok(true);
@@ -5844,24 +5842,15 @@ impl kernel::Server for KernelImpl {
                 let documents = kernel.documents.clone();
 
                 if is_shell {
-                    // Shell mode cannot promote the draft: a shell command is a
-                    // `ToolCall` block carrying JSON arguments, not the user's
-                    // `Text`. So the draft is consumed rather than transitioned —
-                    // and the ORDER is the correctness property. Read without
-                    // clearing, author the command block, and only then discard
-                    // what it was built from. Anything that fails in between
-                    // leaves the typed text exactly where the player left it.
+                    // Capture the revision without clearing it. Runtime admission
+                    // authors the shell pair and consumes only this revision after
+                    // PreCall accepts it, even if the submitting RPC disconnects.
                     let draft = documents
                         .draft_for_submission(context_id, user_principal_id)
                         .map_err(|e| capnp::Error::failed(format!("read draft: {}", e)))?
                         .ok_or_else(|| capnp::Error::failed("input is empty".into()))?;
-                    let text = draft.content().trim().to_string();
-                    if text.is_empty() {
-                        return Err(capnp::Error::failed("input is empty".into()));
-                    }
-
                     let submission = execute_shell_command(
-                        &text,
+                        kaijutsu_kernel::runtime::interactive::ShellSource::Draft(draft),
                         context_id,
                         user_principal_id,
                         true,
@@ -5872,25 +5861,12 @@ impl kernel::Server for KernelImpl {
                     match submission.refusal {
                         None => {
                             let command_block_id = submission.command_block_id;
-                            // Keep typing that arrived while command submission awaited.
-                            documents
-                                .consume_draft(&draft)
-                                .map_err(|e| capnp::Error::failed(format!("clear draft: {}", e)))?;
-
                             let mut b = results.get().init_outcome().init_ok();
                             set_block_id_builder(&mut b, &command_block_id);
                         }
                         Some(refusal) => {
-                            // Refused, so nothing ran and the player still needs
-                            // the text — the draft stays where they left it.
-                            //
-                            // Not the same case as the failures above, which
-                            // happen before any block exists: the command block
-                            // was already authored and is sitting `Waiting` on
-                            // the ask. Resubmitting after an answer therefore
-                            // authors a SECOND pair and strands the first. That
-                            // is what redeeming by ask id fixes — see
-                            // `docs/gate-shape-b.md`.
+                            // A refused draft stays intact. Approval resumes the
+                            // linked pair; resubmitting would create another pair.
                             let mut b = results.get().init_outcome().init_refused();
                             set_refusal(&mut b, &refusal);
                         }
@@ -8131,203 +8107,36 @@ fn require_context_exists(
     }
 }
 
-/// Write a context switch into this connection's shared `session_contexts`.
-/// Runtime execution can hand the same write to a caller that has
-/// already detected the switch itself.
+/// Apply a runtime context switch to this connection's session binding.
 fn record_context_switch(connection: &Rc<RefCell<ConnectionState>>, new_id: ContextId) {
     let conn = connection.borrow();
     conn.session_contexts.insert(conn.session_id, new_id);
 }
 
-struct ShellCommandSubmission {
-    command_block_id: kaijutsu_types::BlockId,
-    operation_id: String,
-    refusal: Option<kaijutsu_types::Refusal>,
-}
-
+/// Resolve the connected player, then leave accepted execution with the kernel.
 async fn execute_shell_command(
-    code: &str,
+    source: kaijutsu_kernel::runtime::interactive::ShellSource,
     context_id: ContextId,
     user_principal_id: PrincipalId,
     user_initiated: bool,
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
-) -> Result<ShellCommandSubmission, capnp::Error> {
-    // Materialize a single-use context shell seeded from L1 (durable env + cwd).
-    // Runtime execution persists changed cwd and exports unless the context
-    // switched; the remaining scope evaporates when this instance drops.
-    let kaish = materialize_context_shell(kernel, connection).await?;
-
-    let documents = kernel.documents.clone();
-    let kernel_arc = kernel.kernel.clone();
-
-    // Link to context's long-running trace
-    let trace_id = {
-        let drift = kernel_arc.drift().read();
-        drift.trace_id_for_context(context_id).unwrap_or([0u8; 16])
-    };
-    let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute").entered();
-
-    // Document must exist — join_context is the sole creator
-    if documents.get(context_id).is_none() {
-        return Err(capnp::Error::failed(format!(
-            "context {} not found — call join_context first",
-            context_id
-        )));
-    }
-
-    // Create ToolCall block for the shell command (authored by user if user_initiated)
-    let last_block = documents.last_block_id(context_id);
-    let role = if user_initiated {
-        Some(Role::User)
-    } else {
-        None
-    };
-    let command_block_id = documents
-        .insert_tool_call_as(
-            context_id,
-            None,
-            last_block.as_ref(),
-            "shell",
-            serde_json::json!({"code": code}),
-            Some(TypesToolKind::Shell),
-            Some(user_principal_id),
-            None,
-            role,
-        )
-        .map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
-
-    // Create ToolResult block (empty, will be filled by execution — system-authored)
-    let output_block_id = documents
-        .insert_tool_result_as(
-            context_id,
-            &command_block_id,
-            Some(&command_block_id),
-            "",
-            false,
-            None,
-            Some(TypesToolKind::Shell),
-            Some(PrincipalId::system()),
-            None,
-        )
-        .map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
-
-    let continuation_epoch = kernel.kernel_db.lock().continuation_epoch(context_id)
-        .map_err(|e| capnp::Error::failed(format!("read continuation: {e}")))?;
-    let receipt = kernel_arc.shell_operations().register(
-        context_id, user_principal_id, user_principal_id,
-        command_block_id, output_block_id, code, continuation_epoch,
-    ).map_err(|e| capnp::Error::failed(format!("register shell operation: {e}")))?;
-    let operation_id = receipt.operation_id.to_string();
-
-    // Mark output block as Running — clients poll this to detect completion
-    if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
-        log::warn!("Failed to set output block to Running: {}", e);
-    }
-
-    // User-initiated shell blocks are excluded from conversation by default.
-    // Users can toggle inclusion via the block gutter controls.
-    if user_initiated {
-        if let Err(e) = documents.set_excluded(context_id, &command_block_id, true) {
-            log::warn!("Failed to set shell command block excluded: {}", e);
-        }
-        if let Err(e) = documents.set_excluded(context_id, &output_block_id, true) {
-            log::warn!("Failed to set shell output block excluded: {}", e);
-        }
-    }
-
-    // Interactive commands use the same PreCall protocol as shell tools.
-    // The existing pair carries a replacement or refusal without execution.
-    let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
-        user_principal_id,
-        context_id,
-        connection.borrow().session_id,
-        kernel.id,
-    ).with_actor(user_principal_id, context_reviewer_for(kernel, context_id, user_principal_id).await);
-    match kernel_arc.broker().shell_pre_call_hooks(code, &call_ctx).await {
-        kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
-        kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {
-            let mut outcome = kaijutsu_kernel::runtime::command_outcome::CommandOutcome::new(
-                kaijutsu_kernel::runtime::command_outcome::CommandExecution::NotRun, 0);
-            outcome.apply_hook(kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result));
-            kaijutsu_kernel::runtime::command::settle_outcome(
-                &kernel_arc, context_id, &command_block_id, &output_block_id, &outcome,
-            ).map_err(capnp::Error::failed)?;
-            return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: None });
-        }
-        kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            let mut outcome = kaijutsu_kernel::runtime::command_outcome::CommandOutcome::new(
-                kaijutsu_kernel::runtime::command_outcome::CommandExecution::NotRun, 0);
-            outcome.hook = Some(kaijutsu_kernel::runtime::command_outcome::CommandHookEffect::Refused {
-                reason: err.to_string(), refusal: err.as_refusal(), waiting: err.settled_block_status() == Status::Waiting,
-                ask_id: err.as_refusal().and_then(|refusal| refusal.ask_id().map(str::to_owned)),
-            });
-            kaijutsu_kernel::runtime::command::settle_outcome(
-                &kernel_arc, context_id, &command_block_id, &output_block_id, &outcome,
-            ).map_err(capnp::Error::failed)?;
-
-            // A verdict rides the result; only a fault still throws.
-            let refusal = refusal_or_fault(err, "shell")?;
-
-            // Tell the ask which blocks are waiting on it, as
-            // `PairOwner::Session`: this connected session watches its own
-            // blocks, so a fill tells nobody. This is the one place the two
-            // are in scope together: the gate runs inside the broker's hook
-            // evaluation, which never sees a block id, and the pair above
-            // was authored before any of that. Without the link, an
-            // execution on approval would author a second pair beside this
-            // one and leave this one waiting forever.
-            //
-            // Best-effort on purpose. The refusal is already correct and
-            // already returned; failing the call because a convenience link
-            // did not write would turn a working refusal into an error.
-            // Logged, never swallowed.
-            if let Some(ask_id) = refusal.ask_id() {
-                let db = kernel.kernel_db.lock();
-                if let Err(e) = db.link_ask_blocks(
-                    ask_id,
-                    &command_block_id,
-                    &output_block_id,
-                    kaijutsu_kernel::PairOwner::Session,
-                ) {
-                    log::error!(
-                        "ask {ask_id}: could not record the blocks waiting on it: {e}"
-                    );
-                }
-            }
-            return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: Some(refusal) });
-        }
-    }
-
-    // Spawn execution in background
-    let code = code.to_owned();
-    let output_block_id_clone = output_block_id;
-    let command_block_id_clone = command_block_id;
-    let connection_switch = connection.clone();
-    let kernel_arc_for_hooks = kernel_arc.clone();
+) -> Result<kaijutsu_kernel::runtime::interactive::ShellSubmission, capnp::Error> {
+    let session = connection.borrow().session_id;
+    let reviewer = context_reviewer_for(kernel, context_id, user_principal_id).await;
+    let identity = ShellIdentity { requester: user_principal_id, performer: user_principal_id,
+        reviewer, context: context_id, session };
+    let (submission, mut switches) = kaijutsu_kernel::runtime::interactive::submit(
+        &kernel.kernel, identity, source, user_initiated,
+    ).await.map_err(capnp::Error::failed)?;
+    let connection = connection.clone();
     tokio::task::spawn_local(async move {
-        // The connection's session map is what an in-shell `kj context
-        // switch` has to move; a detached run has no such map, which is the
-        // one thing that differs between the two callers of this run.
-        let record_switch = |new_id: ContextId| {
-            record_context_switch(&connection_switch, new_id);
-        };
-        if let Err(error) = kaijutsu_kernel::runtime::command::run_into_blocks(
-            &kaish,
-            &code,
-            context_id,
-            &command_block_id_clone,
-            &output_block_id_clone,
-            &kernel_arc_for_hooks,
-            &call_ctx,
-            CommandRunOptions { context_switch: CommandContextSwitch::Publish(Some(&record_switch)), ..Default::default() },
-        )
-        .await {
-            log::error!("shell command settlement failed: {error}");
+        while let Some(switch) = switches.recv().await {
+            record_context_switch(&connection, switch.context);
+            let _ = switch.applied.send(());
         }
     });
-
-    Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: None })
+    Ok(submission)
 }
 
 struct KjCatalogEntry {

@@ -19,7 +19,7 @@ use super::shell_state::{persist_shell_state, snapshot_shell_state};
 /// `None` means nothing is listening: the switch still stops the durable
 /// cwd/env write-back and still publishes `ContextSwitched`, it has no
 /// session map to update.
-pub type ContextSwitchSink<'a> = Option<&'a dyn Fn(ContextId)>;
+pub type ContextSwitchSink<'a> = Option<&'a dyn Fn(ContextId) -> futures::future::LocalBoxFuture<'a, ()>>;
 
 /// A structured command stays addressed to its context; interactive commands
 /// publish an in-shell switch and may update a connection's session map.
@@ -163,7 +163,7 @@ pub(crate) fn recover_settlements(kernel: &Kernel) -> Result<usize, String> {
 
 /// Detect an in-shell context switch, tell the sink about it, and report the
 /// new context id. The transport owns its connection-local map.
-fn context_switched(
+async fn context_switched(
     kaish: &EmbeddedKaish,
     started_at: ContextId,
     sink: ContextSwitchSink<'_>,
@@ -171,7 +171,7 @@ fn context_switched(
     match kaish.context_id() {
         Some(new_id) if new_id != started_at => {
             match sink {
-                Some(record) => record(new_id),
+                Some(record) => record(new_id).await,
                 None => tracing::info!(
                     "shell run: the command switched to context {new_id} and there is no \
                      session map to move with it; the run stays reported against {started_at}"
@@ -199,10 +199,7 @@ pub async fn run_into_blocks(
     call_ctx: &crate::mcp::CallContext,
     mut run: CommandRunOptions<'_>,
 ) -> Result<CommandOutcome, String> {
-    // Yield to let the event loop flush BlockInserted events to clients
-    // before we start producing text ops. Without this, fast commands
-    // (like `ls`) can emit edit_text before the client has processed the
-    // BlockInserted, causing DataMissing errors on the client side.
+    // Let other accepted work make progress before entering the interpreter.
     tokio::task::yield_now().await;
 
     let mut options = kaish_kernel::ExecuteOptions::default();
@@ -374,7 +371,7 @@ async fn capture_command(
     // A context switch saves the outgoing state itself. Its snapshots span
     // two contexts, so only runs that stayed put write back this diff.
     match if let CommandContextSwitch::Publish(sink) = context_switch {
-        context_switched(kaish, context_id, sink)
+        context_switched(kaish, context_id, sink).await
     } else { kaish.context_id().filter(|id| *id != context_id) } {
         Some(new_context_id) => {
             tracing::info!(
@@ -574,7 +571,12 @@ mod fill_tests {
         let kaish = EmbeddedKaish::new("panic-after-capture", documents.clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(ContextId::new());
         let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
-        let publish = |_| panic!("state publication panic sentinel");
+        let publish = |_| -> futures::future::LocalBoxFuture<'_, ()> {
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                panic!("state publication panic sentinel");
+            })
+        };
         let result = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, "echo captured", ctx, &command, &output,
             &kernel, &call, CommandRunOptions { context_switch: CommandContextSwitch::Publish(Some(&publish)), ..Default::default() }))
             .catch_unwind().await;
