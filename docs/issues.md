@@ -86,8 +86,10 @@ that record before terminal block publication; failed writes return errors.
 
 Structured RPC now uses the shared outcome/settlement owner; replacement data
 and metadata agree with the response. Authored calls register receipts and
-release the RPC while result approval waits. Quiet calls share execution and
-projection without creating a pair or receipt.
+release the RPC while result approval waits. Quiet calls share execution,
+review, and projection without creating a transcript pair or ordinary receipt.
+Their review result remains inspectable through `kj ledger show`. Every ask in
+a sequence now retains its invocation and optional operation link.
 
 Still pending: MCP async completion projects independently and its broker hook timing needs reconciliation
 with job completion. Streaming RPC still logs unhandled hook verdicts. Startup now recovers retained pending
@@ -103,12 +105,9 @@ Interactive/approved result reviews now checkpoint execution and continue the
 same hook snapshot after approval. Their non-executable `hook_result` asks stay
 out of the execution/resume queue; cancellation, dropped waits, and restart
 retain execution and report interrupted review. Authored structured calls use
-this owner too. Quiet structured calls, streaming RPC, and MCP still lack a
-retained result-review owner: result-phase Ask/escalation returns GateUnavailable
-before minting an ask. Migrate these callers and their job projections. Also
-retain explicit operation provenance for every ask in a sequence: the current
-receipt/checkpoint points to the latest ask, while earlier ledger rows remain
-without a direct operation link. Preserve the complete shared-outcome contract.
+this owner too. Streaming RPC and MCP still lack a retained result-review owner: result-phase Ask/escalation returns GateUnavailable
+before minting an ask. Migrate these callers and their job projections while
+preserving the complete shared-outcome contract.
 
 The new SSH/RPC regression passes but can print a russh teardown panic after
 its assertions (`there is no reactor running`). The common test helper drops

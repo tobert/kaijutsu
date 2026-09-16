@@ -1284,6 +1284,11 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
         assert_ne!(envelope.stdout, "reviewed result", "denial stops remaining hooks");
     }
     let captured = s.kernel.kernel.shell_operations().outcome(&submission.operation_id, s.worker).unwrap().unwrap();
+    let first_review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask.request_id, s.worker).unwrap().unwrap();
+    assert_eq!(first_review.operation_id.as_deref(), Some(submission.operation_id.as_str()));
+    assert!(first_review.settled.is_some());
+    assert_eq!(s.kernel.kernel.shell_operations().get_by_ask(&ask.request_id, s.worker).unwrap().unwrap().receipt.operation_id,
+        submission.operation_id, "earlier asks keep their operation link after sequential reviews");
     assert_eq!(matches!(captured.execution, kaijutsu_kernel::runtime::command_outcome::CommandExecution::Fault(_)), on_error);
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "once\n");
     assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1, "earlier hooks must not rerun");
@@ -1344,6 +1349,64 @@ fn structured_result_review_returns_pending_then_continues_without_repeating_kj(
         assert_eq!(output.status, Status::Done, "{output:?}");
         let blocks = s.kernel.documents.block_snapshots(s.worker).unwrap();
         assert_eq!(blocks.iter().filter(|block| block.content == "structured-review-once").count(), 1);
+        s.close().await;
+    });
+}
+
+#[test]
+fn quiet_result_review_keeps_its_result_without_a_transcript_pair() {
+    run_local(async {
+        use kaijutsu_kernel::mcp::{KernelToolResult, ToolContent};
+        let s = seats().await;
+        let help = s.approver_kj.execute_kj_quiet(s.approver,
+            &["ledger".into(), "show".into(), "--help".into()]).await.unwrap();
+        println!("Published ledger show help:\n{}", help.stdout);
+        assert!(help.stdout.contains("captured execution"), "{}", help.stdout);
+        let before = s.kernel.documents.block_snapshots(s.worker).unwrap().len();
+        let replacement = serde_json::json!({"reviewed": "quiet"});
+        let mut hooks = s.kernel.kernel.broker().hooks().write().await;
+        for (id, action, priority) in [
+            ("quiet-review", HookAction::Ask(AskSpec { description: Some("Review quiet result".into()) }), 0),
+            ("quiet-replacement", HookAction::ShortCircuit(KernelToolResult {
+                is_error: false, content: vec![ToolContent::Text("quiet result approved".into())],
+                structured: Some(replacement.clone()),
+            }), 1),
+        ] {
+            hooks.post_call.entries.push(HookEntry {
+                id: HookId(id.into()), match_instance: None,
+                match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+                match_principal: None, action, priority, kaish_script_id: None,
+            });
+        }
+        drop(hooks);
+        let argv: Vec<String> = ["block", "create", "--role", "user", "--kind", "text", "--content", "quiet-review-once"]
+            .into_iter().map(str::to_owned).collect();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5),
+            s.worker_kj.execute_kj_quiet(s.worker, &argv)).await.expect("quiet review must release the RPC").unwrap_err();
+        let kaijutsu_client::RpcError::Refused(refusal) = error else { panic!("expected a review refusal: {error}") };
+        assert_eq!(refusal.kind, kaijutsu_types::RefusalKind::Pending);
+        let ask = refusal.ask.unwrap();
+        let pending = s.approver_kj.execute_kj_quiet(s.approver,
+            &["ledger".into(), "show".into(), ask.request_id.clone()]).await.unwrap().data.unwrap();
+        assert!(pending["result_review"]["settled"].is_null());
+        assert!(pending["result_review"]["operation_id"].is_null());
+        assert_eq!(pending["result_review"]["captured"]["status"], "done");
+        assert_eq!(s.kernel.documents.block_snapshots(s.worker).unwrap().len(), before + 1,
+            "quiet execution authors only the block explicitly requested by the verb");
+        s.answer(&ask.request_id, true).await;
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let shown = s.approver_kj.execute_kj_quiet(s.approver,
+                    &["ledger".into(), "show".into(), ask.request_id.clone()]).await.unwrap().data.unwrap();
+                if !shown["result_review"]["settled"].is_null() { break shown; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("quiet result remains inspectable after approval");
+        assert_eq!(settled["result_review"]["settled"]["stdout"], "quiet result approved");
+        assert_eq!(settled["result_review"]["settled"]["data"], replacement);
+        let blocks = s.kernel.documents.block_snapshots(s.worker).unwrap();
+        assert_eq!(blocks.len(), before + 1);
+        assert_eq!(blocks.iter().filter(|block| block.content == "quiet-review-once").count(), 1);
         s.close().await;
     });
 }

@@ -319,11 +319,9 @@ enum LedgerCommand {
         #[arg(long)]
         signals: bool,
     },
-    /// Show one ask in full: the statement being authorized, what an
-    /// approval runs it with — source, working directory, recorded free
-    /// variable values — the context and principal that raised it, and —
-    /// once it is decided — whether its answer has already been spent.
-    /// Works for a decided ask as well as a pending one.
+    /// Show one pending or decided ask, its statement, identities, decision,
+    /// and execution inputs. Result reviews include captured execution and
+    /// the settled result, even when the command authored no transcript pair.
     Show {
         /// The ask to show. Request ids come from `kj ledger list`.
         request_id: String,
@@ -818,6 +816,16 @@ impl KjDispatcher {
             Err(result) => return result,
         };
 
+        drop(db);
+        let result_review = if row.origin == Origin::HookResult {
+            let Some(context) = ContextId::try_from_slice(&row.context_id) else {
+                return KjResult::Err("kj ledger show: result review has a malformed context id".into());
+            };
+            match self.kernel().shell_operations().result_review_for_ask(request_id, context) {
+                Ok(review) => review,
+                Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
+            }
+        } else { None };
         let mut lines = vec![
             format!("request:    {}", row.request_id),
             format!("status:     {}", row.status),
@@ -934,6 +942,20 @@ impl KjDispatcher {
                 "value": e.value,
             })).collect::<Vec<_>>(),
         });
+        if let Some(mut review) = result_review {
+            review.captured.hook = None;
+            let captured = review.captured.envelope();
+            let settled = review.settled.as_ref().map(|outcome| outcome.envelope());
+            lines.push(format!("captured_result: {}", serde_json::to_string(&captured).expect("shell envelope serializes")));
+            match &settled {
+                Some(result) => lines.push(format!("settled_result: {}", serde_json::to_string(result).expect("shell envelope serializes"))),
+                None => lines.push("settled_result: awaiting review processing".into()),
+            }
+            data["result_review"] = serde_json::json!({
+                "review_id": review.review_id, "operation_id": review.operation_id,
+                "captured": captured, "settled": settled,
+            });
+        }
         if show_signals {
             data["signals"] = serde_json::Value::Array(signal_rows.iter().map(signal_row_json).collect());
         }

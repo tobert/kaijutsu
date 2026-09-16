@@ -1,15 +1,15 @@
-//! Suspend result processing while retaining execution and its operation receipt.
+//! Retain execution through result review, with or without a transcript pair.
 
 use std::sync::Arc;
-use kaijutsu_types::{AskRef, BlockId, ContextId, Status};
+use kaijutsu_types::{AskRef, BlockId, Status};
 use crate::mcp::{McpError, McpResult};
 use super::command_outcome::{CommandHookEffect, CommandOutcome};
 
 pub(super) struct CommandResultReview {
     pub kernel: Arc<crate::Kernel>,
-    pub context: ContextId,
-    pub command: BlockId,
-    pub output: BlockId,
+    pub review_id: String,
+    pub call: crate::mcp::CallContext,
+    pub pair: Option<(BlockId, BlockId)>,
     pub captured: CommandOutcome,
     pub cancel: tokio_util::sync::CancellationToken,
     pub notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
@@ -47,8 +47,7 @@ impl Drop for ReviewGuard<'_> {
             reason: "Result review was interrupted; captured execution was not repeated.".into(),
             refusal: None, waiting: false, ask_id: Some(self.ask.request_id.clone()),
         });
-        if let Err(error) = super::command::settle_outcome(&self.owner.kernel, self.owner.context,
-            &self.owner.command, &self.owner.output, &outcome)
+        if let Err(error) = self.owner.settle(&outcome)
         {
             tracing::error!("could not settle interrupted result review: {error}");
         }
@@ -67,19 +66,40 @@ impl crate::mcp::broker::ResultReview for CommandResultReview {
 }
 
 impl CommandResultReview {
+    pub(super) fn new(
+        kernel: Arc<crate::Kernel>, call: crate::mcp::CallContext, pair: Option<(BlockId, BlockId)>,
+        captured: CommandOutcome, cancel: tokio_util::sync::CancellationToken,
+        notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
+    ) -> Self {
+        Self { kernel, review_id: uuid::Uuid::now_v7().to_string(), call, pair, captured, cancel, notices }
+    }
+
+    pub(super) fn settle(&self, outcome: &CommandOutcome) -> Result<(), String> {
+        match self.pair {
+            Some((command, output)) => super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, outcome),
+            None => self.kernel.shell_operations().finish_result_review(&self.review_id, outcome),
+        }
+    }
+
     async fn wait_inner(&self, ask: &AskRef) -> McpResult<()> {
         use approval_ledger::types::ApprovalStatus;
-        let operation = self.kernel.shell_operations().get_by_output(&self.output, self.context)
-            .map_err(McpError::Protocol)?.ok_or_else(|| McpError::Protocol("result review requires a durable operation receipt".into()))?;
+        let operation = match self.pair {
+            Some((_, output)) => Some(self.kernel.shell_operations().get_by_output(&output, self.call.context_id)
+                .map_err(McpError::Protocol)?.ok_or_else(|| McpError::Protocol("result review pair has no durable operation receipt".into()))?),
+            None => None,
+        };
         let mut waiting = self.captured.clone();
         waiting.hook = Some(CommandHookEffect::Refused {
             reason: "Captured execution awaits result review; approval continues processing without running source again.".into(),
             refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()),
         });
-        self.kernel.shell_operations().checkpoint_result_review(&operation.receipt.operation_id, &waiting)
+        self.kernel.shell_operations().checkpoint_result_review(&self.review_id,
+            operation.as_ref().map(|operation| operation.receipt.operation_id.as_str()), &self.call, &waiting)
             .map_err(McpError::Protocol)?;
-        super::command::settle_outcome(&self.kernel, self.context, &self.command, &self.output, &waiting)
-            .map_err(McpError::Protocol)?;
+        if let Some((command, output)) = self.pair {
+            super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, &waiting)
+                .map_err(McpError::Protocol)?;
+        }
         if let Some(notices) = &self.notices {
             let refusal = McpError::gate_pending(None, Some(ask.clone()),
                 "Captured execution awaits result review; approval continues processing without running source again.".into())
@@ -101,9 +121,11 @@ impl CommandResultReview {
                     return Err(McpError::Protocol("result review answer was already consumed".into()));
                 }
                 if row.status == ApprovalStatus::Allowed {
-                    for block in [&self.output, &self.command] {
-                        self.kernel.blocks().set_status(self.context, block, Status::Running)
-                            .map_err(|e| McpError::Protocol(e.to_string()))?;
+                    if let Some((command, output)) = self.pair {
+                        for block in [output, command] {
+                            self.kernel.blocks().set_status(self.call.context_id, &block, Status::Running)
+                                .map_err(|e| McpError::Protocol(e.to_string()))?;
+                        }
                     }
                     return Ok(());
                 }
@@ -130,18 +152,21 @@ mod tests {
     use super::*;
     use crate::mcp::broker::ResultReview;
     use super::super::command_outcome::CommandExecution;
-    use kaijutsu_types::PrincipalId;
+    use kaijutsu_types::{ContextId, PrincipalId};
     use std::future::Future;
 
-    async fn fixture() -> (CommandResultReview, AskRef, String) {
+    async fn fixture(authored: bool) -> (CommandResultReview, AskRef, Option<String>) {
         let kernel = Arc::new(crate::Kernel::new_ephemeral("result-review").await);
         let context = ContextId::new();
         let blocks = kernel.blocks();
         blocks.create_document(context, crate::block_store::DocumentKind::Conversation, None).unwrap();
-        let command = blocks.insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
-        let output = blocks.insert_tool_result(context, &command, Some(&command), "waiting", false, None, None).unwrap();
         let actor = PrincipalId::system();
-        let operation = kernel.shell_operations().register(context, actor, actor, command, output, "never-rerun", None).unwrap();
+        let (pair, operation) = if authored {
+            let command = blocks.insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+            let output = blocks.insert_tool_result(context, &command, Some(&command), "waiting", false, None, None).unwrap();
+            let operation = kernel.shell_operations().register(context, actor, actor, command, output, "never-rerun", None).unwrap();
+            (Some((command, output)), Some(operation.operation_id))
+        } else { (None, None) };
         let request_id = approval_ledger::ask::create_ask(kernel.kernel_db().lock().conn_for_ledger(),
             &approval_ledger::types::NewAsk {
                 context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
@@ -153,36 +178,37 @@ mod tests {
                 continuation_epoch: None, env: vec![],
             }).unwrap();
         let ask = crate::kj::gate::ask_ref(request_id, approval_ledger::types::ApprovalStatus::Pending);
-        let review = CommandResultReview { kernel, context, command, output,
-            captured: CommandOutcome::new(CommandExecution::Completed(
+        let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
+        let review = CommandResultReview::new(kernel, call, pair,
+            CommandOutcome::new(CommandExecution::Completed(
                 kaish_kernel::interpreter::ExecResult::success("already ran")), 1),
-            cancel: tokio_util::sync::CancellationToken::new(), notices: None,
-        };
-        (review, ask, operation.operation_id)
+            tokio_util::sync::CancellationToken::new(), None);
+        (review, ask, operation)
     }
 
     #[tokio::test]
     async fn dropping_a_review_settles_captured_execution_without_rerunning_it() {
-        let (review, ask, operation) = fixture().await;
+        let (review, ask, operation) = fixture(true).await;
+        let operation = operation.unwrap();
         let mut wait = Box::pin(review.wait_for_review(&ask));
         std::future::poll_fn(|cx| {
             assert!(wait.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
         }).await;
         drop(wait);
-        let state = review.kernel.shell_operations().get(&operation, review.context).unwrap().unwrap();
+        let state = review.kernel.shell_operations().get(&operation, review.call.context_id).unwrap().unwrap();
         assert_eq!(state.envelope.unwrap().status, kaijutsu_types::shell_envelope::ShellStatus::Error);
-        let outcome = review.kernel.shell_operations().outcome(&operation, review.context).unwrap().unwrap();
+        let outcome = review.kernel.shell_operations().outcome(&operation, review.call.context_id).unwrap().unwrap();
         let CommandExecution::Completed(raw) = outcome.execution else { panic!("captured execution was lost") };
         assert_eq!(raw.text_out(), "already ran");
         assert_eq!(review.kernel.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
             approval_ledger::types::ApprovalStatus::Abandoned);
-        assert_eq!(review.kernel.blocks().get_block_snapshot(review.context, &review.output).unwrap().unwrap().status, Status::Error);
+        assert_eq!(review.kernel.blocks().get_block_snapshot(review.call.context_id, &review.pair.unwrap().1).unwrap().unwrap().status, Status::Error);
     }
 
     #[tokio::test]
     async fn cancelling_review_abandons_the_wait_without_authorizing_anything() {
-        let (review, ask, _) = fixture().await;
+        let (review, ask, _) = fixture(true).await;
         review.cancel.cancel();
         let error = review.wait_for_review(&ask).await.unwrap_err();
         assert!(error.as_refusal().is_some());
@@ -192,25 +218,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_preserves_execution_but_does_not_resume_an_interrupted_hook_snapshot() {
-        let (review, ask, operation) = fixture().await;
+    async fn review_storage_preserves_captured_execution_and_terminal_results() {
+        let (review, ask, _) = fixture(false).await;
         let mut checkpoint = review.captured.clone();
-        checkpoint.hook = Some(CommandHookEffect::Refused { reason: "awaiting result review".into(),
-            refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()) });
-        review.kernel.shell_operations().checkpoint_result_review(&operation, &checkpoint).unwrap();
-        let db = review.kernel.kernel_db().clone();
-        let principal = review.kernel.blocks().principal_id();
-        let workspace = db.lock().get_or_create_default_workspace(principal).unwrap();
-        let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
-        let dir = tempfile::tempdir().unwrap();
-        let recovered = crate::Kernel::new("recovered-review", dir.path(), blocks, db).await;
-        let outcome = recovered.shell_operations().outcome(&operation, review.context).unwrap().unwrap();
-        let CommandExecution::Completed(raw) = &outcome.execution else { panic!("lost executed outcome") };
+        checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
+            waiting: true, ask_id: Some(ask.request_id.clone()) });
+        let store = review.kernel.shell_operations();
+        store.checkpoint_result_review(&review.review_id, None, &review.call, &checkpoint).unwrap();
+        let mut changed = checkpoint.clone();
+        changed.execution = CommandExecution::Completed(kaish_kernel::interpreter::ExecResult::success("different execution"));
+        assert!(store.checkpoint_result_review(&review.review_id, None, &review.call, &changed).is_err(),
+            "another checkpoint cannot rewrite execution");
+        store.finish_result_review(&review.review_id, &review.captured).unwrap();
+        store.finish_result_review(&review.review_id, &review.captured).unwrap();
+        assert!(store.checkpoint_result_review(&review.review_id, None, &review.call, &checkpoint).is_err());
+        changed.hook = None;
+        assert!(store.finish_result_review(&review.review_id, &changed).is_err());
+        let record = store.result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap();
+        let CommandExecution::Completed(raw) = record.settled.unwrap().execution else { panic!("lost execution") };
         assert_eq!(raw.text_out(), "already ran");
-        assert!(outcome.settlement_error.as_deref().unwrap().contains("restarted during result review"));
-        assert_eq!(outcome.block_status(), Status::Error);
-        assert_eq!(recovered.blocks().get_block_snapshot(review.context, &review.output).unwrap().unwrap().status, Status::Error);
-        assert_eq!(recovered.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
-            approval_ledger::types::ApprovalStatus::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn review_storage_requires_receipt_preparation_for_tracked_completion() {
+        let (review, ask, operation) = fixture(true).await;
+        let mut checkpoint = review.captured.clone();
+        checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
+            waiting: true, ask_id: Some(ask.request_id.clone()) });
+        let store = review.kernel.shell_operations();
+        store.checkpoint_result_review(&review.review_id, operation.as_deref(), &review.call, &checkpoint).unwrap();
+        assert!(store.finish_result_review(&review.review_id, &review.captured).is_err(),
+            "tracked review completion must be atomic with operation outcome preparation");
+        assert!(store.result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().settled.is_none());
+        review.settle(&review.captured).unwrap();
+        assert!(store.result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().settled.is_some());
+    }
+
+    #[tokio::test]
+    async fn quiet_review_drop_retains_execution_without_creating_blocks() {
+        let (review, ask, operation) = fixture(false).await;
+        assert!(operation.is_none());
+        let mut wait = Box::pin(review.wait_for_review(&ask));
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        }).await;
+        drop(wait);
+        let record = review.kernel.shell_operations().result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap();
+        assert!(record.operation_id.is_none());
+        let final_result = record.settled.unwrap();
+        assert_eq!(final_result.block_status(), Status::Error);
+        let CommandExecution::Completed(raw) = final_result.execution else { panic!("lost raw execution") };
+        assert_eq!(raw.text_out(), "already ran");
+        assert!(review.kernel.blocks().block_snapshots(review.call.context_id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_execution_but_does_not_resume_an_interrupted_hook_snapshot() {
+        for (authored, legacy) in [(true, false), (false, false), (true, true)] {
+            let (review, ask, operation) = fixture(authored).await;
+            let mut checkpoint = review.captured.clone();
+            checkpoint.hook = Some(CommandHookEffect::Refused { reason: "awaiting result review".into(),
+                refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()) });
+            if legacy {
+                let db = review.kernel.kernel_db().lock();
+                db.conn_for_ledger().execute_batch("DROP TABLE shell_result_review_asks; DROP TABLE shell_result_reviews;
+                    CREATE TABLE shell_result_reviews(operation_id TEXT PRIMARY KEY REFERENCES shell_operations(operation_id), outcome_json TEXT NOT NULL);")
+                    .unwrap();
+                db.conn_for_ledger().execute("INSERT INTO shell_result_reviews VALUES(?1,?2)",
+                    rusqlite::params![operation.as_ref().unwrap(), serde_json::to_string(&checkpoint).unwrap()]).unwrap();
+            } else {
+                review.kernel.shell_operations().checkpoint_result_review(&review.review_id, operation.as_deref(), &review.call, &checkpoint).unwrap();
+            }
+            let db = review.kernel.kernel_db().clone();
+            let principal = review.kernel.blocks().principal_id();
+            let workspace = db.lock().get_or_create_default_workspace(principal).unwrap();
+            let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
+            let dir = tempfile::tempdir().unwrap();
+            let recovered = crate::Kernel::new("recovered-review", dir.path(), blocks, db).await;
+            let record = recovered.shell_operations().result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap();
+            assert_eq!(record.operation_id, operation);
+            let outcome = record.settled.unwrap();
+            let CommandExecution::Completed(raw) = &outcome.execution else { panic!("lost executed outcome") };
+            assert_eq!(raw.text_out(), "already ran");
+            assert!(outcome.settlement_error.as_deref().unwrap().contains("restarted during result review"));
+            assert_eq!(outcome.block_status(), Status::Error);
+            if let Some((_, output)) = review.pair {
+                assert_eq!(recovered.blocks().get_block_snapshot(review.call.context_id, &output).unwrap().unwrap().status, Status::Error);
+                assert_eq!(recovered.shell_operations().get_by_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().receipt.operation_id,
+                    operation.unwrap());
+            }
+            assert_eq!(recovered.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
+                approval_ledger::types::ApprovalStatus::Abandoned);
+        }
     }
 }

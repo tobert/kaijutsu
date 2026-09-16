@@ -214,10 +214,8 @@ pub async fn run_into_blocks(
     let review_cancel = options.cancel_token.clone().unwrap_or_default();
     let mut outcome = capture_command(kaish, code, options, kernel, context_id, run.context_switch).await;
 
-    let review = super::result_review::CommandResultReview {
-        kernel: kernel.clone(), context: context_id, command: *command_block_id, output: *output_block_id,
-        captured: outcome.clone(), cancel: review_cancel, notices: run.review_notices,
-    };
+    let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
+        Some((*command_block_id, *output_block_id)), outcome.clone(), review_cancel, run.review_notices);
     apply_result_hooks(&mut outcome, code, kernel, call_ctx, Some(&review)).await;
 
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -231,20 +229,24 @@ pub async fn run_into_blocks(
     settled.map(|()| outcome)
 }
 
-/// Execute a receipt-free command with the same state and hook policy. Quiet
-/// callers author no blocks; result escalation requires a retained review owner.
+/// Execute without transcript blocks. A result review retains an audit record
+/// only when it opens an ask; ordinary quiet calls create no review record.
 pub async fn run_quiet(
     kaish: &EmbeddedKaish,
     code: &str,
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
-) -> CommandOutcome {
+    notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
+) -> Result<CommandOutcome, String> {
     let started = std::time::Instant::now();
     let mut outcome = capture_command(kaish, code, kaish_kernel::ExecuteOptions::default(),
         kernel, call_ctx.context_id, CommandContextSwitch::Pinned).await;
-    apply_result_hooks(&mut outcome, code, kernel, call_ctx, None).await;
+    let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
+        None, outcome.clone(), tokio_util::sync::CancellationToken::new(), notices);
+    apply_result_hooks(&mut outcome, code, kernel, call_ctx, Some(&review)).await;
     outcome.elapsed_ms = started.elapsed().as_millis() as u64;
-    outcome
+    review.settle(&outcome)?;
+    Ok(outcome)
 }
 
 async fn capture_command(

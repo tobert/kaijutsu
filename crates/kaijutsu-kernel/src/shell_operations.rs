@@ -1,4 +1,4 @@
-//! Durable shell receipts and context-owned kaish job managers.
+//! Durable shell receipts, result reviews, and context-owned kaish job managers.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +36,15 @@ pub struct ShellOperationState {
     pub envelope: Option<ShellEnvelope>,
 }
 
+/// Captured execution and its eventual result, shared by every ask in a review.
+#[derive(Debug, Clone)]
+pub struct ResultReviewState {
+    pub review_id: String,
+    pub operation_id: Option<String>,
+    pub captured: CommandOutcome,
+    pub settled: Option<CommandOutcome>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellOperationSummary {
     pub running_count: u32,
@@ -54,6 +63,47 @@ pub struct ShellOperationRegistry {
     db: Arc<Mutex<KernelDb>>,
     managers: Mutex<HashMap<ContextId, Arc<JobManager>>>,
     jobs: Mutex<HashMap<String, (JobId, Arc<JobManager>)>>,
+}
+
+fn initialize_review_store(conn: &rusqlite::Connection) -> OperationResult<()> {
+    let columns: Vec<String> = conn.prepare("PRAGMA table_info(shell_result_reviews)").map_err(|e| e.to_string())?
+        .query_map([], |row| row.get(1)).map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?;
+    let legacy = !columns.is_empty() && !columns.iter().any(|name| name == "review_id");
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    if legacy { tx.execute_batch("ALTER TABLE shell_result_reviews RENAME TO shell_result_reviews_legacy").map_err(|e| e.to_string())?; }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS shell_result_reviews (
+        review_id TEXT PRIMARY KEY,
+        operation_id TEXT UNIQUE REFERENCES shell_operations(operation_id),
+        context_id BLOB NOT NULL,
+        principal_id BLOB NOT NULL,
+        actor_id BLOB NOT NULL,
+        outcome_json TEXT NOT NULL,
+        final_json TEXT
+    );
+    CREATE TABLE IF NOT EXISTS shell_result_review_asks (
+        request_id TEXT PRIMARY KEY REFERENCES approvals(request_id),
+        review_id TEXT NOT NULL REFERENCES shell_result_reviews(review_id)
+    );
+    CREATE INDEX IF NOT EXISTS shell_result_review_asks_owner ON shell_result_review_asks(review_id);")
+        .map_err(|e| e.to_string())?;
+    if legacy {
+        let rows: Vec<(String, String)> = tx.prepare("SELECT operation_id,outcome_json FROM shell_result_reviews_legacy")
+            .map_err(|e| e.to_string())?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?.collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?;
+        for (id, json) in rows {
+            let outcome: CommandOutcome = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let ask = outcome.envelope().ask_id.ok_or("legacy result review has no ask")?;
+            let changed = tx.execute("INSERT INTO shell_result_reviews(review_id,operation_id,context_id,principal_id,actor_id,outcome_json)
+                SELECT operation_id,operation_id,context_id,principal_id,actor_id,?2 FROM shell_operations WHERE operation_id=?1",
+                rusqlite::params![id, json]).map_err(|e| e.to_string())?;
+            require_changed(changed, &id)?;
+            tx.execute("INSERT INTO shell_result_review_asks(request_id,review_id) VALUES(?1,?2)",
+                rusqlite::params![ask, id]).map_err(|e| e.to_string())?;
+        }
+        tx.execute_batch("DROP TABLE shell_result_reviews_legacy").map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
 }
 
 impl ShellOperationRegistry {
@@ -81,13 +131,10 @@ impl ShellOperationRegistry {
              CREATE TABLE IF NOT EXISTS shell_operation_projections (
                 operation_id TEXT PRIMARY KEY REFERENCES shell_operation_outcomes(operation_id)
              );
-             CREATE TABLE IF NOT EXISTS shell_result_reviews (
-                operation_id TEXT PRIMARY KEY REFERENCES shell_operations(operation_id),
-                outcome_json TEXT NOT NULL
-             );
              CREATE INDEX IF NOT EXISTS shell_operations_context ON shell_operations(context_id);
              CREATE UNIQUE INDEX IF NOT EXISTS shell_operations_ask ON shell_operations(ask_id);"
         ).map_err(|e| e.to_string())?;
+        initialize_review_store(db.lock().conn_for_ledger())?;
         Ok(Self { db, managers: Mutex::new(HashMap::new()), jobs: Mutex::new(HashMap::new()) })
     }
 
@@ -138,8 +185,12 @@ impl ShellOperationRegistry {
         self.complete_record(id, envelope, None)
     }
 
-    /// Checkpoint captured execution while its result hook awaits a decision.
-    pub(crate) fn checkpoint_result_review(&self, id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
+    /// Retain execution and link each ask to the same review. A quiet command
+    /// has no operation receipt; its call identity still scopes every ask.
+    pub(crate) fn checkpoint_result_review(
+        &self, review_id: &str, operation_id: Option<&str>, call: &crate::mcp::CallContext,
+        outcome: &CommandOutcome,
+    ) -> OperationResult<()> {
         let envelope = outcome.envelope();
         if envelope.status != ShellStatus::Waiting { return Err("result review checkpoint is not waiting".into()); }
         let ask = envelope.ask_id.ok_or("result review checkpoint has no ask")?;
@@ -147,47 +198,111 @@ impl ShellOperationRegistry {
         let db = self.db.lock();
         let tx = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
         let valid: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM approvals a JOIN shell_operations o
-             ON a.context_id=o.context_id AND a.actor_id=o.actor_id AND a.principal_id=o.principal_id
-             WHERE o.operation_id=?1 AND a.request_id=?2 AND a.origin='hook_result' AND a.exec_source IS NULL)",
-            rusqlite::params![id, ask], |row| row.get(0),
+            "SELECT EXISTS(SELECT 1 FROM approvals WHERE request_id=?1 AND context_id=?2
+             AND principal_id=?3 AND actor_id=?4 AND origin='hook_result' AND exec_source IS NULL)",
+            rusqlite::params![ask, call.context_id.as_bytes(), call.principal_id.as_bytes(), call.actor_id.as_bytes()],
+            |row| row.get(0),
         ).map_err(|e| e.to_string())?;
-        if !valid { return Err("ask is not a result review for this operation".into()); }
+        if !valid { return Err("ask is not a result review for this invocation".into()); }
+        let prior: Option<String> = tx.query_row("SELECT outcome_json FROM shell_result_reviews WHERE review_id=?1",
+            [review_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        if let Some(prior) = prior {
+            let mut captured: CommandOutcome = serde_json::from_str(&prior).map_err(|e| e.to_string())?;
+            let mut incoming = outcome.clone();
+            captured.hook = None;
+            incoming.hook = None;
+            if serde_json::to_string(&captured).map_err(|e| e.to_string())?
+                != serde_json::to_string(&incoming).map_err(|e| e.to_string())?
+            {
+                return Err("result review checkpoint cannot rewrite captured execution".into());
+            }
+        }
+        if let Some(id) = operation_id {
+            let changed = tx.execute(
+                "UPDATE shell_operations SET ask_id=?2 WHERE operation_id=?1 AND completed_at IS NULL
+                 AND context_id=?3 AND principal_id=?4 AND actor_id=?5
+                 AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)",
+                rusqlite::params![id, ask, call.context_id.as_bytes(), call.principal_id.as_bytes(), call.actor_id.as_bytes()],
+            ).map_err(|e| e.to_string())?;
+            require_changed(changed, id)?;
+        }
         let changed = tx.execute(
-            "UPDATE shell_operations SET ask_id=?2 WHERE operation_id=?1 AND completed_at IS NULL
-             AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)",
-            rusqlite::params![id, ask],
+            "INSERT INTO shell_result_reviews(review_id,operation_id,context_id,principal_id,actor_id,outcome_json)
+             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(review_id) DO UPDATE SET outcome_json=excluded.outcome_json
+             WHERE shell_result_reviews.final_json IS NULL AND shell_result_reviews.operation_id IS excluded.operation_id
+             AND shell_result_reviews.context_id=excluded.context_id AND shell_result_reviews.principal_id=excluded.principal_id
+             AND shell_result_reviews.actor_id=excluded.actor_id",
+            rusqlite::params![review_id, operation_id, call.context_id.as_bytes(), call.principal_id.as_bytes(), call.actor_id.as_bytes(), json],
         ).map_err(|e| e.to_string())?;
-        require_changed(changed, id)?;
-        tx.execute("INSERT INTO shell_result_reviews(operation_id,outcome_json) VALUES(?1,?2)
-                    ON CONFLICT(operation_id) DO UPDATE SET outcome_json=excluded.outcome_json",
-            rusqlite::params![id, json]).map_err(|e| e.to_string())?;
+        require_changed(changed, review_id)?;
+        tx.execute("INSERT OR IGNORE INTO shell_result_review_asks(request_id,review_id) VALUES(?1,?2)",
+            rusqlite::params![ask, review_id]).map_err(|e| e.to_string())?;
+        let owner: String = tx.query_row("SELECT review_id FROM shell_result_review_asks WHERE request_id=?1", [&ask], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if owner != review_id { return Err("result ask already belongs to another invocation".into()); }
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Finish a quiet review if it opened an ask. Normal quiet calls retain no
+    /// record. A published review result is immutable, including on retry.
+    pub(crate) fn finish_result_review(&self, review_id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
+        if !matches!(outcome.block_status(), kaijutsu_types::Status::Done | kaijutsu_types::Status::Error) {
+            return Err("result review completion is not terminal".into());
+        }
+        let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
+        let db = self.db.lock();
+        let tx = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
+        let prior: Option<(Option<String>, Option<String>)> = tx.query_row(
+            "SELECT operation_id,final_json FROM shell_result_reviews WHERE review_id=?1",
+            [review_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
+        if let Some((operation, prior)) = prior {
+            if operation.is_some() { return Err("tracked result review requires operation outcome preparation".into()); }
+            if let Some(prior) = prior && prior != json { return Err("result review already has a different outcome".into()); }
+        }
+        tx.execute("UPDATE shell_result_reviews SET final_json=?2 WHERE review_id=?1 AND final_json IS NULL",
+            rusqlite::params![review_id, json]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn result_review_for_ask(&self, ask: &str, context: ContextId) -> OperationResult<Option<ResultReviewState>> {
+        let row: Option<(String, Option<String>, String, Option<String>)> = self.db.lock().conn_for_ledger().query_row(
+            "SELECT r.review_id,r.operation_id,r.outcome_json,r.final_json FROM shell_result_reviews r
+             JOIN shell_result_review_asks a USING(review_id) WHERE a.request_id=?1 AND r.context_id=?2",
+            rusqlite::params![ask, context.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        row.map(|(review_id, operation_id, captured, settled)| Ok(ResultReviewState {
+            review_id, operation_id,
+            captured: serde_json::from_str(&captured).map_err(|e| e.to_string())?,
+            settled: settled.map(|json| serde_json::from_str(&json)).transpose().map_err(|e| e.to_string())?,
+        })).transpose()
     }
 
     /// A restart cannot resume the in-memory hook snapshot. Retain execution
     /// and report interrupted review instead of executing or accepting it again.
     pub(crate) fn recover_result_reviews(&self) -> OperationResult<()> {
-        let reviews: Vec<(String, String)> = {
+        let reviews: Vec<(String, Option<String>, String)> = {
             let db = self.db.lock();
-            let mut stmt = db.conn_for_ledger().prepare("SELECT operation_id,outcome_json FROM shell_result_reviews")
+            let mut stmt = db.conn_for_ledger().prepare("SELECT review_id,operation_id,outcome_json FROM shell_result_reviews WHERE final_json IS NULL")
                 .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(|e| e.to_string())?
                 .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?
         };
-        for (id, json) in reviews {
+        for (review_id, operation, json) in reviews {
             let mut outcome: CommandOutcome = serde_json::from_str(&json).map_err(|e| e.to_string())?;
             let reason = "kernel restarted during result review; captured execution was retained and source was not run again";
-            if let Some(ask) = outcome.envelope().ask_id {
+            let ask = outcome.envelope().ask_id.ok_or("interrupted review lost its ask id")?;
+            {
                 let db = self.db.lock();
-                if let Some(row) = db.get_approval(&ask).map_err(|e| e.to_string())?
-                    && matches!(row.status, approval_ledger::types::ApprovalStatus::Pending | approval_ledger::types::ApprovalStatus::Claimed)
-                {
+                let row = db.get_approval(&ask).map_err(|e| e.to_string())?.ok_or("interrupted review lost its ask")?;
+                if matches!(row.status, approval_ledger::types::ApprovalStatus::Pending | approval_ledger::types::ApprovalStatus::Claimed) {
                     approval_ledger::decide::abandon(db.conn_for_ledger(), &ask, Some(reason)).map_err(|e| e.to_string())?;
                 }
             }
             outcome.settlement_error = Some(reason.into());
-            self.prepare_settlement(&id, &outcome)?;
+            match operation {
+                Some(id) => self.prepare_settlement(&id, &outcome)?,
+                None => self.finish_result_review(&review_id, &outcome)?,
+            }
         }
         Ok(())
     }
@@ -219,7 +334,12 @@ impl ShellOperationRegistry {
         }
         tx.execute("INSERT OR IGNORE INTO shell_operation_projections(operation_id) VALUES(?1)", [id])
             .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM shell_result_reviews WHERE operation_id=?1", [id]).map_err(|e| e.to_string())?;
+        let inconsistent: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM shell_result_reviews WHERE operation_id=?1 AND final_json IS NOT NULL AND final_json != ?2)",
+            rusqlite::params![id, json], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if inconsistent { return Err("result review already has a different outcome".into()); }
+        tx.execute("UPDATE shell_result_reviews SET final_json=?2 WHERE operation_id=?1 AND final_json IS NULL",
+            rusqlite::params![id, json]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -317,7 +437,11 @@ impl ShellOperationRegistry {
     }
 
     pub fn get_by_ask(&self, ask: &str, context: ContextId) -> OperationResult<Option<ShellOperationState>> {
-        self.lookup("ask_id", ask, context)
+        self.db.lock().conn_for_ledger().query_row(
+            &format!("{SELECT_STATE} WHERE context_id=?2 AND (ask_id=?1 OR operation_id IN
+                (SELECT r.operation_id FROM shell_result_reviews r JOIN shell_result_review_asks a USING(review_id) WHERE a.request_id=?1))"),
+            rusqlite::params![ask, context.as_bytes()], decode_state,
+        ).optional().map_err(|e| e.to_string())
     }
 
     /// Read the execution record without adding raw output to ordinary receipt polls.
@@ -373,7 +497,7 @@ impl ShellOperationRegistry {
             let mut stmt = db.conn_for_ledger().prepare(
                 "SELECT operation_id FROM shell_operations WHERE completed_at IS NULL
                  AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)
-                 AND operation_id NOT IN (SELECT operation_id FROM shell_result_reviews)",
+                 AND NOT EXISTS (SELECT 1 FROM shell_result_reviews r WHERE r.operation_id=shell_operations.operation_id AND r.final_json IS NULL)",
             ).map_err(|e| e.to_string())?;
             stmt.query_map([], |row| row.get(0)).map_err(|e| e.to_string())?
                 .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?

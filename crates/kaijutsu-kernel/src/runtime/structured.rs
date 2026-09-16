@@ -66,7 +66,7 @@ pub async fn execute_kj(
             Some((command, output)) => command::run_into_blocks(&kaish, &code, context, &command, &output,
                 kernel, &call_ctx, CommandRunOptions { stdin: None,
                     context_switch: CommandContextSwitch::Pinned, review_notices }).await?,
-            None => command::run_quiet(&kaish, &code, kernel, &call_ctx).await,
+            None => command::run_quiet(&kaish, &code, kernel, &call_ctx, review_notices).await?,
         },
         verdict => {
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);

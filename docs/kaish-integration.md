@@ -81,19 +81,22 @@ These are source observations, not promises that all paths behave alike.
   replacements preserve structured data and clear obsolete stderr/exits. Authored
   calls register durable receipts and release the RPC on a pending result review;
   their task retains execution and continues after approval. Quiet calls share
-  captured execution and result projection but create no pair or receipt.
+  execution, result review, and projection without a transcript pair or ordinary
+  operation receipt.
 - Settlement remains incomplete: streaming RPC and MCP completion still have
-  separate projection paths. Receipt-free quiet calls still lack a retained
-  result-review owner. Streaming RPC cannot honor all hook verdicts; live
+  separate projection paths. Streaming RPC cannot honor all hook verdicts; live
   reporting/retry of persistence failures also remains open.
 - `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
   PostCall or OnError ask. Approval continues the same ordered hook snapshot;
   neither the command nor earlier hooks run again. Result-review asks have
   `hook_result` origin, no executable source, and a digest binding the phase,
-  call, and captured result. The generic execution/resume driver excludes them, and retry redemption
-  cannot consume another execution owner's answer.
+  call, and captured result. The generic execution/resume driver excludes them;
+  retry redemption cannot consume another execution owner's answer.
   Cancellation or dropping the wait abandons the ask and retains the outcome;
   restart reports interrupted review without re-entering the lost hook snapshot.
+  The same review store retains quiet results without transcript blocks. Every
+  sequential ask links to its invocation and optional operation receipt.
+  `kj ledger show <request-id>` exposes captured and terminal results.
 - `background_exec.rs` was removed in `8ea04fdf`. Asynchronous shell programs
   use kaish's job system with durable Kaijutsu receipts. Earlier notes claiming
   that a temporary shell cannot host work that outlives it are obsolete.
@@ -110,7 +113,7 @@ remove the obsolete API in the same change as its final caller.
 | Pending | Dedicated threads and startup runtime | kernel `lib.rs`; server `main.rs`, `ssh.rs`, `beat.rs`, turn/resume drivers | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
 | Partial | Interactive shell submission | server `rpc.rs::execute_shell_command`; kernel `runtime/command.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
 | Pending | Streaming execute RPC | server `rpc.rs::execute` | Execution IDs, connection cancellation and concurrency rules, output subscriptions; resolve its unsupported hook substitution explicitly |
-| Partial | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet mode, data, and state write-back migrated; quiet result-review retention and headless task ownership pending |
+| Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
 | Partial | Approval resume | server resume drivers; kernel `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
 | Pending | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs` | Read-only/writable distinction, stdin, typed rejection, job ownership, receipts, cancellation, and async completion |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
@@ -180,16 +183,27 @@ background interactive callers currently log that failure, and approval resumes
 report it to the model.
 
 Result-hook asks retain what already ran and resume hook processing without
-permission to rerun. Interactive/approved and authored structured commands checkpoint the outcome
-and current ask before publishing Waiting blocks. Cwd/exports persist before review.
-Approval consumes the answer and continues the ordered hook snapshot; sequential
-asks update the checkpoint. Final settlement replaces it atomically with the
-terminal outcome. A dropped wait or cancellation abandons an unanswered ask;
+permission to rerun. Interactive/approved and authored structured commands
+checkpoint the outcome and current ask before publishing Waiting blocks.
+Cwd/exports persist before review.
+Approval consumes the answer and continues the ordered hook snapshot; every
+sequential ask retains its link to that invocation. Captured execution remains
+inspectable after completion. Tracked review completion commits atomically with
+terminal outcome preparation; quiet review completion stores an immutable result
+without a transcript pair. Ordinary quiet calls create no review record. The
+checkpoint schema migration preserves interrupted tracked reviews. A dropped
+wait or cancellation abandons an unanswered ask;
 restart retains the execution and reports interrupted review even if the answer
 arrived before shutdown. It cannot reconstruct the in-memory hook snapshot.
 
-Receipt-free quiet structured calls, streaming RPC, and generic MCP calls do
-not yet supply a result-review owner. Their result-phase Ask or kaish escalation returns GateUnavailable before
+`kj ledger show <request-id>` includes `result_review.captured` and
+`result_review.settled` in its structured data; the latter is `null` while hooks
+are still processing. The output shows both results, so a quiet caller can read
+its completed result without a transcript block. An earlier ask in a sequence
+still resolves the same invocation and optional operation receipt.
+
+Streaming RPC and generic MCP calls do not yet supply a result-review owner.
+Their result-phase Ask or kaish escalation returns GateUnavailable before
 creating an ask. Migrate those consumers to retained outcomes; do not restore
 executable asks as a fallback. Streaming RPC's unhandled verdicts remain open.
 

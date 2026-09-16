@@ -36,8 +36,12 @@ Cancellation or dropping the wait abandons an unanswered ask. Restart preserves
 the captured execution but reports interrupted review; it cannot recreate the
 in-memory hook snapshot. Authored structured calls return a typed Pending
 refusal while their task retains the review; the RPC does not wait for a human.
-Quiet structured calls, streaming RPC, and MCP still need a retained review
-owner and currently fail escalation before creating an ask. See
+Quiet structured calls use the same review owner without authoring transcript
+blocks. `kj ledger show <request-id>` includes the captured execution and final
+result; its structured data exposes `result_review.captured` and
+`result_review.settled`. Every ask in a sequence retains the same invocation link.
+Streaming RPC and MCP still need a retained review owner and currently fail
+escalation before creating an ask. See
 `docs/kaish-integration.md` for the caller inventory.
 
 ## Why blocking could never reach where Amy wants it

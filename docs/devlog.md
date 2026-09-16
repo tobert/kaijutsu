@@ -1588,6 +1588,16 @@ also exposed Bash-style backtick escaping that kaish preserved as extra text;
 quoting now follows the pinned kaish parser. Its native argv API lacks per-call
 execution options, so this path retains source execution and cancellation.
 
+Quiet structured calls then gained the same retained review owner. The review
+store now associates every ask with its invocation and an optional operation
+receipt; a quiet call creates a record only if a result hook opens an ask.
+Completion retains both captured execution and the final result, exposed through
+`kj ledger show`, without inventing transcript blocks. Earlier sequential asks
+keep their operation link. Tracked completion remains atomic with operation
+outcome preparation; quiet completion stores an immutable result on its own.
+Restart reports interrupted review for both, and the schema upgrade preserves
+checkpoints written before quiet reviews were supported.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
