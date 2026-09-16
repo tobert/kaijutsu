@@ -115,10 +115,15 @@ These are source observations, not promises that all paths behave alike.
   a worker cannot join itself. Host Drop signals cancellation without waiting.
   Remaining server-owned turn, resume, and transport tasks still need a shared
   shutdown owner.
+- Shared capture/review catches unwinding panics only to settle before resuming
+  the original panic. Execution without a captured result records a fault with
+  unknown side effects. State-publication and result-hook panics retain captured
+  execution; completed statement output drains before streams close. The worker
+  stops admission after a task failure and returns an error from shutdown.
 - Live reporting/retry of persistence failures and headless turn ownership
-  remain open. Panics and abrupt task destruction before capture still need a
-  durable terminal outcome; cooperative worker shutdown now settles execution,
-  paused hooks, and review with matching job/receipt results and closed streams.
+  remain open. Abrupt task destruction before capture still needs a durable
+  terminal outcome; cooperative worker shutdown settles execution, paused hooks,
+  and review with matching job/receipt results and closed streams.
 - `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
   PostCall or OnError ask. Approval continues the same ordered hook snapshot;
   neither the command nor earlier hooks run again. Result-review asks have
@@ -148,7 +153,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Streaming execute RPC | server `rpc.rs::execute`; kernel `runtime/command.rs` | Shared execution, review, state, all hook verdicts, physical exit, execution IDs, interrupt, concurrency, subscriptions, context switching, and disconnect settlement verified |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; RPC response lifetime in server | Shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, and state write-back; worker placement remains in the dedicated-thread audit |
 | Partial | Approval resume | server resume drivers; kernel `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, exactly one execution and terminal settlement |
-| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, and cooperative shutdown migrated; panic/abrupt drop and durable notification recovery remain in the settlement audit |
+| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; abrupt drop and durable notification recovery remain in the settlement audit |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Pending | Editor shell reads | kernel `kernel.rs::fetch_editor_io` | Opener identity/context, full text, and fail-before-splice behavior |

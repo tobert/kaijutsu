@@ -1651,6 +1651,17 @@ the join; repeated and concurrent callers observe the same completion. The
 same audit found that block pairs without receipts ignored explicit cancellation;
 all command runs now install that token before deciding whether to track a job.
 
+Panic tests exposed a second way to strand an accepted command: Tokio reported
+a task panic while its receipt stayed Running, and worker shutdown still returned
+success. Shared capture/review now catches unwinding only long enough to settle,
+then resumes the original panic. Before capture, the record says side effects
+may have occurred; after capture, it preserves the executed result. A separate
+test caught losing output when context-state publication panicked after execution.
+Another caught a completed statement still queued when the next statement
+panicked; the output writer now drains that queue before unwinding. The worker
+stops admission on task failure, cancels remaining work, and returns a failed
+shutdown result. The kaish thread helper now carries that result through its join.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

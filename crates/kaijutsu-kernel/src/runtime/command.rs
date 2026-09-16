@@ -4,6 +4,7 @@
 //! transport may supply a context-switch callback and review notices.
 
 use std::sync::Arc;
+use futures::FutureExt;
 
 use crate::Kernel;
 use crate::runtime::embedded_kaish::EmbeddedKaish;
@@ -196,7 +197,7 @@ pub async fn run_into_blocks(
     output_block_id: &BlockId,
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
-    run: CommandRunOptions<'_>,
+    mut run: CommandRunOptions<'_>,
 ) -> Result<CommandOutcome, String> {
     // Yield to let the event loop flush BlockInserted events to clients
     // before we start producing text ops. Without this, fast commands
@@ -206,7 +207,7 @@ pub async fn run_into_blocks(
 
     let mut options = kaish_kernel::ExecuteOptions::default();
     options.cancel_token = run.cancel.clone();
-    if let Some(stdin) = run.stdin {
+    if let Some(stdin) = run.stdin.take() {
         options = options.with_stdin(stdin);
     }
     let tracked_job = match kernel.shell_operations().get_by_output(output_block_id, context_id) {
@@ -236,28 +237,23 @@ pub async fn run_into_blocks(
         let (manager, job, _) = tracked_job.as_ref().ok_or("live command output requires a tracked job")?;
         Some(manager.streams(*job).await.ok_or("tracked command lost its output streams")?)
     } else { None };
-    if let Some(ready) = run.job_ready { let _ = ready.send(()); }
-    let started = std::time::Instant::now();
-    let review_cancel = options.cancel_token.clone().unwrap_or_default();
-    let mut outcome = capture_command(kaish, code, options, kernel, context_id, run.context_switch, run.state_writeback, streams).await;
-
-    let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
-        Some((*command_block_id, *output_block_id)), outcome.clone(), review_cancel, run.review_notices);
-    if finish_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, &review).await? {
-        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
-    }
-    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
+    if let Some(ready) = run.job_ready.take() { let _ = ready.send(()); }
+    let job_output = run.job_output;
+    let mut attempt = capture_and_review(kaish, code, kernel, context_id, call_ctx,
+        Some((*command_block_id, *output_block_id)), options, run, streams).await?;
+    let outcome = &mut attempt.outcome;
+    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, outcome);
     if let Some((manager, job, sender)) = tracked_job {
         if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
         let result = outcome.exec_result();
-        let streams_result = match run.job_output {
+        let streams_result = match job_output {
             CommandJobOutput::LiveExecution => CommandOutcome::new(outcome.execution.clone(), outcome.elapsed_ms).exec_result(),
             CommandJobOutput::Settled => result.clone(),
         };
         manager.finalize_streams(job, &streams_result).await;
         let _ = sender.send(result);
     }
-    settled.map(|()| outcome)
+    attempt.finish(settled)
 }
 
 /// Execute without transcript blocks. A result review retains an audit record
@@ -268,21 +264,83 @@ pub async fn run_without_blocks(
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
     mut options: kaish_kernel::ExecuteOptions,
-    run: CommandRunOptions<'_>,
+    mut run: CommandRunOptions<'_>,
 ) -> Result<CommandOutcome, String> {
-    let started = std::time::Instant::now();
-    if let Some(stdin) = run.stdin { options = options.with_stdin(stdin); }
-    if let Some(cancel) = run.cancel { options.cancel_token = Some(cancel); }
-    let cancel = options.cancel_token.clone().unwrap_or_default();
-    let mut outcome = capture_command(kaish, code, options,
-        kernel, call_ctx.context_id, run.context_switch, run.state_writeback, None).await;
-    let review = super::result_review::CommandResultReview::new(kernel.clone(), call_ctx.clone(),
-        None, outcome.clone(), cancel, run.review_notices);
-    if finish_result_hooks(&mut outcome, code, kernel, call_ctx, run.hooks, &review).await? {
-        outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    if let Some(stdin) = run.stdin.take() { options = options.with_stdin(stdin); }
+    if let Some(cancel) = run.cancel.clone() { options.cancel_token = Some(cancel); }
+    let attempt = capture_and_review(kaish, code, kernel, call_ctx.context_id, call_ctx,
+        None, options, run, None).await?;
+    let settled = attempt.review.settle(&attempt.outcome);
+    attempt.finish(settled)
+}
+
+struct CommandAttempt {
+    outcome: CommandOutcome,
+    review: super::result_review::CommandResultReview,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl CommandAttempt {
+    fn finish(self, settled: Result<(), String>) -> Result<CommandOutcome, String> {
+        if let Some(panic) = self.panic {
+            if let Err(error) = settled { tracing::error!("could not settle panicked command: {error}"); }
+            std::panic::resume_unwind(panic);
+        }
+        settled.map(|()| self.outcome)
     }
-    review.settle(&outcome)?;
-    Ok(outcome)
+}
+
+/// Catch unwinding only to finish the command's durable record and projections.
+/// The caller resumes the original panic after settlement; no hooks run after
+/// an execution panic, and source is never retried.
+#[allow(clippy::too_many_arguments)]
+async fn capture_and_review(
+    kaish: &EmbeddedKaish, code: &str, kernel: &Arc<Kernel>, context: ContextId,
+    call: &crate::mcp::CallContext, pair: Option<(BlockId, BlockId)>,
+    options: kaish_kernel::ExecuteOptions, run: CommandRunOptions<'_>,
+    streams: Option<kaish_kernel::scheduler::JobStreams>,
+) -> Result<CommandAttempt, String> {
+    let started = std::time::Instant::now();
+    let cancel = options.cancel_token.clone().unwrap_or_default();
+    let mut captured_outcome = None;
+    let captured = std::panic::AssertUnwindSafe(Box::pin(capture_command(kaish, code, options,
+        kernel, context, run.context_switch, run.state_writeback, streams, &mut captured_outcome))).catch_unwind().await;
+    let (mut outcome, mut panic) = match captured {
+        Ok(()) => (captured_outcome.expect("completed capture supplies its outcome"), None),
+        Err(panic) => {
+            let outcome = match captured_outcome {
+                Some(mut outcome) => {
+                    outcome.settlement_error = Some("Command state publication panicked; captured execution was not repeated.".into());
+                    outcome
+                }
+                None => CommandOutcome::new(CommandExecution::Fault(
+                    "Command execution panicked before a result was captured; side effects may have occurred. Source was not repeated.".into()),
+                    started.elapsed().as_millis() as u64),
+            };
+            (outcome, Some(panic))
+        }
+    };
+    let review = super::result_review::CommandResultReview::new(kernel.clone(), call.clone(),
+        pair, outcome.clone(), cancel, run.review_notices);
+    if panic.is_none() {
+        match std::panic::AssertUnwindSafe(Box::pin(finish_result_hooks(&mut outcome, code, kernel, call, run.hooks, &review)))
+            .catch_unwind().await {
+            Ok(Ok(true)) => outcome.elapsed_ms = started.elapsed().as_millis() as u64,
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(payload) => {
+                outcome = match review.interrupted_outcome("Result processing panicked; captured execution was not repeated.") {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        tracing::error!("could not recover result after hook panic: {error}");
+                        std::panic::resume_unwind(payload);
+                    }
+                };
+                panic = Some(payload);
+            }
+        }
+    }
+    Ok(CommandAttempt { outcome, review, panic })
 }
 
 async fn capture_command(
@@ -294,11 +352,13 @@ async fn capture_command(
     context_switch: CommandContextSwitch<'_>,
     state_writeback: ShellStateWriteBack,
     streams: Option<kaish_kernel::scheduler::JobStreams>,
-) -> CommandOutcome {
+    captured: &mut Option<CommandOutcome>,
+) {
     if options.cancel_token.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
         let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
         outcome.settlement_error = Some("Command was cancelled before execution.".into());
-        return outcome;
+        *captured = Some(outcome);
+        return;
     }
     // Persist only this invocation's cwd/export changes to the context.
     let state_before = snapshot_shell_state(kaish).await;
@@ -308,7 +368,8 @@ async fn capture_command(
         Some(streams) => Box::pin(execute_with_job_output(kaish, code, options, streams)).await,
         None => kaish.execute_with_options(code, options).await,
     };
-    let mut outcome = CommandOutcome::from_execution(result, started.elapsed().as_millis() as u64);
+    *captured = Some(CommandOutcome::from_execution(result, started.elapsed().as_millis() as u64));
+    let outcome = captured.as_mut().expect("execution supplied its outcome");
 
     // A context switch saves the outgoing state itself. Its snapshots span
     // two contexts, so only runs that stayed put write back this diff.
@@ -334,8 +395,6 @@ async fn capture_command(
         }
         None => {}
     }
-
-    outcome
 }
 
 async fn execute_with_job_output(
@@ -347,7 +406,8 @@ async fn execute_with_job_output(
         sender.send(result.clone()).expect("command output receiver lives through execution");
     };
     let execute = async {
-        let result = kaish.execute_with_options_streaming(code, options, &mut on_output).await;
+        let result = std::panic::AssertUnwindSafe(kaish.execute_with_options_streaming(code, options, &mut on_output))
+            .catch_unwind().await;
         drop(on_output);
         result
     };
@@ -361,6 +421,7 @@ async fn execute_with_job_output(
         }
     };
     let (result, ()) = tokio::join!(execute, write);
+    let result = match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) };
     if let Ok(result) = &result {
         match result.code {
             124 => streams.stderr.write(b"background job timed out\n").await,
@@ -390,7 +451,7 @@ async fn finish_result_hooks(
         _ = review.cancel.cancelled() => false,
         _ = Box::pin(apply_result_hooks(outcome, code, kernel, call, invocation, Some(review))) => true,
     };
-    if !completed { *outcome = review.interrupted_outcome()?; }
+    if !completed { *outcome = review.interrupted_outcome("Result processing was cancelled; captured execution was not repeated.")?; }
     Ok(completed)
 }
 
@@ -427,6 +488,102 @@ mod fill_tests {
     use super::*;
     use crate::Kernel;
     use crate::block_store::DocumentKind;
+
+    struct PanicBuiltin;
+
+    #[async_trait::async_trait]
+    impl kaish_kernel::Tool for PanicBuiltin {
+        fn name(&self) -> &str { "panic-test" }
+        fn schema(&self) -> kaish_kernel::tools::ToolSchema {
+            kaish_kernel::tools::ToolSchema::new("panic-test", "Panic during command execution")
+        }
+        async fn execute(&self, _: kaish_kernel::tools::ToolArgs, _: &mut dyn kaish_kernel::tools::ToolCtx) -> kaish_kernel::interpreter::ExecResult {
+            panic!("execution panic sentinel");
+        }
+    }
+
+    struct PanicHook;
+
+    #[async_trait::async_trait]
+    impl crate::mcp::Hook for PanicHook {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+            panic!("hook panic sentinel");
+        }
+    }
+
+    #[tokio::test]
+    async fn panics_settle_the_captured_outcome_and_job_before_unwinding() {
+        use futures::FutureExt;
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId};
+        for during_hook in [false, true] {
+            let kernel = Arc::new(Kernel::new_ephemeral("panic-settlement").await);
+            let ctx = ContextId::new();
+            let documents = kernel.blocks();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+            let output = documents.insert_tool_result(ctx, &command, Some(&command), "", false, None, None).unwrap();
+            let code = if during_hook { "echo captured" } else { "echo observed; panic-test" };
+            let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(), command, output, code, None).unwrap();
+            let kaish = EmbeddedKaish::with_identity("panic-settlement", documents.clone(), kernel.clone(), None,
+                PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(),
+                crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
+                super::super::embedded_kaish::OutputProfile::Agent,
+                |_, _, tools| { tools.register(PanicBuiltin); }).unwrap();
+            if during_hook {
+                kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+                    id: HookId("panic-test".into()), match_instance: None, match_tool: None,
+                    match_context: Some(ctx), match_principal: None, priority: 0, kaish_script_id: None,
+                    action: HookAction::Invoke(HookBody::Builtin { name: "panic-test".into(), hook: Arc::new(PanicHook) }),
+                });
+            }
+            let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
+            let panic = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, code, ctx, &command, &output,
+                &kernel, &call, CommandRunOptions { job_output: CommandJobOutput::LiveExecution, ..Default::default() }))
+                .catch_unwind().await.expect_err("settlement must not swallow the panic");
+            assert_eq!(panic.downcast_ref::<&str>().copied(), Some(if during_hook { "hook panic sentinel" } else { "execution panic sentinel" }));
+            let state = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap();
+            assert!(state.completed_at.is_some(), "panic must not strand a Running receipt");
+            let outcome = kernel.shell_operations().outcome(&receipt.operation_id, ctx).unwrap().unwrap();
+            assert!(outcome.envelope().is_error());
+            assert_eq!(outcome.envelope().exit_code, None);
+            match &outcome.execution {
+                CommandExecution::Completed(raw) if during_hook => assert_eq!(raw.text_out(), "captured\n"),
+                CommandExecution::Fault(reason) if !during_hook => assert!(reason.contains("panicked")),
+                other => panic!("incorrect panic capture: {other:?}"),
+            }
+            for block in [&command, &output] { assert_eq!(documents.get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Error); }
+            let jobs = kernel.context_job_manager(ctx);
+            let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+            assert_eq!(jobs.wait(job.id).await.unwrap(), outcome.exec_result());
+            let streams = jobs.streams(job.id).await.unwrap();
+            assert!(streams.stdout.is_closed().await && streams.stderr.is_closed().await);
+            assert_eq!(streams.stdout.read().await, if during_hook { b"captured\n" } else { b"observed\n" });
+        }
+    }
+
+    #[tokio::test]
+    async fn a_state_publication_panic_preserves_captured_execution() {
+        use futures::FutureExt;
+        let kernel = Arc::new(Kernel::new_ephemeral("panic-after-capture").await);
+        let ctx = ContextId::new();
+        let documents = kernel.blocks();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(), command, output, "echo captured", None).unwrap();
+        let kaish = EmbeddedKaish::new("panic-after-capture", documents.clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(ContextId::new());
+        let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
+        let publish = |_| panic!("state publication panic sentinel");
+        let result = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, "echo captured", ctx, &command, &output,
+            &kernel, &call, CommandRunOptions { context_switch: CommandContextSwitch::Publish(Some(&publish)), ..Default::default() }))
+            .catch_unwind().await;
+        assert!(result.is_err());
+        let outcome = kernel.shell_operations().outcome(&receipt.operation_id, ctx).unwrap().unwrap();
+        assert!(outcome.envelope().is_error());
+        let CommandExecution::Completed(raw) = outcome.execution else { panic!("panic after execution discarded its capture") };
+        assert_eq!(raw.text_out(), "captured\n");
+    }
 
     #[tokio::test]
     async fn a_cancelled_admission_does_not_enter_kaish() {

@@ -69,10 +69,10 @@ pub const KAISH_RC_THREAD_STACK: usize = 16 * 1024 * 1024;
 /// is spawned through this, never through `std::thread::Builder` directly, so
 /// none of them can regress to the default 2 MiB stack and abort the server
 /// on a deep rc nest. See [`KAISH_RC_THREAD_STACK`].
-pub fn spawn_kaish_thread(
+pub fn spawn_kaish_thread<T: Send + 'static>(
     name: impl Into<String>,
-    f: impl FnOnce() + Send + 'static,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<T>> {
     std::thread::Builder::new()
         .name(name.into())
         .stack_size(KAISH_RC_THREAD_STACK)

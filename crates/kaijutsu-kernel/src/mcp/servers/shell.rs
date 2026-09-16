@@ -1831,11 +1831,20 @@ mod tests {
         assert!(result.is_err());
     }
 
+    struct PanickingResultHook;
+
+    #[async_trait]
+    impl crate::mcp::Hook for PanickingResultHook {
+        async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {
+            panic!("post-review hook panic sentinel");
+        }
+    }
+
     #[tokio::test]
     async fn tool_result_reviews_retain_execution_for_foreground_and_background_calls() {
-        use crate::mcp::{HookAction, HookEntry, HookId, GlobPattern, AskSpec};
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId, GlobPattern, AskSpec};
         for foreground in [false, true] {
-            for decision in ["deny", "allow", "cancel", "shutdown"] {
+            for decision in ["deny", "allow", "cancel", "shutdown", "panic"] {
                 let allow = decision == "allow";
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
@@ -1853,7 +1862,9 @@ mod tests {
                 let mut hooks = broker.hooks().write().await;
                 for (id, action, priority) in [
                     ("tool-review", HookAction::Ask(AskSpec { description: Some("Review captured shell".into()) }), 0),
-                    ("after-review", HookAction::ShortCircuit(KernelToolResult::text("reviewed tool output")), 1),
+                    ("after-review", if decision == "panic" {
+                        HookAction::Invoke(HookBody::Builtin { name: "panic-test".into(), hook: Arc::new(PanickingResultHook) })
+                    } else { HookAction::ShortCircuit(KernelToolResult::text("reviewed tool output")) }, 1),
                 ] {
                     hooks.post_call.entries.push(HookEntry { id: HookId(id.into()), match_instance: None,
                         match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
@@ -1888,7 +1899,7 @@ mod tests {
                     if let Some(operation) = &operation {
                         assert!(d.kernel().shell_operations().cancel(operation, context).await.unwrap());
                     } else { cancel.cancel(); }
-                } else { answer_pending_ask(d.kernel_db().clone(), allow); }
+                } else { answer_pending_ask(d.kernel_db().clone(), allow || decision == "panic"); }
                 let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
                         if let Some(outcome) = d.kernel().shell_operations().result_review_for_ask(&ask.request_id, context)
@@ -1903,6 +1914,7 @@ mod tests {
                 let crate::runtime::command_outcome::CommandExecution::Completed(raw) = settled.execution
                     else { panic!("lost captured tool execution") };
                 assert_eq!(raw.text_out(), "captured\n");
+                if decision == "panic" { assert!(d.kernel().shutdown_command_worker().await.is_err()); }
                 if let Some(operation) = operation {
                     let state = wait_for_operation(&d, context, &operation).await;
                     let jobs = d.kernel().context_job_manager(context);

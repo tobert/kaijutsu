@@ -116,9 +116,11 @@ The shell tool's async completion notification now reads its settled receipt.
 Make notification delivery recoverable and idempotent across failure/restart;
 it currently occurs once in the live execution owner after settlement. Kernel
 worker shutdown now cancels and drains accepted work through settlement, including
-paused hooks and retained review. Panics or abrupt task destruction before capture
-still need live terminal settlement and job/receipt agreement; startup currently
-reports interruption without replaying source.
+paused hooks and retained review. Execution/state/hook panics settle before
+resuming the original unwind, preserving captured output and completed statement
+observations; a failed worker stops admission and reports an error from shutdown.
+Abrupt task destruction before capture still needs live terminal settlement and
+job/receipt agreement; startup reports interruption without replaying source.
 SIGTERM/SIGINT now await the command worker before checkpointing and exiting;
 host Drop remains a cancellation signal without a wait. Extend shutdown ownership
 to headless turns, approval resumes, and transport-owned command tasks as those

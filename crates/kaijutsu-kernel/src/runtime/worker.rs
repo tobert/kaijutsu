@@ -24,13 +24,14 @@ impl CommandWorker {
         let thread = crate::spawn_kaish_thread("kernel-shell-tools", move || {
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
-                Err(error) => { let _ = started.send(Err(error.to_string())); return; }
+                Err(error) => { let _ = started.send(Err(error.to_string())); return Err(error.to_string()); }
             };
             let _entered = runtime.enter();
             let local = tokio::task::LocalSet::new();
-            if started.send(Ok(())).is_err() { return; }
+            if started.send(Ok(())).is_err() { return Err("shell worker startup receiver disappeared".into()); }
             local.block_on(&runtime, async move {
                 let mut tasks = tokio::task::JoinSet::new();
+                let mut failures = Vec::new();
                 loop {
                     tokio::select! {
                         biased;
@@ -40,7 +41,11 @@ impl CommandWorker {
                             None => break,
                         },
                         Some(result) = tasks.join_next() => {
-                            if let Err(error) = result { tracing::error!("shell command task failed: {error}"); }
+                            if let Err(error) = result {
+                                tracing::error!("shell command task failed: {error}");
+                                failures.push(error.to_string());
+                                stopped.cancel();
+                            }
                         }
                     }
                 }
@@ -50,14 +55,18 @@ impl CommandWorker {
                 stopped.cancel();
                 while let Some(work) = receiver.recv().await { tasks.spawn_local(work(stopped.child_token())); }
                 while let Some(result) = tasks.join_next().await {
-                    if let Err(error) = result { tracing::error!("shell command task failed during shutdown: {error}"); }
+                    if let Err(error) = result {
+                        tracing::error!("shell command task failed during shutdown: {error}");
+                        failures.push(error.to_string());
+                    }
                 }
-            });
+                if failures.is_empty() { Ok(()) } else { Err(format!("shell command worker failed: {}", failures.join("; "))) }
+            })
         }).map_err(|e| e.to_string())?;
         ready.recv().map_err(|_| "shell worker stopped during startup".to_string())??;
         let thread_id = thread.thread().id();
         let joined = async move {
-            tokio::task::spawn_blocking(move || thread.join().map_err(|_| "shell worker thread panicked".to_string()))
+            tokio::task::spawn_blocking(move || thread.join().map_err(|_| "shell worker thread panicked".to_string())?)
                 .await.map_err(|error| format!("shell worker join failed: {error}"))?
         }.boxed().shared();
         Ok(Self { sender, shutdown, thread_id, joined })
@@ -86,6 +95,20 @@ impl Drop for CommandWorker {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_panicked_command_makes_worker_shutdown_fail() {
+        let kernel = crate::Kernel::new_ephemeral("panic-worker").await;
+        kernel.spawn_command(|_| async { panic!("worker command panic sentinel"); }).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if kernel.spawn_command(|_| async {}).is_err() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("task failure must stop new admission without waiting for host shutdown");
+        let result = kernel.shutdown_command_worker().await;
+        assert!(result.is_err(), "worker must not report a clean shutdown after a task panic");
+    }
+
     #[tokio::test]
     async fn shutdown_waits_for_work_even_when_a_waiter_is_dropped() {
         let kernel = crate::Kernel::new_ephemeral("worker-drain").await;
