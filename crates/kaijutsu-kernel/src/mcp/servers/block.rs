@@ -306,7 +306,7 @@ impl McpServerLike for BlockToolsServer {
             tool_def::<BlockReadParams>(&self.instance_id, "block_read", "Read block content with optional line numbers and range")?,
             tool_def::<BlockSearchParams>(&self.instance_id, "block_search", "Search within a block using regex or literal patterns")?,
             tool_def::<BlockListParams>(&self.instance_id, "block_list", "List blocks with optional filters")?,
-            tool_def::<BlockStatusParams>(&self.instance_id, "block_status", "Set block status: pending, running, waiting, done, error, or draft")?,
+            tool_def::<BlockStatusParams>(&self.instance_id, "block_status", "Set block status: pending, running, waiting, done, or error")?,
             tool_def::<KernelSearchParams>(&self.instance_id, "kernel_search", "Search across all blocks using regex, with filters and context")?,
             tool_def::<SvgBlockParams>(&self.instance_id, "svg_block", "Append an SVG block to the current context. Renders as vector graphics inline.")?,
             tool_def::<AbcBlockParams>(&self.instance_id, "abc_block", "Append an ABC music notation block. Validates parse; renders as sheet music inline.")?,
@@ -588,7 +588,7 @@ impl McpServerLike for BlockToolsServer {
                 let context_ids = self.documents.list_ids();
                 for context_id in context_ids {
                     if let Some(entry) = self.documents.get(context_id) {
-                        for snapshot in entry.doc.blocks_ordered() {
+                        for snapshot in entry.doc.blocks_ordered().into_iter().filter(|b| b.status != Status::Draft) {
                             if let Some(ref parent_id) = parent_id_filter
                                 && snapshot.parent_id.as_ref() != Some(parent_id)
                             {
@@ -640,6 +640,9 @@ impl McpServerLike for BlockToolsServer {
                     .map_err(McpError::InvalidParams)?;
                 let (context_id, block_id) = self.find_block(&p.block_id)?;
                 let status = self.parse_status(&p.status)?;
+                if status == Status::Draft {
+                    return Err(McpError::Protocol("draft is reserved for client compose".into()));
+                }
 
                 self.documents
                     .set_status(context_id, &block_id, status)
@@ -696,7 +699,7 @@ impl McpServerLike for BlockToolsServer {
                 // already been resolved to an error above.
                 let mut unreadable: Vec<String> = Vec::new();
                 'outer: for context_id in context_ids {
-                    let snapshots = match self.documents.block_snapshots(context_id) {
+                    let snapshots = match self.documents.non_draft_snapshots(context_id) {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::warn!(
@@ -905,7 +908,7 @@ impl BlockToolsServer {
         let context_id = block_id.context_id;
 
         if let Some(entry) = self.documents.get(context_id)
-            && entry.doc.get_block_snapshot(&block_id).is_some()
+            && entry.doc.get_block_snapshot(&block_id).is_some_and(|b| b.status != Status::Draft)
         {
             return Ok((context_id, block_id));
         }
@@ -1123,6 +1126,39 @@ mod tests {
             Some(ToolContent::Text(s)) => s.clone(),
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn generic_tools_cannot_reach_compose_drafts() {
+        let (broker, ctx, _db, store) = setup().await;
+        let draft = store.edit_draft(ctx.context_id, ctx.principal_id, 0, "unfinished-secret", 0).unwrap();
+        for (tool, args) in [
+            ("block_read", serde_json::json!({"block_id": draft.to_key()})),
+            ("block_status", serde_json::json!({"block_id": draft.to_key(), "status": "done"})),
+            ("block_splice", serde_json::json!({"block_id": draft.to_key(), "offset": 0, "delete_count": 1, "insert": "x"})),
+        ] {
+            let result = call_res(&broker, &ctx, tool, args).await;
+            assert!(result.is_err() || result.as_ref().unwrap().is_error, "{tool}: {result:?}");
+        }
+        for (tool, args) in [
+            ("block_list", serde_json::json!({})),
+            ("kernel_search", serde_json::json!({"query": "unfinished-secret"})),
+        ] {
+            let result = call(&broker, &ctx, tool, args).await;
+            assert!(!text_of(&result).contains("unfinished-secret"), "{tool}: {result:?}");
+            assert!(!text_of(&result).contains(&draft.to_key()), "{tool}: {result:?}");
+        }
+        assert_eq!(store.draft_block(ctx.context_id, ctx.principal_id).unwrap().unwrap().content, "unfinished-secret");
+        store.submit_draft(ctx.context_id, ctx.principal_id, None).unwrap();
+        let result = call_res(&broker, &ctx, "block_status", serde_json::json!({
+            "block_id": draft.to_key(), "status": "draft"
+        })).await;
+        assert!(result.is_err() || result.as_ref().unwrap().is_error);
+        let tmp = tempfile::tempdir().unwrap();
+        let server = BlockToolsServer::new(store, Arc::new(FileStore::at_path(tmp.path().join("cas"))));
+        let tools = server.list_tools(&ctx).await.unwrap();
+        let status = tools.iter().find(|tool| tool.name == "block_status").unwrap();
+        println!("{status:?}");
     }
 
     #[tokio::test]

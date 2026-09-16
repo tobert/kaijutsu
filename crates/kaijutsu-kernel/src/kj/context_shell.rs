@@ -477,7 +477,10 @@ mod tests {
             assert!(ready.ok(), "model shell must otherwise work: {}", ready.err);
             assert_eq!(ready.text_out().trim(), "shell-ready");
 
-            let result = kaish.execute_with_options(command, ExecuteOptions::default())
+            let draft_id = d.block_store().draft_block(ctx, requester).unwrap().unwrap().id;
+            let command = command.replace("{draft}", &draft_id.to_key())
+                .replace("{context}", &ctx.to_hex());
+            let result = kaish.execute_with_options(&command, ExecuteOptions::default())
                 .await.expect("valid command must return an execution result");
             assert!(!result.ok(), "read_only={read_only}: {command} must fail, got {result:?}");
             for (principal, text) in drafts {
@@ -485,6 +488,17 @@ mod tests {
                 let draft = d.block_store().draft_block(ctx, principal).unwrap().unwrap();
                 assert_eq!(draft.content, text, "read_only={read_only}: {command} changed a draft");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_shells_cannot_reach_drafts_through_docs() {
+        for command in [
+            "cat /v/docs/{context}/{draft}",
+            "echo replacement > /v/docs/{context}/{draft}",
+            "rm /v/docs/{context}/{draft}",
+        ] {
+            assert_model_shell_cannot_reach_compose_draft(command).await;
         }
     }
 

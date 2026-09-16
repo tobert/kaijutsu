@@ -2484,6 +2484,23 @@ impl BlockStore {
     // Query Operations
     // =========================================================================
 
+    /// Blocks available to generic commands and model tools. Compose drafts
+    /// remain available through the compose operations and client queries.
+    pub fn non_draft_snapshots(&self, context_id: ContextId) -> BlockStoreResult<Vec<BlockSnapshot>> {
+        Ok(self.block_snapshots(context_id)?.into_iter()
+            .filter(|block| block.status != Status::Draft).collect())
+    }
+
+    /// A generic command cannot inspect or edit an unsubmitted compose block.
+    pub fn get_non_draft_snapshot(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+    ) -> BlockStoreResult<Option<BlockSnapshot>> {
+        Ok(self.get_block_snapshot(context_id, block_id)?
+            .filter(|block| block.status != Status::Draft))
+    }
+
     /// Get block snapshots for a document.
     pub fn block_snapshots(&self, context_id: ContextId) -> BlockStoreResult<Vec<BlockSnapshot>> {
         let entry = self
@@ -3119,16 +3136,18 @@ impl BlockStore {
             )));
         }
 
-        replay
-            .get_block_snapshot(block_id)
-            .map(|s| s.content)
-            .ok_or_else(|| {
-                BlockStoreError::Validation(format!(
-                    "block {} did not exist in document {} at seq {seq}",
-                    block_id.to_key(),
-                    context_id.short()
-                ))
-            })
+        let snapshot = replay.get_block_snapshot(block_id).ok_or_else(|| {
+            BlockStoreError::Validation(format!(
+                "block {} did not exist in document {} at seq {seq}",
+                block_id.to_key(), context_id.short()
+            ))
+        })?;
+        if snapshot.status == Status::Draft {
+            return Err(BlockStoreError::Validation(
+                "draft text is unavailable through block history".into(),
+            ));
+        }
+        Ok(snapshot.content)
     }
 
     /// Insert a drift block with an explicit author identity.
@@ -5576,6 +5595,23 @@ mod tests {
     /// row lost to a failed `append_op`. Both leave the counter pointing past
     /// rows the db doesn't hold; replay must refuse, not silently return the
     /// state minus the missing op.
+    #[test]
+    fn historical_reads_do_not_reveal_drafts_after_submission() {
+        let db = Arc::new(parking_lot::Mutex::new(crate::kernel_db::KernelDb::temporary().unwrap()));
+        let principal = PrincipalId::new();
+        let ws = db.lock().get_or_create_default_workspace(principal).unwrap();
+        let store = BlockStore::with_db(db, ws, principal);
+        let ctx = ContextId::new();
+        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let draft = store.edit_draft(ctx, principal, 0, "unfinished-secret", 0).unwrap();
+        let draft_seq = store.oplog_seq_range(ctx).unwrap().1;
+        store.edit_draft(ctx, principal, 0, "submitted", 17).unwrap();
+        store.submit_draft(ctx, principal, None).unwrap();
+        let submitted_seq = store.oplog_seq_range(ctx).unwrap().1;
+        assert!(store.block_content_at_seq(ctx, &draft, draft_seq).is_err());
+        assert_eq!(store.block_content_at_seq(ctx, &draft, submitted_seq).unwrap(), "submitted");
+    }
+
     #[test]
     fn content_at_seq_refuses_a_gapped_oplog() {
         use crate::kernel_db::KernelDb;

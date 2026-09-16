@@ -265,11 +265,12 @@ it: `resolve_editor_target` (`crates/kaijutsu-kernel/src/editor.rs`) binds to
 file-backed blocks only, and no dedicated `kj input` verb exists. The intended
 contract is no model VFS path for the draft and no editor session over it.
 
-The `/v/input` adapter and mount are removed, with regressions for read,
-write, and clear attempts through both model-shell flavors using distinct
-requester and performer identities. Still open: audit ordinary block mutation
-and `/v/docs` for draft access before claiming the broader invariant is
-enforced. The dedicated pathname was only one possible route.
+The dedicated `/v/input` mount and generic model routes (`/v/docs`, `kj`
+block commands, search/synthesis, and MCP block reads) now exclude drafts.
+Generic status commands cannot create or promote them; historical reads
+refuse draft-era content even after submission. Client compose and feed
+queries retain draft access. Regression coverage includes distinct requester
+and performer identities in both model-shell flavors.
 
 The MCP bridge's `read_input`/`write_input`/`edit_input`/`submit_input` tools
 are gone as of today. A model that wants another player's attention uses `kj

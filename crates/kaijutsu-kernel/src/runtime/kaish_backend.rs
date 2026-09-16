@@ -31,7 +31,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use kaijutsu_types::BlockId;
+use kaijutsu_types::{BlockId, Status};
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::ExecResult;
@@ -262,7 +262,8 @@ impl KernelBackend for KaijutsuBackend {
                 let entry = self.blocks.get(ctx_id).ok_or_else(|| {
                     BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
-                let blocks = entry.doc.blocks_ordered();
+                let blocks: Vec<_> = entry.doc.blocks_ordered().into_iter()
+                    .filter(|b| b.status != Status::Draft).collect();
                 let listing: Vec<String> = blocks.iter().map(|b| b.id.to_key()).collect();
                 Ok((listing.join("\n") + "\n").into_bytes())
             }
@@ -288,7 +289,8 @@ impl KernelBackend for KaijutsuBackend {
                 })?;
 
                 // Find the block and get its content
-                let blocks = entry.doc.blocks_ordered();
+                let blocks: Vec<_> = entry.doc.blocks_ordered().into_iter()
+                    .filter(|b| b.status != Status::Draft).collect();
                 let block = blocks.iter().find(|b| b.id == block_id).ok_or_else(|| {
                     BackendError::NotFound(format!("block not found: {}", block_id.to_key()))
                 })?;
@@ -364,7 +366,8 @@ impl KernelBackend for KaijutsuBackend {
                     let entry = self.blocks.get(ctx_id).ok_or_else(|| {
                         BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                     })?;
-                    let blocks = entry.doc.blocks_ordered();
+                    let blocks: Vec<_> = entry.doc.blocks_ordered().into_iter()
+                    .filter(|b| b.status != Status::Draft).collect();
                     blocks
                         .iter()
                         .find(|b| b.id == block_id)
@@ -437,7 +440,8 @@ impl KernelBackend for KaijutsuBackend {
                 let entry = self.blocks.get(ctx_id).ok_or_else(|| {
                     BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
-                let blocks = entry.doc.blocks_ordered();
+                let blocks: Vec<_> = entry.doc.blocks_ordered().into_iter()
+                    .filter(|b| b.status != Status::Draft).collect();
                 let mut entries: Vec<DirEntry> = blocks
                     .iter()
                     .map(|b| DirEntry::file(b.id.to_key(), b.content.len() as u64))
@@ -475,7 +479,8 @@ impl KernelBackend for KaijutsuBackend {
                 let entry = self.blocks.get(ctx_id).ok_or_else(|| {
                     BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
                 })?;
-                let blocks = entry.doc.blocks_ordered();
+                let blocks: Vec<_> = entry.doc.blocks_ordered().into_iter()
+                    .filter(|b| b.status != Status::Draft).collect();
                 let block = blocks.iter().find(|b| b.id == block_id).ok_or_else(|| {
                     BackendError::NotFound(format!("block not found: {}", block_id.to_key()))
                 })?;
@@ -547,6 +552,9 @@ impl KernelBackend for KaijutsuBackend {
                 Ok(())
             }
             PathResolution::Block(ctx_id, block_id) => {
+                self.blocks.get_non_draft_snapshot(ctx_id, &block_id)
+                    .map_err(|e| BackendError::Io(e.to_string()))?
+                    .ok_or_else(|| BackendError::NotFound(block_id.to_key()))?;
                 self.blocks
                     .delete_block(ctx_id, &block_id)
                     .map_err(|e| BackendError::Io(e.to_string()))?;
@@ -569,7 +577,7 @@ impl KernelBackend for KaijutsuBackend {
             PathResolution::DocumentMeta(ctx_id) => self.blocks.contains(ctx_id),
             PathResolution::Block(ctx_id, block_id) => {
                 if let Some(entry) = self.blocks.get(ctx_id) {
-                    entry.doc.blocks_ordered().iter().any(|b| b.id == block_id)
+                    entry.doc.blocks_ordered().iter().any(|b| b.id == block_id && b.status != Status::Draft)
                 } else {
                     false
                 }
@@ -848,6 +856,26 @@ mod tests {
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, ctx_id);
         KaijutsuBackend::new(blocks, kernel, PrincipalId::system(), session_contexts, sid)
+    }
+
+    #[tokio::test]
+    async fn docs_listing_and_stat_hide_drafts_until_submit() {
+        let ctx = ContextId::new();
+        let backend = stub_backend_fixture(ctx).await;
+        backend.blocks.create_document(ctx, DocKind::Conversation, None).unwrap();
+        let principal = PrincipalId::system();
+        let draft = backend.blocks.edit_draft(ctx, principal, 0, "unfinished", 0).unwrap();
+        let dir = format!("/docs/{}", ctx.to_hex());
+        let path = format!("{dir}/{}", draft.to_key());
+        assert!(!backend.exists(Path::new(&path)).await);
+        assert!(backend.stat(Path::new(&path)).await.is_err());
+        assert_eq!(backend.list(Path::new(&dir)).await.unwrap().len(), 1);
+        assert!(!String::from_utf8(backend.read(Path::new(&dir), None).await.unwrap()).unwrap().contains(&draft.to_key()));
+        backend.blocks.submit_draft(ctx, principal, None).unwrap();
+        assert!(backend.exists(Path::new(&path)).await);
+        assert!(backend.stat(Path::new(&path)).await.is_ok());
+        assert_eq!(backend.list(Path::new(&dir)).await.unwrap().len(), 2);
+        assert_eq!(backend.read(Path::new(&path), None).await.unwrap(), b"unfinished");
     }
 
     /// `append`/`patch` are unreachable through any live mount (see the doc

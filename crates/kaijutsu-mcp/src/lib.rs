@@ -893,14 +893,15 @@ impl KaijutsuMcp {
         ctx: ContextId,
         id: &BlockId,
     ) -> Result<Option<kaijutsu_types::BlockSnapshot>, String> {
-        match &self.backend {
+        let block = match &self.backend {
             Backend::Local(store) => Ok(store.get(ctx).and_then(|e| e.doc.get_block_snapshot(id))),
             Backend::Remote(remote) => remote
                 .actor
                 .get_block(ctx, *id)
                 .await
                 .map_err(|e| format!("Error reading block {}: {e}", id.to_key())),
-        }
+        }?;
+        Ok(block.filter(|b| b.status != kaijutsu_types::Status::Draft))
     }
 
     /// Parse a block-id string and read its snapshot in one pass, returning
@@ -932,7 +933,7 @@ impl KaijutsuMcp {
         &self,
         ctx: ContextId,
     ) -> Result<Option<Vec<kaijutsu_types::BlockSnapshot>>, String> {
-        match &self.backend {
+        let blocks = match &self.backend {
             Backend::Local(store) => Ok(store.get(ctx).map(|e| e.doc.blocks_ordered())),
             Backend::Remote(remote) => remote
                 .actor
@@ -940,7 +941,9 @@ impl KaijutsuMcp {
                 .await
                 .map(Some)
                 .map_err(|e| format!("Error reading blocks for context {ctx}: {e}")),
-        }
+        }?;
+        Ok(blocks.map(|blocks| blocks.into_iter()
+            .filter(|b| b.status != kaijutsu_types::Status::Draft).collect()))
     }
 
     /// Blocks (document order) plus the document's version. Local reads both
@@ -962,7 +965,8 @@ impl KaijutsuMcp {
     ) -> Result<Option<(Vec<kaijutsu_types::BlockSnapshot>, u64)>, String> {
         match &self.backend {
             Backend::Local(store) => {
-                Ok(store.get(ctx).map(|e| (e.doc.blocks_ordered(), e.doc.version())))
+                Ok(store.get(ctx).map(|e| (e.doc.blocks_ordered().into_iter()
+                    .filter(|b| b.status != kaijutsu_types::Status::Draft).collect(), e.doc.version())))
             }
             Backend::Remote(remote) => {
                 let Some(blocks) = self.context_blocks(ctx).await? else {
@@ -3017,6 +3021,23 @@ mod tests {
     }
 
     use kaijutsu_types::ContextId;
+
+    #[tokio::test]
+    async fn tool_reads_hide_drafts_but_compose_queries_retain_them() {
+        let principal = PrincipalId::new();
+        let store = shared_block_store(principal);
+        let ctx = ContextId::new();
+        store.create_document(ctx, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let draft = store.edit_draft(ctx, principal, 0, "unfinished", 0).unwrap();
+        let mcp = KaijutsuMcp::with_store(store.clone());
+        assert!(mcp.read_block(ctx, &draft).await.unwrap().is_none());
+        assert!(mcp.context_blocks(ctx).await.unwrap().unwrap().is_empty());
+        assert!(mcp.context_blocks_and_version(ctx).await.unwrap().unwrap().0.is_empty());
+        assert_eq!(store.block_snapshots(ctx).unwrap().len(), 1);
+        store.submit_draft(ctx, principal, None).unwrap();
+        assert_eq!(mcp.read_block(ctx, &draft).await.unwrap().unwrap().content, "unfinished");
+        assert_eq!(mcp.context_blocks(ctx).await.unwrap().unwrap().len(), 1);
+    }
 
     // =========================================================================
     // register_session TOCTOU retry classification

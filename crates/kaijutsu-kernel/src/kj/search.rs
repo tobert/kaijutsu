@@ -111,7 +111,7 @@ impl KjDispatcher {
         let max = parsed.max_matches;
 
         'outer: for ctx_id in context_ids {
-            let snapshots = match self.blocks.block_snapshots(ctx_id) {
+            let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
                 // Missing document or sync error in one context shouldn't abort
                 // the whole walk — skip it. Same shape as MCP kernel_search.
                 Ok(s) => s,

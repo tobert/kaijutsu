@@ -240,7 +240,7 @@ enum BlockCommand {
     Status {
         /// Block id
         block_id: String,
-        /// New status: pending|running|waiting|done|error|draft
+        /// New status: pending|running|waiting|done|error
         new_status: String,
     },
     /// Edit a block via line-based operations. Single op per invocation —
@@ -458,6 +458,12 @@ impl KjDispatcher {
         caller: &KjCaller,
     ) -> Result<kaijutsu_types::BlockId, String> {
         if let Some(id) = kaijutsu_types::BlockId::from_key(id_str) {
+            if self.blocks.get(id.context_id)
+                .and_then(|entry| entry.doc.get_block_header(&id))
+                .is_some_and(|header| header.status == Status::Draft)
+            {
+                return Err(format!("block not found: {id_str}"));
+            }
             return Ok(id);
         }
 
@@ -494,7 +500,7 @@ impl KjDispatcher {
         };
         let snapshots = self
             .blocks
-            .block_snapshots(ctx_id)
+            .non_draft_snapshots(ctx_id)
             .map_err(|e| format!("resolving short id '{id_str}': {e}"))?;
         let matches: Vec<kaijutsu_types::BlockId> = snapshots
             .iter()
@@ -537,7 +543,7 @@ impl KjDispatcher {
             }
         };
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block list: {e}")),
         };
@@ -630,7 +636,7 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block inspect: {e}")),
         };
@@ -712,7 +718,7 @@ impl KjDispatcher {
             }
         };
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block count: {e}")),
         };
@@ -748,7 +754,7 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block read: {e}")),
         };
@@ -835,7 +841,7 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block render: {e}")),
         };
@@ -943,7 +949,7 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
                 };
                 let ctx_id = block_id.context_id;
-                let snapshots = match self.blocks.block_snapshots(ctx_id) {
+                let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
                     Ok(s) => s,
                     Err(e) => return KjResult::Err(format!("kj block cat: {e}")),
                 };
@@ -966,7 +972,7 @@ impl KjDispatcher {
                         Err(e) => return KjResult::Err(format!("kj block cat --latest: {e}")),
                     }
                 };
-                let snapshots = match self.blocks.block_snapshots(ctx_id) {
+                let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
                     Ok(s) => s,
                     Err(e) => return KjResult::Err(format!("kj block cat --latest: {e}")),
                 };
@@ -1239,7 +1245,7 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block reproject: {e}")),
         };
@@ -1341,7 +1347,7 @@ impl KjDispatcher {
 
         // Read back to compute the new content length for the structured
         // record. Cheaper than tracking it via the append op signature.
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block append: {e}")),
         };
@@ -1374,10 +1380,13 @@ impl KjDispatcher {
             None => {
                 return KjResult::Err(format!(
                     "kj block status: invalid status '{new_status}' \
-                     (expected pending|running|waiting|done|error|draft)"
+                     (expected pending|running|waiting|done|error)"
                 ));
             }
         };
+        if status == Status::Draft {
+            return KjResult::Err("kj block status: draft is reserved for client compose".into());
+        }
         if let Err(e) = self.blocks.set_status(ctx_id, &block_id, status) {
             return KjResult::Err(format!("kj block status: {e}"));
         }
@@ -1412,7 +1421,7 @@ impl KjDispatcher {
         // is small; reading the snapshot once is cheap relative to the edit.
         let snap = match self
             .blocks
-            .block_snapshots(ctx_id)
+            .non_draft_snapshots(ctx_id)
             .ok()
             .and_then(|v| v.into_iter().find(|b| b.id == block_id))
         {
@@ -1508,7 +1517,7 @@ impl KjDispatcher {
 
         let new_len = self
             .blocks
-            .block_snapshots(ctx_id)
+            .non_draft_snapshots(ctx_id)
             .ok()
             .and_then(|v| v.into_iter().find(|b| b.id == block_id))
             .map(|s| s.content.len())
@@ -1540,7 +1549,7 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block history: {e}")),
         };
@@ -1598,7 +1607,7 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block diff: {e}")),
         };
@@ -1944,6 +1953,42 @@ mod tests {
                 None,
             )
             .expect("insert_block_as")
+    }
+
+    #[tokio::test]
+    async fn generic_block_commands_cannot_reach_compose_drafts() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("drafts"), principal);
+        let caller = caller_with_context(ctx);
+        let draft = d.block_store().edit_draft(ctx, principal, 0, "unfinished-secret", 0).unwrap();
+        let key = draft.to_key();
+        for args in [
+            vec!["block", "read", &key],
+            vec!["block", "inspect", &key],
+            vec!["block", "history", &key],
+            vec!["block", "diff", &key],
+            vec!["block", "append", &key, "replacement"],
+            vec!["block", "status", &key, "done"],
+        ] {
+            let result = d.dispatch(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &caller).await;
+            assert!(!result.is_ok(), "{args:?}: {}", result.message());
+            assert!(!result.message().contains("unfinished-secret"));
+        }
+        let listed = d.dispatch(&[s("block"), s("list"), s("--json")], &caller).await;
+        assert!(listed.is_ok(), "{}", listed.message());
+        assert!(!listed.message().contains(&key));
+        assert!(!listed.message().contains("unfinished-secret"));
+        assert_eq!(d.block_store().draft_block(ctx, principal).unwrap().unwrap().content, "unfinished-secret");
+        d.block_store().submit_draft(ctx, principal, None).unwrap();
+        let read = d.dispatch(&[s("block"), s("read"), key], &caller).await;
+        assert!(read.is_ok(), "{}", read.message());
+        assert!(read.message().contains("unfinished-secret"));
+        let demote = d.dispatch(&[s("block"), s("status"), draft.to_key(), s("draft")], &caller).await;
+        assert!(!demote.is_ok(), "generic status must not create a compose draft");
+        let help = d.dispatch(&[s("block"), s("status"), s("--help")], &caller).await;
+        println!("{}", help.message());
+        assert!(!help.message().contains("|draft"));
     }
 
     fn insert_abc_block(
@@ -3602,7 +3647,6 @@ mod tests {
             ("waiting", Status::Waiting),
             ("done", Status::Done),
             ("error", Status::Error),
-            ("draft", Status::Draft),
         ] {
             let result = d
                 .dispatch(&[s("block"), s("status"), bid.to_key(), s(name)], &c)

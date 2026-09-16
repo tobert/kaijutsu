@@ -280,7 +280,7 @@ impl KjDispatcher {
         };
 
         let window = window.unwrap_or(DEFAULT_TAIL_WINDOW) as usize;
-        let blocks = match self.block_store().block_snapshots(ctx) {
+        let blocks = match self.block_store().non_draft_snapshots(ctx) {
             Ok(b) => b,
             Err(e) => return KjResult::Err(format!("kj handoff tail: {e}")),
         };

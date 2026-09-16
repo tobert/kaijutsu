@@ -287,7 +287,7 @@ impl KjDispatcher {
             }
         };
 
-        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj doc tree: {e}")),
         };

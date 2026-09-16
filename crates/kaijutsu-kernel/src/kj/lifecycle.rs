@@ -1031,7 +1031,7 @@ impl kaijutsu_index::BlockSource for BlockStoreSource {
         if !self.0.contains(ctx) {
             let _ = self.0.load_one_from_db(ctx);
         }
-        BlockStore::block_snapshots(&self.0, ctx).map_err(|e| e.to_string())
+        BlockStore::non_draft_snapshots(&self.0, ctx).map_err(|e| e.to_string())
     }
 }
 

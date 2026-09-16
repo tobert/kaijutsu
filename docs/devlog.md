@@ -1394,3 +1394,11 @@ for one context. The registry now serializes lookup and idle eviction; a held
 session keeps its mutex and consumes a pending reset when the next turn locks
 it. Idle LRU hydration policy stays unchanged. The regressions pass, including
 the existing two-turn approval-resume test that verifies refreshed tool output.
+
+Draft isolation now extends through generic block access. `/v/docs`, `kj`
+block commands and search, semantic source adapters, and both MCP block
+adapters exclude unsubmitted blocks. Generic status commands cannot create or
+promote drafts. Historical reads reject draft-era text even after submission.
+The regressions reproduced reads through both model-shell flavors, `kj`, MCP,
+and journal replay; client compose and feed queries retain their draft view.
+The separate wire-facade identity question remains in `docs/issues.md`.
