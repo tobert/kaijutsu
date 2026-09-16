@@ -1,25 +1,9 @@
-//! `ShellEnvelope` — the one result shape the `shell` tool returns, whichever
-//! way it was reached.
+//! The public shell result shared by runtime and transport projections.
 //!
-//! Two builders produce a `shell` result: the in-kernel tool
-//! (`kaijutsu-kernel`'s `ShellServer`, which has a kaish `ExecResult` in hand)
-//! and the external stdio MCP server (`kaijutsu-mcp`, which polls a block
-//! snapshot back over RPC). They ran the same command under the same tool name
-//! and returned different fields with different error semantics. This type is
-//! the single definition both build, so a caller can parse one shape without
-//! knowing which path served it.
-//!
-//! **Every field is always present.** A path that cannot know a value writes
-//! `null`, never omits the key — a key that comes and goes is the shape
-//! instability this type exists to remove. `null` means "this path cannot
-//! know", which is never the same as a zero or an empty string.
-//!
-//! `is_error` follows the exit code: a command that exits nonzero is an error.
-//! `status` carries the finer distinction a bare flag cannot — a program kaish
-//! refused to run (`Rejected`) is the caller's mistake to fix, while a program
-//! that ran and exited nonzero (`Error`) is a result to read.
-//!
-//! `docs/shell-envelope.md` is canonical.
+//! Every field is always present. An unavailable value is `null`, which is
+//! distinct from zero, false, and an empty string. `is_error` follows `status`;
+//! command exits, interpreter rejection, hook replacements, and incomplete
+//! operations retain their distinct meanings. See `docs/shell-envelope.md`.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,9 +12,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellStatus {
-    /// The command ran and exited 0.
+    /// The command exited 0, or a hook supplied a successful replacement.
     Done,
-    /// The command ran and exited nonzero.
+    /// Nonzero exit, execution/persistence failure, or an error hook result.
     Error,
     /// kaish refused the program before running it — a parse or validation
     /// failure. Nothing ran, and the text is the caller's to fix.
@@ -75,8 +59,8 @@ pub struct ShellEnvelope {
     /// string when it wrote none.
     pub stderr: String,
     /// The command's exit code. `null` when no code exists to report: the
-    /// program was refused before running, or the code has not replicated to
-    /// this caller yet. `null` is never evidence of success.
+    /// program was refused, a hook supplied a replacement, or the code is
+    /// unavailable to this caller. `null` is never evidence of success.
     pub exit_code: Option<i64>,
     /// How the call ended.
     pub status: ShellStatus,
@@ -92,8 +76,8 @@ pub struct ShellEnvelope {
     /// The block the command's output landed in. `null` when the serving
     /// path has no block to name.
     pub block_id: Option<String>,
-    /// The handle for a backgrounded command, to poll or kill it. `null`
-    /// unless `status` is `running`.
+    /// The durable command handle, retained while waiting and after completion.
+    /// `null` when no operation was registered.
     pub operation_id: Option<String>,
     /// The decision this operation is waiting for, when present.
     pub ask_id: Option<String>,
@@ -242,7 +226,7 @@ impl ShellEnvelope {
                 "stderr": { "type": "string" },
                 "exit_code": {
                     "type": ["integer", "null"],
-                    "description": "null = no code to report (refused, or not yet replicated); never evidence of success"
+                    "description": "null = no command exit (refused, hook replacement, or unavailable); never evidence of success"
                 },
                 "status": {
                     "type": "string",

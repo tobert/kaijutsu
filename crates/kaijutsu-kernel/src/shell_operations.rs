@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::kernel_db::KernelDb;
+use crate::runtime::command_outcome::CommandOutcome;
 
 type OperationResult<T> = Result<T, String>;
 
@@ -73,6 +74,10 @@ impl ShellOperationRegistry {
                 completed_at INTEGER,
                 envelope_json TEXT
              );
+             CREATE TABLE IF NOT EXISTS shell_operation_outcomes (
+                operation_id TEXT PRIMARY KEY REFERENCES shell_operations(operation_id),
+                outcome_json TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS shell_operations_context ON shell_operations(context_id);
              CREATE UNIQUE INDEX IF NOT EXISTS shell_operations_ask ON shell_operations(ask_id);"
         ).map_err(|e| e.to_string())?;
@@ -122,14 +127,26 @@ impl ShellOperationRegistry {
         Ok(())
     }
 
-    pub fn complete(&self, id: &str, mut envelope: ShellEnvelope) -> OperationResult<bool> {
+    pub fn complete(&self, id: &str, envelope: ShellEnvelope) -> OperationResult<bool> {
+        self.complete_record(id, envelope, None)
+    }
+
+    /// Commit the raw execution, hook decision, and public result together.
+    pub fn complete_outcome(&self, id: &str, output: &BlockId, outcome: &CommandOutcome) -> OperationResult<bool> {
+        let mut envelope = outcome.envelope();
+        envelope.block_id = Some(output.to_key());
+        self.complete_record(id, envelope, Some(outcome))
+    }
+
+    fn complete_record(&self, id: &str, mut envelope: ShellEnvelope, outcome: Option<&CommandOutcome>) -> OperationResult<bool> {
         if matches!(envelope.status, ShellStatus::Running | ShellStatus::Waiting) {
             return Err("cannot complete a shell operation with a nonterminal receipt".into());
         }
         envelope.operation_id = Some(id.to_owned());
         let json = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
+        let outcome_json = outcome.map(serde_json::to_string).transpose().map_err(|e| e.to_string())?;
         let db = self.db.lock();
-        let conn = db.conn_for_ledger();
+        let conn = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
         let changed = conn.execute(
             "UPDATE shell_operations SET completed_at=?2,envelope_json=?3
              WHERE operation_id=?1 AND completed_at IS NULL",
@@ -144,6 +161,21 @@ impl ShellOperationRegistry {
                 return Err(format!("shell operation {id} is missing or already has a different result"));
             }
         }
+        if let Some(outcome_json) = outcome_json {
+            if changed == 1 {
+                conn.execute("INSERT INTO shell_operation_outcomes(operation_id,outcome_json) VALUES(?1,?2)",
+                    rusqlite::params![id, outcome_json]).map_err(|e| e.to_string())?;
+            } else {
+                let prior: Option<String> = conn.query_row(
+                    "SELECT outcome_json FROM shell_operation_outcomes WHERE operation_id=?1",
+                    [id], |row| row.get(0),
+                ).optional().map_err(|e| e.to_string())?;
+                if prior.as_deref() != Some(outcome_json.as_str()) {
+                    return Err(format!("shell operation {id} already has a different outcome"));
+                }
+            }
+        }
+        conn.commit().map_err(|e| e.to_string())?;
         self.jobs.lock().remove(id);
         Ok(changed == 1)
     }
@@ -168,6 +200,16 @@ impl ShellOperationRegistry {
 
     pub fn get_by_ask(&self, ask: &str, context: ContextId) -> OperationResult<Option<ShellOperationState>> {
         self.lookup("ask_id", ask, context)
+    }
+
+    /// Read the execution record without adding raw output to ordinary receipt polls.
+    pub fn outcome(&self, id: &str, context: ContextId) -> OperationResult<Option<CommandOutcome>> {
+        let json: Option<String> = self.db.lock().conn_for_ledger().query_row(
+            "SELECT outcome_json FROM shell_operation_outcomes JOIN shell_operations USING(operation_id)
+             WHERE operation_id=?1 AND context_id=?2",
+            rusqlite::params![id, context.as_bytes()], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        json.map(|json| serde_json::from_str(&json).map_err(|e| e.to_string())).transpose()
     }
 
     fn lookup(&self, column: &str, value: &str, context: ContextId) -> OperationResult<Option<ShellOperationState>> {
@@ -314,6 +356,43 @@ mod tests {
         assert_eq!(state.envelope.unwrap().stdout, "exact\n");
         assert!(state.completed_at.is_some());
         assert!(registry.get_by_output(&receipt.output_block_id, context).unwrap().is_some());
+    }
+
+    #[test]
+    fn raw_and_effective_outcomes_commit_together_and_survive_reload() {
+        use crate::runtime::command_outcome::{CommandExecution, CommandHookEffect};
+        let db = Arc::new(Mutex::new(KernelDb::open(":memory:").unwrap()));
+        let registry = ShellOperationRegistry::new(db.clone()).unwrap();
+        let context = ContextId::new();
+        let receipt = register(&registry, context);
+        let mut outcome = CommandOutcome::new(CommandExecution::Completed(
+            kaish_kernel::interpreter::ExecResult::failure(7, "raw failure")), 12);
+        outcome.hook = Some(CommandHookEffect::Replacement(crate::mcp::KernelToolResult::text("replacement")));
+        db.lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_outcome BEFORE INSERT ON shell_operation_outcomes BEGIN
+             SELECT RAISE(ABORT, 'outcome write failed'); END;"
+        ).unwrap();
+        assert!(registry.complete_outcome(&receipt.operation_id, &receipt.output_block_id, &outcome).is_err());
+        let failed = registry.get(&receipt.operation_id, context).unwrap().unwrap();
+        assert!(failed.completed_at.is_none());
+        assert!(failed.envelope.is_none());
+        assert!(registry.outcome(&receipt.operation_id, context).unwrap().is_none());
+        db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_outcome;").unwrap();
+        assert!(registry.complete_outcome(&receipt.operation_id, &receipt.output_block_id, &outcome).unwrap());
+        assert!(!registry.complete_outcome(&receipt.operation_id, &receipt.output_block_id, &outcome).unwrap());
+        drop(registry);
+        let registry = ShellOperationRegistry::new(db).unwrap();
+        let saved = registry.get(&receipt.operation_id, context).unwrap().unwrap();
+        let envelope = saved.envelope.unwrap();
+        assert_eq!(envelope.stdout, "replacement");
+        assert_eq!(envelope.exit_code, None);
+        assert!(registry.outcome(&receipt.operation_id, ContextId::new()).unwrap().is_none());
+        let CommandExecution::Completed(raw) = registry.outcome(&receipt.operation_id, context).unwrap().unwrap().execution else { panic!("lost raw outcome") };
+        assert_eq!(raw.code, 7);
+        assert_eq!(raw.err, "raw failure\n");
+        outcome.execution = CommandExecution::NotRun;
+        assert!(registry.complete_outcome(&receipt.operation_id, &receipt.output_block_id, &outcome).is_err(),
+            "equal public results must not hide different execution records");
     }
 
     #[test]

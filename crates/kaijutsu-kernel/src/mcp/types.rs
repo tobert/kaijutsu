@@ -63,7 +63,7 @@ pub struct KernelCallParams {
 
 /// Uniform tool result. `is_error` is the channel by which all LLM-visible
 /// failures surface (D-28); non-error completions carry `content` entries.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct KernelToolResult {
     pub is_error: bool,
     pub content: Vec<ToolContent>,
@@ -90,7 +90,7 @@ impl KernelToolResult {
 
 /// Minimal content shape — expand as needed when servers start returning
 /// images/resources. Keeps the kernel API stable across rmcp revs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ToolContent {
     Text(String),
     Json(serde_json::Value),

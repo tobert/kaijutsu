@@ -6,11 +6,11 @@ One tool name, one shape, one error rule.
 ```json
 {"stdout":"hi\n","stderr":"","exit_code":0,"status":"done","did_spill":false,
  "data":null,"latch":null,"block_id":null,"operation_id":null,"ask_id":null,
- "content_type":null,"ephemeral":null,"elapsed_ms":3,"error":null}
+ "content_type":"text/plain","ephemeral":false,"elapsed_ms":3,"error":null}
 ```
 
 The type is `kaijutsu_types::shell_envelope::ShellEnvelope`. It is the single
-definition both builders construct.
+definition the runtime and transport projections construct.
 
 ## Two builders, one shape
 
@@ -37,15 +37,17 @@ does not carry them.
 from `status`, so the flag and the field can never disagree. (Amy, 2026-09-04.)
 
 **`exit_code` null is unknown, never success.** It is `null` exactly when
-there is no code to report: kaish refused the program before running it, or
-the code has not replicated to this caller yet.
+there is no code to report: kaish refused the program before running it, a hook
+supplied a synthetic replacement, or the code is unavailable to this caller.
+A replacement's `status` describes the hook result; its raw command exit remains
+in the runtime execution record.
 
 **`status` carries what one bit cannot.**
 
 | status | meaning |
 |---|---|
-| `done` | ran, exited 0 |
-| `error` | ran, exited nonzero |
+| `done` | exited 0, or a successful hook replacement |
+| `error` | nonzero exit, execution/persistence failure, or an error hook result |
 | `rejected` | kaish refused the program; nothing ran, fix the text and retry |
 | `running` | accepted asynchronous operation; `operation_id` identifies its receipt |
 | `waiting` | accepted operation is waiting on `ask_id`; this is not an error |
@@ -56,6 +58,17 @@ the code has not replicated to this caller yet.
 remapped to 3, real exit in `original_code`) is judged by the command's real
 exit. Flagging it an error tempts a model into re-running a command that
 already succeeded. The capping stays visible as `did_spill: true`.
+
+## Runtime outcomes
+
+Interactive commands and approval resumes use `CommandOutcome`. The raw kaish
+result and any hook replacement or refusal remain distinct. Terminal receipts
+commit that record and the effective envelope together before blocks advertise
+completion. A hook replacement clears the old stderr, physical exit, content
+type, ephemeral flag, and structured output. Its text/JSON content and structured
+payload supply the new result. Raw records are separate from ordinary receipt
+polls. Structured RPC, streaming RPC, and MCP completion are still being migrated;
+see `docs/kaish-integration.md`.
 
 ## The body is the envelope
 

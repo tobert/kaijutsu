@@ -88,9 +88,9 @@ pub fn shell_hook_result_text(result: &crate::mcp::KernelToolResult) -> String {
     result
         .content
         .iter()
-        .filter_map(|c| match c {
-            crate::mcp::ToolContent::Text(s) => Some(s.clone()),
-            _ => None,
+        .map(|c| match c {
+            crate::mcp::ToolContent::Text(s) => s.clone(),
+            crate::mcp::ToolContent::Json(value) => value.to_string(),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -188,21 +188,16 @@ pub fn shell_result_to_envelope(
 ) -> kaijutsu_types::shell_envelope::ShellEnvelope {
     use kaijutsu_types::shell_envelope::ShellEnvelope;
 
-    let exit_code = if result.did_spill {
-        result.original_code.unwrap_or(result.code)
-    } else {
-        result.code
-    };
+    let exit_code = result.original_code.unwrap_or(result.code);
     let mut env = ShellEnvelope::new(ShellEnvelope::status_for_exit(exit_code));
     env.stdout = result.text_out().into_owned();
     env.stderr = result.err.clone();
     env.exit_code = Some(exit_code);
     env.did_spill = Some(result.did_spill);
     env.elapsed_ms = Some(elapsed_ms);
-    // kj verbs (and any builtin that opts in) attach a structured `.data`
-    // payload — context-id arrays for list commands, records for inspect. Carry
-    // it so consumers don't scrape stdout. `null` when the command set no data
-    // (external commands, echo, …).
+    env.content_type = Some(result.content_type.clone().unwrap_or_else(|| "text/plain".into()));
+    env.ephemeral = Some(result.baggage.get("kaijutsu.ephemeral").is_some_and(|value| value == "true"));
+    // Keep structured payloads separate from rendered stdout.
     env.data = result
         .data
         .as_ref()

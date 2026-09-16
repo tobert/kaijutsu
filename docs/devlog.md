@@ -1528,8 +1528,23 @@ reproduced premature Done publication in both interactive execution and the
 structured-kj wire path. Both now defer terminal blocks until hooks settle.
 A late export-write failure also reproduced partial cwd/environment persistence;
 the shared state owner now commits the diff atomically and returns errors.
-Receipts rebuilt from blocks, synthetic-result metadata, and MCP asynchronous
-completion remain unfinished parts of the common outcome contract.
+Interactive and approved commands now retain one `CommandOutcome`. A durable
+record keeps the raw execution separately from a hook replacement or refusal;
+receipt polls retain their existing effective-envelope shape. Blocks, receipts,
+and kaish jobs project from that record, and the block-reading reconstruction
+helper is deleted. Regressions first reproduced replacements carrying stale
+failure exits and real exits 2/3 producing successful blocks. Replacements now
+clear old metadata, retain structured content, and report no physical exit.
+Kaish job control uses an explicitly synthetic 0/1 result where its API requires
+an integer. Unmodified jobs retain their complete execution result.
+
+Receipt and raw record commit atomically before terminal block publication.
+Failure injection verifies rollback and retry without execution; restart reads
+retain both raw failure and synthetic success. Paused hooks and an SSH/RPC
+replacement test check the publication boundary. The remaining structured,
+streaming, and MCP paths still need this outcome owner. Automatic projection
+recovery and approval of already-executed result hooks remain explicit work;
+returning a persistence error does not by itself recover an accepted operation.
 
 ## The kernel with no one to answer to (September 16)
 

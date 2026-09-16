@@ -915,11 +915,12 @@ fn settle_pair_error(
     output_block_id: &BlockId,
     reason: String,
 ) {
-    let documents = &kernel.documents;
-    let _ = documents.set_stderr(context_id, output_block_id, Some(reason));
-    let _ = documents.set_status(context_id, output_block_id, Status::Error);
-    let _ = documents.set_status(context_id, command_block_id, Status::Error);
-    if let Err(error) = kaijutsu_kernel::runtime::command::complete_operation_from_blocks(&kernel.kernel, context_id, output_block_id) {
+    let mut outcome = kaijutsu_kernel::runtime::command_outcome::CommandOutcome::new(
+        kaijutsu_kernel::runtime::command_outcome::CommandExecution::NotRun, 0);
+    outcome.settlement_error = Some(reason);
+    if let Err(error) = kaijutsu_kernel::runtime::command::settle_outcome(
+        &kernel.kernel, context_id, command_block_id, output_block_id, &outcome,
+    ) {
         log::error!("could not settle refused shell operation: {error}");
     }
     // The pair may already be cached from an earlier turn as `Waiting`;
@@ -1216,16 +1217,13 @@ async fn act_on_executable_answer(
         "gate-resume: running approved ask {} in {context_id}",
         answer.request_id
     );
-    kaijutsu_kernel::runtime::command::run_into_blocks(
+    if let Err(error) = kaijutsu_kernel::runtime::command::run_into_blocks(
         &kaish,
         source,
         ask.stdin.clone(),
         context_id,
         &command_block_id,
         &output_block_id,
-        &kernel.documents,
-        kernel.kernel.block_flows(),
-        &kernel.kernel_db,
         &kernel.kernel,
         &kaijutsu_kernel::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id)
             .with_actor(ask.actor, Some(ask.reviewer)),
@@ -1233,7 +1231,10 @@ async fn act_on_executable_answer(
         // map of its own and no connection behind it.
         None,
     )
-    .await;
+    .await {
+        kernel.conversation_cache.evict(context_id);
+        return ExecAction::Tell(format!("Approved command settlement failed: {error}. Inspect operation output {} before retrying.", output_block_id.to_key()));
+    }
 
     // `run_into_blocks` just settled the pair in place. When it was
     // already `Waiting` in a cached mailbox, that edit is invisible to
@@ -9802,17 +9803,8 @@ async fn execute_shell_command(
         }
     }
 
-    // Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "The three
-    // rpc.rs shell paths take the hook path"): this path runs kaish
-    // directly, bypassing `Broker::call_tool` and every hook that watches
-    // it — so no `PreCall` hook ever sees a human typing at the interactive
-    // shell. Evaluate the same phase a `shell_write` tool call gets, right
-    // where the command would otherwise start running, so a `Deny`/`Ask`
-    // hook (the sh -c guard, a future lfm2d scorer) covers this path too.
-    // The blocks already exist at this point (unlike a tool call, which has
-    // none to show) — a denial settles them to `Error` with the reason
-    // rather than leaving them `Running` forever, so the human sees WHY
-    // nothing ran instead of a hang.
+    // Interactive commands use the same PreCall protocol as shell tools.
+    // The existing pair carries a replacement or refusal without execution.
     let call_ctx = kaijutsu_kernel::mcp::CallContext::new(
         user_principal_id,
         context_id,
@@ -9822,42 +9814,24 @@ async fn execute_shell_command(
     match kernel_arc.broker().shell_pre_call_hooks(code, &call_ctx).await {
         kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => {}
         kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {
-            let text = shell_hook_result_text(&result);
-            if let Err(e) = documents.edit_text_as(
-                context_id,
-                &output_block_id,
-                0,
-                &text,
-                0,
-                Some(PrincipalId::system()),
-            ) {
-                log::error!("Failed to write short-circuited shell output: {}", e);
-            }
-            let status = if result.is_error {
-                Status::Error
-            } else {
-                Status::Done
-            };
-            let _ = documents.set_status(context_id, &output_block_id, status);
-            let _ = documents.set_status(context_id, &command_block_id, status);
-            kaijutsu_kernel::runtime::command::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
-                .map_err(|e| capnp::Error::failed(e))?;
+            let mut outcome = kaijutsu_kernel::runtime::command_outcome::CommandOutcome::new(
+                kaijutsu_kernel::runtime::command_outcome::CommandExecution::NotRun, 0);
+            outcome.apply_hook(kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result));
+            kaijutsu_kernel::runtime::command::settle_outcome(
+                &kernel_arc, context_id, &command_block_id, &output_block_id, &outcome,
+            ).map_err(capnp::Error::failed)?;
             return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: None });
         }
         kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-            // No "denied" prefix: the refusal carries three different kinds
-            // and only one of them is a no. Labelling all three "denied"
-            // teaches a model that a pending ask is a refusal, which is the
-            // collapse `RefusalKind` exists to prevent — each kind's own
-            // Display already names what happened.
-            let reason = err.to_string();
-            // The same split applied to the blocks: a pending ask settles
-            // them `Waiting`, not `Error`, so the pair does not read as a
-            // failed command afterwards.
-            let settled = err.settled_block_status();
-            let _ = documents.set_stderr(context_id, &output_block_id, Some(reason.clone()));
-            let _ = documents.set_status(context_id, &output_block_id, settled);
-            let _ = documents.set_status(context_id, &command_block_id, settled);
+            let mut outcome = kaijutsu_kernel::runtime::command_outcome::CommandOutcome::new(
+                kaijutsu_kernel::runtime::command_outcome::CommandExecution::NotRun, 0);
+            outcome.hook = Some(kaijutsu_kernel::runtime::command_outcome::CommandHookEffect::Refused {
+                reason: err.to_string(), waiting: err.settled_block_status() == Status::Waiting,
+                ask_id: err.as_refusal().and_then(|refusal| refusal.ask_id().map(str::to_owned)),
+            });
+            kaijutsu_kernel::runtime::command::settle_outcome(
+                &kernel_arc, context_id, &command_block_id, &output_block_id, &outcome,
+            ).map_err(capnp::Error::failed)?;
 
             // A verdict rides the result; only a fault still throws.
             let refusal = refusal_or_fault(err, "shell")?;
@@ -9888,25 +9862,15 @@ async fn execute_shell_command(
                     );
                 }
             }
-            if let Some(ask_id) = refusal.ask_id() {
-                kernel_arc.shell_operations().mark_waiting(&operation_id, ask_id)
-                    .map_err(|e| capnp::Error::failed(format!("record shell ask: {e}")))?;
-            } else {
-                kaijutsu_kernel::runtime::command::complete_operation_from_blocks(&kernel_arc, context_id, &output_block_id)
-                    .map_err(capnp::Error::failed)?;
-            }
             return Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: Some(refusal) });
         }
     }
 
     // Spawn execution in background
     let code = code.to_owned();
-    let documents_clone = documents.clone();
     let output_block_id_clone = output_block_id;
     let command_block_id_clone = command_block_id;
-    let block_flows = kernel_arc.block_flows().clone();
     let connection_switch = connection.clone();
-    let kernel_db_for_persist = kernel.kernel_db.clone();
     let kernel_arc_for_hooks = kernel_arc.clone();
     tokio::task::spawn_local(async move {
         // The connection's session map is what an in-shell `kj context
@@ -9915,21 +9879,20 @@ async fn execute_shell_command(
         let record_switch = |new_id: ContextId| {
             record_context_switch(&connection_switch, new_id);
         };
-        kaijutsu_kernel::runtime::command::run_into_blocks(
+        if let Err(error) = kaijutsu_kernel::runtime::command::run_into_blocks(
             &kaish,
             &code,
             None,
             context_id,
             &command_block_id_clone,
             &output_block_id_clone,
-            &documents_clone,
-            &block_flows,
-            &kernel_db_for_persist,
             &kernel_arc_for_hooks,
             &call_ctx,
             Some(&record_switch),
         )
-        .await;
+        .await {
+            log::error!("shell command settlement failed: {error}");
+        }
     });
 
     Ok(ShellCommandSubmission { command_block_id, operation_id, refusal: None })

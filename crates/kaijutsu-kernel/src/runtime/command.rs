@@ -5,13 +5,12 @@
 
 use std::sync::Arc;
 
-use crate::{
-    block_store::SharedBlockStore, flows::SharedBlockFlowBus, kernel_db::KernelDb, Kernel,
-};
+use crate::Kernel;
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use kaijutsu_types::{BlockId, ContentType, ContextId, PrincipalId, Status};
 
-use super::command_result::{block_output_data, exec_result_to_hook_tool_result, shell_hook_result_text};
+use super::command_result::exec_result_to_hook_tool_result;
+use super::command_outcome::{CommandExecution, CommandOutcome};
 use super::shell_state::{persist_shell_state, snapshot_shell_state};
 
 /// Where an in-shell context switch is recorded.
@@ -21,45 +20,65 @@ use super::shell_state::{persist_shell_state, snapshot_shell_state};
 /// session map to update.
 pub type ContextSwitchSink<'a> = Option<&'a dyn Fn(ContextId)>;
 
-/// Persist a registered operation's final result after its block pair settles.
-// TODO: Project blocks, receipts, and job results from one settled shell outcome.
-// Reconstructing the receipt here duplicates the MCP shell completion policy.
-// Preserve caller-specific hooks, cwd/env persistence, and context switching.
-// See docs/issues.md, "Turn execution and shell settlement".
-pub fn complete_operation_from_blocks(
+/// Project the final outcome before publishing terminal block statuses.
+/// A receipt commits the raw execution and hook result before either block
+/// advertises completion. Projection failures reach the caller for recovery.
+pub fn settle_outcome(
     kernel: &Kernel,
     context_id: ContextId,
+    command_block_id: &BlockId,
     output_block_id: &BlockId,
+    outcome: &CommandOutcome,
 ) -> Result<(), String> {
-    use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
-
-    let Some(operation) = kernel.shell_operations()
-        .get_by_output(output_block_id, context_id).map_err(|e| e.to_string())?
-    else {
-        return Ok(());
-    };
-    let block = kernel.blocks().get_block_snapshot(context_id, output_block_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("shell operation output {output_block_id} is missing"))?;
-    if matches!(block.status, Status::Running | Status::Waiting) {
-        return Err(format!("shell operation output {output_block_id} has not settled"));
+    let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
+    if operation.as_ref().is_some_and(|operation| operation.receipt.command_block_id != *command_block_id) {
+        return Err("shell operation command block does not match its receipt".into());
     }
-    let status = if block.status == Status::Error {
-        ShellStatus::Error
-    } else {
-        block.exit_code.map_or(ShellStatus::Done, |code| ShellEnvelope::status_for_exit(i64::from(code)))
+    let documents = kernel.blocks();
+    let envelope = outcome.envelope();
+    let raw = match (&outcome.hook, &outcome.execution) {
+        (None, CommandExecution::Completed(result)) => crate::ansi_ingest::raw_stdout(result),
+        _ => std::borrow::Cow::Borrowed(envelope.stdout.as_bytes()),
     };
-    let mut envelope = ShellEnvelope::new(status);
-    envelope.stdout = block.content;
-    envelope.stderr = block.stderr.unwrap_or_default();
-    envelope.exit_code = block.exit_code.map(i64::from);
-    envelope.block_id = Some(output_block_id.to_key());
-    envelope.operation_id = Some(operation.receipt.operation_id.to_string());
-    envelope.data = block.output.as_ref().map(|output| output.to_json());
-    envelope.content_type = Some(block.content_type.as_mime().to_owned());
-    kernel.shell_operations().complete(&operation.receipt.operation_id.to_string(), envelope)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let projection = crate::ansi_ingest::project(&raw);
+    let text = projection.as_ref().map_or(envelope.stdout.as_str(), |p| p.text.as_str());
+    documents.replace_text_as(context_id, output_block_id, text, Some(PrincipalId::system()))
+        .map_err(|e| e.to_string())?;
+    if let Some(projection) = projection {
+        crate::ansi_ingest::record(documents, context_id, output_block_id, projection.spans, &raw);
+    }
+    let mut stderr = envelope.stderr.clone();
+    if let Some(error) = &envelope.error {
+        if !stderr.is_empty() && !stderr.ends_with('\n') { stderr.push('\n'); }
+        stderr.push_str(error);
+    }
+    documents.set_stderr(context_id, output_block_id, if stderr.is_empty() { None } else { Some(stderr) })
+        .map_err(|e| e.to_string())?;
+    documents.set_output(context_id, output_block_id, outcome.output_data().as_ref())
+        .map_err(|e| e.to_string())?;
+    documents.set_content_type(context_id, output_block_id,
+        envelope.content_type.as_deref().map_or(ContentType::Plain, ContentType::from_mime))
+        .map_err(|e| e.to_string())?;
+    documents.set_exit_code(context_id, output_block_id,
+        envelope.exit_code.map(|code| code.clamp(i32::MIN as i64, i32::MAX as i64) as i32))
+        .map_err(|e| e.to_string())?;
+    for block in [command_block_id, output_block_id] {
+        documents.set_ephemeral(context_id, block, envelope.ephemeral.unwrap_or(false))
+            .map_err(|e| e.to_string())?;
+    }
+    let status = outcome.block_status();
+    if let Some(operation) = operation {
+        if status == Status::Waiting {
+            let ask = envelope.ask_id.as_deref().ok_or("waiting command outcome has no ask")?;
+            kernel.shell_operations().mark_waiting(&operation.receipt.operation_id, ask)?;
+        } else {
+            kernel.shell_operations().complete_outcome(&operation.receipt.operation_id, output_block_id, outcome)?;
+        }
+    }
+    for block in [output_block_id, command_block_id] {
+        documents.set_status(context_id, block, status).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Detect an in-shell context switch, tell the sink about it, and report the
@@ -87,8 +106,8 @@ fn context_switched(
 /// Run `code` in `kaish` and fill the already-authored `command_block_id` /
 /// `output_block_id` pair with what it produced.
 ///
-/// The pair must already exist; this never authors blocks. It settles both
-/// to a terminal status on every path, including a kaish fault.
+/// The pair must already exist. Hooks and durable shell state settle before
+/// projections publish completion. A persistence failure is returned explicitly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_into_blocks(
     kaish: &EmbeddedKaish,
@@ -97,13 +116,10 @@ pub async fn run_into_blocks(
     context_id: ContextId,
     command_block_id: &BlockId,
     output_block_id: &BlockId,
-    documents: &SharedBlockStore,
-    block_flows: &SharedBlockFlowBus,
-    kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
     on_context_switch: ContextSwitchSink<'_>,
-) {
+) -> Result<(), String> {
     // Yield to let the event loop flush BlockInserted events to clients
     // before we start producing text ops. Without this, fast commands
     // (like `ls`) can emit edit_text before the client has processed the
@@ -123,269 +139,36 @@ pub async fn run_into_blocks(
             manager.set_cancel_token(job, cancel.clone()).await;
             options.cancel_token = Some(cancel);
             if let Err(error) = kernel.shell_operations().attach_job(&operation.receipt.operation_id, job, manager.clone()) {
-                let failure = kaish_kernel::interpreter::ExecResult::failure(1, error.clone());
+                let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
+                outcome.settlement_error = Some(error);
+                let failure = outcome.job_result();
+                let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
                 manager.finalize_streams(job, &failure).await;
                 let _ = sender.send(failure);
-                let _ = documents.set_stderr(context_id, output_block_id, Some(error));
-                let _ = documents.set_status(context_id, output_block_id, Status::Error);
-                let _ = documents.set_status(context_id, command_block_id, Status::Error);
-                if let Err(error) = complete_operation_from_blocks(kernel, context_id, output_block_id) {
-                    tracing::error!("could not settle unstarted shell operation: {error}");
-                }
-                return;
+                return settled;
             }
             Some((manager, job, sender))
         }
         Ok(None) => None,
-        Err(error) => {
-            let _ = documents.set_stderr(context_id, output_block_id, Some(error));
-            let _ = documents.set_status(context_id, output_block_id, Status::Error);
-            let _ = documents.set_status(context_id, command_block_id, Status::Error);
-            return;
-        }
+        Err(error) => return Err(error),
     };
 
-    // Snapshot the shell's durable surface (cwd + exported env) so we can
-    // persist whatever this command changes (`cd`, `export`) back to L1.
+    // Persist only this invocation's cwd/export changes to the context.
     let state_before = snapshot_shell_state(kaish).await;
 
-    tracing::debug!(
-        "shell_execute: executing code via EmbeddedKaish: {:?}",
-        code
-    );
-    let mut final_status = match kaish
-        .execute_with_options(code, options)
-        .await
-    {
-        Ok(result) => {
-            tracing::info!(
-                "shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",
-                result.code,
-                result.original_code,
-                result.did_spill,
-                result.text_out().len(),
-                result.err.len()
-            );
-
-            // stdout → block content (DTE-tracked, app-observable, streams).
-            // stderr → its own metadata field so callers can tell them apart
-            // (a successful-with-warnings command carries stderr + exit 0).
-            // The LLM still sees both: hydration merges stderr back into the
-            // tool_result content (see hydrate.rs).
-            //
-            // ANSI ingest (docs/ansi-and-beyond.md): the raw bytes are the
-            // provenance, the projection is the block. `raw_stdout` reads
-            // `result.out` directly because `text_out()` is already lossy
-            // on the `Bytes` arm — storing a lossy "original" would defeat
-            // the whole point of keeping one.
-            let raw_out = crate::ansi_ingest::raw_stdout(&result);
-            let projection = crate::ansi_ingest::project(&raw_out);
-            let out_text = match projection {
-                Some(ref p) => p.text.clone(),
-                None => result.text_out().into_owned(),
-            };
-            // Replace, never insert: an output block authored for this run
-            // is empty, but a `Waiting` tool result an approval fills already
-            // carries the gate's placeholder text.
-            if let Err(e) = documents.replace_text_as(
-                context_id,
-                output_block_id,
-                &out_text,
-                Some(PrincipalId::system()),
-            ) {
-                tracing::error!("Failed to update shell output: {}", e);
-            }
-            // Strictly after the edit: `edit_text` clears style_spans.
-            if let Some(p) = projection {
-                crate::ansi_ingest::record(
-                    documents,
-                    context_id,
-                    output_block_id,
-                    p.spans,
-                    &raw_out,
-                );
-            }
-
-            if !result.err.is_empty()
-                && let Err(e) = documents.set_stderr(
-                    context_id,
-                    output_block_id,
-                    Some(result.err.clone()),
-                )
-            {
-                tracing::error!("Failed to set shell stderr: {}", e);
-            }
-
-            if let Some(output_data) = block_output_data(&result)
-                && let Err(e) = documents.set_output(
-                    context_id,
-                    output_block_id,
-                    Some(&output_data),
-                )
-            {
-                tracing::error!("Failed to set output data: {}", e);
-            }
-
-            if let Some(ref ct_str) = result.content_type {
-                let ct = ContentType::from_mime(ct_str);
-                if ct != ContentType::Plain
-                    && let Err(e) =
-                        documents.set_content_type(context_id, output_block_id, ct)
-                {
-                    tracing::error!("Failed to set content_type: {}", e);
-                }
-            }
-
-            // Read baggage: mark blocks ephemeral if tool signaled it
-            if result
-                .baggage
-                .get("kaijutsu.ephemeral")
-                .map(|v| v == "true")
-                .unwrap_or(false)
-            {
-                for bid in [command_block_id, output_block_id] {
-                    if let Err(e) = documents.set_ephemeral(context_id, bid, true) {
-                        tracing::error!("Failed to set ephemeral on block: {}", e);
-                    }
-                }
-            }
-
-            // Persist the real kaish exit code on the ToolResult block
-            // before flipping status. Consumers (MCP context_shell return,
-            // BRP introspection, history views) read this to distinguish
-            // exit codes that all map to the same Status::Error.
-            //
-            // `result.code` is the code kaish hands back for `$?` inside a
-            // script — and on this `OutputProfile::Agent` shell, a capped
-            // command (`did_spill`) has that field FORCIBLY remapped to 3,
-            // with the command's actual exit stashed in `original_code`
-            // (kaish-kernel's `output_limit` module doc). That remap is a
-            // deliberate, loud signal for a script's own control flow — but
-            // this durable field is not control flow, it's the permanent
-            // record. Resolving through `original_code` here is the same
-            // move `mcp/servers/shell.rs`'s `shell_result_to_envelope` makes
-            // ("truncation is not failure") — a command that exited 0 and
-            // merely printed a lot must not read back as exit_code=3
-            // forever because it once got captured over 8 KB.
-            // Clamp to i32 — POSIX exit codes are 0-255; saturating cast
-            // covers the i64-to-i32 narrowing without surprise.
-            let real_code = result.original_code.unwrap_or(result.code);
-            let exit_code_i32: i32 = real_code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            if let Err(e) = documents.set_exit_code(
-                context_id,
-                output_block_id,
-                Some(exit_code_i32),
-            ) {
-                tracing::error!("Failed to set output block exit_code: {}", e);
-            }
-
-            // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
-            // Exit 3: truncation (did_spill) OR a command's own genuine exit 3 — neither is a failure
-            //
-            // Matched on `real_code`, not `result.code`: kaish's did_spill
-            // remap is unconditional — a command that FAILED and also
-            // spilled >8KB of output gets `code = 3` with the real failing
-            // code stashed in `original_code` (kaish-kernel's `output_limit`
-            // remap in `Kernel::run`/`spill_if_needed`, unconditional on the
-            // pre-spill exit). Matching on the raw code would fold that
-            // failure into the `3 => Done` arm and misreport it as success.
-            // `real_code` collapses back to `result.code` whenever
-            // `original_code` is `None` (no spill), so a command that
-            // genuinely exits 2 or 3 on its own is unaffected — this only
-            // changes classification for the spilled-and-failed case.
-            let mut final_status = match real_code {
-                0 | 2 | 3 => Status::Done,
-                _ => Status::Error,
-            };
-            // PostCall — hand the hook the real result this command
-            // produced (docs/gate-and-shell-split.md, "The three rpc.rs
-            // shell paths take the hook path"): mirrors `Broker::
-            // call_tool`'s own PostCall pinch point. `Proceed` changes
-            // nothing — the real output above already stands.
-            // `ShortCircuit` overrides it the same way `call_tool`'s
-            // PostCall can override a real server result; `Deny` settles
-            // both blocks to `Error` with the hook's reason, same as a
-            // `call_tool` caller getting `Denied` instead of the result
-            // it actually produced.
-            let hook_result = exec_result_to_hook_tool_result(&result);
-            match kernel
-                .broker()
-                .shell_post_call_hooks(code, call_ctx, &hook_result)
-                .await
-            {
-                crate::mcp::ShellHookVerdict::Proceed => {}
-                crate::mcp::ShellHookVerdict::ShortCircuit(sc_result) => {
-                    let text = shell_hook_result_text(&sc_result);
-                    let status = if sc_result.is_error { Status::Error } else { Status::Done };
-                    if let Err(e) =
-                        documents.replace_text_as(context_id, output_block_id, &text, Some(PrincipalId::system()))
-                    {
-                        tracing::error!("Failed to write PostCall short-circuited shell output: {}", e);
-                    }
-                    final_status = status;
-                }
-                crate::mcp::ShellHookVerdict::Denied(err) => {
-                    // "on ...", not "denied by ...": the next line asks
-                    // for a settled status precisely because this carries
-                    // `GatePending` too, and a pending ask is not a no.
-                    let reason = format!("on shell command result: {err}");
-                    let settled = err.settled_block_status();
-                    let _ = documents.set_stderr(context_id, output_block_id, Some(reason));
-                    final_status = settled;
-                }
-            }
-            final_status
-        }
-        Err(e) => {
-            let mut final_status = Status::Error;
-            let error_msg = format!("Error: {}", e);
-            tracing::error!("Shell execution failed: {}", e);
-            if let Err(e) = documents.edit_text_as(
-                context_id,
-                output_block_id,
-                0,
-                &error_msg,
-                0,
-                Some(PrincipalId::system()),
-            ) {
-                tracing::error!("Failed to update shell output with error: {}", e);
-            }
-            // OnError — hand the hook the real failure (mirrors
-            // `call_tool`'s own OnError pinch point). `ShortCircuit` can
-            // convert the failure into a synthetic success, same as
-            // `call_tool`'s OnError; `Proceed`/`Deny` both leave the
-            // real error above standing — a failed command is already
-            // the terminal state a `Deny` would produce.
-            let mcp_err = crate::mcp::McpError::Protocol(e.to_string());
-            if let crate::mcp::ShellHookVerdict::ShortCircuit(sc_result) =
-                kernel
-                    .broker()
-                    .shell_on_error_hooks(code, call_ctx, &mcp_err)
-                    .await
-            {
-                let text = shell_hook_result_text(&sc_result);
-                let status = if sc_result.is_error { Status::Error } else { Status::Done };
-                if let Err(e) =
-                    documents.replace_text_as(context_id, output_block_id, &text, Some(PrincipalId::system()))
-                {
-                    tracing::error!("Failed to write OnError short-circuited shell output: {}", e);
-                }
-                final_status = status;
-            }
-            final_status
-        }
+    let started = std::time::Instant::now();
+    let result = kaish.execute_with_options(code, options).await;
+    let verdict = match &result {
+        Ok(result) => kernel.broker().shell_post_call_hooks(
+            code, call_ctx, &exec_result_to_hook_tool_result(result)).await,
+        Err(error) => kernel.broker().shell_on_error_hooks(
+            code, call_ctx, &crate::mcp::McpError::Protocol(error.to_string())).await,
     };
-    // Settle durable context state *before* flipping status to a
-    // terminal value: clients (and our own e2e harness) treat the
-    // ToolResult reaching Done/Error as "command finished" and may
-    // fire their next command immediately. If we persisted after, a
-    // back-to-back `cd /x` then `pwd` could re-materialize the shell
-    // off stale L1. Detect an in-shell context switch (kj fork /
-    // context switch) and propagate it to the connection's shared
-    // map; otherwise persist this command's cwd/export changes to the
-    // context it ran in. (On a switch the snapshots straddle two
-    // contexts and the outgoing cwd is already saved inside kaish, so
-    // we skip the write-back.)
+    let mut outcome = CommandOutcome::from_execution(result, started.elapsed().as_millis() as u64);
+    outcome.apply_hook(verdict);
+
+    // A context switch saves the outgoing state itself. Its snapshots span
+    // two contexts, so only runs that stayed put write back this diff.
     match context_switched(kaish, context_id, on_context_switch) {
         Some(new_context_id) => {
             tracing::info!(
@@ -393,45 +176,28 @@ pub async fn run_into_blocks(
                 context_id,
                 new_context_id
             );
-            block_flows.publish(crate::flows::BlockFlow::ContextSwitched {
+            kernel.block_flows().publish(crate::flows::BlockFlow::ContextSwitched {
                 context_id: new_context_id,
             });
         }
         None => {
             let state_after = snapshot_shell_state(kaish).await;
-            if let Err(error) = persist_shell_state(kernel_db, context_id, &state_before, &state_after) {
+            if let Err(error) = persist_shell_state(kernel.kernel_db(), context_id, &state_before, &state_after) {
                 tracing::error!("shell state write failed: {error}");
-                let _ = documents.set_stderr(context_id, output_block_id, Some(error));
-                final_status = Status::Error;
+                outcome.settlement_error = Some(error);
             }
         }
     }
 
-    // Terminal publication follows hooks and durable shell state. Observers
-    // may submit the next command as soon as they see either block settle.
-    for block in [output_block_id, command_block_id] {
-        if let Err(error) = documents.set_status(context_id, block, final_status) {
-            tracing::error!("Failed to settle shell block: {error}");
-        }
-    }
+    outcome.elapsed_ms = started.elapsed().as_millis() as u64;
+    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
     if let Some((manager, job, sender)) = tracked_job {
-        let result = match documents.get_block_snapshot(context_id, output_block_id) {
-            Ok(Some(block)) => {
-                let mut result = kaish_kernel::interpreter::ExecResult::success(block.content);
-                result.err = block.stderr.unwrap_or_default();
-                result.code = block.exit_code.map(i64::from)
-                    .unwrap_or(if block.status == Status::Error { 1 } else { 0 });
-                result
-            }
-            Ok(None) => kaish_kernel::interpreter::ExecResult::failure(1, "shell output block is missing"),
-            Err(error) => kaish_kernel::interpreter::ExecResult::failure(1, error.to_string()),
-        };
+        if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
+        let result = outcome.job_result();
         manager.finalize_streams(job, &result).await;
         let _ = sender.send(result);
     }
-    if let Err(error) = complete_operation_from_blocks(kernel, context_id, output_block_id) {
-        tracing::error!("could not complete shell operation: {error}");
-    }
+    settled
 }
 
 #[cfg(test)]
@@ -485,7 +251,7 @@ mod fill_tests {
             let call_ctx = crate::mcp::CallContext::new(
                 PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
             let run = run_into_blocks(&kaish, code, None, ctx, &command, &output,
-                &documents, kernel.block_flows(), kernel.kernel_db(), &kernel, &call_ctx, None);
+                &kernel, &call_ctx, None);
             let observe = async {
                 tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await.unwrap();
                 let command_status = documents.get_block_snapshot(ctx, &command).unwrap().unwrap().status;
@@ -493,12 +259,145 @@ mod fill_tests {
                 release.notify_one();
                 (command_status, output_status)
             };
-            let (_, statuses) = tokio::join!(run, observe);
+            let (settled, statuses) = tokio::join!(run, observe);
+            settled.unwrap();
             assert_eq!(statuses, (Status::Running, Status::Running), "{code}: hook result is not final yet");
             let final_output = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
             assert_eq!(final_output.status, Status::Done);
             assert_eq!(final_output.content, "synthetic output");
         }
+    }
+
+    #[tokio::test]
+    async fn replacement_clears_command_metadata_in_every_projection() {
+        use crate::mcp::{HookAction, HookEntry, HookId, KernelToolResult, ToolContent};
+        let kernel = Arc::new(Kernel::new_ephemeral("replacement-projections").await);
+        let documents = kernel.blocks().clone();
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "waiting", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            command, output, "echo warning >&2; false", None).unwrap();
+        let payload = serde_json::json!({"replacement": true});
+        kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("replace".into()), match_instance: None, match_tool: None,
+            match_context: None, match_principal: None, priority: 0, kaish_script_id: None,
+            action: HookAction::ShortCircuit(KernelToolResult {
+                is_error: false,
+                content: vec![ToolContent::Text("replacement".into()), ToolContent::Json(payload.clone())],
+                structured: Some(payload.clone()),
+            }),
+        });
+        let kaish = EmbeddedKaish::new("replacement-projections", documents.clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(ctx);
+        run_into_blocks(&kaish, "echo warning >&2; false", None, ctx, &command, &output,
+            &kernel,
+            &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), None).await.unwrap();
+        let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
+        assert_eq!(block.status, Status::Done);
+        assert_eq!(block.exit_code, None, "a replacement has no command exit code");
+        assert!(block.stderr.is_none(), "the replaced command's diagnostic must not leak");
+        assert_eq!(block.content, "replacement\n{\"replacement\":true}");
+        assert_eq!(block.output.unwrap().rich_json, Some(payload.clone()));
+        let state = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap();
+        let raw_outcome = kernel.shell_operations().outcome(&receipt.operation_id, ctx).unwrap().unwrap();
+        let CommandExecution::Completed(raw) = &raw_outcome.execution else { panic!("missing raw command") };
+        assert_eq!(raw.code, 1);
+        assert_eq!(raw.err, "warning\n");
+        let jobs = kernel.context_job_manager(ctx);
+        let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+        let job_result = jobs.wait(job.id).await.unwrap();
+        assert_eq!(job_result.code, 0);
+        assert_eq!(job_result.data, Some(kaish_kernel::ast::Value::Json(payload.clone())));
+        assert!(job_result.err.is_empty());
+        let envelope = state.envelope.unwrap();
+        assert!(!envelope.is_error());
+        assert_eq!(envelope.exit_code, None);
+        assert_eq!(envelope.data, Some(payload));
+        assert_eq!(envelope.stdout, block.content);
+        assert!(envelope.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn real_nonzero_exits_are_errors_in_blocks_and_receipts() {
+        for exit in [2, 3] {
+            let kernel = Arc::new(Kernel::new_ephemeral("real-exit").await);
+            let documents = kernel.blocks().clone();
+            let ctx = ContextId::new();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+            let output = documents.insert_tool_result(ctx, &command, Some(&command), "waiting", false, None, None).unwrap();
+            let code = format!("exit {exit}");
+            let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+                command, output, &code, None).unwrap();
+            let kaish = EmbeddedKaish::new("real-exit", documents.clone(), kernel.clone(), None).unwrap();
+            kaish.set_context_id(ctx);
+            run_into_blocks(&kaish, &code, None, ctx, &command, &output,
+                &kernel,
+                &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), None).await.unwrap();
+            let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
+            assert_eq!(block.status, Status::Error, "exit {exit} is a command failure");
+            let envelope = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap();
+            assert!(envelope.is_error());
+            assert_eq!(envelope.exit_code, Some(exit));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_receipt_commit_keeps_blocks_running_until_settlement_retries() {
+        let kernel = Arc::new(Kernel::new_ephemeral("receipt-commit-failure").await);
+        let documents = kernel.blocks();
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "waiting", false, None, None).unwrap();
+        for block in [&command, &output] { documents.set_status(ctx, block, Status::Running).unwrap(); }
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            command, output, "echo executed-once", None).unwrap();
+        let outcome = CommandOutcome::new(CommandExecution::Completed(
+            kaish_kernel::interpreter::ExecResult::success("executed-once")), 3);
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_completion BEFORE UPDATE OF completed_at ON shell_operations BEGIN
+             SELECT RAISE(ABORT, 'receipt write failed'); END;"
+        ).unwrap();
+        let error = settle_outcome(&kernel, ctx, &command, &output, &outcome).unwrap_err();
+        assert!(error.contains("receipt write failed"));
+        for block in [&command, &output] {
+            assert_eq!(documents.get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Running);
+        }
+        assert!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().completed_at.is_none());
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_completion;").unwrap();
+        settle_outcome(&kernel, ctx, &command, &output, &outcome).unwrap();
+        settle_outcome(&kernel, ctx, &command, &output, &outcome).unwrap();
+        assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Done);
+        assert_eq!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap().stdout, "executed-once");
+    }
+
+    #[tokio::test]
+    async fn rejected_program_clears_waiting_text_and_preserves_rejection() {
+        let kernel = Arc::new(Kernel::new_ephemeral("rejected-command").await);
+        let documents = kernel.blocks().clone();
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "waiting placeholder", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            command, output, "echo '", None).unwrap();
+        let kaish = EmbeddedKaish::new("rejected-command", documents.clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(ctx);
+        run_into_blocks(&kaish, "echo '", None, ctx, &command, &output, &kernel,
+            &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), None).await.unwrap();
+        let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
+        assert_eq!(block.status, Status::Error);
+        assert!(block.content.is_empty());
+        assert!(block.stderr.is_some());
+        assert_eq!(block.exit_code, None);
+        let envelope = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap();
+        assert_eq!(envelope.status, kaijutsu_types::shell_envelope::ShellStatus::Rejected);
+        assert_eq!(envelope.exit_code, None);
+        assert!(matches!(kernel.shell_operations().outcome(&receipt.operation_id, ctx).unwrap().unwrap().execution,
+            CommandExecution::Rejected(_)));
     }
 
     /// An approved ask fills the pair the gate left `Waiting`. That result
@@ -532,16 +431,13 @@ mod fill_tests {
             ctx,
             &call,
             &result,
-            &documents,
-            kernel.block_flows(),
-            kernel.kernel_db(),
             &kernel,
             &crate::mcp::CallContext::new(
                 PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id(),
             ),
             None,
         )
-        .await;
+        .await.unwrap();
 
         let filled = documents
             .get_block_snapshot(ctx, &result)

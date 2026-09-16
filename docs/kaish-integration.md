@@ -67,11 +67,16 @@ These are source observations, not promises that all paths behave alike.
   values in one transaction. Failed writes roll back and reach the caller.
   Interactive and structured `kj` block completion now waits for result hooks;
   paused-hook regressions cover runtime execution and the SSH/RPC surface.
-- Settlement remains incomplete: command execution still reconstructs receipts
-  and jobs from blocks; MCP asynchronous completion still has a separate
-  projection path. Synthetic replacements need coherent metadata and raw-outcome
-  retention, and streaming RPC still cannot honor all hook verdicts. Moving
-  these owners is a migration step, not completion of the shared outcome contract.
+- `runtime/command_outcome.rs` retains raw execution, a hook replacement or
+  refusal, elapsed time, and shell-state write failures. Interactive and approved
+  commands project blocks, receipts, and jobs from it; block reconstruction is
+  deleted. Terminal receipts commit the execution record and effective envelope
+  together before terminal block publication. Raw records are read separately
+  from ordinary receipt polls, so a poll does not duplicate captured output.
+- Settlement remains incomplete: structured/streaming RPC and MCP completion
+  still have separate projection paths. Their replacements need the same metadata
+  policy, and streaming RPC still cannot honor all hook verdicts. Persistence
+  recovery and result-hook approval waits also need the audit below.
 - `background_exec.rs` was removed in `8ea04fdf`. Asynchronous shell programs
   use kaish's job system with durable Kaijutsu receipts. Earlier notes claiming
   that a temporary shell cannot host work that outlives it are obsolete.
@@ -129,7 +134,20 @@ truncation, structured data, content type, and spill references distinguishable.
 Do not invent a command exit code for a synthetic hook result. Publish terminal
 completion only after required hook processing and durable state write-back.
 Build block, receipt, and job projections from that outcome; do not rebuild the
-outcome by reading a partially settled block.
+outcome by reading a partially settled block. Kaish's job control requires an
+integer: unmodified execution retains its complete `ExecResult`, including its
+spill control code. A synthetic job result uses 0/1 and `kaijutsu.synthetic`
+baggage; its public envelope has no physical exit code. Real command exits 2
+and 3 are errors, just like other nonzero exits; an output-limit remap is judged
+by the retained original exit.
+
+Interactive settlement returns projection failures explicitly and commits its
+receipt before publishing terminal blocks. Retrying `settle_outcome` with the
+same outcome does not rerun the command. The remaining recovery audit must wire
+this into accepted-operation handling: a failure before receipt commit leaves
+an unfinished operation; a failure after commit leaves a durable outcome whose
+block projection needs repair. Result-hook asks also need durable retention of
+what already ran without treating approval as permission to rerun it.
 
 Preserve the distinction between parse/validation rejection (nothing ran) and
 an execution fault. Persistence failure must be visible and must not report a

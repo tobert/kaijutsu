@@ -56,3 +56,54 @@ fn structured_kj_blocks_wait_for_post_call() {
         assert_eq!(final_statuses, vec![Status::Done, Status::Done]);
     });
 }
+
+#[test]
+fn interactive_hook_replacements_agree_with_durable_receipts() {
+    run_local(async {
+        use kaijutsu_kernel::mcp::KernelToolResult;
+        use kaijutsu_kernel::runtime::command_outcome::CommandExecution;
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let contexts = kj.list_contexts().await.unwrap();
+        let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        kj.join_context(context, "settlement-test").await.unwrap();
+        for pre_call in [true, false] {
+            let mut hooks = kernel.kernel.broker().hooks().write().await;
+            hooks.pre_call.entries.clear();
+            hooks.post_call.entries.clear();
+            let table = if pre_call { &mut hooks.pre_call } else { &mut hooks.post_call };
+            table.entries.push(HookEntry {
+                id: HookId("replace-command".into()), match_instance: None, match_tool: None,
+                match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::ShortCircuit(KernelToolResult::text("replacement")),
+            });
+            drop(hooks);
+            let submission = kj.shell_submit("false", context, true).await.unwrap();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let blocks = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+                    if let Some(output) = blocks.into_iter().find(|block| {
+                        block.kind == kaijutsu_types::BlockKind::ToolResult
+                            && block.tool_call_id == Some(submission.command_block_id)
+                            && matches!(block.status, Status::Done | Status::Error)
+                    }) { break output; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            assert_eq!(output.status, Status::Done);
+            assert_eq!(output.content, "replacement");
+            assert_eq!(output.exit_code, None);
+            let state = kernel.kernel.shell_operations().get(&submission.operation_id, context).unwrap().unwrap();
+            let envelope = state.envelope.expect("terminal block implies committed receipt");
+            assert!(!envelope.is_error());
+            assert_eq!(envelope.exit_code, None);
+            assert_eq!(envelope.stdout, output.content);
+            match kernel.kernel.shell_operations().outcome(&submission.operation_id, context).unwrap().unwrap().execution {
+                CommandExecution::NotRun if pre_call => {}
+                CommandExecution::Completed(result) if !pre_call => assert_eq!(result.code, 1),
+                other => panic!("unexpected execution record: {other:?}"),
+            }
+        }
+    });
+}

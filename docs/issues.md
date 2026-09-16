@@ -78,12 +78,23 @@ shell-state persistence moved out of RPC too. Paused PostCall/OnError tests pin
 terminal publication after hooks, including a structured-kj SSH/RPC regression.
 Cwd/export changes now commit together and failed writes are returned.
 
-Still pending in settlement: `complete_operation_from_blocks` loses raw result
-facts; hook replacements retain stale exit/data/stderr metadata; block writes
-can still log errors and continue; MCP async completion projects independently
-and its broker hook timing needs reconciliation with job completion. Streaming
-RPC still logs unhandled hook verdicts. Preserve the complete shared-outcome
-contract while replacing these paths, not just their locations.
+Interactive/approved settlement now retains raw execution and hook effects in
+`CommandOutcome`, projects blocks/receipts/jobs from it, and deletes
+`complete_operation_from_blocks`. Replacements clear obsolete metadata and have
+no physical exit. Real exits 2/3 are errors. Receipt and outcome commit together
+before terminal block publication; failed writes return errors.
+
+Still pending: structured RPC replacements retain stale metadata; MCP async
+completion projects independently and its broker hook timing needs reconciliation
+with job completion. Streaming RPC still logs unhandled hook verdicts. Wire
+persistence recovery into callers: before receipt commit an operation remains
+unfinished, and after commit a failed block projection must be repaired from the
+retained outcome without rerunning execution. `settle_outcome` supports an
+idempotent retry, but background interactive failures currently log the error
+and approval resumes report it to the model. Result-hook approval waits must
+retain the executed outcome and resume publication, not rerun the command; their
+job status and durable record still need that distinction. Preserve this complete
+shared-outcome contract while replacing the remaining paths.
 
 The new SSH/RPC regression passes but can print a russh teardown panic after
 its assertions (`there is no reactor running`). The common test helper drops
