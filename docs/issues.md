@@ -74,8 +74,7 @@ external-edit regressions from `docs/file-buffers.md`; only then remove clean
 read materialization. This remains a separate design change.
 
 **Order:** runtime settlement, shared recovery, rendering, then file-buffer
-persistence. Feed callback recovery and shell draft consumption are tracked
-below. Each requires its own reviewable change; the source TODOs point to
+persistence. Shell draft consumption is tracked below. Each requires its own reviewable change; the source TODOs point to
 these entries.
 
 ### Kernel architecture overview needs a refresh
@@ -2297,14 +2296,6 @@ shipped. Still open, all verified against current code:
   a re-shape within a frame or two.
 - **Backgrounds/underlines bake color into vertices** — `ShapeKey::
   baked_theme_epoch` exists for exactly this reason.
-
-## Change-feed callback failures must end the feed
-
-`server/context_feed.rs::deliver` clears its batch before awaiting the observer.
-A refused or timed-out callback returns `Ok(None)` and the feed continues with
-later events. The observer may never have accepted the skipped delivery; an
-append-only gap can look like valid text. End the feed and force resubscribe /
-snapshot recovery on either outcome, with regressions for refusal and timeout.
 
 ## Shell submission can clear a newer draft
 

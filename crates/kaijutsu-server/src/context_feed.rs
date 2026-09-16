@@ -158,8 +158,8 @@ fn append_message(batch: &mut Vec<BlockFlow>, complete: &mut usize, message: Flo
 }
 
 /// Build and send one delivery. Returns the version the observer was brought
-/// to, or `None` when nothing in the batch belonged on this feed or the
-/// observer refused the call.
+/// to, or `None` when nothing in the batch belonged on this feed. A refused
+/// or timed-out callback ends the feed because acceptance is unknown.
 async fn deliver(
     observer: &context_observer::Client,
     context_id: ContextId,
@@ -201,20 +201,18 @@ async fn deliver(
     }
     batch.clear();
 
-    // TODO: End the feed on callback refusal or timeout. See docs/issues.md,
-    // "Change-feed callback failures must end the feed".
     match tokio::time::timeout(FEED_CALLBACK_TIMEOUT, req.send().promise).await {
         Ok(Ok(_)) => Ok(Some(version)),
         Ok(Err(e)) => {
             tracing::debug!(kernel = %kernel_id, error = %e, "context feed delivery refused");
-            Ok(None)
+            Err(FeedFault::CallbackRefused)
         }
         Err(_) => {
             tracing::warn!(
                 kernel = %kernel_id,
                 "context feed delivery timed out after {FEED_CALLBACK_TIMEOUT:?}"
             );
-            Ok(None)
+            Err(FeedFault::CallbackTimeout)
         }
     }
 }
@@ -224,13 +222,15 @@ async fn deliver(
 enum FeedFault {
     VersionOrder,
     IncompleteGroup,
+    CallbackRefused,
+    CallbackTimeout,
 }
 
 /// End the feed because the server cannot deliver a correct stream.
 ///
-/// Distinct from the slow-subscriber path below: nothing is wrong with the
-/// client here. It is told so, and recovers exactly the same way — refetch a
-/// snapshot and start again.
+/// Stream order or callback acceptance is uncertain. The client must
+/// resubscribe and refetch a snapshot; replaying an uncertain append could
+/// apply it twice.
 async fn terminate_fault(
     observer: &context_observer::Client,
     delivered_version: u64,
@@ -242,7 +242,7 @@ async fn terminate_fault(
         kernel = %kernel_id,
         ?fault,
         delivered_version,
-        "context feed ending on a server-side fault; the client will refetch"
+        "context feed ending on a delivery fault; the client will refetch"
     );
     let mut req = observer.on_terminated_request();
     {
@@ -433,6 +433,91 @@ mod tests {
     use super::*;
     use kaijutsu_types::{BlockId, ContextId, PrincipalId, ProvenanceTag, StyleAttrs, StyleColor,
         StyleSpan};
+
+    struct FailingObserver {
+        timeout: bool,
+        notice_timeout: bool,
+        deliveries: tokio::sync::mpsc::UnboundedSender<u64>,
+        terminations: tokio::sync::mpsc::UnboundedSender<(crate::kaijutsu_capnp::SubscriptionEndReason, u64)>,
+    }
+
+    impl context_observer::Server for FailingObserver {
+        fn on_context_changed(
+            self: std::rc::Rc<Self>,
+            params: context_observer::OnContextChangedParams,
+            _results: context_observer::OnContextChangedResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            let version = params.get().unwrap().get_version();
+            self.deliveries.send(version).unwrap();
+            if version != 2 {
+                capnp::capability::Promise::ok(())
+            } else if self.timeout {
+                capnp::capability::Promise::from_future(std::future::pending())
+            } else {
+                capnp::capability::Promise::err(capnp::Error::failed("delivery refused".into()))
+            }
+        }
+
+        fn on_terminated(
+            self: std::rc::Rc<Self>,
+            params: context_observer::OnTerminatedParams,
+            _results: context_observer::OnTerminatedResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            let p = params.get().unwrap();
+            self.terminations.send((p.get_reason().unwrap(), p.get_delivered_version())).unwrap();
+            if self.notice_timeout {
+                capnp::capability::Promise::from_future(std::future::pending())
+            } else {
+                capnp::capability::Promise::err(capnp::Error::failed("notice refused".into()))
+            }
+        }
+    }
+
+    async fn callback_failure_ends_feed(timeout: bool, notice_timeout: bool) {
+        use kaijutsu_kernel::flows::{FlowBus, OpSource};
+
+        tokio::task::LocalSet::new().run_until(async {
+            let ctx = ContextId::new();
+            let id = BlockId::new(ctx, PrincipalId::new(), 1);
+            let bus = FlowBus::new(8);
+            let sub = bus.subscribe("block.>");
+            let publish = |version| bus.publish(BlockFlow::TextAppended {
+                context_id: ctx, block_id: id, suffix: "x".into(), version, source: OpSource::Local,
+            });
+            let (deliveries, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (terminations, mut ended) = tokio::sync::mpsc::unbounded_channel();
+            let observer = capnp_rpc::new_client(FailingObserver {
+                timeout, notice_timeout, deliveries, terminations,
+            });
+            let disconnect = CancellationToken::new();
+            let feed = tokio::task::spawn_local(run_context_feed(
+                observer, ctx, sub, KernelId::new(), CancellationToken::new(), disconnect.clone(),
+            ));
+            publish(1);
+            assert_eq!(rx.recv().await, Some(1));
+            publish(2);
+            assert_eq!(rx.recv().await, Some(2));
+            publish(3);
+            tokio::time::timeout(FEED_CALLBACK_TIMEOUT + Duration::from_secs(2), feed).await
+                .expect("a failed callback must end the feed, even if its termination notice fails")
+                .unwrap();
+            assert!(disconnect.is_cancelled(), "disconnect forces snapshot recovery");
+            assert_eq!(ended.recv().await, Some((
+                crate::kaijutsu_capnp::SubscriptionEndReason::InternalFault, 1,
+            )), "only acknowledged deliveries advance the recovery version");
+            assert_eq!(rx.recv().await, None, "no later append may cross a failed delivery");
+        }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_callback_ends_feed() {
+        callback_failure_ends_feed(false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_callback_ends_feed() {
+        callback_failure_ends_feed(true, true).await;
+    }
 
     #[tokio::test(start_paused = true)]
     async fn draft_submission_stays_complete_at_the_delivery_limit() {

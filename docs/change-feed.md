@@ -91,6 +91,11 @@ inversion ends the feed. A client accepts equal versions within a delivery,
 above the previous delivery's version, and rejects repeats across deliveries.
 Snapshot overlap skips all events of a mutation the snapshot already contains.
 
+A refused callback or a callback unanswered for 30 seconds ends the feed. The
+server sends a best-effort termination notice with the last acknowledged
+version, waits at most one second, then disconnects. The client resubscribes
+and fetches a snapshot; retrying an uncertain append could apply it twice.
+
 ## Normative rules
 
 Rules use Simplified-Technical-English style. One rule is one sentence. Each term

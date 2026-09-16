@@ -1437,8 +1437,14 @@ A batch-limit regression reproduced a split draft submission, then exposed the
 client mirror's assumption that every event had a distinct version. The mirror
 now accepts equal versions inside one delivery while rejecting duplicates
 across deliveries. Separate output and status mutations remain ordered separate
-acceptances; batching never made them one transaction. Callback-failure recovery
-and shell submission's async draft consumption remain tracked follow-ups.
+acceptances; batching never made them one transaction.
+
+A refused or timed-out feed callback now ends the feed and disconnects for
+snapshot recovery. Only acknowledged deliveries advance the reported version;
+an uncertain append cannot be retried safely. Both regressions first reproduced
+a feed that kept running after failure. They also check that a refused or hung
+termination notice cannot prevent disconnect. Shell submission's async draft
+consumption remains a tracked follow-up.
 
 ## The kernel with no one to answer to (September 16)
 
