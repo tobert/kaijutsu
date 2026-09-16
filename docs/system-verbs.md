@@ -238,7 +238,7 @@ lack `ps`; without the shadow a coder would get kaish's **host** process
 table, which is strictly worse than getting ours. For a narrow seat the
 shadow should render a refusal that names the alternative (drift a
 question) rather than the roster. The `privileged` flag already threaded
-through `kj/context_shell.rs` is the switch.
+through `runtime/context_shell.rs` is the switch.
 
 ## Settled while building
 

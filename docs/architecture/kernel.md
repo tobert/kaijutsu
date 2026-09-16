@@ -154,12 +154,15 @@ and the context's shared JobManager. Foreground and background execution
 methods both propagate tracing. Background work can outlive the shell that
 started it.
 
-`kj/context_shell.rs` supplies the shared context-shell factory used by
+`runtime/context_shell.rs` supplies `EmbeddedKaish::for_context`, used by
 interactive commands, model shells, rc, hooks, and editor reads. Each invocation
 gets a fresh session map, explicit identity, registered Kaijutsu builtins, and
 restored durable environment/cwd. Restoration checks the backend namespace.
 Read-only shells refuse filesystem mutation and host subprocess execution by
-construction. Output profile and rc authority are separate choices.
+construction. `ShellIdentity` carries requester, performer, reviewer, session,
+and context; `ShellPolicy` selects the execution profile. Rc policy requires
+authority supplied by lifecycle orchestration. Missing dispatcher registration
+fails construction.
 
 Rc, hook, and editor callers interpret their own results. Interactive commands
 and approval resume share server `shell_run.rs`; MCP shell completion has a

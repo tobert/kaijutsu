@@ -12,6 +12,8 @@
 //! ResourceUpdated → `BlockKind::Resource` (Phase 3), elicitation live
 //! handling (§9, D-25), tool search / late injection (Phase 5).
 
+use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
+use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
@@ -2547,17 +2549,17 @@ impl Broker {
                 );
             }
         };
-        let kaish = match dispatcher
-            .materialize_context_kaish_internal_as(
-                "hook",
-                ctx.principal_id,
-                ctx.actor_id,
-                ctx.reviewer_id,
-                ctx.context_id,
-                kaijutsu_types::SessionId::new(),
-                None,
-                Arc::new(crate::kj::lifecycle::NoopBlockSource),
-            )
+        let kaish = match EmbeddedKaish::for_context(
+            &dispatcher,
+            "hook",
+            ShellIdentity {
+                requester: ctx.principal_id, performer: ctx.actor_id, reviewer: ctx.reviewer_id,
+                context: ctx.context_id, session: kaijutsu_types::SessionId::new(),
+            },
+            ShellPolicy::Internal,
+            None,
+            Arc::new(crate::runtime::synthesis::NoopBlockSource),
+        )
             .await
         {
             Ok(k) => k,
@@ -8826,21 +8828,20 @@ mod tests {
             .await
             .unwrap();
 
-        // `materialize_context_kaish_rc`, not `_internal` — `kj hook add` is
-        // gated on `Capability::ConfigWrite` unless the caller is
-        // privileged, and the ONLY privileged path is rc's own
-        // materialization (see that method's doc). This mirrors how the
-        // real seed actually runs (`run_rc_lifecycle`'s own rc kaish), not
-        // a hook body's unprivileged shell.
-        let kaish = kj
-            .materialize_context_kaish_rc(
-                "rc",
-                PrincipalId::new(),
-                kaijutsu_types::ContextId::new(),
-                kaijutsu_types::SessionId::new(),
-                None,
-                Arc::new(crate::kj::lifecycle::NoopBlockSource),
-            )
+        // Seed installation uses lifecycle authority to configure hooks;
+        // ordinary hook bodies use the Internal execution policy.
+        let principal = PrincipalId::new();
+        let kaish = EmbeddedKaish::for_context(
+            &kj,
+            "rc",
+            ShellIdentity {
+                requester: principal, performer: principal, reviewer: None,
+                context: kaijutsu_types::ContextId::new(), session: kaijutsu_types::SessionId::new(),
+            },
+            ShellPolicy::Rc(crate::kj::lifecycle::RcAuthority::for_test()),
+            None,
+            Arc::new(crate::runtime::synthesis::NoopBlockSource),
+        )
             .await
             .expect("materialize kaish for installing the seed script");
         let install = kaish

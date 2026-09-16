@@ -58,6 +58,7 @@
 
 #![allow(refining_impl_trait)]
 
+use kaijutsu_kernel::runtime::context_shell::{ShellIdentity, ShellPolicy};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -1090,18 +1091,17 @@ async fn act_on_executable_answer(
     // keyed by it.
     let session_id = SessionId::new();
     let name = format!("{}-gate-{}", kernel.name, session_id.short());
-    let kaish = match kernel
-        .kj_dispatcher
-        .materialize_context_kaish_as(
-            &name,
-            principal_id,
-            ask.actor,
-            Some(ask.reviewer),
-            context_id,
-            session_id,
-            kernel.kj_dispatcher.semantic_index(),
-            kernel.kj_dispatcher.block_source(),
-        )
+    let kaish = match EmbeddedKaish::for_context(
+        &kernel.kj_dispatcher,
+        &name,
+        ShellIdentity {
+            requester: principal_id, performer: ask.actor, reviewer: Some(ask.reviewer),
+            context: context_id, session: session_id,
+        },
+        ShellPolicy::Agent,
+        kernel.kj_dispatcher.semantic_index(),
+        kernel.kj_dispatcher.block_source(),
+    )
         .await
     {
         Ok(kaish) => kaish,
@@ -9694,19 +9694,18 @@ async fn materialize_context_shell_for(
     // off the dispatcher (the server installs the index there at bootstrap via
     // `set_semantic_index`), the same accessors the in-kernel model shell uses.
     // `dispatcher.semantic_index()` mirrors `kernel.semantic_index` — installed
-    // from the same Arc — so the human and model shells can never drift apart.
-    kernel
-        .kj_dispatcher
-        .materialize_context_kaish_as(
-            &name,
-            principal,
-            principal,
-            reviewer,
-            context_id,
-            session_id,
-            kernel.kj_dispatcher.semantic_index(),
-            kernel.kj_dispatcher.block_source(),
-        )
+    // from the same Arc — so human and model shells use the same source.
+    EmbeddedKaish::for_context(
+        &kernel.kj_dispatcher,
+        &name,
+        ShellIdentity {
+            requester: principal, performer: principal, reviewer: reviewer,
+            context: context_id, session: session_id,
+        },
+        ShellPolicy::Agent,
+        kernel.kj_dispatcher.semantic_index(),
+        kernel.kj_dispatcher.block_source(),
+    )
         .await
         .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))
 }

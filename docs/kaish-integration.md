@@ -1,7 +1,8 @@
 # Kaish integration and rc lifecycle
 
-Status: migration plan. The current implementation is described below; the
-migration steps are not implemented by this document.
+Status: migration in progress. Contextual construction has moved into runtime;
+rc separation, instruction loading, command settlement, and turn ownership
+remain open. The inventory distinguishes completed and pending work.
 
 Amy's objective: "*completely* migrate kaijutsu and clean up all the call
 sites." Completion includes deleting superseded entry points and correcting
@@ -36,8 +37,7 @@ chain or dispatch nested work onto a worker that is waiting for itself.
 
 ## Current implementation
 
-The baseline is `19c4deac`. These are source observations, not promises that
-all paths already behave alike.
+These are source observations, not promises that all paths behave alike.
 
 - `src/lib.rs::spawn_kaish_thread` reserves the 16 MiB stack for dedicated
   threads that can enter kaish. The server's Tokio runtime also reserves it.
@@ -46,10 +46,13 @@ all paths already behave alike.
 - `runtime/embedded_kaish.rs::EmbeddedKaish` wraps the kaish kernel. Its common
   constructor wires mounts, the kernel's file cache, per-context JobManager,
   output limits, host execution policy, HOME/PATH, and trace propagation.
-- `kj/context_shell.rs::materialize_context_kaish_*` supplies context identity,
-  builtins, environment, and cwd. Eight public variants select four profiles
-  with default or explicit performer identity; they share one construction
-  body. The factory's placement under `kj` hides its wider set of consumers.
+- `runtime/context_shell.rs` implements `EmbeddedKaish::for_context` with
+  explicit `ShellIdentity` and `ShellPolicy`. It supplies builtins, environment,
+  and cwd for every production caller. The eight dispatcher factory methods
+  are deleted. Rc policy requires `RcAuthority`, constructed only by lifecycle
+  orchestration. Missing dispatcher registration fails construction.
+- `runtime/synthesis.rs` owns the block-source adapters used by contextual
+  shells; hooks no longer depend on rc for synthesis wiring.
 - `kj/lifecycle.rs` owns rc loading, ordering, variables, recursion, run
   records, `.md` block creation, and `.kai` execution.
 - Server `shell_run.rs` shares execution between interactive commands and
@@ -70,7 +73,7 @@ remove the obsolete API in the same change as its final caller.
 
 | State | Caller or mechanism | Current location | Contract to retain |
 |---|---|---|---|
-| Pending | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `kj/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
+| Migrated | Shell construction and builtin wiring | `runtime/embedded_kaish.rs`, `runtime/context_shell.rs` | One construction owner; structural read-only policy; explicit requester, performer, reviewer, session, and context |
 | Pending | Dedicated threads and startup runtime | kernel `lib.rs`; server `main.rs`, `ssh.rs`, `beat.rs`, turn/resume drivers | Stack reservation, cancellation/shutdown, re-entry, and `!Send` RPC placement |
 | Pending | Interactive shell submission | server `rpc.rs::execute_shell_command`, `shell_run.rs` | Draft revision consumption, command/output pair, identity, hooks, cwd/export write-back, context-switch notification |
 | Pending | Streaming execute RPC | server `rpc.rs::execute` | Execution IDs, connection cancellation and concurrency rules, output subscriptions; resolve its unsupported hook substitution explicitly |
@@ -190,11 +193,11 @@ adapters must have a named deletion step and must not become permanent aliases.
 1. **Document the boundary and inventory.** This document, architecture
    summaries, rc/prompt contracts, and the live issue plan agree about current
    behavior and the intended destination.
-2. **Consolidate construction.** Move contextual construction into runtime
-   ownership; introduce explicit invocation identity and named policies.
-   Migrate all factory callers and remove the `materialize_context_kaish_*`
-   family after the final caller moves. Preserve existing backend and builtin
-   interfaces. Keep rc authority restricted to its lifecycle caller.
+2. **Consolidate construction (implemented).** Contextual construction belongs
+   to runtime, with explicit invocation identity and named policies.
+   All factory callers now use `EmbeddedKaish::for_context`; the
+   `materialize_context_kaish_*` family is deleted. Backend and builtin
+   interfaces are preserved. Rc authority belongs to its lifecycle caller.
 3. **Separate rc orchestration.** Give lifecycle discovery, execution records,
    recursion, and error/trace emission a clear module owner adjacent to runtime.
    `kj rc` remains an administration adapter. Migrate every lifecycle caller.
@@ -238,11 +241,11 @@ As each file moves, replace historical narratives and stale rollout comments
 with the current invariant, responsible owner, and a contract link where
 needed. Move useful decisions into `docs/devlog.md`; delete comments about
 removed mechanisms. Check adjacent comments and module docs, not only changed
-lines. Known examples include `lifecycle.rs` claiming attach/drift are reserved
-and bodies use `FileDocumentCache`, and `embedded_kaish.rs` describing a global
-session map, the retired `read_only_shell` name, and an `input_fs` mount that no
-longer exists. Verify the surrounding contract before rewriting those comments.
-Do not run a formatting sweep.
+lines. The construction migration corrected lifecycle verb/body-loading docs,
+invocation-local session tracking, retired tool names, removed mounts, and
+output-limit descriptions. Continue auditing each owner as it moves. Verify
+the surrounding contract before rewriting comments. Do not run a formatting
+sweep.
 
 The migration is complete when all inventory rows are resolved, superseded
 APIs have no remaining callers and are deleted, supported entry paths use the

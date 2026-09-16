@@ -194,7 +194,8 @@ mod tests {
     /// `gotcha_kaish_test_eq`).
     #[tokio::test]
     async fn attach_kai_script_sees_overlay_vars() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("watched"), None, principal);
         set_context_type(&d, target, "watched");

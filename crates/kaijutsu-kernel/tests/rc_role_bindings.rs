@@ -82,7 +82,7 @@ async fn harness() -> Harness {
 /// `create` lifecycle, and return the new context id.
 async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_types::ContextId {
     // Unprivileged caller: the rc create lifecycle assigns the loadout via its
-    // own privileged kaish (materialize_context_kaish_rc), not this caller.
+    // own privileged kaish (EmbeddedKaish::for_context), not this caller.
     let caller = KjCaller {
         principal_id: h.creator,
         actor_id: h.creator,

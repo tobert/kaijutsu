@@ -126,7 +126,7 @@ of embedded defaults. Keep one owner for each configuration value.
 The host's `/etc` remains a plain read-only host path.
 
 Host execution policy belongs to kaish's `EmbeddedKaish` and its
-`ExternalExec::Allow{path}|Deny` setting in `kj/context_shell.rs`. MCP stdio
+`ExternalExec::Allow{path}|Deny` setting in `runtime/context_shell.rs`. MCP stdio
 server launch through `rmcp` is the sanctioned config-driven exception.
 A new `Command::new` or `/bin/sh -c` execution path needs a design conversation;
 asynchronous shell work uses kaish jobs and durable Kaijutsu receipts.

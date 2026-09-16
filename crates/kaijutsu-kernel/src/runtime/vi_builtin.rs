@@ -29,14 +29,11 @@ use crate::kj::KjDispatcher;
 /// kaish builtin that opens an editor session via `Kernel::editor_open`.
 ///
 /// Registered once per user-facing name (`vi`, `edit`) so both resolve to the
-/// same behaviour; `name` is the registry key this instance answers to.
+/// same behavior; `name` is the registry key this instance answers to.
 ///
-/// The `opener` (caller principal + context) is captured at **construction**,
-/// not via a `ToolCtx` downcast: the kaish interpreter hands builtins the kaish
-/// `ExecContext`, which carries no kaijutsu principal/context, so a downcast to
-/// our `ExecContext` always missed. `materialize_context_kaish` builds a fresh
-/// instance per invocation with the live `(principal, context_id, session_id)`,
-/// so each `ViBuiltin` already knows who opened it (mirrors `KjBuiltin`).
+/// The opener is captured when `EmbeddedKaish::for_context` constructs the
+/// invocation. Kaish's `ToolCtx` does not carry Kaijutsu principal or context
+/// identity, so editor commands use this captured value.
 pub struct ViBuiltin {
     dispatcher: Arc<KjDispatcher>,
     name: &'static str,

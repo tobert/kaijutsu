@@ -1275,7 +1275,7 @@ rather than inventing a second one.
 instead of `Result<(), String>`: exit 0 continues; exit 3 escalates with the
 stderr tail as the ask description; any other non-zero exit still denies;
 and — the behavior change — a fault running the body at all (no
-`KjDispatcher` wired, `materialize_context_kaish_internal` failing,
+`KjDispatcher` wired, `EmbeddedKaish::for_context` failing,
 `execute_with_options` returning `Err`) ALSO escalates rather than denying.
 `evaluate_phase`'s `HookBody::Kaish` arm routes `Escalate` through
 `self.run_permission_ask` — the exact same call `HookAction::Ask` makes —

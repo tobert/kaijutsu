@@ -2972,9 +2972,16 @@ mod tests {
             &caller,
         ).await;
         assert!(note.is_ok(), "{}", note.message());
-        let shell = d.materialize_context_kaish_rc(
-            "create-operator", caller.principal_id, parent, caller.session_id, None,
-            std::sync::Arc::new(super::super::lifecycle::NoopBlockSource),
+        let shell = crate::runtime::embedded_kaish::EmbeddedKaish::for_context(
+            &d,
+            "create-operator",
+            crate::runtime::context_shell::ShellIdentity {
+                requester: caller.principal_id, performer: caller.principal_id, reviewer: None,
+                context: parent, session: caller.session_id,
+            },
+            crate::runtime::context_shell::ShellPolicy::Rc(crate::kj::lifecycle::RcAuthority::for_test()),
+            None,
+            std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
         ).await.unwrap();
         let result = shell.execute_with_options(
             "kj context create operator --type director --as banto --env 'KJ_CHARACTER=obsolete-name'",
@@ -3039,9 +3046,16 @@ mod tests {
                 && b.content.contains("name-specific-history")).expect("performer's handoff");
             let advice = handoff.content.lines().find(|line| line.trim_start().starts_with("kj handoff note"))
                 .expect("handoff command").trim();
-            let shell = d.materialize_context_kaish_rc(
-                "handoff-advice", caller.principal_id, id, caller.session_id, None,
-                std::sync::Arc::new(super::super::lifecycle::NoopBlockSource),
+            let shell = crate::runtime::embedded_kaish::EmbeddedKaish::for_context(
+                &d,
+                "handoff-advice",
+                crate::runtime::context_shell::ShellIdentity {
+                    requester: caller.principal_id, performer: caller.principal_id, reviewer: None,
+                    context: id, session: caller.session_id,
+                },
+                crate::runtime::context_shell::ShellPolicy::Rc(crate::kj::lifecycle::RcAuthority::for_test()),
+                None,
+                std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
             ).await.unwrap();
             let result = shell.execute_with_options(advice, kaish_kernel::ExecuteOptions::default()).await.unwrap();
             assert!(result.ok(), "name={name}, advice={advice}: {result:?}");

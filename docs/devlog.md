@@ -1477,6 +1477,20 @@ must author a block and verify its content, metadata, and rendered instructions.
 Ordinary companion-file reads also differ from the loader's current snapshot
 of all executable bodies; that choice must stay visible in the migration.
 
+Contextual construction moved from the eight dispatcher factory methods to
+`EmbeddedKaish::for_context` in `runtime/context_shell.rs`. Every caller now
+supplies `ShellIdentity` and a named `ShellPolicy`; rc policy carries authority
+that only lifecycle orchestration can construct. The old module and entry
+points are deleted. Synthesis block-source adapters moved from lifecycle into
+runtime ownership. Adjacent comments now describe current behavior rather than
+retired tool names or rollout history.
+
+Construction no longer silently omits `kj` and editor builtins when dispatcher
+registration is missing. A regression reproduced that fallback before it was
+replaced with an explicit initialization error. Lifecycle test fixtures now wire
+the dispatcher as production does. Rc loading and command settlement retain
+their current behavior for the next migration steps.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

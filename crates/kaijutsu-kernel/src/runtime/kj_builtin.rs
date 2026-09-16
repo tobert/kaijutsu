@@ -813,7 +813,7 @@ mod tests {
     /// dispatcher. Mirrors the rc-lifecycle wiring in `kj/lifecycle.rs`
     /// but without the script-execution scaffolding.
     async fn embedded_with_kj(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
-        embedded_with_index(dispatcher, ctx, None, Arc::new(crate::kj::lifecycle::NoopBlockSource)).await
+        embedded_with_index(dispatcher, ctx, None, Arc::new(crate::runtime::synthesis::NoopBlockSource)).await
     }
 
     async fn embedded_with_index(

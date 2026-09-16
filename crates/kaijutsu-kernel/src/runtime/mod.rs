@@ -1,22 +1,12 @@
-//! Embedded scripting runtime.
+//! Shared kaish integration for command, lifecycle, hook, and editor consumers.
 //!
-//! Hosts the kaish executor, the kaish↔kernel backends, and the per-session
-//! context registry. Lives in `kaijutsu-kernel` (not `kaijutsu-server`) so the
-//! kernel can run kaish scripts on its own initiative — context lifecycle (rc)
-//! hooks, `HookBody::Kaish`, distillation, scheduled drift, etc. — without
-//! needing a connected SSH session.
-//!
-//! - `embedded_kaish` — the kaish kernel embedded in-process.
-//! - `kaish_backend` — bridges kaish ops to kaijutsu kernel state.
-//! - `mount_backend` — kaish's filesystem root, wires VFS mounts to kaish.
-//! - `docs_filesystem` — `/v/docs` (kernel blocks-as-files).
-//! - `read_only_fs` — read-only wrapper for the `/v/*` document mounts (toolie).
-//! - `context_engine` — per-session "current context" registry.
-//! - `kj_builtin` — the `kj` kaish Tool.
-//! - `curl_tool` — the `curl` kaish Tool (kaish-extras' `kaish-tools-curl`),
-//!   one configuration shared by every materialized shell.
+//! `context_shell` owns contextual construction and builtin wiring.
+//! `embedded_kaish` owns the interpreter and its execution adapters. Backend,
+//! filesystem, and builtin modules implement kaish interfaces. Rc orchestration
+//! remains a distinct owner; see `docs/kaish-integration.md`.
 
 pub mod context_engine;
+pub mod context_shell;
 pub mod curl_tool;
 pub mod docs_filesystem;
 pub mod embedded_kaish;

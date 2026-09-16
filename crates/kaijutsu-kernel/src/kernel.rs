@@ -7,6 +7,8 @@
 //! - LLM providers (for model access)
 //! - Control plane (consent mode)
 
+use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
+use crate::runtime::embedded_kaish::EmbeddedKaish;
 use async_trait::async_trait;
 use kaijutsu_types::{ContextId, PrincipalId};
 use std::path::Path;
@@ -1647,7 +1649,7 @@ impl Kernel {
     /// Fetch the content for a `:r` read intent. `:r <file>` reads through the
     /// shared `FileDocumentCache` (the same source the editor and file tools
     /// use). `:r !cmd` materializes a per-context kaish in the *opener's*
-    /// `(principal, context_id, session_id)` — the same `materialize_context_kaish`
+    /// `(principal, context_id, session_id)` — the same `EmbeddedKaish::for_context`
     /// the model shell and rc lifecycle use — and splices the command's stdout.
     /// Running in the opener's context means the command sees their cwd and
     /// capability allow-set, not the edited block's context. Fails loud (never a
@@ -1676,15 +1678,17 @@ impl Kernel {
                 let dispatcher = self.broker.kj_dispatcher().await.ok_or_else(|| {
                     "editor: ':r !cmd' unavailable — kj dispatcher not wired".to_string()
                 })?;
-                let kaish = dispatcher
-                    .materialize_context_kaish_internal(
-                        "editor-read",
-                        opener.principal,
-                        opener.context_id,
-                        opener.session_id,
-                        dispatcher.semantic_index(),
-                        dispatcher.block_source(),
-                    )
+                let kaish = EmbeddedKaish::for_context(
+                    &dispatcher,
+                    "editor-read",
+                    ShellIdentity {
+                        requester: opener.principal, performer: opener.principal, reviewer: None,
+                        context: opener.context_id, session: opener.session_id,
+                    },
+                    ShellPolicy::Internal,
+                    dispatcher.semantic_index(),
+                    dispatcher.block_source(),
+                )
                     .await
                     .map_err(|e| format!("editor: ':r !{cmd}' materialize shell: {e}"))?;
                 let result = kaish

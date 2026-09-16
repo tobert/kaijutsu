@@ -1,45 +1,16 @@
-//! `ShellServer` — the in-kernel projection of the `shell` / `shell_write`
-//! facades as broker MCP tools (`builtin.shell` / `shell` and
-//! `builtin.shell_write` / `shell_write`).
+//! Broker tools for contextual shell execution.
 //!
-//! **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3", Amy's
-//! 2026-08-16 ruling): `shell` is now the unmarked, SAFE name
-//! (`ExternalExec::Deny`) — the tool a model reaches for by accident must be
-//! the one that cannot hurt anything. `shell_write` is the hot, mutating name
-//! (`ExternalExec::Allow`, same behavior `builtin.shell`/`shell` had before
-//! the flag day), granted not default. `read_only_shell` retires as a name
-//! entirely — no dual-name transition period. A stale caller that still asks
-//! for `"shell"` after the flag day lands on the SAFE tool now, never the
-//! mutating one — wrong-but-safe, the only acceptable direction for a
-//! breaking rename.
+//! `shell` selects structural read-only execution. `shell_write` permits
+//! mutation, with host execution separately controlled by the context's Exec
+//! capability. Each call uses `EmbeddedKaish::for_context`, shared with RPC,
+//! rc, hooks, and editor commands.
 //!
-//! The `shell`/`shell_write` facades were historically reachable only over the
-//! RPC seam: the human shell box and the external MCP `context_shell` (both
-//! cross `Broker::check_facade`). The in-kernel LLM agent's tool roster is
-//! built from broker tools (`list_visible_tools`), which never included
-//! facades — so a native agent in any context "had no shell" no matter what
-//! its binding said.
-//!
-//! This server closes that gap. It exposes tools that materialize the SAME
-//! per-context kaish (`KjDispatcher::materialize_context_kaish`) the RPC seam
-//! and the rc lifecycle use, so durable env/cwd stay coherent across every
-//! surface — there is one shell (per flavor), reached three ways.
-//!
-//! Gating stays single-axis per flavor: `builtin.shell` and `builtin.
-//! shell_write` are each *facade-projected* instances (see
-//! [`crate::mcp::binding::FACADE_PROJECTED_INSTANCES`]), so a context sees and
-//! can call `shell` exactly when its binding grants `facade:shell`, and
-//! `shell_write` exactly when it grants `facade:shell_write` — the same bits
-//! that gate the RPC seam. There is no second capability to keep in sync.
-//! Default grants stay per-rc, decided per context type at the flag day:
-//! `default`/`coder`/`mcp` via `facade:*`; `director` explicitly holds both
-//! (operator's console — wants the safe tool AND the hot one available);
-//! `toolie` holds `facade:shell` only (never `facade:shell_write`), so it gets
-//! exactly the safe tool; `musician` holds neither and is excluded by design —
-//! its binding grants only `drive`, because a small local model plays best
-//! with an empty tool palette (see
-//! `assets/defaults/rc/musician/create/S10-binding.kai`).
+//! The instances are facade projections: `facade:shell` and
+//! `facade:shell_write` govern visibility and dispatch without a second grant.
+//! Rc selects each context type's loadout; see `docs/gate-and-shell-split.md`.
 
+use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
+use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::sync::{Arc, LazyLock, Weak};
 
 use async_trait::async_trait;
@@ -164,18 +135,11 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// In-kernel broker server backing the `shell` / `shell_write` tools. Holds
-/// `Weak<Broker>` (the broker owns this instance's `Arc`) and reaches the
-/// shared `KjDispatcher` through the broker, materializing a throwaway context
-/// kaish per call. One struct, two flavours selected at construction: the
-/// hot, mutating `shell_write` (`facade:shell_write`) and the safe, unmarked
-/// `shell` (`facade:shell`) — the name a caller reaches for by default, and
-/// what `read_only_shell`/`facade:shell_readonly` used to be before the
-/// 2026-08-17 flag day. The constraint lives in the *tool name* so the model
-/// never wastes a turn attempting a write it can't do.
+/// Broker server for `shell` or `shell_write`, selected at construction.
+/// A weak broker reference avoids a cycle; each call constructs its own shell.
 pub struct ShellServer {
     instance_id: InstanceId,
-    /// The model-facing tool name (`shell`, safe, or `shell_write`, hot).
+    /// The model-facing tool name: `shell` or `shell_write`.
     tool: &'static str,
     /// When true, materialize a read-only context kaish (no writes, no external
     /// commands; reads — incl. document views — still work).
@@ -185,20 +149,14 @@ pub struct ShellServer {
 }
 
 impl ShellServer {
-    /// The safe, unmarked tool — `ExternalExec::Deny`. This is what
-    /// `builtin.shell_readonly`/`read_only_shell` was before the 2026-08-17
-    /// flag day (`docs/gate-and-shell-split.md`, "Slice 3"): the name a caller
-    /// reaches for by accident must be the one that cannot hurt anything.
+    /// Read-only execution; host subprocesses are disabled.
     pub const INSTANCE: &'static str = "builtin.shell";
     pub const TOOL: &'static str = "shell";
-    /// The hot, mutating tool — `ExternalExec::Allow`, granted not default.
-    /// This is what `builtin.shell`/`shell` was before the flag day; a stale
-    /// caller that still asks for the bare name `"shell"` now lands on the
-    /// SAFE tool above instead, never here.
+    /// Writable execution; the context's Exec capability controls subprocesses.
     pub const INSTANCE_WRITE: &'static str = "builtin.shell_write";
     pub const TOOL_WRITE: &'static str = "shell_write";
 
-    /// The hot `shell_write` tool (gated by `facade:shell_write`).
+    /// The writable `shell_write` tool (gated by `facade:shell_write`).
     pub fn new(broker: Weak<Broker>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
@@ -440,39 +398,24 @@ impl McpServerLike for ShellServer {
             // asked (`docs/gate-resume.md`, "Staleness"). `outcome.cwd` is
             // the pin `run_gate` captured at escalation time; carry it
             // through so the command below runs there, not in whatever
-            // directory `materialize_context_kaish` would otherwise land in.
+            // directory `EmbeddedKaish::for_context` would otherwise land in.
             pinned_cwd = outcome.cwd;
         }
 
         let semantic_index = dispatcher.semantic_index();
         let block_source = dispatcher.block_source();
-        let kaish = if self.read_only {
-            dispatcher
-                .materialize_context_kaish_read_only_as(
-                    "model-shell-ro",
-                    ctx.principal_id,
-                    ctx.actor_id,
-                    ctx.reviewer_id,
-                    ctx.context_id,
-                    ctx.session_id,
-                    semantic_index,
-                    block_source,
-                )
-                .await
-        } else {
-            dispatcher
-                .materialize_context_kaish_as(
-                    "model-shell",
-                    ctx.principal_id,
-                    ctx.actor_id,
-                    ctx.reviewer_id,
-                    ctx.context_id,
-                    ctx.session_id,
-                    semantic_index,
-                    block_source,
-                )
-                .await
-        }
+        let kaish = EmbeddedKaish::for_context(
+            &dispatcher,
+            if self.read_only { "model-shell-ro" } else { "model-shell" },
+            ShellIdentity {
+                requester: ctx.principal_id, performer: ctx.actor_id, reviewer: ctx.reviewer_id,
+                context: ctx.context_id, session: ctx.session_id,
+            },
+            if self.read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
+            semantic_index,
+            block_source,
+        )
+        .await
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
         // The pinned directory is validated against the shell's own backend
@@ -1874,7 +1817,7 @@ mod tests {
     /// **Slice 3 spec test 2**: a context newly granted `facade:shell_write`
     /// (plus the `exec` authority — external spawning is gated on that
     /// authority independent of which facade is granted, see
-    /// `kj/context_shell.rs::materialize_context_kaish_inner`) gets exactly
+    /// `EmbeddedKaish::for_context`) gets exactly
     /// what `builtin.shell` provided before the flag day, under the new name
     /// — proven with a real external binary (`id`), not just a kaish
     /// builtin, so the assertion actually exercises `ExternalExec::Allow`,
@@ -1882,7 +1825,7 @@ mod tests {
     ///
     /// The `exec` grant must land on TWO brokers: `wired()`'s standalone
     /// broker (what `call_tool` gates against) AND `d.kernel().broker()`
-    /// (what `materialize_context_kaish_inner`'s exec-authority check reads,
+    /// (what `EmbeddedKaish::for_context`'s exec-authority check reads,
     /// via `self.kernel().broker()` — a different `Arc<Broker>` than the one
     /// `ShellServer` was registered on for the *synchronous* path; the
     #[tokio::test]
@@ -1890,7 +1833,7 @@ mod tests {
         let (broker, d) = wired().await;
         // Real host root so the shell's default cwd resolves to a real
         // directory and `id` can actually spawn (mirrors
-        // `kj/context_shell.rs`'s `unknown_command_fails_fast_exec_granted_shell`).
+        // `runtime/context_shell.rs`'s `unknown_command_fails_fast_exec_granted_shell`).
         d.kernel()
             .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
             .await;

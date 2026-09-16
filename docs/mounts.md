@@ -85,7 +85,7 @@ survives the inversion (later slices only narrow what's visible and what
   like every authority, **not implied by `*`**. Granted in the rc seeds
   to the broad roles (`lib/create/S10-binding.kai` → coder/mcp/default)
   and to `director`; musician/toolie never carry it. The gate is applied
-  in `materialize_context_kaish_inner`: no binding or no grant → `Deny`.
+  in `EmbeddedKaish::for_context`: no binding or no grant → `Deny`.
 - **`MountBackend::resolve_real_path`** now resolves (it returned `None`
   unconditionally): sync mount-table walk
   (`MountTable::resolve_real_path_sync`, longest-prefix owner + the new

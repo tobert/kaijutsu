@@ -236,7 +236,7 @@ The same surface a test drives is what a model plays.
 ## Decisions
 
 1. **Dispatch is a kaish builtin.** `vi`/`edit <path>` is a real kaish `Tool`
-   (`runtime/vi_builtin.rs`, registered in `kj/context_shell.rs`) — not a
+   (`runtime/vi_builtin.rs`, registered in `runtime/context_shell.rs`) — not a
    `kj editor open` alias. `kj editor` reaches the editor through the same
    shared `Kernel::editor_open` primitive; two front doors, one kernel
    method, one `EditorState::to_json` shape.
@@ -399,7 +399,7 @@ push channel; the app renders it read-only.
   existing diff→`EditOp`→block-mirror path.
 - **Read:** `:r <file>` reads via `FileDocumentCache::read_content`; `:r !cmd`
   materializes a kaish in the **opener's** `(principal, context_id,
-  session_id)` (the same `materialize_context_kaish` helper the model shell +
+  session_id)` (the same `EmbeddedKaish::for_context` helper the model shell +
   rc lifecycle use) and splices the command's stdout — both **at the cursor**
   (not vim's linewise-below; simpler, refine later). Accepted spellings also
   include `:read <file>`, `:read !cmd`, and the adjacent-bang `:r!cmd`. These
@@ -441,7 +441,7 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 |---|---|
 | Editor sessions + resolver + state shape | `kaijutsu-kernel/src/editor.rs` (`resolve_editor_target`, `EditorSessions`, `EditorState::to_json`, `APP_PEER_NICK`) |
 | Vim engine (pure) | `kaijutsu-editor/src/lib.rs` (`EditorCore`, `EditOp`, `CommandRequest`, `EditorIo`) |
-| `vi`/`edit` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `kj/context_shell.rs` |
+| `vi`/`edit` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `runtime/context_shell.rs` |
 | `kj editor` | `kaijutsu-kernel/src/kj/editor.rs` |
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |

@@ -9,6 +9,35 @@ use kaijutsu_index::{BlockSource, Embedder, EmbeddingPurpose, IndexError, Semant
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId};
 use sha2::{Digest, Sha256};
 
+/// Empty synthesis input for rc and hook bodies.
+pub(crate) struct NoopBlockSource;
+
+impl kaijutsu_index::BlockSource for NoopBlockSource {
+    fn block_snapshots(
+        &self,
+        _ctx: kaijutsu_types::ContextId,
+    ) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// Non-draft context blocks for search and synthesis.
+pub(crate) struct BlockStoreSource(pub(crate) crate::block_store::SharedBlockStore);
+
+impl kaijutsu_index::BlockSource for BlockStoreSource {
+    fn block_snapshots(
+        &self,
+        ctx: kaijutsu_types::ContextId,
+    ) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+        use crate::block_store::BlockStore;
+        // In-memory first; hydrate from the DB on demand for a cold context.
+        if !self.0.contains(ctx) {
+            let _ = self.0.load_one_from_db(ctx);
+        }
+        BlockStore::non_draft_snapshots(&self.0, ctx).map_err(|e| e.to_string())
+    }
+}
+
 const TOP_BLOCKS_FOR_PREVIEW: usize = 3;
 const GIST_TOP_BLOCKS: usize = 5;
 const GIST_MAX_CANDIDATES: usize = 64;

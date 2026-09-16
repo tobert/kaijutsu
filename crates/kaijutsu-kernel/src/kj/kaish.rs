@@ -40,7 +40,7 @@ enum KaishCommand {
 /// `Recipe::agent_onboarding()`'s `Builtins` concept wants `(name,
 /// description)` pairs pulled from a live kaish tool registry, which only
 /// exists inside a materialized per-context shell
-/// (`KjDispatcher::materialize_context_kaish`) — spinning one up just to list
+/// (`EmbeddedKaish::for_context`) — spinning one up just to list
 /// builtin names for a text primer would drag in a context id, principal,
 /// session, and block source this context-agnostic verb has no business
 /// needing. An empty index makes `compose()` skip the `Builtins` section

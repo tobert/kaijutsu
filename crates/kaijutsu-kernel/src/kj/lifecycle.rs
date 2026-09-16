@@ -1,10 +1,9 @@
 //! Run-control (rc) lifecycle dispatch.
 //!
-//! Fires at context lifecycle moments (`create`, `fork`; `attach` and
-//! `drift` reserved). Looks up scripts at `/config/rc/<context_type>/<verb>/`,
-//! runs them in lexical sort order. `.md` scripts become blocks; `.kai`
-//! scripts execute via `kaish_kernel::Kernel::execute_with_options` with the
-//! kernel's `TimeoutPolicy::rc_script_timeout` applied per call.
+//! Runs at create, fork, attach, drift, tick, rotate, and submit. Scripts under
+//! `/config/rc/<context_type>/<verb>/` run in lexical order. Markdown entries
+//! author instruction blocks; kaish entries use the shared runtime constructor
+//! with rc authority and `TimeoutPolicy::rc_script_timeout`.
 //!
 //! ## Failure semantics
 //!
@@ -22,15 +21,11 @@
 //! its caller). When depth exceeds `MAX_RC_DEPTH`, the script is skipped
 //! and an error block is inserted in its place.
 //!
-//! ## `kj` from inside rc kaish (shipped 2026-05-02)
-//!
-//! `KjDispatcher` stores a `Weak<Self>` (set via `set_self_arc` after
-//! `Arc::new`); `run_kai_script` upgrades it and registers `KjBuiltin`
-//! into the rc session's tool registry. Test dispatchers that don't
-//! call `set_self_arc` still run scripts — they just don't get `kj`
-//! in scope.
 
+use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
+use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::collections::HashMap;
+use crate::runtime::synthesis::NoopBlockSource;
 
 use approval_ledger::rc_runs;
 use approval_ledger::types::RcOutcome;
@@ -41,10 +36,27 @@ use kaijutsu_types::{
 
 use super::{KjCaller, KjDispatcher};
 
+/// Authority to construct the lifecycle control-plane shell.
+///
+/// The private field keeps ordinary execution callers from selecting rc policy.
+///
+/// ```compile_fail
+/// use kaijutsu_kernel::kj::lifecycle::RcAuthority;
+/// let authority = RcAuthority { _private: () };
+/// ```
+pub struct RcAuthority {
+    _private: (),
+}
+
+#[cfg(test)]
+impl RcAuthority {
+    pub(crate) fn for_test() -> Self { Self { _private: () } }
+}
+
 /// One rc script resolved from the `/config/rc` file tree for a single
 /// lifecycle run. The path is canonical (`/config/rc/<type>/<verb>/SXX-name.ext`);
 /// `sort_key` and `extension` are parsed from the filename for ordering and
-/// dispatch. Content is read through the kernel's `FileDocumentCache`.
+/// dispatch. Bodies are read through the VFS before execution starts.
 pub(crate) struct RcScript {
     pub path: String,
     pub sort_key: String,
@@ -237,7 +249,7 @@ impl KjDispatcher {
         // else: `require_cap` authorizes against the caller's loadout keyed by
         // `context_id` (`kj/mod.rs`), never against `principal_id`; rc shells
         // are constructed privileged; and the host-exec policy is read from the
-        // *context's* binding in `materialize_context_kaish_inner`. Moving this
+        // *context's* binding in `EmbeddedKaish::for_context`. Moving this
         // value changes who the blocks belong to and nothing about what the
         // scripts may do.
         let (context_type, owner) = {
@@ -571,17 +583,17 @@ async fn run_kai_script(
     // only through the explicit `kj context set` channel, so later scripts in
     // the phase see earlier ones' deliberate writes, never their transients.
     // rc uses the bare kj surface (no semantic index): `NoopBlockSource`.
-    let kaish = match dispatcher
-        .materialize_context_kaish_rc_as(
-            "rc",
-            principal,
-            actor,
-            reviewer,
-            new_id,
-            SessionId::new(),
-            None,
-            std::sync::Arc::new(NoopBlockSource),
-        )
+    let kaish = match EmbeddedKaish::for_context(
+        &dispatcher,
+        "rc",
+        ShellIdentity {
+            requester: principal, performer: actor, reviewer: reviewer,
+            context: new_id, session: SessionId::new(),
+        },
+        ShellPolicy::Rc(RcAuthority { _private: () }),
+        None,
+        std::sync::Arc::new(NoopBlockSource),
+    )
         .await
     {
         Ok(k) => k,
@@ -995,46 +1007,6 @@ fn insert_rc_trace_block(
     );
 }
 
-/// Stub `BlockSource` for `KjBuiltin`'s synthesis wiring. rc and hook
-/// kaish sessions don't need semantic search; passing a real source
-/// would require kaijutsu-index plumbing that doesn't belong here.
-pub(crate) struct NoopBlockSource;
-
-impl kaijutsu_index::BlockSource for NoopBlockSource {
-    fn block_snapshots(
-        &self,
-        _ctx: kaijutsu_types::ContextId,
-    ) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
-        Ok(Vec::new())
-    }
-}
-
-/// Real `BlockSource` over the kernel's `SharedBlockStore`: hands `kj`'s
-/// synthesis/search tools the context's block snapshots, hydrating from the DB
-/// on an in-memory miss. This is what the model's `shell` / `read_only_shell`
-/// materialize with (via [`crate::kj::KjDispatcher::block_source`]), so the
-/// model gets full `kj search`/synthesis. rc and hook control-plane scripts
-/// keep [`NoopBlockSource`] — they don't search.
-///
-/// Mirrors the server's `BlockStoreSource` (rpc.rs), kept kernel-local so the
-/// in-kernel shell path doesn't reach across crates for a 10-line adapter; both
-/// wrap the same `SharedBlockStore` API.
-pub(crate) struct BlockStoreSource(pub(crate) crate::block_store::SharedBlockStore);
-
-impl kaijutsu_index::BlockSource for BlockStoreSource {
-    fn block_snapshots(
-        &self,
-        ctx: kaijutsu_types::ContextId,
-    ) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
-        use crate::block_store::BlockStore;
-        // In-memory first; hydrate from the DB on demand for a cold context.
-        if !self.0.contains(ctx) {
-            let _ = self.0.load_one_from_db(ctx);
-        }
-        BlockStore::non_draft_snapshots(&self.0, ctx).map_err(|e| e.to_string())
-    }
-}
-
 fn log_unwired_verb_once(verb: &str) {
     // Every verb in RC_VERBS is wired to a call site. This stays a no-op
     // so a future reserved verb can plug in here without touching the
@@ -1121,7 +1093,8 @@ mod tests {
 
     #[tokio::test]
     async fn rc_create_md_inserts_block() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-prompt.md",
@@ -1158,7 +1131,8 @@ mod tests {
         // real POSIX symlink, resolved host-relative to the link's own
         // directory, same shape `reseed_rc_files` writes for the embedded
         // seed's init.d composition.
-        let d = test_dispatcher_rc().await;
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
         // The shared, canonical stance lives once under a `lib` type.
         install_rc_script_file(
             &d,
@@ -1199,7 +1173,8 @@ mod tests {
     async fn rc_create_reports_and_records_a_broken_symlinked_md() {
         use crate::vfs::VfsOps;
 
-        let d = test_dispatcher_rc().await;
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
         d.kernel()
             .vfs()
             .symlink(
@@ -1247,7 +1222,8 @@ mod tests {
 
     #[tokio::test]
     async fn rc_create_kai_runs_script() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-noop.kai",
@@ -1278,7 +1254,8 @@ mod tests {
     /// there's something to capture.
     #[tokio::test]
     async fn rc_kai_stdout_captured_as_trace_block() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-echo.kai",
@@ -1342,7 +1319,8 @@ mod tests {
     /// `case "$KJ_CONTEXT_TYPE" in coder) ... esac`.
     #[tokio::test]
     async fn rc_kai_receives_context_type() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-echo-type.kai",
@@ -1389,7 +1367,8 @@ mod tests {
         // (A db-less store no-ops `store_provenance` — the same graceful
         // degradation a replica store gets — which would make this test assert
         // nothing about the row.)
-        let d = test_dispatcher_rc().await;
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-color.kai",
@@ -1456,7 +1435,8 @@ mod tests {
     /// vars and asserts they round-trip through the captured Trace block.
     #[tokio::test]
     async fn rc_lifecycle_with_vars_seeds_kai_env() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/tick/S00-report.kai",
@@ -1503,7 +1483,8 @@ mod tests {
     /// seeding, not an always-populated env.
     #[tokio::test]
     async fn rc_lifecycle_without_vars_leaves_heartbeat_empty() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/tick/S00-report.kai",
@@ -1552,7 +1533,8 @@ mod tests {
     /// blocks belong to and nothing about what the scripts may do.
     #[tokio::test]
     async fn rc_md_block_is_authored_by_context_owner_not_caller() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/tick/S00-stance.md",
@@ -1606,7 +1588,8 @@ mod tests {
     /// human actually reads in the timeline.
     #[tokio::test]
     async fn rc_kai_trace_block_is_authored_by_context_owner_not_caller() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/tick/S00-report.kai",
@@ -1734,7 +1717,8 @@ mod tests {
     /// context" would find the visitor.
     #[tokio::test]
     async fn rc_failure_block_is_authored_by_context_owner_not_caller() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/tick/S00-broken.zzz",
@@ -1878,7 +1862,8 @@ mod tests {
 
     #[tokio::test]
     async fn rc_kai_silent_success_inserts_no_trace_block() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-silent.kai",
@@ -1912,7 +1897,8 @@ mod tests {
     /// widens the System-role carve-out to all kinds.)
     #[tokio::test]
     async fn rc_kai_trace_block_is_hidden_from_llm_hydrate() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-echo.kai",
@@ -1968,7 +1954,8 @@ mod tests {
             rc_script_timeout: std::time::Duration::from_millis(150),
             ..Default::default()
         };
-        let d = test_dispatcher_with_timeouts(policy).await;
+        let d = std::sync::Arc::new(test_dispatcher_with_timeouts(policy).await);
+        d.set_self_arc();
 
         // Sleep well past the 150ms bound so the timeout MUST fire. The
         // kaish `sleep` builtin honors `ctx.cancel`, so the timer-induced
@@ -2089,7 +2076,8 @@ mod tests {
     #[tokio::test]
     async fn rc_no_scripts_for_type_is_noop() {
         use crate::vfs::VfsOps;
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         d.kernel
             .vfs()
             .mkdir(std::path::Path::new("/config/rc/nonexistent"), 0o755)
@@ -2125,7 +2113,8 @@ mod tests {
     /// failed. Both outcomes are `Failed`; only the count separates them.
     #[tokio::test]
     async fn rc_run_records_intended_script_count() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/counted/create/S00-one.md", "first").await;
         install_rc_script_file(&d, "/config/rc/counted/create/S10-two.md", "second").await;
 
@@ -2154,7 +2143,8 @@ mod tests {
     #[tokio::test]
     async fn rc_empty_verb_records_zero_script_count() {
         use crate::vfs::VfsOps;
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         let vfs = d.kernel.vfs();
         vfs.mkdir(std::path::Path::new("/config/rc/nothinghere"), 0o755)
             .await
@@ -2183,7 +2173,8 @@ mod tests {
     /// not be able to reach either by being dropped in the directory.
     #[tokio::test]
     async fn rc_non_canonical_script_name_fails_the_verb() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_rc_script_file(
             &d,
             "/config/rc/stray/create/S00-benign.md",
@@ -2225,7 +2216,8 @@ mod tests {
     /// is inert rather than a mistake worth failing a context create over.
     #[tokio::test]
     async fn rc_ignores_files_that_are_not_scripts() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/inert/create/S00-real.md", "the real script").await;
         install_rc_script_file(&d, "/config/rc/inert/create/README.txt", "notes").await;
 
@@ -2250,7 +2242,8 @@ mod tests {
 
     #[tokio::test]
     async fn rc_script_failure_inserts_error_block_continues() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         // S00 returns non-zero; S10 is benign.
         install_script(
             &d,
@@ -2302,7 +2295,8 @@ mod tests {
 
     #[tokio::test]
     async fn rc_attach_fires_scripts_on_target() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         // `.md` script lands its content as a block on the target.
         install_script(
             &d,
@@ -2334,7 +2328,8 @@ mod tests {
 
     #[tokio::test]
     async fn rc_recursion_guard_caps_depth() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-noop.md",
@@ -2387,7 +2382,8 @@ mod tests {
 
     #[tokio::test]
     async fn rc_drift_pull_inserts_drift_then_runs_script() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         // .kai script asserts overlay vars look right for a Pull drift.
         // No `kj` calls — so set_self_arc is unnecessary.
         install_script(
@@ -2446,7 +2442,8 @@ esac
 
     #[tokio::test]
     async fn rc_drift_merge_runs_with_target_overlay() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/drift/S00-introspect.kai",
@@ -2501,7 +2498,8 @@ esac
 
     #[tokio::test]
     async fn rc_drift_flush_fires_per_item() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/drift/S00-marker.md",
@@ -2551,7 +2549,8 @@ esac
 
     #[tokio::test]
     async fn rc_drift_script_failure_inserts_error_continues_flush() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/drift/S00-fail.kai",
@@ -2612,7 +2611,8 @@ esac
 
     #[tokio::test]
     async fn rc_drift_compact_fork_does_not_double_fire() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/fork/S00-fork.md",
@@ -2715,7 +2715,8 @@ esac
         // breakpoint. Captured from the parent's BlockStore (not the
         // child's) because the child's count already includes the
         // fork-marker block by the time this rc hook fires.
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/fork/S00-assert-parent-count.kai",
@@ -2812,7 +2813,8 @@ esac
     async fn rc_create_omits_parent_block_count() {
         // KJ_PARENT_BLOCK_COUNT is fork-only — rc-on-create has no
         // parent, so the var must be absent (not "0", not "").
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-no-parent-count.kai",
@@ -2849,7 +2851,8 @@ esac
 
     #[tokio::test]
     async fn rc_fork_does_not_trigger_create_scripts() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-only-create.md",
@@ -3219,7 +3222,8 @@ esac
     /// run just as visible as a loud one.
     #[tokio::test]
     async fn a_failing_rc_script_leaves_a_finished_run_with_failed_outcome() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-fail.kai",
@@ -3260,7 +3264,8 @@ esac
     /// real failure signal, not an always-`None`/always-absent row.
     #[tokio::test]
     async fn a_successful_rc_lifecycle_records_a_finished_ok_run() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-noop.kai",
@@ -3294,7 +3299,8 @@ esac
     /// ledger runs <run-id>` reads.
     #[tokio::test]
     async fn rc_run_records_per_script_rows_in_order() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-first.kai",
@@ -3357,7 +3363,8 @@ esac
     /// no-op, and must not leave a dangling unfinished row.
     #[tokio::test]
     async fn a_recursion_guarded_run_still_finishes_as_failed() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_script(
             &d,
             "/config/rc/test/create/S00-noop.md",
@@ -3395,7 +3402,8 @@ esac
     /// reports the directory missing."
     #[tokio::test]
     async fn a_verb_with_no_scripts_still_finishes_as_ok() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
         install_rc_script_file(
             &d,
             "/config/rc/emptytype/create/README.txt",

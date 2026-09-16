@@ -25,7 +25,6 @@ pub mod reflect;
 pub mod cp;
 pub mod config;
 pub mod context;
-pub mod context_shell;
 pub mod db;
 pub mod diff;
 pub mod doc;
@@ -438,7 +437,7 @@ impl KjDispatcher {
     /// The model shell pairs this with [`Self::semantic_index`]; rc/hook paths
     /// deliberately pass a `NoopBlockSource` instead.
     pub fn block_source(&self) -> Arc<dyn kaijutsu_index::BlockSource> {
-        Arc::new(crate::kj::lifecycle::BlockStoreSource(self.blocks.clone()))
+        Arc::new(crate::runtime::synthesis::BlockStoreSource(self.blocks.clone()))
     }
 
     /// Upgrade the stored `Weak<Self>` to `Arc<Self>`. Returns `None`

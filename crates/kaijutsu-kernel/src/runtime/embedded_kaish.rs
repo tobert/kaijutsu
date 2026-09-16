@@ -7,7 +7,7 @@
 //! # Architecture
 //!
 //! ```text
-//! kaijutsu-server
+//! Kaijutsu runtime
 //!     │
 //!     └── EmbeddedKaish
 //!             │
@@ -55,20 +55,18 @@ use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Embedded kaish executor backed by kernel blocks.
 ///
-/// Embeds the kaish interpreter directly and routes all I/O through
+/// File access uses `MountBackend`; document access and tool dispatch use
 /// `KaijutsuBackend`.
 pub struct EmbeddedKaish {
     /// The embedded kaish kernel.
     kernel: KaishKernel,
     /// Kernel name/id.
     name: String,
-    /// Global session map for context tracking.
+    /// Invocation-local session map for context tracking.
     session_contexts: SessionContextMap,
     session_id: SessionId,
     /// Snapshot of the kaijutsu kernel's `TimeoutPolicy` at construction.
-    /// Read by `apply_context_config` for the init-script bound; read by
-    /// the wrapper accessor `timeouts()` for callers that build their own
-    /// `ExecuteOptions` (e.g. `KjDispatcher::run_kai_script`).
+    /// Callers use `timeouts()` when supplying per-invocation `ExecuteOptions`.
     timeouts: kaijutsu_types::TimeoutPolicy,
 }
 
@@ -140,46 +138,22 @@ pub enum ExternalExec {
     Allow { path: Option<String> },
 }
 
-/// Who consumes this shell's output — which decides how hard we cap it.
+/// Output limits selected by the consumer.
 ///
-/// kaish caps output by *replacing* the captured text with a head+tail preview
-/// and **remapping the exit code to 3** (`did_spill`), keeping the real code in
-/// `original_code` (`kaish-kernel`'s `output_limit` module doc). The remap is a
-/// deliberate signal to the embedder, but it reaches the running script's `$?`
-/// too — so inside a kaish program a command that *succeeded* and merely
-/// printed a lot looks like it failed, and `set -e` / `cmd || fallback` /
-/// `if cmd; then` all take the error branch. Measured live 2026-08-15; see
-/// docs/issues.md, "kaish output limiting — REMEASURED".
-///
-/// `kj`/MCP callers never see this, because `mcp/servers/shell.rs` unwraps
-/// `original_code` at the tool boundary. Scripts do. So the profile is chosen
-/// by who reads the output, not by how much we trust the caller.
+/// Kaish replaces oversized output with a preview and sets exit code 3, retaining
+/// the command's code in `original_code`. That remap also reaches script `$?`.
+/// Internal consumers need complete text and a larger cap; callers must reject
+/// spilled output when a preview would corrupt the result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputProfile {
-    /// **Model-facing.** kaish's sandboxed-agent preset: an 8 KB cap with a
-    /// head+tail preview. Bounded output is the point here — it protects the
-    /// context window, and a model that hits the cap can re-run something
-    /// narrower. The `$?` remap is a live wart on this path (a model writing
-    /// `cmd || echo failed` gets bitten), and the real fix for it is upstream:
-    /// a kaish knob that signals spill without forging the exit code. Filed.
+    /// Model-facing output: kaish's 8 KB agent limit and head/tail preview.
     #[default]
     Agent,
-    /// **Kernel-internal.** rc scripts, hook bodies, and editor `:r !cmd`
-    /// splices: output is consumed by kaijutsu itself, not shipped to a model,
-    /// so capping it buys nothing and costs correctness twice over — a forged
-    /// `$?`, and (where the text is spliced into a document) a silent
-    /// head+tail replacement of content that was supposed to be verbatim.
-    ///
-    /// Still an explicit cap rather than `none()`: a runaway rc script should
-    /// hit a wall rather than eat the kernel's memory. It is set far above any
-    /// legitimate rc output, so `did_spill` should never fire in practice —
-    /// and if it does, that is a real problem worth the loud wrong answer.
+    /// Rc, hook, and editor output: a 4 MiB memory ceiling.
     Internal,
 }
 
-/// The in-memory ceiling for [`OutputProfile::Internal`]. Two orders of
-/// magnitude above kaish's 8 KB agent preset and far above any rc/hook body we
-/// write, so it is a runaway backstop and not a working limit.
+/// Memory ceiling for internal consumers; spill still requires caller handling.
 const INTERNAL_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
 impl OutputProfile {
@@ -267,8 +241,7 @@ impl EmbeddedKaish {
     /// Like [`Self::with_identity`] but the materialized shell is **read-only**:
     /// every filesystem mutation and every external command is refused by
     /// construction, while reads — real files *and* the kernel document views at
-    /// `/v/docs` — still work. Backs the toolie's
-    /// `read_only_shell` (see `mcp/servers/shell.rs`).
+    /// `/v/docs` — still work. Used by the model `shell` tool.
     // See with_identity's doc above for why this family's argument count is
     // what it is.
     #[allow(clippy::too_many_arguments)]
@@ -296,10 +269,7 @@ impl EmbeddedKaish {
             // Read-only never spawns: external exec is the sandbox's fourth
             // lever, held Deny by construction (no caller choice to get wrong).
             ExternalExec::Deny,
-            // Read-only backs the toolie's `read_only_shell` — a model-facing
-            // surface, so it takes the model-facing cap. Same reasoning as
-            // exec: not a caller choice, because there is only one caller and
-            // one right answer.
+            // The read-only model shell uses the agent output limit.
             OutputProfile::Agent,
             configure_tools,
         )
@@ -369,7 +339,7 @@ impl EmbeddedKaish {
         // `/v/swap` (docs/file-buffers.md): a read-only view over unflushed
         // file buffers, mirrored by real path under this kernel's identity
         // segment. Read-only by construction (`SwapFilesystem` refuses every
-        // mutation itself), so — unlike `docs_fs`/`input_fs` — it needs no
+        // mutation itself), so — unlike `docs_fs` — it needs no
         // conditional `ReadOnlyFs` wrap for the read-only shell mode.
         let swap_fs = Arc::new(SwapFilesystem::new(
             kernel.kernel_db().clone(),
@@ -388,7 +358,7 @@ impl EmbeddedKaish {
         // cwd (`context_shell.cwd`) is *not* restored here: it must be validated
         // against the shell's backend (the VFS namespace `cd` uses), which is
         // async, so `restore_cwd_from_db` does it post-construction — see
-        // `materialize_context_kaish`.
+        // `EmbeddedKaish::for_context`.
         // kaijutsu overrides the backend with MountBackend (see below), so the
         // config's vfs_mode is moot — what matters is the cwd and the agent-grade
         // ignore/output-limit presets (gitignore-aware walks + capped output).
@@ -398,8 +368,7 @@ impl EmbeddedKaish {
             .with_ignore_config(IgnoreConfig::agent())
             // Output cap by consumer, not by trust — see `OutputProfile`.
             // Model-facing shells keep kaish's 8 KB agent preset; rc/hook/
-            // editor-splice shells get a runaway backstop instead, so kaish's
-            // `did_spill` exit-code remap never forges a failure in a script.
+            // editor shells use the larger internal ceiling. Both can spill.
             .with_output_limit(output.to_config());
         if let Some(root) = project_root {
             config = config.with_cwd(root);
@@ -666,18 +635,9 @@ impl EmbeddedKaish {
 
     /// Seed the shell with the context's durable env vars (`context_env`).
     ///
-    /// The context shell is shared state that evolves over the context's
-    /// lifetime; its durable identity is `env + cwd` in the DB. cwd is restored
-    /// post-construction by `restore_cwd_from_db`; this applies the env half.
-    /// Context-setup *scripting* is RC's job now (the former
-    /// `context_shell.init_script` was a leftover and has been folded into the
-    /// rc lifecycle), so this no longer runs any script of its own — see
-    /// [`Self::export_env_vars`] for how the durable rows actually reach the
-    /// shell.
-    ///
-    /// Fails loudly: a DB read failure or a rejected key means this context
-    /// would run with silently wrong env, so the error returns to the caller
-    /// and materialization fails instead of continuing on a warning.
+    /// Cwd is restored separately by `restore_cwd_from_db`; setup scripts belong
+    /// to rc. A DB read failure or rejected key fails construction so execution
+    /// cannot proceed with an incomplete environment.
     pub async fn apply_context_config(
         &self,
         db: &parking_lot::Mutex<KernelDb>,

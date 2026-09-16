@@ -36,6 +36,15 @@ orchestration distinct. Migrate every production entry path and relevant test;
 remove the old factory family and duplicate completion code after their final
 callers move. Clean adjacent comments and module docs with each change.
 
+Contextual construction now lives in `runtime/context_shell.rs`; every factory
+caller uses `EmbeddedKaish::for_context`, and the dispatcher factory family is
+deleted. Follow up on constructor state reads: host-exec selection still uses
+`Broker::binding`, which logs a storage failure and treats the binding as absent.
+Use the checked read with a regression during the remaining execution-policy
+audit. The synthesis block-source adapter also ignores hydration errors; retain
+that finding for the adapter audit instead of treating an empty result as proof
+that loading succeeded.
+
 Shared command settlement and headless turn ownership remain separate changes.
 Keep connection/session subscriptions in the server and preserve JobManager's
 execution lifetime separately from durable receipts. Replace rc
@@ -685,7 +694,7 @@ The policy is ours; the seam is kaish's. Kaijutsu never sees the
 or a `before_exec` hook on the spawn request is filed in
 `~/exomemory/issues/kaish.md`, "A pre-exec seam on the spawn request".
 Once it lands, `ExternalExec` in `runtime/embedded_kaish.rs` (the one
-exec authority, `kj/context_shell.rs`) grows the policy, and it should be
+exec authority, `runtime/context_shell.rs`) grows the policy, and it should be
 pluggable by host rather than a table in kaish: nice is the portable
 floor; Linux can add cgroup placement (write the pid into a prepared
 cgroup, or `systemd-run --scope` with `CPUWeight`/`IOWeight`) for IO and
@@ -1655,7 +1664,7 @@ An rc `create` script calling `fmt` fails with `command not found: fmt`,
 while the same command in the MCP `shell` tool succeeds — a `.kai`
 verified interactively can still fail at context create. Exec authority
 gates on the context's binding holding `Capability::Exec`
-(`kj/context_shell.rs:283`), so this is plausibly an ordering artifact of
+(`runtime/context_shell.rs`), so this is plausibly an ordering artifact of
 when a create-time binding takes effect, not yet confirmed either way.
 
 Two consequences. Verify rc scripts by *creating a context*, not by
