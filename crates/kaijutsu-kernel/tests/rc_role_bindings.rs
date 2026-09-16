@@ -25,6 +25,7 @@ struct Harness {
     kernel: Arc<Kernel>,
     dispatcher: Arc<KjDispatcher>,
     db: Arc<parking_lot::Mutex<KernelDb>>,
+    store: kaijutsu_kernel::block_store::SharedBlockStore,
     creator: PrincipalId,
     _tmp: tempfile::TempDir,
 }
@@ -71,6 +72,7 @@ async fn harness() -> Harness {
         kernel,
         dispatcher,
         db,
+        store,
         creator,
         _tmp: tmp,
     }
@@ -290,6 +292,57 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
             "director facade {facade} should pass the gate"
         );
     }
+}
+
+/// A root context is a human's admin console with no model: it holds the
+/// operator's whole authority set and composes no instruction blocks.
+#[tokio::test]
+async fn root_role_is_a_model_less_admin_console() {
+    let h = harness().await;
+    let ctx = create_typed(&h, "amy", "root").await;
+
+    let binding = h
+        .kernel
+        .broker()
+        .binding(&ctx)
+        .await
+        .expect("root rc must seed a binding");
+    assert!(binding.is_admin(), "root should hold binding-admin");
+    for cap in [
+        Capability::Operator,
+        Capability::ConfigWrite,
+        Capability::Drive,
+        Capability::Fork,
+        Capability::Drift,
+        Capability::Transport,
+        Capability::System,
+        Capability::Exec,
+        Capability::Editor,
+        Capability::Facade("shell".into()),
+        Capability::Facade("shell_write".into()),
+        Capability::Facade("edit_input".into()),
+        Capability::Facade("submit_input".into()),
+    ] {
+        assert!(binding.allows(&cap), "root should allow {cap:?}");
+    }
+    let file = InstanceId::new("builtin.file");
+    assert!(binding.allows_tool(&file, "write"), "root should allow file write");
+    assert!(binding.allows_tool(&InstanceId::new("builtin.block"), "block_create"));
+
+    // Instructions are `(System, Text)` blocks; tool notifications and rc
+    // traces are other kinds.
+    let instructions: Vec<_> = h
+        .store
+        .block_snapshots(ctx)
+        .expect("root context blocks")
+        .into_iter()
+        .filter(|block| block.role == kaijutsu_types::Role::System && block.kind == kaijutsu_types::BlockKind::Text)
+        .collect();
+    assert!(
+        instructions.is_empty(),
+        "a model-less root must compose no instruction blocks, got {:?}",
+        instructions.iter().map(|block| block.content.chars().take(80).collect::<String>()).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

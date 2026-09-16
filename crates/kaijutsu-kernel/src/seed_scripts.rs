@@ -417,7 +417,7 @@ mod tests {
             "the director role follows the shared S00-base by lexical order"
         );
 
-        for context_type in ["assistant", "bassist", "mcp", "musician", "toolie"] {
+        for context_type in ["assistant", "bassist", "mcp", "musician", "root", "toolie"] {
             let path = format!("/config/rc/{context_type}/create/S00-base.md");
             assert!(
                 seed_body(&path).is_none(),

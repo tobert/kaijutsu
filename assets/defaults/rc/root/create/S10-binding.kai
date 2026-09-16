@@ -1,0 +1,35 @@
+# root: a root character's admin console. A person types `kj` here; no model
+# performs a root context, so this bundle composes no instruction blocks.
+# Other characters' seats start from here, so their lineage and their
+# accountability begin at this root (docs/character.md, "Roots and rotation").
+set -e
+kj binding allow "builtin.block"
+kj binding allow "builtin.file:read"
+kj binding allow "builtin.file:write"
+kj binding allow "builtin.file:edit"
+kj binding allow "builtin.resources"
+kj binding allow "builtin.tool_search"
+kj binding allow "builtin.kernel_info"
+kj binding allow "builtin.bindings"
+# Binding administration: may write any context's loadout.
+kj binding allow "admin"
+# `kj backend`, `kj cast`, `kj alias`, `kj hook`, and `kj mcp reload`.
+kj binding allow "config-write"
+# Context and workspace lifecycle, and the verbs that move work between
+# contexts.
+kj binding allow "operator"
+kj binding allow "drive"
+kj binding allow "fork"
+kj binding allow "drift"
+kj binding allow "transport"
+# See and stop the running kernel.
+kj binding allow "system"
+# Host subprocesses from the context shell.
+kj binding allow "exec"
+# The kernel-owned editor's write path.
+kj binding allow "editor"
+kj binding allow "facade:shell"
+kj binding allow "facade:shell_write"
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"

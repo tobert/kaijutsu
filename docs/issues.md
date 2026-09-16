@@ -145,35 +145,63 @@ banto. Both are models. Neither the docs nor a test pins it; Amy decides
 whether a human's command in a model's lane is reviewed by that model,
 by its parent, or walks to the nearest root.
 
-## Roots, accountability as a runtime relation, and rotation (Amy, 2026-09-15)
+## Roots, bootstrap, and rotation (Amy, 2026-09-15 and 2026-09-16)
 
 Guidance in `docs/character.md`, "Roots and rotation", and
-`docs/approval-identity.md`. Amy, after reading the noon slice: "My thought
-was that accountable_to is a relation at runtime, so if banto forks a
-coder, that coder is accountable to the precise banto that forked it, not
-any banto." Queued in build order; each slice leaves the tree green.
+`docs/approval-identity.md`. Accountability is a runtime relation: "if banto
+forks a coder, that coder is accountable to the precise banto that forked
+it, not any banto." A fresh kernel on 2026-09-16 deadlocked: it seeded
+`hajime`, the shipped `approval.toml` named `amy`, and nobody could assign
+ROOT's performer. Amy's decisions that day: the person creates themself
+before the first connection; drop `default_reviewer`; ROOT is "a root for
+attaching bantos to, and a model-less place I can type kj admin commands";
+"there should be no anonymous at all"; adding keys stays host-only; "equal
+roots. 1 will be typical, more than one just needs to be possible for now";
+a root context takes its character's name as its label. Build order, each
+slice green and committed:
 
-1. **`ROOT` is reserved and single.** One reserved-names set (`ROOT`, the
-   drift queue, factory preset labels); `ROOT` claimed once per kernel like
-   the drift queue; it must be played by a root character. Move the label
-   from banto's seat to Amy's root context; banto's seat is labeled `banto`.
-2. **`root_ctx` on the sheet, with rotation as its reader.** `kj context
-   rotate <character>`: reads the predecessor from the sheet, creates the
-   successor from the predecessor's own parent with the same type, cast,
+1. **`root` rc bundle.** Model-less admin console: director's grants, no
+   instruction blocks. Shipped 2026-09-16.
+2. **`root_ctx` on the sheet.** `kj character create <name> --root` creates
+   the character's root context (type `root`, label = name, played by it,
+   no parent). The kernel creates a missing root context at start for each
+   live root character. The performerless `director` ROOT seed goes away.
+3. **`kaijutsu-server init --as <name> --key <pub>`.** Creates the first
+   root character and binds its key. A kernel with no live root character
+   refuses to start. Remove `hajime` and `allow_anonymous`; tests bind keys
+   explicitly.
+4. **No default reviewer.** Resolution is override, delegation, then the
+   `forked_from` walk. The authority the default held (routing changes,
+   delegation grant and revoke, escalation) belongs to the root character at
+   the top of the context's walk. `kj context create` with no parent forks
+   from the caller's root context. Remove `approval.toml` and its cache.
+5. **Rotation reads `root_ctx`.** `kj context rotate <character>`: creates
+   the successor from the predecessor's own parent with the same type, cast,
    and performer, sets `ROTATED_FROM`, moves the pointer, archives the
-   predecessor, one transaction. Label follows the live holder.
-   `docs/prompts.md`, "Rotating a director context" changes to the verb.
-3. **`create --as` asks instead of refusing.** Apply the held patch
+   predecessor, in one transaction. `docs/prompts.md`, "Rotating a director
+   context" changes to the verb.
+6. **`create --as` asks instead of refusing.** Apply the held patch
    (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
    turn its refusal into an ask to the responsible character above, and
-   accept a redeemed approval for the exact statement as authority. A
-   static allow rule for a well-formed self-rotation is a policy entry.
-4. **banto from `ROOT`.** Seed: `amy` root, banto's seat created from the
-   root context. A migration note for the live kernel, since `ROOT` is
-   banto's today.
+   accept a redeemed approval for the exact statement as authority.
+
+Migrate zorak by hand or in downtime after slice 4; keep it simple.
 
 Also open: `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
 is flaky under the parallel test runner and passes single-threaded.
+
+## Split admin grants between `root` and `director` (2026-09-16)
+
+`director` is banto's model seat and still carries the whole operator grant
+set (`assets/defaults/rc/director/create/S10-binding.kai`), which `root`
+now also holds. Decide which grants banto keeps (likely drive, fork, drift,
+operator) and which belong to roots only (likely `admin`, `config-write`,
+`system`). Amy chose the split on 2026-09-16 and left the grant list open.
+
+## Should `bassist` and `musician` merge? (Amy, 2026-09-16)
+
+Two rc bundles with the same verb set (`create`, `fork`, `rotate`, `tick`).
+Compare their scripts and grants and decide. Not part of the bootstrap work.
 
 ## Identity audit: what stays open (2026-09-15)
 
