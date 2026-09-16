@@ -64,7 +64,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio_util::sync::CancellationToken;
 // tokio::sync::Mutex used inside ConversationCache for per-context locking
@@ -154,39 +154,44 @@ fn extract_rpc_trace(
 // Server State
 // ============================================================================
 
-/// Per-context conversation sessions, each behind its own lock so
-/// concurrent prompts to the same context serialize properly.
+/// A context's turn lock and live conversation. Reset waits for the next
+/// lock acquisition; an active turn keeps its mailbox until it finishes.
+pub struct ConversationSession {
+    mailbox: tokio::sync::Mutex<ConversationMailbox>,
+    reset_pending: AtomicBool,
+}
+
+impl ConversationSession {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ConversationMailbox> {
+        let mut mailbox = self.mailbox.lock().await;
+        if self.reset_pending.swap(false, Ordering::SeqCst) {
+            *mailbox = ConversationMailbox::new();
+        }
+        mailbox
+    }
+}
+
+/// Per-context turn ownership and cached conversations.
 ///
-/// Each entry is a [`ConversationMailbox`] — the live, append-only
-/// session for that context (see `docs/conversation-session.md`).
-/// The LLM-stream path calls `mailbox.catch_up(&block_snapshots)` to
-/// fold any blocks that landed since the last turn, then `snapshot()`
-/// for the wire-history view. DashMap provides outer concurrent
-/// access; LRU eviction keeps memory bounded — an evicted context
-/// re-hydrates from blocks on next touch.
+/// Lookup and eviction share one registry lock. An entry can leave the
+/// registry only when no caller holds it, so every active or waiting turn
+/// for a context uses the same mutex. Idle LRU eviction still causes cold
+/// hydration on next use; see `docs/conversation-session.md`.
 ///
-/// Also owns the per-hash [`ImageBase64Cache`] so resolving the same
-/// screenshot every turn doesn't re-encode bytes. The image cache is
-/// keyed by content hash (global) but shares lifetime with this
-/// struct because both belong to the same LLM-stream subsystem.
+/// Also owns the content-hash image cache used by the LLM stream.
 pub struct ConversationCache {
-    entries: dashmap::DashMap<ContextId, Arc<tokio::sync::Mutex<ConversationMailbox>>>,
-    last_accessed: dashmap::DashMap<ContextId, std::time::Instant>,
+    entries: parking_lot::Mutex<HashMap<ContextId, (Arc<ConversationSession>, std::time::Instant)>>,
     max_contexts: usize,
     image_cache: Arc<kaijutsu_kernel::llm::image_cache::ImageBase64Cache>,
 }
 
 impl ConversationCache {
-    /// Create a new cache with the given capacity.
-    ///
-    /// `max_images` bounds the per-hash image cache; pick a value that covers
-    /// the longest conversation you expect to keep hot (4× max_contexts is
-    /// a defensible default).
+    /// Create a cache with the given idle conversation capacity.
+    /// Active sessions may temporarily exceed it.
     pub fn new(max_contexts: usize) -> Self {
         let max_images = max_contexts.saturating_mul(4).max(16);
         Self {
-            entries: dashmap::DashMap::new(),
-            last_accessed: dashmap::DashMap::new(),
+            entries: parking_lot::Mutex::new(HashMap::new()),
             max_contexts,
             image_cache: Arc::new(kaijutsu_kernel::llm::image_cache::ImageBase64Cache::new(
                 max_images,
@@ -199,66 +204,44 @@ impl ConversationCache {
         &self.image_cache
     }
 
-    /// Get or create the per-context mailbox lock. Returns an
-    /// `Arc<Mutex<ConversationMailbox>>` — the caller holds the lock
-    /// for the entire `process_llm_stream`, serializing concurrent
-    /// prompts to the same context.
-    pub fn get_or_create(
-        &self,
-        ctx: ContextId,
-    ) -> Arc<tokio::sync::Mutex<ConversationMailbox>> {
-        self.last_accessed.insert(ctx, std::time::Instant::now());
-
-        if let Some(entry) = self.entries.get(&ctx) {
-            return entry.clone();
+    /// Get the context's session. Hold its lock for the entire turn.
+    pub fn get_or_create(&self, ctx: ContextId) -> Arc<ConversationSession> {
+        let mut entries = self.entries.lock();
+        if let Some((session, accessed)) = entries.get_mut(&ctx) {
+            *accessed = std::time::Instant::now();
+            return session.clone();
         }
 
-        // Evict LRU if at capacity (skip entries with strong_count > 1, they're in active use)
-        if self.entries.len() >= self.max_contexts {
-            let mut oldest: Option<(ContextId, std::time::Instant)> = None;
-            for entry in self.last_accessed.iter() {
-                let ctx_id = *entry.key();
-                let accessed = *entry.value();
-                // Skip entries in active use
-                if let Some(e) = self.entries.get(&ctx_id)
-                    && Arc::strong_count(&e) > 1
-                {
-                    continue;
-                }
-                if oldest.is_none() || accessed < oldest.unwrap().1 {
-                    oldest = Some((ctx_id, accessed));
-                }
-            }
-            if let Some((evict_id, _)) = oldest {
-                self.entries.remove(&evict_id);
-                self.last_accessed.remove(&evict_id);
+        if entries.len() >= self.max_contexts {
+            let oldest = entries.iter()
+                .filter(|(_, (session, _))| Arc::strong_count(session) == 1)
+                .min_by_key(|(_, (_, accessed))| *accessed)
+                .map(|(ctx, _)| *ctx);
+            if let Some(ctx) = oldest {
+                entries.remove(&ctx);
             }
         }
 
-        let lock = Arc::new(tokio::sync::Mutex::new(ConversationMailbox::new()));
-        self.entries.insert(ctx, lock.clone());
-        lock
+        let session = Arc::new(ConversationSession {
+            mailbox: tokio::sync::Mutex::new(ConversationMailbox::new()),
+            reset_pending: AtomicBool::new(false),
+        });
+        entries.insert(ctx, (session.clone(), std::time::Instant::now()));
+        session
     }
 
-    /// Drop this context's cached mailbox so the next turn hydrates it
-    /// cold from the durable block log.
-    ///
-    /// `ConversationMailbox::catch_up` folds blocks it has not seen; it
-    /// has no way to notice that a block it already folded was edited in
-    /// place. Call this whenever code outside a running turn fills a
-    /// block already in the cache — the gate-resume driver settling a
-    /// `Waiting` pair to its real output, for one — so the stale text
-    /// does not linger for the rest of the conversation.
-    ///
-    /// An active turn retains its old `Arc`, but the next lookup creates a
-    /// different mutex. Eviction does not preserve turn exclusion across
-    /// those two entries.
-    // TODO: Keep turn exclusion stable across conversation reset and eviction.
-    // Cache pressure also changes which edits enter the next conversation.
-    // See docs/issues.md, "Conversation lifetime and turn exclusion".
+    /// Make the next turn hydrate cold without replacing an active turn's
+    /// lock. Use after filling a previously hydrated block in place:
+    /// `ConversationMailbox::catch_up` only sees blocks it has not folded.
     pub fn evict(&self, ctx: ContextId) {
-        self.entries.remove(&ctx);
-        self.last_accessed.remove(&ctx);
+        let mut entries = self.entries.lock();
+        if let Some((session, _)) = entries.get(&ctx) {
+            if Arc::strong_count(session) == 1 {
+                entries.remove(&ctx);
+            } else {
+                session.reset_pending.store(true, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -266,36 +249,65 @@ impl ConversationCache {
 mod conversation_cache_tests {
     use super::*;
 
-    /// `evict` drops the cached mailbox; the next `get_or_create` must hand
-    /// back a fresh, un-materialized one rather than the same `Arc` —
-    /// otherwise a driver that fills a pair in place has no way to make the
-    /// next turn hydrate cold.
     #[tokio::test]
-    async fn get_or_create_returns_a_fresh_mailbox_after_evict() {
+    async fn reset_waits_for_the_active_turn_without_replacing_its_lock() {
+        use futures::FutureExt;
+
         let cache = ConversationCache::new(4);
         let ctx = ContextId::new();
-
         let first = cache.get_or_create(ctx);
-        {
-            let mut mb = first.lock().await;
-            // Any feed materializes the mailbox, even an empty one — see
-            // `ConversationMailbox::catch_up`.
-            mb.catch_up(&[]);
-        }
-        assert!(first.lock().await.is_materialized());
+        let mut active = first.lock().await;
+        active.catch_up(&[]);
 
         cache.evict(ctx);
-
         let second = cache.get_or_create(ctx);
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "evict must remove the entry so get_or_create allocates a new mailbox"
-        );
-        assert!(
-            !second.lock().await.is_materialized(),
-            "the mailbox handed back after evict must be fresh, not the evicted one"
-        );
+        assert!(Arc::ptr_eq(&first, &second), "reset must preserve turn exclusion");
+        assert!(second.lock().now_or_never().is_none(), "next turn must wait");
+        assert!(active.is_materialized(), "reset must not interrupt the active turn");
+        drop(active);
+
+        let mut next = second.lock().await;
+        assert!(!next.is_materialized(), "next turn must hydrate cold");
+        next.catch_up(&[]);
+        drop(next);
+        assert!(first.lock().await.is_materialized(), "reset is consumed once");
     }
+
+    #[test]
+    fn simultaneous_first_lookups_share_one_turn_lock() {
+        let cache = ConversationCache::new(4);
+        let ctx = ContextId::new();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16).map(|_| scope.spawn(|| {
+                barrier.wait();
+                cache.get_or_create(ctx)
+            })).collect();
+            let sessions: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(sessions.iter().all(|session| Arc::ptr_eq(&sessions[0], session)));
+        });
+    }
+
+    #[tokio::test]
+    async fn cache_pressure_preserves_active_turns_and_resets_idle_conversations() {
+        let cache = ConversationCache::new(1);
+        let ctx = ContextId::new();
+        let first = cache.get_or_create(ctx);
+        first.lock().await.catch_up(&[]);
+        let other_ctx = ContextId::new();
+        let other = cache.get_or_create(other_ctx);
+        other.lock().await.catch_up(&[]);
+        assert!(Arc::ptr_eq(&first, &cache.get_or_create(ctx)));
+        assert!(first.lock().await.is_materialized());
+        drop(other);
+        drop(first);
+
+        let third = cache.get_or_create(ContextId::new());
+        let cold = cache.get_or_create(other_ctx);
+        assert!(!cold.lock().await.is_materialized());
+        drop(third);
+    }
+
 }
 
 /// One live FlowBus block-event subscription in the per-(principal, instance)

@@ -30,7 +30,11 @@ the mailbox or the durable blocks.
 A pair the gate-resume driver fills in place (`crates/kaijutsu-server/src/rpc.rs`,
 `act_on_executable_answer`) evicts the context's cached mailbox
 (`ConversationCache::evict`), so the next turn hydrates cold from the block
-log. `catch_up` folds blocks it has not seen; it has no way to notice that a
+log. Reset preserves the turn lock while any caller holds the session and
+takes effect after the active turn releases it. First lookup and idle eviction
+are serialized by the session registry; active and waiting turns cannot get
+different locks for one context. Idle LRU eviction retains its current cold
+hydration policy; changing that semantic boundary is separate work. `catch_up` folds blocks it has not seen; it has no way to notice that a
 block it already folded was edited afterward, so a cached mailbox would keep
 serving the pre-edit text for the rest of the conversation.
 

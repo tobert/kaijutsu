@@ -1387,3 +1387,10 @@ its own lock and identity in `Kernel::id()`. Durable `context_env` and
 `context_shell`, per-invocation kaish scope, and connection command history
 remain their existing owners. Tests solely exercising the retired API were
 deleted with it; context-shell and embedded-kaish tests cover the live paths.
+
+The next batch separates turn ownership from mailbox reset. Simultaneous
+first lookups and reset during an active turn both reproduced distinct locks
+for one context. The registry now serializes lookup and idle eviction; a held
+session keeps its mutex and consumes a pending reset when the next turn locks
+it. Idle LRU hydration policy stays unchanged. The regressions pass, including
+the existing two-turn approval-resume test that verifies refreshed tool output.

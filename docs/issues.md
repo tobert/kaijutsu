@@ -18,19 +18,17 @@ state". The remaining work below needs separate reviewable changes. Start
 behavior changes with red/green regressions; remove each issue and its source
 marker in the change that satisfies it.
 
-### Conversation lifetime and turn exclusion
+### Idle conversation reset policy
 
-`ConversationCache::evict` replaces the turn mutex while an active turn can
-retain its old Arc. LRU eviction also resets semantic conversation history.
-First reproduce overlapping ownership and edit visibility under cache pressure
-with deterministic tests. Give each context stable turn exclusion and an
-explicit conversation-reset transition. Decide when idle conversations may
-reset before changing LRU semantics; preserve context/conversation separation.
-This can proceed independently of document sequencing.
+Idle LRU eviction still resets semantic conversation history, so cache
+pressure can make stored edits visible on the next turn. Active and waiting
+turns retain one lock across reset; concurrent first lookups share it.
+Decide when idle conversations may reset before changing the LRU policy;
+preserve context/conversation separation. See `docs/conversation-session.md`.
 
 ### Turn execution and shell settlement
 
-After turn exclusion is stable, move the headless turn driver, interruption,
+Move the headless turn driver, interruption,
 and resumption lifecycle from server `rpc.rs` into kernel runtime ownership.
 Keep connection/session subscriptions in the server. In a separate change,
 project one settled shell outcome into blocks, receipts, and job results;
@@ -76,7 +74,7 @@ external-edit regressions from `docs/file-buffers.md`; only then remove clean
 read materialization. This remains a separate design change.
 
 **Order:** document sequencing (see "Document mutation
-and publication need one sequencer" below), stable turn ownership, runtime
+and publication need one sequencer" below), runtime
 settlement, shared recovery, rendering, then file-buffer persistence. Each
 requires its own reviewable change; the source TODOs point to these entries.
 
