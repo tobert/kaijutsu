@@ -1417,6 +1417,12 @@ publication. Keeping lock order explicit also exposed a subtree fork that
 reacquired its held database mutex; a persistent-store regression reproduced
 it where memory-only fixtures had not. Compound compose selection and complete
 change-feed acceptance groups remain separate, marked follow-ups.
+Journal replay now distinguishes an append from an explicit edit at the end.
+Appends preserve existing style spans; edits invalidate them. A regression
+through the real oplog reproduced lost spans and checks text, spans,
+provenance, and the edited marker, including an empty append. The payload
+already carried the distinction, so this needs no storage migration.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

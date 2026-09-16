@@ -4944,6 +4944,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn text_mutations_replay_with_live_style_and_provenance() {
+        use kaijutsu_types::{ProvenanceTag, StyleAttrs, StyleSpan};
+
+        for (append, text) in [(true, " 語"), (true, ""), (false, " 語")] {
+            let (store, _bus, db, _dir) = store_with_db_and_flows();
+            let ctx = ContextId::new();
+            store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let id = store.insert_block(
+                ctx, None, None, Role::Tool, BlockKind::ToolResult,
+                "日本", Status::Done, ContentType::Plain,
+            ).unwrap();
+            let spans = vec![StyleSpan {
+                start: 0, end: 6, fg: None, bg: None, attrs: StyleAttrs::BOLD,
+            }];
+            store.set_style_spans(ctx, &id, spans.clone(), Some(ProvenanceTag {
+                transform: "ansi-strip".to_string(), version: 1,
+            })).unwrap();
+
+            if append {
+                store.append_text(ctx, &id, text).unwrap();
+            } else {
+                store.edit_text(ctx, &id, 2, text, 0).unwrap();
+            }
+
+            let live = store.get_block_snapshot(ctx, &id).unwrap().unwrap();
+            assert_eq!(live.style_spans, if append { spans } else { Vec::new() });
+            assert!(live.edited_since_ingest);
+            let replayed = replay_journal(&db, ctx).get_block_snapshot(&id).unwrap();
+            assert_eq!(replayed.style_spans, live.style_spans, "append={append}, text={text:?}");
+            assert_eq!(replayed.provenance, live.provenance);
+            assert_eq!(replayed.edited_since_ingest, live.edited_since_ingest);
+            assert!(live.content_eq(&replayed),
+                "append={append}, text={text:?}: live {live:#?} != replay {replayed:#?}");
+        }
+    }
+
     #[tokio::test]
     async fn test_set_signature_survives_oplog_replay_without_compaction() {
         let (store, _bus, db, _dir) = store_with_db_and_flows();

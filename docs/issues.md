@@ -2319,16 +2319,6 @@ one and forces a snapshot. Preserve complete acceptance groups before
 claiming transactional delivery; a four-millisecond window cannot guarantee
 it. Keep the existing recovery check until that contract is tested.
 
-## Oplog replay clears spans that live appends keep (2026-08-19)
-
-`BlockContent::append_text` (end-append) keeps `style_spans`; `merge_ops`
-replay still applies journaled appends through `edit_text`
-(`blocks/block_store.rs:993`), which clears spans unconditionally
-(`block.rs:2872`). Harmless under buffer-until-done ordering (spans land
-after all appends); wrong the day spans land before later appends. Verify
-whether `updated_snapshots` replay (which may run last) already repairs
-this before building anything.
-
 ## vte 0.15.0 drops a control byte after a chunked partial UTF-8 codepoint (2026-08-19)
 
 Upstream bug in `vte::Parser::advance_partial_utf8` (not `kaijutsu-ansi`):

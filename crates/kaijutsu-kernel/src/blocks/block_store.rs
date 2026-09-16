@@ -1313,7 +1313,7 @@ impl BlockDocument {
     /// concurrently — never two independently-edited replicas reconciling a
     /// genuine divergence, which is structurally impossible here. A
     /// `block_ops` entry is therefore replayed as the literal edit it
-    /// records (`BlockContent::edit_text`), not merged against a tracked
+    /// records (append or edit), not merged against a tracked
     /// causal history.
     pub fn merge_ops(&mut self, payload: SyncPayload) -> Result<()> {
         // Restore the tick high-water across the merge: a freshly-stamped tick
@@ -1417,7 +1417,13 @@ impl BlockDocument {
                     len,
                 });
             }
-            block.edit_text(pos, &edit.insert, edit.delete);
+            if edit.pos.is_none() {
+                // Appends preserve earlier spans, including on replay. An
+                // explicit edit at the end still follows edit invalidation.
+                block.append_text(&edit.insert);
+            } else {
+                block.edit_text(pos, &edit.insert, edit.delete);
+            }
         }
 
         // Apply tombstone deletions
