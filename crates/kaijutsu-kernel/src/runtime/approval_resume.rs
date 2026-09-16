@@ -1,7 +1,7 @@
 //! Approval delivery and execution of approved source in its captured context.
 //!
 //! The ledger owns claims and answers; shared command execution owns settlement.
-//! Driver thread shutdown remains part of the runtime migration.
+//! The kernel worker owns delivery, cancellation, and joined settlement.
 
 use std::sync::Arc;
 use crate::{Kernel, KernelDb};
@@ -287,6 +287,19 @@ fn needs_no_shell_turn_seed(linked: Option<(BlockId, BlockId, crate::PairOwner)>
     !matches!(linked, Some((_, _, crate::PairOwner::Session)))
 }
 
+/// Preparation may stop immediately: its caller still owns the claimed ask
+/// and reports that no source ran. Execution uses cooperative command settlement.
+async fn prepare_while_running<T, E: std::fmt::Display>(
+    stop: &tokio_util::sync::CancellationToken,
+    prepare: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => Err("kernel runtime shut down before approved execution".into()),
+        result = prepare => result.map_err(|error| error.to_string()),
+    }
+}
+
 /// Run an answered ask that carries executable source, or settle the blocks
 /// waiting on it when it was refused.
 ///
@@ -304,7 +317,9 @@ async fn act_on_executable_answer(
     answer: &crate::UndeliveredAnswer,
     ask: &ExecutableAsk,
     who: &str,
+    stop: &tokio_util::sync::CancellationToken,
 ) -> ExecAction {
+    if stop.is_cancelled() { return ExecAction::Deferred; }
     let source = ask.source.as_str();
     let linked = ask.pair;
 
@@ -407,7 +422,7 @@ async fn act_on_executable_answer(
     // keyed by it.
     let session_id = SessionId::new();
     let name = format!("{}-gate-{}", kernel.id(), session_id.short());
-    let kaish = match async {
+    let kaish = match prepare_while_running(stop, async {
         let dispatcher = kernel.broker().kj_dispatcher().await.ok_or_else(||
             anyhow::anyhow!("context shell requires a registered kj dispatcher"))?;
         EmbeddedKaish::for_context(
@@ -421,7 +436,7 @@ async fn act_on_executable_answer(
         dispatcher.semantic_index(),
         dispatcher.block_source(),
         ).await
-    }.await {
+    }).await {
         Ok(kaish) => kaish,
         Err(e) => {
             tracing::error!(
@@ -472,39 +487,27 @@ async fn act_on_executable_answer(
         },
     };
 
-    // The directory the human was asked about, not wherever the context has
-    // reached since. A cwd that no longer resolves stops the run: the
-    // approved text was read against that directory, and running it
-    // somewhere else is a different action.
-    if let Some(cwd) = ask.cwd.as_deref()
-        && !kaish.try_set_cwd(std::path::PathBuf::from(cwd)).await
-    {
-        let reason = format!(
-            "approved, but not run: {cwd} — the directory this was raised in — no longer \
-             resolves to a directory"
-        );
-        settle_pair_error(
-            kernel,
-            context_id,
-            &command_block_id,
-            &output_block_id,
-            reason,
-        );
+    // Restore captured inputs before execution. Cancellation after redemption
+    // spends the approval but settles its pair without running the source.
+    let cwd_error = if let Some(cwd) = ask.cwd.as_deref() {
+        prepare_while_running(stop, async {
+            if kaish.try_set_cwd(std::path::PathBuf::from(cwd)).await { Ok(()) }
+            else { Err(format!("the approved directory {cwd} no longer resolves to a directory")) }
+        }).await.err()
+    } else { None };
+    if let Some(why) = cwd_error {
+        settle_pair_error(kernel, context_id, &command_block_id, &output_block_id,
+            format!("approved, but not run: {why}"));
         return if tell {
             ExecAction::Tell(format!(
                 "{who} approved the action you were waiting on: {}\n\n\
-                 It did NOT run: {cwd} — the directory it was raised in — no longer \
-                 resolves. Block {} carries the same message. Ask again from a \
-                 directory that exists.",
-                answer.description,
-                output_block_id.to_key()
+                 It did NOT run: {why}. Block {} carries the same message. Ask again.",
+                answer.description, output_block_id.to_key()
             ))
-        } else {
-            ExecAction::Settled
-        };
+        } else { ExecAction::Settled };
     }
 
-    if let Err(why) = seed_ask_env(&kaish, &answer.request_id, kernel).await {
+    if let Err(why) = prepare_while_running(stop, seed_ask_env(&kaish, &answer.request_id, kernel)).await {
         let reason = format!("approved, but not run: {why}");
         settle_pair_error(
             kernel,
@@ -538,7 +541,7 @@ async fn act_on_executable_answer(
         kernel,
         &crate::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id())
             .with_actor(ask.actor, Some(ask.reviewer)),
-        CommandRunOptions { stdin: ask.stdin.clone(), ..Default::default() },
+        CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(stop.clone()), ..Default::default() },
     )
     .await {
         kernel.turns().conversations().evict(context_id);
@@ -566,399 +569,411 @@ async fn act_on_executable_answer(
     }
 }
 
-/// Deliver answered asks and run approved source in its captured context.
-///
-/// Claim an executable answer before running it. Fill its existing pair, or
-/// author one when absent. Model-owned pairs receive a seed describing the
-/// outcome; session-owned pairs are observed directly. Non-executable answers
-/// wake a model to retry only when its continuation window is still open.
-pub fn spawn_gate_resume_driver(kernel: Arc<Kernel>) {
-    // An approved `kj context create` or `kj fork` runs its rc lifecycle on
-    // THIS thread, re-entering kaish deeply; the default 2 MiB stack
-    // overflows and aborts the whole server. Same reservation as the SSH
-    // session and beat-scheduler threads — see `spawn_kaish_thread`.
-    if let Err(e) = crate::spawn_kaish_thread("gate-resume", move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                tracing::error!("gate-resume: failed to build runtime: {e}");
-                return;
+/// Subscribe and snapshot old answers before accepting new delivery. Startup
+/// failure reaches the host; the worker owns cancellation and joined settlement.
+pub(crate) fn start(kernel: &Arc<Kernel>) -> Result<(), String> {
+    let sub = kernel.ledger_flows().subscribe("ledger.changed");
+    // Answers already outstanding belong to callers from the previous lifetime.
+    // Never wake that backlog because an unrelated new answer arrives.
+    let woken = kernel.kernel_db().lock().undelivered_answers()
+        .map_err(|error| format!("could not read approval backlog: {error}"))?
+        .into_iter().map(|answer| answer.request_id).collect();
+    let owner = Arc::downgrade(kernel);
+    kernel.spawn_command(move |stop| run_delivery(owner, sub, woken, stop))
+}
+
+async fn run_delivery(
+    owner: std::sync::Weak<Kernel>,
+    mut sub: crate::flows::Subscription<crate::flows::LedgerFlow>,
+    mut woken: std::collections::HashSet<String>,
+    stop: tokio_util::sync::CancellationToken,
+) {
+    // Bound provider spending from one event. Unhandled answers remain in the
+    // ledger for a later event; each scan reads authoritative state again.
+    const WAKE_CAP_PER_EVENT: usize = 4;
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            event = sub.recv() => if event.is_none() { return; },
+        }
+        let Some(owner) = owner.upgrade() else { return; };
+        let kernel = &owner;
+        // The event carries only a generation; the ledger is the
+        // authority, so re-read it rather than trusting the number.
+        // `ledger.changed` is on the timing lane (lossy by design):
+        // dropping events is safe here because any later one
+        // re-reads everything still outstanding.
+        let answers = {
+            let db = kernel.kernel_db().lock();
+            match db.undelivered_answers() {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!("gate-resume: could not read the ledger: {e}");
+                    continue;
+                }
             }
         };
-        // A LocalSet, like the runtime worker: executing an approved ask
-        // materializes an `EmbeddedKaish` on this thread, and kaish's own
-        // execution path is not `Send`.
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
-            let kernel = &kernel;
-            let mut sub = kernel.ledger_flows().subscribe("ledger.changed");
-            tracing::info!("Gate-resume driver online");
 
-            // Answers this driver has already woken someone for. The ledger
-            // row does not clear until the caller actually retries, so
-            // without this every later `ledger.changed` would wake the same
-            // context again for the same answer.
-            //
-            // In memory on purpose. A restart clears it, and re-waking once
-            // after a restart is the harmless side of the trade — the wake
-            // costs a turn, never a duplicated action.
-            let mut woken: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-            // Ignore answers already outstanding at startup. Their callers
-            // did not survive restart; a new event must not wake the backlog.
-            match kernel.kernel_db().lock().undelivered_answers() {
-                Ok(rows) => {
-                    let n = rows.len();
-                    woken.extend(rows.into_iter().map(|a| a.request_id));
-                    tracing::info!("gate-resume: {n} answer(s) already outstanding at start; not waking those");
-                }
-                Err(e) => {
-                    // Fail loud and stay closed: an empty seed set would
-                    // wake the whole backlog on the next event.
-                    tracing::error!(
-                        "gate-resume: could not read the outstanding answers at start ({e}); \
-                         driver exiting rather than risk waking the backlog"
-                    );
-                    return;
-                }
+        let mut woken_this_event = 0usize;
+        for answer in answers {
+            if stop.is_cancelled() { return; }
+            if woken.contains(&answer.request_id) {
+                continue;
             }
+            if woken_this_event >= WAKE_CAP_PER_EVENT {
+                tracing::warn!(
+                    "gate-resume: stopped at {WAKE_CAP_PER_EVENT} wakes for one ledger \
+                     change; the rest wait for the next one"
+                );
+                break;
+            }
+            let Ok(bytes) = <[u8; 16]>::try_from(answer.context_id.as_slice()) else {
+                tracing::error!(
+                    "gate-resume: ask {} has a context_id that is not 16 bytes; skipping",
+                    answer.request_id
+                );
+                continue;
+            };
+            let context_id = ContextId::from(uuid::Uuid::from_bytes(bytes));
 
-            // A single ledger change should never wake more than a handful of
-            // contexts. More than this means something is wrong with the
-            // predicate, and a herd of LLM turns is the expensive way to find
-            // out — stop at the cap and say so.
-            const WAKE_CAP_PER_EVENT: usize = 4;
-
-            while sub.recv().await.is_some() {
-                // The event carries only a generation; the ledger is the
-                // authority, so re-read it rather than trusting the number.
-                // `ledger.changed` is on the timing lane (lossy by design):
-                // dropping events is safe here because any later one
-                // re-reads everything still outstanding.
-                let answers = {
-                    let db = kernel.kernel_db().lock();
-                    match db.undelivered_answers() {
-                        Ok(rows) => rows,
-                        Err(e) => {
-                            tracing::error!("gate-resume: could not read the ledger: {e}");
-                            continue;
-                        }
-                    }
-                };
-
-                let mut woken_this_event = 0usize;
-                for answer in answers {
-                    if woken.contains(&answer.request_id) {
-                        continue;
-                    }
-                    if woken_this_event >= WAKE_CAP_PER_EVENT {
-                        tracing::warn!(
-                            "gate-resume: stopped at {WAKE_CAP_PER_EVENT} wakes for one ledger \
-                             change; the rest wait for the next one"
-                        );
-                        break;
-                    }
-                    let Ok(bytes) = <[u8; 16]>::try_from(answer.context_id.as_slice()) else {
-                        tracing::error!(
-                            "gate-resume: ask {} has a context_id that is not 16 bytes; skipping",
-                            answer.request_id
-                        );
-                        continue;
-                    };
-                    let context_id = ContextId::from(uuid::Uuid::from_bytes(bytes));
-
-                    // Preserve the requester: redemption is principal-scoped.
-                    let Ok(pbytes) = <[u8; 16]>::try_from(answer.principal_id.as_slice())
-                    else {
-                        tracing::error!(
-                            "gate-resume: ask {} has a principal_id that is not 16 bytes; skipping",
-                            answer.request_id
-                        );
-                        continue;
-                    };
-                    let principal_id =
-                        kaijutsu_types::PrincipalId::from(uuid::Uuid::from_bytes(pbytes));
+            // Preserve the requester: redemption is principal-scoped.
+            let Ok(pbytes) = <[u8; 16]>::try_from(answer.principal_id.as_slice())
+            else {
+                tracing::error!(
+                    "gate-resume: ask {} has a principal_id that is not 16 bytes; skipping",
+                    answer.request_id
+                );
+                continue;
+            };
+            let principal_id =
+                kaijutsu_types::PrincipalId::from(uuid::Uuid::from_bytes(pbytes));
 
 
-                    // Audit rows outlive their contexts. Only live contexts
-                    // may receive a seed or spend another provider request.
-                    match kernel.kernel_db().lock().get_context(context_id) {
-                        Ok(Some(row)) if context_row_is_live(&row) => {}
-                        Ok(Some(row)) => {
-                            tracing::info!(
-                                "gate-resume: {context_id} is {}; leaving ask {} uncollected",
-                                if row.is_archived() {
-                                    "archived".to_string()
-                                } else {
-                                    format!("{:?}, not Live", row.context_state)
-                                },
-                                answer.request_id
-                            );
-                            woken.insert(answer.request_id.clone());
-                            continue;
-                        }
-                        Ok(None) => {
-                            tracing::info!(
-                                "gate-resume: {context_id} no longer exists; leaving ask {} \
-                                 uncollected",
-                                answer.request_id
-                            );
-                            woken.insert(answer.request_id.clone());
-                            continue;
-                        }
-                        Err(e) => {
-                            // Fail closed: an unreadable context is not a
-                            // reason to write into it.
-                            tracing::error!(
-                                "gate-resume: could not read context {context_id} ({e}); not waking"
-                            );
-                            continue;
-                        }
-                    }
-
-                    // The whole row, because the summary does not carry
-                    // `exec_source` — and whether an answer runs here or
-                    // sends its caller back to try again is exactly that
-                    // field.
-                    let row = match kernel.kernel_db().lock().get_approval(&answer.request_id) {
-                        Ok(Some(row)) => row,
-                        Ok(None) => {
-                            tracing::error!(
-                                "gate-resume: ask {} has an answer but no row; skipping",
-                                answer.request_id
-                            );
-                            woken.insert(answer.request_id.clone());
-                            continue;
-                        }
-                        Err(e) => {
-                            // Fail closed: an unreadable row is not a reason
-                            // to guess which branch it belongs in.
-                            tracing::error!(
-                                "gate-resume: could not read ask {} ({e}); not acting on it",
-                                answer.request_id
-                            );
-                            continue;
-                        }
-                    };
-
-                    // Executable asks run here; other answers wake the
-                    // original caller to retry and redeem. Name the answerer
-                    // in the seed using its current character sheet.
-                    let who = answerer_name(kernel.kernel_db(), row.decided_by.as_deref());
-                    let actor = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice);
-                    let reviewer = row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice);
-                    let (Some(actor), Some(reviewer)) = (actor, reviewer) else {
-                        tracing::error!("gate-resume: ask {} has no resolved actor/reviewer; nothing was run", answer.request_id);
-                        woken.insert(answer.request_id.clone());
-                        continue;
-                    };
-                    let pair = match approval_pair(
-                        row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner,
-                    ) {
-                        Ok(pair) => pair,
-                        Err(reason) => {
-                            tracing::error!("gate-resume: ask {}: {reason}; nothing was run", answer.request_id);
-                            woken.insert(answer.request_id.clone());
-                            continue;
-                        }
-                    };
-                    let executable = row.exec_source.clone().map(|source| {
-                        let denial = match row.decided_option.as_deref() {
-                            Some("cancel") => format!("cancelled by {who} — nothing was run"),
-                            Some(option) => format!("denied by {who} ({option}) — nothing was run"),
-                            None => format!("denied by {who} — nothing was run"),
-                        };
-                        ExecutableAsk {
-                            source,
-                            stdin: row.exec_stdin.clone(),
-                            cwd: row.cwd.clone(),
-                            actor,
-                            reviewer,
-                            pair,
-                            denial,
-                        }
-                    });
-
-                    let executed_seed = match executable {
-                        None => None,
-                        Some(ask) => {
-                            match act_on_executable_answer(
-                                kernel,
-                                context_id,
-                                principal_id,
-                                &answer,
-                                &ask,
-                                &who,
-                            )
-                            .await
-                            {
-                                ExecAction::Settled => {
-                                    woken.insert(answer.request_id.clone());
-                                    woken_this_event += 1;
-                                    continue;
-                                }
-                                ExecAction::Deferred => continue,
-                                ExecAction::Tell(text) => Some(text),
-                                ExecAction::FallThrough => None,
-                            }
-                        }
-                    };
-
-                    let turn_in_flight = kernel.turn_in_flight(context_id);
-
-                    // A plain wake is skipped while a turn is already
-                    // running: it will make its own next attempt, and if it
-                    // ends without retrying, the next ledger change picks
-                    // this up again. Not marked woken, so that retry stays
-                    // possible.
-                    //
-                    // An executed seed is never skipped this way, in flight
-                    // or not: filling a pair is an in-place edit, and a
-                    // running turn's cached mailbox does not re-read an
-                    // already-seen block on its own `catch_up`
-                    // (`llm/mailbox.rs`) — the seed is the only trace of the
-                    // fill that reaches it.
-                    if executed_seed.is_none() && turn_in_flight {
-                        continue;
-                    }
-
-                    let seed = executed_seed.unwrap_or_else(|| {
-                        let (decision, next) = match answer.status {
-                            crate::ApprovalStatus::Allowed => ("approved", "Try the same call again; this approval authorizes it once."),
-                            crate::ApprovalStatus::Abandoned => ("cancelled", "Do not retry the cancelled action. Continue with the rest of your work."),
-                            _ => ("denied", "Do not retry the denied action. Continue with the rest of your work."),
-                        };
-                        format!("{who} {decision} the action you were waiting on: {}\n\nNothing has run yet. {next}", answer.description)
-                    });
-
-                    let tail = kernel.blocks().last_block_id(context_id);
-                    let seed_block = match kernel.blocks().insert_block_as(
-                        context_id,
-                        None,
-                        tail.as_ref(),
-                        kaijutsu_types::Role::User,
-                        kaijutsu_types::BlockKind::Text,
-                        seed.clone(),
-                        kaijutsu_types::Status::Done,
-                        kaijutsu_types::ContentType::Plain,
-                        None,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            tracing::error!(
-                                "gate-resume: failed to write the seed block for {context_id}: {e}"
-                            );
-                            continue;
-                        }
-                    };
-
-                    if answer.status == crate::ApprovalStatus::Abandoned {
-                        if let Err(e) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
-                            tracing::error!("gate-resume: cancellation delivery could not be recorded for {}: {e}", answer.request_id);
-                            continue;
-                        }
-                    }
-
-                    // A turn is already in flight: the seed just written is
-                    // the trace of the fill, read on that turn's next
-                    // `catch_up` or on the next drive, and there is no turn
-                    // to request.
-                    if turn_in_flight {
-                        woken.insert(answer.request_id.clone());
-                        woken_this_event += 1;
-                        tracing::info!(
-                            "gate-resume: left a seed for {context_id}'s in-flight turn, ask {}",
-                            answer.request_id
-                        );
-                        continue;
-                    }
-
-                    let Some(continuation_epoch) = row.continuation_epoch else {
-                        woken.insert(answer.request_id.clone());
-                        woken_this_event += 1;
-                        tracing::info!(
-                            "gate-resume: delivered {} to {context_id} without automatic continuation; the ask predates continuation epochs",
-                            answer.request_id
-                        );
-                        continue;
-                    };
-                    let window = match kernel.gate_resume_window().await {
-                        Ok(window) => window,
-                        Err(error) => {
-                            woken.insert(answer.request_id.clone());
-                            woken_this_event += 1;
-                            tracing::error!(
-                                "gate-resume: delivered {} but could not read continuation policy: {error}",
-                                answer.request_id
-                            );
-                            continue;
-                        }
-                    };
-                    let window_ms = match i64::try_from(window.as_millis()) {
-                        Ok(window_ms) => window_ms,
-                        Err(_) => {
-                            woken.insert(answer.request_id.clone());
-                            woken_this_event += 1;
-                            tracing::error!(
-                                "gate-resume: delivered {} but continuation window is too large",
-                                answer.request_id
-                            );
-                            continue;
-                        }
-                    };
-                    let automatic_resume_allowed = match kernel.kernel_db().lock()
-                        .automatic_resume_allowed(
-                            context_id,
-                            continuation_epoch,
-                            kaijutsu_types::now_millis() as i64,
-                            window_ms,
-                        )
-                    {
-                        Ok(allowed) => allowed,
-                        Err(error) => {
-                            tracing::error!(
-                                "gate-resume: delivered {} but could not check continuation epoch: {error}",
-                                answer.request_id
-                            );
-                            false
-                        }
-                    };
-                    if !automatic_resume_allowed {
-                        woken.insert(answer.request_id.clone());
-                        woken_this_event += 1;
-                        tracing::info!(
-                            "gate-resume: delivered {} to {context_id}; its continuation window is closed",
-                            answer.request_id
-                        );
-                        continue;
-                    }
-
-                    if let Err(error) = kernel.request_turn(super::turn_request::TurnRequest {
-                        context_id, after_block_id: seed_block, content: seed,
-                        principal_id, model: None, continuation_epoch: Some(continuation_epoch),
-                    }) {
-                        tracing::warn!("gate-resume: {context_id} was not admitted: {error}");
-                        continue;
-                    }
-                    woken.insert(answer.request_id.clone());
-                    woken_this_event += 1;
+            // Audit rows outlive their contexts. Only live contexts
+            // may receive a seed or spend another provider request.
+            match kernel.kernel_db().lock().get_context(context_id) {
+                Ok(Some(row)) if context_row_is_live(&row) => {}
+                Ok(Some(row)) => {
                     tracing::info!(
-                        "gate-resume: woke {context_id} for {:?} ask {}",
-                        answer.status,
+                        "gate-resume: {context_id} is {}; leaving ask {} uncollected",
+                        if row.is_archived() {
+                            "archived".to_string()
+                        } else {
+                            format!("{:?}, not Live", row.context_state)
+                        },
                         answer.request_id
                     );
+                    woken.insert(answer.request_id.clone());
+                    continue;
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        "gate-resume: {context_id} no longer exists; leaving ask {} \
+                         uncollected",
+                        answer.request_id
+                    );
+                    woken.insert(answer.request_id.clone());
+                    continue;
+                }
+                Err(e) => {
+                    // Fail closed: an unreadable context is not a
+                    // reason to write into it.
+                    tracing::error!(
+                        "gate-resume: could not read context {context_id} ({e}); not waking"
+                    );
+                    continue;
                 }
             }
-            tracing::warn!("gate-resume: ledger bus closed, driver exiting");
-        });
-    }) {
-        tracing::error!("Failed to spawn gate-resume thread: {e}");
+
+            // The whole row, because the summary does not carry
+            // `exec_source` — and whether an answer runs here or
+            // sends its caller back to try again is exactly that
+            // field.
+            let row = match kernel.kernel_db().lock().get_approval(&answer.request_id) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    tracing::error!(
+                        "gate-resume: ask {} has an answer but no row; skipping",
+                        answer.request_id
+                    );
+                    woken.insert(answer.request_id.clone());
+                    continue;
+                }
+                Err(e) => {
+                    // Fail closed: an unreadable row is not a reason
+                    // to guess which branch it belongs in.
+                    tracing::error!(
+                        "gate-resume: could not read ask {} ({e}); not acting on it",
+                        answer.request_id
+                    );
+                    continue;
+                }
+            };
+
+            // Executable asks run here; other answers wake the
+            // original caller to retry and redeem. Name the answerer
+            // in the seed using its current character sheet.
+            let who = answerer_name(kernel.kernel_db(), row.decided_by.as_deref());
+            let actor = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice);
+            let reviewer = row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice);
+            let (Some(actor), Some(reviewer)) = (actor, reviewer) else {
+                tracing::error!("gate-resume: ask {} has no resolved actor/reviewer; nothing was run", answer.request_id);
+                woken.insert(answer.request_id.clone());
+                continue;
+            };
+            let pair = match approval_pair(
+                row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner,
+            ) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    tracing::error!("gate-resume: ask {}: {reason}; nothing was run", answer.request_id);
+                    woken.insert(answer.request_id.clone());
+                    continue;
+                }
+            };
+            let executable = row.exec_source.clone().map(|source| {
+                let denial = match row.decided_option.as_deref() {
+                    Some("cancel") => format!("cancelled by {who} — nothing was run"),
+                    Some(option) => format!("denied by {who} ({option}) — nothing was run"),
+                    None => format!("denied by {who} — nothing was run"),
+                };
+                ExecutableAsk {
+                    source,
+                    stdin: row.exec_stdin.clone(),
+                    cwd: row.cwd.clone(),
+                    actor,
+                    reviewer,
+                    pair,
+                    denial,
+                }
+            });
+
+            let executed_seed = match executable {
+                None => None,
+                Some(ask) => {
+                    match act_on_executable_answer(
+                        kernel,
+                        context_id,
+                        principal_id,
+                        &answer,
+                        &ask,
+                        &who,
+                        &stop,
+                    )
+                    .await
+                    {
+                        ExecAction::Settled => {
+                            woken.insert(answer.request_id.clone());
+                            woken_this_event += 1;
+                            continue;
+                        }
+                        ExecAction::Deferred => continue,
+                        ExecAction::Tell(text) => Some(text),
+                        ExecAction::FallThrough => None,
+                    }
+                }
+            };
+
+            if stop.is_cancelled() { return; }
+            let turn_in_flight = kernel.turn_in_flight(context_id);
+
+            // A plain wake is skipped while a turn is already
+            // running: it will make its own next attempt, and if it
+            // ends without retrying, the next ledger change picks
+            // this up again. Not marked woken, so that retry stays
+            // possible.
+            //
+            // An executed seed is never skipped this way, in flight
+            // or not: filling a pair is an in-place edit, and a
+            // running turn's cached mailbox does not re-read an
+            // already-seen block on its own `catch_up`
+            // (`llm/mailbox.rs`) — the seed is the only trace of the
+            // fill that reaches it.
+            if executed_seed.is_none() && turn_in_flight {
+                continue;
+            }
+
+            let seed = executed_seed.unwrap_or_else(|| {
+                let (decision, next) = match answer.status {
+                    crate::ApprovalStatus::Allowed => ("approved", "Try the same call again; this approval authorizes it once."),
+                    crate::ApprovalStatus::Abandoned => ("cancelled", "Do not retry the cancelled action. Continue with the rest of your work."),
+                    _ => ("denied", "Do not retry the denied action. Continue with the rest of your work."),
+                };
+                format!("{who} {decision} the action you were waiting on: {}\n\nNothing has run yet. {next}", answer.description)
+            });
+
+            let tail = kernel.blocks().last_block_id(context_id);
+            let seed_block = match kernel.blocks().insert_block_as(
+                context_id,
+                None,
+                tail.as_ref(),
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                seed.clone(),
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+                None,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(
+                        "gate-resume: failed to write the seed block for {context_id}: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            if answer.status == crate::ApprovalStatus::Abandoned {
+                if let Err(e) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
+                    tracing::error!("gate-resume: cancellation delivery could not be recorded for {}: {e}", answer.request_id);
+                    continue;
+                }
+            }
+
+            // A turn is already in flight: the seed just written is
+            // the trace of the fill, read on that turn's next
+            // `catch_up` or on the next drive, and there is no turn
+            // to request.
+            if turn_in_flight {
+                woken.insert(answer.request_id.clone());
+                woken_this_event += 1;
+                tracing::info!(
+                    "gate-resume: left a seed for {context_id}'s in-flight turn, ask {}",
+                    answer.request_id
+                );
+                continue;
+            }
+
+            let Some(continuation_epoch) = row.continuation_epoch else {
+                woken.insert(answer.request_id.clone());
+                woken_this_event += 1;
+                tracing::info!(
+                    "gate-resume: delivered {} to {context_id} without automatic continuation; the ask predates continuation epochs",
+                    answer.request_id
+                );
+                continue;
+            };
+            let window = match prepare_while_running(&stop, kernel.gate_resume_window()).await {
+                Ok(window) => window,
+                Err(error) => {
+                    woken.insert(answer.request_id.clone());
+                    woken_this_event += 1;
+                    tracing::error!(
+                        "gate-resume: delivered {} but could not read continuation policy: {error}",
+                        answer.request_id
+                    );
+                    continue;
+                }
+            };
+            let window_ms = match i64::try_from(window.as_millis()) {
+                Ok(window_ms) => window_ms,
+                Err(_) => {
+                    woken.insert(answer.request_id.clone());
+                    woken_this_event += 1;
+                    tracing::error!(
+                        "gate-resume: delivered {} but continuation window is too large",
+                        answer.request_id
+                    );
+                    continue;
+                }
+            };
+            let automatic_resume_allowed = match kernel.kernel_db().lock()
+                .automatic_resume_allowed(
+                    context_id,
+                    continuation_epoch,
+                    kaijutsu_types::now_millis() as i64,
+                    window_ms,
+                )
+            {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    tracing::error!(
+                        "gate-resume: delivered {} but could not check continuation epoch: {error}",
+                        answer.request_id
+                    );
+                    false
+                }
+            };
+            if !automatic_resume_allowed {
+                woken.insert(answer.request_id.clone());
+                woken_this_event += 1;
+                tracing::info!(
+                    "gate-resume: delivered {} to {context_id}; its continuation window is closed",
+                    answer.request_id
+                );
+                continue;
+            }
+
+            if let Err(error) = kernel.request_turn(super::turn_request::TurnRequest {
+                context_id, after_block_id: seed_block, content: seed,
+                principal_id, model: None, continuation_epoch: Some(continuation_epoch),
+            }) {
+                tracing::warn!("gate-resume: {context_id} was not admitted: {error}");
+                continue;
+            }
+            woken.insert(answer.request_id.clone());
+            woken_this_event += 1;
+            tracing::info!(
+                "gate-resume: woke {context_id} for {:?} ask {}",
+                answer.status,
+                answer.request_id
+            );
+        }
     }
 }
 
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_shutdown_removes_the_approval_subscription() {
+        let kernel = Arc::new(Kernel::new_ephemeral("approval-shutdown").await);
+        kernel.start_approval_delivery().unwrap();
+        assert_eq!(kernel.ledger_flows().subscriber_count(), 1,
+            "startup must install the subscription before returning");
+        kernel.start_approval_delivery().unwrap();
+        assert_eq!(kernel.ledger_flows().subscriber_count(), 1,
+            "repeated startup must not create another delivery owner");
+        kernel.shutdown_command_worker().await.unwrap();
+        assert_eq!(kernel.ledger_flows().subscriber_count(), 0,
+            "shutdown returned while approval delivery was still listening");
+        assert!(kernel.start_approval_delivery().unwrap_err().contains("shut down"));
+    }
+
+    #[tokio::test]
+    async fn unreadable_backlog_refuses_startup_without_a_subscription() {
+        let kernel = Arc::new(Kernel::new_ephemeral("approval-startup-failure").await);
+        kernel.kernel_db().lock().conn_for_ledger()
+            .execute_batch("ALTER TABLE approvals RENAME TO inaccessible_approvals").unwrap();
+        let error = kernel.start_approval_delivery().unwrap_err();
+        assert!(error.contains("could not read approval backlog"), "{error}");
+        assert_eq!(kernel.ledger_flows().subscriber_count(), 0);
+        kernel.shutdown_command_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_delivery_does_not_keep_its_kernel_alive() {
+        let kernel = Arc::new(Kernel::new_ephemeral("approval-weak-owner").await);
+        kernel.start_approval_delivery().unwrap();
+        let owner = Arc::downgrade(&kernel);
+        drop(kernel);
+        assert!(owner.upgrade().is_none(), "idle delivery must not own the kernel");
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_pending_preparation() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let preparation = prepare_while_running(&stop,
+            std::future::pending::<Result<(), String>>());
+        tokio::pin!(preparation);
+        assert!(futures::poll!(&mut preparation).is_pending());
+        stop.cancel();
+        assert!(preparation.await.unwrap_err().contains("shut down before approved execution"));
+    }
+}
 
 #[cfg(test)]
 mod answerer_tests {

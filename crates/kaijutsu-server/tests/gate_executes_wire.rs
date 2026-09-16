@@ -402,6 +402,33 @@ impl Seats {
     }
 }
 
+#[test]
+fn shutdown_settles_an_approved_command_before_returning() {
+    run_local(async {
+        let scratch = Scratch::new("shutdown");
+        let s = seats().await;
+        let marker = scratch.marker();
+        let code = format!("echo entered > {}\nsleep 10\necho finished >> {}",
+            marker.display(), marker.display());
+        let ask = s.raise(&code).await;
+        let (command, output) = s.link_waiting_pair(&ask, &code, PairOwner::Session);
+        s.answer(&ask, true).await;
+        wait_for("approved execution to enter", || {
+            std::fs::read_to_string(&marker).is_ok_and(|content| content == "entered\n")
+        }).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2),
+            s.kernel.kernel.shutdown_command_worker()).await
+            .expect("shutdown must cancel the approved command").unwrap();
+        assert!(matches!(s.block(&output).status, Status::Done | Status::Error),
+            "shutdown returned before the approved output settled");
+        assert!(matches!(s.block(&command).status, Status::Done | Status::Error));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "entered\n",
+            "the cancelled command must not run its final statement");
+        assert!(!s.undelivered(&ask));
+        s.close().await;
+    });
+}
+
 /// The headline. An allowed ask whose blocks are already waiting on it goes
 /// `Waiting` → `Done` with the command's stdout in the output block, the
 /// approval is spent exactly once, and a later ledger change does not run it

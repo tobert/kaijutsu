@@ -130,20 +130,25 @@ Abrupt task destruction before capture still needs live terminal settlement and
 job/receipt agreement; startup reports interruption without replaying source.
 SIGTERM/SIGINT now await the command worker before checkpointing and exiting;
 host Drop remains a cancellation signal without a wait. Extend shutdown ownership
-to approval resumes and transport-owned command tasks as those owners migrate. Command cancellation also reaches block pairs without receipts.
+to transport-owned command tasks as those owners migrate. Command cancellation also reaches block pairs without receipts.
 
 Model streaming, identity resolution, conversation sessions, and interrupts now
 belong to kernel runtime modules. RPC translates startup errors but no longer
 owns those state fields. Accepted turns now run on the kernel worker; startup
 failures leave no interrupt. Normal exits, early failures, and panics share
-terminal-event cleanup; shutdown cancels and joins accepted work. Move the
-approval-resume thread into the shared shutdown owner next. Its logic lives in
-`runtime/approval_resume.rs`, with no server entry point. Startup must acknowledge
-its subscriptions before callers can submit answers, and failure must reach
-startup instead of only a thread log. Transport-owned command tasks remain to
-migrate. Headless requests now use direct runtime admission; no event subscriber
-count authorizes execution. Per-turn leases own liveness and interrupts for all
-accepted work, including queued turns.
+terminal-event cleanup; shutdown cancels and joins accepted work. Approval
+execution and delivery now use that worker too. Startup subscribes and snapshots
+old answers synchronously, reports failure to the host, and admits one owner.
+Shutdown cancels preparation and commands and joins settlement. Transport-owned
+command tasks remain to migrate. Headless requests use direct runtime admission;
+per-turn leases own liveness and interrupts, including queued turns.
+
+Approved execution still has preparation paths before shared command capture.
+A panic after redeeming an ask but before entering command execution can leave
+its linked pair Waiting. Track that exact pair through preparation unwinding;
+retain the spent claim and never replay source. Cancellation settles linked
+pairs, but shutdown can suppress the follow-up seed for an unlinked ask whose
+preparation failed. Retain that no-run delivery fact without starting a new turn.
 
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
 aggregate liveness when polling the log but returns on the first terminal event,

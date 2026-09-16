@@ -171,6 +171,7 @@ pub struct Kernel {
     shell_operations: Arc<crate::shell_operations::ShellOperationRegistry>,
     turn_state: crate::runtime::turn_state::TurnState,
     command_worker: OnceLock<Result<crate::runtime::worker::CommandWorker, String>>,
+    approval_delivery: OnceLock<Result<(), String>>,
     command_worker_shutdown: tokio_util::sync::CancellationToken,
     /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
     /// "Order from here: kernel wiring of the inbox"). `OnceLock` like
@@ -391,6 +392,7 @@ impl Kernel {
             },
             turn_state: crate::runtime::turn_state::TurnState::default(),
             command_worker: OnceLock::new(),
+            approval_delivery: OnceLock::new(),
             command_worker_shutdown: tokio_util::sync::CancellationToken::new(),
             cc_inbox: OnceLock::new(),
         };
@@ -413,14 +415,23 @@ impl Kernel {
         worker.submit(work)
     }
 
-    /// Signal accepted commands and model turns to cancel before their worker exits.
+    /// Start exactly one approval delivery subscription on the runtime worker.
+    /// Subscription and backlog reads finish before this returns.
+    pub fn start_approval_delivery(self: &Arc<Self>) -> Result<(), String> {
+        if self.command_worker_shutdown.is_cancelled() {
+            return Err("kernel runtime is shut down".into());
+        }
+        self.approval_delivery.get_or_init(|| crate::runtime::approval_resume::start(self)).clone()
+    }
+
+    /// Signal commands, model turns, and approval delivery to stop before worker exit.
     /// This does not wait for the worker; transport disconnects do not stop it.
     pub fn stop_command_worker(&self) {
         self.command_worker_shutdown.cancel();
         if let Some(Ok(worker)) = self.command_worker.get() { worker.stop(); }
     }
 
-    /// Stop accepting work and join command settlement and turn finalization.
+    /// Stop accepting work and join commands, turns, and approval delivery.
     pub async fn shutdown_command_worker(&self) -> Result<(), String> {
         self.stop_command_worker();
         match self.command_worker.get() {

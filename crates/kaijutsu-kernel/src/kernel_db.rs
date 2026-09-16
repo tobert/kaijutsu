@@ -2279,9 +2279,8 @@ impl KernelDb {
     /// Uncollected human answers for the execution/resume driver.
     /// Result reviews are consumed by their retained outcome owner.
     ///
-    /// Wrapped here rather than handing out the connection: the gate-resume
-    /// driver lives in `kaijutsu-server` and has no business knowing the
-    /// ledger's schema. See `docs/gate-resume.md`.
+    /// Runtime delivery reads through this API; the ledger owns its schema.
+    /// See `docs/gate-resume.md`.
     pub fn undelivered_answers(
         &self,
     ) -> KernelDbResult<Vec<approval_ledger::ask::UndeliveredAnswer>> {

@@ -456,6 +456,10 @@ impl SshServer {
         .await
         .map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
 
+        // Subscribe before publishing the kernel to callers. Startup failure
+        // refuses the host instead of silently leaving approved work undelivered.
+        shared_kernel.kernel.start_approval_delivery().map_err(std::io::Error::other)?;
+
         // Best-effort: a test that asked for the kernel handle but dropped
         // its receiver (or never awaited it) must not abort server startup.
         if let Some(kernel_tx) = kernel_tx {
@@ -481,10 +485,6 @@ impl SshServer {
         });
 
         log::info!("Shared kernel created: {}", registry.kernel.name);
-
-        // Headless requests enter the kernel worker directly. Approval delivery
-        // still has a dedicated driver; joined shutdown remains in docs/issues.md.
-        kaijutsu_kernel::runtime::approval_resume::spawn_gate_resume_driver(registry.kernel.kernel.clone());
 
         // The single coalescing beat scheduler: drives per-context hyoushigi
         // timelines on their wall-clock beat (musician contexts). Installs its

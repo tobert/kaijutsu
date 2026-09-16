@@ -111,8 +111,9 @@ callers share startup and the kernel worker. Each accepted turn owns its own
 liveness and interrupt registration, survives submitter teardown, and cancels
 and settles during worker shutdown. `runtime/turn_request.rs` admits headless
 requests directly; its events report admission and outcomes.
-`runtime/approval_resume.rs` handles answered asks on a dedicated thread that
-still needs joined shutdown; see `docs/kaish-integration.md`.
+`runtime/approval_resume.rs` handles answered asks on the same worker. Startup
+installs its subscription before returning; shutdown cancels preparation and
+execution and joins settlement. See `docs/kaish-integration.md`.
 
 **kaish**, the shell, runs embedded inside the kernel. `EmbeddedKaish`
 (`kaijutsu-kernel/src/runtime/embedded_kaish.rs:59`) runs the kaish interpreter

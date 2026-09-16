@@ -426,36 +426,22 @@ is redeemable.*
 
 ## Still open
 
-**A `ledger.changed` driver already exists and is shipped.**
-`spawn_gate_resume_driver` (`kaijutsu-server/src/rpc.rs`) wakes each context
-holding an answer nobody has collected, by writing a seed block and
-publishing a turn request — the two steps `kj drive --prompt` takes. The
-woken turn retries the tool call, and *that* attempt is what redeems. It is
-seeded with the outstanding backlog at start (waking all of it once drove
-the kernel to 754% CPU), capped at four wakes per event, and wakes only a
-`Live` context. Denials wake too: a denied caller that is never woken keeps
-"waiting on a human" as its last word.
+**Approval delivery runs on the kernel worker.**
+`Kernel::start_approval_delivery` installs one `ledger.changed` subscription and
+snapshots the outstanding backlog before returning. It refuses unreadable
+startup state. `runtime/approval_resume.rs` re-reads uncollected answers on each
+event, handles only Live contexts, and caps wakes at four per event.
 
-An earlier version of this section said nothing resumes an approval on its
-own. That was true when written and stopped being true when the driver
-shipped; it was restated as still-open on 2026-09-01 and is corrected here.
+Allowed executable asks are claimed before execution, then fill their existing
+command/output pair or author one. Denied and cancelled linked pairs settle
+without execution. Other answers write a seed and request automatic continuation
+only within the original window; the caller retries and redeems the answer.
+Result reviews belong to their retained command owner and are excluded here.
 
-**Ruled 2026-09-01: approval should EXECUTE, not wake**
-(`docs/gate-shape-b.md`, "Slice 5: approval executes"). `kj ledger allow
-<id>` runs the stored source itself and fills the command and output blocks
-already sitting `Waiting` on that ask, instead of driving a turn that
-re-issues the call.
-
-**The driver's own doc comment is the caution to read first.** It says it
-does not need exactly-once and deliberately does not implement it, because
-"every hard problem it carried — exactly-once across a crash, a `claimed`
-row nobody can resolve — belonged to executing the action, and this does not
-execute anything." Waking twice costs one wasted turn; executing twice does
-not. What keeps the ruled design out of that territory is that it stays in
-memory and nothing survives a restart, so the exactly-once it needs is the
-within-process one `approval_redemptions` already gives — but the line is
-thinner here than anywhere else in this lane, and it is where to look first
-if something goes wrong.
+Shutdown stops delivery, cancels preparation and commands, and waits for command
+settlement. A spent claim never authorizes replay, including after a preparation
+failure. Restart does not resume approved source. See `docs/gate-shape-b.md`,
+"Slice 5: approval executes", and `docs/kaish-integration.md`.
 
 **Why this is available now, and not a return to the durable resume
 machinery this document deleted above.** That machinery — the

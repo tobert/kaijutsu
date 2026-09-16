@@ -14,8 +14,8 @@ drives the musician beat loop, and persists SSH identity.
 
 Startup (`SshServer::run_on_listener`, `:281`): load/generate the Ed25519 host
 key, open `AuthDb`, build a `russh` config with 30 s keepalive × 3 (≈90 s
-dead-peer window), call `create_shared_kernel`, spawn the **gate-resume** and
-**beat-scheduler** threads, then run the russh server.
+dead-peer window), call `create_shared_kernel`, start approval delivery on the
+kernel worker, spawn the **beat-scheduler** thread, then run the russh server.
 
 Per connection (`ConnectionHandler`, `:480`): `channel_open_session` (`:839`)
 stashes every channel a client opens in a per-connection map; `subsystem_request`
@@ -101,8 +101,10 @@ facts, and admits `process_llm_stream` to the kernel worker. Each accepted turn
 owns a lease for its liveness and interrupt registration, including queue time.
 The worker owns cancellation, cleanup, and joining during shutdown. Headless
 admission publishes Requested before any terminal event; event observers never
-authorize execution. SSH still starts the dedicated approval-resume thread,
-which needs joined shutdown. See `docs/kaish-integration.md`.
+authorize execution. SSH installs approval delivery on the same worker before
+exposing the kernel; startup failures propagate to the host. Shutdown cancels
+approval preparation and execution and joins settlement too. See
+`docs/kaish-integration.md`.
 
 `process_llm_stream` is the agentic loop: acquire the per-context
 conversation lock, read hydration policy (full vs windowed), hydrate the mailbox

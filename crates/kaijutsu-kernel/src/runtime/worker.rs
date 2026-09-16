@@ -1,5 +1,5 @@
-//! Kernel-owned local executor for accepted shell tools and model turns. Its runtime outlives
-//! submitting transports and supports reentrant calls on the reserved kaish stack.
+//! Kernel-owned executor for commands, model turns, and approval delivery.
+//! It outlives submitting transports and supports reentrant calls on the kaish stack.
 
 use std::future::Future;
 use std::pin::Pin;

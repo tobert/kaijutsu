@@ -27,8 +27,8 @@ image caching, and interrupts. Interactive RPC and headless turn submission
 share `runtime/llm_stream.rs`. The kernel worker owns accepted turns through
 cancellation and shutdown. Per-turn leases keep queued and running turns
 visible until each releases ownership; context interruption signals all of them.
-Headless requests use direct runtime admission. The approval-resume thread
-still needs joined shutdown.
+Headless requests use direct runtime admission. Approval delivery also runs
+on the kernel worker, with cancellation and joined settlement.
 See `docs/kaish-integration.md`.
 
 ## Tool pairing at send
@@ -38,7 +38,7 @@ block log. It is a pull-based cursor, not an insert-event subscriber.
 `snapshot()` repairs a clone of the accumulated history; it does not change
 the mailbox or the durable blocks.
 
-A pair the gate-resume driver fills in place (`crates/kaijutsu-server/src/rpc.rs`,
+A pair the gate-resume driver fills in place (`crates/kaijutsu-kernel/src/runtime/approval_resume.rs`,
 `act_on_executable_answer`) evicts the context's cached mailbox
 (`ConversationCache::evict`), so the next turn hydrates cold from the block
 log. Reset preserves the turn lock while any caller holds the session and
