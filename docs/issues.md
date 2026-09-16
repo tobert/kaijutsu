@@ -13,23 +13,10 @@ Source review at `f7e46f8e`, September 16:
 This is the live plan; the audit records the review. Planning added source
 markers and corrected misleading comments, without changing behavior.
 
-### Bounded cleanup batch
-
-Take these as separate changes so each has a clear verification boundary:
-
-1. **Remove the unused shell-state facade.** Recheck callers of `KernelState`,
-   `state_id`, variables, history, and checkpoints across the workspace,
-   examples, and integration tests. Delete verified unused APIs, backing state,
-   and tests that only exercise the retired API. Preserve the kernel name and
-   `Kernel::id`; leave `context_env`, `context_shell`, and kaish scope intact.
-   Compile all workspace targets and run context-shell tests. If a production
-   caller exists, trace it before expanding the deletion.
-
-The inaccurate shell-persistence comments are corrected in this planning pass.
-Behavior changes use red/green regression tests; pure deletions use caller
-checks, compilation, and relevant existing tests. Run affected package checks
-per change, then one workspace check after the batch. Remove resolved issue
-entries and source markers in the same change that satisfies them.
+The bounded deletions are recorded in `docs/devlog.md`, "Retiring duplicated
+state". The remaining work below needs separate reviewable changes. Start
+behavior changes with red/green regressions; remove each issue and its source
+marker in the change that satisfies it.
 
 ### Conversation lifetime and turn exclusion
 
@@ -88,10 +75,17 @@ checks, pinning, and swap acknowledgment. Start with restart/recovery and
 external-edit regressions from `docs/file-buffers.md`; only then remove clean
 read materialization. This remains a separate design change.
 
-**Order after the bounded batch:** document sequencing (see "Document mutation
+**Order:** document sequencing (see "Document mutation
 and publication need one sequencer" below), stable turn ownership, runtime
 settlement, shared recovery, rendering, then file-buffer persistence. Each
 requires its own reviewable change; the source TODOs point to these entries.
+
+### Kernel architecture overview needs a refresh
+
+`docs/architecture/kernel.md` still claims `Kernel` does not own `BlockStore`
+and describes input-document tables and buses that compose drafts no longer
+use. Recheck the overview against current field and schema owners; avoid
+using that inventory as a contract until it is reconciled.
 
 ## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
 

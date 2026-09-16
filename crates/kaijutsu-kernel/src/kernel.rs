@@ -2,7 +2,7 @@
 //!
 //! A kernel owns:
 //! - A VFS (MountTable)
-//! - State (variables, history, checkpoints)
+//! - Durable context and block state
 //! - Tools (execution engines)
 //! - LLM providers (for model access)
 //! - Control plane (consent mode)
@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use kaijutsu_cas::FileStore;
 
@@ -28,7 +27,6 @@ use crate::flows::{
 };
 use crate::llm::{LlmRegistry, Provider};
 use crate::mcp::Broker;
-use crate::state::KernelState;
 use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
 
 /// The Kernel: fundamental primitive of kaijutsu.
@@ -37,7 +35,7 @@ use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsRes
 /// - Owns `/` in its VFS
 /// - Can mount worktrees, repos, other kernels
 /// - Has a consent mode (collaborative vs autonomous)
-/// - Can checkpoint, fork, and thread
+/// - Holds contexts and their block logs
 pub struct Kernel {
     /// Stable kernel identity — set at construction from the KernelDb
     /// singleton row, immutable thereafter. Used by the wire layer for
@@ -45,8 +43,8 @@ pub struct Kernel {
     id: kaijutsu_types::KernelId,
     /// VFS mount table.
     vfs: Arc<MountTable>,
-    /// Kernel state (behind RwLock for interior mutability).
-    state: RwLock<KernelState>,
+    /// Human-readable kernel name.
+    name: RwLock<String>,
     /// LLM provider registry (behind RwLock for interior mutability).
     llm: RwLock<LlmRegistry>,
     /// Peer registry. A synchronous lock: the registry never awaits while
@@ -370,7 +368,7 @@ impl Kernel {
         Self {
             id,
             vfs,
-            state: RwLock::new(KernelState::new(&name)),
+            name: RwLock::new(name),
             llm: RwLock::new(LlmRegistry::new()),
             peers: parking_lot::RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
@@ -1294,22 +1292,14 @@ impl Kernel {
     // Identity
     // ========================================================================
 
-    /// Get the legacy KernelState UUID. Distinct from `Self::id()`, which is
-    /// the stable wire-level `KernelId`. KernelState is kept around for
-    /// checkpoint/fork bookkeeping; once that surface is retired this can
-    /// collapse onto the singleton id.
-    pub async fn state_id(&self) -> Uuid {
-        self.state.read().await.id
-    }
-
     /// Get the kernel name.
     pub async fn name(&self) -> String {
-        self.state.read().await.name.clone()
+        self.name.read().await.clone()
     }
 
     /// Set the kernel name.
     pub async fn set_name(&self, name: impl Into<String>) {
-        self.state.write().await.name = name.into();
+        *self.name.write().await = name.into();
     }
 
     // ========================================================================
@@ -1929,58 +1919,6 @@ impl Kernel {
     /// List all mounts.
     pub async fn list_mounts(&self) -> Vec<crate::vfs::MountInfo> {
         self.vfs.list_mounts().await
-    }
-
-    // ========================================================================
-    // State
-    // ========================================================================
-
-    /// Get a variable value.
-    pub async fn get_var(&self, name: &str) -> Option<String> {
-        self.state.read().await.get_var(name).map(|s| s.to_string())
-    }
-
-    /// Set a variable value.
-    pub async fn set_var(&self, name: impl Into<String>, value: impl Into<String>) {
-        self.state.write().await.set_var(name, value);
-    }
-
-    /// Unset a variable.
-    pub async fn unset_var(&self, name: &str) -> Option<String> {
-        self.state.write().await.unset_var(name)
-    }
-
-    /// Add a command to history.
-    pub async fn add_history(&self, command: impl Into<String>) -> u64 {
-        self.state.write().await.add_history(command)
-    }
-
-    /// Add a command with result to history.
-    pub async fn add_history_with_result(
-        &self,
-        command: impl Into<String>,
-        output: impl Into<String>,
-        exit_code: i32,
-    ) -> u64 {
-        self.state
-            .write()
-            .await
-            .add_history_with_result(command, output, exit_code)
-    }
-
-    /// Get recent history.
-    pub async fn recent_history(&self, limit: usize) -> Vec<crate::state::HistoryEntry> {
-        self.state.read().await.recent_history(limit).to_vec()
-    }
-
-    /// Create a checkpoint.
-    pub async fn checkpoint(&self, name: impl Into<String>) -> Uuid {
-        self.state.write().await.checkpoint(name)
-    }
-
-    /// Restore to a checkpoint.
-    pub async fn restore_checkpoint(&self, id: Uuid) -> bool {
-        self.state.write().await.restore_checkpoint(id)
     }
 
     // ========================================================================
@@ -3305,29 +3243,6 @@ mod tests {
             .invalidate(path)
             .expect_err("the pin must still be held while the session is open");
         assert!(inv_err.contains(path), "error must name the path: {inv_err}");
-    }
-
-    #[tokio::test]
-    async fn test_variables() {
-        let kernel = Kernel::new_ephemeral("test").await;
-
-        kernel.set_var("FOO", "bar").await;
-        assert_eq!(kernel.get_var("FOO").await, Some("bar".to_string()));
-
-        kernel.unset_var("FOO").await;
-        assert_eq!(kernel.get_var("FOO").await, None);
-    }
-
-    #[tokio::test]
-    async fn test_history() {
-        let kernel = Kernel::new_ephemeral("test").await;
-
-        kernel.add_history("echo hello").await;
-        kernel.add_history("ls -la").await;
-
-        let history = kernel.recent_history(10).await;
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].command, "echo hello");
     }
 
     #[tokio::test]

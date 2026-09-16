@@ -7,9 +7,8 @@
 //! - Owns `/` in its VFS (virtual filesystem)
 //! - Can mount worktrees, repos, other kernels at paths like `/mnt/project`
 //! - Has a consent mode (collaborative vs autonomous)
-//! - Can checkpoint (distill history into summaries)
-//! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
-//! - Has a DriftRouter for cross-context communication (shared across fork/thread)
+//! - Holds durable contexts and their block logs
+//! - Has a DriftRouter for cross-context communication
 
 pub mod ansi_ingest;
 pub mod audio_inventory;
@@ -48,7 +47,6 @@ pub mod seed_backends;
 pub mod seed_character;
 pub mod seed_presets;
 pub mod seed_scripts;
-pub mod state;
 pub mod vfs;
 
 /// Stack size for any thread that drives rc lifecycles (the server's beat
@@ -140,7 +138,6 @@ pub use llm::{
 };
 pub use model_resolution::{ModelSource, ResolvedContextModel, resolve_context_model};
 pub use execution::{ExecContext, ExecResult};
-pub use state::KernelState;
 pub use vfs::{
     ActivityCursor, ActivityDigest, DirEntry, FileAttr, FileType, MountTable, SHARE_OP_TIMEOUT,
     SetAttr, ShareFs, ShareRegisterError, ShareRegistry, ShareRow, SnapshotNode, SnapshotResult,

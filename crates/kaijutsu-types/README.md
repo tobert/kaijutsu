@@ -133,7 +133,6 @@ Named constructors: `text()`, `thinking()`, `tool_call()`, `tool_result()`,
 ### kaijutsu-kernel — pending
 
 - [ ] Replace `Identity` struct with `Principal`
-- [ ] Replace `KernelState.id: String` with `KernelId`, add `founder: PrincipalId`
 - [ ] Update agent registration to use `PrincipalId`
 - [x] `BlockDocument` removed 2026-08-09 (`BlockStore` was already the live model — see `docs/crdt-position-2026-08.md`)
 

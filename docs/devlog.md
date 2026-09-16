@@ -1380,3 +1380,10 @@ Kernel construction now has one service initializer. `Kernel::new` supplies
 its existing identity and flow-bus defaults to `with_flows`, so broker setup,
 file-cache wiring, and unfinished-operation recovery cannot drift between
 two copies. Ephemeral construction continues through that same path.
+
+The legacy `KernelState` facade had no production callers for its variables,
+history, checkpoints, or second UUID. Removing it leaves the kernel name in
+its own lock and identity in `Kernel::id()`. Durable `context_env` and
+`context_shell`, per-invocation kaish scope, and connection command history
+remain their existing owners. Tests solely exercising the retired API were
+deleted with it; context-shell and embedded-kaish tests cover the live paths.

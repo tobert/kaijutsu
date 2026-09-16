@@ -147,9 +147,9 @@ candidates, not commitments.
 
 ### Session & workflow
 
-- **Pre-edit filesystem checkpoint + `kj restore` — HIGH.** `KernelState::checkpoint`
-  (`state.rs:160`) snapshots in-memory vars only, not the host FS, and isn't tied to
-  tool execution. A bad edit run leaves files half-modified with no mechanical rollback.
+- **Pre-edit filesystem checkpoint + `kj restore` — HIGH.** There is no host
+  filesystem checkpoint tied to tool execution. A bad edit run leaves files
+  half-modified with no mechanical rollback.
   gemini auto-commits a shadow git snapshot before every file-write tool, with
   `/restore`. Auto-snapshot + `kj restore <checkpoint>` to revert FS + conversation.
 - **Turn rewind + FS revert.** `kj fork` is a forward branch (explore), the inverse

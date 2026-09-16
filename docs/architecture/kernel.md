@@ -12,7 +12,7 @@ The kernel owns context data, model interactions, the VFS, and tools. It does
 ## `Kernel` (`src/kernel.rs:41`)
 
 Every field is `Arc`/`OnceLock`-wrapped. The coordinator owns: `vfs:
-Arc<MountTable>`, `state: RwLock<KernelState>`, `llm: RwLock<LlmRegistry>`,
+Arc<MountTable>`, `name: RwLock<String>`, `llm: RwLock<LlmRegistry>`,
 `peers: RwLock<PeerRegistry>`, `consent_mode`, three `FlowBus`es (`block_flows`,
 `turn_flows`, input via the broker), `drift: SharedDriftRouter`, `cas:
 Arc<FileStore>`, `image_backends`, `broker: Arc<Broker>`, `timeouts`,
@@ -126,8 +126,10 @@ oneshot with a timeout.
 
 ### Misc
 
-`KernelState` (`state.rs:16`) — **in-memory only** vars/history/checkpoints (lost
-on restart). `execution.rs` — `ExecContext`/`ExecResult` data shims.
+`execution.rs` — `ExecContext`/`ExecResult` data shims. Shell cwd and exported
+variables live in `context_shell` and `context_env`; each invocation gets its
+own kaish scope. `Kernel::id()` supplies kernel identity, and the kernel name
+has its own lock.
 `config_seed.rs` — the embedded default bodies (`theme.toml`, `mcp.toml`,
 `system.md`) that seed the `/config` host directories only while empty
 (`docs/config-namespace.md`). `config_doc.rs` and the `ConfigDocFs` backend it
@@ -283,8 +285,6 @@ take effect "at fork."
   "god-table + single-mutex" smell and records the decision **not** to split
   it pre-emptively (`kernel_db.rs:8`) — revisit only once write-contention
   under concurrent contexts is an observed problem, not a theoretical one.
-- **Dual kernel identity** — `Kernel::id()` (`kernel.rs:473`) vs the separate
-  `KernelState.id` (`state.rs:16`, read at `kernel.rs:1362`).
 - **Kernel-facade vs `MountTable`** — some callers go through `Kernel::mount`/
   `Kernel::vfs()`, others (e.g. `FileDocumentCache`) hold their own cloned
   `Arc<MountTable>` directly. Harmless today (one shared table behind every
