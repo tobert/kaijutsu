@@ -1683,6 +1683,14 @@ Connection setup and retry backoff now race cancellation too. Request/resume
 drivers, multiple queued turns' liveness, and exact ownership of unfinished
 blocks remain separate pieces of the runtime migration.
 
+Headless request and approval-resume logic then moved out of server RPC into
+runtime modules. Both now accept `Arc<Kernel>`; approved execution obtains the
+registered dispatcher from the broker, preserving the same contextual shell
+constructor and no-shell refusal path. Durable cwd reads also moved into
+runtime for all RPC and headless callers. The dedicated driver threads still
+need startup readiness and joined shutdown; moving source ownership makes those
+lifetimes independent of the server registry without claiming they are finished.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

@@ -64,7 +64,7 @@
 //!   inside banto's own scripted turn; amy assigns nothing.
 //! - **Two defects this scenario found**, fixed the same day and pinned
 //!   here: the `"turn-driver"` thread now reserves `KAISH_RC_THREAD_STACK`
-//!   (`crates/kaijutsu-server/src/rpc.rs`, `spawn_turn_driver`), and
+//!   (`crates/kaijutsu-kernel/src/runtime/turn_driver.rs`, `spawn_turn_driver`), and
 //!   `kj handoff note`/`signoff` without `--for` file under the performer
 //!   (`crates/kaijutsu-kernel/src/kj/handoff.rs`, `resolve_caller_character`).
 

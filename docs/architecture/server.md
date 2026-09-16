@@ -97,8 +97,9 @@ Server RPC and the headless turn driver call `spawn_llm_for_prompt`. It resolves
 provider/model (explicit parameter > context override > cast slot > registry
 default), builds tools through the broker, assembles instructions and runtime
 facts, and admits `process_llm_stream` to the kernel worker. That worker owns
-cancellation, turn cleanup, and joining during shutdown. Server request/resume
-drivers still need migration; see `docs/kaish-integration.md`.
+cancellation, turn cleanup, and joining during shutdown. SSH startup starts the
+kernel's `runtime/turn_driver.rs` and `runtime/approval_resume.rs`; their dedicated
+threads still need joined shutdown. See `docs/kaish-integration.md`.
 
 `process_llm_stream` is the agentic loop: acquire the per-context
 conversation lock, read hydration policy (full vs windowed), hydrate the mailbox

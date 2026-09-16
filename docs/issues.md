@@ -138,7 +138,22 @@ belong to kernel runtime modules. RPC translates startup errors but no longer
 owns those state fields. Accepted turns now run on the kernel worker; startup
 failures leave no interrupt. Normal exits, early failures, and panics share
 terminal-event cleanup; shutdown cancels and joins accepted work. Move the
-request/resume drivers and transport-owned command tasks next.
+request/resume driver threads into the shared shutdown owner next; their logic
+now lives in `runtime/turn_driver.rs` and `runtime/approval_resume.rs`, with no
+server entry points. Startup must acknowledge its subscriptions before callers
+can request work, and failure must reach startup instead of only a thread log.
+Transport-owned command tasks remain to migrate.
+
+Headless admission must not use FlowBus delivery count as proof of execution.
+`kj/fork.rs::publish_turn_request` and the automatic continuation publishers count
+all subscribers; an RPC turn-event observer can make that count nonzero even
+with no execution driver. A runtime-owned request queue should admit work and
+then publish the observation. Audit fork/drive, approval continuation, and
+`shell_operations.rs` async completion together when replacing the driver.
+
+The shared `shell_state::context_cwd` read still returns None on storage errors,
+which is indistinguishable from an unset cwd. Preserve the no-cwd refusal but
+report failed reads through every caller; do not invent a default directory.
 
 Per-context turn liveness still uses one map entry while the conversation mutex
 can queue multiple turns. Ending one turn can clear the mark for another; the

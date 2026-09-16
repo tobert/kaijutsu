@@ -56,6 +56,24 @@ pub fn persist_shell_state(
     transaction.commit().map_err(|e| format!("commit shell state: {e}"))
 }
 
+/// Read a context's durable cwd from L1 (`context_shell.cwd`). Returns `None`
+/// when unset or unreadable. `get_cwd` (the interactive shell's `kj cwd`)
+/// still applies its own `/docs` landing-dir default for display purposes;
+/// every `ExecContext`-constructing call site instead passes the `Option`
+/// straight through to `ExecContext::new`/`new_without_cwd` — a tool
+/// context with no cwd is `None`, not a fabricated `/` (`servers/file.rs`
+/// rejects it outright rather than resolving paths against a fake root).
+pub fn context_cwd(kernel: &crate::Kernel, context_id: ContextId) -> Option<std::path::PathBuf> {
+    kernel
+        .kernel_db()
+        .lock()
+        .get_context_shell(context_id)
+        .ok()
+        .flatten()
+        .and_then(|row| row.cwd)
+        .map(std::path::PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

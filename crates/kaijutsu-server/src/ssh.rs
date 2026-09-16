@@ -482,15 +482,12 @@ impl SshServer {
 
         log::info!("Shared kernel created: {}", registry.kernel.name);
 
-        // Bring the turn driver online before accepting connections so an
-        // autonomous turn requested by an early `kj fork --prompt` isn't
-        // dropped. One driver for the whole server (see spawn_turn_driver).
-        crate::rpc::spawn_turn_driver(registry.clone());
+        // Start one headless request driver and one approval-resume driver.
+        // Startup readiness and joined shutdown remain in docs/issues.md.
+        kaijutsu_kernel::runtime::turn_driver::spawn_turn_driver(registry.kernel.kernel.clone());
 
-        // The gate-resume driver, after the turn driver: it wakes a context
-        // by publishing a turn request, and a request published with no
-        // driver subscribed is dropped.
-        crate::rpc::spawn_gate_resume_driver(registry.clone());
+        // Approval delivery can request another turn, so start it second.
+        kaijutsu_kernel::runtime::approval_resume::spawn_gate_resume_driver(registry.kernel.kernel.clone());
 
         // The single coalescing beat scheduler: drives per-context hyoushigi
         // timelines on their wall-clock beat (musician contexts). Installs its
