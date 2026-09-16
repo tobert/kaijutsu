@@ -1889,12 +1889,12 @@ async fn process_llm_stream(
         context_id
     );
 
-    // Track total iterations to prevent infinite loops. The cap is consent-
-    // aware (M1-A6): in Collaborative mode the loop yields after one
-    // tool round-trip + synthesis so the human stays in the loop; in
-    // Autonomous mode the model can chain up to AUTONOMOUS_MAX_ITERATIONS.
-    // Read consent once per stream so the cap and any halt message stay
-    // coherent if the operator toggles consent mid-flight.
+    // Resolve the iteration cap once per stream so the guard and halt message
+    // agree. Both modes allow chained tool work; this is a runaway limit.
+    // TODO: Resolve consent from this context or retire the per-context setting.
+    // `kj context set --consent` writes ContextRow, but this reads kernel state.
+    // Do not copy context configuration into the shared kernel-wide value.
+    // See docs/issues.md, "Consent setting ownership".
     let consent = kernel.consent_mode().await;
     let max_iterations = iteration_cap_for_consent(consent);
     let mut iteration: u32 = 0;

@@ -6,6 +6,106 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Architecture cleanup plan
+
+Source review at `f7e46f8e`, September 16:
+[evidence and proposed tests](audits/2026-09-16-architecture-debt.md).
+This is the live plan; the audit records the review. Planning added source
+markers and corrected misleading comments, without changing behavior.
+
+### Bounded cleanup batch
+
+Take these as separate changes so each has a clear verification boundary:
+
+1. **Remove `/v/input`.** First add a failing model-shell regression with
+   distinct requester and performer, covering read-only and writable shells
+   and read/write/clear attempts. Delete `InputFilesystem`, its mount,
+   exports, obsolete tests, and advertised tool guidance. Inspect emitted
+   shell schemas and run `user_input_identity` to preserve client compose
+   behavior. Completion means this VFS route is absent; the broader draft
+   invariant remains open until `/v/docs` and generic block access are audited.
+   See the existing "compose draft is the player's alone" decision below.
+2. **Consolidate kernel construction.** Make `Kernel::new` delegate to
+   `with_flows` with the same ID and flow-bus defaults. Preserve injected
+   dependencies, broker defaults, receipt recovery, and ephemeral cleanup.
+   Run existing kernel construction and shell-operation tests; check workspace
+   compilation. Do not change identity or flow wiring as part of this deletion.
+3. **Remove the unused shell-state facade.** Recheck callers of `KernelState`,
+   `state_id`, variables, history, and checkpoints across the workspace,
+   examples, and integration tests. Delete verified unused APIs, backing state,
+   and tests that only exercise the retired API. Preserve the kernel name and
+   `Kernel::id`; leave `context_env`, `context_shell`, and kaish scope intact.
+   Compile all workspace targets and run context-shell tests. If a production
+   caller exists, trace it before expanding the deletion.
+
+The inaccurate shell-persistence comments are corrected in this planning pass.
+Behavior changes use red/green regression tests; pure deletions use caller
+checks, compilation, and relevant existing tests. Run affected package checks
+per change, then one workspace check after the batch. Remove resolved issue
+entries and source markers in the same change that satisfies them.
+
+### Conversation lifetime and turn exclusion
+
+`ConversationCache::evict` replaces the turn mutex while an active turn can
+retain its old Arc. LRU eviction also resets semantic conversation history.
+First reproduce overlapping ownership and edit visibility under cache pressure
+with deterministic tests. Give each context stable turn exclusion and an
+explicit conversation-reset transition. Decide when idle conversations may
+reset before changing LRU semantics; preserve context/conversation separation.
+This can proceed independently of document sequencing.
+
+### Turn execution and shell settlement
+
+After turn exclusion is stable, move the headless turn driver, interruption,
+and resumption lifecycle from server `rpc.rs` into kernel runtime ownership.
+Keep connection/session subscriptions in the server. In a separate change,
+project one settled shell outcome into blocks, receipts, and job results;
+share it with the MCP shell path. Preserve read-only execution, explicit
+identity, output profiles, hooks, cwd/env persistence, and context switching.
+Require interactive/model/approval-resume parity tests for the shared outcome,
+including cancellation and PostCall substitution. Keep JobManager and durable
+receipts separate. Do not combine this with a constructor API redesign.
+
+### Shared client recovery
+
+Give `kaijutsu-client` ownership of subscription, mirror, snapshot recovery,
+and rejection of obsolete responses. Start with tests for delta/snapshot
+ordering, overlapping reconnects, and release during recovery. Migrate app,
+TUI, and ACP one at a time, removing their duplicate lifecycle code as they
+adopt the shared owner. Clients retain retry/release presentation choices.
+
+### Render the live mirror
+
+Separate collapse/selection state from live `BlockSnapshot` copies, then let
+the app render its mirror without rebuilding `RenderBlockStore` per version.
+Preserve welcome/offline sources and geometry/glyph caches. Reuse collapse
+regressions and check streaming plus context switching through the GUI runner
+and BRP. Keep this separate from the shared recovery migration.
+
+### Consent setting ownership
+
+`kj context set --consent` writes `ContextRow.consent_mode`, while the model
+loop reads the kernel-wide value, whose setter has no workspace callers.
+Choose context resolution or removal before implementation. Do not copy
+context configuration into shared kernel state. If retained, test two contexts
+with distinct limits through the real turn path. If removed, check CLI help,
+schema/persistence migration, and rejection of the retired option. This is a
+behavior decision, not part of the dead-API deletion.
+
+### Lazy file documents
+
+Audit readers, editors, and recovery callers before choosing a buffer
+representation. Ordinary reads should not require durable documents; persist
+unsaved editor content with its recovery metadata. Preserve external-change
+checks, pinning, and swap acknowledgment. Start with restart/recovery and
+external-edit regressions from `docs/file-buffers.md`; only then remove clean
+read materialization. This remains a separate design change.
+
+**Order after the bounded batch:** document sequencing (see "Document mutation
+and publication need one sequencer" below), stable turn ownership, runtime
+settlement, shared recovery, rendering, then file-buffer persistence. Each
+requires its own reviewable change; the source TODOs point to these entries.
+
 ## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
 
 Read by the lead; each line re-checked before it went here.
@@ -153,11 +253,21 @@ allow the mcp for now, we use it a lot for testing, but we should mark it for
 removal later, y'all have drive and drift for talking to each other."*
 
 The draft is the per-principal input block written by `edit_draft`
-(`crates/kaijutsu-kernel/src/block_store.rs`) and reached only through the
-`edit_input`/`submit_input` RPC facades. Today the kernel editor cannot open
+(`crates/kaijutsu-kernel/src/block_store.rs`). The kernel editor cannot open
 it: `resolve_editor_target` (`crates/kaijutsu-kernel/src/editor.rs`) binds to
-file-backed blocks only, and no `kj` verb touches the draft. Keep it that way:
-no VFS path for the draft, no `kj input`, no editor session over it.
+file-backed blocks only, and no dedicated `kj input` verb exists. The intended
+contract is no model VFS path for the draft and no editor session over it.
+
+**Correction from the architecture scan (2026-09-16): the VFS route remains.**
+`runtime/input_filesystem.rs` reads/writes/clears `/v/input`, and
+`EmbeddedKaish::with_identity_mode` mounts it in every shell. Read-only model
+shells can read it; writable shells can mutate it. The mount uses requester
+`principal_id`, while nested `kj` separately receives performer `actor_id`.
+The model shell constructor therefore selects the requester's draft. Remove
+the filesystem route and its advertised tool guidance; add a regression with
+distinct requester and performer. Also audit ordinary block mutation and
+`/v/docs` for draft access before claiming the broader invariant is enforced.
+This finding is from source tracing; no live draft was accessed.
 
 The MCP bridge's `read_input`/`write_input`/`edit_input`/`submit_input` tools
 are gone as of today. A model that wants another player's attention uses `kj
@@ -2165,14 +2275,21 @@ shipped. Still open, all verified against current code:
 - **Backgrounds/underlines bake color into vertices** — `ShapeKey::
   baked_theme_epoch` exists for exactly this reason.
 
-## `journal_op` is still not a transaction (pre-existing, surfaced 2026-08-19)
+## Document mutation and publication need one sequencer
 
-`BlockStore::journal_op` (`kaijutsu-kernel/src/block_store.rs:961`) still
-issues `append_op` and `touch_context_activity` as separate autocommit
-statements under a mutex — no `BEGIN`/`COMMIT`. Not urgent (the mutex
-serializes, a crash gap is detectable) but every new hook-site write
-inherits the pattern. Fix shape: a `KernelDb` method wrapping
-`self.conn.transaction()`, like `write_snapshot_and_truncate`.
+`BlockStore::journal_op` now commits `append_op` and the activity stamp in one
+SQLite transaction; the earlier two-autocommit issue is fixed. The broader
+boundary is still split: setters such as `edit_text_as` mutate memory and
+advance the version under a document guard, release it, journal under a
+separate DB lock, then publish. Concurrent writers can cross those boundaries
+in different orders, and a journal error can leave changed memory behind.
+Compaction separately snapshots memory and the journal head before its write.
+
+Give the existing block store one ordered acceptance path for the mutation,
+durable op, and projected event. Start with deterministic interleaving and
+commit-failure tests comparing live state, replay, and delivery. Structural
+finding from source, not a reproduced race. See the
+[architecture scan](audits/2026-09-16-architecture-debt.md).
 
 ## Oplog replay clears spans that live appends keep (2026-08-19)
 

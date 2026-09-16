@@ -1,9 +1,9 @@
 //! Multi-context document store.
 //!
 //! Holds a [`ContextMirror`] (the change-feed applier, `context_feed.rs`) per
-//! joined context, enabling instant context switching and LRU eviction. This
-//! is the client-owned home for *all* conversation document state — the app
-//! is a renderer over it, not the owner of the recovery mechanics.
+//! joined context, enabling instant context switching and LRU eviction. Holds
+//! mirrors and feed receivers; callers still drive snapshot fetching and
+//! recovery after reconnects.
 //!
 //! Bevy-free on purpose: the app wraps this in a `Resource` newtype, but the
 //! store itself is plain Rust so its logic is unit-testable without a world.
@@ -172,6 +172,10 @@ pub enum FeedSignal {
 
 /// Multi-context document store — the authoritative source for all document
 /// state. The active entry is what the renderer draws.
+// TODO: Own subscription, snapshot recovery, and stale-response rejection
+// together in kaijutsu-client. App, TUI, and ACP still coordinate them separately.
+// Keep each client's retry/release presentation policy at its call site.
+// See docs/issues.md, "Shared client recovery".
 #[allow(dead_code)]
 pub struct DocumentStore {
     /// Map from context_id → cached document state.

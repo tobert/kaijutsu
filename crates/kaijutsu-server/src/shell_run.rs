@@ -34,6 +34,10 @@ use crate::rpc::{
 pub(crate) type ContextSwitchSink<'a> = Option<&'a dyn Fn(ContextId)>;
 
 /// Persist a registered operation's final result after its block pair settles.
+// TODO: Project blocks, receipts, and job results from one settled shell outcome.
+// Reconstructing the receipt here duplicates the MCP shell completion policy.
+// Preserve caller-specific hooks, cwd/env persistence, and context switching.
+// See docs/issues.md, "Turn execution and shell settlement".
 pub(crate) fn complete_operation_from_blocks(
     kernel: &Kernel,
     context_id: ContextId,

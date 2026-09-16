@@ -1017,6 +1017,10 @@ impl BlockStore {
     ///
     /// Serializes the SyncPayload, appends it to the `oplog` table, and
     /// triggers compaction if the uncompacted count or bytes exceed thresholds.
+    // TODO: Order memory mutation, durable commit, compaction, and publication
+    // at one acceptance boundary. Callers release the document guard before
+    // journaling, so this transaction alone cannot order accepted mutations.
+    // See docs/issues.md, "Document mutation and publication need one sequencer".
     fn journal_op(
         &self,
         context_id: ContextId,

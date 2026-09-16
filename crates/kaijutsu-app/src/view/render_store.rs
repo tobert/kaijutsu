@@ -60,6 +60,10 @@ impl std::error::Error for RenderStoreError {}
 static NEXT_STORE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Ordered render buffer for one `CellEditor` — see the module doc.
+// TODO: Render live ContextMirror blocks with separate per-view collapse state
+// instead of rebuilding a second domain-block store on each version change.
+// Preserve welcome/offline content and the layout caches that consume this view.
+// See docs/issues.md, "Render the live mirror".
 pub struct RenderBlockStore {
     context_id: ContextId,
     principal_id: PrincipalId,

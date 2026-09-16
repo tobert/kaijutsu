@@ -250,9 +250,12 @@ impl ConversationCache {
     /// `Waiting` pair to its real output, for one — so the stale text
     /// does not linger for the rest of the conversation.
     ///
-    /// Safe to call while a turn holds this context's mailbox: that turn
-    /// keeps its own `Arc` clone and finishes on it unaffected. Only the
-    /// entry the cache itself would hand out next is removed.
+    /// An active turn retains its old `Arc`, but the next lookup creates a
+    /// different mutex. Eviction does not preserve turn exclusion across
+    /// those two entries.
+    // TODO: Keep turn exclusion stable across conversation reset and eviction.
+    // Cache pressure also changes which edits enter the next conversation.
+    // See docs/issues.md, "Conversation lifetime and turn exclusion".
     pub fn evict(&self, ctx: ContextId) {
         self.entries.remove(&ctx);
         self.last_accessed.remove(&ctx);
@@ -377,6 +380,10 @@ fn register_subscription(
 
 /// Kernel state shared across all connections via Arc.
 /// Created once at server startup.
+// TODO: Move transport-independent turn ownership and drivers into the kernel
+// runtime. Conversation sessions, interrupts, and shutdown belong to the same
+// owner even when no connection exists. Keep session subscriptions in the server.
+// See docs/issues.md, "Turn execution and shell settlement".
 pub struct SharedKernelState {
     pub id: KernelId,
     pub name: String,
@@ -9941,9 +9948,10 @@ fn context_cwd(kernel: &SharedKernelState, context_id: ContextId) -> Option<std:
 /// durable L1 state (`context_env` + `context_shell.cwd`).
 ///
 /// The instance is throwaway: run exactly one command against it and drop it.
-/// Durable changes flow through `kj context set`, never through this instance's
-/// transient scope — so two callers never see each other's in-flight vars. The
-/// factory hands back a kaish whose session→context map is *isolated* from the
+/// `kj context set` writes durable state explicitly; `shell_run` also writes
+/// back changed cwd and exports after execution unless the context switched.
+/// In-flight scope belongs to this invocation. The factory hands back a kaish
+/// whose session→context map is *isolated* from the
 /// connection's; callers that run context-switching commands (`kj context
 /// switch`, `kj fork`) must read `kaish.context_id()` afterward and write any
 /// change back to the connection's `session_contexts`.
@@ -10179,8 +10187,8 @@ async fn execute_shell_command(
     connection: &Rc<RefCell<ConnectionState>>,
 ) -> Result<ShellCommandSubmission, capnp::Error> {
     // Materialize a single-use context shell seeded from L1 (durable env + cwd).
-    // No caching: transient scope evaporates when this instance drops, so the
-    // context's durable state only ever changes through `kj context set`.
+    // No caching: shell_run persists changed cwd and exports unless the context
+    // switched; the remaining scope evaporates when this instance drops.
     let kaish = materialize_context_shell(kernel, connection).await?;
 
     let documents = kernel.documents.clone();

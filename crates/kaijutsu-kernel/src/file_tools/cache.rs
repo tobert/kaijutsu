@@ -151,6 +151,10 @@ struct CachedFileDoc {
 ///
 /// Each file becomes a document with `DocKind::File` and a single
 /// `BlockKind::Text` block; edits apply directly to that block.
+// TODO: Separate ordinary reads from durable editor-buffer creation. Persist
+// unsaved content and its recovery metadata together; preserve conflict checks,
+// editor pins, and explicit swap acknowledgment through the transition.
+// See docs/issues.md, "Lazy file documents".
 pub struct FileDocumentCache {
     cache: RwLock<HashMap<ContextId, CachedFileDoc>>,
     block_store: SharedBlockStore,
