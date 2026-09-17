@@ -270,14 +270,14 @@ mod tests {
                 rendered: "work".into(), statement_kind: "test".into(), vars: vec![], source_index: None,
             }], exec_source: None, exec_stdin: None, planned: vec![],
         };
-        let result = gate::run_gate(dispatcher.kernel_db(), &stale_caller, spec(), dispatcher.kernel().ledger_flows(), &gate_policy::no_config()).await;
+        let result = gate::run_gate(dispatcher.kernel(), &stale_caller, spec(), dispatcher.kernel().ledger_flows(), &gate_policy::no_config()).await;
         let request = result.ask.expect("new ask is routed after revocation");
         let row = dispatcher.kernel_db().lock().get_approval(&request.request_id).unwrap().unwrap();
         assert_eq!(row.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
         assert_eq!(row.actor_id.as_deref(), Some(coder.as_bytes().as_slice()));
 
         let unknown = test_helpers::caller_with_context(ContextId::new()).with_actor(coder, Some(lead));
-        let result = gate::run_gate(dispatcher.kernel_db(), &unknown, spec(), dispatcher.kernel().ledger_flows(), &gate_policy::no_config()).await;
+        let result = gate::run_gate(dispatcher.kernel(), &unknown, spec(), dispatcher.kernel().ledger_flows(), &gate_policy::no_config()).await;
         assert!(result.ask.is_none(), "a missing context must not use the stale caller's reviewer");
         assert_eq!(dispatcher.kernel_db().lock().list_pending_asks().unwrap().len(), 1);
     }

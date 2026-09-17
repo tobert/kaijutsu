@@ -273,7 +273,7 @@ impl McpServerLike for ShellServer {
             let gate_config =
                 crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
             let outcome = crate::kj::gate::run_gate(
-                dispatcher.kernel_db(),
+                dispatcher.kernel(),
                 &caller,
                 spec,
                 dispatcher.kernel().ledger_flows(),

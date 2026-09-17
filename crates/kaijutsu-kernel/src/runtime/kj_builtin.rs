@@ -95,20 +95,10 @@ impl KjBuiltin {
         }
     }
 
-    /// Load context shell config (cwd + env vars) from KernelDb and apply to
-    /// ExecContext.
-    ///
-    /// Durable env is converted with [`context_env_values`] — the helper
-    /// `EmbeddedKaish::apply_context_config` (`runtime/embedded_kaish.rs`)
-    /// also uses, so a malformed key is rejected the same way on both
-    /// `apply_context_config` implementations. This side already has a live
-    /// `ExecContext` mid-dispatch, so it writes straight onto `ctx.scope`
-    /// instead of routing through a script.
-    ///
-    /// Fails loudly: a DB error or a rejected key returns `Err` instead of
-    /// the old `unwrap_or_default()` silent-empty fallback; `execute()`'s
-    /// `KjResult::Switch` arm turns that into an `ExecResult::failure`
-    /// rather than reporting the switch as successful with missing env.
+    /// Apply a context's cwd and durable exports to the live interpreter.
+    /// Export conversion uses the same `context_env_values` validation as
+    /// contextual construction. Invalid keys and failed export reads return
+    /// errors; values enter the existing scope directly during dispatch.
     async fn apply_context_config(
         &self,
         context_id: ContextId,
@@ -1962,12 +1952,8 @@ mod tests {
         );
     }
 
-    /// A durable env value containing a single quote, a `$`, and a newline
-    /// must land on the live scope byte-for-byte after `kj context switch` —
-    /// this is `KjBuiltin::apply_context_config`'s half of the same
-    /// guarantee `EmbeddedKaish::apply_context_config`'s round-trip test pins
-    /// (`embedded_kaish.rs::test_context_env_special_chars_round_trip`); both
-    /// now share the same `context_env_values` conversion.
+    /// Context switching preserves literal quotes, dollar signs, and newlines
+    /// in durable exports, matching contextual shell construction.
     #[tokio::test]
     async fn context_switch_applies_special_char_env_verbatim() {
         let dispatcher = Arc::new(test_dispatcher().await);

@@ -1809,13 +1809,9 @@ fn validate_label(label: &str) -> KernelDbResult<()> {
     Ok(())
 }
 
-/// Validate a `context_env` key against the shell identifier rule
-/// `EmbeddedKaish::apply_context_config`/`KjBuiltin::apply_context_config`
-/// require when they later export the row (`is_valid_env_key`,
-/// `runtime/embedded_kaish.rs`, mirroring kaish's own `export` builtin): an
-/// ASCII letter or underscore first, then ASCII alphanumeric or underscore.
-/// Anything else can never become `export KEY=...`, so it is refused here
-/// rather than only discovered at the next shell materialization.
+/// Validate a durable export name before storing it. Contextual construction
+/// and switching use the same kaish identifier rule: ASCII letter/underscore
+/// first, then ASCII alphanumeric/underscore.
 fn validate_env_key(key: &str) -> KernelDbResult<()> {
     let mut chars = key.chars();
     let starts_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_');

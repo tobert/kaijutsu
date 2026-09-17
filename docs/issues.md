@@ -242,16 +242,14 @@ performer settlement's lack of a seed against already running conversations.
 Kaibo review and disposition:
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
-Approval capture now refuses cwd/env read failures before creating either normal
-or dry-run asks. Continue the effective-environment audit: `HOME` is seeded by
-EmbeddedKaish even when absent from `context_env`, but the ask reader currently
-records it as unset. Kaish also seeds PWD from its initial cwd, outside durable
-exports; compare captured values with actual shell scope after cwd restoration.
-Pin actual approval-driver cwd A versus newer cwd B. Shared `context_cwd` still
-swallows read faults, and context switching
-logs cwd persistence failure then continues. Switching also swallows target cwd
-read failures and keeps the previous directory when the target no longer resolves.
-These paths need explicit error propagation before publishing a successful switch.
+Context cwd error propagation remains incomplete. Shared `context_cwd` swallows
+read faults; switching logs failed cwd persistence and continues, swallows target
+cwd reads, and keeps the old directory for a dead target. Make failure explicit
+before publishing a successful switch. Also audit relative stored/captured cwd:
+public setters require absolute paths, but direct database writes can bypass that
+contract. Initial environment capture now shares constructor inputs, including
+HOME/PWD/PATH and their durable overrides; the actual SSH approval scenario pins
+cwd A while the current context changes to B.
 
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
 aggregate liveness when polling the log but returns on the first terminal event,
@@ -1618,6 +1616,12 @@ without naming the mechanism. Cause unknown: not reproducible on demand
 work. Fix the test to assert on order keys, not the sort result, so a
 recurrence names order-key precision or tie-break rather than a content
 string.
+
+Recurred during the September 17 effective-environment validation: `Middle-9`
+sorted before `First` (3117 passed, one failed,6 ignored). The change does not
+edit block ordering. Evidence: `/tmp/kaijutsu-effective-env-kernel-final.log`.
+Keep this occurrence with the existing ordering audit; a passing rerun does not
+explain it.
 
 ---
 

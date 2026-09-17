@@ -42,7 +42,6 @@ use kaish_kernel::{
 
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
-use crate::kernel_db::KernelDb;
 use kaijutsu_types::paths::{DOCS_ROOT, SWAP_ROOT};
 use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
@@ -329,10 +328,8 @@ impl EmbeddedKaish {
         // `project_root` sets the cwd to a specific project directory (used by
         // MCP sessions that operate on a particular repo). When None, cwd
         // defaults to $HOME via `KaishConfig::named()`. The context's persisted
-        // cwd (`context_shell.cwd`) is *not* restored here: it must be validated
-        // against the shell's backend (the VFS namespace `cd` uses), which is
-        // async, so `restore_cwd_from_db` does it post-construction — see
-        // `EmbeddedKaish::for_context`.
+        // cwd is selected before construction by `for_context`, which validates
+        // it against the backend namespace before returning the shell.
         // kaijutsu overrides the backend with MountBackend (see below), so the
         // config's vfs_mode is moot — what matters is the cwd and the agent-grade
         // ignore/output-limit presets (gitignore-aware walks + capped output).
@@ -359,41 +356,8 @@ impl EmbeddedKaish {
         let context_jobs = kernel.context_job_manager(context_id);
         config = config.with_job_manager(context_jobs.clone());
 
-        // Seed `HOME` for EVERY shell flavor (read-only included), not just
-        // exec-granted ones. kaish is hermetic: it never reads the host
-        // `std::env::var("HOME")`, so with empty `initial_vars` the scope has no
-        // `HOME` — `$HOME` expands to empty AND `~` is left literal (both read
-        // the same scope var via kaish's `scope_home()`). Seeding it here makes
-        // the two agree by construction (`echo $HOME` == the `~` target) and
-        // exports it to child processes. `KaishConfig::named()` already lands the
-        // shell's default cwd on this same directory, so `~` == cwd in the common
-        // case. A durable `context_env` HOME still wins: `apply_context_config`
-        // exports it after construction.
-        let home = kaish_kernel::home_dir().to_string_lossy().into_owned();
-        config
-            .initial_vars
-            .insert("HOME".to_string(), kaish_kernel::ast::Value::String(home));
-
-        // Host subprocess policy. With kaish's `subprocess` feature compiled
-        // in, `allow_external_commands` would default to true — so every shell
-        // states its policy explicitly, decided by the caller from the
-        // context's loadout (`exec` authority). Deny keeps the old behavior:
-        // unknown commands fail fast, builtins/kj unaffected. For read-only
-        // shells Deny is structural (the constructor pins it), the sandbox's
-        // fourth lever alongside the read-only MountBackend + `/v/*` wraps.
-        match &external_exec {
-            ExternalExec::Deny => {
-                config = config.with_allow_external_commands(false);
-            }
-            ExternalExec::Allow { path } => {
-                config = config.with_allow_external_commands(true);
-                if let Some(p) = path {
-                    config
-                        .initial_vars
-                        .insert("PATH".to_string(), kaish_kernel::ast::Value::String(p.clone()));
-                }
-            }
-        }
+        config.initial_vars = super::context_shell::initial_environment(&external_exec);
+        config = config.with_allow_external_commands(matches!(external_exec, ExternalExec::Allow { .. }));
 
         // The kernel document view (`/v/docs`) mounts directly on the kaish VFS,
         // bypassing MountBackend. ReadOnlyFs refuses writes in read-only mode.
@@ -566,32 +530,6 @@ impl EmbeddedKaish {
         self.kernel.try_set_cwd(path).await
     }
 
-    /// Restore the persisted cwd through the shell's backend, as `cd` does.
-    /// Unset state keeps the default directory. A storage error or unavailable
-    /// persisted directory refuses construction rather than changing where a
-    /// command runs.
-    pub async fn restore_cwd_from_db(
-        &self,
-        kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
-        context_id: ContextId,
-    ) -> Result<Option<std::path::PathBuf>> {
-        let persisted = {
-            let db = kernel_db.lock();
-            db.get_context_shell(context_id)
-                .map_err(|e| anyhow::anyhow!("read context {context_id} cwd: {e}"))?
-                .and_then(|row| row.cwd)
-        };
-        let Some(cwd) = persisted else {
-            return Ok(None);
-        };
-        let path = std::path::PathBuf::from(cwd);
-        if self.try_set_cwd(path.clone()).await {
-            Ok(Some(path))
-        } else {
-            anyhow::bail!("context {context_id} cwd '{}' is unavailable; set a valid cwd before executing", path.display())
-        }
-    }
-
     /// Get the last execution result ($?).
     pub async fn last_result(&self) -> Option<ExecResult> {
         Some(self.kernel.last_result().await)
@@ -607,38 +545,8 @@ impl EmbeddedKaish {
         self.kernel.cancel();
     }
 
-    /// Seed the shell with the context's durable env vars (`context_env`).
-    ///
-    /// Cwd is restored separately by `restore_cwd_from_db`; setup scripts belong
-    /// to rc. A DB read failure or rejected key fails construction so execution
-    /// cannot proceed with an incomplete environment.
-    pub async fn apply_context_config(
-        &self,
-        db: &parking_lot::Mutex<KernelDb>,
-        context_id: ContextId,
-    ) -> Result<()> {
-        let env_vars = {
-            let db_guard = db.lock();
-            db_guard.get_context_env(context_id).map_err(|e| {
-                anyhow::anyhow!(
-                    "apply_context_config: get_context_env({}) failed: {e}",
-                    context_id.to_hex()
-                )
-            })?
-        };
-        if env_vars.is_empty() {
-            return Ok(());
-        }
-        self.export_env_vars(&env_vars).await.map_err(|e| {
-            anyhow::anyhow!(
-                "apply_context_config: failed to export context {} durable env: {e:#}",
-                context_id.to_hex()
-            )
-        })
-    }
-
     /// Apply durable exports through the shared environment restore path.
-    async fn export_env_vars(&self, vars: &[crate::kernel_db::ContextEnvRow]) -> Result<()> {
+    pub(crate) async fn export_env_vars(&self, vars: &[crate::kernel_db::ContextEnvRow]) -> Result<()> {
         let values = context_env_values(vars)?.into_iter()
             .map(|(name, value)| (name, Some(value))).collect();
         self.restore_env_values(values).await
@@ -701,15 +609,9 @@ impl EmbeddedKaish {
     }
 }
 
-/// Validate and convert durable `context_env` rows into `(name, Value)`
-/// pairs ready to export. The one helper both `apply_context_config`
-/// implementations share — this file's [`EmbeddedKaish::apply_context_config`]
-/// and `kj_builtin.rs`'s `KjBuiltin::apply_context_config` — so a malformed
-/// key is rejected identically on both paths instead of silently accepted by
-/// the direct-`scope` one while corrupting the generated script on this one.
-/// The identifier rule matches kaish's own `export` builtin
-/// (`tools/builtin/export.rs::check_name`): ASCII letter/underscore first,
-/// then ASCII alphanumeric/underscore.
+/// Validate durable export names before contextual construction or switching.
+/// Identifiers follow kaish's export builtin: ASCII letter/underscore first,
+/// then ASCII alphanumeric/underscore. Values remain typed strings.
 pub(crate) fn context_env_values(
     vars: &[crate::kernel_db::ContextEnvRow],
 ) -> Result<Vec<(String, kaish_kernel::ast::Value)>> {
@@ -1458,288 +1360,4 @@ mod tests {
         assert_eq!(actual, expected, "cwd should be project root");
     }
 
-    /// Context env vars stored in KernelDb should be available after
-    /// apply_context_config is called on a freshly-created EmbeddedKaish.
-    #[tokio::test]
-    async fn test_context_env_applied_on_creation() {
-        use crate::kernel_db::{ContextRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
-
-        let context_id = ContextId::new();
-        let principal = PrincipalId::system();
-        let db = KernelDb::temporary().unwrap();
-
-        let ws_id = db
-            .get_or_create_default_workspace(principal)
-            .unwrap();
-
-        db.insert_context_with_document(
-            &ContextRow {
-                context_id,
-                                label: Some("test-env".into()),
-                provider: None,
-                model: None,
-                system_prompt: None,
-                consent_mode: ConsentMode::default(),
-                context_state: ContextState::Live,
-                forked_from: None,
-                fork_kind: None,
-                created_by: principal,
-                context_type: "default".to_string(),
-                created_at: now_millis() as i64,
-                archived_at: None,
-                workspace_id: None,
-                preset_id: None,
-                concluded_at: None,
-                last_activity_at: None,
-                promoted_at: None,
-                demoted_at: None,
-                paused_at: None,
-                cast_id: None,
-                origin_host: None,
-                played_by: None,
-                reviewer_id: None,
-                director_id: None,
-            },
-            ws_id,
-        )
-        .unwrap();
-
-        // Store env vars in DB.
-        db.set_context_env(context_id, "KJ_TEST_FOO", "bar_value")
-            .unwrap();
-        db.set_context_env(context_id, "KJ_TEST_NUM", "42")
-            .unwrap();
-
-        let kernel_db = Arc::new(parking_lot::Mutex::new(db));
-        let blocks = shared_block_store(principal);
-        let kernel = test_kernel("test-env").await;
-
-        let sid = SessionId::new();
-        let session_contexts = crate::runtime::context_engine::session_context_map();
-        let kaish = EmbeddedKaish::with_identity(
-            "test-env",
-            blocks,
-            kernel,
-            None,
-            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: context_id, session: sid },
-            session_contexts,
-            ExternalExec::Deny,
-            OutputProfile::Agent,
-            |_, _, _| {},
-        )
-        .unwrap();
-
-        // Apply context config (durable env vars).
-        kaish
-            .apply_context_config(&kernel_db, context_id)
-            .await
-            .expect("apply context env");
-
-        // Verify env vars are accessible via kaish execution.
-        let result = kaish
-            .execute_with_options("echo $KJ_TEST_FOO", ExecuteOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            result.text_out().trim(),
-            "bar_value",
-            "KJ_TEST_FOO should be set from context_env",
-        );
-
-        let result = kaish
-            .execute_with_options("echo $KJ_TEST_NUM", ExecuteOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            result.text_out().trim(),
-            "42",
-            "KJ_TEST_NUM should be set from context_env",
-        );
-    }
-
-    /// A durable env value containing a single quote, a `$`, and a newline
-    /// must round-trip byte-for-byte. This is what `export_env_vars`'s
-    /// temp-var indirection replaces the old `value.replace('\'', "'\\''")`
-    /// escaping loop with: the value never becomes literal script text, so
-    /// there is nothing for a shell metacharacter to break out of.
-    #[tokio::test]
-    async fn test_context_env_special_chars_round_trip() {
-        use crate::kernel_db::{ContextRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
-
-        let context_id = ContextId::new();
-        let principal = PrincipalId::system();
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = db.get_or_create_default_workspace(principal).unwrap();
-        db.insert_context_with_document(
-            &ContextRow {
-                context_id,
-                label: Some("test-env-special".into()),
-                provider: None,
-                model: None,
-                system_prompt: None,
-                consent_mode: ConsentMode::default(),
-                context_state: ContextState::Live,
-                forked_from: None,
-                fork_kind: None,
-                created_by: principal,
-                context_type: "default".to_string(),
-                created_at: now_millis() as i64,
-                archived_at: None,
-                workspace_id: None,
-                preset_id: None,
-                concluded_at: None,
-                last_activity_at: None,
-                promoted_at: None,
-                demoted_at: None,
-                paused_at: None,
-                cast_id: None,
-                origin_host: None,
-                played_by: None,
-                reviewer_id: None,
-                director_id: None,
-            },
-            ws_id,
-        )
-        .unwrap();
-
-        let special_value = "it's a $HOME test\nwith a second line";
-        db.set_context_env(context_id, "KJ_TEST_SPECIAL", special_value)
-            .unwrap();
-
-        let kernel_db = Arc::new(parking_lot::Mutex::new(db));
-        let blocks = shared_block_store(principal);
-        let kernel = test_kernel("test-env-special").await;
-        let sid = SessionId::new();
-        let session_contexts = crate::runtime::context_engine::session_context_map();
-        let kaish = EmbeddedKaish::with_identity(
-            "test-env-special",
-            blocks,
-            kernel,
-            None,
-            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: context_id, session: sid },
-            session_contexts,
-            ExternalExec::Deny,
-            OutputProfile::Agent,
-            |_, _, _| {},
-        )
-        .unwrap();
-
-        kaish
-            .apply_context_config(&kernel_db, context_id)
-            .await
-            .expect("apply context env");
-
-        let exported = kaish.exported_vars().await;
-        let value = exported
-            .iter()
-            .find(|(k, _)| k == "KJ_TEST_SPECIAL")
-            .map(|(_, v)| v.as_str());
-        assert_eq!(
-            value,
-            Some(special_value),
-            "a value with a single quote, $, and a newline must round-trip verbatim; got {exported:?}",
-        );
-    }
-
-    /// Regression test: a persisted cwd that is a directory in the shell's
-    /// *backend* (a VFS mount) but does NOT exist on the host filesystem must
-    /// still restore. The old restore gated on host-FS `PathBuf::is_dir()` and
-    /// would silently drop it; `restore_cwd_from_db` validates against the same
-    /// backend `cd` resolves against.
-    #[tokio::test]
-    async fn test_persisted_vfs_cwd_restored_against_backend() {
-        use crate::kernel_db::{ContextRow, ContextShellRow, KernelDb};
-        use crate::vfs::{MemoryBackend, VfsOps};
-        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
-        use std::path::Path;
-
-        // A VFS-only path: lives in the MemoryBackend mount below, never on disk.
-        let vfs_cwd = "/scratch/work";
-        assert!(
-            !Path::new(vfs_cwd).is_dir(),
-            "precondition: cwd must not exist on the host filesystem"
-        );
-
-        let context_id = ContextId::new();
-        let principal = PrincipalId::system();
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = db.get_or_create_default_workspace(principal).unwrap();
-        db.insert_context_with_document(
-            &ContextRow {
-                context_id,
-                label: Some("test-restore-vfs".into()),
-                provider: None,
-                model: None,
-                system_prompt: None,
-                consent_mode: ConsentMode::default(),
-                context_state: ContextState::Live,
-                forked_from: None,
-                fork_kind: None,
-                created_by: principal,
-                context_type: "default".to_string(),
-                created_at: now_millis() as i64,
-                archived_at: None,
-                workspace_id: None,
-                preset_id: None,
-                concluded_at: None,
-                last_activity_at: None,
-                promoted_at: None,
-                demoted_at: None,
-                paused_at: None,
-                cast_id: None,
-                origin_host: None,
-                played_by: None,
-                reviewer_id: None,
-                director_id: None,
-            },
-            ws_id,
-        )
-        .unwrap();
-        db.upsert_context_shell(&ContextShellRow {
-            context_id,
-            cwd: Some(vfs_cwd.to_string()),
-            updated_at: now_millis() as i64,
-        })
-        .unwrap();
-
-        let kernel_db = Arc::new(parking_lot::Mutex::new(db));
-        let blocks = shared_block_store(principal);
-        let kernel = test_kernel("test-restore-vfs").await;
-
-        // Mount an in-memory FS and create the dir there — pure VFS, no host path.
-        kernel.mount("/scratch", MemoryBackend::new()).await;
-        kernel
-            .vfs()
-            .mkdir(Path::new(vfs_cwd), 0o755)
-            .await
-            .expect("mkdir in VFS mount");
-
-        let sid = SessionId::new();
-        let session_contexts = crate::runtime::context_engine::session_context_map();
-        let kaish = EmbeddedKaish::with_identity(
-            "test-restore-vfs",
-            blocks,
-            kernel,
-            None,
-            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: context_id, session: sid },
-            session_contexts,
-            ExternalExec::Deny,
-            OutputProfile::Agent,
-            |_, _, _| {},
-        )
-        .unwrap();
-
-        let restored = kaish
-            .restore_cwd_from_db(&kernel_db, context_id)
-            .await
-            .expect("VFS cwd should restore via backend, not be rejected by a host-FS check");
-        assert_eq!(restored.as_deref(), Some(Path::new(vfs_cwd)));
-        assert_eq!(
-            kaish.cwd().await,
-            std::path::PathBuf::from(vfs_cwd),
-            "shell cwd should be the restored VFS path"
-        );
-    }
 }

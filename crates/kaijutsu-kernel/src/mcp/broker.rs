@@ -2312,7 +2312,7 @@ impl Broker {
         };
         let spec = crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params);
         crate::kj::gate::record_dry_run_ask(
-            dispatcher.kernel_db(),
+            dispatcher.kernel(),
             &caller,
             spec,
             dispatcher.kernel().ledger_flows(),
@@ -2416,7 +2416,7 @@ impl Broker {
         };
         let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
         let outcome = crate::kj::gate::run_gate(
-            dispatcher.kernel_db(),
+            dispatcher.kernel(),
             &caller,
             gate_spec,
             dispatcher.kernel().ledger_flows(),
@@ -2677,13 +2677,10 @@ impl Broker {
         // whole statement's rendering, because that is the string the
         // classifier will see for it. Additive.
         //
-        // `env` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): the value
-        // every free `${VAR}` across every statement held in `context_env`
-        // at fire time — `kj::env_snapshot::free_variable_values`, the same
-        // reader `kj::gate::build_ask` calls. Each phase snapshots the current
-        // durable exports independently; a later ask can see changed values.
-        // `value` is `null` for an absent export. Read failures stop the hook
-        // before execution. This top-level field is a sibling to `statements`.
+        // `env` captures the effective initial variables through the same
+        // ContextShellInputs as shell construction and approval creation.
+        // Phases snapshot independently; a later ask can observe changed state.
+        // A missing variable is null. Read faults stop this hook before execution.
         if matches!(params.tool.as_str(), "shell" | "shell_write") {
             if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
                 match kaish_kernel::ast::plan::plan_program(command) {
@@ -2772,8 +2769,8 @@ impl Broker {
                             }
                         }
                         let env_entries = match crate::kj::env_snapshot::free_variable_values(
-                            &dispatcher.kernel_db().lock(), ctx.context_id, &statements,
-                        ) {
+                            dispatcher.kernel(), ctx.context_id, params.tool == "shell", &statements,
+                        ).await {
                             Ok(entries) => entries,
                             Err(error) => return KaishHookOutcome::Escalate(format!(
                                 "could not capture shell plan inputs: {error}")),
@@ -10401,20 +10398,18 @@ mod tests {
         name: &str,
         policy: kaijutsu_types::TimeoutPolicy,
     ) -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
-        use crate::drift::shared_drift_router;
-        use crate::kernel_db::KernelDb;
         use crate::kj::KjDispatcher;
 
         let kernel = Arc::new(crate::Kernel::new_ephemeral(name).await.with_timeouts(policy));
-        let store = crate::block_store::shared_block_store(PrincipalId::system());
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let store = kernel.blocks().clone();
+        let kernel_db = kernel.kernel_db().clone();
         {
             let db = kernel_db.lock();
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
         }
         let kj_dispatcher = Arc::new(KjDispatcher::new(
-            shared_drift_router(),
+            kernel.drift().clone(),
             store.clone(),
             kernel_db,
             kernel.clone(),

@@ -726,6 +726,46 @@ fn an_allowed_ask_runs_with_the_values_it_was_asked_about() {
     });
 }
 
+#[test]
+fn approval_captures_default_environment_and_original_directory() {
+    run_local(async {
+        let original = Scratch::new("env-original");
+        let moved = Scratch::new("env-moved");
+        let s = seats().await;
+        {
+            let db = s.kernel.kernel_db.lock();
+            db.delete_context_env(s.worker, "HOME").unwrap();
+            db.delete_context_env(s.worker, "PWD").unwrap();
+            db.upsert_context_shell(&kaijutsu_kernel::kernel_db::ContextShellRow {
+                context_id: s.worker, cwd: Some(original.path().to_string_lossy().into_owned()), updated_at: 0,
+            }).unwrap();
+        }
+        let code = "echo \"$HOME|$PWD\" > marker\npwd >> marker";
+        let ask = s.raise(code).await;
+        let env = s.kernel.kernel_db.lock().ask_env(&ask).unwrap();
+        let value = |name: &str| env.iter().find(|row| row.name == name).unwrap().value.clone();
+        assert_eq!(value("HOME"), Some(kaish_kernel::home_dir().to_string_lossy().into_owned()),
+            "the reviewer must see the HOME supplied by the interpreter");
+        assert_eq!(value("PWD"), Some(original.path().to_string_lossy().into_owned()));
+        {
+            let db = s.kernel.kernel_db.lock();
+            db.upsert_context_shell(&kaijutsu_kernel::kernel_db::ContextShellRow {
+                context_id: s.worker, cwd: Some(moved.path().to_string_lossy().into_owned()), updated_at: 0,
+            }).unwrap();
+            db.set_context_env(s.worker, "HOME", "/new-home").unwrap();
+            db.set_context_env(s.worker, "PWD", "/new-pwd").unwrap();
+        }
+        let (_, output) = s.link_waiting_pair(&ask, code, PairOwner::Session);
+        s.answer(&ask, true).await;
+        wait_for("approved captured environment", || s.block(&output).status != Status::Waiting).await;
+        assert_eq!(s.block(&output).status, Status::Done, "{:?}", s.block(&output).stderr);
+        assert_eq!(std::fs::read_to_string(original.marker()).unwrap(), format!("{}|{}\n{}",
+            kaish_kernel::home_dir().display(), original.path().display(), original.path().display()));
+        assert!(!moved.marker().exists(), "approval must not follow the newer context cwd");
+        s.close().await;
+    });
+}
+
 /// A denial settles the same pair to `Error` with the reason on stderr, and
 /// runs nothing at all.
 ///

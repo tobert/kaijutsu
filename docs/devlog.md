@@ -1852,6 +1852,21 @@ red/green check now rejects that ambiguous capture before mutation too. This
 removes two copies of the restore mechanism without reserving a namespace from
 players.
 
+A real SSH approval then recorded HOME as unset even though construction supplied
+it. `ContextShellInputs` now owns the selected cwd, durable exports, and external
+execution policy for both construction and capture. One defaults provider supplies
+HOME/PATH; kaish starts at the selected cwd so its initial PWD matches. Tests compare
+actual scope and execution under writable/read-only policies and durable overrides.
+The SSH scenario approves in directory A, changes cwd and exports to B, and verifies
+execution still uses A and the captured values. The two old database restore APIs
+are deleted, with their export and VFS-only-directory coverage moved to contextual
+construction. The kernel boundary also exposed four fixtures with separate kernel
+and dispatcher databases; those now use one owner, matching production. The
+full SSH suite passes, including default capture and the original-directory
+scenario. Kernel validation also reproduced the recorded ordering-stress flake;
+its evidence remains in docs/issues.md rather than being attributed to this
+unrelated change.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

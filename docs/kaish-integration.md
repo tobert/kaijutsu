@@ -57,6 +57,10 @@ These are source observations, not promises that all paths behave alike.
   newer context cwd before applying their pin. Gate outcomes preserve no pin
   versus captured-unset state; rule decisions use current context state. RPC
   cwd validation can repair a removed old directory.
+  `ContextShellInputs` is the shared construction/capture value: cwd, durable
+  exports, and external execution policy. HOME/PATH defaults have one provider;
+  initial PWD follows selected cwd. The old database restore methods are deleted,
+  and their tests use the contextual constructor, including VFS-only cwd.
 - `runtime/editor_read.rs` owns `:r !cmd` on the existing kernel worker. Caller
   drop and shutdown cancel the read and allow kaish to finish cleanup; nested
   `kj editor keys` can re-enter without blocking that worker. The editor receives
@@ -235,7 +239,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
-| Partial | Environment setup and approved environment restore | `EmbeddedKaish::apply_context_config`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |
+| Partial | Environment setup and approved environment restore | `ContextShellInputs`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |
 | Pending | Job/receipt readers and controllers | kernel `shell_operations.rs`, `kj/wait.rs`, `kj/context.rs`, runtime job builtins | In-memory jobs and durable receipts keep their distinct lifetimes |
 | Pending | Integration backends and builtins | `runtime/*_backend.rs`, filesystem adapters, `kj_builtin`, `vi_builtin`, `curl_tool`, `ps_builtin`, synthesis | Use kaish's backend/tool interfaces directly where they implement those interfaces |
 | Pending | Gate planning and parsing | `kj/gate*`, `hook_gate`, `shell_gate`, `plan_clauses`, `readonly` | Kaish remains the syntax authority; preserve clause plans and approval semantics |

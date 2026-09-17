@@ -47,6 +47,58 @@ pub enum ShellCwd {
     Captured(Option<std::path::PathBuf>),
 }
 
+/// Inputs shared by contextual construction and approval capture.
+pub(crate) struct ContextShellInputs {
+    pub cwd: Option<std::path::PathBuf>,
+    pub exports: Vec<crate::kernel_db::ContextEnvRow>,
+    pub external_exec: super::embedded_kaish::ExternalExec,
+}
+
+impl ContextShellInputs {
+    pub async fn load(kernel: &crate::Kernel, context: ContextId, read_only: bool, cwd: ShellCwd) -> Result<Self> {
+        let external_exec = if !read_only && kernel.broker().binding_checked(&context).await?
+            .allows(&crate::mcp::Capability::Exec) {
+            super::embedded_kaish::ExternalExec::Allow { path: kernel.host_path().map(str::to_string) }
+        } else {
+            super::embedded_kaish::ExternalExec::Deny
+        };
+        let db = kernel.kernel_db().lock();
+        let cwd = match cwd {
+            ShellCwd::Context => db.get_context_shell(context)
+                .map_err(|error| anyhow::anyhow!("read context_shell for {context}: {error}"))?
+                .and_then(|row| row.cwd).map(std::path::PathBuf::from),
+            ShellCwd::Captured(cwd) => cwd,
+        };
+        let exports = db.get_context_env(context)
+            .map_err(|error| anyhow::anyhow!("read context_env for {context}: {error}"))?;
+        Ok(Self { cwd, exports, external_exec })
+    }
+
+    pub fn environment(&self) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<_, _> = initial_environment(&self.external_exec)
+            .into_iter().map(|(name, value)| (name, kaish_kernel::interpreter::value_to_string(&value))).collect();
+        // Kaish initializes PWD from cwd before durable exports are applied.
+        let cwd = self.cwd.clone().unwrap_or_else(kaish_kernel::home_dir);
+        env.insert("PWD".into(), cwd.to_string_lossy().into_owned());
+        env.extend(self.exports.iter().map(|row| (row.key.clone(), row.value.clone())));
+        env
+    }
+}
+
+/// Interpreter defaults. Durable exports may override these values.
+pub(crate) fn initial_environment(external_exec: &super::embedded_kaish::ExternalExec)
+    -> std::collections::HashMap<String, kaish_kernel::ast::Value>
+{
+    use kaish_kernel::ast::Value;
+    let mut env = std::collections::HashMap::from([
+        ("HOME".into(), Value::String(kaish_kernel::home_dir().to_string_lossy().into_owned())),
+    ]);
+    if let super::embedded_kaish::ExternalExec::Allow { path: Some(path) } = external_exec {
+        env.insert("PATH".into(), Value::String(path.clone()));
+    }
+    env
+}
+
 impl EmbeddedKaish {
     /// Construct a contextual shell with explicit identity and execution policy.
     ///
@@ -111,65 +163,41 @@ impl EmbeddedKaish {
                 tools.register(crate::runtime::curl_tool::curl_tool());
             };
 
+        let inputs = ContextShellInputs::load(dispatcher.kernel(), context_id, read_only, cwd.clone()).await?;
         let kaish = if read_only {
             EmbeddedKaish::with_identity_read_only(
                 name,
                 dispatcher.block_store().clone(),
                 dispatcher.kernel().clone(),
-                None,
+                inputs.cwd.clone(),
                 identity,
                 session_contexts,
                 configure_tools,
             )?
         } else {
-            // Host subprocess policy from the context's loadout: the `exec`
-            // authority (deny-by-default — a context with no binding, or a
-            // binding without the grant, gets no external commands). PATH is
-            // the kernel's startup capture; kaish never reads OS env itself.
-            let external_exec = if dispatcher
-                .kernel()
-                .broker()
-                .binding_checked(&context_id)
-                .await?
-                .allows(&crate::mcp::Capability::Exec)
-            {
-                crate::runtime::embedded_kaish::ExternalExec::Allow {
-                    path: dispatcher.kernel().host_path().map(str::to_string),
-                }
-            } else {
-                crate::runtime::embedded_kaish::ExternalExec::Deny
-            };
             EmbeddedKaish::with_identity(
                 name,
                 dispatcher.block_store().clone(),
                 dispatcher.kernel().clone(),
-                None,
+                inputs.cwd.clone(),
                 identity,
                 session_contexts,
-                external_exec,
+                inputs.external_exec,
                 output,
                 configure_tools,
             )?
         };
 
-        // Seed the env half of the context's durable state.
-        kaish
-            .apply_context_config(dispatcher.kernel_db(), context_id)
-            .await?;
-
-        // Validate against the same VFS namespace as `cd`. Captured approval
-        // state must not depend on a newer context cwd, including an unset pin.
-        let restored = match cwd {
-            ShellCwd::Context => kaish.restore_cwd_from_db(dispatcher.kernel_db(), context_id).await.map(|_| ()),
-            ShellCwd::Captured(None) => Ok(()),
-            ShellCwd::Captured(Some(path)) => {
-                if kaish.try_set_cwd(path.clone()).await { Ok(()) }
-                else { Err(anyhow::anyhow!("approved cwd '{}' no longer resolves to a directory; nothing was run", path.display())) }
+        kaish.export_env_vars(&inputs.exports).await?;
+        // Validate the initial directory without changing its scope after seeding.
+        if let Some(path) = &inputs.cwd {
+            if !kaish.try_set_cwd(path.clone()).await {
+                kaijutsu_telemetry::record_cwd_restore_failed();
+                if matches!(cwd, ShellCwd::Captured(_)) {
+                    anyhow::bail!("approved cwd '{}' no longer resolves to a directory; nothing was run", path.display());
+                }
+                anyhow::bail!("context cwd '{}' is unavailable; set a valid cwd before executing", path.display());
             }
-        };
-        if let Err(error) = restored {
-            kaijutsu_telemetry::record_cwd_restore_failed();
-            return Err(error);
         }
 
         Ok(kaish)
@@ -727,13 +755,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn captured_environment_matches_materialized_scope_and_exec_policy() {
+        let d = dispatcher_with_full_broker().await;
+        d.kernel().mount("/", crate::vfs::backends::LocalBackend::read_only("/")).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("effective-env"), None, principal);
+        grant_broad_binding(&d, context, true).await;
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: context, cwd: Some(cwd.path().to_string_lossy().into_owned()), updated_at: 0,
+        }).unwrap();
+        for (read_only, overridden) in [(false, false), (true, false), (false, true), (true, true)] {
+            if overridden {
+                let db = d.kernel_db().lock();
+                for (name, value) in [("HOME", "/configured-home"), ("PWD", "/configured-pwd"), ("PATH", "/configured-bin")] {
+                    db.set_context_env(context, name, value).unwrap();
+                }
+            }
+            let inputs = ContextShellInputs::load(d.kernel(), context, read_only, ShellCwd::Context).await.unwrap();
+            let captured = inputs.environment();
+            let shell = EmbeddedKaish::for_context(&d, "effective-env", ShellIdentity {
+                requester: principal, performer: principal, reviewer: None, context, session: SessionId::new(),
+            }, if read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
+                ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
+            assert_eq!(captured.get("PATH").map(String::as_str), if overridden { Some("/configured-bin") } else if read_only { None } else { d.kernel().host_path() });
+            for name in ["HOME", "PWD", "PATH", "UNSET"] {
+                let value = shell.get_var(name).await.map(|value| kaish_kernel::interpreter::value_to_string(&value));
+                assert_eq!(value.as_ref(), captured.get(name), "{name}, read_only={read_only}");
+                if let Some(value) = captured.get(name) {
+                    let result = shell.execute_with_options(&format!("echo \"${name}\""), ExecuteOptions::default()).await.unwrap();
+                    assert_eq!(result.code, 0, "{name}: {}", result.err);
+                    assert_eq!(result.text_out(), format!("{value}\n"), "{name}, read_only={read_only}");
+                }
+            }
+            assert_eq!(shell.cwd().await, cwd.path());
+        }
+    }
+
     /// Every invocation reads the context's durable environment.
     #[tokio::test]
-    async fn materialized_shell_seeds_durable_env() {
+    async fn materialized_shell_restores_durable_exports_and_vfs_cwd() {
         let d = Arc::new(test_dispatcher().await);
         d.set_self_arc();
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("here"), None, principal);
+        use crate::vfs::VfsOps;
+        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        d.kernel().vfs().mkdir(std::path::Path::new("/scratch/work"), 0o755).await.unwrap();
+        let special = "it's a $HOME test\nwith a second line";
+        {
+            let db = d.kernel_db().lock();
+            db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: ctx, cwd: Some("/scratch/work".into()), updated_at: 0,
+            }).unwrap();
+            db.set_context_env(ctx, "SPECIAL", special).unwrap();
+            db.set_context_env(ctx, "NUMBER", "42").unwrap();
+        }
 
         // L1: set a durable env var on the context.
         d.kernel_db()
@@ -754,6 +832,10 @@ mod tests {
         )
             .await
             .expect("materialize context shell");
+        assert_eq!(kaish.cwd().await, std::path::Path::new("/scratch/work"));
+        let exported = kaish.exported_vars().await;
+        assert!(exported.contains(&("SPECIAL".into(), special.into())));
+        assert!(exported.contains(&("NUMBER".into(), "42".into())));
 
         let result = kaish
             .execute_with_options("echo $FOO", ExecuteOptions::default())

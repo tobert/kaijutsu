@@ -413,34 +413,32 @@ else is the caller's.
 
 ## The ask carries its free variables
 
-**Ruled (Amy, 2026-09-02): snapshot, do not refuse.** Both gated shell
-paths run on a single-use materialized shell seeded only from the context's
-durable state, so "kaish state" at ask time is the `context_env` rows and
-the cwd, and the cwd was already on the ask. The snapshot is exact, not an
-estimate: it is the value substitution would read.
+**Ruled (Amy, 2026-09-02): snapshot, do not refuse.** Approval captures the
+initial environment a contextual shell would read. `ContextShellInputs` supplies
+both construction and capture: selected cwd, durable exports, and host execution
+policy. HOME comes from the interpreter defaults, PWD from the selected initial
+cwd, and PATH from the kernel startup capture when Exec is granted. Durable
+exports override those values. Read-only shells never gain host execution from
+an environment value.
 
-`kj::env_snapshot::free_variable_values` is the one place the rule lives:
-the union of each statement's `free_variables` and its non-literal
-heredocs' `free_variables`, deduplicated, first-seen order, each name read
-from `context_env` as a value or an explicit unset. `approval_env` stores
-it (`request_id, seq, name, value NULL-for-unset`, cascading with the ask);
-`KernelDb::ask_env` reads it back. The executor restores it before running:
-one kaish script that `export`s each value through the typed-overlay path
-durable `context_env` uses and `unset`s each recorded absence, identifiers
-validated first. A failure to restore is a reason not to run.
+`kj::env_snapshot` takes the union of statement and non-literal heredoc free
+variables, deduplicated in first-seen order. `approval_env` stores each value or
+explicit unset (`request_id, seq, name, value NULL-for-unset`). Before execution,
+the shared restore helper exports captured values and unsets captured absences.
+It validates all names and refuses duplicates before mutation; temporary overlay
+names cannot collide with any target. A restore failure prevents execution.
 
-Cwd and free-variable capture share one database lock. A failed read refuses
-before recording an ask, including dry-run audit asks; it never records an
-unreadable value as unset. The hook plan reader also returns its read failure
-before running a classifier body. Interpreter-provided defaults, including
-HOME, still need an effective-environment audit; the reader currently captures
-durable exports only.
+Cwd and durable exports are read under one database lock. Storage faults refuse
+before recording an ask, including dry-run audit asks. The hook plan reader also
+reports a capture failure before running the classifier. Construction initializes
+kaish at the selected cwd, then validates that directory in its VFS namespace;
+there is no second database restore that can select a newer cwd.
 
-**Both consumers call the same function** (Amy: the classifier "should see
-the same data"). The broker's `KJ_TOOL_PLAN` gains an additive top-level
-`env: [{name, value|null}]` beside `statements`. The lfm2d hook script does
-not read it yet; whether the scorer substitutes values into its clause is
-a scorer decision, in `docs/issues.md`.
+**Both consumers use the same input rules** (Amy: the classifier "should see
+the same data"). The broker's `KJ_TOOL_PLAN` includes `env: [{name, value|null}]`
+beside `statements`. Hook classification and ask creation are independent
+snapshots; intervening durable changes can affect the later one. The lfm2d scorer
+still does not substitute the environment into its clauses; see `docs/issues.md`.
 
 **The human sees the values on the ask's `description`, not on the
 statement rendering.** `approval_statements` is content-addressed and

@@ -110,7 +110,7 @@ impl KjDispatcher {
                 // A kj-verb ask carries no plan for the config layers to
                 // key on; it meets the user-rule layer only.
                 let outcome = crate::kj::gate::run_gate(
-                    &self.kernel_db,
+                    self.kernel(),
                     caller,
                     spec,
                     self.kernel.ledger_flows(),
