@@ -14,9 +14,10 @@ how this shipped).
 ## One seam, as built
 
 MIDI and samples are one render path. The kernel decides *what/when*; a sink
-near the hardware does the physical emit. The kernel/server binary links no
-`alsa`/`pipewire`/`symphonia` dependency at all — hardware emit lives
-entirely in `kaijutsu-audiod` (`docs/audio-daemon.md`).
+near the hardware does the physical emit. Hardware emit lives entirely in
+`kaijutsu-audiod` (`docs/audio-daemon.md`). The kernel still links Symphonia,
+Rubato, and RTen through `beat-this` for offline `kj audio beats` analysis;
+see `docs/audio-inference.md` for its cost and placement tradeoffs.
 
 What crosses the wire lives in the FFI-free `kaijutsu-audio` crate
 (`src/lib.rs` — no audio deps, no tokio, nothing kernel-ward):

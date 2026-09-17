@@ -956,6 +956,16 @@ bridge task's self-detach lived on a LocalSet that was dropped before it
 could run — and moved that cleanup onto the connection's own Drop, the only
 teardown that runs.
 
+The later inference review kept placement open. Amy: "for now we'll
+evaluate kaijutsu's tradeoffs, and decide later about the new home." Local
+embeddings had moved to lfm2d, but offline beat analysis still decoded and
+ran ONNX graphs inside the kernel. Optimized probes processed a synthetic
+three-minute track in 2.32 s with 564 MiB peak RSS; two simultaneous jobs
+peaked at 1.37 GiB. Small weights did not remove the full-file buffer cost.
+The review proposes a bounded analysis executor, distinct from the kernel's
+music state and audiod's hardware timing. `docs/audio-inference.md` records
+the evidence and the limits; no model or service was moved.
+
 ## The file that answered a question the code already knew (September 9)
 
 Amy read `contrib/kj-expectations.toml` and said something felt off without

@@ -1076,8 +1076,7 @@ non-File/length filter, whereas indexing requires terminal Text/Thinking
 blocks. Neither filter explicitly accounts for excluded blocks. Review that
 policy before automatic synthesis returns. An empty index projection also
 leaves its prior search vector intact; synthesis now clears its own preview,
-but search needs an explicit removal policy. Audio still uses rten; its stale
-`kj/audio.rs` embedding-reference comment belongs to the active kj lane.
+but search needs an explicit removal policy.
 
 Bulk synthesis also undercounts completed indexing when a context's index
 write succeeds but its later synthesis fails: `refresh_synthesis` returns one
@@ -2151,6 +2150,22 @@ primitive (`write_all` is truncate+rewrite, `vfs/ops.rs:158`), which would
 also make `>>` and jsonl logs cheap. `opendir` materializes a whole
 `readdir` per handle (no pagination); the post-write re-getattr race is
 accepted in code (`sftp.rs:585`).
+
+## Offline audio analysis has no resource admission or cancellation contract
+
+`kj/audio.rs::audio_beats` starts a blocking task for each request, without
+an analysis-specific concurrency limit, decoded sample bound, or inference
+cancellation mechanism. Dropping its waiter cannot stop started inference;
+runtime shutdown waits for the blocking work. Full-file decoding and mel
+extraction precede chunked prediction. A 180 s synthetic track peaked near
+564 MiB; two concurrent analyses peaked near 1.37 GiB on the measured host.
+See `docs/audio-inference.md` for methodology and placement tradeoffs.
+
+Define bounded admission, input limits, and cancellation semantics before
+expanding this workload. Results currently name a mutable host path and
+model family, without audio or weight hashes; caching or durable musical
+use needs immutable provenance. Executor placement, including possible
+lfm2d ownership, remains undecided. Hardware timing stays with audiod.
 
 ## Audio nodes — follow-up after daemon extraction
 

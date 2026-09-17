@@ -194,8 +194,8 @@ impl KjDispatcher {
         let audio_path = PathBuf::from(&path);
         let model_dir = beat_this_model_dir();
 
-        // CPU-bound (model load + inference) — off the async runtime, same
-        // pattern as the index embed/synth path (runtime/kj_builtin.rs).
+        // Keep graph loading, decoding, resampling, and inference off the
+        // async executor. Started blocking work outlives a canceled waiter.
         let join_result = tokio::task::spawn_blocking({
             let audio_path = audio_path.clone();
             move || run_beats(&model_dir, &audio_path)
