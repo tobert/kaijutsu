@@ -652,10 +652,15 @@ impl KernelBackend for KaijutsuBackend {
             self.kernel.id(),
         );
 
-        // Phase 1 M4: dispatch through the MCP broker.
+        // Carry kaish's invocation cancellation through the broker. Its
+        // watchdog signals this token; replacing it would strand pending tools
+        // after the shell's caller cancels or the kernel shuts down.
+        let cancel = ctx.as_any_mut().downcast_mut::<kaish_kernel::tools::ExecContext>()
+            .ok_or_else(|| BackendError::Io("MCP dispatch requires a kaish execution context".into()))?
+            .cancel.clone();
         let result = self
             .kernel
-            .dispatch_tool_via_broker(name, &params_str, &tool_ctx)
+            .dispatch_tool_via_broker_with_cancel(name, &params_str, &tool_ctx, cancel)
             .await
             .map_err(|e| match e {
                 crate::mcp::McpError::ToolNotFound { tool, .. } => {

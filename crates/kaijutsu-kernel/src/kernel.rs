@@ -7,8 +7,7 @@
 //! - LLM providers (for model access)
 //! - Control plane (consent mode)
 
-use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
-use crate::runtime::embedded_kaish::EmbeddedKaish;
+use crate::runtime::context_shell::ShellIdentity;
 use async_trait::async_trait;
 use kaijutsu_types::{ContextId, PrincipalId};
 use std::path::Path;
@@ -1633,15 +1632,8 @@ impl Kernel {
         Ok(state)
     }
 
-    /// Fetch the content for a `:r` read intent. `:r <file>` reads through the
-    /// shared `FileDocumentCache` (the same source the editor and file tools
-    /// use). `:r !cmd` materializes a per-context kaish in the *opener's*
-    /// `(principal, context_id, session_id)` — the same `EmbeddedKaish::for_context`
-    /// the model shell and rc lifecycle use — and splices the command's stdout.
-    /// Running in the opener's context means the command sees their cwd and
-    /// capability allow-set, not the edited block's context. Fails loud (never a
-    /// silent empty splice) when there's no opener, no dispatcher, or the command
-    /// fails.
+    /// Fetch complete text before an editor splice. Shell reads run in the
+    /// opener's context on the kernel runtime; failures leave the buffer intact.
     async fn fetch_editor_io(
         &self,
         io: kaijutsu_editor::EditorIo,
@@ -1654,8 +1646,7 @@ impl Kernel {
                 .await
                 .map_err(|e| e.to_string()),
             kaijutsu_editor::EditorIo::ReadShell(cmd) => {
-                // No opener (a headless driver / wire open) → no context to run
-                // in. Fail loud pointing at the interactive shell, as before.
+                // Headless opens cannot infer a working context or identity.
                 let opener = opener.ok_or_else(|| {
                     format!(
                         "editor: ':r !{cmd}' needs an opener context — open via \
@@ -1665,31 +1656,10 @@ impl Kernel {
                 let dispatcher = self.broker.kj_dispatcher().await.ok_or_else(|| {
                     "editor: ':r !cmd' unavailable — kj dispatcher not wired".to_string()
                 })?;
-                let kaish = EmbeddedKaish::for_context(
-                    &dispatcher,
-                    "editor-read",
-                    ShellIdentity {
-                        requester: opener.principal, performer: opener.principal, reviewer: None,
-                        context: opener.context_id, session: opener.session_id,
-                    },
-                    ShellPolicy::Internal,
-                    dispatcher.semantic_index(),
-                    dispatcher.block_source(),
-                )
-                    .await
-                    .map_err(|e| format!("editor: ':r !{cmd}' materialize shell: {e}"))?;
-                let result = kaish
-                    .execute_with_options(&cmd, kaish_kernel::ExecuteOptions::default())
-                    .await
-                    .map_err(|e| format!("editor: ':r !{cmd}' failed: {e}"))?;
-                if result.code != 0 {
-                    return Err(format!(
-                        "editor: ':r !{cmd}' exited {}: {}",
-                        result.code,
-                        result.err.trim()
-                    ));
-                }
-                Ok(result.text_out().into_owned())
+                crate::runtime::editor_read::read_shell(dispatcher, ShellIdentity {
+                    requester: opener.principal, performer: opener.principal, reviewer: None,
+                    context: opener.context_id, session: opener.session_id,
+                }, cmd.clone()).await.map_err(|e| format!("editor: ':r !{cmd}' failed: {e}"))
             }
         }
     }
@@ -2537,6 +2507,43 @@ mod tests {
             "':r !echo' must splice command stdout: {:?}",
             state.text
         );
+    }
+
+    #[tokio::test]
+    async fn editor_colon_r_shell_rejects_invalid_utf8_before_splicing() {
+        use crate::kj::test_helpers::{install_rc_script_file, register_context, test_dispatcher_rc};
+        let d = Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let principal = PrincipalId::system();
+        let context_id = register_context(&d, Some("vi-binary"), None, principal);
+        let path = "/config/rc/vitest/create/S00-foo.kai";
+        install_rc_script_file(&d, path, "unchanged").await;
+        let opener = crate::editor::EditorOpener { principal, context_id, session_id: kaijutsu_types::SessionId::new() };
+        let (id, _) = d.kernel().editor_open_as(path, Some(opener)).await.unwrap();
+        let state = d.kernel().editor_keys(id, ":r !echo '/w==' | base64 -d<CR>").await.unwrap();
+        assert_eq!(state.text, "unchanged", "invalid UTF-8 must not become replacement characters");
+        assert!(state.message.as_deref().unwrap_or("").contains("UTF-8"), "{:?}", state.message);
+        assert!(!state.dirty);
+    }
+
+    #[tokio::test]
+    async fn editor_colon_r_shell_refuses_after_runtime_shutdown() {
+        use crate::kj::test_helpers::{install_rc_script_file, register_context, test_dispatcher_rc};
+        let d = Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let principal = PrincipalId::system();
+        let context_id = register_context(&d, Some("vi-shutdown"), None, principal);
+        let path = "/config/rc/vitest/create/S00-foo.kai";
+        install_rc_script_file(&d, path, "unchanged").await;
+        let opener = crate::editor::EditorOpener { principal, context_id, session_id: kaijutsu_types::SessionId::new() };
+        let (id, _) = d.kernel().editor_open_as(path, Some(opener)).await.unwrap();
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+        let state = d.kernel().editor_keys(id, ":r !echo must-not-run<CR>").await.unwrap();
+        assert_eq!(state.text, "unchanged", "shutdown forbids new editor shell execution");
+        assert!(state.message.as_deref().unwrap_or("").contains("shut down"), "{:?}", state.message);
+        assert!(!state.dirty);
     }
 
     #[tokio::test]

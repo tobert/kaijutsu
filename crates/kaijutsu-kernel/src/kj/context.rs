@@ -3183,6 +3183,7 @@ mod tests {
         if persist_bindings {
             d.kernel().broker().set_db(d.kernel_db().clone()).await;
         }
+        d.kernel().mount("/tmp/seat", crate::vfs::backends::MemoryBackend::new()).await;
         let [amy, banto, coder, judge] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
         let db = d.kernel_db().lock();
         for (principal_id, name, root) in [(amy, "amy", true), (banto, "banto", false), (coder, "coder", false), (judge, "judge", false)] {
@@ -3378,7 +3379,7 @@ mod tests {
                 requester: caller.principal_id, performer: caller.principal_id, reviewer: None,
                 context: parent, session: caller.session_id,
             },
-            crate::runtime::context_shell::ShellPolicy::Rc(crate::rc::RcAuthority::for_test()),
+            crate::runtime::context_shell::ShellPolicy::Rc(crate::rc::RcAuthority::for_test()), crate::runtime::context_shell::ShellCwd::Context,
             None,
             std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
         ).await.unwrap();
@@ -3454,7 +3455,7 @@ mod tests {
                     requester: caller.principal_id, performer: caller.principal_id, reviewer: None,
                     context: id, session: caller.session_id,
                 },
-                crate::runtime::context_shell::ShellPolicy::Rc(crate::rc::RcAuthority::for_test()),
+                crate::runtime::context_shell::ShellPolicy::Rc(crate::rc::RcAuthority::for_test()), crate::runtime::context_shell::ShellCwd::Context,
                 None,
                 std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
             ).await.unwrap();

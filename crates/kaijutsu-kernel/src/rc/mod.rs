@@ -22,7 +22,7 @@
 //! and an error block is inserted in its place.
 //!
 
-use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
+use crate::runtime::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::collections::HashMap;
 use crate::runtime::synthesis::NoopBlockSource;
@@ -437,7 +437,7 @@ async fn run_kai_script(
             requester: principal, performer: caller.actor_id, reviewer: caller.reviewer_id,
             context: new_id, session: SessionId::new(),
         },
-        ShellPolicy::Rc(RcAuthority { _private: () }),
+        ShellPolicy::Rc(RcAuthority { _private: () }), ShellCwd::Context,
         None,
         std::sync::Arc::new(NoopBlockSource),
     )

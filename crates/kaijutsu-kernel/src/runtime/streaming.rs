@@ -8,7 +8,7 @@ use kaijutsu_types::Refusal;
 use crate::Kernel;
 use super::command::{self, CommandContextSwitch, CommandRunOptions, ContextSwitch};
 use super::command_outcome::{CommandExecution, CommandOutcome};
-use super::context_shell::{ShellIdentity, ShellPolicy};
+use super::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use super::embedded_kaish::EmbeddedKaish;
 
 /// The adapter applies and acknowledges switches while waiting for completion.
@@ -78,7 +78,7 @@ async fn prepare(
         _ = cancel.cancelled() => return Err("streaming command cancelled before execution".into()),
         result = async {
             let dispatcher = kernel.broker().kj_dispatcher().await.ok_or("kj dispatcher is not registered")?;
-            EmbeddedKaish::for_context(&dispatcher, "streaming", identity, ShellPolicy::Agent,
+            EmbeddedKaish::for_context(&dispatcher, "streaming", identity, ShellPolicy::Agent, ShellCwd::Context,
                 dispatcher.semantic_index(), dispatcher.block_source()).await.map_err(|e| e.to_string())
         } => result?,
     };

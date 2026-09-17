@@ -7946,9 +7946,9 @@ fn value_to_env_string(value: &kaish_kernel::ast::Value) -> String {
     }
 }
 
-/// Materialize a shell for an explicitly addressed context without consulting
-/// or changing the connection's ambient joined-context binding.
-async fn materialize_context_shell_for(
+/// Validate a new directory independently of the old cwd so a removed
+/// directory can be repaired. This shell never executes submitted source.
+async fn shell_for_cwd_validation(
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
     context_id: ContextId,
@@ -7982,7 +7982,7 @@ async fn materialize_context_shell_for(
             requester: principal, performer: principal, reviewer: reviewer,
             context: context_id, session: session_id,
         },
-        ShellPolicy::Agent,
+        ShellPolicy::Agent, kaijutsu_kernel::runtime::context_shell::ShellCwd::Captured(None),
         kernel.kj_dispatcher.semantic_index(),
         kernel.kj_dispatcher.block_source(),
     )
@@ -8037,7 +8037,7 @@ async fn set_context_cwd(
     if !std::path::Path::new(path).is_absolute() {
         return Ok(Err(format!("cwd must be absolute: {}", path)));
     }
-    let kaish = materialize_context_shell_for(kernel, connection, context_id).await?;
+    let kaish = shell_for_cwd_validation(kernel, connection, context_id).await?;
     if !kaish.try_set_cwd(std::path::PathBuf::from(path)).await {
         return Ok(Err(format!("not a directory: {}", path)));
     }

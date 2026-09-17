@@ -8,7 +8,7 @@ use kaijutsu_types::{BlockId, PrincipalId, Refusal, Role, Status, ToolKind};
 use crate::Kernel;
 use super::command::{self, CommandContextSwitch, CommandRunOptions};
 use super::command_outcome::{CommandExecution, CommandHookEffect, CommandOutcome};
-use super::context_shell::{ShellIdentity, ShellPolicy};
+use super::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use super::embedded_kaish::EmbeddedKaish;
 
 pub struct ExecutedKj {
@@ -69,7 +69,7 @@ async fn run_kj(
         _ = stop.cancelled() => return Err("kernel runtime shut down during structured preparation".into()),
         result = async {
             let dispatcher = kernel.broker().kj_dispatcher().await.ok_or("kj dispatcher is not registered")?;
-            EmbeddedKaish::for_context(&dispatcher, "structured-kj", identity, ShellPolicy::Agent,
+            EmbeddedKaish::for_context(&dispatcher, "structured-kj", identity, ShellPolicy::Agent, ShellCwd::Context,
                 dispatcher.semantic_index(), dispatcher.block_source()).await.map_err(|e| e.to_string())
         } => result?,
     };

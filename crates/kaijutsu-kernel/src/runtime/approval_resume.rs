@@ -8,7 +8,7 @@ use crate::{Kernel, KernelDb};
 use kaijutsu_types::{BlockId, ContextId, PrincipalId, SessionId, Status};
 use kaijutsu_types::ToolKind as TypesToolKind;
 use super::embedded_kaish::EmbeddedKaish;
-use super::context_shell::{ShellIdentity, ShellPolicy};
+use super::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use super::command::CommandRunOptions;
 
 /// Who a principal is, as a model should read it: the two sentinels, then
@@ -455,7 +455,7 @@ async fn act_on_executable_answer(
             requester: principal_id, performer: ask.actor, reviewer: Some(ask.reviewer),
             context: context_id, session: session_id,
         },
-        ShellPolicy::Agent,
+        ShellPolicy::Agent, ShellCwd::Captured(ask.cwd.as_ref().map(std::path::PathBuf::from)),
         dispatcher.semantic_index(),
         dispatcher.block_source(),
         ).await
@@ -513,24 +513,6 @@ async fn act_on_executable_answer(
 
     // Restore captured inputs before execution. Cancellation after redemption
     // spends the approval but settles its pair without running the source.
-    let cwd_error = if let Some(cwd) = ask.cwd.as_deref() {
-        prepare_while_running(stop, async {
-            if kaish.try_set_cwd(std::path::PathBuf::from(cwd)).await { Ok(()) }
-            else { Err(format!("the approved directory {cwd} no longer resolves to a directory")) }
-        }).await.err()
-    } else { None };
-    if let Some(why) = cwd_error {
-        settle_pair_error(kernel, context_id, &command_block_id, &output_block_id,
-            format!("approved, but not run: {why}"));
-        return if tell {
-            ExecAction::Tell(format!(
-                "{who} approved the action you were waiting on: {}\n\n\
-                 It did NOT run: {why}. Block {} carries the same message. Ask again.",
-                answer.description, output_block_id.to_key()
-            ))
-        } else { ExecAction::Settled };
-    }
-
     if let Err(why) = prepare_while_running(stop, seed_ask_env(&kaish, &answer.request_id, kernel)).await {
         let reason = format!("approved, but not run: {why}");
         settle_pair_error(

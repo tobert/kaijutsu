@@ -1784,6 +1784,20 @@ absent clears output, present empty stays present, and JSON-only output survives
 Three decoding regressions first failed, then passed; the real `:!echo hi`
 terminal probe confirms that accepted output becomes visible to the player.
 
+Editor shell reads now belong to the kernel runtime and return complete UTF-8
+text or an error before splicing. A pending-tool cancellation test exposed a
+second gap: the kaish MCP adapter created a fresh token, so the shell's
+watchdog and cancellation could not reach its tool. It now forwards kaish's
+execution token. Context construction also reports loadout/cwd read failures
+and refuses a directory that no longer resolves. Explicit current-versus-
+captured cwd selection preserves approval pins without first consulting a
+newer directory; the two post-construction restore paths are removed.
+DeepSeek's Kaibo review caught a conflation between no approval pin and a
+captured unset cwd. A real auto-allowed shell test failed by landing in HOME;
+`GateOutcome` now carries the explicit cwd source too. RPC cwd validation
+starts independently of the previous directory, so it can repair a removed
+cwd instead of refusing its own remedy.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

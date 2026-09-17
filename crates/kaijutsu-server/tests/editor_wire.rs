@@ -442,6 +442,33 @@ fn colon_r_reads_a_file_into_the_buffer_over_the_wire() {
 }
 
 #[test]
+fn editor_shell_reads_complete_text_and_refuses_binary_over_the_wire() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "editor-read").await.unwrap();
+        let opened = kernel.execute_kj(context, &["editor".into(), "open".into(), RC_PATH.into()]).await.unwrap();
+        assert_eq!(opened.exit_code, 0, "{opened:?}");
+        let session = opened.data.unwrap()["session"].as_u64().unwrap();
+        let original = kernel.editor_state(session).await.unwrap();
+        let rejected = kernel.editor_keys(session, ":r !echo '/w==' | base64 -d<CR>").await.unwrap();
+        assert_eq!(rejected.text, original.text);
+        assert_eq!(rejected.dirty, original.dirty);
+        assert!(rejected.message.as_deref().unwrap_or("").contains("UTF-8"), "{rejected:?}");
+        let limited = kernel.editor_keys(session,
+            ":r !kaish-output-limit set 1; echo preview-must-not-land<CR>").await.unwrap();
+        assert_eq!(limited.text, original.text);
+        assert!(!limited.dirty);
+        assert!(limited.message.as_deref().unwrap_or("").contains("truncated"), "{limited:?}");
+        let accepted = kernel.editor_keys(session, ":r !echo complete-read<CR>").await.unwrap();
+        assert_eq!(accepted.text, format!("complete-read\n{}", original.text));
+        assert!(accepted.dirty);
+        kernel.editor_keys(session, ":q!<CR>").await.unwrap();
+    });
+}
+
+#[test]
 fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
     // The `open_editor` peer signal (vi.md step 2): a human's `vi <path>` in the
     // app shell must nudge the submitter's app windows to pop a renderer. We

@@ -1,56 +1,21 @@
-//! The approval-ledger gate — shared by `kj` verbs with external effects
-//! ([`crate::kj::cc`]) and the `shell_write` gate ([`crate::kj::shell_gate`]).
+//! Approval decisions shared by `kj` effectful verbs and `shell_write`.
 //!
-//! First consumer: `kj cc send` — injecting a turn into a Claude Code
-//! session is exactly the "agent action an assigned reviewer should authorize" case the
-//! ledger exists for (Amy, 2026-08-16: *"yeah kj cc send should go through
-//! the ledger"*). The shape here is the template gate, extended, then, to
-//! `shell_write` (`docs/gate-and-shell-split.md`, "Slice 4").
+//! A `GateSpec` carries an ordered list of statements. Policy applies to the
+//! whole submission: any denial refuses it, complete coverage allows it, and
+//! uncovered work asks for review. A submission never executes partially on
+//! the strength of a partially covered plan.
 //!
-//! A [`GateSpec`] carries an ORDERED list of [`GatedStatement`]s, not one —
-//! `kj cc send` happens to gate exactly one, `shell_write` gates every
-//! top-level statement a submission's `plan_program()` produces.
-//! [`AskCoverage::verdict`] (`approval-ledger`) composes across the whole
-//! list: a single denied statement denies the entire call, every statement
-//! must be covered to auto-allow, anything else escalates — a
-//! partially-covered submission is never partially applied, because there is
-//! no way to run "just the allowed half" of one submitted blob (see
-//! `docs/gate-and-shell-split.md`, "The crux").
+//! Rules are evaluated before redeeming a prior answer. Redemption grants one
+//! caller the saved decision; it does not create standing permission. New asks
+//! and automatic decisions are durable before their ledger change is published.
+//! Result-review answers belong to their retained execution owner and cannot
+//! be redeemed by a new invocation.
 //!
-//! ## The flow
-//!
-//! 1. **Rules first** — [`approval_ledger::rules::redeem`] checks whether an
-//!    active rule already covers the statement. A `Deny` rule denies without
-//!    asking anyone; an `Allow` rule auto-allows; both still leave a durable
-//!    ask row (created, then decided with `auto_reason`) so the audit trail
-//!    is complete. With the free-variable statement this gate builds, allow
-//!    rules cannot exist (ledger guarantee 3), so in practice everything
-//!    escalates — deliberately, until fan-out exists.
-//! 2. **Durable before asked** — [`approval_ledger::ask::create_ask`]
-//!    commits before anything waits (ledger guarantee 1). The ask row is the
-//!    durable record regardless of how the wait ends.
-//! 3. **Return, without waiting.** The gate hands back
-//!    [`GateVerdict::Pending`] with the request id and nothing runs. Its assigned reviewer
-//!    answers from `kj ledger` whenever they answer — minutes or a night
-//!    later — and the next attempt at the same request redeems that answer
-//!    once (step 2 above). Fail-closed throughout: an unanswered ask
-//!    authorizes nothing, and no clock ever turns absence into permission.
-//!    Why nothing blocks: `docs/gate-resume.md`.
-//!
-//! ## Two findings from the gate research pass, honored here
-//!
-//! - **`authorized_label` is the RAW typed reference** (finding #3) — what
-//!   the caller typed, never a resolved id/label. For `kj cc send` that is
-//!   the target string exactly as given.
-//!
-//! ## Answering
-//!
-//! From any shell: `kj ledger list`, `kj ledger allow <id>` /
-//! `kj ledger deny <id>` (see [`crate::kj::ledger`]). The ledger's claim
-//! race (guarantee 5) makes concurrent answers safe: exactly one answerer
-//! wins, losers read a loud `AlreadyDecided`/claim failure, never a silent
-//! no-op.
+//! Gate outcomes keep current cwd selection distinct from an approval's
+//! captured directory, including a captured unset cwd. See `docs/gate-shape-b.md`
+//! and `docs/kaish-integration.md`.
 
+use crate::runtime::context_shell::ShellCwd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -132,15 +97,10 @@ pub(crate) struct GateOutcome {
     /// Human-readable reason, always populated — on refusal it says exactly
     /// why (denied by whom, expired after how long, which rule fired).
     pub reason: String,
-    /// The context's cwd at the moment its ask escalated, handed back
-    /// exactly once — on the redemption that spends the answer and turns
-    /// `Allowed`. An approval authorizes the operation it was asked about,
-    /// not a similar one run wherever the context's cwd has since moved to
-    /// (see [`caller_cwd`]). `None` on every other outcome: a rule-matched
-    /// auto-allow never escalated, so nothing was pinned; a denial does not
-    /// need a directory to run in; and a caller with no `context_id` had
-    /// nothing to pin in the first place.
-    pub cwd: Option<PathBuf>,
+    /// A redeemed approval supplies its captured cwd, including an unset pin.
+    /// Rule decisions use current context state; a missing pin is not a captured
+    /// unset directory.
+    pub cwd: ShellCwd,
 }
 
 /// What a player does about a pending ask whose `exec_source` is `Some` —
@@ -187,7 +147,7 @@ impl GateOutcome {
 
     /// A fault before anything durable existed.
     fn unavailable_without_row(reason: String) -> Self {
-        Self { verdict: GateVerdict::Unavailable, ask: None, reason, cwd: None }
+        Self { verdict: GateVerdict::Unavailable, ask: None, reason, cwd: ShellCwd::Context }
     }
 }
 
@@ -659,7 +619,7 @@ pub(crate) async fn run_gate(
                 // row that has outlived whatever process raised it.
                 // Surfaced only on an allow: a denial runs nothing, so it
                 // has no directory to run in.
-                let cwd = allowed.then(|| row.cwd.map(PathBuf::from)).flatten();
+                let cwd = if allowed { ShellCwd::Captured(row.cwd.map(PathBuf::from)) } else { ShellCwd::Context };
                 return GateOutcome {
                     verdict: if allowed { GateVerdict::Allowed } else { GateVerdict::Denied },
                     ask: Some(ask_ref(request_id, status)),
@@ -743,9 +703,8 @@ pub(crate) async fn run_gate(
         // Both the ask row and its auto-decision have committed by now.
         announce_ledger_change(db, ledger_flows);
         return match row {
-            // A rule match never escalates, so there was never a pin to
-            // hand back — `cwd: None` here is not a gap, it is the honest
-            // fact that no ask (and no directory) was ever recorded.
+            // A rule decision runs against current context state, without
+            // redeeming a reviewer's captured directory.
             Ok(row) => GateOutcome {
                 verdict: if row.status.is_allowed() {
                     GateVerdict::Allowed
@@ -753,7 +712,7 @@ pub(crate) async fn run_gate(
                     GateVerdict::Denied
                 },
                 ask: Some(ask_ref(request_id, row.status)),
-                cwd: None,
+                cwd: ShellCwd::Context,
                 reason: auto_reason.to_string(),
             },
             // The ask committed and its decision did not, so the row exists
@@ -762,7 +721,7 @@ pub(crate) async fn run_gate(
             Err(e) => GateOutcome {
                 verdict: GateVerdict::Unavailable,
                 ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
-                cwd: None,
+                cwd: ShellCwd::Context,
                 reason: format!(
                     "approval gate could not record the rule decision: {e} (fail-closed — \
                      this is a ledger fault, not a decision)"
@@ -778,7 +737,7 @@ pub(crate) async fn run_gate(
     GateOutcome {
         verdict: GateVerdict::Pending,
         ask: Some(ask_ref(request_id, ApprovalStatus::Pending)),
-        cwd: None,
+        cwd: ShellCwd::Context,
         reason: if spec.origin == Origin::HookResult {
             "Captured execution awaits review; approval continues result processing without running source again.".into()
         } else if spec.exec_source.is_some() {
@@ -2081,7 +2040,7 @@ mod tests {
         assert_eq!(second.verdict, GateVerdict::Allowed);
         assert_eq!(
             second.cwd,
-            Some(PathBuf::from("/original/dir")),
+            ShellCwd::Captured(Some(PathBuf::from("/original/dir"))),
             "a redeemed approval must run in the directory it was ASKED about, not \
              wherever the context's cwd has since moved to"
         );

@@ -1068,6 +1068,13 @@ fn test_context_cwd_is_addressed_and_vfs_validated() {
             "a relative cwd must not replace durable state"
         );
 
+        let removed = tempfile::tempdir().unwrap();
+        kernel.set_context_cwd(context_a, removed.path().to_str().unwrap()).await.unwrap();
+        drop(removed);
+        kernel.set_context_cwd(context_a, target).await
+            .expect("setting a valid cwd must repair an unavailable previous directory");
+        assert_eq!(kernel.get_context_cwd(context_a).await.unwrap(), Some(target.to_owned()));
+
         let unknown = kaijutsu_types::ContextId::new();
         let error = kernel.get_context_cwd(unknown).await.unwrap_err();
         assert!(

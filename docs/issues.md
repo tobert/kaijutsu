@@ -112,12 +112,15 @@ callers move. Clean adjacent comments and module docs with each change.
 
 Contextual construction now lives in `runtime/context_shell.rs`; every factory
 caller uses `EmbeddedKaish::for_context`, and the dispatcher factory family is
-deleted. Follow up on constructor state reads: host-exec selection still uses
-`Broker::binding`, which logs a storage failure and treats the binding as absent.
-Use the checked read with a regression during the remaining execution-policy
-audit. The synthesis block-source adapter also ignores hydration errors; retain
-that finding for the adapter audit instead of treating an empty result as proof
-that loading succeeded.
+deleted. The synthesis block-source adapter still ignores hydration errors;
+retain that finding for the adapter audit instead of treating an empty result
+as proof that loading succeeded.
+
+The editor opener and kaish MCP backend currently retain the requester but
+lose the distinct performer/reviewer. Carry the complete invocation identity
+through both adapters, including context switches, and pin actual authored
+blocks in regression tests. The editor's runtime ownership and complete-text
+checks do not finish this identity audit.
 
 Rc orchestration and its path grammar now belong to `rc`; every lifecycle caller
 uses `rc::run` with `RcInvocation`. The old dispatcher lifecycle methods and
@@ -216,6 +219,13 @@ old answers synchronously, reports failure to the host, and admits one owner.
 Shutdown cancels preparation and commands and joins settlement. Headless requests
 use direct runtime admission;
 per-turn leases own liveness and interrupts, including queued turns.
+
+The approval driver still treats a failed context-row read as a performer
+reassignment, settles with a false explanation, and spends the answer. Defer
+without redemption on a read fault. Its wake path can also repeat a durable
+seed if turn admission fails after the seed was written; make seed delivery
+idempotent separately from turn admission. Kaibo DeepSeek review and disposition:
+`~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
 aggregate liveness when polling the log but returns on the first terminal event,
@@ -1949,31 +1959,18 @@ resize" cleanup.
 
 ---
 
-## Kaish output limiting still hides physical exits in editor and rc (2026-08-15)
+## Rc output limiting still hides physical exits
 
-**Shipped 2026-08-15:** `execute_shell_command` (`rpc.rs`) now persists
-`result.original_code.unwrap_or(result.code)` as the durable `exit_code`, so a
-command that spills >8 KB of output but exits 0 no longer records
-`exit_code=3` forever. Pinned by
-`test_shell_truncation_does_not_corrupt_exit_code`
-(`crates/kaijutsu-server/tests/e2e_kj_workflow.rs:500`).
+Rc lifecycle `.kai` execution matches `exec.code == 0` and persists the control
+code in failure records. Audit the distinction between script failure and
+bounded diagnostic stdout: record the physical exit and spill separately.
+Kaish can expose remapped `3` through script `$?`, so changing only the final
+record cannot undo control-flow decisions already made inside a script.
 
-**Still open — same bug shape, unfixed sites** (verified against current code):
-- `crates/kaijutsu-kernel/src/kernel.rs:1731` — vi's `:r !cmd`
-  (`EditorIo::ReadShell`) checks `result.code != 0` raw; a spilled-but-
-  successful command reports a spurious editor failure.
-- `crates/kaijutsu-kernel/src/rc/mod.rs` — rc-lifecycle `.kai`
-  execution matches `exec.code == 0` raw and persists the unresolved code
-  into a durable rc-failure block on the fallthrough arm.
-
-Streaming `execute` now resolves `original_code` before sending its terminal
-output event, covered by `streaming_output_limit_preserves_the_command_exit`.
-
-Fix for both remaining sites: the same `original_code.unwrap_or(code)` unwrap
-`execute_shell_command` already does. `mcp/broker.rs`'s hook-exit classifier
-(`classify_kaish_hook_exit`) already treats a remapped `3` as its own
-`Escalate` outcome rather than folding it into pass/fail, so that site is not
-in this list.
+Editor reads explicitly refuse truncated output before splicing. They must
+not accept a successful physical exit as proof that the returned text is
+complete. Hook bodies intentionally classify spill code `3` as escalation;
+retain that protocol rather than treating it as an ordinary command exit.
 
 ## Summaries drift stronger than what they summarise (2026-08-11)
 

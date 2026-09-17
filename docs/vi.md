@@ -397,15 +397,15 @@ push channel; the app renders it read-only.
   fails loud. Arbitrary delimiter (`:s#a#b#`). `:s` is an **edit**, not a
   kernel `CommandRequest`: it mutates the `EditorCore` buffer and rides the
   existing diff→`EditOp`→block-mirror path.
-- **Read:** `:r <file>` reads via `FileDocumentCache::read_content`; `:r !cmd`
-  materializes a kaish in the **opener's** `(principal, context_id,
-  session_id)` (the same `EmbeddedKaish::for_context` helper the model shell +
-  rc lifecycle use) and splices the command's stdout — both **at the cursor**
-  (not vim's linewise-below; simpler, refine later). Accepted spellings also
-  include `:read <file>`, `:read !cmd`, and the adjacent-bang `:r!cmd`. These
-  are the async intents (`EditorIo::{ReadFile, ReadShell}` via `take_io()`); a
-  missing file, denied/failed command, or unfulfilled intent fails loud **on
-  the `:` status line** (the session stays open), never a silent no-op.
+- **Read:** `:r <file>` reads through `FileDocumentCache::try_read_content`.
+  `:r !cmd` runs in the opener's context on the kernel runtime. Both splice
+  **at the cursor**, rather than below its line. Accepted spellings also include
+  `:read <file>`, `:read !cmd`, and the adjacent-bang `:r!cmd`.
+  A missing file, denied or failed command, invalid UTF-8, or truncated output
+  reports on the `:` status line and leaves the buffer unchanged. Shell output
+  uses the internal 4 MiB limit; redirect larger output to a file, then use
+  `:r <file>`. Caller cancellation and kernel shutdown stop the shell read.
+  Local cwd/export changes in that shell are not written back.
 - **No `:!`, deliberately.** It was the entire source of complexity — nested
   editor sessions, a return stack, ephemeral-block lifecycle. The **shell is
   already a surface a keystroke away**: **Ctrl+Z** (a local app intercept —

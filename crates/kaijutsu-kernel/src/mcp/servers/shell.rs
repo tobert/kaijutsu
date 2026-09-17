@@ -12,7 +12,7 @@
 #[cfg(test)]
 use crate::runtime::command_result::shell_result_to_envelope;
 use crate::runtime::command_result::shell_envelope_to_tool_result as envelope_result;
-use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
+use crate::runtime::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::sync::{Arc, LazyLock, Weak};
 
@@ -252,7 +252,7 @@ impl McpServerLike for ShellServer {
         // Writable submissions pass the source-program gate. Read-only shells
         // enforce their policy structurally and do not need execution approval.
         // An approved writable submission carries the directory it authorized.
-        let mut pinned_cwd: Option<std::path::PathBuf> = None;
+        let mut cwd_source = ShellCwd::Context;
         if !self.read_only {
             // A submission that does not parse is refused here, before the
             // gate — a human is never asked to approve text that cannot be
@@ -343,7 +343,7 @@ impl McpServerLike for ShellServer {
             }
             // Preserve the directory attached to the approval; current context
             // state may have changed while its reviewer was deciding.
-            pinned_cwd = outcome.cwd;
+            cwd_source = outcome.cwd;
         }
 
         let semantic_index = dispatcher.semantic_index();
@@ -355,24 +355,12 @@ impl McpServerLike for ShellServer {
                 requester: ctx.principal_id, performer: ctx.actor_id, reviewer: ctx.reviewer_id,
                 context: ctx.context_id, session: ctx.session_id,
             },
-            if self.read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
+            if self.read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent }, cwd_source,
             semantic_index,
             block_source,
         )
         .await
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
-
-        // Validate the approved directory against the shell's backend. A
-        // removed path or changed mount must not redirect approved execution.
-        if let Some(cwd) = &pinned_cwd {
-            if !kaish.try_set_cwd(cwd.clone()).await {
-                return Err(McpError::Protocol(format!(
-                    "shell_write: the approved directory ({}) no longer resolves — \
-                     refusing rather than running elsewhere — nothing was run",
-                    cwd.display()
-                )));
-            }
-        }
 
         crate::runtime::tool_command::ToolCommand {
             kernel: dispatcher.kernel().clone(), broker, kaish, params, call: ctx.clone(),
@@ -947,6 +935,29 @@ mod tests {
         assert!(!result.is_error);
         let out = body_of(&result)["stdout"].as_str().unwrap_or_default().to_string();
         assert!(out.contains("answered-like-cc-send"), "stdout missing, got: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn auto_allowed_shell_write_uses_the_current_context_cwd() {
+        use crate::vfs::VfsOps;
+        let (broker, d) = wired().await;
+        d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"),
+            b"[global]\nallow = [\"pwd\"]\n").await.unwrap();
+        d.kernel().mount("/working", crate::vfs::backends::MemoryBackend::new()).await;
+        let principal = PrincipalId::new();
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("auto-cwd"), principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        d.kernel_db().lock().upsert_context_shell(&ContextShellRow {
+            context_id: context, cwd: Some("/working".into()), updated_at: 0,
+        }).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let call = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let result = broker.call_tool(call_write("pwd"), &call, CancellationToken::new()).await.unwrap();
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(body_of(&result)["stdout"].as_str().unwrap().trim(), "/working");
+        d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
     /// **The unresolvable-pin refusal.** The context's cwd at ask time is a

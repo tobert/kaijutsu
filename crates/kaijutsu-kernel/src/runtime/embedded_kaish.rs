@@ -173,8 +173,8 @@ impl OutputProfile {
 impl EmbeddedKaish {
     /// Create a new embedded kaish executor with default identity.
     ///
-    /// Uses `PrincipalId::system()` and a fresh `ContextId`. For real connections,
-    /// prefer `with_identity` which accepts the actual connection identity.
+    /// Uses `PrincipalId::system()` and a fresh `ContextId` for engine tests.
+    /// Production callers use `for_context` to apply contextual policy.
     pub fn new(
         name: &str,
         blocks: SharedBlockStore,
@@ -587,24 +587,19 @@ impl EmbeddedKaish {
         self.kernel.try_set_cwd(path).await
     }
 
-    /// Restore this context's persisted cwd (`context_shell.cwd`) into the
-    /// shell, validating it against the shell's backend — the same namespace
-    /// `cd` resolves against, *not* the host filesystem. Returns:
-    ///   - `Ok(None)` — nothing persisted; the shell keeps its default cwd.
-    ///   - `Ok(Some(path))` — the persisted cwd was restored.
-    ///   - `Err(path)` — a cwd was persisted but no longer resolves to a
-    ///     directory; the shell keeps its default. Callers should surface this
-    ///     rather than swallow it (it would otherwise be a silent fallback).
+    /// Restore the persisted cwd through the shell's backend, as `cd` does.
+    /// Unset state keeps the default directory. A storage error or unavailable
+    /// persisted directory refuses construction rather than changing where a
+    /// command runs.
     pub async fn restore_cwd_from_db(
         &self,
         kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
         context_id: ContextId,
-    ) -> Result<Option<std::path::PathBuf>, std::path::PathBuf> {
+    ) -> Result<Option<std::path::PathBuf>> {
         let persisted = {
             let db = kernel_db.lock();
             db.get_context_shell(context_id)
-                .ok()
-                .flatten()
+                .map_err(|e| anyhow::anyhow!("read context {context_id} cwd: {e}"))?
                 .and_then(|row| row.cwd)
         };
         let Some(cwd) = persisted else {
@@ -614,7 +609,7 @@ impl EmbeddedKaish {
         if self.try_set_cwd(path.clone()).await {
             Ok(Some(path))
         } else {
-            Err(path)
+            anyhow::bail!("context {context_id} cwd '{}' is unavailable; set a valid cwd before executing", path.display())
         }
     }
 

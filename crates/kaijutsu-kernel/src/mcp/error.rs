@@ -377,7 +377,7 @@ mod tests {
         GateOutcome {
             verdict: GateVerdict::Pending,
             ask: Some(ask_ref(ASK.to_string(), ApprovalStatus::Pending)),
-            cwd: None,
+            cwd: crate::runtime::context_shell::ShellCwd::Context,
             // The REAL text `run_gate` uses for a hook ask (`exec_source:
             // None`), not a stand-in — a stand-in makes this test unable to
             // fail when that text regresses.
@@ -476,7 +476,7 @@ mod tests {
         let outcome = GateOutcome {
             verdict: GateVerdict::Unavailable,
             ask: None,
-            cwd: None,
+            cwd: crate::runtime::context_shell::ShellCwd::Context,
             reason: "the ledger could not be reached".to_string(),
         };
         let rendered = McpError::gate_unavailable(

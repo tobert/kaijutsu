@@ -12,7 +12,7 @@
 //! ResourceUpdated → `BlockKind::Resource` (Phase 3), elicitation live
 //! handling (§9, D-25), tool search / late injection (Phase 5).
 
-use crate::runtime::context_shell::{ShellIdentity, ShellPolicy};
+use crate::runtime::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -2568,7 +2568,7 @@ impl Broker {
                 requester: ctx.principal_id, performer: ctx.actor_id, reviewer: ctx.reviewer_id,
                 context: ctx.context_id, session: kaijutsu_types::SessionId::new(),
             },
-            ShellPolicy::Internal,
+            ShellPolicy::Internal, ShellCwd::Context,
             None,
             Arc::new(crate::runtime::synthesis::NoopBlockSource),
         )
@@ -8845,7 +8845,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: kaijutsu_types::ContextId::new(), session: kaijutsu_types::SessionId::new(),
             },
-            ShellPolicy::Rc(crate::rc::RcAuthority::for_test()),
+            ShellPolicy::Rc(crate::rc::RcAuthority::for_test()), ShellCwd::Context,
             None,
             Arc::new(crate::runtime::synthesis::NoopBlockSource),
         )

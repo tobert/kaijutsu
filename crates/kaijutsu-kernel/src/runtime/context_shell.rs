@@ -37,6 +37,15 @@ pub enum ShellPolicy {
     Rc(RcAuthority),
 }
 
+/// Source of the working directory, independent of output and execution policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellCwd {
+    /// Restore the current context's durable cwd; an unset cwd keeps the default.
+    Context,
+    /// Restore the approval's captured cwd, including its explicitly unset state.
+    Captured(Option<std::path::PathBuf>),
+}
+
 impl EmbeddedKaish {
     /// Construct a contextual shell with explicit identity and execution policy.
     ///
@@ -47,6 +56,7 @@ impl EmbeddedKaish {
         name: &str,
         identity: ShellIdentity,
         policy: ShellPolicy,
+        cwd: ShellCwd,
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Result<Self> {
@@ -136,9 +146,9 @@ impl EmbeddedKaish {
             let external_exec = if dispatcher
                 .kernel()
                 .broker()
-                .binding(&context_id)
-                .await
-                .is_some_and(|b| b.allows(&crate::mcp::Capability::Exec))
+                .binding_checked(&context_id)
+                .await?
+                .allows(&crate::mcp::Capability::Exec)
             {
                 crate::runtime::embedded_kaish::ExternalExec::Allow {
                     path: dispatcher.kernel().host_path().map(str::to_string),
@@ -166,20 +176,19 @@ impl EmbeddedKaish {
             .apply_context_config(dispatcher.kernel_db(), context_id)
             .await?;
 
-        // Restore the persisted cwd, validated against the shell's backend (the
-        // VFS namespace `cd` uses — a host-FS check would wrongly reject
-        // VFS-only cwds like /scratch or /v/docs). A persisted cwd that no
-        // longer resolves is surfaced, not silently dropped.
-        if let Err(dead) = kaish
-            .restore_cwd_from_db(dispatcher.kernel_db(), context_id)
-            .await
-        {
-            tracing::warn!(
-                context = %context_id.to_hex(),
-                cwd = %dead.display(),
-                "persisted context cwd no longer resolves in backend; using default landing dir",
-            );
+        // Validate against the same VFS namespace as `cd`. Captured approval
+        // state must not depend on a newer context cwd, including an unset pin.
+        let restored = match cwd {
+            ShellCwd::Context => kaish.restore_cwd_from_db(dispatcher.kernel_db(), context_id).await.map(|_| ()),
+            ShellCwd::Captured(None) => Ok(()),
+            ShellCwd::Captured(Some(path)) => {
+                if kaish.try_set_cwd(path.clone()).await { Ok(()) }
+                else { Err(anyhow::anyhow!("approved cwd '{}' no longer resolves to a directory; nothing was run", path.display())) }
+            }
+        };
+        if let Err(error) = restored {
             kaijutsu_telemetry::record_cwd_restore_failed();
+            return Err(error);
         }
 
         Ok(kaish)
@@ -205,7 +214,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: ctx, session: SessionId::new(),
             },
-            ShellPolicy::Agent,
+            ShellPolicy::Agent, ShellCwd::Context,
             None,
             Arc::new(NoopBlockSource),
         ).await;
@@ -214,6 +223,90 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("dispatcher"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn contextual_shell_reports_binding_read_failure() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("broken-binding"), None, principal);
+        d.kernel().broker().set_db(d.kernel_db().clone()).await;
+        {
+            let mut db = d.kernel_db().lock();
+            db.upsert_context_binding(ctx, &crate::mcp::ContextToolBinding::default()).unwrap();
+            db.poison_context_binding_detail_table_for_test().unwrap();
+        }
+        let result = EmbeddedKaish::for_context(&d, "broken-binding", ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        }, ShellPolicy::Internal, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await;
+        let error = match result {
+            Ok(_) => panic!("a binding read failure must refuse construction"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(&ctx.to_string()), "{error}");
+    }
+
+    #[tokio::test]
+    async fn contextual_shell_reports_cwd_read_failure() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("broken-cwd"), None, principal);
+        d.kernel_db().lock().conn_for_ledger().execute_batch(
+            "ALTER TABLE context_shell RENAME TO unavailable_context_shell"
+        ).unwrap();
+        let result = EmbeddedKaish::for_context(&d, "broken-cwd", ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        }, ShellPolicy::Internal, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await;
+        let error = match result {
+            Ok(_) => panic!("a cwd read failure must refuse construction"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("context_shell"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn contextual_shell_reports_unavailable_cwd() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("missing-cwd"), None, principal);
+        let missing = "/unmounted/context-shell-missing-cwd";
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: ctx, cwd: Some(missing.into()), updated_at: 0,
+        }).unwrap();
+        let result = EmbeddedKaish::for_context(&d, "missing-cwd", ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        }, ShellPolicy::Internal, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await;
+        let error = match result {
+            Ok(_) => panic!("an unavailable persisted cwd must not run in a different directory"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(missing), "{error}");
+    }
+
+    #[tokio::test]
+    async fn captured_cwd_does_not_depend_on_newer_context_state() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("captured-cwd"), None, principal);
+        d.kernel().mount("/approved", crate::vfs::backends::MemoryBackend::new()).await;
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: ctx, cwd: Some("/missing/current-cwd".into()), updated_at: 0,
+        }).unwrap();
+        for pinned in [None, Some(std::path::PathBuf::from("/approved"))] {
+            let kaish = EmbeddedKaish::for_context(&d, "captured-cwd", ShellIdentity {
+                requester: principal, performer: principal, reviewer: None,
+                context: ctx, session: SessionId::new(),
+            }, ShellPolicy::Agent, ShellCwd::Captured(pinned.clone()), None, Arc::new(NoopBlockSource)).await.unwrap();
+            let expected = pinned.unwrap_or_else(kaish_kernel::home_dir);
+            assert_eq!(kaish.cwd().await, expected, "captured state wins, including an unset cwd");
+        }
     }
 
     /// Wire a dispatcher whose kernel carries the FULL builtin MCP server set
@@ -273,7 +366,7 @@ mod tests {
                     requester, performer, reviewer: Some(requester),
                     context: ctx, session: SessionId::new(),
                 },
-                if read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
+                if read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent }, ShellCwd::Context,
                 None,
                 Arc::new(NoopBlockSource),
             ).await.expect("materialize model shell");
@@ -341,7 +434,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: ctx, session: SessionId::new(),
             },
-            ShellPolicy::Agent,
+            ShellPolicy::Agent, ShellCwd::Context,
             None,
             Arc::new(NoopBlockSource),
         )
@@ -377,7 +470,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: ctx, session: SessionId::new(),
             },
-            ShellPolicy::ReadOnly,
+            ShellPolicy::ReadOnly, ShellCwd::Context,
             None,
             Arc::new(NoopBlockSource),
         )
@@ -419,7 +512,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: ctx, session: SessionId::new(),
             },
-            ShellPolicy::Agent,
+            ShellPolicy::Agent, ShellCwd::Context,
             None,
             Arc::new(NoopBlockSource),
         )
@@ -479,7 +572,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None,
                 context: ctx, session: SessionId::new(),
             },
-            ShellPolicy::Agent,
+            ShellPolicy::Agent, ShellCwd::Context,
             None,
             Arc::new(NoopBlockSource),
         )
@@ -513,7 +606,7 @@ mod tests {
                 requester: alice, performer: alice, reviewer: None,
                 context: ctx, session: SessionId::new(),
             },
-            ShellPolicy::Agent,
+            ShellPolicy::Agent, ShellCwd::Context,
             None,
             Arc::new(NoopBlockSource),
         )
@@ -526,7 +619,7 @@ mod tests {
                 requester: bob, performer: bob, reviewer: None,
                 context: ctx, session: SessionId::new(),
             },
-            ShellPolicy::Agent,
+            ShellPolicy::Agent, ShellCwd::Context,
             None,
             Arc::new(NoopBlockSource),
         )
