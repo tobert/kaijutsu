@@ -54,47 +54,33 @@ failure is useful evidence; a new model integration is not required to
 prove the coordination contract. Update the checklist as each step lands,
 and correct adjacent docs/comments in the same change.
 
-### Slow preparation cannot run inside the current resolver call
+### Connect live model attempts to admitted timeline work
 
-`kaijutsu-hyoushigi/src/engine.rs::Timeline::speculate` calls
-`Resolver::resolve` synchronously. The server's
-`beat.rs::materialize_track` advances that timeline while holding its lock.
-The production `CasCommitResolver` reads and validates already prepared CAS
-content, estimates a fixed 20 ms, and bases validity on the artifact hash.
-That establishes artifact identity, not whether a model's original context
-is still current. Model turns execute separately from this resolver.
+The timeline now owns pending futures, rejects late/stale completions, bounds open
+admission, and exposes work status through `kj transport work`. The controlled SSH
+scenario exercises those contracts. Production CAS read/validation runs on the
+existing Tokio blocking pool with a shared four-operation limit.
 
-Before admitting long-running model preparation through this seam, pin
-nonblocking timeline advancement and stale-completion rejection in the
-scenario above. Decide how admitted work returns prepared results and their
-input basis to commitment. Merely making `resolve` async and awaiting it in
-the beat loop would retain the stall. Keep the existing fast CAS adapter's
-contract distinct from the model attempt's lifetime and validity.
+`BeatScheduler::on_turn_completed` still schedules one phrase ahead of completion;
+it does not capture an intended target or input basis when the model turn begins.
+Migrate that handoff to admitted work and cancellation ownership. The CAS adapter's
+artifact-hash basis establishes artifact identity, not model-context freshness.
+Keep rc tick lifecycle policy distinct from model preparation and commitment.
 
-The controlled SSH scenario now proves that a failed producer reports its error,
-then uses its declared fallback at commitment, including newer accepted content
-from the same lane. It does not yet prove pending or superseded work. Design
-review identified two details to preserve in that extension: completion first
-observed after the intended start cannot be backdated by a jump-ahead clock,
-and dropping a Tokio join handle alone does not cancel its task. Keep terminal
-source cells distinct from new transport-authored fallback cells.
+CAS preparation has a process-wide limit of four operations. An uninterruptible
+host read retains its slot even after its owner is cancelled; four stuck reads
+would stop further CAS preparation until a read returns or the process restarts.
+Timeline deadlines still settle waiting work and the pulse keeps advancing. The
+20 ms cost estimate remains an initial guess, not a measured size/queue model.
+The open-work bound counts operations, not bytes; ready-source and committed CAS
+residency still need measurement before admitting large rendered artifacts through
+this adapter (placed clips carry small records referring to media in CAS).
 
-Equal-deadline action ordering currently depends on the open-future vector's
-`swap_remove` order. Define a stable order when adding attempt identity, including
-which accepted content a simultaneous `UseLastGood` can see. Bounded admission
-must also replace `absorb_emitted`'s ignored schedule errors with an observable
-disposition; an emission over capacity must not disappear silently.
-
-`BeatScheduler::drain_track_failures` advances `failure_water` even if the
-producer has no anchor block or error-block insertion fails. That loses client
-feedback after the logged fault. Pin retry ownership and idempotent delivery
-when extending the disposition path; the current SSH scenario covers successful
-delivery only.
-
-`TickClock` accepts public, unvalidated numeric fields. Invalid rates or margins
-can schedule lifecycle actions after their intended start; NaN or infinite rates
-also make duration-to-tick conversion ambiguous. Pin and reject invalid clock
-inputs as part of the pending-work deadline contract.
+`BeatScheduler::drain_track_failures` advances `failure_water` even if the producer
+has no anchor block or error-block insertion fails. That loses client feedback
+after the logged fault. Pin retry ownership and idempotent delivery. Work status
+supplies live error/disposition visibility, but its bounded history is not durable
+recovery or provenance.
 
 ## Kaish positional suffix expansion
 

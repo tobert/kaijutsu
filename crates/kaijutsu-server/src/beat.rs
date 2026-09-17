@@ -2709,8 +2709,10 @@ mod tests {
             &self,
             _p: &serde_json::Value,
             _c: &dyn ResolverCtx,
-        ) -> Result<Resolution, ResolveError> {
-            Err(ResolveError::Failed("CAS read failed: missing entry".to_string()))
+        ) -> kaijutsu_hyoushigi::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Err(ResolveError::Failed("CAS read failed: missing entry".to_string()))
+            })()))
         }
     }
 
@@ -2731,8 +2733,10 @@ mod tests {
             &self,
             _p: &serde_json::Value,
             c: &dyn ResolverCtx,
-        ) -> Result<Resolution, ResolveError> {
-            Ok(Resolution::new(format!("beat-{}", c.now().get()), "text/plain"))
+        ) -> kaijutsu_hyoushigi::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Ok(Resolution::new(format!("beat-{}", c.now().get()), "text/plain"))
+            })()))
         }
     }
 
@@ -2767,8 +2771,10 @@ mod tests {
             &self,
             _p: &serde_json::Value,
             _c: &dyn ResolverCtx,
-        ) -> Result<Resolution, ResolveError> {
-            Ok(Resolution::new(b"X:1\nK:C\nCDEF|\n".to_vec(), "text/vnd.abc"))
+        ) -> kaijutsu_hyoushigi::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Ok(Resolution::new(b"X:1\nK:C\nCDEF|\n".to_vec(), "text/vnd.abc"))
+            })()))
         }
     }
 
@@ -2819,6 +2825,23 @@ mod tests {
     /// A 1-second beat policy with a large phrase length (phrase boundaries never
     /// fire in the span of these tests). `ooda_every` is now on the `Attachment`
     /// — use `slow_attachment()` alongside this policy.
+    async fn settle_track_preparation(kernel: &Kernel, track: &TrackId) {
+        let timeline = kernel.track_timeline(track).expect("armed track");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let mut tl = timeline.lock();
+                    let now = tl.playhead();
+                    tl.advance_to(now);
+                    if tl.statuses().iter().all(|s| s.readiness != kaijutsu_hyoushigi::Readiness::Running) {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("CAS preparation completes while the controlled clock holds");
+    }
+
     fn slow_policy() -> BeatPolicy {
         BeatPolicy {
             period: Duration::from_secs(1),
@@ -3449,8 +3472,10 @@ mod tests {
             &self,
             _p: &serde_json::Value,
             _c: &dyn ResolverCtx,
-        ) -> Result<Resolution, ResolveError> {
-            Ok(Resolution::new(Self::record(), kaijutsu_audio::CLIP_MIME))
+        ) -> kaijutsu_hyoushigi::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Ok(Resolution::new(Self::record(), kaijutsu_audio::CLIP_MIME))
+            })()))
         }
     }
 
@@ -4158,6 +4183,7 @@ mod tests {
         // Advance past tick 5 so the cell commits and materializes the pair.
         for i in 2..=8 {
             sched.fire_due(base + Duration::from_secs(i));
+            settle_track_preparation(&kernel, &track_id).await;
         }
 
         let snaps = documents.block_snapshots(score).unwrap();
@@ -4264,6 +4290,7 @@ mod tests {
             }
             for i in 2..=8 {
                 sched.fire_due(base + Duration::from_secs(i));
+                settle_track_preparation(&kernel, &track_id).await;
             }
 
             documents
@@ -5337,8 +5364,10 @@ mod tests {
             &self,
             _p: &serde_json::Value,
             _c: &dyn ResolverCtx,
-        ) -> Result<Resolution, ResolveError> {
-            Ok(Resolution::new(b"this is not abc {{{ ][".to_vec(), "text/vnd.abc"))
+        ) -> kaijutsu_hyoushigi::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Ok(Resolution::new(b"this is not abc {{{ ][".to_vec(), "text/vnd.abc"))
+            })()))
         }
     }
 
@@ -5573,6 +5602,7 @@ mod tests {
         sched_c.on_turn_completed(cc, docs_c.last_block_id(cc));
         for i in 2..=8 {
             sched_c.fire_due(base_c + Duration::from_secs(i));
+            settle_track_preparation(&kernel_c, &TrackId::solo()).await;
         }
         let midi = docs_c
             .block_snapshots(score_c)

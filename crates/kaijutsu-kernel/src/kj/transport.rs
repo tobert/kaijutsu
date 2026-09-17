@@ -197,6 +197,13 @@ enum TransportCommand {
     /// scheduler snapshot (playhead/beat/attachment truth), so a track shows as
     /// `dormant` when it's in the DB but nothing has re-attached it this session.
     List,
+    /// Show pending work and the most recent 256 dispositions as JSON. This
+    /// process-local history resets when the timeline is removed or the process restarts.
+    Work {
+        /// Track whose intended times, readiness, validity, and outcomes to read.
+        #[arg(long)]
+        track: String,
+    },
 }
 
 impl TransportCommand {
@@ -217,7 +224,7 @@ impl TransportCommand {
             | TransportCommand::Ooda { context, .. }
             | TransportCommand::Clock { context, .. }
             | TransportCommand::Rotate { context, .. } => context.as_deref(),
-            TransportCommand::Delete { .. } | TransportCommand::List => None,
+            TransportCommand::Delete { .. } | TransportCommand::List | TransportCommand::Work { .. } => None,
         }
     }
 
@@ -234,7 +241,7 @@ impl TransportCommand {
             | TransportCommand::Ooda { track, .. }
             | TransportCommand::Clock { track, .. }
             | TransportCommand::Rotate { track, .. } => track.as_deref(),
-            TransportCommand::Delete { track } => Some(track.as_str()),
+            TransportCommand::Delete { track } | TransportCommand::Work { track } => Some(track.as_str()),
             TransportCommand::List => None,
         }
     }
@@ -253,6 +260,7 @@ impl TransportCommand {
             TransportCommand::Rotate { .. } => "rotate",
             TransportCommand::Delete { .. } => "delete",
             TransportCommand::List => "list",
+            TransportCommand::Work { .. } => "work",
         }
     }
 }
@@ -285,6 +293,18 @@ impl KjDispatcher {
         // context that can't drive the beat can still see what's on it.
         if matches!(command, TransportCommand::List) {
             return self.transport_list(false).await;
+        }
+        if let TransportCommand::Work { track } = &command {
+            let track = match TrackId::new(track) {
+                Ok(track) => track,
+                Err(e) => return KjResult::Err(format!("kj transport work: invalid track: {e}")),
+            };
+            let Some(timeline) = self.kernel().track_timeline(&track) else {
+                return KjResult::Err(format!("kj transport work: track '{}' is not armed", track.as_str()));
+            };
+            let statuses = timeline.lock().statuses();
+            let data = serde_json::to_value(statuses).expect("work status is serializable");
+            return KjResult::ok_with_data(serde_json::to_string_pretty(&data).expect("work status is JSON"), data);
         }
 
         // Driving the beat (play/pause/stop/tempo/ooda) is gated on `transport`.
@@ -486,7 +506,7 @@ impl KjDispatcher {
 
                 // `list` is a read — dispatched (and returned) above, before this
                 // match ever runs. Kept only so the match stays exhaustive.
-                TransportCommand::List => {
+                TransportCommand::List | TransportCommand::Work { .. } => {
                     unreachable!("transport list is handled before the command match")
                 }
             };
@@ -846,7 +866,7 @@ impl Classify for TransportCommand {
             // from the module's table only because `kj transport` was kept
             // out wholesale, not because it mutates — `kj/effect.rs`
             // makes it Read on its own merits).
-            TransportCommand::List => Effect::Read,
+            TransportCommand::List | TransportCommand::Work { .. } => Effect::Read,
             TransportCommand::Attach { .. }
             | TransportCommand::Detach { .. }
             | TransportCommand::Play { .. }

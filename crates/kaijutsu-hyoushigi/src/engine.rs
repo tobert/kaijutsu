@@ -1,11 +1,10 @@
 //! Speculation and commitment on a [`Timeline`] driven by external ticks.
 //!
-//! Resolvers currently run synchronously; advancing the playhead waits for each
-//! resolve. Only bounded preparation belongs here until pending work has its own
-//! lifecycle. The kernel materializes committed cells from the in-memory log and
-//! content map into durable CAS and score blocks.
+//! Each attempt owns a future. The timeline polls without waiting and validates
+//! ready output before commitment. The kernel materializes accepted cells from
+//! the in-memory log and content map into durable CAS and score blocks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use kaijutsu_cas::ContentHash;
@@ -14,14 +13,11 @@ use kaijutsu_types::{PrincipalId, Tick, TickDelta, TrackId};
 use crate::cell::{Body, Cell, CellState, Fallback, Recipe, ResolverId};
 use crate::content::{ContentRef, ContextHash};
 use crate::resolver::{ResolverCtx, Resolver};
+use crate::{Disposition, FallbackReason, Readiness, ResolveFuture, WorkId, WorkStatus};
 
-/// The wall-clock binding for this proof, collapsed to a tick rate.
-///
-/// In the real engine PPQ + tempo + epoch make up the binding; here a single
-/// `ticks_per_sec` converts an [`estimate_cost`](Resolver::estimate_cost)
-/// `Duration` into a [`TickDelta`] lead time. `safety_factor` widens the lead;
-/// `commit_margin` is how far before a cell's `start` the first commit attempt
-/// fires.
+/// Convert preparation costs into lead times at the external clock's tick rate.
+/// `safety_factor` widens the initial lead; `commit_margin` leaves time between
+/// the first commitment check and the intended start.
 #[derive(Debug, Clone, Copy)]
 pub struct TickClock {
     pub ticks_per_sec: f64,
@@ -40,9 +36,16 @@ impl Default for TickClock {
 }
 
 impl TickClock {
+    fn validate(&self) {
+        assert!(self.ticks_per_sec.is_finite() && self.ticks_per_sec > 0.0, "tick rate must be finite and positive");
+        assert!(self.safety_factor.is_finite() && self.safety_factor >= 0.0, "lead safety factor must be finite and nonnegative");
+        assert!(self.commit_margin.get() >= 0, "commit margin must be nonnegative");
+    }
     /// Convert a wall-clock duration into ticks, rounding up (never under-lead).
     fn beats_for(&self, d: Duration) -> TickDelta {
-        TickDelta::new((d.as_secs_f64() * self.ticks_per_sec).ceil() as i64)
+        let ticks = (d.as_secs_f64() * self.ticks_per_sec).ceil();
+        assert!(ticks.is_finite() && ticks < i64::MAX as f64, "lead time exceeds the tick range");
+        TickDelta::new(ticks as i64)
     }
 }
 
@@ -61,6 +64,8 @@ pub enum Recovery {
 /// anticipation model was wrong — and what it cost.
 #[derive(Debug, Clone)]
 pub struct SquashEvent {
+    pub work_id: WorkId,
+    pub attempt: u32,
     pub at: Tick,
     pub start: Tick,
     pub predicted: ContextHash,
@@ -75,6 +80,9 @@ pub struct SquashEvent {
 /// rate" eval ruler and the input to the kernel's per-event Error-block surfacing.
 #[derive(Debug, Clone)]
 pub struct FailureEvent {
+    /// Absent for an emitted cell that could not be admitted.
+    pub work_id: Option<WorkId>,
+    pub attempt: u32,
     /// The playhead position when the failure was recorded.
     pub at: Tick,
     /// The failed cell's start tick — its intended musical position.
@@ -91,13 +99,16 @@ pub struct FailureEvent {
 
 /// Engine bookkeeping wrapped around a deferred [`Cell`].
 struct Scheduled {
+    status: WorkStatus,
+    order: u64,
+    work: Option<ResolveFuture>,
+    observed_at: Tick,
     cell: Cell,
     start: Tick,
     speculate_at: Tick,
     commit_deadline: Tick,
     /// `estimate_cost` in ticks — the budget threshold for re-speculation.
     est_cost: TickDelta,
-    predicted_basis: Option<ContextHash>,
     resolution: Option<crate::resolver::Resolution>,
     /// Set once a squash re-speculated; the next commit check is at `start` and
     /// is the last — diverge there and the fallback fires.
@@ -109,11 +120,12 @@ impl Scheduled {
     fn next_at(&self) -> Option<Tick> {
         match self.cell.state {
             CellState::Pending => Some(self.speculate_at),
-            CellState::Speculated | CellState::Failed => Some(if self.final_attempt {
+            CellState::Speculating => Some(self.start),
+            CellState::Speculated | CellState::Failed => Some((if self.final_attempt {
                 self.start
             } else {
                 self.commit_deadline
-            }),
+            }).max(self.observed_at)),
             _ => None,
         }
     }
@@ -127,6 +139,10 @@ pub enum ScheduleError {
     InThePast { start: Tick, now: Tick },
     #[error("unknown resolver: {0}")]
     UnknownResolver(String),
+    #[error("timeline has reached its capacity of {0} open work items")]
+    AtCapacity(usize),
+    #[error("work is no longer pending on this timeline")]
+    NotPending,
 }
 
 /// Why a [`Timeline::seed_playhead`] call was rejected. Seeding is a
@@ -137,13 +153,14 @@ pub enum ScheduleError {
 pub enum SeedError {
     #[error(
         "cannot seed playhead to {at:?}: timeline is not virgin \
-         (playhead {playhead:?}, {future} future cell(s), {committed} committed)"
+         (playhead {playhead:?}, {future} future cell(s), {committed} committed, {admitted} admitted)"
     )]
     NotVirgin {
         at: Tick,
         playhead: Tick,
         future: usize,
         committed: usize,
+        admitted: u64,
     },
 }
 
@@ -156,6 +173,9 @@ pub struct Timeline {
     ambient: HashMap<String, Vec<u8>>,
     /// The open future: deferred cells ahead of the commit point.
     future: Vec<Scheduled>,
+    capacity: usize,
+    next_order: u64,
+    history: VecDeque<WorkStatus>,
     /// The durable past (in-RAM stand-in for the block log).
     committed: Vec<Cell>,
     /// The content store (in-RAM stand-in for CAS). Crystallized at commit.
@@ -165,33 +185,25 @@ pub struct Timeline {
     /// Resolver errors, drained by the kernel into each producer's conversation.
     /// Failed work keeps its deadline until its declared fallback settles.
     failures: Vec<FailureEvent>,
-    /// Wall-clock reading of the last [`pump`](Self::pump), so the playhead is
-    /// integrated forward *incrementally* — each interval converted at the rate in
-    /// force during it — rather than re-derived from absolute time at the current
-    /// rate. Origin is `Duration::ZERO` (musical tick 0 ↔ wall-clock origin), so a
-    /// constant-tempo run reads identically to the old absolute mapping; a tempo
-    /// change only re-rates time AFTER it (no retroactive playhead jump under
-    /// dynamic tempo — gemini-pro Stage-3 SEV-2).
-    last_pump: Duration,
-    /// Sub-tick phase carried between pumps so fractional ticks aren't dropped or
-    /// double-counted as the playhead is integrated forward.
-    pump_phase_frac: f64,
+
 }
 
 impl Timeline {
     pub fn new(clock: TickClock) -> Self {
+        clock.validate();
         Self {
             clock,
             playhead: Tick::ZERO,
             resolvers: HashMap::new(),
             ambient: HashMap::new(),
             future: Vec::new(),
+            capacity: 64,
+            next_order: 0,
+            history: VecDeque::new(),
             committed: Vec::new(),
             cas: HashMap::new(),
             squashes: Vec::new(),
             failures: Vec::new(),
-            last_pump: Duration::ZERO,
-            pump_phase_frac: 0.0,
         }
     }
 
@@ -199,18 +211,55 @@ impl Timeline {
         self.resolvers.insert(resolver.id().0, resolver);
     }
 
-    /// Re-slave the speculation [`TickClock`] (WI 2, docs/tracks.md Stage 3). A
-    /// track's firing tempo can change mid-flight (`kj transport tempo`, or — at
-    /// M3 — a drift estimate). The `TickClock` converts a resolver's wall-clock
-    /// `estimate_cost` into the tick lead a cell speculates at and the tick it must
-    /// commit by; if it stays at the arm-time tempo while the firing period
-    /// changes, the lead goes stale — a sped-up clock under-leads, cells miss
-    /// their commit deadline, and the fallback pool wedges. So a tempo change MUST
-    /// push the new clock down here. Affects cells scheduled AFTER this call; cells
-    /// already in the open future keep the deadlines they were sized under (the
-    /// tempo in force when they were scheduled — re-pricing a half-led cell would
-    /// be the corruption we avoid).
+    pub fn with_capacity(clock: TickClock, capacity: std::num::NonZeroUsize) -> Self {
+        let mut timeline = Self::new(clock);
+        timeline.capacity = capacity.get();
+        timeline
+    }
+
+    /// Open work and the most recent 256 dispositions, local to this timeline.
+    pub fn statuses(&self) -> Vec<WorkStatus> {
+        self.history.iter().chain(self.future.iter().map(|s| &s.status)).cloned().collect()
+    }
+
+    pub fn status(&self, id: WorkId) -> Option<&WorkStatus> {
+        self.future.iter().map(|s| &s.status).chain(self.history.iter()).find(|s| s.id == id)
+    }
+
+    fn finish(&mut self, mut status: WorkStatus, disposition: Disposition) {
+        status.settled_at = Some(self.playhead);
+        status.disposition = Some(disposition);
+        if self.history.len() == 256 {
+            self.history.pop_front();
+        }
+        self.history.push_back(status);
+    }
+
+    pub fn cancel(&mut self, id: WorkId) -> bool {
+        let Some(idx) = self.future.iter().position(|s| s.status.id == id) else { return false };
+        let s = self.future.swap_remove(idx);
+        self.finish(s.status, Disposition::Cancelled);
+        true
+    }
+
+    /// Validate and admit the replacement before cancelling its predecessor.
+    pub fn supersede(&mut self, id: WorkId, cell: Cell) -> Result<WorkId, ScheduleError> {
+        let idx = self.future.iter().position(|s| s.status.id == id).ok_or(ScheduleError::NotPending)?;
+        let by = self.schedule_inner(cell, true)?;
+        let old = self.future.swap_remove(idx);
+        self.finish(old.status, Disposition::Superseded { by });
+        drop(old.work);
+        let idx = self.future.iter().position(|s| s.status.id == by).expect("replacement was admitted");
+        if self.future[idx].speculate_at <= self.playhead {
+            self.speculate(idx);
+        }
+        Ok(by)
+    }
+
+    /// Use this rate for future admissions. Already admitted work retains the
+    /// deadlines derived from the rate in force when it was scheduled.
     pub fn set_clock(&mut self, clock: TickClock) {
+        clock.validate();
         self.clock = clock;
     }
 
@@ -286,7 +335,14 @@ impl Timeline {
     /// Schedule a deferred cell. Derives its lead time from `estimate_cost`:
     /// `speculate_at = start − beats_for(estimate × safety)`,
     /// `commit_deadline = start − commit_margin`.
-    pub fn schedule(&mut self, cell: Cell) -> Result<(), ScheduleError> {
+    pub fn schedule(&mut self, cell: Cell) -> Result<WorkId, ScheduleError> {
+        self.schedule_inner(cell, false)
+    }
+
+    fn schedule_inner(&mut self, cell: Cell, replacing: bool) -> Result<WorkId, ScheduleError> {
+        if !replacing && self.future.len() >= self.capacity {
+            return Err(ScheduleError::AtCapacity(self.capacity));
+        }
         let Body::Deferred(recipe) = &cell.body else {
             return Err(ScheduleError::NotDeferred);
         };
@@ -311,17 +367,35 @@ impl Timeline {
         let est_cost = self.clock.beats_for(est);
         let lead = self.clock.beats_for(est.mul_f64(self.clock.safety_factor));
 
+        let id = WorkId(uuid::Uuid::new_v4());
+        let order = self.next_order;
+        self.next_order = self.next_order.checked_add(1).expect("timeline admission order overflow");
         self.future.push(Scheduled {
+            status: WorkStatus {
+                id, track: cell.track.clone(), played_by: cell.played_by,
+                start, admitted_at: self.playhead, attempt: 0,
+                started_at: None, ready_at: None, readiness: Readiness::Queued,
+                predicted: None, actual: None, valid: None, error: None,
+                settled_at: None, disposition: None,
+            },
+            order,
+            work: None,
+            observed_at: self.playhead,
             start,
             speculate_at: start - lead,
             commit_deadline: start - self.clock.commit_margin,
             est_cost,
-            predicted_basis: None,
             resolution: None,
             final_attempt: false,
             cell,
         });
-        Ok(())
+        if !replacing {
+            let idx = self.future.len() - 1;
+            if self.future[idx].speculate_at <= self.playhead {
+                self.speculate(idx);
+            }
+        }
+        Ok(id)
     }
 
     /// Seed the playhead to `at` on a **virgin** timeline — the re-arm entry
@@ -335,122 +409,103 @@ impl Timeline {
     /// lifecycle actions: it only positions the playhead so the first beat
     /// advances from real musical time.
     pub fn seed_playhead(&mut self, at: Tick) -> Result<(), SeedError> {
-        if self.playhead != Tick::ZERO || !self.future.is_empty() || !self.committed.is_empty() {
+        if self.playhead != Tick::ZERO || !self.future.is_empty() || !self.committed.is_empty() || self.next_order != 0 {
             return Err(SeedError::NotVirgin {
                 at,
                 playhead: self.playhead,
                 future: self.future.len(),
                 committed: self.committed.len(),
+                admitted: self.next_order,
             });
         }
         self.playhead = at;
         Ok(())
     }
 
-    /// Drive the playhead from a wall-clock reading — the **internal beat**.
-    ///
-    /// Convert elapsed time into ticks and run the due lifecycle actions.
-    /// Resolver calls are synchronous, so callers must keep their work bounded.
-    /// A reading at or behind the last pump is ignored.
-    ///
-    /// Phase is integrated **incrementally**: the elapsed wall time since the last
-    /// pump is converted at the current rate and accumulated (sub-tick remainder
-    /// carried in `pump_phase_frac`). It is deliberately NOT re-derived as
-    /// `since_epoch × rate` — under a mutable tempo (WI 2) that would reinterpret
-    /// all prior time at the new rate and rocket the playhead far into the future,
-    /// firing every scheduled cell (gemini-pro Stage-3 SEV-2). A rate change thus
-    /// only affects time after it. (Caveat: the first pump integrates the whole
-    /// `[0, reading]` span at the then-current rate — set the tempo before pumping,
-    /// as the documented usage does; the real M3 binding carries epoch + tempo +
-    /// PPQ explicitly.)
-    pub fn pump(&mut self, since_epoch: Duration) {
-        // Monotonic: a stale or duplicate reading never rewinds the beat.
-        if since_epoch <= self.last_pump {
-            return;
-        }
-        let delta = since_epoch - self.last_pump;
-        self.last_pump = since_epoch;
-        let advanced = delta.as_secs_f64() * self.clock.ticks_per_sec + self.pump_phase_frac;
-        let whole = advanced.floor();
-        self.pump_phase_frac = advanced - whole;
-        let target = self.playhead + TickDelta::new(whole as i64);
-        if target > self.playhead {
-            self.advance_to(target);
-        }
-    }
-
-    /// Advance to `target`, firing due lifecycle actions in tick order. An action
-    /// whose nominal time has passed runs at the current playhead. Time never
-    /// moves backward; a non-advancing target is a no-op.
+    /// Observe work at `target` and process due actions by intended start, then
+    /// admission order. Equal ticks poll without advancing time; earlier ticks
+    /// are ignored. Readiness and validation are never backdated to crossed ticks.
     pub fn advance_to(&mut self, target: Tick) {
-        if target <= self.playhead {
+        if target < self.playhead {
             return;
+        }
+        self.playhead = target;
+        // Completions belong to this observation tick, never a deadline crossed
+        // on the way here. A result first observed after start is too late.
+        for idx in 0..self.future.len() {
+            if self.future[idx].cell.state == CellState::Speculating && target <= self.future[idx].start {
+                self.poll_work(idx);
+            }
         }
         loop {
-            // Find the earliest pending action at or before `target`.
-            let mut next: Option<(usize, Tick)> = None;
-            for (i, s) in self.future.iter().enumerate() {
-                if let Some(at) = s.next_at().map(|at| at.max(self.playhead))
-                    && at <= target
-                    && next.is_none_or(|(_, best)| at < best)
-                {
-                    next = Some((i, at));
-                }
+            let next = self.future.iter().enumerate()
+                .filter(|(_, s)| s.next_at().is_some_and(|at| at <= target))
+                .min_by_key(|(_, s)| (s.start, s.order))
+                .map(|(idx, _)| idx);
+            let Some(idx) = next else { break };
+            if target > self.future[idx].start && self.future[idx].cell.state != CellState::Failed {
+                self.fire_fallback(idx, FallbackReason::DeadlineMissed);
+                continue;
             }
-            let Some((idx, at)) = next else { break };
-            self.playhead = at;
             match self.future[idx].cell.state {
                 CellState::Pending => self.speculate(idx),
+                CellState::Speculating => self.fire_fallback(idx, FallbackReason::DeadlineMissed),
                 CellState::Speculated => self.commit_or_squash(idx),
-                CellState::Failed => self.fire_fallback(idx),
+                CellState::Failed => self.fire_fallback(idx, FallbackReason::ResolveFailed),
                 _ => unreachable!("next_at only yields actionable states"),
             }
         }
-        self.playhead = target;
     }
 
-    /// Run the resolver against the current committed view, snapshotting the basis.
-    /// `Pending → Speculating → Speculated`.
+    /// Snapshot the basis and start an owned resolution without waiting for it.
     fn speculate(&mut self, idx: usize) {
         let recipe = self.deferred_recipe(idx);
-        let now = self.future[idx].start;
-
-        // Disjoint immutable borrows (resolvers / ambient / committed); the owned
-        // results end the borrows before we mutate `future`.
-        let resolver = self
-            .resolvers
-            .get(&recipe.resolver.0)
+        let resolver = self.resolvers.get(&recipe.resolver.0)
             .expect("resolver presence checked at schedule time");
         let ctx = CommittedCtx {
-            now,
+            now: self.future[idx].start,
             ambient: &self.ambient,
             committed: &self.committed,
         };
         let basis = resolver.compute_basis(&recipe.params, &ctx);
-        let resolution = resolver.resolve(&recipe.params, &ctx);
-
+        let work = resolver.resolve(&recipe.params, &ctx);
         let s = &mut self.future[idx];
         debug_assert!(s.cell.state.can_advance_to(CellState::Speculating));
-        match resolution {
+        s.cell.state = CellState::Speculating;
+        s.status.attempt += 1;
+        s.status.started_at = Some(self.playhead);
+        s.status.ready_at = None;
+        s.status.readiness = Readiness::Running;
+        s.status.predicted = Some(basis.clone());
+        s.status.actual = None;
+        s.status.valid = None;
+        s.work = Some(work);
+        self.poll_work(idx);
+    }
+
+    fn poll_work(&mut self, idx: usize) {
+        let s = &mut self.future[idx];
+        let mut ctx = std::task::Context::from_waker(std::task::Waker::noop());
+        let polled = s.work.as_mut().expect("running work owns its future").as_mut().poll(&mut ctx);
+        let std::task::Poll::Ready(result) = polled else { return };
+        s.work = None;
+        s.observed_at = self.playhead;
+        match result {
             Ok(res) => {
-                s.predicted_basis = Some(basis);
+                s.status.readiness = Readiness::Ready;
+                s.status.ready_at = Some(self.playhead);
                 s.resolution = Some(res);
                 s.cell.state = CellState::Speculated;
             }
-            Err(err) => {
-                // Report the failure now. Select fallback content at commitment,
-                // after other producers have had time to supply the lane.
-                debug_assert!(s.cell.state.can_advance_to(CellState::Failed));
+            Err(crate::resolver::ResolveError::Failed(error)) => {
+                s.status.readiness = Readiness::Failed;
+                s.status.error = Some(error.clone());
                 s.cell.state = CellState::Failed;
-                let start = s.start;
-                let played_by = s.cell.played_by;
-                let crate::resolver::ResolveError::Failed(error) = err;
+                let Body::Deferred(recipe) = &s.cell.body else { unreachable!("scheduled work is deferred") };
                 self.failures.push(FailureEvent {
-                    at: self.playhead,
-                    start,
-                    resolver: recipe.resolver.clone(),
-                    error,
-                    played_by,
+                    work_id: Some(s.status.id), attempt: s.status.attempt,
+                    at: self.playhead, start: s.start, resolver: recipe.resolver.clone(),
+                    error, played_by: s.cell.played_by,
                 });
             }
         }
@@ -476,8 +531,10 @@ impl Timeline {
             committed: &self.committed,
         };
         let actual = resolver.compute_basis(&recipe.params, &ctx);
-        let predicted = self.future[idx].predicted_basis.clone().expect("speculated");
+        let predicted = self.future[idx].status.predicted.clone().expect("speculated");
 
+        self.future[idx].status.actual = Some(actual.clone());
+        self.future[idx].status.valid = Some(actual == predicted);
         if actual == predicted {
             self.commit(idx);
             return;
@@ -494,6 +551,8 @@ impl Timeline {
             Recovery::FellBack
         };
         self.squashes.push(SquashEvent {
+            work_id: self.future[idx].status.id,
+            attempt: self.future[idx].status.attempt,
             at: current_tick,
             start,
             predicted,
@@ -514,12 +573,11 @@ impl Timeline {
             {
                 let s = &mut self.future[idx];
                 s.final_attempt = true;
-                s.predicted_basis = None;
                 s.resolution = None;
             }
             self.speculate(idx);
         } else {
-            self.fire_fallback(idx);
+            self.fire_fallback(idx, FallbackReason::InvalidBasis);
         }
     }
 
@@ -532,7 +590,7 @@ impl Timeline {
         self.cas.entry(cref.hash.clone()).or_insert(res.bytes);
 
         debug_assert!(s.cell.state.can_advance_to(CellState::Committed));
-        s.cell.body = Body::Concrete(cref);
+        s.cell.body = Body::Concrete(cref.clone());
         s.cell.state = CellState::Committed;
 
         // The committing parent's lane + player are the authority for everything
@@ -540,6 +598,7 @@ impl Timeline {
         // them before the cell moves into the committed log.
         let parent_track = s.cell.track.clone();
         let parent_player = s.cell.played_by;
+        self.finish(s.status, Disposition::Committed { content: cref.clone() });
         self.committed.push(s.cell);
 
         // Emitted cells become real only on commit — a squashed resolution's
@@ -586,36 +645,19 @@ impl Timeline {
     /// by the player: the transport played them. Attributing vamp-insurance to
     /// the player would be false provenance. They stay on the missing cell's
     /// `track` — the lane persists even when no player covered this beat.
-    fn fire_fallback(&mut self, idx: usize) {
-        let s = &self.future[idx];
-        let Body::Deferred(recipe) = &s.cell.body else {
-            unreachable!("scheduled cells are deferred")
+    fn fire_fallback(&mut self, idx: usize, reason: FallbackReason) {
+        let s = self.future.swap_remove(idx);
+        let Body::Deferred(recipe) = &s.cell.body else { unreachable!("scheduled cells are deferred") };
+        let policy = recipe.fallback.clone();
+        let content = match &policy {
+            Fallback::Skip => None,
+            Fallback::UseLastGood => self.last_committed_content_in(&s.cell.track, s.start),
+            Fallback::Literal(content) => Some(content.clone()),
         };
-        let span = s.cell.span;
-        let track = s.cell.track.clone();
-        match recipe.fallback.clone() {
-            Fallback::Skip => {
-                // Emit nothing — the playhead passes a hole.
-                self.future.swap_remove(idx);
-            }
-            Fallback::UseLastGood => {
-                // Per-track: a repeat may only reuse THIS lane's last good
-                // content. `track == None`/another-track's content can never
-                // satisfy this track's UseLastGood — `None` (empty lane history)
-                // falls through to silence (Skip), the locked decision.
-                let last = self.last_committed_content_in(&track, span.start);
-                self.future.swap_remove(idx);
-                if let Some(cref) = last {
-                    self.committed
-                        .push(Cell::concrete_on(span, cref, track, PrincipalId::beat()));
-                }
-            }
-            Fallback::Literal(cref) => {
-                self.future.swap_remove(idx);
-                self.committed
-                    .push(Cell::concrete_on(span, cref, track, PrincipalId::beat()));
-            }
+        if let Some(content) = &content {
+            self.committed.push(Cell::concrete_on(s.cell.span, content.clone(), s.cell.track, PrincipalId::beat()));
         }
+        self.finish(s.status, Disposition::Fallback { reason, policy, content });
     }
 
     /// Place an emitted cell: a deferred emission re-enters scheduling; a concrete
@@ -623,11 +665,17 @@ impl Timeline {
     fn absorb_emitted(&mut self, cell: Cell) {
         match &cell.body {
             Body::Concrete(_) => self.committed.push(cell),
-            Body::Deferred(_) => {
-                // Best-effort: a future emission only schedules if it's genuinely
-                // ahead of the playhead. A backdated emission is dropped rather
-                // than allowed to rewrite the past.
-                let _ = self.schedule(cell);
+            Body::Deferred(recipe) => {
+                let resolver = recipe.resolver.clone();
+                let start = cell.span.start;
+                let played_by = cell.played_by;
+                if let Err(error) = self.schedule(cell) {
+                    self.failures.push(FailureEvent {
+                        work_id: None, attempt: 0,
+                        at: self.playhead, start, resolver, played_by,
+                        error: format!("emitted work was not admitted: {error}"),
+                    });
+                }
             }
         }
     }
@@ -719,12 +767,14 @@ mod tests {
         fn compute_basis(&self, _p: &Value, ctx: &dyn ResolverCtx) -> ContextHash {
             ContextHash::of(&ctx.ambient("beat").unwrap_or_default())
         }
-        fn resolve(&self, p: &Value, ctx: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
-            let beat = ctx.ambient("beat").unwrap_or_default();
-            if p.get("fail_on").and_then(Value::as_str).map(str::as_bytes) == Some(beat.as_slice()) {
-                return Err(ResolveError::Failed("changed input cannot resolve".into()));
-            }
-            Ok(Resolution::new(beat, "text/plain"))
+        fn resolve(&self, p: &Value, ctx: &dyn ResolverCtx) -> crate::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                let beat = ctx.ambient("beat").unwrap_or_default();
+                if p.get("fail_on").and_then(Value::as_str).map(str::as_bytes) == Some(beat.as_slice()) {
+                    return Err(ResolveError::Failed("changed input cannot resolve".into()));
+                }
+                Ok(Resolution::new(beat, "text/plain"))
+            })()))
         }
     }
 
@@ -744,8 +794,10 @@ mod tests {
         fn compute_basis(&self, _p: &Value, ctx: &dyn ResolverCtx) -> ContextHash {
             ContextHash::of(&ctx.now().get().to_le_bytes())
         }
-        fn resolve(&self, _p: &Value, _ctx: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
-            Ok(Resolution::new(b"X".to_vec(), "text/plain"))
+        fn resolve(&self, _p: &Value, _ctx: &dyn ResolverCtx) -> crate::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Ok(Resolution::new(b"X".to_vec(), "text/plain"))
+            })()))
         }
     }
 
@@ -937,7 +989,8 @@ mod tests {
 
         tl.advance_to(Tick::new(96)); // lead=beats_for(4s)=4 → speculate_at=96, against "A"
         tl.set_ambient("beat", *b"B"); // diverges
-        tl.advance_to(Tick::new(100)); // deadline=97 → squash+re-spec against "B"; final commit at 100
+        tl.advance_to(Tick::new(97)); // retry while budget remains
+        tl.advance_to(Tick::new(100)); // final validation
 
         assert_eq!(tl.squashes().len(), 1);
         assert_eq!(tl.squashes()[0].recovery, Recovery::ReSpeculated);
@@ -952,71 +1005,6 @@ mod tests {
         }
     }
 
-    /// The internal beat: wall-clock pumps alone drive the playhead through the
-    /// lifecycle — no manual `advance_to` call from the integrator.
-    #[test]
-    fn beat_drives_commit_from_wallclock() {
-        let clock = TickClock {
-            ticks_per_sec: 10.0, // 10 ticks/sec → tick 10 == 1.0s
-            safety_factor: 2.0,
-            commit_margin: TickDelta::new(2),
-        };
-        let mut tl = Timeline::new(clock);
-        tl.register_resolver(Box::new(EchoBeat {
-            cost: Duration::from_millis(300), // est 3 ticks, lead 6 → speculate_at=4
-        }));
-        tl.set_ambient("beat", *b"A");
-        tl.schedule(deferred_at(10, Fallback::Skip)).unwrap(); // start at 1.0s
-
-        // Beat ticks arrive on the wall clock; nobody calls advance_to.
-        tl.pump(Duration::from_millis(500)); // → tick 5: crosses speculate_at(4)
-        assert!(tl.committed().is_empty(), "not committed before its deadline");
-        tl.pump(Duration::from_millis(1000)); // → tick 10: crosses commit_deadline(8)
-
-        assert_eq!(tl.committed().len(), 1);
-        assert!(tl.squashes().is_empty());
-        match &tl.committed()[0].body {
-            Body::Concrete(cref) => assert_eq!(cref.hash, concrete_hash(b"A")),
-            _ => panic!("beat should have committed concrete content"),
-        }
-    }
-
-    /// A wall-clock reading behind the playhead is ignored — the beat never walks
-    /// time backward.
-    #[test]
-    fn pump_is_monotonic() {
-        let mut tl = Timeline::new(TickClock::default());
-        tl.pump(Duration::from_secs(5));
-        let p = tl.playhead();
-        tl.pump(Duration::from_secs(2)); // stale reading
-        assert_eq!(tl.playhead(), p, "stale beat reading must not rewind the playhead");
-    }
-
-    /// SEV-2 (gemini-pro Stage-3 review): `pump` integrates phase incrementally, so
-    /// a mid-stream tempo change (WI 2 made the rate mutable) only re-rates time
-    /// AFTER it. The old absolute mapping (`since_epoch × current_rate`) would have
-    /// reinterpreted all prior elapsed time at the new rate and jumped the playhead
-    /// far ahead, firing every scheduled cell.
-    #[test]
-    fn pump_integrates_phase_across_a_tempo_change() {
-        let mut tl = Timeline::new(TickClock { ticks_per_sec: 1.0, ..TickClock::default() });
-        tl.pump(Duration::from_secs(10)); // 10s at 1 tick/sec → tick 10
-        assert_eq!(tl.playhead(), Tick::new(10));
-
-        // Double the rate, then advance one more wall-second. The new rate applies
-        // only to the +1s delta (=+2 ticks → 12), NOT to the whole 11s-since-origin
-        // (which the old `tick_at` would have mapped to 22, a 12-tick jump).
-        tl.set_clock(TickClock { ticks_per_sec: 2.0, ..TickClock::default() });
-        tl.pump(Duration::from_secs(11));
-        assert_eq!(
-            tl.playhead(),
-            Tick::new(12),
-            "a tempo change re-rates only time after it — no retroactive playhead jump",
-        );
-    }
-
-    /// Scheduling behind the playhead is rejected — crash over corruption, never a
-    /// silently-backdated cell.
     #[test]
     fn rejects_scheduling_in_the_past() {
         let mut tl = Timeline::new(TickClock::default());
@@ -1047,14 +1035,16 @@ mod tests {
         fn compute_basis(&self, _p: &Value, _c: &dyn ResolverCtx) -> ContextHash {
             ContextHash::of(b"stable")
         }
-        fn resolve(&self, _p: &Value, _c: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
-            let sibling = Cell::concrete_on(
-                Span::instant(Tick::new(self.sibling_tick)),
-                ContentRef::of(b"sibling", "text/plain"),
-                self.sibling_track.clone(),
-                self.sibling_player,
-            );
-            Ok(Resolution::new(b"parent".to_vec(), "text/plain").with_emitted(vec![sibling]))
+        fn resolve(&self, _p: &Value, _c: &dyn ResolverCtx) -> crate::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                let sibling = Cell::concrete_on(
+                    Span::instant(Tick::new(self.sibling_tick)),
+                    ContentRef::of(b"sibling", "text/plain"),
+                    self.sibling_track.clone(),
+                    self.sibling_player,
+                );
+                Ok(Resolution::new(b"parent".to_vec(), "text/plain").with_emitted(vec![sibling]))
+            })()))
         }
     }
 
@@ -1084,8 +1074,10 @@ mod tests {
         fn compute_basis(&self, _p: &Value, _c: &dyn ResolverCtx) -> ContextHash {
             ContextHash::of(b"stable")
         }
-        fn resolve(&self, _p: &Value, _c: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
-            Err(ResolveError::Failed(self.message.to_string()))
+        fn resolve(&self, _p: &Value, _c: &dyn ResolverCtx) -> crate::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Err(ResolveError::Failed(self.message.to_string()))
+            })()))
         }
     }
 
@@ -1195,6 +1187,7 @@ mod tests {
             };
             tl.set_ambient("beat", b"another lane".to_vec());
             tl.schedule(deferred_at_track(9, Fallback::Skip, TrackId::new("other").unwrap())).unwrap();
+            tl.advance_to(Tick::new(9));
             tl.advance_to(Tick::new(10));
             assert_eq!(tl.committed().len(), 2, "no fallback before its deadline");
 
@@ -1243,7 +1236,7 @@ mod tests {
             PrincipalId::beat(),
         )).unwrap();
         tl.advance_to(Tick::new(11));
-        assert_eq!(tl.failures()[0].at, Tick::new(10), "late work starts at the current playhead");
+        assert_eq!(tl.failures()[0].at, Tick::new(10), "overdue preparation starts when admitted");
         assert_eq!(tl.playhead(), Tick::new(11));
         assert_eq!(tl.future_len(), 0);
     }
@@ -1319,6 +1312,26 @@ mod tests {
         assert_eq!(tl.squashes().len(), 2);
     }
 
+    #[test]
+    fn equal_deadlines_keep_admission_order_after_an_unrelated_cancel() {
+        let mut tl = Timeline::new(TickClock::default());
+        tl.register_resolver(Box::new(AlwaysFails { message: "controlled" }));
+        let make = |at, fallback| Cell::deferred_on(Span::instant(Tick::new(at)), Recipe {
+            resolver: ResolverId::new("always_fails"),
+            params: serde_json::json!({"cost": 10}),
+            query: ContextQuery::default(), fallback,
+        }, TrackId::solo(), PrincipalId::beat());
+        let unrelated = tl.schedule(make(100, Fallback::Skip)).unwrap();
+        tl.schedule(make(10, Fallback::Literal(ContentRef::of(b"first", "text/plain")))).unwrap();
+        let latest = ContentRef::of(b"second", "text/plain");
+        tl.schedule(make(10, Fallback::Literal(latest.clone()))).unwrap();
+        tl.schedule(make(10, Fallback::UseLastGood)).unwrap();
+        tl.cancel(unrelated);
+        tl.advance_to(Tick::new(9));
+        assert_eq!(tl.committed().len(), 3);
+        assert_eq!(tl.committed()[2].body, Body::Concrete(latest));
+    }
+
     /// T11 — the locked two-track cross-contamination test. Track B commits good
     /// content; track A's UseLastGood misses with an empty A-history and must NOT
     /// pick up B's content. Nothing is committed for A.
@@ -1343,7 +1356,8 @@ mod tests {
         tl.schedule(deferred_at_track(30, Fallback::UseLastGood, track_a.clone()))
             .unwrap();
 
-        tl.advance_to(Tick::new(24)); // B speculates@14 + commits@19 (beat=A); A speculates@24 (beat=A)
+        tl.advance_to(Tick::new(19)); // B is ready and commits while useful
+        tl.advance_to(Tick::new(24)); // A starts against beat=A
         assert_eq!(tl.committed().len(), 1, "only B has committed so far");
         assert_eq!(tl.committed()[0].track, track_b);
 

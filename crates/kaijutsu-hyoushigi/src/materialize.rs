@@ -64,7 +64,7 @@ mod tests {
     use super::*;
     use crate::cell::{ContextQuery, Fallback, Recipe, ResolverId};
     use crate::content::ContextHash;
-    use crate::resolver::{ResolveError, Resolution, Resolver, ResolverCtx};
+    use crate::resolver::{Resolution, Resolver, ResolverCtx};
     use crate::{Cell, Span, Tick, TickClock, TickDelta};
     use kaijutsu_types::{ContextId, PrincipalId};
     use std::time::Duration;
@@ -90,8 +90,10 @@ mod tests {
             &self,
             _p: &serde_json::Value,
             _c: &dyn ResolverCtx,
-        ) -> Result<Resolution, ResolveError> {
-            Ok(Resolution::new(self.bytes.clone(), self.mime.clone()))
+        ) -> crate::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Ok(Resolution::new(self.bytes.clone(), self.mime.clone()))
+            })()))
         }
     }
 

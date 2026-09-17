@@ -54,7 +54,7 @@ trait Resolver {
     fn id(&self) -> ResolverId;
     fn estimate_cost(&self, params, rctx) -> Duration;       // wall-clock, feeds lead time
     fn compute_basis(&self, params, rctx) -> ContextHash;    // the equivalence class
-    fn resolve(&self, params, rctx) -> Result<Resolution>;   // content + emitted cells
+    fn resolve(&self, params, rctx) -> ResolveFuture;       // owned, Send, static work
 }
 ```
 
@@ -122,16 +122,49 @@ Resolver errors do not automatically retry. Neither the error nor its fallback
 fires again on later ticks. `Recovery::ReSpeculated` records that a retry started,
 not that it succeeded; a second basis divergence records a second squash.
 
-Lifecycle actions never rewind the playhead. If a newly admitted cell's nominal
-speculation or commitment time has already passed, its due action runs at the
-current playhead. Its intended start stays unchanged.
+Preparation starts when its lead time arrives, or at admission if that lead
+already passed. Each attempt owns a future; the timeline polls it without waiting
+on every observed tick. `advance_to` with the same tick polls again; an earlier
+tick is ignored. `estimate_cost`, `compute_basis`, construction, and polling must
+return promptly. A resolver copies the committed inputs it needs before returning
+its future; it cannot borrow a changing timeline. Production CAS read/validation
+runs on Tokio's existing blocking pool, limited to four operations across timelines.
+The server scheduler is the only timebase; the unused independent wall-clock
+`Timeline::pump` API has been removed.
+A running blocking operation may finish after cancellation, but retains its permit
+until it finishes and cannot deliver into a cancelled attempt.
 
-The current implementation still calls `resolve` synchronously while advancing
-the timeline. The nonblocking contract below is a design requirement, not yet a
-guarantee for a slow resolver. `timeline_commitment_wire` verifies failure,
-intervening accepted content, and fallback through the SSH client's score and
-conversation reads. Pending, delayed, and superseded work remain the next part
-of that scenario; see `docs/issues.md`, "Anticipation and commitment".
+Readiness belongs to the observation tick. A result first observed after its
+intended start is discarded; advancing across old deadlines never makes it timely.
+A ready result can use the interval between the commit margin and intended start,
+with basis validation at commitment. An unresolved attempt at the intended start
+uses its declared fallback. The score retains the intended span; a clock jump does
+not replay elapsed beats. Due actions run by intended start, then admission order,
+so unrelated cancellation cannot change simultaneous fallback selection.
+
+Admission defaults to 64 open work items per timeline, including failures waiting
+for fallback. `with_capacity` selects another positive limit. Supersession validates
+its replacement before cancelling old work and reuses its capacity. Cancellation,
+supersession, deadline expiry, and timeline removal drop the owned future. A resolver
+that delegates work must carry cancellation ownership with that future; dropping a
+bare Tokio join handle would detach its task. Failed admission of emitted work is
+recorded in the failure ledger, not silently discarded.
+
+`kj transport work --track <name>` reads current work and the most recent 256 terminal
+dispositions as JSON. It includes the work UUID and attempt number, intended start,
+admission/start/readiness/settlement ticks, predicted and actual basis, validity,
+error, and final disposition. A retry updates the current attempt; squash/failure
+events retain its work ID and attempt number. This history is local to the live
+timeline and is lost on process restart or timeline removal. Committed score blocks
+remain durable. Clock inputs must be finite, with a positive rate and nonnegative
+safety factor and margin.
+
+`timeline_commitment_wire` drives the real scheduler with controlled fast, delayed,
+failed, superseded, missed-deadline, and stale-basis producers. The actual SSH client
+reads progress and final disposition through `kj`, and reads accepted score blocks.
+OODA is disarmed during this test; no model inference is involved. Live model turns
+still choose a target relative to completion and need the same admitted-work
+contract; see `docs/issues.md`, "Anticipation and commitment".
 
 ## Can the playhead block? — the one axis that matters
 
@@ -609,8 +642,7 @@ fallback are exercised by their first user.
 >   `set_clock` (a tempo change re-slaves the speculation `TickClock`),
 >   `seed_playhead` (virgin-only, crash on time travel), and
 >   `rehydrate_committed` (restart recovery of the committed log). The crate
->   stays runtime-agnostic; `pump` integrates phase incrementally so a tempo
->   change only re-rates time after it.
+>   stays runtime-agnostic; the server scheduler supplies its only timebase.
 > - **Kernel integration — track-keyed (`docs/tracks.md`):** for beaten
 >   contexts the timeline lives on the **track**, which owns clock + playhead
 >   + transport + score. A durable **score context** (`context_type="score"`,

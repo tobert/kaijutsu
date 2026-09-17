@@ -2,7 +2,7 @@
 //! production resolvers that crystallize content into the block log.
 //!
 //! `kaijutsu-hyoushigi` is the runtime-agnostic engine (the `Timeline`, the
-//! speculate→commit-or-squash→fallback loop, the internal-beat `pump`). This
+//! speculate→commit-or-squash→fallback loop). This
 //! module is where the kernel *owns* those timelines, registers real
 //! [`Resolver`](kaijutsu_hyoushigi::Resolver)s onto them, and bridges committed
 //! cells into the kernel block log + CAS. The wall-clock timer that drives the
@@ -17,13 +17,15 @@ use kaijutsu_abc::ParseMode;
 use kaijutsu_audio::{Clip, CuePayload, RenderCue, CLIP_MIME, PREPARE_MIME};
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
 use kaijutsu_hyoushigi::{
-    ContextHash, ContextQuery, Fallback, Recipe, ResolveError, Resolution, Resolver, ResolverCtx,
-    ResolverId, TickDelta, Timeline,
+    ContextQuery, Fallback, Recipe, ResolverId, TickDelta, Timeline,
 };
 use kaijutsu_types::{
     BlockId, BlockKind, BlockSnapshotBuilder, ContentType, ContextId, PrincipalId, Role, TrackId,
 };
 use parking_lot::Mutex;
+
+mod resolver;
+use resolver::CasCommitResolver;
 
 use crate::flows::BlockFlow;
 
@@ -358,13 +360,8 @@ impl From<BeatCommand> for BeatRequest {
     }
 }
 
-/// A context's timeline, shared between the beat scheduler (which pumps it) and
-/// the turn-completion handler (which schedules cells onto it).
-///
-/// A sync `parking_lot::Mutex` rather than a tokio mutex: the only holder that
-/// matters — the beat scheduler — locks it for the duration of a `pump` and
-/// never `.await`s under the lock, so there is nothing for an async mutex to
-/// buy. `Arc` because two parties hold it.
+/// A track timeline shared by scheduling, commitment, and observation paths.
+/// Hold the lock only for bounded synchronous work; never await while holding it.
 pub type SharedTimeline = Arc<Mutex<Timeline>>;
 
 /// The constant MIME a notation cell commits under. The cell body *is* the ABC
@@ -415,7 +412,7 @@ fn validate_abc(bytes: &[u8]) -> Result<Vec<kaijutsu_abc::Tune>, String> {
 /// deleted; its parse-and-render logic moved verbatim into [`AbcToMidiDeriver`],
 /// run at the write barrier from the [`DeriverRegistry`].
 pub fn register_resolvers(timeline: &mut Timeline, cas: Arc<FileStore>) {
-    timeline.register_resolver(Box::new(CasCommitResolver { cas }));
+    timeline.register_resolver(Box::new(CasCommitResolver::new(cas)));
 }
 
 /// Absorb a completed OODA turn's ABC decision onto a context's timeline — the
@@ -598,99 +595,6 @@ fn publish_prepare_cue(kernel: &Kernel, media: ContentHash) {
             onset_beat: None,
         },
     });
-}
-
-/// The single production resolver (§2): commit CAS-referenced bytes onto the score
-/// at a tick, validating by mime. The generic "put this content on the score"
-/// resolver — notation today (`text/vnd.abc`), automation cells tomorrow (same
-/// recipe shape, different mime).
-///
-/// This is the musician OODA loop's **Act** step, and it is deliberately a *pure*
-/// resolver — idempotent, side-effect-free, safe to speculate and discard. It
-/// reads bytes by **hash** from `params` (the `hash` the source content was stored
-/// under), not from the committed timeline view, so the block log and the timeline
-/// stay decoupled at the resolver boundary. The committed body is the *source*
-/// (ABC), never a render — MIDI is derived at the write barrier (§4/§5), so the
-/// `UseLastGood` candidate pool stays notation-pure by construction.
-struct CasCommitResolver {
-    cas: Arc<FileStore>,
-}
-
-impl CasCommitResolver {
-    /// The single resolver id; recipes name it.
-    pub const ID: &'static str = "cas_commit";
-
-    fn param_str<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a str, ResolveError> {
-        params
-            .get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ResolveError::Failed(format!("cas_commit: missing `{key}` param")))
-    }
-
-    fn hash_param(params: &serde_json::Value) -> Result<ContentHash, ResolveError> {
-        let s = Self::param_str(params, "hash")?;
-        // Crash on a malformed hash — a bad hash is structural corruption, never
-        // a lenient fallback (the doc's asymmetric boundary).
-        ContentHash::from_str_checked(s)
-            .map_err(|e| ResolveError::Failed(format!("cas_commit: malformed hash: {e}")))
-    }
-}
-
-impl Resolver for CasCommitResolver {
-    fn id(&self) -> ResolverId {
-        ResolverId::new(Self::ID)
-    }
-
-    fn estimate_cost(&self, _params: &serde_json::Value, _rctx: &dyn ResolverCtx) -> Duration {
-        // Hashing + a validate parse is sub-millisecond; keep a small floor so
-        // lead-time derivation has something to chew on.
-        Duration::from_millis(20)
-    }
-
-    fn compute_basis(&self, params: &serde_json::Value, _rctx: &dyn ResolverCtx) -> ContextHash {
-        // The equivalence class is exactly the input hash: same hash → same bytes →
-        // commits cleanly. Constant per cell, so this resolver never squashes on
-        // its own basis. (ContextQuery growth is future work.)
-        let h = params.get("hash").and_then(|v| v.as_str()).unwrap_or_default();
-        ContextHash::of(h.as_bytes())
-    }
-
-    fn resolve(
-        &self,
-        params: &serde_json::Value,
-        _rctx: &dyn ResolverCtx,
-    ) -> Result<Resolution, ResolveError> {
-        let hash = Self::hash_param(params)?;
-        let mime = Self::param_str(params, "mime")?.to_string();
-        let bytes = self
-            .cas
-            .retrieve(&hash)
-            .map_err(|e| ResolveError::Failed(format!("cas_commit: CAS read: {e}")))?
-            .ok_or_else(|| {
-                ResolveError::Failed(format!("cas_commit: hash not in CAS: {}", hash.as_str()))
-            })?;
-
-        // Gate 2 of 3: per-mime validate. `text/vnd.abc` must parse; a clip
-        // record must be structurally well-formed (presence of its `media` in
-        // CAS was already gate 1, `schedule_clip_cell`'s eager
-        // `parse_validated` — this resolver is pure, so it never re-checks CAS
-        // presence, only that the committed bytes are still a well-formed
-        // Shape A record). An unknown mime is a defined pass-through (most
-        // content needs no kernel opinion) — a documented default, never a
-        // silent fallback.
-        if mime.as_str() == ABC_MIME {
-            validate_abc(&bytes).map_err(|e| ResolveError::Failed(format!("cas_commit: {e}")))?;
-        } else if mime.as_str() == CLIP_MIME {
-            let json = std::str::from_utf8(&bytes).map_err(|e| {
-                ResolveError::Failed(format!("cas_commit: clip record is not UTF-8: {e}"))
-            })?;
-            Clip::parse(json).map_err(|e| ResolveError::Failed(format!("cas_commit: {e}")))?;
-        }
-
-        // The committed body IS the source bytes under its source mime — never a
-        // render. (MIDI for ABC is derived at the write barrier.)
-        Ok(Resolution::new(bytes, mime))
-    }
 }
 
 /// A pure, fast (≲1 ms) projection run at the write barrier, on the beat thread,
@@ -1008,7 +912,7 @@ mod tests {
     use std::sync::Arc;
 
     use kaijutsu_hyoushigi::{
-        Cell, ContextHash, ContextQuery, Fallback, Recipe, ResolveError, Resolution, Resolver,
+        Cell, ContextHash, ContextQuery, Fallback, Recipe, Resolution, Resolver,
         ResolverCtx, ResolverId, Span, Tick, TickClock, TickDelta, Timeline,
     };
     use kaijutsu_types::ContextId;
@@ -1044,14 +948,43 @@ mod tests {
             &self,
             _p: &serde_json::Value,
             _c: &dyn ResolverCtx,
-        ) -> Result<Resolution, ResolveError> {
-            Ok(Resolution::new(self.bytes.clone(), self.mime.clone()))
+        ) -> kaijutsu_hyoushigi::ResolveFuture {
+            Box::pin(std::future::ready((|| {
+                Ok(Resolution::new(self.bytes.clone(), self.mime.clone()))
+            })()))
         }
     }
 
     /// Build a timeline that has already committed one cell of the given content via
     /// the `Fixed` resolver (used by the F1-landed bridge/restart pins, which test
     /// the generic single-block bridge independent of ABC→MIDI derivation).
+    async fn wait_prepared(mut poll: impl FnMut() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !poll() {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("CAS preparation must finish");
+    }
+
+    async fn prepare_local(tl: &mut Timeline, at: Tick) {
+        let prepare_at = at - TickDelta::new(1);
+        wait_prepared(|| {
+            tl.advance_to(prepare_at);
+            tl.statuses().iter().all(|s| s.readiness != kaijutsu_hyoushigi::Readiness::Running)
+        }).await;
+        tl.advance_to(at);
+    }
+
+    async fn prepare_shared(tl: &SharedTimeline, at: Tick) {
+        let prepare_at = at - TickDelta::new(1);
+        wait_prepared(|| {
+            let mut g = tl.lock();
+            g.advance_to(prepare_at);
+            g.statuses().iter().all(|s| s.readiness != kaijutsu_hyoushigi::Readiness::Running)
+        }).await;
+        tl.lock().advance_to(at);
+    }
+
     fn timeline_with_one_committed(mime: &str, bytes: &[u8]) -> SharedTimeline {
         let mut tl = Timeline::new(TickClock {
             ticks_per_sec: 1.0,
@@ -1083,7 +1016,7 @@ mod tests {
     /// ABC through the real `cas_commit` resolver (the production path) so the
     /// committed body is `text/vnd.abc` and the write barrier derives its MIDI
     /// sibling. `cas` is the durable store the resolver reads the ABC from.
-    fn timeline_with_committed_abc(cas: &Arc<kaijutsu_cas::FileStore>, abc: &str) -> SharedTimeline {
+    async fn timeline_with_committed_abc(cas: &Arc<kaijutsu_cas::FileStore>, abc: &str) -> SharedTimeline {
         use kaijutsu_cas::ContentStore;
         let hash = cas.store(abc.as_bytes(), super::ABC_MIME).unwrap();
         let mut tl = Timeline::new(TickClock {
@@ -1104,7 +1037,7 @@ mod tests {
             kaijutsu_types::PrincipalId::beat(),
         ))
         .unwrap();
-        tl.advance_to(Tick::new(10));
+        prepare_local(&mut tl, Tick::new(10)).await;
         assert_eq!(tl.committed().len(), 1, "the notation cell committed");
         Arc::new(Mutex::new(tl))
     }
@@ -1344,7 +1277,7 @@ mod tests {
             kaijutsu_types::PrincipalId::beat(),
         ))
         .unwrap();
-        tl.advance_to(Tick::new(1));
+        prepare_local(&mut tl, Tick::new(1)).await;
 
         assert!(tl.committed().is_empty(), "a bad hash must not commit content");
     }
@@ -1359,7 +1292,7 @@ mod tests {
         use kaijutsu_cas::ContentStore;
         let (blocks, cas, ctx, _dir) = store_and_cas();
 
-        let tl = timeline_with_committed_abc(&cas, VAMP_ABC);
+        let tl = timeline_with_committed_abc(&cas, VAMP_ABC).await;
         let mut cursor = MaterializeCursor::default();
         let derivers = DeriverRegistry::production();
 
@@ -1428,7 +1361,7 @@ mod tests {
         use kaijutsu_types::{BlockKind, ContentType, PrincipalId, Role, Status};
 
         let (blocks, cas, ctx, _dir) = store_and_cas();
-        let tl = timeline_with_committed_abc(&cas, VAMP_ABC);
+        let tl = timeline_with_committed_abc(&cas, VAMP_ABC).await;
         let mut cursor = MaterializeCursor::default();
         let derivers = DeriverRegistry::production();
 
@@ -1489,7 +1422,7 @@ mod tests {
     /// Commit the VAMP ABC at a chosen tick via the real `cas_commit` resolver,
     /// returning a timeline with exactly that one notation cell committed. The
     /// tick parameter lets a second (post-restart) phrase land after the first.
-    fn timeline_with_committed_abc_at(
+    async fn timeline_with_committed_abc_at(
         cas: &Arc<kaijutsu_cas::FileStore>,
         abc: &str,
         tick: i64,
@@ -1514,7 +1447,7 @@ mod tests {
             kaijutsu_types::PrincipalId::beat(),
         ))
         .unwrap();
-        tl.advance_to(Tick::new(tick));
+        prepare_local(&mut tl, Tick::new(tick)).await;
         assert_eq!(tl.committed().len(), 1, "the notation cell committed");
         Arc::new(Mutex::new(tl))
     }
@@ -1568,7 +1501,7 @@ mod tests {
         let derivers = DeriverRegistry::production();
 
         // Pre-restart: a phrase at tick 10 materializes the ABC+MIDI pair.
-        let tl1 = timeline_with_committed_abc_at(&cas, VAMP_ABC, 10);
+        let tl1 = timeline_with_committed_abc_at(&cas, VAMP_ABC, 10).await;
         let mut cursor1 = MaterializeCursor::default();
         let pre = materialize_committed(&tl1, &cas, &blocks, ctx, &mut cursor1, &derivers).unwrap();
         assert_eq!(pre.len(), 2, "pre-restart phrase → ABC source + MIDI sibling");
@@ -1585,7 +1518,7 @@ mod tests {
 
         // The re-arm shape: a brand-new committed timeline at a LATER tick, cursor
         // back to 0 (it counts this-process materialization only).
-        let tl2 = timeline_with_committed_abc_at(&cas, VAMP_ABC, 26);
+        let tl2 = timeline_with_committed_abc_at(&cas, VAMP_ABC, 26).await;
         let mut cursor2 = MaterializeCursor::default();
         let post = materialize_committed(&tl2, &cas, &blocks2, ctx, &mut cursor2, &derivers)
             .expect("post-restart materialization must not DuplicateBlock");
@@ -1650,8 +1583,10 @@ mod tests {
                 &self,
                 _p: &serde_json::Value,
                 _c: &dyn ResolverCtx,
-            ) -> Result<Resolution, ResolveError> {
-                Ok(Resolution::new(VAMP_ABC.as_bytes().to_vec(), super::ABC_MIME.to_string()))
+            ) -> kaijutsu_hyoushigi::ResolveFuture {
+                Box::pin(std::future::ready((|| {
+                    Ok(Resolution::new(VAMP_ABC.as_bytes().to_vec(), super::ABC_MIME.to_string()))
+                })()))
             }
         }
 
@@ -1869,7 +1804,7 @@ mod tests {
             kaijutsu_types::PrincipalId::beat(),
         ))
         .unwrap();
-        tl.advance_to(Tick::new(10));
+        prepare_local(&mut tl, Tick::new(10)).await;
         let tl = Arc::new(Mutex::new(tl));
 
         let mut cursor = MaterializeCursor::default();
@@ -1887,7 +1822,7 @@ mod tests {
     #[tokio::test]
     async fn committed_log_never_contains_midi() {
         let (blocks, cas, ctx, _dir) = store_and_cas();
-        let tl = timeline_with_committed_abc(&cas, VAMP_ABC);
+        let tl = timeline_with_committed_abc(&cas, VAMP_ABC).await;
         let mut cursor = MaterializeCursor::default();
         let derivers = DeriverRegistry::production();
         materialize_committed(&tl, &cas, &blocks, ctx, &mut cursor, &derivers).unwrap();
@@ -1920,7 +1855,7 @@ mod tests {
             .create_document(ctx, DocumentKind::Conversation, None)
             .unwrap();
 
-        let tl = timeline_with_committed_abc(&cas, VAMP_ABC);
+        let tl = timeline_with_committed_abc(&cas, VAMP_ABC).await;
         let mut cursor = MaterializeCursor::default();
         let derivers = DeriverRegistry::production();
 
@@ -2119,7 +2054,7 @@ mod tests {
         assert_eq!(tick, Tick::new(1), "ASAP default is playhead(0) + 1");
 
         let tl = kernel.track_timeline(&track).expect("armed");
-        tl.lock().advance_to(tick);
+        prepare_shared(&tl, tick).await;
         assert_eq!(tl.lock().committed().len(), 1, "the clip cell commits at the barrier");
 
         let cref = {
@@ -2326,7 +2261,7 @@ mod tests {
             kaijutsu_types::PrincipalId::beat(),
         ))
         .unwrap();
-        tl.advance_to(Tick::new(1));
+        prepare_local(&mut tl, Tick::new(1)).await;
 
         assert_eq!(
             tl.committed().len(),
@@ -2362,7 +2297,7 @@ mod tests {
             kaijutsu_types::PrincipalId::beat(),
         ))
         .unwrap();
-        tl.advance_to(Tick::new(1));
+        prepare_local(&mut tl, Tick::new(1)).await;
 
         assert!(tl.committed().is_empty(), "garbage under CLIP_MIME must not commit");
     }
@@ -2391,7 +2326,7 @@ mod tests {
             .expect("a valid clip schedules");
 
         let tl = kernel.track_timeline(&track).expect("armed");
-        tl.lock().advance_to(tick);
+        prepare_shared(&tl, tick).await;
         assert_eq!(tl.lock().committed().len(), 1, "the clip cell committed at the barrier");
 
         // A fresh, DB-less block store + context to materialize into.

@@ -10,6 +10,10 @@ use kaijutsu_types::Tick;
 use std::time::Duration;
 use thiserror::Error;
 
+/// Work owned by one timeline attempt. Polling must return promptly. Dropping
+/// this future must release or cancel its work; a detached task is not ownership.
+pub type ResolveFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Resolution, ResolveError>> + Send + 'static>>;
+
 /// The read-only **committed** view handed to a resolver.
 ///
 /// A resolver is *only* ever handed committed context — an uncommitted cell
@@ -50,6 +54,8 @@ impl Resolution {
     }
 
     /// Attach cells this resolve emits into the open future (or the past).
+    /// Concrete emissions reference bytes already in durable CAS; only this
+    /// resolution's own bytes enter the timeline's content map at commitment.
     ///
     /// **Track/player inheritance contract:** an emission is part of the
     /// committing parent's act, so the engine stamps every emitted cell with the
@@ -63,8 +69,8 @@ impl Resolution {
         self
     }
 
-    /// The content-addressed reference these bytes crystallize to. The hash *is*
-    /// the memoization key — identical bytes → identical ref → no recompute.
+    /// Hash the bytes and retain their declared interpretation. Equal bytes share
+    /// CAS storage; different MIME labels remain distinct content references.
     pub fn content_ref(&self) -> ContentRef {
         ContentRef::of(&self.bytes, self.mime.clone())
     }
@@ -94,11 +100,12 @@ pub trait Resolver: Send + Sync {
     /// `speculate_at`, recomputed at `commit_deadline` to commit-or-squash.
     fn compute_basis(&self, params: &serde_json::Value, rctx: &dyn ResolverCtx) -> ContextHash;
 
-    /// Produce content + emitted cells. Must be idempotent, reversible, and
-    /// side-effect-free — it may run speculatively and be discarded on a squash.
+    /// Start owned preparation. Copy required inputs from the committed view
+    /// before returning; the future cannot borrow a changing timeline. Both this
+    /// call and polling must be bounded and nonblocking. Output may be discarded.
     fn resolve(
         &self,
         params: &serde_json::Value,
         rctx: &dyn ResolverCtx,
-    ) -> Result<Resolution, ResolveError>;
+    ) -> ResolveFuture;
 }

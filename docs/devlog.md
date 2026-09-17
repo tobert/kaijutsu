@@ -1886,6 +1886,33 @@ synchronously under the timeline lock. Pending work, stale completion rejection,
 and bounded admission remain the next part of the scenario; the passing failure
 case is evidence for that part of the contract, not the whole performance goal.
 
+Pending preparation now has an owner on that same timeline. A resolver returns
+an owned future; beats poll it without waiting, and readiness belongs to the
+actual observation tick. A clock jump cannot make late bytes timely by visiting
+old deadlines. UUIDs identify work, attempts carry their basis, and cancellation
+or replacement drops the old delivery path. The controlled SSH scenario now runs
+fast, delayed, failed, superseded, missed-deadline, and stale-basis producers
+alongside each other. It reads their status through `kj transport work` and checks
+accepted score blocks, including the transport's declared fallback. The status
+history is bounded and process-local; it does not pretend to be durable recovery.
+
+CAS preparation moved into a small resolver adapter on Tokio's existing blocking
+pool. Four process-wide permits bound running operations, and a cancelled read
+retains its permit until it actually finishes. A channel-controlled test pins
+that ownership. Review also found that FileStore retrieval did not verify content
+against the requested hash; a red test changed the bytes under a valid hash, and
+the adapter now refuses the mismatch. Equal-deadline decisions use admission
+order, emitted admission failures are reported, invalid clock inputs are rejected,
+and cancelled admission cannot make an already-used timeline virgin again.
+
+Review exposed a second, unused timebase in `Timeline::pump`, with ambiguous seed
+and tempo semantics. Only its own tests called it; it is removed. The scheduler
+supplies ticks, and the engine converts cost estimates into lead time. Older CAS
+fixtures also assumed all preparation finished inside one call, so they now wait
+for readiness at the current tick before moving their controlled clock. Live model
+turns still schedule relative to completion; connecting those turns to admitted
+intent remains the next timing task, alongside the unfinished caller migration.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
