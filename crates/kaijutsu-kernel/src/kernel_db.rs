@@ -1916,15 +1916,14 @@ impl KernelDb {
         )?)
     }
 
-    /// Record the block pair waiting on an ask, and who authored it.
+    /// Link the ask's original pair and retain its execution receipt together.
+    /// Executable asks reuse an existing receipt or adopt the supplied pair.
+    /// The caller validates the pair before linking; context and performer
+    /// must match the ask. A different pair or owner cannot replace a link.
     ///
-    /// The public face of `approval_ledger::ask::link_ask_blocks`. The
-    /// caller that authored the pair is the one place its ids and the ask id
-    /// are in scope together — the gate runs inside the broker's hook
-    /// evaluation and never sees a block. `owner` is `PairOwner::Turn` for a
-    /// model turn's own pair (its turn ended at the gate too, so an
-    /// execution on approval must tell it) and `PairOwner::Session` for a
-    /// connected session watching its own blocks (told nothing).
+    /// Joins an existing transaction; its caller must roll back on error.
+    /// Turn pairs need a model notification after settlement; Session pairs
+    /// are read directly by their connected player.
     pub fn link_ask_blocks(
         &self,
         request_id: &str,
@@ -1932,13 +1931,10 @@ impl KernelDb {
         output_block_id: &BlockId,
         owner: approval_ledger::types::PairOwner,
     ) -> KernelDbResult<()> {
-        Ok(approval_ledger::ask::link_ask_blocks(
-            self.conn_for_ledger(),
-            request_id,
-            &command_block_id.to_key(),
-            &output_block_id.to_key(),
-            owner,
-        )?)
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.link_ask_blocks(request_id, command_block_id, output_block_id, owner));
+        }
+        crate::shell_operations::link_approval_pair(self, request_id, command_block_id, output_block_id, owner)
     }
 
     /// The free-variable env snapshot recorded on this ask

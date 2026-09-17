@@ -165,6 +165,89 @@ mod setup_tests {
         restored.load_from_db().unwrap();
         assert!(restored.block_snapshots(context).unwrap().is_empty(), "failed setup must not survive replay");
     }
+
+    #[tokio::test]
+    async fn waiting_model_pair_retains_its_execution_owner_in_the_same_acceptance() {
+        use approval_ledger::{ask::create_ask, types::{NewAsk, Origin}};
+        for fault in [None, Some("receipt"), Some("link"), Some("context"), Some("actor"), Some("plain")] {
+            let (_dir, kernel, context) = fixture().await;
+            let requester = PrincipalId::new();
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let ask = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+                context_id: if fault == Some("context") { ContextId::new() } else { context }.as_bytes().to_vec(),
+                actor_id: if fault == Some("actor") { PrincipalId::new() } else { actor }.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: requester.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "captured model command".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: (fault != Some("plain")).then(|| "echo captured".into()), exec_stdin: None,
+                continuation_epoch: Some(17), env: vec![],
+            }).unwrap();
+            let command = kernel.blocks().insert_tool_call_as(context, None, None, "shell",
+                serde_json::json!({"command": "echo captured", "foreground": true}), None,
+                Some(actor), Some("model-call-1".into()), None).unwrap();
+            let output = kernel.blocks().insert_tool_result_as(context, &command, Some(&command), "",
+                Status::Running, None, None, Some(PrincipalId::system()), Some("model-call-1".into())).unwrap();
+            if let Some(fault @ ("receipt" | "link")) = fault {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(match fault {
+                    "receipt" => "CREATE TRIGGER reject_receipt BEFORE INSERT ON shell_operations BEGIN SELECT RAISE(FAIL, 'injected receipt fault'); END;",
+                    _ => "CREATE TRIGGER reject_link BEFORE UPDATE OF command_block_id ON approvals BEGIN SELECT RAISE(FAIL, 'injected link fault'); END;",
+                }).unwrap();
+            }
+            let mut events = kernel.block_flows().subscribe("block.*");
+            let accepted = kernel.blocks().settle_tool_result_as(context, &command, &output, "waiting for approval",
+                Status::Waiting, false, PrincipalId::system(), None, Some(&ask));
+            let db = kernel.kernel_db().clone();
+            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
+            restored.load_from_db().unwrap();
+            let row = kernel.kernel_db().lock().get_approval(&ask).unwrap().unwrap();
+            if fault == Some("plain") {
+                accepted.unwrap();
+                assert!(kernel.shell_operations().get_by_ask(&ask, context).unwrap().is_none(), "a caller-retry ask owns no executable source");
+                assert_eq!(row.command_block_id, Some(command.to_key()));
+                assert_eq!(row.output_block_id, Some(output.to_key()));
+                assert_eq!(restored.get_block_snapshot(context, &output).unwrap().unwrap().status, Status::Waiting);
+                continue;
+            }
+            if let Some(fault) = fault {
+                let error = accepted.unwrap_err().to_string();
+                let expected = if matches!(fault, "context" | "actor") { "context and performer".into() }
+                    else { format!("injected {fault} fault") };
+                assert!(error.contains(&expected), "{fault}: {error}");
+                assert!(events.try_recv().is_none(), "failed ownership transfer must not publish Waiting");
+                assert!(kernel.shell_operations().get_by_ask(&ask, context).unwrap().is_none());
+                assert!(row.command_block_id.is_none() && row.output_block_id.is_none());
+                let result = restored.get_block_snapshot(context, &output).unwrap().unwrap();
+                assert_eq!(result.status, Status::Running);
+                assert_eq!(result.content, "");
+            } else {
+                accepted.unwrap();
+                let operation = kernel.shell_operations().get_by_ask(&ask, context).unwrap()
+                    .expect("Waiting must publish with a durable execution owner");
+                assert_eq!(operation.receipt.command_block_id, command);
+                assert_eq!(operation.receipt.output_block_id, output);
+                assert_eq!(operation.source, "echo captured");
+                assert_eq!(operation.continuation_epoch, Some(17), "adopted pair retains the ask's epoch");
+                assert_eq!(restored.block_snapshots(context).unwrap().len(), 2, "adoption must reuse the model pair");
+                let result = restored.get_block_snapshot(context, &output).unwrap().unwrap();
+                assert_eq!(result.status, Status::Waiting);
+                assert_eq!(result.tool_use_id.as_deref(), Some("model-call-1"));
+                let db = kernel.kernel_db().lock();
+                db.link_ask_blocks(&ask, &command, &output, crate::PairOwner::Turn).unwrap();
+                assert!(db.link_ask_blocks(&ask, &command, &output, crate::PairOwner::Session).is_err(), "the waiting owner cannot be replaced");
+                let other = kaijutsu_types::BlockId::new(context, actor, command.seq + 100);
+                assert!(db.link_ask_blocks(&ask, &other, &output, crate::PairOwner::Turn).is_err(), "the waiting command cannot be replaced");
+                let identities: (Vec<u8>, Vec<u8>) = db.conn_for_ledger().query_row(
+                    "SELECT principal_id,actor_id FROM shell_operations WHERE operation_id=?1",
+                    [&operation.receipt.operation_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+                assert_eq!(identities, (requester.as_bytes().to_vec(), actor.as_bytes().to_vec()));
+                drop(db);
+                assert_eq!(kernel.shell_operations().list_for_context(context).unwrap().len(), 1);
+            }
+        }
+    }
     #[tokio::test]
     async fn operation_pair_receipt_and_ask_link_commit_together() {
         use approval_ledger::ask::create_ask;

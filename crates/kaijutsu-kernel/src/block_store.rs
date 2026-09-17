@@ -1500,8 +1500,9 @@ impl BlockStore {
         })
     }
 
-    /// Commit a model tool result and both statuses, linking its ask before
-    /// publishing Waiting. A failed link rolls back the result acceptance.
+    /// Commit a model tool result and both statuses, linking its ask and
+    /// execution receipt before publishing Waiting. A failed ownership
+    /// transfer rolls back the result acceptance.
     pub(crate) fn settle_tool_result_as(
         &self, context_id: ContextId, call: &BlockId, result: &BlockId,
         content: &str, status: Status, is_error: bool, author: PrincipalId,

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use uuid::Uuid;
 
-use crate::kernel_db::KernelDb;
+use crate::kernel_db::{KernelDb, KernelDbError, KernelDbResult};
 use crate::runtime::command_outcome::CommandOutcome;
 
 type OperationResult<T> = Result<T, String>;
@@ -23,6 +23,8 @@ pub struct ShellOperationReceipt {
     pub context_id: ContextId,
     pub command_block_id: BlockId,
     pub output_block_id: BlockId,
+    /// Most recent ask, retained after completion. Earlier asks can resolve
+    /// the same operation through their pair or result-review links.
     pub ask_id: Option<String>,
     pub job_id: Option<String>,
 }
@@ -47,13 +49,17 @@ pub(crate) struct ShellOperationStart<'a> {
 impl ShellOperationStart<'_> {
     /// The caller holds the context's document guard, serializing setup retries.
     pub(crate) fn existing(&self, db: &KernelDb) -> crate::kernel_db::KernelDbResult<Option<ShellOperationReceipt>> {
-        let Some((ask, _)) = self.ask else { return Ok(None); };
-        let prior = db.conn_for_ledger().query_row(&format!("{SELECT_STATE} WHERE ask_id=?1"),
+        let Some((ask, owner)) = self.ask else { return Ok(None); };
+        let prior = db.conn_for_ledger().query_row(&format!("{SELECT_STATE} WHERE {ASK_OPERATION}"),
             [ask], decode_state).optional()?;
         let Some(prior) = prior else { return Ok(None); };
         let same_identity: bool = db.conn_for_ledger().query_row(
-            "SELECT principal_id=?2 AND actor_id=?3 FROM shell_operations WHERE operation_id=?1",
-            rusqlite::params![prior.receipt.operation_id, self.principal.as_bytes(), self.actor.as_bytes()],
+            "SELECT o.principal_id=?2 AND o.actor_id=?3 AND a.context_id=o.context_id
+                AND a.principal_id=o.principal_id AND a.actor_id=o.actor_id
+                AND a.command_block_id=o.command_block_id AND a.output_block_id=o.output_block_id
+                AND a.pair_owner=?4
+             FROM shell_operations o JOIN approvals a ON a.request_id=?5 WHERE o.operation_id=?1",
+            rusqlite::params![prior.receipt.operation_id, self.principal.as_bytes(), self.actor.as_bytes(), owner.as_str(), ask],
             |row| row.get(0),
         )?;
         if prior.receipt.context_id != self.context || prior.source != self.source || !same_identity {
@@ -64,19 +70,79 @@ impl ShellOperationStart<'_> {
 
     pub(crate) fn record(&self, db: &KernelDb, receipt: &ShellOperationReceipt) -> crate::kernel_db::KernelDbResult<()> {
         let epoch = db.continuation_epoch(self.context)?;
-        db.conn_for_ledger().execute(
-            "INSERT INTO shell_operations(operation_id,context_id,principal_id,actor_id,
-             command_block_id,output_block_id,source,continuation_epoch,ask_id,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            rusqlite::params![receipt.operation_id, self.context.as_bytes(), self.principal.as_bytes(), self.actor.as_bytes(),
-                receipt.command_block_id.to_key(), receipt.output_block_id.to_key(), self.source, epoch,
-                receipt.ask_id, kaijutsu_types::now_millis() as i64],
-        )?;
+        insert_operation(db, receipt, self.principal, self.actor, self.source, epoch)?;
         if let Some((ask, owner)) = self.ask {
             db.link_ask_blocks(ask, &receipt.command_block_id, &receipt.output_block_id, owner)?;
         }
         Ok(())
     }
+}
+
+fn insert_operation(
+    db: &KernelDb, receipt: &ShellOperationReceipt, principal: PrincipalId,
+    actor: PrincipalId, source: &str, epoch: Option<i64>,
+) -> KernelDbResult<()> {
+    db.conn_for_ledger().execute(
+        "INSERT INTO shell_operations(operation_id,context_id,principal_id,actor_id,
+         command_block_id,output_block_id,source,continuation_epoch,ask_id,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        rusqlite::params![receipt.operation_id, receipt.context_id.as_bytes(), principal.as_bytes(), actor.as_bytes(),
+            receipt.command_block_id.to_key(), receipt.output_block_id.to_key(), source, epoch,
+            receipt.ask_id, kaijutsu_types::now_millis() as i64],
+    )?;
+    Ok(())
+}
+
+/// Join the caller's transaction: an executable ask and its pair share a
+/// durable execution owner before Waiting is published. Existing links are
+/// immutable; repeating the same link does not create another operation.
+pub(crate) fn link_approval_pair(
+    db: &KernelDb, request: &str, command: &BlockId, output: &BlockId, owner: crate::PairOwner,
+) -> KernelDbResult<()> {
+    let row = db.get_approval(request)?.ok_or_else(|| KernelDbError::NotFound(request.into()))?;
+    let context = command.context_id;
+    let actor = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice)
+        .ok_or_else(|| KernelDbError::Validation("approval pair has no valid performer".into()))?;
+    if row.context_id != context.as_bytes() || output.context_id != context || command.principal_id != actor {
+        return Err(KernelDbError::Validation("approval pair does not match its context and performer".into()));
+    }
+    let command_key = command.to_key();
+    let output_key = output.to_key();
+    let already_linked = match (row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner) {
+        (None, None, None) => false,
+        (Some(prior_command), Some(prior_output), Some(prior_owner))
+            if prior_command == command_key && prior_output == output_key && prior_owner == owner => true,
+        _ => return Err(KernelDbError::Validation("approval already belongs to a different block pair or owner".into())),
+    };
+    if let Some(source) = row.exec_source.as_deref() {
+        let principal = PrincipalId::try_from_slice(&row.principal_id)
+            .ok_or_else(|| KernelDbError::Validation("approval pair has no valid requester".into()))?;
+        let prior = db.conn_for_ledger().query_row(&format!("{SELECT_STATE} WHERE output_block_id=?1"),
+            [&output_key], decode_state).optional()?;
+        if let Some(prior) = prior {
+            let same_identity: bool = db.conn_for_ledger().query_row(
+                "SELECT principal_id=?2 AND actor_id=?3 FROM shell_operations WHERE operation_id=?1",
+                rusqlite::params![prior.receipt.operation_id, principal.as_bytes(), actor.as_bytes()], |r| r.get(0))?;
+            if prior.receipt.context_id != context || prior.receipt.command_block_id != *command || !same_identity
+                || (!already_linked && prior.receipt.ask_id.as_deref().is_some_and(|ask| ask != request))
+                || (prior.completed_at.is_some() && prior.receipt.ask_id.is_none()) {
+                return Err(KernelDbError::Validation("approval pair already belongs to a different execution".into()));
+            }
+            if prior.receipt.ask_id.is_none() {
+                db.conn_for_ledger().execute("UPDATE shell_operations SET ask_id=?2 WHERE operation_id=?1",
+                    rusqlite::params![prior.receipt.operation_id, request])?;
+            }
+        } else {
+            let receipt = ShellOperationReceipt {
+                operation_id: uuid::Uuid::now_v7().to_string(), context_id: context,
+                command_block_id: *command, output_block_id: *output,
+                ask_id: Some(request.into()), job_id: None,
+            };
+            insert_operation(db, &receipt, principal, actor, source, row.continuation_epoch)?;
+        }
+    }
+    approval_ledger::ask::link_ask_blocks(db.conn_for_ledger(), request, &command_key, &output_key, owner)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,18 +267,12 @@ impl ShellOperationRegistry {
         &self, context: ContextId, principal: PrincipalId, actor: PrincipalId,
         command: BlockId, output: BlockId, source: &str, epoch: Option<i64>,
     ) -> OperationResult<ShellOperationReceipt> {
-        let id = Uuid::now_v7().to_string();
-        self.db.lock().conn_for_ledger().execute(
-            "INSERT INTO shell_operations(operation_id,context_id,principal_id,actor_id,
-             command_block_id,output_block_id,source,continuation_epoch,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            rusqlite::params![id, context.as_bytes(), principal.as_bytes(), actor.as_bytes(),
-                command.to_key(), output.to_key(), source, epoch, kaijutsu_types::now_millis() as i64],
-        ).map_err(|e| e.to_string())?;
-        Ok(ShellOperationReceipt {
-            operation_id: id, context_id: context, command_block_id: command,
+        let receipt = ShellOperationReceipt {
+            operation_id: Uuid::now_v7().to_string(), context_id: context, command_block_id: command,
             output_block_id: output, ask_id: None, job_id: None,
-        })
+        };
+        insert_operation(&self.db.lock(), &receipt, principal, actor, source, epoch).map_err(|e| e.to_string())?;
+        Ok(receipt)
     }
 
     pub fn mark_waiting(&self, id: &str, ask: &str) -> OperationResult<()> {
@@ -480,16 +540,6 @@ impl ShellOperationRegistry {
         Ok(changed == 1)
     }
 
-    pub fn complete_from_ask(&self, ask: &str, envelope: ShellEnvelope) -> OperationResult<()> {
-        let id: Option<String> = self.db.lock().conn_for_ledger().query_row(
-            "SELECT operation_id FROM shell_operations WHERE ask_id=?1", [ask], |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
-        match id {
-            Some(id) => self.complete(&id, envelope).map(|_| ()),
-            None => Err(format!("ask {ask} has no shell operation")),
-        }
-    }
-
     pub fn get(&self, id: &str, context: ContextId) -> OperationResult<Option<ShellOperationState>> {
         self.lookup("operation_id", id, context)
     }
@@ -500,8 +550,7 @@ impl ShellOperationRegistry {
 
     pub fn get_by_ask(&self, ask: &str, context: ContextId) -> OperationResult<Option<ShellOperationState>> {
         self.db.lock().conn_for_ledger().query_row(
-            &format!("{SELECT_STATE} WHERE context_id=?2 AND (ask_id=?1 OR operation_id IN
-                (SELECT r.operation_id FROM shell_result_reviews r JOIN shell_result_review_asks a USING(review_id) WHERE a.request_id=?1))"),
+            &format!("{SELECT_STATE} WHERE context_id=?2 AND ({ASK_OPERATION})"),
             rusqlite::params![ask, context.as_bytes()], decode_state,
         ).optional().map_err(|e| e.to_string())
     }
@@ -601,6 +650,13 @@ impl ShellOperationRegistry {
 
 const SELECT_STATE: &str = "SELECT operation_id,context_id,command_block_id,output_block_id,
     ask_id,job_id,source,created_at,continuation_epoch,completed_at,envelope_json FROM shell_operations";
+
+// The current ask may be a result review. Original execution asks keep their
+// pair link; earlier result asks keep their review link to the same operation.
+const ASK_OPERATION: &str = "ask_id=?1 OR (command_block_id,output_block_id) IN
+    (SELECT command_block_id,output_block_id FROM approvals WHERE request_id=?1)
+    OR operation_id IN (SELECT r.operation_id FROM shell_result_reviews r
+        JOIN shell_result_review_asks a USING(review_id) WHERE a.request_id=?1)";
 
 fn decode_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShellOperationState> {
     let invalid = |index, message: &str| rusqlite::Error::FromSqlConversionFailure(

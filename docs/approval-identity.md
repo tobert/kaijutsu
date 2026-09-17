@@ -195,6 +195,10 @@ Changing performers revokes that context's learned session rules. Broader
 rules remain governed by their explicit scope. A linked model approval whose
 performer changed is consumed without execution; restoring the old performer
 does not revive it. Malformed or partial output-pair linkage refuses replay.
+Linking an executable ask also retains the original pair's execution receipt;
+model Waiting publication commits both together. Context and performer must
+match, and an established pair or owner cannot be replaced. Receipt lookup
+through the original ask survives later result-review asks.
 
 Old asks with no recorded performer/reviewer remain audit history and cannot
 be approved through a guessed identity. The policy migration removes old

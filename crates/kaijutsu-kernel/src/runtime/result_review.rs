@@ -237,6 +237,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_execution_ask_keeps_its_receipt_after_result_review() {
+        let (review, ask, operation) = fixture(true).await;
+        let operation = operation.unwrap();
+        let (command, output) = review.pair.unwrap();
+        let context = review.call.context_id;
+        let original = {
+            let db = review.kernel.kernel_db().lock();
+            let original = approval_ledger::ask::create_ask(db.conn_for_ledger(), &approval_ledger::types::NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: review.call.actor_id.as_bytes().to_vec(),
+                principal_id: review.call.principal_id.as_bytes().to_vec(), reviewer_id: PrincipalId::new().as_bytes().to_vec(),
+                origin: approval_ledger::types::Origin::ShellGate, instance: None, tool: None,
+                hook_id: None, description: "execute captured source".into(), statements: vec![],
+                authorized_label: None, rc_run_id: None, expires_at: None, options: vec![],
+                signals: vec![], cwd: None, exec_source: Some("never-rerun".into()), exec_stdin: None,
+                continuation_epoch: None, env: vec![],
+            }).unwrap();
+            db.link_ask_blocks(&original, &command, &output, crate::PairOwner::Turn).unwrap();
+            original
+        };
+        let store = review.kernel.shell_operations();
+        assert_eq!(store.get_by_ask(&original, context).unwrap().unwrap().receipt.operation_id, operation);
+        let mut checkpoint = review.captured.clone();
+        checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
+            waiting: true, ask_id: Some(ask.request_id.clone()) });
+        store.checkpoint_result_review(&review.review_id, Some(&operation), &review.call, &checkpoint).unwrap();
+        for request in [&original, &ask.request_id] {
+            let state = store.get_by_ask(request, context).unwrap().expect("every ask retains its original receipt");
+            assert_eq!(state.receipt.operation_id, operation);
+            assert_eq!(state.receipt.ask_id.as_deref(), Some(ask.request_id.as_str()), "lookup preserves the most recent review ask");
+            assert!(store.get_by_ask(request, ContextId::new()).unwrap().is_none());
+        }
+        review.kernel.kernel_db().lock().link_ask_blocks(&original, &command, &output, crate::PairOwner::Turn).unwrap();
+        let reused = crate::runtime::tool_command::create_operation(&review.kernel, &review.call, "never-rerun", Some(&original)).unwrap();
+        assert_eq!(reused.operation_id, operation, "setup retries retain the original pair during result review");
+        assert_eq!(reused.ask_id.as_deref(), Some(ask.request_id.as_str()));
+        review.settle(&review.captured).unwrap();
+        for request in [&original, &ask.request_id] {
+            let state = store.get_by_ask(request, context).unwrap().unwrap();
+            assert_eq!(state.envelope.unwrap().stdout, "already ran");
+        }
+        assert_eq!(store.list_for_context(context).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn review_storage_preserves_captured_execution_and_terminal_results() {
         let (review, ask, _) = fixture(false).await;
         let mut checkpoint = review.captured.clone();

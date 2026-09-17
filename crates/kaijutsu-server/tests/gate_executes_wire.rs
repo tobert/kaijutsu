@@ -275,6 +275,8 @@ impl Seats {
     fn link_waiting_pair(&self, request_id: &str, code: &str, owner: PairOwner) -> (BlockId, BlockId) {
         let documents = &self.kernel.documents;
         let after = documents.last_block_id(self.worker);
+        let actor = self.kernel.kernel_db.lock().get_approval(request_id).unwrap().unwrap()
+            .actor_id.as_deref().and_then(PrincipalId::try_from_slice).unwrap();
         let command_block_id = documents
             .insert_tool_call_as(
                 self.worker,
@@ -283,7 +285,7 @@ impl Seats {
                 "shell",
                 serde_json::json!({ "code": code }),
                 Some(ToolKind::Shell),
-                Some(PrincipalId::system()),
+                Some(actor),
                 None,
                 None,
             )
@@ -499,6 +501,11 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
             "the output block must hold the command's stdout, got {:?}",
             s.block(&output_block_id).content
         );
+        let operation = s.kernel.kernel.shell_operations().get_by_ask(&ask, s.worker).unwrap().unwrap();
+        assert_eq!(operation.receipt.command_block_id, command_block_id);
+        assert_eq!(operation.receipt.output_block_id, output_block_id);
+        let retained = s.kernel.kernel.shell_operations().outcome(&operation.receipt.operation_id, s.worker).unwrap().unwrap();
+        assert_eq!(retained.envelope().stdout, "gate-executed\n");
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap(),
             "gate-executed\n",

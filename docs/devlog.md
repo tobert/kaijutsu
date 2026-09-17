@@ -2062,6 +2062,17 @@ approval is spent and nothing ran, without leaving durable partial blocks.
 Already-linked pairs without receipts and notification delivery after redemption
 remain separate ownership work.
 
+The next ownership handoff belongs at linkage, before a model publishes Waiting.
+Kernel ask linkage now adopts an existing pair into the receipt registry or
+reuses its receipt, in the caller's transaction. Model content/status acceptance
+and execution ownership therefore succeed together. Receipt or link failures
+roll back both; context and performer mismatches and link replacement refuse.
+Non-executable asks retain only their pair link. Result reviews can change the
+current ask without hiding the receipt from its original execution ask; setup
+retries reuse that pair too. The unused ask-based completion API is deleted.
+Early answers racing the original caller and approved notification recovery
+remain open.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
