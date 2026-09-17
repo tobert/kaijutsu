@@ -385,6 +385,8 @@ impl VfsOps for LocalBackend {
             .map_err(VfsError::from)?;
 
         file.write_all(data).await.map_err(VfsError::from)?;
+        // Await the host write; Tokio may accept bytes into its own buffer first.
+        file.flush().await.map_err(VfsError::from)?;
 
         Ok(data.len() as u32)
     }
@@ -663,6 +665,15 @@ mod tests {
 
         let data = backend.read(Path::new("test.txt"), 0, 100).await.unwrap();
         assert_eq!(data, b"hello world");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_reports_the_host_failure_before_returning() {
+        let backend = LocalBackend::new("/dev");
+        let error = backend.write(Path::new("full"), 0, b"must reach the host").await
+            .expect_err("buffered acceptance must not hide a failed host write");
+        assert!(error.to_string().contains("No space left"), "{error}");
     }
 
     #[tokio::test]
