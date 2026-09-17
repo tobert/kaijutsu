@@ -1695,11 +1695,18 @@ async fn process_llm_stream(
             continuation_epoch, mailbox, &turn_lease,
         )).catch_unwind().await
     } else {
-        Ok(TurnFlow::Completed {
+        Ok(Ok(TurnFlow::Completed {
             turn_id, context_id, principal_id: user_principal_id, output_block_id: None,
             reason: TurnStopReason::Cancelled { immediate: true }, origin,
-        })
+        }))
     };
+    let mut write_failure = false;
+    let outcome = outcome.map(|result| result.unwrap_or_else(|error| {
+        write_failure = true;
+        turn_lease.interrupt().hard();
+        TurnFlow::Failed { turn_id, context_id, principal_id: user_principal_id,
+            error: format!("Could not persist model output: {error}"), origin }
+    }));
 
     if outcome.is_err() { turn_lease.interrupt().hard(); }
     let (cleanup, mut cleanup_panic) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| turn_lease.settle_blocks(&documents))) {
@@ -1716,21 +1723,23 @@ async fn process_llm_stream(
                     Some(format!("Model turn ended with {count} unfinished block(s); they were marked Error.")),
                 _ => None,
             };
+            let needs_diagnostic = write_failure || cleanup_error.is_some();
             if let Some(mut error) = cleanup_error {
                 if let TurnFlow::Failed { error: original, .. } = &event {
                     error = format!("{original}; {error}");
                 }
                 tracing::error!(%context_id, %error);
-                // Do not re-enter a document whose cleanup failed. Terminal
-                // publication remains possible when its journal is unavailable.
-                if can_record_diagnostic {
-                    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                        insert_pre_stream_error_block(&documents, context_id, &panic_anchor, &error))) {
-                        tracing::error!(%context_id, "recording the turn diagnostic panicked");
-                        cleanup_panic = Some(panic);
-                    }
-                }
                 event = TurnFlow::Failed { turn_id, context_id, principal_id: user_principal_id, error, origin };
+            }
+            // Do not re-enter a document whose cleanup failed. Terminal
+            // publication remains possible when its journal is unavailable.
+            if needs_diagnostic && can_record_diagnostic {
+                let TurnFlow::Failed { error, .. } = &event else { unreachable!("write and cleanup faults fail the turn") };
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    insert_pre_stream_error_block(&documents, context_id, &panic_anchor, error))) {
+                    tracing::error!(%context_id, "recording the turn diagnostic panicked");
+                    cleanup_panic = Some(panic);
+                }
             }
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
@@ -1789,7 +1798,7 @@ async fn run_llm_stream(
     continuation_epoch: Option<i64>,
     mailbox: &mut crate::ConversationMailbox,
     turn_lease: &TurnLease,
-) -> TurnFlow {
+) -> crate::block_store::BlockStoreResult<TurnFlow> {
     let turn_id = turn_lease.id();
     if let Some(identity) = span_identity {
         let span = tracing::Span::current();
@@ -1843,12 +1852,12 @@ async fn run_llm_stream(
             tracing::error!(
                 "Hydration policy read failed for context {context_id}: {e}; failing the turn"
             );
-            return TurnFlow::Failed {
+            return Ok(TurnFlow::Failed {
                 turn_id, context_id,
                 principal_id: user_principal_id,
                 error: format!("hydration policy unreadable: {e}"),
                 origin,
-            };
+            });
         }
     };
     let mut messages = match hydrate_messages(
@@ -1863,12 +1872,12 @@ async fn run_llm_stream(
         // loudly rather than streaming against an empty/partial session. This is a
         // terminal path: return Failed for the finalization owner to publish.
         Err(()) => {
-            return TurnFlow::Failed {
+            return Ok(TurnFlow::Failed {
                 turn_id, context_id,
                 principal_id: user_principal_id,
                 error: "hydration failed: could not read conversation history".to_string(),
                 origin,
-            };
+            });
         }
     };
     // mailbox lock is held through the rest of the stream — same
@@ -2135,12 +2144,12 @@ async fn run_llm_stream(
                             Some(PrincipalId::system()),
                         );
                         // Finalization publishes this failure after cleanup.
-                        return TurnFlow::Failed {
+                        return Ok(TurnFlow::Failed {
                             turn_id, context_id,
                             principal_id: user_principal_id,
                             error: format!("LLM stream failed to start: {e}"),
                             origin,
-                        };
+                        });
                     }
                 }
             }
@@ -2251,7 +2260,7 @@ async fn run_llm_stream(
                     // Open a fresh reasoning entry for this block (its deltas
                     // append here; ThinkingEnd stamps its signature).
                     assistant_reasoning.push((String::new(), None));
-                    match documents.insert_block_as(
+                    let block_id = documents.insert_block_as(
                         context_id,
                         None,
                         Some(&last_block_id),
@@ -2261,35 +2270,21 @@ async fn run_llm_stream(
                         Status::Running,
                         ContentType::Plain,
                         Some(actor_principal),
-                    ) {
-                        Ok(block_id) => {
-                            turn_lease.track_block(block_id);
-                            last_block_id = block_id;
-                            current_block_id = Some(block_id);
-                        }
-                        Err(e) => tracing::error!("Failed to insert thinking block: {}", e),
-                    }
+                    )?;
+                    turn_lease.track_block(block_id);
+                    last_block_id = block_id;
+                    current_block_id = Some(block_id);
                 }
 
                 StreamEvent::ThinkingDelta(text) => {
-                    // In-call thinking continuity (A3): accumulate alongside
-                    // the kernel block so the next agentic-loop iteration can
-                    // include reasoning in the assistant message. Append to the
-                    // current block's entry (defensive: open one if a delta
-                    // arrives before ThinkingStart).
+                    // Keep each reasoning block separate for the next request;
+                    // its signature verifies precisely these provider bytes.
                     match assistant_reasoning.last_mut() {
                         Some((t, _)) => t.push_str(&text),
                         None => assistant_reasoning.push((text.clone(), None)),
                     }
-                    if let Some(ref block_id) = current_block_id
-                        && let Err(e) = documents.append_text_as(
-                            context_id,
-                            block_id,
-                            &text,
-                            Some(actor_principal),
-                        )
-                    {
-                        tracing::error!("Failed to append thinking text: {}", e);
+                    if let Some(ref block_id) = current_block_id {
+                        documents.append_text_as(context_id, block_id, &text, Some(actor_principal))?;
                     }
                 }
 
@@ -2307,14 +2302,11 @@ async fn run_llm_stream(
                         }
                         // Persist the token on the Thinking block so a later
                         // fork / cold-start / attach can rehydrate the reasoning
-                        // (the hydrator only rehydrates *signed* Thinking blocks
-                        // — see `llm::hydrate`). Best-effort: a failed write
-                        // loses cross-turn continuity but never the turn.
-                        if let Some(ref block_id) = current_block_id
-                            && let Err(e) =
-                                documents.set_signature(context_id, block_id, Some(sig.clone()))
-                        {
-                            tracing::warn!("Failed to persist thinking signature: {}", e);
+                        // (the hydrator only rehydrates signed Thinking blocks).
+                        // A failed write must stop the turn: the next hydration
+                        // needs the same reasoning and verifier as this call.
+                        if let Some(ref block_id) = current_block_id {
+                            documents.set_signature(context_id, block_id, Some(sig.clone()))?;
                         }
                     }
                     if let Some(ref block_id) = current_block_id {
@@ -2331,13 +2323,13 @@ async fn run_llm_stream(
                         {
                             tracing::warn!("Failed to persist thinking summary: {}", e);
                         }
-                        let _ = documents.set_status(context_id, block_id, Status::Done);
+                        documents.set_status(context_id, block_id, Status::Done)?;
                     }
                     current_block_id = None;
                 }
 
                 StreamEvent::TextStart => {
-                    match documents.insert_block_as(
+                    let block_id = documents.insert_block_as(
                         context_id,
                         None,
                         Some(&last_block_id),
@@ -2347,39 +2339,28 @@ async fn run_llm_stream(
                         Status::Running,
                         ContentType::Plain,
                         Some(actor_principal),
-                    ) {
-                        Ok(block_id) => {
-                            turn_lease.track_block(block_id);
-                            last_block_id = block_id;
-                            current_block_id = Some(block_id);
-                            // This is the turn's model-text output. A later text
-                            // block in the same turn supersedes it — Completed
-                            // carries the LAST one, the model's final say.
-                            output_block_id = Some(block_id);
-                        }
-                        Err(e) => tracing::error!("Failed to insert text block: {}", e),
-                    }
+                    )?;
+                    turn_lease.track_block(block_id);
+                    last_block_id = block_id;
+                    current_block_id = Some(block_id);
+                    // This is the turn's model-text output. A later text
+                    // block in the same turn supersedes it — Completed
+                    // carries the LAST one, the model's final say.
+                    output_block_id = Some(block_id);
                 }
 
                 StreamEvent::TextDelta(text) => {
                     // Collect text for conversation history
                     assistant_text.push_str(&text);
 
-                    if let Some(ref block_id) = current_block_id
-                        && let Err(e) = documents.append_text_as(
-                            context_id,
-                            block_id,
-                            &text,
-                            Some(actor_principal),
-                        )
-                    {
-                        tracing::error!("Failed to append text: {}", e);
+                    if let Some(ref block_id) = current_block_id {
+                        documents.append_text_as(context_id, block_id, &text, Some(actor_principal))?;
                     }
                 }
 
                 StreamEvent::TextEnd => {
                     if let Some(ref block_id) = current_block_id {
-                        let _ = documents.set_status(context_id, block_id, Status::Done);
+                        documents.set_status(context_id, block_id, Status::Done)?;
                     }
                     current_block_id = None;
                 }
@@ -2430,7 +2411,7 @@ async fn run_llm_stream(
                             "inline tool {} arrived with an open content block; closing it defensively",
                             id
                         );
-                        let _ = documents.set_status(context_id, &block_id, Status::Done);
+                        documents.set_status(context_id, &block_id, Status::Done)?;
                     }
 
                     let result = dispatch_inline_tool_result(
@@ -2472,12 +2453,12 @@ async fn run_llm_stream(
                             payload.summary_line(),
                             Some(PrincipalId::system()),
                         );
-                        return TurnFlow::Failed {
+                        return Ok(TurnFlow::Failed {
                             turn_id, context_id,
                             principal_id: user_principal_id,
                             error: detail,
                             origin,
-                        };
+                        });
                     }
                 }
 
@@ -2724,12 +2705,12 @@ async fn run_llm_stream(
                         Some(PrincipalId::system()),
                     );
                     // The outer owner settles open blocks before publishing failure.
-                    return TurnFlow::Failed {
+                    return Ok(TurnFlow::Failed {
                         turn_id, context_id,
                         principal_id: user_principal_id,
                         error: format!("LLM stream error: {err}"),
                         origin,
-                    };
+                    });
                 }
             }
         }
@@ -3050,13 +3031,13 @@ async fn run_llm_stream(
     let turn_span = tracing::Span::current();
     turn_span.record("turn.stop_reason", stop_reason_out.as_str());
     turn_span.record("turn.origin", origin.as_str());
-    TurnFlow::Completed {
+    Ok(TurnFlow::Completed {
         turn_id, context_id,
         principal_id: user_principal_id,
         output_block_id,
         reason: stop_reason_out,
         origin,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3115,6 +3096,16 @@ mod publish_tests {
         provider: Provider,
         arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
     ) -> (SharedBlockStore, ContextId, PrincipalId) {
+        drive_turn_with_write_fault(origin, kernel, provider, arm_interrupt, 0).await
+    }
+
+    async fn drive_turn_with_write_fault(
+        origin: TurnOrigin,
+        kernel: Arc<Kernel>,
+        provider: Provider,
+        arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
+        rejected_write: usize,
+    ) -> (SharedBlockStore, ContextId, PrincipalId) {
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let documents: SharedBlockStore =
             Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
@@ -3138,6 +3129,8 @@ mod publish_tests {
                 Some(player),
             )
             .unwrap();
+
+        documents.arm_accept_fault(rejected_write);
 
         let provider = Arc::new(provider);
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
@@ -3178,6 +3171,56 @@ mod publish_tests {
         .await;
 
         (documents, ctx, player)
+    }
+
+    #[tokio::test]
+    async fn rejected_provider_content_writes_fail_the_turn() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            for thinking in [false, true] {
+                // Insert, append, optional thinking signature/summary, final status.
+                for rejected_write in 1..=if thinking { 5 } else { 3 } {
+                    let kernel = Arc::new(Kernel::new_ephemeral("content-write-refusal").await);
+                    let mut terminal = kernel.turn_flows().subscribe("turn.*");
+                    let mut events = if thinking { vec![StreamEvent::ThinkingStart,
+                        StreamEvent::ThinkingDelta("reasoning must survive hydration".into()),
+                        StreamEvent::ThinkingEnd { signature: Some("signed-reasoning".into()) }] }
+                    else { vec![StreamEvent::TextStart, StreamEvent::TextDelta("required output".into()), StreamEvent::TextEnd] };
+                    events.push(StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None });
+                    let provider = Provider::Mock(MockClient::new("").with_scripted_stream(vec![events]));
+                    let (documents, ctx, _) = drive_turn_with_write_fault(
+                        TurnOrigin::Interactive, kernel, provider, |_| {}, rejected_write,
+                    ).await;
+                    let event = terminal.try_recv().expect("one terminal event").payload;
+                    if thinking && rejected_write == 4 {
+                        assert!(matches!(event, TurnFlow::Completed { .. }), "display summary is optional: {event:?}");
+                    } else {
+                        let TurnFlow::Failed { error, .. } = event else {
+                            panic!("thinking={thinking} write={rejected_write}: {event:?}");
+                        };
+                        assert!(error.contains("Could not persist model output: ") && error.contains("injected acceptance refusal"), "{error}");
+                    }
+                    assert!(terminal.try_recv().is_none());
+                    let blocks = documents.block_snapshots(ctx).unwrap();
+                    assert!(!blocks.iter().any(|block| block.status == Status::Running));
+                    let output = blocks.iter().find(|block| block.role == Role::Model
+                        && block.kind == if thinking { BlockKind::Thinking } else { BlockKind::Text });
+                    if rejected_write == 1 {
+                        assert!(output.is_none(), "refused insert must not appear");
+                    } else {
+                        let output = output.expect("accepted partial output must remain");
+                        let expected = if rejected_write == 2 { "" }
+                            else if thinking { "reasoning must survive hydration" } else { "required output" };
+                        assert_eq!(output.content, expected);
+                        assert_eq!(output.status, if thinking && rejected_write == 4 { Status::Done } else { Status::Error });
+                        if thinking {
+                            assert_eq!(output.signature.as_deref(), if rejected_write <= 3 { None } else { Some("signed-reasoning") });
+                            assert_eq!(output.summary.is_some(), rejected_write == 5);
+                        }
+                    }
+                }
+            }
+        }).await;
     }
 
     #[tokio::test(start_paused = true)]

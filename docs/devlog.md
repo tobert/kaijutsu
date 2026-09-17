@@ -1982,6 +1982,13 @@ cleanup faults cannot turn into a successful terminal event. Tests cover replay
 and the actual SSH callback observing already-settled partial output. Required
 stream writes and transfer of Waiting receipt ownership remain in the audit.
 
+Rejecting a model text insert still produced Completed with no output. Required
+text/thinking inserts, appends, signatures and completion statuses now return
+write errors to the terminal owner, which interrupts, settles and publishes
+Failed. Fault injection rejects each write before mutation and distinguishes
+optional display summaries from content needed for hydration. Tool persistence
+and malformed content framing remain in the same audit.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

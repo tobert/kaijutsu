@@ -247,6 +247,8 @@ pub struct BlockStore {
     #[cfg(test)]
     fail_insert_countdown: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    fail_accept_countdown: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     before_journal: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -268,6 +270,8 @@ impl BlockStore {
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            fail_accept_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
             before_publish: parking_lot::Mutex::new(None),
@@ -288,6 +292,8 @@ impl BlockStore {
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_accept_countdown: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -313,6 +319,8 @@ impl BlockStore {
             live_status: DashMap::new(),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_accept_countdown: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -340,6 +348,8 @@ impl BlockStore {
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            fail_accept_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             before_journal: parking_lot::Mutex::new(None),
             #[cfg(test)]
             before_publish: parking_lot::Mutex::new(None),
@@ -365,6 +375,12 @@ impl BlockStore {
     pub fn arm_insert_fault(&self, n: usize) {
         self.fail_insert_countdown
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Reject the nth subsequent acceptance before mutation; 0 disarms.
+    #[cfg(test)]
+    pub(crate) fn arm_accept_fault(&self, n: usize) {
+        self.fail_accept_countdown.store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Get a reference to the database handle, if one is configured.
@@ -1026,6 +1042,13 @@ impl BlockStore {
         entry: &mut DocumentEntry,
         mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
     ) -> BlockStoreResult<T> {
+        #[cfg(test)]
+        if self.fail_accept_countdown.fetch_update(
+            std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
+            |remaining| remaining.checked_sub(1),
+        ) == Ok(1) {
+            return Err(BlockStoreError::Db("injected acceptance refusal (test)".into()));
+        }
         self.journaling_db()?;
         let before = entry.doc.version();
         entry.poisoned = true;

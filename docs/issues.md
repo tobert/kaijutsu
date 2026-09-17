@@ -1401,12 +1401,18 @@ and panic. A panic also interrupts the turn's tool calls. Completed blocks,
 Waiting approvals and unrelated writers remain untouched; see
 `docs/kaish-integration.md`. The original live orphan cleanup issue is closed.
 
-The stream still logs some failed text/thinking insert, append, signature and
-status writes and continues. Cleanup catches a remaining Running block, and a
-poisoned document fails loudly, but neither proves every provider byte reached
-the durable log. Audit these writes as part of model-turn settlement: distinguish
-display metadata from provider content and refuse successful completion when
-required content did not persist.
+Text/thinking insert, append, signature and completion-status failures now stop
+streaming and publish Failed after owned-block cleanup. The thinking summary
+is display metadata; its pre-mutation rejection remains a warning. Fault
+injection covers each required write and the optional summary separately.
+
+Tool-call/result insert, content and settlement writes still sometimes log a
+failure and continue. Audit ordinary and inline tools together: do not execute
+a tool without its durable pair, or send the provider a result missing from the
+log. Join concurrent tool settlement on failure. Malformed event framing also
+needs validation: a delta with no open content block currently updates the
+in-call message without any durable append; one current block slot can accept
+text into a thinking block. Required content must survive hydration unchanged.
 
 `pending_shell_operation_receipt` records Waiting before receipt registration
 and ask linkage finish. A failure there can leave a Waiting pair without its

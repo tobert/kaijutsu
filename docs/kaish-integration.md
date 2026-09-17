@@ -191,7 +191,10 @@ These are source observations, not promises that all paths behave alike.
   cleanup. Panic signals its calls before publication, then reaches worker
   supervision. Cleanup faults publish Failed even when a diagnostic cannot be
   written; cleanup panics also reach supervision. Shutdown cancels queued turns
-  and provider work and joins cleanup.
+  and provider work and joins cleanup. Required text/thinking inserts, appends,
+  signatures and completion statuses propagate write errors to this owner;
+  failure interrupts the turn and prevents successful completion. Thinking
+  summaries are display metadata and remain best-effort.
 - Timed `kj drive --track <name> --score-at <tick>` pairs a turn lease with
   timeline-owned preparation before model work starts. Rc chooses the target
   and fallback; runtime validates complete performer-authored ABC and retains
@@ -260,7 +263,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Interactive shell submission | kernel `runtime/interactive.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, draft revision consumption, addressed identity/context, command/output pair, hooks, write-back, acknowledged context switches, disconnect survival, and joined shutdown |
 | Migrated | Streaming execute RPC | kernel `runtime/streaming.rs`, `runtime/command.rs`; server RPC adapter | Kernel-owned preparation/execution/settlement; connection-owned IDs, admission slot, history, cancellation and callbacks; hooks, review, physical exit, context switches, disconnect and joined shutdown |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, state write-back, disconnect survival, and joined shutdown |
-| Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; stream write-error propagation remains open |
+| Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; tool write-error propagation and malformed content framing remain open |
 | Migrated | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, existing block pair, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup, and durable delivery before shutdown |
 | Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; abrupt drop and durable notification recovery remain in the settlement audit |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
