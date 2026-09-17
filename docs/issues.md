@@ -66,6 +66,12 @@ it does not capture an intended target or input basis when the model turn begins
 Migrate that handoff to admitted work and cancellation ownership. The CAS adapter's
 artifact-hash basis establishes artifact identity, not model-context freshness.
 Keep rc tick lifecycle policy distinct from model preparation and commitment.
+`TurnFlow` carries context identity but no attempt identifier: Requested reports
+headless admission, while Completed/Failed cannot identify which overlapping
+request ended. Thread a stable attempt identifier through admission and terminal
+ownership before matching output to timeline work. Do not associate by context
+alone, and do not treat already accepted model/tool side effects as rollbackable
+resolver output.
 
 CAS preparation has a process-wide limit of four operations. An uninterruptible
 host read retains its slot even after its owner is cancelled; four stuck reads
@@ -253,25 +259,12 @@ performer settlement's lack of a seed against already running conversations.
 Kaibo review and disposition:
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
-Context cwd error propagation remains incomplete. Shared `context_cwd` swallows
-read faults; switching logs failed cwd persistence and continues, swallows target
-cwd reads, and keeps the old directory for a dead target. Make failure explicit
-before publishing a successful switch. Also audit relative stored/captured cwd:
-public setters require absolute paths, but direct database writes can bypass that
-contract. Initial environment capture now shares constructor inputs, including
-HOME/PWD/PATH and their durable overrides; the actual SSH approval scenario pins
-cwd A while the current context changes to B.
-
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
 aggregate liveness when polling the log but returns on the first terminal event,
 even if another accepted turn remains. Decide whether it joins one turn or an
 idle context, then align the event and polling paths. Turn events currently have
 no request identifier; clients also clear context activity on a terminal event.
 Per-turn runtime leases fix ownership, not these consumer semantics.
-
-The shared `shell_state::context_cwd` read still returns None on storage errors,
-which is indistinguishable from an unset cwd. Preserve the no-cwd refusal but
-report failed reads through every caller; do not invent a default directory.
 
 ### Shared client recovery
 

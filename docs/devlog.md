@@ -1913,6 +1913,24 @@ for readiness at the current tick before moving their controlled clock. Live mod
 turns still schedule relative to completion; connecting those turns to admitted
 intent remains the next timing task, alongside the unfinished caller migration.
 
+The next caller audit found a cwd read failure still meant “unset” to headless
+turns and RPC. The real SSH client confirmed the false answer. Those callers now
+share a fallible read with contextual construction, and stored or captured
+relative paths are refused. Switching had also changed its context binding before
+applying configuration, while failed cwd saves and missing directories only
+logged warnings. It now validates target cwd and exports and persists outgoing
+cwd before changing live state. Fault tests preserve context, cwd, and exports
+across read/write errors, missing directories, and invalid export names.
+Reattaching the current context keeps the live cwd it saves; a separate regression
+caught that path restoring the older snapshot after write-back.
+
+DeepSeek's review exposed a write/read asymmetry: shell-state persistence could
+accept a relative cwd that construction would then refuse. A red test pinned that
+path; validation now precedes the cwd/export transaction. Fixtures that switched
+from an unmounted default HOME now supply real VFS directories. The live timing
+trace also confirmed that turn events have no attempt identifier; the next handoff
+must carry admission identity through completion instead of matching by context.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

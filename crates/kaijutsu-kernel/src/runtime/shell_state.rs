@@ -31,6 +31,7 @@ pub fn persist_shell_state(
     before: &ShellStateSnapshot,
     after: &ShellStateSnapshot,
 ) -> Result<(), String> {
+    validate_cwd(Some(&after.cwd))?;
     let db = kernel_db.lock();
     let transaction = db.conn_for_ledger().unchecked_transaction()
         .map_err(|e| format!("begin shell state write: {e}"))?;
@@ -56,22 +57,28 @@ pub fn persist_shell_state(
     transaction.commit().map_err(|e| format!("commit shell state: {e}"))
 }
 
-/// Read a context's durable cwd from L1 (`context_shell.cwd`). Returns `None`
-/// when unset or unreadable. `get_cwd` (the interactive shell's `kj cwd`)
-/// still applies its own `/docs` landing-dir default for display purposes;
-/// every `ExecContext`-constructing call site instead passes the `Option`
-/// straight through to `ExecContext::new`/`new_without_cwd` — a tool
-/// context with no cwd is `None`, not a fabricated `/` (`servers/file.rs`
-/// rejects it outright rather than resolving paths against a fake root).
-pub fn context_cwd(kernel: &crate::Kernel, context_id: ContextId) -> Option<std::path::PathBuf> {
-    kernel
-        .kernel_db()
-        .lock()
-        .get_context_shell(context_id)
-        .ok()
-        .flatten()
+/// Read the durable cwd. Only an absent value means unset; read failures and
+/// relative paths refuse execution. Backend availability is checked by the shell.
+pub fn context_cwd(kernel: &crate::Kernel, context_id: ContextId) -> Result<Option<std::path::PathBuf>, String> {
+    read_context_cwd(&kernel.kernel_db().lock(), context_id)
+}
+
+pub(crate) fn read_context_cwd(db: &KernelDb, context_id: ContextId) -> Result<Option<std::path::PathBuf>, String> {
+    let cwd = db.get_context_shell(context_id)
+        .map_err(|error| format!("read context_shell for {context_id}: {error}"))?
         .and_then(|row| row.cwd)
-        .map(std::path::PathBuf::from)
+        .map(std::path::PathBuf::from);
+    validate_cwd(cwd.as_deref())?;
+    Ok(cwd)
+}
+
+pub(crate) fn validate_cwd(cwd: Option<&std::path::Path>) -> Result<(), String> {
+    if let Some(path) = cwd {
+        if !path.is_absolute() {
+            return Err(format!("cwd '{}' must be absolute; set a valid cwd before executing", path.display()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -79,6 +86,21 @@ mod tests {
     use super::*;
     use crate::kj::test_helpers::{register_context, test_dispatcher};
     use kaijutsu_types::PrincipalId;
+
+    #[tokio::test]
+    async fn shell_state_rejects_relative_cwd_before_persisting_exports() {
+        let dispatcher = test_dispatcher().await;
+        let context = register_context(&dispatcher, Some("relative"), None, PrincipalId::new());
+        let before = ShellStateSnapshot { cwd: "/before".into(), env: Default::default() };
+        let after = ShellStateSnapshot { cwd: "relative/path".into(),
+            env: [("KEEP".into(), "unchanged".into())].into_iter().collect() };
+        let error = persist_shell_state(dispatcher.kernel_db(), context, &before, &after)
+            .expect_err("relative cwd must not poison the next execution");
+        assert!(error.contains("must be absolute"), "{error}");
+        let db = dispatcher.kernel_db().lock();
+        assert!(db.get_context_shell(context).unwrap().is_none());
+        assert!(db.get_context_env(context).unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn shell_state_write_failure_does_not_commit_partial_changes() {

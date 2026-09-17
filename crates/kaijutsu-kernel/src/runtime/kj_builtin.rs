@@ -61,89 +61,67 @@ impl KjBuiltin {
         self.session_contexts.insert(self.identity.session, id);
     }
 
-    /// Persist the current context's cwd to KernelDb so it survives session
-    /// reconnects and context switches.
-    ///
-    /// The live cwd was validated when `cd` set it, so this normally persists
-    /// known-good state — but if the directory was removed under us mid-session
-    /// it would now point at a dead path. Validate against the backend and skip
-    /// the write in that case, preserving the last good persisted value rather
-    /// than overwriting it with a path every later restore would reject.
-    async fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) {
-        let path = ctx.cwd.clone();
-        let is_dir = matches!(ctx.backend.stat(&path).await, Ok(entry) if entry.is_dir());
-        if !is_dir {
-            tracing::warn!(
-                context = %context_id.to_hex(),
-                cwd = %path.display(),
-                "live cwd no longer resolves in backend; not persisting on switch",
-            );
-            kaijutsu_telemetry::record_cwd_restore_failed();
-            return;
-        }
-        let db = self.dispatcher.kernel_db().lock();
-        if let Err(e) = db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+    /// Persist outgoing cwd before publishing a context switch. A removed
+    /// directory or failed write refuses the switch without changing live state.
+    async fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) -> Result<(), String> {
+        let path = &ctx.cwd;
+        Self::validate_directory(ctx, path).await?;
+        self.dispatcher.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
             context_id,
             cwd: Some(path.to_string_lossy().into_owned()),
             updated_at: kaijutsu_types::now_millis() as i64,
-        }) {
-            tracing::warn!(
-                context = %context_id.to_hex(),
-                error = %e,
-                "failed to persist context cwd"
-            );
+        }).map_err(|error| format!("persist context cwd for {context_id}: {error}"))
+    }
+
+    async fn validate_directory(ctx: &ExecContext, path: &std::path::Path) -> Result<(), String> {
+        super::shell_state::validate_cwd(Some(path))?;
+        match ctx.backend.stat(path).await {
+            Ok(entry) if entry.is_dir() => Ok(()),
+            result => {
+                kaijutsu_telemetry::record_cwd_restore_failed();
+                let reason = match result {
+                    Err(error) => error.to_string(),
+                    Ok(_) => "not a directory".into(),
+                };
+                Err(format!("cwd '{}' is unavailable: {reason}; set a valid cwd before switching", path.display()))
+            }
         }
     }
 
-    /// Apply a context's cwd and durable exports to the live interpreter.
-    /// Export conversion uses the same `context_env_values` validation as
-    /// contextual construction. Invalid keys and failed export reads return
-    /// errors; values enter the existing scope directly during dispatch.
-    async fn apply_context_config(
+    /// Validate the target's cwd and exports, then persist the outgoing cwd.
+    /// Only after every fallible step succeeds may the live shell change.
+    async fn switch_context(
         &self,
         context_id: ContextId,
         ctx: &mut ExecContext,
     ) -> Result<(), String> {
-        // Snapshot durable state and drop the DB lock before any await.
-        let (persisted_cwd, env_vars) = {
+        let current = self.current_context_id();
+        let (mut persisted_cwd, env_vars) = {
             let db = self.dispatcher.kernel_db().lock();
-            let cwd = db
-                .get_context_shell(context_id)
-                .ok()
-                .flatten()
-                .and_then(|shell| shell.cwd);
-            let vars = db.get_context_env(context_id).map_err(|e| {
-                format!(
-                    "get_context_env({}) failed: {e}",
-                    context_id.to_hex()
-                )
-            })?;
+            let cwd = super::shell_state::read_context_cwd(&db, context_id)?;
+            let vars = db.get_context_env(context_id)
+                .map_err(|error| format!("read context exports for {context_id}: {error}"))?;
             (cwd, vars)
         };
-
-        // Apply cwd, validated against the shell's backend — the namespace `cd`
-        // resolves against, not the host filesystem (a host-FS `is_dir()` check
-        // would wrongly reject VFS-only cwds like /scratch or /v/docs).
-        if let Some(cwd) = persisted_cwd {
-            let path = std::path::PathBuf::from(&cwd);
-            let is_dir = matches!(ctx.backend.stat(&path).await, Ok(entry) if entry.is_dir());
-            if is_dir {
-                ctx.set_cwd(path);
-            } else {
-                tracing::warn!(
-                    context = %context_id.to_hex(),
-                    cwd = %cwd,
-                    "context cwd no longer resolves in backend on switch; keeping current",
-                );
-                kaijutsu_telemetry::record_cwd_restore_failed();
-            }
+        // Reattaching this context saves its live cwd. Do not restore the older
+        // durable value over the directory we are about to persist.
+        if current == Some(context_id) {
+            persisted_cwd = Some(ctx.cwd.clone());
         }
-
-        // Apply env vars (exported so they propagate to child processes).
         let pairs = super::embedded_kaish::context_env_values(&env_vars).map_err(|e| e.to_string())?;
+        if let Some(path) = &persisted_cwd {
+            Self::validate_directory(ctx, path).await?;
+        }
+        if let Some(old_id) = current {
+            self.save_context_cwd(old_id, ctx).await?;
+        }
+        if let Some(path) = persisted_cwd {
+            ctx.set_cwd(path);
+        }
         for (key, value) in pairs {
             ctx.scope.set_exported(&key, value);
         }
+        self.set_context_id(context_id);
         Ok(())
     }
 
@@ -559,22 +537,11 @@ impl Tool for KjBuiltin {
             }
             KjResult::Err(msg) => ExecResult::failure(1, msg),
             KjResult::Switch(new_id, msg) => {
-                // Persist outgoing context's cwd so it survives the switch
-                if let Some(old_id) = self.current_context_id() {
-                    self.save_context_cwd(old_id, ctx).await;
-                }
-
-                // Side-effect: update the shared context ID
-                self.set_context_id(new_id);
-
-                // Apply context shell config (cwd + env vars). A failure here
-                // means the switch would silently leave the new context's
-                // durable env unapplied — fail the switch instead.
-                match self.apply_context_config(new_id, ctx).await {
+                match self.switch_context(new_id, ctx).await {
                     Ok(()) => ExecResult::success(msg),
                     Err(e) => ExecResult::failure(
                         1,
-                        format!("context switch: failed to apply context config: {e}"),
+                        format!("context switch refused: {e}"),
                     ),
                 }
             }
@@ -588,12 +555,8 @@ impl Tool for KjBuiltin {
             }
         };
 
-        // `--json` formatting is entirely kaish's concern now (kaish 0.13):
-        // `finalize_output`/`apply_output_format` render this `ExecResult`
-        // after `execute()` returns, reading `.data`/`.output` exactly as set
-        // above — a `Switch` has already switched by this point, so returning
-        // `exec` as-is preserves that side effect. kj no longer builds its own
-        // envelope (see `schema()`'s `owns_output` note).
+        // Kaish formats the result after dispatch, preserving structured data
+        // and any context switch already applied above.
         exec
     }
 }
@@ -1952,6 +1915,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reattach_current_context_keeps_live_and_durable_cwd_together() {
+        use crate::vfs::VfsOps;
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let context = register_context(&dispatcher, Some("reattach"), None, PrincipalId::new());
+        dispatcher.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        dispatcher.kernel().vfs().mkdir(std::path::Path::new("/scratch/live"), 0o755).await.unwrap();
+        dispatcher.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: context, cwd: Some("/scratch".into()), updated_at: 0,
+        }).unwrap();
+        let kaish = embedded_with_kj(dispatcher.clone(), context).await;
+        assert!(kaish.try_set_cwd("/scratch/live".into()).await);
+        let result = kaish.execute_with_options("kj attach reattach", ExecuteOptions::default()).await.unwrap();
+        assert!(result.ok(), "{result:?}");
+        assert_eq!(kaish.cwd().await, std::path::Path::new("/scratch/live"));
+        assert_eq!(super::super::shell_state::context_cwd(dispatcher.kernel(), context).unwrap(),
+            Some("/scratch/live".into()));
+    }
+
+    #[tokio::test]
+    async fn context_switch_failure_preserves_live_context_cwd_and_exports() {
+        for fault in ["read", "write", "missing", "relative", "export", "export-read", "outgoing"] {
+            let dispatcher = Arc::new(test_dispatcher().await);
+            dispatcher.set_self_arc();
+            let principal = PrincipalId::new();
+            let source = register_context(&dispatcher, Some("switch-src"), None, principal);
+            let target = register_context(&dispatcher, Some("switch-dst"), None, principal);
+            use crate::vfs::VfsOps;
+            dispatcher.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+            for path in ["/scratch/source", "/scratch/target"] {
+                dispatcher.kernel().vfs().mkdir(std::path::Path::new(path), 0o755).await.unwrap();
+            }
+            let kaish = embedded_with_kj(dispatcher.clone(), source).await;
+            assert!(kaish.try_set_cwd("/scratch/source".into()).await);
+            let setup = kaish.execute_with_options(
+                "export KEEP=original",
+                ExecuteOptions::default(),
+            ).await.unwrap();
+            assert!(setup.ok(), "{setup:?}");
+            let before = kaish.exported_vars().await;
+            {
+                let db = dispatcher.kernel_db().lock();
+                db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                    context_id: target,
+                    cwd: Some(match fault {
+                        "missing" => "/scratch/missing",
+                        "relative" => "scratch/target",
+                        _ => "/scratch/target",
+                    }.into()), updated_at: 0,
+                }).unwrap();
+                db.set_context_env(target, "KEEP", "target").unwrap();
+                match fault {
+                    "read" => db.conn_for_ledger().execute_batch(
+                        "ALTER TABLE context_shell RENAME TO unavailable_context_shell"
+                    ).unwrap(),
+                    "write" => db.conn_for_ledger().execute_batch(
+                        "CREATE TRIGGER refuse_cwd BEFORE INSERT ON context_shell
+                         BEGIN SELECT RAISE(ABORT, 'cwd write refused'); END;"
+                    ).unwrap(),
+                    "export" => db.conn_for_ledger().execute_batch(
+                        "UPDATE context_env SET key = 'not-an-env-name' WHERE key = 'KEEP'"
+                    ).unwrap(),
+                    "export-read" => db.conn_for_ledger().execute_batch(
+                        "ALTER TABLE context_env RENAME TO unavailable_context_env"
+                    ).unwrap(),
+                    _ => {}
+                }
+            }
+            if fault == "outgoing" {
+                dispatcher.kernel().vfs().rmdir(std::path::Path::new("/scratch/source")).await.unwrap();
+            }
+            let result = kaish.execute_with_options(
+                "kj context switch switch-dst", ExecuteOptions::default(),
+            ).await.unwrap();
+            assert!(!result.ok(), "{fault} must refuse the switch: {result:?}");
+            assert_eq!(kaish.context_id(), Some(source), "{fault} changed context");
+            assert_eq!(kaish.cwd().await, std::path::Path::new("/scratch/source"), "{fault} changed cwd");
+            assert_eq!(kaish.exported_vars().await, before, "{fault} changed exports");
+        }
+    }
+
     /// Context switching preserves literal quotes, dollar signs, and newlines
     /// in durable exports, matching contextual shell construction.
     #[tokio::test]
@@ -1970,7 +2015,9 @@ mod tests {
                 .unwrap();
         }
 
+        dispatcher.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
         let kaish = embedded_with_kj(dispatcher.clone(), source).await;
+        assert!(kaish.try_set_cwd("/scratch".into()).await);
         let switch = kaish
             .execute_with_options("kj context switch switch-dst", ExecuteOptions::default())
             .await

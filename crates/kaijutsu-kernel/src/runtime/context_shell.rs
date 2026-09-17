@@ -64,11 +64,11 @@ impl ContextShellInputs {
         };
         let db = kernel.kernel_db().lock();
         let cwd = match cwd {
-            ShellCwd::Context => db.get_context_shell(context)
-                .map_err(|error| anyhow::anyhow!("read context_shell for {context}: {error}"))?
-                .and_then(|row| row.cwd).map(std::path::PathBuf::from),
+            ShellCwd::Context => super::shell_state::read_context_cwd(&db, context)
+                .map_err(anyhow::Error::msg)?,
             ShellCwd::Captured(cwd) => cwd,
         };
+        super::shell_state::validate_cwd(cwd.as_deref()).map_err(anyhow::Error::msg)?;
         let exports = db.get_context_env(context)
             .map_err(|error| anyhow::anyhow!("read context_env for {context}: {error}"))?;
         Ok(Self { cwd, exports, external_exec })
@@ -275,6 +275,28 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("context_shell"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stored_and_captured_cwd_must_be_absolute() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("relative-cwd"), None, principal);
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: context, cwd: Some("relative/path".into()), updated_at: 0,
+        }).unwrap();
+        for cwd in [ShellCwd::Context, ShellCwd::Captured(Some("relative/path".into()))] {
+            let result = EmbeddedKaish::for_context(&d, "relative-cwd", ShellIdentity {
+                requester: principal, performer: principal, reviewer: None,
+                context, session: SessionId::new(),
+            }, ShellPolicy::Internal, cwd, None, Arc::new(NoopBlockSource)).await;
+            let error = match result {
+                Ok(_) => panic!("relative cwd must refuse construction"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("must be absolute"), "{error}");
+        }
     }
 
     #[tokio::test]

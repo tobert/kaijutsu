@@ -47,7 +47,7 @@ impl Kernel {
             }
             let result = {
                 let startup = std::panic::AssertUnwindSafe(async {
-                    let tool_ctx = match context_cwd(&kernel, accepted.context_id) {
+                    let tool_ctx = match context_cwd(&kernel, accepted.context_id)? {
                         Some(cwd) => ExecContext::new(accepted.principal_id, accepted.context_id,
                             cwd, SessionId::new(), kernel.id()),
                         None => ExecContext::new_without_cwd(accepted.principal_id, accepted.context_id,
@@ -102,4 +102,38 @@ fn report_failure(kernel: &Kernel, request: &TurnRequest, error: String) {
         context_id: request.context_id, principal_id: request.principal_id,
         error, origin: TurnOrigin::Autonomous,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kj::test_helpers::{register_context, test_dispatcher};
+
+    #[tokio::test]
+    async fn unreadable_cwd_fails_before_headless_model_startup() {
+        let dispatcher = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("bad-cwd"), None, principal);
+        let blocks = dispatcher.block_store();
+        blocks.create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let anchor = blocks.insert_block_as(context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "seed", kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain, Some(principal)).unwrap();
+        dispatcher.kernel_db().lock().conn_for_ledger().execute_batch(
+            "ALTER TABLE context_shell RENAME TO unavailable_context_shell"
+        ).unwrap();
+        let mut failures = dispatcher.kernel().turn_flows().subscribe("turn.failed");
+        dispatcher.kernel().request_turn(TurnRequest {
+            context_id: context, after_block_id: anchor, content: String::new(),
+            principal_id: principal, model: None, continuation_epoch: None,
+        }).unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), failures.recv())
+            .await.unwrap().unwrap();
+        match event.payload {
+            TurnFlow::Failed { error, .. } => assert!(error.contains("context_shell"), "{error}"),
+            other => panic!("expected failed startup, got {other:?}"),
+        }
+        assert!(!dispatcher.kernel().turn_in_flight(context));
+        dispatcher.kernel().shutdown_runtime_worker().await.unwrap();
+    }
 }

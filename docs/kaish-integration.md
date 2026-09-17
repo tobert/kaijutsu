@@ -61,6 +61,14 @@ These are source observations, not promises that all paths behave alike.
   exports, and external execution policy. HOME/PATH defaults have one provider;
   initial PWD follows selected cwd. The old database restore methods are deleted,
   and their tests use the contextual constructor, including VFS-only cwd.
+- Durable cwd reads share `shell_state::read_context_cwd`; storage errors are
+  distinct from an unset value through model startup and every RPC caller.
+  Stored, captured, and persisted cwd values must be absolute. A context switch
+  validates target cwd and exports, then saves the outgoing cwd, before changing
+  live cwd, exports, or the session's context. Missing directories, read errors,
+  invalid exports, and failed write-back refuse the switch without partial live
+  changes. Unset target cwd retains the live cwd; target exports overlay the
+  current scope.
 - `runtime/editor_read.rs` owns `:r !cmd` on the existing kernel worker. Caller
   drop and shutdown cancel the read and allow kaish to finish cleanup; nested
   `kj editor keys` can re-enter without blocking that worker. The editor receives

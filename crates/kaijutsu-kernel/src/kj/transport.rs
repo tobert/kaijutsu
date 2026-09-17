@@ -1857,6 +1857,10 @@ mod tests {
         .unwrap();
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("bass"), None, principal);
+        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: parent, cwd: Some("/scratch".into()), updated_at: 0,
+        }).unwrap();
         d.kernel_db().lock().update_context_type(parent, "musician").unwrap();
 
         // Seed a track + attachment (with rotate cadence) so the fork-copy carries
@@ -1907,7 +1911,8 @@ mod tests {
 
         // The page-turn emits two commands — all for the forked CHILD (the rc
         // `--switch`ed onto it), never the retired parent.
-        let attach_cmd = cmds.recv().await.expect("rotate attaches the child");
+        let attach_cmd = tokio::time::timeout(std::time::Duration::from_secs(3), cmds.recv())
+            .await.expect("rotate must send an attach command").expect("rotate attaches the child");
         let (child, track) = match attach_cmd {
             BeatCommand::Attach { context_id, track, attachment, .. } => {
                 assert_eq!(

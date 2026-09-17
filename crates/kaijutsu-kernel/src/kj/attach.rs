@@ -1,13 +1,8 @@
-//! `kj attach <ctx>` — pull an existing context into the current
-//! session and fire the rc `attach` lifecycle on it.
+//! Attach to a context and run its rc `attach` lifecycle.
 //!
-//! Distinct from `kj context switch`: switch is pure focus-change,
-//! while attach also runs `/config/rc/<context_type>/attach/SXX-*.{kai,md}`
-//! scripts on the target. Use cases include "set up state when joining a
-//! shared/team context" or "show a banner block on resume." The session
-//! is moved to the target context (via `KjResult::Switch`) regardless
-//! of rc script outcomes — failures land as Error blocks in the target,
-//! consistent with create / fork / drift verbs.
+//! Only `.kai` scripts execute. Discovery errors refuse attachment; individual
+//! script failures leave Error blocks in the target. After the lifecycle runs,
+//! the caller applies the context switch, which can refuse invalid shell state.
 
 use clap::Parser;
 use kaijutsu_types::ContentType;
@@ -68,10 +63,8 @@ impl KjDispatcher {
             }
         };
 
-        // Fire the rc lifecycle BEFORE returning Switch. Scripts that
-        // fail land Error blocks in the target context but don't block
-        // the attach — same as create / fork / drift, which prefer
-        // "alive but degraded" over "rolled back."
+        // Run lifecycle policy before asking the caller to switch. Accepted
+        // script effects remain in the target if applying the switch later fails.
         if let Err(e) = crate::rc::run(
             self,
             crate::rc::RcInvocation::new("attach", target_id),

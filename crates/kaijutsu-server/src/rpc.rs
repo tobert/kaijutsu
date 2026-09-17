@@ -2668,7 +2668,7 @@ impl kernel::Server for KernelImpl {
             )
         };
         trace_span.record("principal.id", principal_id.to_string());
-        let cwd = context_cwd(&kernel.kernel, context_id);
+        let cwd = pry!(context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed));
 
         Promise::from_future(
             async move {
@@ -3464,7 +3464,7 @@ impl kernel::Server for KernelImpl {
                 log::debug!("prompt future started for context_id={}", context_id);
 
                 // Resolve cwd from the context's durable L1 state.
-                let tool_ctx = match context_cwd(&kernel.kernel, context_id) {
+                let tool_ctx = match context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed)? {
                     Some(cwd) => kaijutsu_kernel::ExecContext::new(
                         user_principal_id,
                         context_id,
@@ -3714,15 +3714,9 @@ impl kernel::Server for KernelImpl {
                         c.set_origin_host(row.origin_host.as_deref().unwrap_or(""));
                     }
 
-                    // Durable working directory (`context_shell.cwd`) — a
-                    // synchronous, sub-ms KernelDb read per row (same table
-                    // `getContextCwd`/`setContextCwd` hit), NOT a second RPC.
-                    // This is the whole point of carrying `cwd` on
-                    // `ContextHandleInfo`: a caller that used to loop
-                    // `getContextCwd` once per context over the wire (68
-                    // round trips for 67 contexts) now gets it for free on
-                    // the one `listContexts` call.
-                    if let Some(cwd) = context_cwd(&kernel_state.kernel, ctx.id) {
+                    // Include durable cwd in this snapshot; a failed read must
+                    // not masquerade as a context whose cwd is unset.
+                    if let Some(cwd) = context_cwd(&kernel_state.kernel, ctx.id).map_err(capnp::Error::failed)? {
                         c.set_cwd(cwd.to_string_lossy().as_ref());
                     }
 
@@ -3959,12 +3953,8 @@ impl kernel::Server for KernelImpl {
                         "no context joined — call joinContext first".into(),
                     )
                 })?;
-            // Sibling call sites (`execute_tool`, `prompt`) resolve this from
-            // the context's durable L1 state; this one used to hardcode `/`
-            // unconditionally instead — worse than the others, since it
-            // never even looked. Bring it in line: a real cwd if the context
-            // has one, `None` (not a fabricated root) if it doesn't.
-            let exec_ctx = match context_cwd(&kernel.kernel, context_id) {
+            // An unset cwd remains absent; a failed read refuses dispatch.
+            let exec_ctx = match context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed)? {
                 Some(cwd) => kaijutsu_kernel::ExecContext::new(
                     principal_id,
                     context_id,
@@ -4104,7 +4094,7 @@ impl kernel::Server for KernelImpl {
                 // cwd is durable context state (L1), shared across the context's
                 // lifetime; default to the VFS landing dir when unset.
                 let context_id = connection.borrow().require_context()?;
-                let cwd = context_cwd(&kernel.kernel, context_id)
+                let cwd = context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed)?
                     .unwrap_or_else(|| std::path::PathBuf::from("/docs"));
 
                 results.get().set_path(cwd.to_string_lossy());
@@ -4161,7 +4151,7 @@ impl kernel::Server for KernelImpl {
                 .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
         );
         pry!(require_context_exists(&self.kernel, context_id));
-        if let Some(cwd) = context_cwd(&self.kernel.kernel, context_id) {
+        if let Some(cwd) = pry!(context_cwd(&self.kernel.kernel, context_id).map_err(capnp::Error::failed)) {
             results.get().set_path(cwd.to_string_lossy());
             results.get().set_found(true);
         } else {
@@ -5902,7 +5892,7 @@ impl kernel::Server for KernelImpl {
 
                     // Build ToolContext from connection state; cwd is durable
                     // context-scoped state (L1).
-                    let tool_ctx = match context_cwd(&kernel.kernel, context_id) {
+                    let tool_ctx = match context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed)? {
                         Some(cwd) => kaijutsu_kernel::ExecContext::new(
                             user_principal_id,
                             context_id,

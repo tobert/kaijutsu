@@ -218,6 +218,10 @@ mod tests {
         for shutdown in [false, true] {
             let (dispatcher, identity) = fixture().await;
             let kernel = dispatcher.kernel();
+            kernel.mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+            kernel.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: identity.context, cwd: Some("/scratch".into()), updated_at: 0,
+            }).unwrap();
             let target = crate::kj::test_helpers::register_context(&dispatcher, Some("switch-target"), None, identity.performer);
             kernel.blocks().create_document(target, crate::DocumentKind::Conversation, None).unwrap();
             let (submission, mut switches) = submit(kernel, identity,

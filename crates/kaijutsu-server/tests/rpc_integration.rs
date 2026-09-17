@@ -1085,6 +1085,31 @@ fn test_context_cwd_is_addressed_and_vfs_validated() {
 }
 
 #[test]
+fn unreadable_context_cwd_is_an_rpc_error_not_unset() {
+    run_local(async {
+        let state = tempfile::tempdir().unwrap();
+        let addr = start_server_with_state_dir(state.path().to_owned()).await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "cwd-read-fault").await.unwrap();
+        assert_eq!(kernel.get_context_cwd(context).await.unwrap(), None);
+        for argv in [vec!["context", "switch", "--help"], vec!["attach", "--help"]] {
+            let help = kernel.execute_kj_quiet(context, &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>()).await.unwrap();
+            assert_eq!(help.exit_code, 0, "{}", help.stderr);
+            eprintln!("{}", help.stdout);
+        }
+        rusqlite::Connection::open(state.path().join("kernel.db")).unwrap().execute_batch(
+            "ALTER TABLE context_shell RENAME TO unavailable_context_shell"
+        ).unwrap();
+        let error = kernel.get_context_cwd(context).await
+            .expect_err("unreadable cwd must not be reported as unset");
+        assert!(error.to_string().contains("context_shell"), "{error}");
+        let error = kernel.list_contexts().await.expect_err("context listing must not hide a cwd read fault");
+        assert!(error.to_string().contains("context_shell"), "{error}");
+    });
+}
+
+#[test]
 fn test_kj_rpc_is_addressed_curated_and_keeps_ambient_context() {
     run_local(async {
         let addr = start_server().await;
