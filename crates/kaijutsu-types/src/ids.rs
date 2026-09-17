@@ -34,6 +34,12 @@ pub struct ContextId(uuid::Uuid);
 #[serde(transparent)]
 pub struct SessionId(uuid::Uuid);
 
+/// One admitted model turn (UUIDv7), including startup and queued work.
+/// Opaque identity, not an admission sequence or ordering guarantee.
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(uuid::Uuid);
+
 /// A workspace identifier (UUIDv7).
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -197,6 +203,7 @@ impl_typed_id!(PrincipalId, "PrincipalId");
 impl_typed_id!(KernelId, "KernelId");
 impl_typed_id!(ContextId, "ContextId");
 impl_typed_id!(SessionId, "SessionId");
+impl_typed_id!(TurnId, "TurnId");
 impl_typed_id!(WorkspaceId, "WorkspaceId");
 impl_typed_id!(PresetId, "PresetId");
 impl_typed_id!(BackendId, "BackendId");

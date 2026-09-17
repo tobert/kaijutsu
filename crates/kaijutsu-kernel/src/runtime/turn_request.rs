@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use futures::FutureExt;
-use kaijutsu_types::{BlockId, ContextId, PrincipalId, SessionId};
+use kaijutsu_types::{BlockId, ContextId, PrincipalId, SessionId, TurnId};
 use crate::{ExecContext, Kernel};
 use crate::flows::{TurnFlow, TurnOrigin};
 use super::llm_stream::spawn_admitted_turn;
@@ -20,7 +20,7 @@ pub struct TurnRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnAdmission {
-    Accepted,
+    Accepted(TurnId),
     AlreadyActive,
 }
 
@@ -36,13 +36,14 @@ impl Kernel {
             },
             None => self.turns().begin(request.context_id),
         };
+        let turn_id = lease.id();
         let accepted = request.clone();
         let kernel = self.clone();
         let (release, ready) = tokio::sync::oneshot::channel();
         self.spawn_runtime_task(move |stop| async move {
             if ready.await.is_err() {
                 drop(lease);
-                report_failure(&kernel, &accepted, "turn admission ended before publication".into());
+                report_failure(&kernel, turn_id, &accepted, "turn admission ended before publication".into());
                 return;
             }
             let result = {
@@ -66,25 +67,26 @@ impl Kernel {
             };
             match result {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => report_failure(&kernel, &accepted, error),
+                Ok(Err(error)) => report_failure(&kernel, turn_id, &accepted, error),
                 Err(panic) => {
-                    report_failure(&kernel, &accepted, "turn startup panicked".into());
+                    report_failure(&kernel, turn_id, &accepted, "turn startup panicked".into());
                     std::panic::resume_unwind(panic);
                 }
             }
         })?;
         self.turn_flows().publish(TurnFlow::Requested {
+            turn_id,
             context_id: request.context_id, after_block_id: request.after_block_id,
             content: request.content, principal_id: request.principal_id, model: request.model,
             continuation_epoch: request.continuation_epoch,
         });
         // The worker cannot publish a terminal event ahead of Requested.
         let _ = release.send(());
-        Ok(TurnAdmission::Accepted)
+        Ok(TurnAdmission::Accepted(turn_id))
     }
 }
 
-fn report_failure(kernel: &Kernel, request: &TurnRequest, error: String) {
+fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, error: String) {
     let payload = kaijutsu_types::ErrorPayload {
         category: kaijutsu_types::ErrorCategory::Stream,
         severity: kaijutsu_types::ErrorSeverity::Error,
@@ -99,6 +101,7 @@ fn report_failure(kernel: &Kernel, request: &TurnRequest, error: String) {
         tracing::error!("failed to record rejected turn: {insert_error}");
     }
     kernel.turn_flows().publish(TurnFlow::Failed {
+        turn_id,
         context_id: request.context_id, principal_id: request.principal_id,
         error, origin: TurnOrigin::Autonomous,
     });

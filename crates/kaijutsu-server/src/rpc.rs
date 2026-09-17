@@ -3159,6 +3159,7 @@ impl kernel::Server for KernelImpl {
                             };
                             match msg.payload {
                                 TurnFlow::Completed {
+                                    turn_id,
                                     context_id,
                                     principal_id,
                                     output_block_id,
@@ -3174,6 +3175,7 @@ impl kernel::Server for KernelImpl {
                                     let mut req = callback.on_turn_completed_request();
                                     {
                                         let mut p = req.get();
+                                        p.set_turn_id(turn_id.as_bytes());
                                         p.set_context_id(context_id.as_bytes());
                                         p.set_principal_id(principal_id.as_bytes());
                                         p.set_stop_reason(stop_reason_to_capnp(reason));
@@ -3222,6 +3224,7 @@ impl kernel::Server for KernelImpl {
                             };
                             match msg.payload {
                                 TurnFlow::Failed {
+                                    turn_id,
                                     context_id,
                                     principal_id,
                                     ref error,
@@ -3236,6 +3239,7 @@ impl kernel::Server for KernelImpl {
                                     let mut req = callback.on_turn_failed_request();
                                     {
                                         let mut p = req.get();
+                                        p.set_turn_id(turn_id.as_bytes());
                                         p.set_context_id(context_id.as_bytes());
                                         p.set_principal_id(principal_id.as_bytes());
                                         p.set_error(error.as_str());
@@ -3280,6 +3284,7 @@ impl kernel::Server for KernelImpl {
                             };
                             match msg.payload {
                                 TurnFlow::Requested {
+                                    turn_id,
                                     context_id,
                                     principal_id,
                                     ..
@@ -3287,6 +3292,7 @@ impl kernel::Server for KernelImpl {
                                     let mut req = callback.on_turn_started_request();
                                     {
                                         let mut p = req.get();
+                                        p.set_turn_id(turn_id.as_bytes());
                                         p.set_context_id(context_id.as_bytes());
                                         p.set_principal_id(principal_id.as_bytes());
                                     }

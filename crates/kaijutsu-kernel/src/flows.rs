@@ -1480,36 +1480,23 @@ impl TurnOrigin {
     }
 }
 
-/// Turn-driving flow events.
+/// Live observations of admitted model turns. The turn lease supplies one ID
+/// across startup, queuing, inference and termination; context IDs name the
+/// shared conversation, not a particular attempt.
 ///
-/// `Kernel::request_turn` publishes Requested after runtime admission. Event
-/// observers do not execute requests or authorize admission. The durable seed
-/// already lives in the context log; Requested does not insert it again.
+/// Headless Requested events follow runtime admission. Observers do not execute
+/// requests or insert their durable seed again. Completed and Failed report
+/// interactive and headless outcomes through the TurnEvents wire callbacks.
 ///
-/// # On the wire, but never journaled
-///
-/// Requested reports admission; the editor callback projects it as turn-started.
-/// Completed and Failed cross the Cap'n Proto boundary through TurnEvents
-/// (`subscribeTurnEvents`).
-///
-/// Still **never journaled**, and that is deliberate: blocks are the durable
-/// record of what a turn produced. These events are a live signal about a live
-/// turn; replaying them after a restart would announce completions for turns
-/// nobody is waiting on.
-///
-/// A subscriber that missed the push can fall back to the block log, but
-/// only for **what the turn wrote** — the text and status ops are durable.
-/// It cannot recover **why the turn stopped**: `reason` (`TurnStopReason`)
-/// has no block-log shadow, and `EndTurn`, `MaxTokens`, and a soft cancel all
-/// leave the same thing behind (a `Done` block with ordinary text) —
-/// indistinguishable from block status alone. A missed push genuinely loses
-/// that fact, not just delays it. The real fix is a catch-up story for the
-/// bus itself (deepseek post-merge review, `docs/issues.md`: "TurnFlow bus
-/// lossy + in-memory"), not a claim that the block log already covers it.
+/// These events are not journaled. Blocks retain what a turn wrote, but cannot
+/// reconstruct its stop reason or admission ID after a missed event. Recovery
+/// remains separate work; see `docs/issues.md`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TurnFlow {
     /// One autonomous turn was admitted for `context_id`.
     Requested {
+        /// Identity assigned by the turn lease at admission.
+        turn_id: kaijutsu_types::TurnId,
         /// The context that should take a turn.
         context_id: ContextId,
         /// Block to anchor the response after (typically the context's last
@@ -1536,26 +1523,20 @@ pub enum TurnFlow {
     /// join-side substrate for a blocking waiter (`kj wait`, the delegation
     /// join) and the payload the `TurnEvents` wire bridge forwards to clients.
     Completed {
+        /// Identity assigned by the turn lease at admission.
+        turn_id: kaijutsu_types::TurnId,
         /// The context whose turn completed.
         context_id: ContextId,
-        /// Principal the turn ran as.
+        /// Requester who admitted the turn; output blocks name the performer.
         principal_id: PrincipalId,
-        /// The block the turn produced that the OODA **Act** should crystallize
-        /// — the last `Role::Model` / `BlockKind::Text` block this stream
-        /// inserted, or `None` when the turn produced no text. Carried so the
-        /// beat scheduler schedules *that* block's ABC instead of a blind
-        /// last-block read that races the model (F2 §7).
+        /// The last model text block this turn inserted, or None for a turn
+        /// without text. Consumers must not substitute the context's last block.
         #[serde(default)]
         output_block_id: Option<BlockId>,
-        /// Why the turn stopped. `#[serde(default)]` → [`TurnStopReason::EndTurn`]
-        /// for a payload that predates the field, which is the only honest
-        /// default: before this field existed, every `Completed` *was* a clean
-        /// end-of-turn (cancels went out as `Failed`).
+        /// Why the turn stopped; omitted reasons decode as EndTurn.
         #[serde(default)]
         reason: TurnStopReason,
-        /// Who asked for the turn. `#[serde(default)]` →
-        /// [`TurnOrigin::Interactive`], the answer that feeds no autonomous
-        /// machinery if the field is ever missing.
+        /// Who asked for the turn; an omitted origin cannot drive autonomous work.
         #[serde(default)]
         origin: TurnOrigin,
     },
@@ -1569,9 +1550,11 @@ pub enum TurnFlow {
     /// failures, provider/stream errors, and unreadable policy — the cases
     /// where there is a real error to report and no turn happened.
     Failed {
+        /// Identity assigned by the turn lease at admission.
+        turn_id: kaijutsu_types::TurnId,
         /// The context whose turn failed.
         context_id: ContextId,
-        /// Principal the turn ran as.
+        /// Requester who admitted the turn; output blocks name the performer.
         principal_id: PrincipalId,
         /// Human-readable failure description.
         error: String,
@@ -1582,6 +1565,13 @@ pub enum TurnFlow {
 }
 
 impl TurnFlow {
+    pub fn turn_id(&self) -> kaijutsu_types::TurnId {
+        match self {
+            Self::Requested { turn_id, .. } | Self::Completed { turn_id, .. }
+                | Self::Failed { turn_id, .. } => *turn_id,
+        }
+    }
+
     /// Get the subject string for this event.
     pub fn subject(&self) -> &'static str {
         match self {
@@ -2213,6 +2203,7 @@ mod tests {
         let after = BlockId::new(ctx, principal, 7);
 
         let delivered = bus.publish(TurnFlow::Requested {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx,
             after_block_id: after,
             content: "explore the auth module".into(),
@@ -2226,6 +2217,7 @@ mod tests {
         assert_eq!(msg.topic, "turn.requested");
         match msg.payload {
             TurnFlow::Requested {
+                turn_id: _,
                 context_id,
                 after_block_id,
                 content,
@@ -2255,6 +2247,7 @@ mod tests {
         let principal = PrincipalId::new();
 
         let delivered = bus.publish(TurnFlow::Completed {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx,
             principal_id: principal,
             output_block_id: None,
@@ -2264,6 +2257,7 @@ mod tests {
         assert_eq!(delivered, 1, "exactly one subscriber on turn.completed");
 
         let delivered = bus.publish(TurnFlow::Failed {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx,
             principal_id: principal,
             error: "boom".into(),
@@ -2290,6 +2284,7 @@ mod tests {
         assert_eq!(msg.topic, "turn.failed");
         match msg.payload {
             TurnFlow::Failed {
+                turn_id: _,
                 context_id,
                 principal_id,
                 error,
@@ -2326,6 +2321,7 @@ mod tests {
         let output = BlockId::new(ctx, principal, 42);
 
         bus.publish(TurnFlow::Completed {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx,
             principal_id: principal,
             output_block_id: Some(output),
@@ -2342,6 +2338,7 @@ mod tests {
 
         // A turn that produced no text publishes `None` — not an error.
         bus.publish(TurnFlow::Completed {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx,
             principal_id: principal,
             output_block_id: None,
@@ -2367,7 +2364,7 @@ mod tests {
         let principal = PrincipalId::new();
         // A JSON form lacking the field — decodes to None via #[serde(default)].
         let json = serde_json::json!({
-            "Completed": {
+            "Completed": { "turn_id": kaijutsu_types::TurnId::new(),
                 "context_id": ctx,
                 "principal_id": principal
             }
@@ -2392,7 +2389,7 @@ mod tests {
         let ctx = ContextId::new();
         let principal = PrincipalId::new();
         let json = serde_json::json!({
-            "Completed": { "context_id": ctx, "principal_id": principal }
+            "Completed": { "turn_id": kaijutsu_types::TurnId::new(), "context_id": ctx, "principal_id": principal }
         });
         let decoded: TurnFlow =
             serde_json::from_value(json).expect("Completed decodes without reason/origin");
@@ -2405,7 +2402,7 @@ mod tests {
         }
 
         let json = serde_json::json!({
-            "Failed": { "context_id": ctx, "principal_id": principal, "error": "boom" }
+            "Failed": { "turn_id": kaijutsu_types::TurnId::new(), "context_id": ctx, "principal_id": principal, "error": "boom" }
         });
         let decoded: TurnFlow =
             serde_json::from_value(json).expect("Failed decodes without origin");
@@ -2647,12 +2644,13 @@ mod tests {
     }
 
     #[test]
-    fn test_turn_flow_all_subjects_in_topics() {
+    fn test_turn_flow_subjects_and_admission_identity() {
         let ctx = ContextId::new();
         let principal = PrincipalId::new();
         let after = BlockId::new(ctx, principal, 1);
         let variants = vec![
             TurnFlow::Requested {
+                turn_id: kaijutsu_types::TurnId::new(),
                 context_id: ctx,
                 after_block_id: after,
                 content: "go".into(),
@@ -2661,6 +2659,7 @@ mod tests {
                 continuation_epoch: None,
             },
             TurnFlow::Completed {
+                turn_id: kaijutsu_types::TurnId::new(),
                 context_id: ctx,
                 principal_id: principal,
                 output_block_id: None,
@@ -2668,6 +2667,7 @@ mod tests {
                 origin: TurnOrigin::Autonomous,
             },
             TurnFlow::Failed {
+                turn_id: kaijutsu_types::TurnId::new(),
                 context_id: ctx,
                 principal_id: principal,
                 error: "boom".into(),
@@ -2681,6 +2681,13 @@ mod tests {
                 | TurnFlow::Completed { .. }
                 | TurnFlow::Failed { .. } => {}
             }
+            let mut json = serde_json::to_value(v).unwrap();
+            let decoded: TurnFlow = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(decoded.turn_id(), v.turn_id());
+            json.as_object_mut().unwrap().values_mut().next().unwrap()
+                .as_object_mut().unwrap().remove("turn_id");
+            assert!(serde_json::from_value::<TurnFlow>(json).is_err(),
+                "a missing admission ID must not invent a different turn");
         }
 
         assert_subjects_registered(&variants, TurnFlow::TOPICS);
@@ -2886,6 +2893,7 @@ mod tests {
         }
 
         let delivered = turns.publish(TurnFlow::Completed {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx,
             principal_id: principal,
             output_block_id: Some(id),

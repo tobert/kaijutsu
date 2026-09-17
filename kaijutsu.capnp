@@ -1009,6 +1009,9 @@ enum TurnOrigin {
 # `subscribeEditor` — the event names its context rather than the subscription
 # filtering to one, so a client watching several contexts needs one channel.
 interface TurnEvents {
+  # Every callback carries the same 16-byte TurnId assigned at admission.
+  # Context identity alone cannot distinguish overlapping turns. principalId
+  # names the requester; outputBlockId names the performing author.
   # Next free ordinal: 3. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
@@ -1018,11 +1021,11 @@ interface TurnEvents {
   # meaningless) when the turn produced no text at all.
   onTurnCompleted @0 (contextId :Data, principalId :Data,
                       outputBlockId :BlockId, hasOutputBlock :Bool,
-                      stopReason :TurnStopReason, origin :TurnOrigin);
+                      stopReason :TurnStopReason, origin :TurnOrigin, turnId :Data);
   # A turn BROKE — hydration failure, provider/stream error. Not a cancel:
   # a cancelled turn arrives as onTurnCompleted with a cancelled stopReason.
   onTurnFailed @1 (contextId :Data, principalId :Data, error :Text,
-                   origin :TurnOrigin);
+                   origin :TurnOrigin, turnId :Data);
   # A turn was REQUESTED for contextId — the driver has accepted it but has
   # not produced anything yet. The early signal a client widening its
   # block-event subscription needs: by the time onTurnCompleted/onTurnFailed
@@ -1033,7 +1036,7 @@ interface TurnEvents {
   # directly and fires no onTurnStarted, so this is not a general "a turn
   # is beginning" signal and a client must not treat its absence as "no
   # turn is running". Every turn still reports onTurnCompleted/onTurnFailed.
-  onTurnStarted @2 (contextId :Data, principalId :Data);
+  onTurnStarted @2 (contextId :Data, principalId :Data, turnId :Data);
 }
 
 # ============================================================================

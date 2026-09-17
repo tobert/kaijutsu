@@ -14,7 +14,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "drive",
-    about = "Clock one autonomous turn on a context.",
+    about = "Admit one autonomous model turn and return its turn ID.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -132,12 +132,14 @@ impl KjDispatcher {
             None => tail,
         };
 
-        if let Err(error) = self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
+        let turn_id = match self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
             context_id: target, after_block_id: after, content: seed,
             principal_id: caller.principal_id, model: None, continuation_epoch: None,
         }) {
-            return KjResult::Err(format!("kj drive: turn was not admitted: {error}"));
-        }
+            Ok(crate::runtime::turn_request::TurnAdmission::Accepted(id)) => id,
+            Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) => unreachable!("explicit drive admits a turn"),
+            Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),
+        };
 
         // Identify the driven context by a compact handle in the message.
         let display = target.short();
@@ -148,6 +150,7 @@ impl KjDispatcher {
             data: Some(serde_json::json!({
                 "context_id": target.to_hex(),
                 "accepted": true,
+                "turn_id": turn_id,
             })),
         }
     }

@@ -176,6 +176,7 @@ mod tests {
     #[test]
     fn turn_completed_and_turn_failed_land_on_the_south_switchboard_bearing() {
         let completed = ServerEvent::TurnCompleted {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx(1),
             principal_id: PrincipalId::nil(),
             output_block_id: None,
@@ -183,6 +184,7 @@ mod tests {
             origin: kaijutsu_client::TurnOrigin::Interactive,
         };
         let failed = ServerEvent::TurnFailed {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ctx(1),
             principal_id: PrincipalId::nil(),
             error: "boom".to_string(),

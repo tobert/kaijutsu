@@ -2742,7 +2742,7 @@ mod tests {
     fn turn_started_marks_the_context_running() {
         let id = ContextId::new();
         let mut app = App::new("amy");
-        let event = ServerEvent::TurnStarted { context_id: id, principal_id: PrincipalId::new() };
+        let event = ServerEvent::TurnStarted { turn_id: kaijutsu_types::TurnId::new(), context_id: id, principal_id: PrincipalId::new() };
         assert!(mark_turn_liveness(&mut app, &event));
         assert!(app.turn_running(id));
     }
@@ -2775,7 +2775,7 @@ mod tests {
         app.switch_to(id);
         assert!(!app.thinking_pane_latched(id), "no turn is known running yet");
 
-        let event = ServerEvent::TurnStarted { context_id: id, principal_id: PrincipalId::new() };
+        let event = ServerEvent::TurnStarted { turn_id: kaijutsu_types::TurnId::new(), context_id: id, principal_id: PrincipalId::new() };
         assert!(mark_turn_liveness(&mut app, &event));
         assert!(
             app.thinking_pane_latched(id),
@@ -2789,6 +2789,7 @@ mod tests {
         let mut app = App::new("amy");
         app.mark_turn_running(id);
         let event = ServerEvent::TurnCompleted {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: id,
             principal_id: PrincipalId::new(),
             output_block_id: None,
@@ -2805,6 +2806,7 @@ mod tests {
         let mut app = App::new("amy");
         app.mark_turn_running(id);
         let event = ServerEvent::TurnFailed {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: id,
             principal_id: PrincipalId::new(),
             error: "provider stream error".to_string(),
@@ -2820,6 +2822,7 @@ mod tests {
     fn turn_completed_for_a_context_with_no_known_running_turn_is_a_no_op() {
         let mut app = App::new("amy");
         let event = ServerEvent::TurnCompleted {
+            turn_id: kaijutsu_types::TurnId::new(),
             context_id: ContextId::new(),
             principal_id: PrincipalId::new(),
             output_block_id: None,

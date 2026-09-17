@@ -1,9 +1,9 @@
-//! Context turn locks, cached conversations, and generation-scoped interrupts.
+//! Context turn locks, cached conversations, and turn-scoped interrupts.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use kaijutsu_types::ContextId;
+use std::sync::atomic::{AtomicBool, Ordering};
+use kaijutsu_types::{ContextId, TurnId};
 use crate::ConversationMailbox;
 use super::interrupt::ContextInterruptState;
 
@@ -12,7 +12,7 @@ struct ActiveTurn {
     interrupt: Arc<ContextInterruptState>,
 }
 
-type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<u64, ActiveTurn>>;
+type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<TurnId, ActiveTurn>>;
 
 /// Owns one admitted turn's liveness and interrupt registration.
 /// Dropping one lease cannot clear another turn in the same context.
@@ -20,11 +20,12 @@ type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<u64, ActiveTurn
 pub struct TurnLease {
     active: Arc<parking_lot::Mutex<ActiveTurns>>,
     context: ContextId,
-    generation: u64,
+    id: TurnId,
     interrupt: Arc<ContextInterruptState>,
 }
 
 impl TurnLease {
+    pub fn id(&self) -> TurnId { self.id }
     pub(super) fn interrupt(&self) -> Arc<ContextInterruptState> { self.interrupt.clone() }
     pub(super) fn context(&self) -> ContextId { self.context }
 }
@@ -33,7 +34,7 @@ impl Drop for TurnLease {
     fn drop(&mut self) {
         let mut active = self.active.lock();
         if let Some(turns) = active.get_mut(&self.context) {
-            turns.remove(&self.generation);
+            turns.remove(&self.id);
             if turns.is_empty() { active.remove(&self.context); }
         }
     }
@@ -43,7 +44,6 @@ impl Drop for TurnLease {
 pub struct TurnState {
     conversations: Arc<ConversationCache>,
     active: Arc<parking_lot::Mutex<ActiveTurns>>,
-    generation: AtomicU64,
 }
 
 impl Default for TurnState {
@@ -51,7 +51,6 @@ impl Default for TurnState {
         Self {
             conversations: Arc::new(ConversationCache::new(64)),
             active: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            generation: AtomicU64::new(0),
         }
     }
 }
@@ -76,12 +75,11 @@ impl TurnState {
     fn register(&self, context: ContextId, interrupt: Arc<ContextInterruptState>, idle_only: bool) -> Option<TurnLease> {
         let mut active = self.active.lock();
         if idle_only && active.contains_key(&context) { return None; }
-        let generation = self.generation.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-            |value| value.checked_add(1)).expect("turn generation overflow");
-        active.entry(context).or_default().insert(generation, ActiveTurn {
+        let id = TurnId::new();
+        active.entry(context).or_default().insert(id, ActiveTurn {
             began: std::time::Instant::now(), interrupt: interrupt.clone(),
         });
-        Some(TurnLease { active: self.active.clone(), context, generation, interrupt })
+        Some(TurnLease { active: self.active.clone(), context, id, interrupt })
     }
 
     pub fn active_count(&self, context: ContextId) -> usize {

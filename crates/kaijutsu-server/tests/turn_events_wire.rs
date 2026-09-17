@@ -278,15 +278,15 @@ fn autonomous_fork_turn_pushes_started_then_completed_for_the_child() {
         // is the only filter available — and it is enough, since nothing
         // else in this test drives a turn on any other context.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let child_ctx = loop {
+        let (child_ctx, admitted_id) = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
                 !remaining.is_zero(),
                 "no TurnStarted arrived — the fork's turn request never announced"
             );
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(ServerEvent::TurnStarted { context_id, .. })) if context_id != main_ctx => {
-                    break context_id;
+                Ok(Ok(ServerEvent::TurnStarted { context_id, turn_id, .. })) if context_id != main_ctx => {
+                    break (context_id, turn_id);
                 }
                 Ok(Ok(_)) => continue,
                 Ok(Err(e)) => panic!("turn push channel error: {e}"),
@@ -297,7 +297,8 @@ fn autonomous_fork_turn_pushes_started_then_completed_for_the_child() {
         // Now that the child's context is known, the outcome push must name
         // that SAME context and be tagged Autonomous.
         match recv_turn_event(&mut rx, child_ctx).await {
-            ServerEvent::TurnCompleted { context_id, origin, .. } => {
+            ServerEvent::TurnCompleted { context_id, turn_id, origin, .. } => {
+                assert_eq!(turn_id, admitted_id);
                 assert_eq!(
                     context_id, child_ctx,
                     "TurnStarted and TurnCompleted must name the same child context"
@@ -313,5 +314,58 @@ fn autonomous_fork_turn_pushes_started_then_completed_for_the_child() {
             }
             other => panic!("unreachable: {other:?}"),
         }
+    });
+}
+
+#[test]
+fn overlapping_drives_keep_their_admission_ids_through_cancellation() {
+    run_local(async {
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "overlapping-turns").await.unwrap();
+        assign_turn_identity(&server, context, PrincipalId::new());
+        kernel.join_context(context, "turn-identity").await.unwrap();
+        let help = kernel.execute_kj_quiet(context, &["drive".into(), "--help".into()]).await.unwrap();
+        assert_eq!(help.exit_code, 0, "{}", help.stderr);
+        assert!(help.stdout.contains("turn ID"));
+        eprintln!("{}", help.stdout);
+        let (callback, mut events) = turn_events_channel(64);
+        kernel.subscribe_turn_events(callback).await.unwrap();
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let mut admitted = std::collections::HashSet::new();
+        for prompt in ["first", "second"] {
+            let result = kernel.execute_kj_quiet(context, &[
+                "drive".into(), "--prompt".into(), prompt.into(),
+            ]).await.unwrap();
+            assert_eq!(result.exit_code, 0, "{}", result.stderr);
+            let id: kaijutsu_types::TurnId = serde_json::from_value(result.data.unwrap()["turn_id"].clone()).unwrap();
+            assert!(admitted.insert(id), "each drive admits a distinct turn");
+        }
+        let mut started = std::collections::HashSet::new();
+        while started.len() != admitted.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+            if let ServerEvent::TurnStarted { turn_id, context_id, .. } = event {
+                assert_eq!(context_id, context);
+                assert!(admitted.contains(&turn_id));
+                assert!(started.insert(turn_id));
+            }
+        }
+        assert_eq!(server.kernel.turns().active_count(context), 2);
+        assert!(kernel.interrupt_context(context, true).await.unwrap());
+        for _ in 0..2 {
+            match recv_turn_event(&mut events, context).await {
+                ServerEvent::TurnCompleted { turn_id, stop_reason, output_block_id, .. } => {
+                    assert!(admitted.remove(&turn_id), "completion must settle one original admission");
+                    assert_eq!(stop_reason, TurnCompletedStopReason::CancelledImmediate);
+                    assert!(output_block_id.is_none(), "queued cancellation must not enter inference");
+                }
+                other => panic!("expected cancellation, got {other:?}"),
+            }
+        }
+        assert!(admitted.is_empty());
+        assert!(!server.kernel.turn_in_flight(context));
+        drop(held);
     });
 }

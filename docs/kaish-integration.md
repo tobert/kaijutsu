@@ -173,8 +173,11 @@ These are source observations, not promises that all paths behave alike.
   receipt instead of writing a second outcome.
 - Model streaming and identity resolution live in `runtime/llm_stream.rs` and
   `runtime/turn_identity.rs`. Kernel-owned `TurnState` holds conversation locks,
-  cached mailboxes, images, and per-turn leases. Each accepted turn owns its
-  liveness and interrupt registration through startup, queuing, and inference.
+  cached mailboxes, images, and per-turn leases. Each lease owns its `TurnId`,
+  liveness and interrupt registration through startup, queuing and inference. Headless
+  admission returns that ID (`kj drive` includes it in structured data), and
+  Requested/Completed/Failed retain it through the TurnEvents client callbacks.
+  Missing or malformed callback IDs are errors; clients do not invent identity.
   Ending one cannot hide another turn; a context interrupt signals all accepted
   turns. RPC translates startup errors into wire errors. Accepted turns run on
   the kernel worker and survive the caller's LocalSet. Rejected admission drops

@@ -66,12 +66,12 @@ it does not capture an intended target or input basis when the model turn begins
 Migrate that handoff to admitted work and cancellation ownership. The CAS adapter's
 artifact-hash basis establishes artifact identity, not model-context freshness.
 Keep rc tick lifecycle policy distinct from model preparation and commitment.
-`TurnFlow` carries context identity but no attempt identifier: Requested reports
-headless admission, while Completed/Failed cannot identify which overlapping
-request ended. Thread a stable attempt identifier through admission and terminal
-ownership before matching output to timeline work. Do not associate by context
-alone, and do not treat already accepted model/tool side effects as rollbackable
-resolver output.
+The runtime lease now supplies a stable `TurnId` across admission, startup and
+terminal events, including client callbacks. Use it to bind each attempt's target
+and input basis before model work starts. Keep an owned completion handoff: the
+live event bus is an observation channel, not durable or lossless settlement.
+Do not associate by context alone, and do not treat already accepted model/tool
+side effects as rollbackable resolver output.
 
 CAS preparation has a process-wide limit of four operations. An uninterruptible
 host read retains its slot even after its owner is cancelled; four stuck reads
@@ -262,9 +262,9 @@ Kaibo review and disposition:
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
 aggregate liveness when polling the log but returns on the first terminal event,
 even if another accepted turn remains. Decide whether it joins one turn or an
-idle context, then align the event and polling paths. Turn events currently have
-no request identifier; clients also clear context activity on a terminal event.
-Per-turn runtime leases fix ownership, not these consumer semantics.
+idle context, then align the event and polling paths. Turn events now carry a
+`TurnId`, but clients still clear context activity on a terminal event. Per-turn
+runtime leases and callback IDs fix identity, not these consumer semantics.
 
 ### Shared client recovery
 

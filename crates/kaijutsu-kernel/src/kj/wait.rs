@@ -747,6 +747,7 @@ mod tests {
         d.kernel()
             .turn_flows()
             .publish(crate::flows::TurnFlow::Completed {
+                turn_id: kaijutsu_types::TurnId::new(),
                 context_id: ctx,
                 principal_id: principal,
                 output_block_id: None,
@@ -788,6 +789,7 @@ mod tests {
         d.kernel()
             .turn_flows()
             .publish(crate::flows::TurnFlow::Failed {
+                turn_id: kaijutsu_types::TurnId::new(),
                 context_id: ctx,
                 principal_id: principal,
                 error: "provider stream broke".to_string(),

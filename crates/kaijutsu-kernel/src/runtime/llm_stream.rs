@@ -1628,6 +1628,7 @@ fn record_continuation_yield(
         llm.usage.cache_write_tokens = tracing::field::Empty,
         llm.usage.reasoning_tokens = tracing::field::Empty,
         llm.response.stop_reason = tracing::field::Empty,
+        turn.id = %turn_lease.id(),
         turn.stop_reason = tracing::field::Empty,
         turn.origin = tracing::field::Empty,
     )
@@ -1668,9 +1669,11 @@ async fn process_llm_stream(
     origin: TurnOrigin,
     continuation_epoch: Option<i64>,
 ) {
+    let turn_id = turn_lease.id();
     let panic_anchor = after_block_id.clone();
-    // Keep turn exclusion through cleanup and terminal publication, including
-    // unwinding. A queued cancellation does not need to acquire this lock.
+    // The mailbox lock keeps conversation exclusion through terminal publication.
+    // The lease releases liveness first so observers see that this turn ended.
+    // A queued cancellation does not need to acquire the mailbox lock.
     let session = conversation_cache.get_or_create(context_id);
     let mut mailbox = tokio::select! {
         biased;
@@ -1682,11 +1685,11 @@ async fn process_llm_stream(
             provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, slot_tunables,
             conversation_cache, user_principal_id, span_identity, tool_ctx, interrupt, origin,
-            continuation_epoch, mailbox,
+            continuation_epoch, mailbox, turn_id,
         )).catch_unwind().await
     } else {
         Ok(TurnFlow::Completed {
-            context_id, principal_id: user_principal_id, output_block_id: None,
+            turn_id, context_id, principal_id: user_principal_id, output_block_id: None,
             reason: TurnStopReason::Cancelled { immediate: true }, origin,
         })
     };
@@ -1699,7 +1702,7 @@ async fn process_llm_stream(
             let error = "Model turn panicked; execution stopped and side effects may be incomplete.";
             insert_pre_stream_error_block(&documents, context_id, &panic_anchor, error);
             kernel.turn_flows().publish(TurnFlow::Failed {
-                context_id, principal_id: user_principal_id, error: error.into(), origin,
+                turn_id, context_id, principal_id: user_principal_id, error: error.into(), origin,
             });
             std::panic::resume_unwind(panic);
         }
@@ -1741,6 +1744,7 @@ async fn run_llm_stream(
     origin: TurnOrigin,
     continuation_epoch: Option<i64>,
     mailbox: &mut crate::ConversationMailbox,
+    turn_id: kaijutsu_types::TurnId,
 ) -> TurnFlow {
     if let Some(identity) = span_identity {
         let span = tracing::Span::current();
@@ -1795,7 +1799,7 @@ async fn run_llm_stream(
                 "Hydration policy read failed for context {context_id}: {e}; failing the turn"
             );
             return TurnFlow::Failed {
-                context_id,
+                turn_id, context_id,
                 principal_id: user_principal_id,
                 error: format!("hydration policy unreadable: {e}"),
                 origin,
@@ -1815,7 +1819,7 @@ async fn run_llm_stream(
         // terminal path: return Failed for the finalization owner to publish.
         Err(()) => {
             return TurnFlow::Failed {
-                context_id,
+                turn_id, context_id,
                 principal_id: user_principal_id,
                 error: "hydration failed: could not read conversation history".to_string(),
                 origin,
@@ -2090,7 +2094,7 @@ async fn run_llm_stream(
                         );
                         // Finalization publishes this failure after cleanup.
                         return TurnFlow::Failed {
-                            context_id,
+                            turn_id, context_id,
                             principal_id: user_principal_id,
                             error: format!("LLM stream failed to start: {e}"),
                             origin,
@@ -2423,7 +2427,7 @@ async fn run_llm_stream(
                             Some(PrincipalId::system()),
                         );
                         return TurnFlow::Failed {
-                            context_id,
+                            turn_id, context_id,
                             principal_id: user_principal_id,
                             error: detail,
                             origin,
@@ -2676,7 +2680,7 @@ async fn run_llm_stream(
                     // Terminal mid-stream error — Failed (not Completed) so an
                     // announced turn never leaves the scheduler waiting.
                     return TurnFlow::Failed {
-                        context_id,
+                        turn_id, context_id,
                         principal_id: user_principal_id,
                         error: format!("LLM stream error: {err}"),
                         origin,
@@ -3002,7 +3006,7 @@ async fn run_llm_stream(
     turn_span.record("turn.stop_reason", stop_reason_out.as_str());
     turn_span.record("turn.origin", origin.as_str());
     TurnFlow::Completed {
-        context_id,
+        turn_id, context_id,
         principal_id: user_principal_id,
         output_block_id,
         reason: stop_reason_out,
@@ -5792,19 +5796,88 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
+    async fn headless_turn_ids_survive_queuing_and_cancellation() {
+        use super::super::turn_request::TurnRequest;
+        let (kernel, context, after, call) = fixture(Some(
+            MockClient::new("").with_scripted_stream(vec![]))).await;
+        let session = kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let mut events = kernel.turn_flows().subscribe("turn.*");
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..2 {
+            kernel.request_turn(TurnRequest {
+                context_id: context, after_block_id: after.clone(), content: String::new(),
+                principal_id: call.principal_id, model: None, continuation_epoch: None,
+            }).unwrap();
+            let requested = serde_json::to_value(events.try_recv().unwrap().payload).unwrap();
+            let id = requested["Requested"]["turn_id"].as_str()
+                .expect("admission must identify its own turn").to_owned();
+            assert!(ids.insert(id), "overlapping turns must have distinct IDs");
+        }
+        assert_eq!(kernel.turns().active_count(context), 2);
+        kernel.turns().interrupt(context, true);
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+            assert!(matches!(event.payload, TurnFlow::Completed {
+                reason: TurnStopReason::Cancelled { immediate: true }, ..
+            }), "{:?}", event.payload);
+            let completed = serde_json::to_value(event.payload).unwrap();
+            assert!(ids.remove(completed["Completed"]["turn_id"].as_str().unwrap()),
+                "terminal event must identify exactly one admitted turn");
+        }
+        assert!(ids.is_empty());
+        assert!(!kernel.turn_in_flight(context));
+        drop(held);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_headless_startup_settles_the_admitted_id() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        let (kernel, context, after, call) = fixture(None).await;
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        kernel.spawn_runtime_task(move |_| async move {
+            entered.send(()).unwrap();
+            // Hold this test's dedicated runtime before it can poll admission.
+            held.recv_timeout(Duration::from_secs(5)).unwrap();
+        }).unwrap();
+        ready.await.unwrap();
+        let mut events = kernel.turn_flows().subscribe("turn.*");
+        let TurnAdmission::Accepted(id) = kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+        }).unwrap() else { panic!("explicit request must be admitted") };
+        assert_eq!(events.try_recv().unwrap().payload.turn_id(), id);
+        kernel.stop_runtime_worker();
+        release.send(()).unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
+        let event = events.try_recv().expect("accepted startup must settle during shutdown");
+        assert_eq!(event.payload.turn_id(), id);
+        assert!(matches!(event.payload, TurnFlow::Failed { ref error, .. } if error.contains("shut down before turn startup")));
+        assert!(!kernel.turn_in_flight(context));
+        assert!(events.try_recv().is_none());
+    }
+
+    #[tokio::test]
     async fn headless_startup_failure_follows_requested_and_releases_ownership() {
         use super::super::turn_request::{TurnAdmission, TurnRequest};
         let (kernel, context, after, call) = fixture(None).await;
         let mut events = kernel.turn_flows().subscribe("turn.*");
-        assert_eq!(kernel.request_turn(TurnRequest {
+        let admission = kernel.request_turn(TurnRequest {
             context_id: context, after_block_id: after, content: String::new(),
             principal_id: call.principal_id, model: None, continuation_epoch: None,
-        }).unwrap(), TurnAdmission::Accepted);
+        }).unwrap();
+        let TurnAdmission::Accepted(admitted_id) = admission else { panic!("turn was not admitted") };
         let first = events.recv().await.unwrap();
         assert!(matches!(first.payload, TurnFlow::Requested { .. }));
+        assert_eq!(first.payload.turn_id(), admitted_id);
+        let requested = serde_json::to_value(first.payload).unwrap();
+        let id = requested["Requested"]["turn_id"].as_str().expect("startup owns an admitted turn ID");
         let last = tokio::time::timeout(Duration::from_secs(3), events.recv()).await
             .expect("startup refusal must reach observers").unwrap();
         assert!(matches!(last.payload, TurnFlow::Failed { .. }));
+        assert_eq!(serde_json::to_value(last.payload).unwrap()["Failed"]["turn_id"], id);
         assert!(!kernel.turn_in_flight(context));
         kernel.shutdown_runtime_worker().await.unwrap();
         assert!(events.try_recv().is_none());
@@ -5880,23 +5953,37 @@ mod lifetime_tests {
 
     #[tokio::test]
     async fn provider_panic_publishes_failure_and_fails_worker() {
-        let mock = MockClient::new("").with_scripted_stream(vec![]);
-        let (kernel, context, after, call) = fixture(Some(mock)).await;
-        let mut failed = kernel.turn_flows().subscribe("turn.failed");
-        let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-            spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
-                call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        for headless in [false, true] {
+            let mock = MockClient::new("").with_scripted_stream(vec![]);
+            let (kernel, context, after, call) = fixture(Some(mock)).await;
+            let mut failed = kernel.turn_flows().subscribe("turn.failed");
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let mut requested = kernel.turn_flows().subscribe("turn.requested");
+            let turn_id = if headless {
+                let TurnAdmission::Accepted(id) = kernel.request_turn(TurnRequest {
+                    context_id: context, after_block_id: after, content: String::new(),
+                    principal_id: call.principal_id, model: None, continuation_epoch: None,
+                }).unwrap() else { panic!("explicit request must be admitted") };
+                assert_eq!(requested.try_recv().unwrap().payload.turn_id(), id);
+                id
+            } else {
+                let lease = kernel.turns().begin(context);
+                let id = lease.id();
+                spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
+                    call.principal_id, TurnOrigin::Interactive, None, Some(lease)).await.unwrap();
+                id
+            };
             let event = tokio::time::timeout(Duration::from_secs(3), failed.recv()).await
                 .expect("a panicked turn must announce failure").unwrap();
-            assert!(matches!(event.payload, TurnFlow::Failed { .. }));
-        }).await;
-        assert!(kernel.shutdown_runtime_worker().await.is_err(), "panic must reach shutdown owner");
-        assert!(!kernel.turn_in_flight(context));
-        assert!(kernel.turns().active_count(context) == 0);
-        assert!(failed.try_recv().is_none());
-        assert!(completed.try_recv().is_none());
+            assert_eq!(event.payload.turn_id(), turn_id);
+            assert!(matches!(event.payload, TurnFlow::Failed { ref error, .. } if error.contains("Model turn panicked")));
+            assert!(kernel.shutdown_runtime_worker().await.is_err(), "panic must reach shutdown owner");
+            assert!(!kernel.turn_in_flight(context));
+            assert_eq!(kernel.turns().active_count(context), 0);
+            assert!(failed.try_recv().is_none(), "startup must not report the stream panic a second time");
+            assert!(completed.try_recv().is_none());
+        }
     }
     #[tokio::test]
     async fn stopped_worker_refuses_turn_without_leaving_state() {

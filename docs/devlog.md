@@ -1931,6 +1931,16 @@ from an unmounted default HOME now supply real VFS directories. The live timing
 trace also confirmed that turn events have no attempt identifier; the next handoff
 must carry admission identity through completion instead of matching by context.
 
+The lease now supplies that attempt identity. A shared UUID `TurnId` replaces
+its private numeric generation and follows startup, queuing, inference and every
+terminal path. Headless admission returns it, `kj drive` exposes it, and all three
+TurnEvents callbacks carry it. The client refuses missing or malformed IDs instead
+of making one up. A controlled SSH test holds the conversation lock, admits two
+turns, matches their returned IDs to start callbacks, then cancels both and checks
+that each original ID settles once without inference. Normal completion, startup
+failure and panic coverage follow the same identity. Timing admission still needs
+an owned target/basis handoff; an observation event is not its completion owner.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

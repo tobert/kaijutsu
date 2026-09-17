@@ -175,9 +175,11 @@ pub enum ServerEvent {
     /// polling can tell you a block stopped changing, but never *why*, and never
     /// the difference between a finished turn and a cancelled one.
     TurnCompleted {
+        /// Identity of the admitted turn, shared by its start and outcome.
+        turn_id: kaijutsu_types::TurnId,
         /// The context whose turn ended.
         context_id: ContextId,
-        /// The principal the turn ran as.
+        /// Requester who admitted the turn; output blocks name the performer.
         principal_id: kaijutsu_types::PrincipalId,
         /// The model's last text block, or `None` when the turn produced no
         /// text (a tool-only turn, or an interrupt before the first token).
@@ -191,9 +193,11 @@ pub enum ServerEvent {
     /// the server's description. A *cancelled* turn is not a failure: it arrives
     /// as [`ServerEvent::TurnCompleted`] with a cancelled stop reason.
     TurnFailed {
+        /// Identity of the admitted turn, shared by its start and outcome.
+        turn_id: kaijutsu_types::TurnId,
         /// The context whose turn broke.
         context_id: ContextId,
-        /// The principal the turn ran as.
+        /// Requester who admitted the turn; output blocks name the performer.
         principal_id: kaijutsu_types::PrincipalId,
         /// Human-readable failure description from the server.
         error: String,
@@ -206,9 +210,11 @@ pub enum ServerEvent {
     /// before [`ServerEvent::TurnCompleted`]/[`ServerEvent::TurnFailed`]
     /// arrives too late to observe what the turn wrote.
     TurnStarted {
+        /// Identity of the admitted turn, shared by its start and outcome.
+        turn_id: kaijutsu_types::TurnId,
         /// The context the turn will run in.
         context_id: ContextId,
-        /// The principal the turn will run as.
+        /// Requester who admitted the turn.
         principal_id: kaijutsu_types::PrincipalId,
     },
 }
@@ -593,6 +599,13 @@ impl turn_events::Server for TurnEventsForwarder {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
         };
+        let turn_id = match params.get_turn_id().and_then(|bytes| {
+            kaijutsu_types::TurnId::try_from_slice(bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid turn_id on turn event".into()))
+        }) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
         let context_id = match params.get_context_id() {
             Ok(bytes) => match ContextId::try_from_slice(bytes) {
                 Some(id) => id,
@@ -648,6 +661,7 @@ impl turn_events::Server for TurnEventsForwarder {
         if self
             .event_tx
             .send(ServerEvent::TurnCompleted {
+                turn_id,
                 context_id,
                 principal_id,
                 output_block_id,
@@ -669,6 +683,13 @@ impl turn_events::Server for TurnEventsForwarder {
         let params = match params.get() {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
+        };
+        let turn_id = match params.get_turn_id().and_then(|bytes| {
+            kaijutsu_types::TurnId::try_from_slice(bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid turn_id on turn event".into()))
+        }) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
         };
         let context_id = match params.get_context_id() {
             Ok(bytes) => match ContextId::try_from_slice(bytes) {
@@ -710,6 +731,7 @@ impl turn_events::Server for TurnEventsForwarder {
         if self
             .event_tx
             .send(ServerEvent::TurnFailed {
+                turn_id,
                 context_id,
                 principal_id,
                 error,
@@ -730,6 +752,13 @@ impl turn_events::Server for TurnEventsForwarder {
         let params = match params.get() {
             Ok(p) => p,
             Err(e) => return Promise::err(e),
+        };
+        let turn_id = match params.get_turn_id().and_then(|bytes| {
+            kaijutsu_types::TurnId::try_from_slice(bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid turn_id on turn event".into()))
+        }) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
         };
         let context_id = match params.get_context_id() {
             Ok(bytes) => match ContextId::try_from_slice(bytes) {
@@ -756,6 +785,7 @@ impl turn_events::Server for TurnEventsForwarder {
         if self
             .event_tx
             .send(ServerEvent::TurnStarted {
+                turn_id,
                 context_id,
                 principal_id,
             })
@@ -1675,6 +1705,8 @@ mod turn_events_tests {
             let output = BlockId::new(ctx, principal, 42);
 
             let mut req = client.on_turn_completed_request();
+            let turn_id = kaijutsu_types::TurnId::new();
+            req.get().set_turn_id(turn_id.as_bytes());
             {
                 let mut p = req.get();
                 p.set_context_id(ctx.as_bytes());
@@ -1691,12 +1723,14 @@ mod turn_events_tests {
 
             match rx.try_recv().expect("a TurnCompleted event arrived") {
                 ServerEvent::TurnCompleted {
+                    turn_id: actual_turn_id,
                     context_id,
                     principal_id,
                     output_block_id,
                     stop_reason,
                     origin,
                 } => {
+                    assert_eq!(actual_turn_id, turn_id);
                     assert_eq!(context_id, ctx);
                     assert_eq!(principal_id, principal);
                     assert_eq!(output_block_id, Some(output));
@@ -1719,6 +1753,8 @@ mod turn_events_tests {
             let principal = PrincipalId::new();
 
             let mut req = client.on_turn_completed_request();
+            let turn_id = kaijutsu_types::TurnId::new();
+            req.get().set_turn_id(turn_id.as_bytes());
             {
                 let mut p = req.get();
                 p.set_context_id(ctx.as_bytes());
@@ -1766,6 +1802,8 @@ mod turn_events_tests {
 
             for (wire, expected) in cases {
                 let mut req = client.on_turn_completed_request();
+            let turn_id = kaijutsu_types::TurnId::new();
+            req.get().set_turn_id(turn_id.as_bytes());
                 {
                     let mut p = req.get();
                     p.set_context_id(ctx.as_bytes());
@@ -1802,6 +1840,8 @@ mod turn_events_tests {
             let principal = PrincipalId::new();
 
             let mut req = client.on_turn_failed_request();
+            let turn_id = kaijutsu_types::TurnId::new();
+            req.get().set_turn_id(turn_id.as_bytes());
             {
                 let mut p = req.get();
                 p.set_context_id(ctx.as_bytes());
@@ -1813,11 +1853,13 @@ mod turn_events_tests {
 
             match rx.try_recv().expect("a TurnFailed event arrived") {
                 ServerEvent::TurnFailed {
+                    turn_id: actual_turn_id,
                     context_id,
                     principal_id,
                     error,
                     origin,
                 } => {
+                    assert_eq!(actual_turn_id, turn_id);
                     assert_eq!(context_id, ctx);
                     assert_eq!(principal_id, principal);
                     assert_eq!(error, "hydration failed: could not read conversation history");
@@ -1837,6 +1879,8 @@ mod turn_events_tests {
             let principal = PrincipalId::new();
 
             let mut req = client.on_turn_started_request();
+            let turn_id = kaijutsu_types::TurnId::new();
+            req.get().set_turn_id(turn_id.as_bytes());
             {
                 let mut p = req.get();
                 p.set_context_id(ctx.as_bytes());
@@ -1846,9 +1890,11 @@ mod turn_events_tests {
 
             match rx.try_recv().expect("a TurnStarted event arrived") {
                 ServerEvent::TurnStarted {
+                    turn_id: actual_turn_id,
                     context_id,
                     principal_id,
                 } => {
+                    assert_eq!(actual_turn_id, turn_id);
                     assert_eq!(context_id, ctx);
                     assert_eq!(principal_id, principal);
                 }
@@ -1861,10 +1907,31 @@ mod turn_events_tests {
     /// same as the outcome events — a swapped/short id here would tell a
     /// client to widen its subscription on the wrong context.
     #[test]
+    fn turn_callbacks_refuse_missing_or_malformed_admission_ids() {
+        run_local(async {
+            let (client, mut events) = turn_events_channel(16);
+            for bytes in [vec![], vec![0; 15], vec![0; 17]] {
+                let mut request = client.on_turn_started_request();
+                request.get().set_turn_id(&bytes);
+                assert!(request.send().promise.await.err().expect("invalid turn ID must fail").to_string().contains("turn_id"));
+                let mut request = client.on_turn_completed_request();
+                request.get().set_turn_id(&bytes);
+                assert!(request.send().promise.await.err().expect("invalid turn ID must fail").to_string().contains("turn_id"));
+                let mut request = client.on_turn_failed_request();
+                request.get().set_turn_id(&bytes);
+                assert!(request.send().promise.await.err().expect("invalid turn ID must fail").to_string().contains("turn_id"));
+            }
+            assert!(events.try_recv().is_err(), "invalid identities must not reach consumers");
+        });
+    }
+
+    #[test]
     fn started_malformed_context_id_is_an_error_not_a_guess() {
         run_local(async {
             let (client, mut rx) = turn_events_channel(16);
             let mut req = client.on_turn_started_request();
+            let turn_id = kaijutsu_types::TurnId::new();
+            req.get().set_turn_id(turn_id.as_bytes());
             {
                 let mut p = req.get();
                 p.set_context_id(&[0u8; 3]); // not 16 bytes
@@ -1893,6 +1960,8 @@ mod turn_events_tests {
         run_local(async {
             let (client, mut rx) = turn_events_channel(16);
             let mut req = client.on_turn_completed_request();
+            let turn_id = kaijutsu_types::TurnId::new();
+            req.get().set_turn_id(turn_id.as_bytes());
             {
                 let mut p = req.get();
                 p.set_context_id(&[0u8; 3]); // not 16 bytes
