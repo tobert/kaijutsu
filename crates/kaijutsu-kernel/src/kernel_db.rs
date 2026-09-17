@@ -552,7 +552,8 @@ CREATE TABLE IF NOT EXISTS kernel (
 -- A paired caller retains delivery until its result and ask link commit.
 CREATE TABLE IF NOT EXISTS approval_pair_handoffs (
     request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
-    released INTEGER NOT NULL DEFAULT 0 CHECK (released IN (0, 1))
+    released INTEGER NOT NULL DEFAULT 0 CHECK (released IN (0, 1)),
+    abandoned_reason TEXT
 );
 
 -- ── Quiesce (singleton; the row's absence means running) ────────
@@ -2324,7 +2325,7 @@ impl KernelDb {
         Ok(self.conn.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM approval_pair_handoffs WHERE request_id=?1)
              OR EXISTS(SELECT 1 FROM approval_pair_handoffs h JOIN approvals a USING(request_id)
-                 WHERE h.request_id=?1 AND h.released=1 AND a.command_block_id IS NOT NULL
+                 WHERE h.request_id=?1 AND h.released=1 AND h.abandoned_reason IS NULL AND a.command_block_id IS NOT NULL
                  AND a.output_block_id IS NOT NULL AND a.pair_owner IS NOT NULL)",
             [request], |row| row.get(0),
         )?)
@@ -2335,12 +2336,56 @@ impl KernelDb {
         if !self.approval_pair_expected(request)? { return Ok(()); }
         if self.conn.is_autocommit() { return Err(KernelDbError::Validation("approval handoff requires the result transaction".into())); }
         let changed = self.conn.execute(
-            "UPDATE approval_pair_handoffs SET released=1 WHERE request_id=?1
+            "UPDATE approval_pair_handoffs SET released=1 WHERE request_id=?1 AND abandoned_reason IS NULL
              AND EXISTS(SELECT 1 FROM approvals WHERE request_id=?1 AND command_block_id IS NOT NULL
                  AND output_block_id IS NOT NULL AND pair_owner IS NOT NULL)", [request],
         )?;
         if changed != 1 { return Err(KernelDbError::Validation("approval handoff requires a complete pair link".into())); }
         Ok(())
+    }
+
+    pub(crate) fn approval_pair_abandoned_reason(&self, request: &str) -> KernelDbResult<Option<String>> {
+        Ok(self.conn.query_row("SELECT abandoned_reason FROM approval_pair_handoffs WHERE request_id=?1",
+            [request], |row| row.get(0)).optional()?.flatten())
+    }
+
+    /// Retire an unpublished invocation without replacing its reviewer's answer.
+    /// Joins result acceptance; errors require rollback by the caller.
+    pub(crate) fn abandon_approval_pair(&self, request: &str, pair: Option<(&BlockId, &BlockId)>, reason: &str) -> KernelDbResult<()> {
+        if self.conn.is_autocommit() { return Err(KernelDbError::Validation("approval abandonment requires a transaction".into())); }
+        let changed = self.conn.execute(
+            "UPDATE approval_pair_handoffs SET abandoned_reason=?2
+             WHERE request_id=?1 AND released=0 AND abandoned_reason IS NULL", rusqlite::params![request, reason])?;
+        if changed == 0 { return Ok(()); }
+        let row = self.get_approval(request)?.ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request.into()))?;
+        if let Some((command, output)) = pair {
+            if row.context_id != command.context_id.as_bytes() || output.context_id != command.context_id
+                || row.actor_id.as_deref() != Some(command.principal_id.as_bytes().as_slice()) {
+                return Err(KernelDbError::Validation("approval abandonment does not match its context and performer".into()));
+            }
+            match (row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner) {
+                (None, None, None) => {}
+                (Some(prior_command), Some(prior_output), Some(_))
+                    if prior_command == command.to_key() && prior_output == output.to_key() => {}
+                _ => return Err(KernelDbError::Validation("approval abandonment belongs to a different block pair".into())),
+            }
+        } else if row.command_block_id.is_some() || row.output_block_id.is_some() || row.pair_owner.is_some() {
+            return Err(KernelDbError::Validation("linked approval abandonment requires its original pair".into()));
+        }
+        match row.status {
+            crate::ApprovalStatus::Pending | crate::ApprovalStatus::Claimed => {
+                approval_ledger::decide::abandon(self.conn_for_ledger(), request, Some(reason))?;
+            }
+            crate::ApprovalStatus::Allowed | crate::ApprovalStatus::Denied => { self.redeem_ask(request)?; }
+            crate::ApprovalStatus::Abandoned if row.decided_option.as_deref() == Some("cancel") => { self.redeem_ask(request)?; }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unpublished_approval_pairs(&self) -> KernelDbResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT request_id FROM approval_pair_handoffs WHERE released=0 AND abandoned_reason IS NULL ORDER BY request_id")?;
+        Ok(stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
     /// One approval row, whole — the executable source, the cwd, the block
@@ -2476,6 +2521,7 @@ impl KernelDb {
             tracing::info!("migrated builtin embedding configuration to the default lfm2d service");
         }
         let alters = [
+            "ALTER TABLE approval_pair_handoffs ADD COLUMN abandoned_reason TEXT",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
             "ALTER TABLE tracks ADD COLUMN clock_kind TEXT NOT NULL DEFAULT 'system'",
@@ -8414,6 +8460,20 @@ fn make_edge(source: ContextId, target: ContextId, kind: EdgeKind) -> ContextEdg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_handoffs_gain_abandonment_on_existing_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.conn.execute_batch("ALTER TABLE approval_pair_handoffs DROP COLUMN abandoned_reason").unwrap();
+        }
+        let db = KernelDb::open(&path).unwrap();
+        assert!(db.approval_pair_abandoned_reason("missing").unwrap().is_none());
+        drop(db);
+        assert!(KernelDb::open(&path).unwrap().unpublished_approval_pairs().unwrap().is_empty());
+    }
 
     #[test]
     fn legacy_embedding_config_migrates_to_service_and_preserves_disable() {

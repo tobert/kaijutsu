@@ -386,7 +386,6 @@ impl Kernel {
                 let operations = crate::shell_operations::ShellOperationRegistry::new(db.clone())
                     .expect("initialize shell operation registry");
                 operations.recover_result_reviews().expect("recover interrupted result reviews");
-                operations.abandon_unfinished().expect("settle interrupted shell operations");
                 Arc::new(operations)
             },
             turn_state: crate::runtime::turn_state::TurnState::default(),
@@ -396,6 +395,8 @@ impl Kernel {
             cc_inbox: OnceLock::new(),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
+        crate::runtime::approval_resume::recover_unpublished_pairs(&kernel).expect("retire unpublished approval invocations");
+        kernel.shell_operations().abandon_unfinished().expect("settle interrupted shell operations");
         kernel
     }
 

@@ -541,6 +541,31 @@ async fn act_on_executable_answer(
     }
 }
 
+/// No caller survives a kernel restart to finish an unpublished handoff.
+/// Retain the reviewer's decision, but retire its invocation without execution.
+/// Run after captured-result recovery and before generic receipt abandonment.
+pub(crate) fn recover_unpublished_pairs(kernel: &Kernel) -> Result<usize, String> {
+    let held = kernel.kernel_db().lock().unpublished_approval_pairs().map_err(|error| error.to_string())?;
+    let reason = "Kernel restarted before the caller published its Waiting result. Approved source did not run.";
+    for request in &held {
+        let row = kernel.kernel_db().lock().get_approval(request).map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("unpublished approval {request} has no ask"))?;
+        let pair = approval_pair(row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner)?;
+        if let Some((command, output, owner)) = pair {
+            let context = ContextId::try_from_slice(&row.context_id).ok_or("unpublished approval has an invalid context")?;
+            if !kernel.blocks().contains(context) { kernel.blocks().load_one_from_db(context).map_err(|error| error.to_string())?; }
+            let mut outcome = super::command_outcome::CommandOutcome::new(super::command_outcome::CommandExecution::NotRun, 0);
+            outcome.hook = Some(super::command_outcome::CommandHookEffect::Refused {
+                reason: reason.into(), waiting: false, ask_id: Some(request.clone()), refusal: None,
+            });
+            super::command::settle_outcome(kernel, context, &command, &output, &outcome, Some(owner))?;
+        } else {
+            kernel.kernel_db().lock().in_transaction(|db| db.abandon_approval_pair(request, None, reason)).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(held.len())
+}
+
 /// Subscribe and snapshot old answers before accepting new delivery. Startup
 /// failure reaches the host; the worker owns cancellation and joined settlement.
 pub(crate) fn start(kernel: &Arc<Kernel>) -> Result<(), String> {
@@ -903,11 +928,84 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
+    async fn restart_retires_unpublished_asks_without_overwriting_answers() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        use approval_ledger::{decide::{decide, DecideInput}, types::{NewAsk, Origin}};
+        for mode in ["pending", "allowed", "denied", "linked", "released", "model-error", "model-wrong-actor", "model-wrong-context", "model-wrong-pair"] {
+            let dispatcher = test_dispatcher_persistent().await;
+            let kernel = dispatcher.kernel();
+            let actor = PrincipalId::new();
+            let context = register_context(&dispatcher, Some("orphaned-publication"), None, actor);
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let db = kernel.kernel_db().clone();
+            let request = db.lock().create_approval_ask(&NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: PrincipalId::new().as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "lost publisher".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some("never execute this orphan".into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }, true).unwrap();
+            if mode != "pending" {
+                decide(db.lock().conn_for_ledger(), &request, DecideInput { allow: mode != "denied", ..Default::default() }).unwrap();
+            }
+            let pair = if matches!(mode, "linked" | "released") {
+                let (command, output) = test_pair(kernel, context, actor, "never execute this orphan");
+                db.lock().link_ask_blocks(&request, &command, &output, crate::PairOwner::Session).unwrap();
+                if mode == "released" { db.lock().in_transaction(|db| db.release_approval_pair(&request)).unwrap(); }
+                Some((command, output))
+            } else { None };
+            if mode.starts_with("model-") {
+                let invalid = mode != "model-error";
+                let command_actor = if mode == "model-wrong-actor" { PrincipalId::new() } else { actor };
+                let command_context = if mode == "model-wrong-context" {
+                    let other = ContextId::new();
+                    kernel.blocks().create_document(other, crate::DocumentKind::Conversation, None).unwrap();
+                    other
+                } else { context };
+                if mode == "model-wrong-pair" {
+                    let (command, output) = test_pair(kernel, context, actor, "never execute this orphan");
+                    db.lock().link_ask_blocks(&request, &command, &output, crate::PairOwner::Session).unwrap();
+                }
+                let command = kernel.blocks().insert_tool_call_as(command_context, None, None, "shell",
+                    serde_json::json!({"command": "never execute this orphan"}), None, Some(command_actor), None, None).unwrap();
+                let output = kernel.blocks().insert_tool_result(command_context, &command, Some(&command), "", false, None, None).unwrap();
+                let settled = kernel.blocks().settle_tool_result_as(command_context, &command, &output, "publisher stopped",
+                    Status::Error, true, PrincipalId::system(), None, Some(&request));
+                assert_eq!(settled.is_err(), invalid, "a different pair or performer cannot retire this invocation: {settled:?}");
+                assert_eq!(db.lock().approval_pair_abandoned_reason(&request).unwrap().is_some(), !invalid);
+                assert_eq!(approval_ledger::ask::redeemed_at(db.lock().conn_for_ledger(), &request).unwrap().is_some(), !invalid);
+            }
+            let principal = kernel.blocks().principal_id();
+            let workspace = db.lock().get_or_create_default_workspace(principal).unwrap();
+            let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
+            let dir = tempfile::tempdir().unwrap();
+            let recovered = Kernel::new("retire-orphaned-publication", dir.path(), blocks, db.clone()).await;
+            assert_eq!(recover_unpublished_pairs(&recovered).unwrap(), 0, "retirement is idempotent and leaves released asks alone");
+            assert_eq!(db.lock().approval_pair_abandoned_reason(&request).unwrap().is_some(), mode != "released");
+            let row = db.lock().get_approval(&request).unwrap().unwrap();
+            if mode == "pending" {
+                assert_eq!(row.status, crate::ApprovalStatus::Abandoned);
+            } else {
+                assert_eq!(row.status, if mode == "denied" { crate::ApprovalStatus::Denied } else { crate::ApprovalStatus::Allowed });
+                assert_eq!(approval_ledger::ask::redeemed_at(db.lock().conn_for_ledger(), &request).unwrap().is_some(), mode != "released");
+            }
+            if let Some((_, output)) = pair {
+                if mode == "linked" {
+                    assert_eq!(recovered.blocks().get_block_snapshot(context, &output).unwrap().unwrap().status, Status::Error);
+                }
+            } else if !mode.starts_with("model-") {
+                assert!(recovered.blocks().block_snapshots(context).unwrap_or_default().is_empty(), "recovery must not manufacture execution");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn paired_approval_waits_for_original_result_publication() {
         use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
         use approval_ledger::{decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
-        for mode in ["waiting", "link-fault", "release-fault", "stopped"] {
-            let fail_link = matches!(mode, "link-fault" | "release-fault");
+        for mode in ["waiting", "link-fault", "release-fault", "stopped", "abandon-fault"] {
+            let fail_link = matches!(mode, "link-fault" | "release-fault" | "abandon-fault");
             let dispatcher = Arc::new(test_dispatcher_persistent().await);
             dispatcher.set_self_arc();
             let kernel = dispatcher.kernel();
@@ -947,7 +1045,9 @@ mod lifetime_tests {
             assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
             let (command, output) = test_pair(kernel, context, actor, source);
             if fail_link {
-                kernel.kernel_db().lock().conn_for_ledger().execute_batch(if mode == "release-fault" {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(if mode == "abandon-fault" {
+                    "CREATE TRIGGER fail_handoff BEFORE UPDATE OF abandoned_reason ON approval_pair_handoffs BEGIN SELECT RAISE(FAIL, 'handoff fault'); END;"
+                } else if mode == "release-fault" {
                     "CREATE TRIGGER fail_handoff BEFORE UPDATE OF released ON approval_pair_handoffs BEGIN SELECT RAISE(FAIL, 'handoff fault'); END;"
                 } else {
                     "CREATE TRIGGER fail_handoff BEFORE UPDATE OF command_block_id ON approvals BEGIN SELECT RAISE(FAIL, 'handoff fault'); END;"
@@ -957,19 +1057,34 @@ mod lifetime_tests {
             waiting.hook = Some(super::super::command_outcome::CommandHookEffect::Refused {
                 reason: "waiting for review".into(), waiting: true, ask_id: Some(request.clone()), refusal: None,
             });
-            if mode == "stopped" { waiting.settlement_error = Some("caller stopped before handing off execution".into()); }
+            if matches!(mode, "stopped" | "abandon-fault") { waiting.settlement_error = Some("caller stopped before handing off execution".into()); }
             let result = super::super::command::settle_outcome(kernel, context, &command, &output, &waiting, Some(crate::PairOwner::Session));
             if fail_link {
                 assert!(result.unwrap_err().contains("handoff fault"));
                 assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Deferred));
                 assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+                if mode == "abandon-fault" {
+                    let db = kernel.kernel_db().clone();
+                    assert!(db.lock().approval_pair_abandoned_reason(&request).unwrap().is_none());
+                    db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_handoff").unwrap();
+                    let principal = kernel.blocks().principal_id();
+                    let workspace = db.lock().get_or_create_default_workspace(principal).unwrap();
+                    let restored = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
+                    restored.load_one_from_db(context).unwrap();
+                    assert_eq!(restored.get_block_snapshot(context, &output).unwrap().unwrap().status, Status::Running);
+                    let dir = tempfile::tempdir().unwrap();
+                    let recovered = Kernel::new("recover-retirement", dir.path(), restored, db.clone()).await;
+                    assert!(db.lock().approval_pair_abandoned_reason(&request).unwrap().is_some());
+                    assert!(approval_ledger::ask::redeemed_at(db.lock().conn_for_ledger(), &request).unwrap().is_some());
+                    assert_eq!(recovered.blocks().get_block_snapshot(context, &output).unwrap().unwrap().status, Status::Error);
+                }
             } else if mode == "stopped" {
                 result.unwrap();
                 assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Deferred),
                     "a terminal caller failure must not release approved source");
                 assert!(kernel.kernel_db().lock().approval_pair_expected(&request).unwrap());
                 assert!(!kernel.kernel_db().lock().approval_pair_ready(&request).unwrap());
-                assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+                assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_some());
                 assert_eq!(kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap().status, Status::Error);
             } else {
                 result.unwrap();

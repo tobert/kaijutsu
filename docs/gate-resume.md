@@ -459,8 +459,19 @@ The driver checks release before admission, under the claim's database guard.
 Matching gate retries cannot redeem a paired executable ask: its original
 operation owns the answer. They report that ownership without an AskRef that
 a new caller might attach to another pair. Non-executable asks remain eligible
-for retry after publication. Failed or stopped publication stays held; explicit
-recovery/abandonment and durable notification delivery remain open.
+for retry after publication. Terminal publication abandons an unreleased
+invocation in the result transaction. Pending asks become Abandoned; Allowed
+and Denied decisions remain intact and their answers are spent without execution.
+`kj ledger show` reports the publication abandonment reason separately from the
+decision, including `publication_abandoned` in structured data.
+
+At startup, retained result projections recover first. Any remaining unreleased
+invocation has lost its caller and is abandoned; linked pairs settle to Error,
+and unlinked asks create no execution. This precedes generic unfinished receipt
+abandonment. A failed write rolls back retirement, and startup fails visibly so
+recovery can retry. An abrupt live failure without a terminal result still holds
+its ask until restart. Unlinked original-pair recovery and durable notification
+delivery remain open.
 
 Shutdown stops delivery, cancels preparation and commands, and waits for command
 settlement. A spent claim never authorizes replay, including after a preparation

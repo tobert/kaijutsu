@@ -1527,14 +1527,18 @@ impl BlockStore {
         content: &str, status: Status, is_error: bool, author: PrincipalId,
         ansi: Option<(Vec<kaijutsu_types::StyleSpan>, &[u8])>, ask: Option<&str>,
     ) -> BlockStoreResult<()> {
-        let ask = if status == Status::Waiting {
-            Some(ask.ok_or_else(|| BlockStoreError::Validation("waiting tool result has no ask".into()))?)
-        } else { None };
+        if status == Status::Waiting && ask.is_none() {
+            return Err(BlockStoreError::Validation("waiting tool result has no ask".into()));
+        }
         self.settle_tool_result_recorded(context_id, call, result,
             ToolResultUpdate { content, status, is_error, author, ansi, shell: None }, |db| {
                 if let Some(ask) = ask {
-                    db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?;
-                    db.release_approval_pair(ask)?;
+                    if status == Status::Waiting {
+                        db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?;
+                        db.release_approval_pair(ask)?;
+                    } else if matches!(status, Status::Done | Status::Error) {
+                        db.abandon_approval_pair(ask, Some((call, result)), "Caller stopped before publishing its Waiting result. Approved source did not run.")?;
+                    }
                 }
                 Ok(())
             })

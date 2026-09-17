@@ -320,7 +320,7 @@ enum LedgerCommand {
         signals: bool,
     },
     /// Show one pending or decided ask, its statement, identities, decision,
-    /// and execution inputs. Result reviews include captured execution and
+    /// execution inputs, and publication abandonment. Result reviews include captured execution and
     /// the settled result, even when the command authored no transcript pair.
     Show {
         /// The ask to show. Request ids come from `kj ledger list`.
@@ -774,6 +774,10 @@ impl KjDispatcher {
             Ok(at) => at,
             Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
         };
+        let publication_abandoned = match db.approval_pair_abandoned_reason(request_id) {
+            Ok(reason) => reason,
+            Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
+        };
         // The free-variable values an approval runs with, recorded on the
         // ask at raise time (`docs/gate-shape-b.md`, "The ask carries its
         // free variables") — always loaded, not gated on `--signals`, since
@@ -876,6 +880,9 @@ impl KjDispatcher {
         if let Some(reason) = &row.auto_reason {
             lines.push(format!("auto:       {reason}"));
         }
+        if let Some(reason) = &publication_abandoned {
+            lines.push(format!("publication: abandoned — {reason}"));
+        }
         // Only a decided ask can be spent, so `redeemed: no` on a pending
         // one would state a fact about a question nobody has answered.
         if matches!(row.status, ApprovalStatus::Allowed | ApprovalStatus::Denied) {
@@ -927,6 +934,7 @@ impl KjDispatcher {
             "decided_option": row.decided_option,
             "remember_scope": row.remember_scope,
             "redeemed_at": redeemed_at,
+            "publication_abandoned": publication_abandoned,
             "status": row.status.to_string(),
             "origin": row.origin.to_string(),
             "instance": row.instance,
@@ -2360,18 +2368,26 @@ mod tests {
         let _ = gate.await;
     }
 
-    /// `show` reports the two identity fields redemption turns on, and
-    /// whether the answer has been spent. `find_redeemable` matches on
-    /// `principal_id` and `context_id`; until this landed, neither was
-    /// printed anywhere, so an answered ask that minted a SECOND ask
-    /// instead of redeeming looked identical to one nobody had answered.
-    ///
-    /// The three-phase walk is the point: pending (no redemption line at
-    /// all — nothing has been answered), answered-and-unspent, and spent.
-    ///
-    /// Falsified by dropping the `principal:` line, and separately by
-    /// making the spent phase's line unconditional — the pending assertion
-    /// then trips. Reverted afterward.
+    #[tokio::test]
+    async fn ledger_show_distinguishes_an_answer_from_an_abandoned_invocation() {
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let mut paired = spec();
+        paired.publishes_pair = true;
+        let request = gate_once(&d, &c, paired).await.ask.unwrap().request_id;
+        assert!(d.dispatch(&[s("ledger"), s("allow"), s(&request)], &answering_seat()).await.is_ok());
+        d.kernel_db.lock().in_transaction(|db| db.abandon_approval_pair(&request, None, "Caller stopped. Approved source did not run.")).unwrap();
+        let shown = d.dispatch(&[s("ledger"), s("show"), s(&request)], &c).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        assert!(shown.message().contains("publication: abandoned"), "{}", shown.message());
+        assert!(shown.message().contains("Approved source did not run."));
+        let KjResult::Ok { data: Some(data), .. } = shown else { panic!("missing structured ask"); };
+        assert_eq!(data["status"], "allowed");
+        assert!(data["redeemed_at"].is_number());
+        assert_eq!(data["publication_abandoned"], "Caller stopped. Approved source did not run.");
+    }
+
+    /// Identity and redemption remain distinct across pending, answered and spent asks.
     #[tokio::test]
     async fn ledger_show_reports_the_principal_and_whether_the_answer_is_spent() {
         let d = test_dispatcher().await;

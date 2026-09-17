@@ -248,6 +248,7 @@ pub fn expire(conn: &Connection, request_id: &str) -> Result<ApprovalRow> {
 
 /// Fail an ask closed because whatever was waiting on it gave up:
 /// `pending`/`claimed` → `abandoned`. Guarantee 2's abandonment leg.
+/// Joins an existing transaction; its caller must roll back on error.
 pub fn abandon(conn: &Connection, request_id: &str, reason: Option<&str>) -> Result<ApprovalRow> {
     transition(conn, request_id, "abandoned", EventKind::Abandoned, reason)
 }
@@ -408,9 +409,11 @@ fn transition(
     event_kind: EventKind,
     note: Option<&str>,
 ) -> Result<ApprovalRow> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let tx = if conn.is_autocommit() {
+        Some(Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?)
+    } else { None };
 
-    let updated = tx
+    let updated = conn
         .query_row(
             &format!(
                 "UPDATE approvals SET status = ?1
@@ -423,12 +426,12 @@ fn transition(
         .optional()?;
 
     if let Some(row) = updated {
-        events::append(&tx, request_id, event_kind, None, None, None, None, note)?;
-        tx.commit()?;
+        events::append(conn, request_id, event_kind, None, None, None, None, note)?;
+        if let Some(tx) = tx { tx.commit()?; }
         return Ok(row);
     }
 
-    let existing = tx
+    let existing = conn
         .query_row(
             &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
             params![request_id],
@@ -524,6 +527,23 @@ mod tests {
     use crate::types::{ApprovalStatus, EventKind};
 
     use super::*;
+
+    #[test]
+    fn abandonment_participates_in_its_callers_transaction() {
+        let conn = open_memory();
+        let request = create_ask(&conn, &minimal_ask()).unwrap();
+        let before = list_events(&conn, &request).unwrap().len();
+        let tx = conn.unchecked_transaction().unwrap();
+        abandon(&tx, &request, Some("caller stopped")).unwrap();
+        assert_eq!(get_approval(&tx, &request).unwrap().unwrap().status, ApprovalStatus::Abandoned);
+        tx.rollback().unwrap();
+        assert_eq!(get_approval(&conn, &request).unwrap().unwrap().status, ApprovalStatus::Pending);
+        assert_eq!(list_events(&conn, &request).unwrap().len(), before);
+        let tx = conn.unchecked_transaction().unwrap();
+        abandon(&tx, &request, Some("caller stopped")).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(get_approval(&conn, &request).unwrap().unwrap().status, ApprovalStatus::Abandoned);
+    }
 
     #[test]
     fn redemption_participates_in_its_callers_transaction() {

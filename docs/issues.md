@@ -1431,10 +1431,22 @@ terminal failure do not authorize execution. Driver admission and matching gate
 retries honor that ownership. A publication event wakes answers deferred before
 the pair existed. Quiet, streaming and direct foreground calls declare no pair.
 
-Failed or stopped publication can leave a held ask. Define explicit recovery or
-abandonment, retaining the rule that a terminal caller failure never releases
-source for execution. Claimed execution still needs durable notification retry.
-See docs/gate-resume.md, "Still open".
+Terminal publication now retires an unreleased invocation with its result.
+Startup recovers captured projections, then retires remaining unpublished asks
+without execution. Pending asks become Abandoned; terminal reviewer decisions
+remain intact. `kj ledger show` distinguishes publication abandonment from the
+answer. Linked pairs settle to Error; retirement faults roll back and retry on
+restart.
+
+A live caller that fails without publishing a terminal result still leaves a
+hold until restart. An ask that never linked its original pair cannot identify
+that pair for recovery. The generic unfinished-operation sweep stores an error
+receipt without projecting it into those blocks; finish that ownership audit.
+The typed client's AskDetail still drops `publication_abandoned`; propagate it
+into the GUI/TUI ask detail so those views explain retirement as `kj ledger show`
+already does. Redemption means answer consumption, not proof of execution.
+Claimed execution still needs durable notification retry. See docs/gate-resume.md,
+"Still open".
 
 ## Asks vs forms — decision open (2026-08-22)
 

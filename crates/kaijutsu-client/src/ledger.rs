@@ -322,9 +322,9 @@ pub struct AskDetail {
     /// pending. Finer than `status`, which says only `allowed`/`denied`.
     pub decided_option: Option<String>,
     pub remember_scope: Option<String>,
-    /// When this decision was redeemed (actually executed), or `None` when
-    /// it never was, or the ask is still pending. `docs/tui.md`'s "was this
-    /// consumed" question.
+    /// When this answer was consumed, or `None` while pending or unspent.
+    /// Consumption can deliver a refusal or retire an unpublished invocation;
+    /// it does not prove that source executed.
     pub redeemed_at: Option<i64>,
 }
 

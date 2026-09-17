@@ -1533,6 +1533,7 @@ fn quiet_result_review_keeps_its_result_without_a_transcript_pair() {
             &["ledger".into(), "show".into(), "--help".into()]).await.unwrap();
         println!("Published ledger show help:\n{}", help.stdout);
         assert!(help.stdout.contains("captured execution"), "{}", help.stdout);
+        assert!(help.stdout.contains("publication abandonment"), "{}", help.stdout);
         let before = s.kernel.documents.block_snapshots(s.worker).unwrap().len();
         let replacement = serde_json::json!({"reviewed": "quiet"});
         let mut hooks = s.kernel.kernel.broker().hooks().write().await;

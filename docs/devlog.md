@@ -2113,7 +2113,18 @@ Non-executable answers can still return to retry after release. A third test
 showed why linkage alone was insufficient: a caller could link while publishing
 a terminal error. Release now commits only with a Waiting result. Link or release
 faults roll back together, and publication wakes an already-deferred answer.
-Held-ask recovery/abandonment and claimed notification delivery remain open.
+Terminal results now retire their unreleased invocation in the same transaction.
+A pending ask becomes Abandoned; a terminal reviewer answer remains unchanged
+but is spent without executing source. Publication abandonment has its own
+reason in `kj ledger show`, so an Allowed decision never implies execution.
+
+Startup first recovers retained results, then retires unpublished invocations,
+and only then applies generic unfinished-receipt abandonment. This ordering
+keeps generic cleanup from taking a receipt that still has a more specific
+settlement. Tests reproduce pending holds surviving restart and answered holds
+remaining unspent after terminal failure; fault injection checks retirement and
+result rollback together. Unlinked original-pair recovery, abrupt live failure
+without a result, and claimed notification delivery remain open.
 
 ## The kernel with no one to answer to (September 16)
 
