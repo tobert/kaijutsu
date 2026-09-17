@@ -469,6 +469,42 @@ fn editor_shell_reads_complete_text_and_refuses_binary_over_the_wire() {
 }
 
 #[test]
+fn read_only_model_shell_cannot_drive_editor_mutations_over_the_wire() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let contexts = kernel.list_contexts().await.unwrap();
+        let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        kernel.join_context(context, "readonly-editor").await.unwrap();
+        let opened = kernel.execute_kj(context, &["editor".into(), "open".into(), RC_PATH.into()]).await.unwrap();
+        assert_eq!(opened.exit_code, 0, "{opened:?}");
+        let session = opened.data.unwrap()["session"].as_u64().unwrap();
+        let original = kernel.editor_state(session).await.unwrap();
+        for command in [
+            format!("kj editor keys {session} ':r !echo must-not-land<CR>'"),
+            "kj block $(echo create) --role user --kind text --content must-not-land".to_string(),
+            "block_create --role user --kind text --content must-not-land".to_string(),
+        ] {
+            let refused = kernel.call_mcp_tool("shell", &serde_json::json!({
+                "command": command, "foreground": true,
+            })).await.unwrap();
+            assert!(refused.is_error && refused.content.contains("read-only"), "{command}: {refused:?}");
+        }
+        let unchanged = kernel.editor_state(session).await.unwrap();
+        assert_eq!(unchanged.text, original.text);
+        assert_eq!(unchanged.dirty, original.dirty);
+        let read = kernel.call_mcp_tool("shell", &serde_json::json!({
+            "command": "kj editor list", "foreground": true,
+        })).await.unwrap();
+        assert!(!read.is_error, "{read:?}");
+        let direct = kernel.editor_keys(session, ":r !echo direct-read<CR>").await.unwrap();
+        assert_eq!(direct.text, format!("direct-read\n{}", original.text));
+        kernel.editor_keys(session, ":q!<CR>").await.unwrap();
+    });
+}
+
+#[test]
 fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
     // The `open_editor` peer signal (vi.md step 2): a human's `vi <path>` in the
     // app shell must nudge the submitter's app windows to pop a renderer. We

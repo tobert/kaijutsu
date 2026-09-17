@@ -407,7 +407,8 @@ push channel; the app renders it read-only.
   reports on the `:` status line and leaves the buffer unchanged. Shell output
   uses the internal 4 MiB limit; redirect larger output to a file, then use
   `:r <file>`. Caller cancellation and kernel shutdown stop the shell read.
-  Local cwd/export changes in that shell are not written back.
+  Local cwd/export changes in that shell are not written back. Read-only model
+  shells refuse editor opens and input; use `shell_write` to drive an editor.
 - **No `:!`, deliberately.** It was the entire source of complexity — nested
   editor sessions, a return stack, ephemeral-block lifecycle. The **shell is
   already a surface a keystroke away**: **Ctrl+Z** (a local app intercept —

@@ -1808,6 +1808,20 @@ and task writes. These now attribute content and edit provenance to the
 performer. Lower-level identity constructors are crate-private, with explicit
 engine fixtures retained.
 
+Kaibo's follow-up review exposed mutating tool paths in the read-only model
+shell. A broker-level regression created blocks, allocated editor sessions,
+and changed an existing editor through `:r !cmd`. Read-only `kj` now classifies
+resolved argv before dispatch; generic MCP calls, editor tools, and curl are
+refused. Existing effect declarations remain authoritative. Kaish's aggregate
+backend read-only flag includes its writable temporary overlays, so the
+integration carries the contextual policy explicitly instead of inferring it
+from that flag. Unknown commands retain exit 127, and help and reads remain
+available. This is execution policy within the shared trust boundary.
+The read-only check also exposed that synthesis arguments lived outside the
+shared command declaration. `kj synth` now parses, classifies, and renders help
+from that declaration. Synthesis status/help and the dispatcher's existing
+trailing-help normalization remain available without a separate read allow-list.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

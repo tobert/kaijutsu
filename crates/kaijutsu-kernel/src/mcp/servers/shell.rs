@@ -117,26 +117,16 @@ static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-// Read-only variant's kaijutsu-specific half: same return contract, plus what
-// makes it read-only (no mutation, no external commands) and the document views
-// it can still read (`/v/docs`) that a host-only read-only shell
-// wouldn't have.
-//
-// Names `shell_write` as where external commands live. The refusal a model
-// meets at runtime states its condition and stops there, deliberately — the
-// remedy belongs to the layer that configured the condition, which is this
-// description. Without it a model reads "command not found" and concludes the
-// binary is missing.
+// The model sees the policy and the writable alternative alongside kaish syntax.
 static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Run a READ-ONLY command in your current kernel context using kaish \
-         (会sh). This shell cannot mutate anything: every file write/delete/\
-         move and every external command is refused — the binary is still \
-         installed and on PATH, so reach for `shell_write` when you need to \
-         run one, rather than concluding it is missing. Use this tool to \
-         inspect — read files, `grep`, `find`, walk the tree, and read the \
-         kernel document view under `/v/docs`; `kj` is \
-         in scope for read-only context introspection. {}\n\n{}",
+         (会sh). Submitted commands cannot mutate shared state. File writes, \
+         external commands, mutating `kj` verbs, editor input, `curl`, and MCP \
+         calls are refused. Use `shell_write` for those operations. Host tools \
+         may still be installed and on PATH. Inspect with filesystem builtins \
+         (`cat`, `grep`, `find`), `/v/docs`, and read-only `kj` commands. \
+         Help and local shell variables remain available. {}\n\n{}",
         RETURN_CONTRACT, &*COMPOSED_TOOL_DESCRIPTION
     )
 });
@@ -445,7 +435,7 @@ mod tests {
 
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
         assert!(
-            ro_text.contains("cannot mutate anything"),
+            ro_text.contains("cannot mutate shared state"),
             "read-only contract must survive: {ro_text}"
         );
         assert!(
@@ -457,10 +447,7 @@ mod tests {
                 && ro_text.contains("Read `status`"),
             "return contract must survive on the read-only variant too: {ro_text}"
         );
-        // The runtime refusal names its condition and stops, by design, so
-        // this description is the only place a model learns where external
-        // commands live. Without it, `command not found` reads as a missing
-        // binary and a model abandons a viable path.
+        // Execution refusal does not imply a host binary is absent.
         assert!(
             ro_text.contains("`shell_write`") && ro_text.contains("on PATH"),
             "the read-only description must name `shell_write` as where \

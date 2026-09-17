@@ -71,26 +71,24 @@ pub struct EmbeddedKaish {
     timeouts: kaijutsu_types::TimeoutPolicy,
 }
 
-/// Refuses kaish job-control operations in a read-only materialization.
-///
-/// A context shares its job manager across short-lived shells. Replacing these
-/// names after kaish registers builtins keeps a read-only shell from cancelling
-/// or changing another invocation's operation through that shared manager.
-struct ReadOnlyJobControlBuiltin {
+/// Refuse tools whose effects cannot be limited to observation. Register these
+/// after the invocation's tools so a read-only shell cannot replace the refusal.
+struct ReadOnlyDeniedBuiltin {
     name: &'static str,
+    reason: &'static str,
 }
 
 #[async_trait::async_trait]
-impl Tool for ReadOnlyJobControlBuiltin {
+impl Tool for ReadOnlyDeniedBuiltin {
     fn name(&self) -> &str { self.name }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema::new(self.name, "Not available in a read-only kaijutsu shell.")
+        ToolSchema::new(self.name, "Not available in a read-only kaijutsu shell; use shell_write.")
     }
 
     async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
         ExecResult::failure(1, format!(
-            "{} is not available in a read-only kaijutsu shell: job control can change a shared context operation", self.name
+            "{} is not available in a read-only kaijutsu shell: {}; use shell_write", self.name, self.reason,
         ))
     }
 }
@@ -424,7 +422,12 @@ impl EmbeddedKaish {
                 configure_tools(ctx_for_tools, sid_for_tools, tools);
                 if read_only {
                     for name in ["kill", "bg", "fg"] {
-                        tools.register(ReadOnlyJobControlBuiltin { name });
+                        tools.register(ReadOnlyDeniedBuiltin { name,
+                            reason: "job control can change a shared context operation" });
+                    }
+                    for name in ["vi", "edit", "curl"] {
+                        tools.register(ReadOnlyDeniedBuiltin { name,
+                            reason: "the tool can change shared or remote state" });
                     }
                     tools.register(ReadOnlyJobsBuiltin);
                 }

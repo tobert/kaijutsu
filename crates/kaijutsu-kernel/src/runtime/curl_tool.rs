@@ -1,10 +1,8 @@
 //! The kaijutsu-wide `curl` tool: one configuration, registered once.
 //!
-//! [`curl_tool`] is called from exactly one site —
-//! `kj::context_shell`'s `configure_tools` closure — which every
-//! materialized shell shares (rc, hook bodies, the interactive shell, the
-//! MCP `shell`/`shell_write` tools, read-only shells). One call site means
-//! one allowlist and one ceiling; there is no second place this could drift.
+//! `runtime::context_shell` registers this configuration for contextual shells.
+//! Read-only construction replaces the tool with a refusal; network calls use
+//! the writable shell. Other policies share one host allowlist and ceiling.
 
 use kaish_tools_curl::{AllowByList, CurlConfig, CurlTool, Limits};
 

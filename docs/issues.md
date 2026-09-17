@@ -117,10 +117,6 @@ retain that finding for the adapter audit instead of treating an empty result
 as proof that loading succeeded.
 
 Kaibo's identity review found remaining adapter policy/provenance gaps:
-- Read-only construction blocks filesystem and host execution, but still
-  exposes mutating `kj` and MCP tools. An editor opened there can run an
-  Internal shell through `:r !cmd`. Pin the intended read-only contract through
-  the actual model shell, including nested calls, before completing this row.
 - `/v/docs` writes and editor mirrors call `edit_text` with the store's default
   principal. Carry the mutation performer's identity. For shared editor input,
   distinguish the player making the edit from the opener retained for shell

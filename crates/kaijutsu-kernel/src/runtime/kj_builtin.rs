@@ -1,8 +1,8 @@
 //! `kj` kaish builtin — routes argv through `KjDispatcher`.
 //!
 //! Registered as a kaish Tool in EmbeddedKaish via the `configure_tools` callback.
-//! Each connection gets its own `KjBuiltin` instance with the shared dispatcher
-//! plus per-connection identity.
+//! Each invocation has its own identity and session map. Context switches change
+//! the map; requester, performer, and reviewer remain fixed.
 //!
 //! ## Synthesis command interception
 //!
@@ -22,18 +22,17 @@ use crate::kj::{KjCaller, KjDispatcher, KjResult};
 use kaijutsu_types::{ContentType, ContextId, PrincipalId, SessionId};
 
 use super::context_engine::{SessionContextExt, SessionContextMap};
+use super::context_shell::ShellIdentity;
 
 /// kaish builtin tool for the `kj` command.
 ///
-/// Bridges kaish's `Tool` trait to `KjDispatcher`. Each connection gets its own
-/// `KjBuiltin` with the shared dispatcher and per-connection identity fields.
+/// Bridges kaish's `Tool` trait to `KjDispatcher`. Resolved argv is classified
+/// before dispatch when the invocation is read-only.
 pub struct KjBuiltin {
     dispatcher: Arc<KjDispatcher>,
     session_contexts: SessionContextMap,
-    principal_id: PrincipalId,
-    actor_id: PrincipalId,
-    reviewer_id: Option<PrincipalId>,
-    session_id: SessionId,
+    identity: ShellIdentity,
+    read_only: bool,
     /// Semantic index for synthesis commands. None if embedding model not configured.
     semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
     /// Block source adapter for fetching context blocks during synthesis.
@@ -47,44 +46,19 @@ pub struct KjBuiltin {
 
 impl KjBuiltin {
     pub fn new(
-        dispatcher: Arc<KjDispatcher>,
-        session_contexts: SessionContextMap,
-        principal_id: PrincipalId,
-        session_id: SessionId,
-        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
-        block_source: Arc<dyn kaijutsu_index::BlockSource>,
-        privileged: bool,
-    ) -> Self {
-        Self {
-            dispatcher,
-            session_contexts,
-            principal_id,
-            actor_id: principal_id,
-            reviewer_id: None,
-            session_id,
-            semantic_index,
-            block_source,
-            privileged,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_as(
         dispatcher: Arc<KjDispatcher>, session_contexts: SessionContextMap,
-        principal_id: PrincipalId, actor_id: PrincipalId, reviewer_id: Option<PrincipalId>,
-        session_id: SessionId, semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
-        block_source: Arc<dyn kaijutsu_index::BlockSource>, privileged: bool,
+        identity: ShellIdentity, semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>, privileged: bool, read_only: bool,
     ) -> Self {
-        Self { dispatcher, session_contexts, principal_id, actor_id, reviewer_id, session_id,
-            semantic_index, block_source, privileged }
+        Self { dispatcher, session_contexts, identity, semantic_index, block_source, privileged, read_only }
     }
 
     fn current_context_id(&self) -> Option<ContextId> {
-        self.session_contexts.current(&self.session_id)
+        self.session_contexts.current(&self.identity.session)
     }
 
     fn set_context_id(&self, id: ContextId) {
-        self.session_contexts.insert(self.session_id, id);
+        self.session_contexts.insert(self.identity.session, id);
     }
 
     /// Persist the current context's cwd to KernelDb so it survives session
@@ -189,18 +163,27 @@ impl KjBuiltin {
 
     /// Dispatch `kj synth <subcommand>`.
     async fn dispatch_synth(&self, argv: &[String], caller: &KjCaller) -> ExecResult {
-        let force = argv.iter().any(|arg| arg == "--force");
-        let args: Vec<&str> = argv.iter().map(String::as_str).filter(|arg| *arg != "--force").collect();
-        let sub = args.first().copied().unwrap_or("help");
-        if args.len() > 1 || (force && matches!(sub, "status" | "rebuild" | "help" | "--help" | "-h")) {
-            return ExecResult::failure(2, "usage: kj synth <context|all> [--force], or kj synth <status|rebuild|help>");
+        use clap::FromArgMatches;
+        let parsed = crate::kj::effect::cached_kj_args_command().try_get_matches_from(
+            std::iter::once("synth").chain(argv.iter().map(String::as_str)),
+        ).and_then(|matches| crate::kj::effect::KjArgs::from_arg_matches(&matches));
+        let (target, force) = match parsed {
+            Ok(crate::kj::effect::KjArgs { command: crate::kj::effect::KjCommand::Synth { target, force }, .. }) => (target, force),
+            Ok(_) => unreachable!("synth parser starts with the synth verb"),
+            Err(error) if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp) => {
+                return ExecResult::success(error.to_string());
+            }
+            Err(error) => return ExecResult::failure(2, error.to_string()),
+        };
+        let sub = target.as_str();
+        if force && matches!(sub, "status" | "rebuild" | "help") {
+            return ExecResult::failure(2, "--force applies only to synthesis for a context or all active contexts");
         }
         match sub {
             "all" => self.synth_all(force).await,
             "status" => self.synth_status(),
             "rebuild" => self.synth_rebuild().await,
-            "help" | "--help" | "-h" => ExecResult::success(Self::synth_help()),
-            _ if sub.starts_with('-') => ExecResult::failure(2, format!("unknown synth option: {sub}")),
+            "help" => ExecResult::success(Self::synth_help()),
             _ => self.synth_context(sub, caller, force).await,
         }
     }
@@ -325,25 +308,10 @@ impl KjBuiltin {
     }
 
     fn synth_help() -> String {
-        "\
-kj synth — semantic indexing + keyword synthesis
-
-Commands:
-  kj synth all [--force] Index and synthesize all active contexts
-  kj synth <ctx> [--force] Index and synthesize a specific context
-  kj synth status       Show index statistics
-  kj synth rebuild      Compact the HNSW index (reclaim evicted slots)
-  kj synth help         Show this help
-
-Unchanged synthesis is reused. --force recomputes synthesis.\n\nContext references: . (current), .parent, label, hex prefix
-
-Examples:
-  kj synth .            Synthesize current context
-  kj synth all          Bulk index + synthesize everything
-  kj synth explore      Synthesize context labeled \"explore\"
-  kj synth status       Show model info and index count"
-            .to_string()
+        crate::kj::kj_command().find_subcommand_mut("synth")
+            .expect("synth is declared in the shared command tree").render_long_help().to_string()
     }
+
 }
 
 #[async_trait]
@@ -457,6 +425,29 @@ impl Tool for KjBuiltin {
         // kaish still owns global output flags such as --json.
         let mut argv = args.words_argv();
 
+        // Classify resolved argv at dispatch, including substitutions and
+        // dynamically selected verbs. This is the factory's invocation policy;
+        // kaish's overlay backend may have writable temporary mounts.
+        if self.read_only {
+            use crate::kj::effect::{classify, ClassifyError, Effect};
+            let normalized = crate::kj::parse::normalize_trailing_help(&argv);
+            match classify(&normalized) {
+                Ok(Effect::Read) => {}
+                Ok(_) => return ExecResult::failure(1,
+                    "kj: this command changes state and is unavailable in a read-only shell; use shell_write"),
+                Err(ClassifyError::Parse(error)) => {
+                    if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                        | clap::error::ErrorKind::DisplayVersion) {
+                        // The ordinary dispatcher owns help rendering. A help
+                        // parse returns before any handler can change state.
+                    } else {
+                        return ExecResult::failure(2, error.to_string());
+                    }
+                }
+            }
+        }
+
         // Extract the bare --confirm flag before dispatch. kaish 0.14 deleted
         // the confirmation latch and with it the nonce store this used to
         // round-trip through, so presence of the flag IS the confirmation.
@@ -488,18 +479,18 @@ impl Tool for KjBuiltin {
         };
 
         let caller = KjCaller {
-            principal_id: self.principal_id,
-            actor_id: self.actor_id,
-            reviewer_id: self.reviewer_id,
+            principal_id: self.identity.requester,
+            actor_id: self.identity.performer,
+            reviewer_id: self.identity.reviewer,
             context_id: self.current_context_id(),
-            session_id: self.session_id,
+            session_id: self.identity.session,
             confirmed,
             rc_depth,
             privileged: self.privileged,
         };
 
-        // Server-crate commands intercepted here because they require
-        // dependencies that kaijutsu-kernel does not have.
+        // Synthesis uses this invocation's explicit index and block source;
+        // its arguments and effects belong to the shared kj command tree.
         if argv.first().map(|s| s.as_str()) == Some("synth") {
             return self.dispatch_synth(&argv[1..], &caller).await;
         }
@@ -809,11 +800,11 @@ mod tests {
                 tools.register(KjBuiltin::new(
                     dispatcher,
                     scm,
-                    PrincipalId::system(),
-                    sid,
+                    ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
+                        reviewer: None, context: ctx, session: sid },
                     index,
                     source,
-                    false,
+                    false, false,
                 ));
             };
 

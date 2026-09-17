@@ -591,6 +591,17 @@ impl KernelBackend for MountBackend {
         args: ToolArgs,
         ctx: &mut dyn ToolCtx,
     ) -> BackendResult<ToolResult> {
+        // MCP metadata carries no effect contract. Read-only inspection uses
+        // filesystem builtins and classified `kj` reads; arbitrary tools need
+        // the writable shell even when a context's binding permits them.
+        if self.read_only {
+            if self.docs_tools.get_tool(name).await?.is_none() {
+                return Err(BackendError::ToolNotFound(name.to_string()));
+            }
+            return Err(BackendError::PermissionDenied(format!(
+                "{name}: MCP calls are unavailable in a read-only shell; use shell_write",
+            )));
+        }
         self.docs_tools.call_tool(name, args, ctx).await
     }
 

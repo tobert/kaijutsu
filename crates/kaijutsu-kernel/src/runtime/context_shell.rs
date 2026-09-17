@@ -31,7 +31,8 @@ pub enum ShellPolicy {
     Agent,
     /// Hook and editor output uses the internal limit, without rc authority.
     Internal,
-    /// Filesystem writes, host execution, and shared job mutation are refused.
+    /// Shared file/state writes, host execution, MCP calls, and network tools
+    /// are refused. Only classified `kj` reads and local shell operations run.
     ReadOnly,
     /// Only lifecycle orchestration can supply the authority to widen a loadout.
     Rc(RcAuthority),
@@ -61,8 +62,7 @@ impl EmbeddedKaish {
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Result<Self> {
         let ShellIdentity {
-            requester: principal, performer: actor, reviewer,
-            context: context_id, session: session_id,
+            requester: principal, context: context_id, session: session_id, ..
         } = identity;
         let (privileged, read_only, output) = match policy {
             ShellPolicy::Agent => (false, false, OutputProfile::Agent),
@@ -82,7 +82,7 @@ impl EmbeddedKaish {
         })?;
         let configure_tools =
             move |scm: SessionContextMap,
-                  sid: SessionId,
+                  _sid: SessionId,
                   tools: &mut kaish_kernel::ToolRegistry| {
                 let d = kj_dispatcher;
                 tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
@@ -98,19 +98,16 @@ impl EmbeddedKaish {
                 ));
                 // Replace the host process listing with Kaijutsu jobs.
                 tools.register(crate::runtime::ps_builtin::PsBuiltin::new(true));
-                tools.register(crate::runtime::kj_builtin::KjBuiltin::new_as(
+                tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
                     d,
                     scm,
-                    principal,
-                    actor,
-                    reviewer,
-                    sid,
+                    identity,
                     semantic_index,
                     block_source,
-                    privileged,
+                    privileged, read_only,
                 ));
-                // Network access to the configured inference endpoint is
-                // independent of filesystem and host-execution policy.
+                // The read-only interpreter replaces curl with an explicit
+                // refusal after tool registration.
                 tools.register(crate::runtime::curl_tool::curl_tool());
             };
 
@@ -369,6 +366,11 @@ mod tests {
                 ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
             kaish.set_context_id(switched);
             let result = kaish.execute_with_options("identity-probe", ExecuteOptions::default()).await.unwrap();
+            if read_only {
+                assert!(!result.ok() && result.err.contains("read-only"), "{result:?}");
+                assert!(calls.lock().is_empty(), "read-only refusal happens before MCP dispatch");
+                continue;
+            }
             assert!(result.ok(), "{result:?}");
             let calls = calls.lock();
             assert_eq!(calls.len(), 1);
@@ -461,6 +463,61 @@ mod tests {
             assert!(initial_blocks.is_empty(), "{front_door}: unexpected initial-context blocks: {initial_blocks:?}");
             d.kernel().shutdown_runtime_worker().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_model_shell_refuses_mutating_tools_and_nested_editor_reads() {
+        use crate::mcp::{CallContext, KernelCallParams, InstanceId};
+        use crate::vfs::VfsOps;
+        let d = dispatcher_with_full_broker().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("readonly-tools"), None, principal);
+        grant_broad_binding(&d, context, false).await;
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let path = "/config/kernel/readonly-editor.txt";
+        d.kernel().vfs().write_all(std::path::Path::new(path), b"original").await.unwrap();
+        let opener = crate::editor::EditorOpener { principal, performer: principal, reviewer: None,
+            context_id: context, session_id: SessionId::new() };
+        let (editor, _) = d.kernel().editor_open_as(path, Some(opener)).await.unwrap();
+        let call_context = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let mut wrong = Vec::new();
+        for command in [
+            "kj block create --role user --kind text --content readonly-must-not-write".to_string(),
+            "kj block $(echo create) --role user --kind text --content readonly-must-not-write".to_string(),
+            "kj block create --confirm --role user --kind text --content readonly-must-not-write".to_string(),
+            "kj synth all".to_string(),
+            "kj synth rebuild".to_string(),
+            "block_create --role user --kind text --content readonly-must-not-write".to_string(),
+            format!("vi {path}"),
+            format!("edit {path}"),
+            format!("kj editor keys {} ':r !echo readonly-must-not-write<CR>'", editor.as_u64()),
+            "curl -X POST http://127.0.0.1:9".to_string(),
+        ] {
+            let result = d.kernel().broker().call_tool(KernelCallParams {
+                instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE),
+                tool: "shell".into(),
+                arguments: serde_json::json!({"command": command, "foreground": true}),
+            }, &call_context, tokio_util::sync::CancellationToken::new()).await.unwrap();
+            let text = format!("{result:?}");
+            if !result.is_error || !text.contains("read-only") {
+                wrong.push(format!("{command}: {text}"));
+            }
+        }
+        assert!(wrong.is_empty(), "mutating tools must refuse before dispatch:\n{}", wrong.join("\n"));
+        assert!(!d.block_store().block_snapshots(context).unwrap().iter().any(|b| b.content == "readonly-must-not-write"));
+        assert_eq!(d.kernel().editor_state(editor).unwrap().text, "original");
+        assert_eq!(d.kernel().editor_list().len(), 1, "refused vi/edit must not allocate sessions");
+        let mut failed_reads = Vec::new();
+        for command in ["kj context list", "kj block list", "kj editor open --help", "cat /config/kernel/readonly-editor.txt",
+            "kj help", "kj context create help", "kj synth status", "kj synth help", "kj synth --help"] {
+            let result = d.kernel().broker().call_tool(KernelCallParams {
+                instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE), tool: "shell".into(),
+                arguments: serde_json::json!({"command": command, "foreground": true}),
+            }, &call_context, tokio_util::sync::CancellationToken::new()).await.unwrap();
+            if result.is_error { failed_reads.push(format!("{command}: {result:?}")); }
+        }
+        assert!(failed_reads.is_empty(), "read-only inspection remains available: {}", failed_reads.join("\n"));
+        d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
     async fn assert_model_shell_cannot_reach_compose_draft(command: &str) {
