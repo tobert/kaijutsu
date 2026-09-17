@@ -1,5 +1,24 @@
 # 会術 Kaijutsu
 
+The kernel’s central responsibility is coordinating anticipation and commitment
+on the shared pulse. Each model can have its own pace, provided its output
+arrives while it’s still useful.
+
+Kaijutsu is an instrument for people and models working together across
+contexts. Players prepare work ahead of the moment it matters; the kernel
+coordinates shared state and accepted decisions. Music makes this concrete:
+models can take seconds to produce a phrase or analyze a clip, and binary
+media can travel over SFTP while the performance continues. The shared pulse
+gives that work a place in time. Whether a result is ready and still valid
+determines how it can join the performance.
+
+This is the direction we judge the implementation against. The timing design
+is in [Hyoushigi](docs/hyoushigi.md), the shared clock in
+[MIDI and the timebase](docs/midi.md), and the current model-placement
+assessment in [Audio inference](docs/audio-inference.md). The
+[iteration plan](docs/issues.md#anticipation-and-commitment--iteration-order)
+tracks the gaps between that direction and the code.
+
 ## Developer Notes from Amy 2026-06-26
 
 Kaijutsu started as a "more serious" version of an [SSH MUD](https://github.com/tobert/sshwarma)
@@ -129,10 +148,11 @@ parent) and a plain `String` of text.
 
 ### kaijutsu-server
 
-SSH + Cap'n Proto RPC server, and the sequencing boundary: it accepts commands,
-orders and commits them, and publishes the resulting events. Handles authentication
-via SQLite-backed public keys, runs EmbeddedKaish for shell command execution, and
-routes file I/O through kernel-owned blocks via KaijutsuBackend.
+SSH + Cap'n Proto RPC host. It authenticates connections through SQLite-backed
+public keys, admits requests to the kernel, and translates results and event
+subscriptions for clients. The kernel owns sequencing and accepted shell/model
+execution; the server owns transport and connection state. The beat scheduler
+is still hosted here.
 
 ### kaijutsu-client
 

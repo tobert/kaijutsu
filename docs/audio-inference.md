@@ -29,6 +29,13 @@ owns clock and sink timing. Model integration should use those contracts.
 This review does not establish that `kj audio beats` participates in them;
 today it is a synchronous request/response analysis command.
 
+There is also an execution gap in the resolver seam itself:
+`Timeline::speculate` calls `resolve` synchronously while the beat scheduler
+holds the timeline lock. The current production adapter reads prepared CAS
+content. A slow model cannot be substituted directly without stalling that
+path. See `docs/issues.md`, "Anticipation and commitment — iteration order",
+for the proof and implementation work needed before that substitution.
+
 ## Current implementation
 
 `kj audio beats <host-path>` loads a mel spectrogram graph and a beat graph

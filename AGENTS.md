@@ -5,6 +5,24 @@ contexts. It is an instrument you play: the kernel holds durable state, model
 interactions, workspaces, and tools; players choose the work. It speaks SSH
 with Cap'n Proto over channels. See `docs/instrument-design.md`.
 
+The kernel’s central responsibility is coordinating anticipation and commitment
+on the shared pulse. Each model can have its own pace, provided its output
+arrives while it’s still useful.
+
+Judge changes against that responsibility. Keep the pulse advancing while
+producers compute and media moves. Make readiness, validity, commitment, and
+misses observable; use the declared fallback when work cannot serve its
+intended moment. Separate kernel coordination, model execution, and hardware
+timing. A useful model or tool does not automatically belong in the kernel
+or earn a core `kj` verb.
+
+Use the existing timeline, resolver, runtime, and CAS contracts before adding
+another mechanism. Read `docs/hyoushigi.md`, `docs/tracks.md`, and
+`docs/audio-inference.md` when changing their boundaries. Check implementation
+against design claims: the current resolver call is synchronous, so slow work
+must not be placed on the beat path. Track realignment in `docs/issues.md`,
+"Anticipation and commitment — iteration order".
+
 ## Working together
 
 Work as peers. Amy is accountable for our work. Follow her objective and
@@ -138,8 +156,9 @@ delete superseded APIs, and correct adjacent comments as each area moves.
 ## Finding and checking code
 
 Start with `kaijutsu-types` for shared domain types. `kaijutsu-kernel` owns
-state, VFS, model work, MCP brokerage, and `kj`; `kaijutsu-server` owns SSH and
-embedded kaish; `kaijutsu-client` owns the RPC client and `ActorHandle`.
+state, VFS, model work, embedded kaish, MCP brokerage, and `kj`;
+`kaijutsu-server` owns SSH/RPC hosting and the beat scheduler;
+`kaijutsu-client` owns the RPC client and `ActorHandle`.
 `kaijutsu-app` is the Bevy GUI; `kaijutsu-tui` is the terminal client;
 `kaijutsu-mcp` is the stdio MCP bridge. Wire schema: `kaijutsu.capnp`.
 

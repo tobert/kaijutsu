@@ -975,6 +975,17 @@ commit contract. She also questioned beat analysis as a core `kj` verb;
 an optional tool with a resolver adapter is a candidate, with its eventual
 home still undecided.
 
+The principle now leads README and contributor guidance: "The kernel’s
+central responsibility is coordinating anticipation and commitment on the
+shared pulse. Each model can have its own pace, provided its output arrives
+while it’s still useful." The iteration plan starts with dependable
+interaction and controlled producers sharing a timeline. Source review found
+the important limit behind the resolver design: `resolve` still runs inline
+under the timeline lock, and the production adapter validates prepared CAS
+content. Slow model preparation needs an explicit completion path before
+that seam can carry it. The next proof should expose this gap without
+spending model tokens or choosing another service architecture first.
+
 ## The file that answered a question the code already knew (September 9)
 
 Amy read `contrib/kj-expectations.toml` and said something felt off without

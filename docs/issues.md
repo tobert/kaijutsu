@@ -6,6 +6,72 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Anticipation and commitment — iteration order
+
+The kernel coordinates anticipation and commitment on the shared pulse.
+Iterate through one observable performance with producers at different
+speeds; each change should improve that flow, remove a competing mechanism,
+or establish a testable contract. Keep model placement independent of this
+work. `docs/audio-inference.md` records the workload and measured costs.
+
+1. **Restore dependable interaction.** Reproduce and fix the `:!` completion
+   regression in `terminal_fit` below. Continue the complete kaish/rc caller
+   migration alongside the following steps, using `docs/kaish-integration.md`'s
+   inventory. Each migrated caller must retain identity, cancellation,
+   complete output, and terminal
+   settlement, with the old path removed. These are the means of playing
+   the instrument, so verify them through the actual client as well as unit
+   tests.
+2. **Prove different producer speeds on one pulse.** Build a deterministic
+   integration scenario using controlled producers and a controllable clock:
+   fast, delayed, failed, and completed after their basis changes. Assert
+   that the shared timeline advances while work is pending, valid results
+   commit once, stale or superseded completions cannot overwrite accepted
+   work, and a missed commitment uses its declared fallback. Use barriers
+   and explicit completion delivery, not wall-clock sleeps or hosted models.
+3. **Align execution with that proof.** Audit admission through completion
+   and commitment against exact work ownership and intended musical time.
+   Keep slow preparation outside timeline locks; give attempts bounded
+   resource admission and explicit cancellation/shutdown behavior. Preserve
+   a small synchronous commit step. Use existing runtime and resolver seams;
+   delete superseded paths as the scenario starts passing.
+4. **Expose the feedback needed to play.** Record intended musical time,
+   queue/compute/transfer duration, readiness, basis validity, and final
+   disposition. A player should be able to distinguish committed work,
+   obsolete work, a failure, and a declared fallback. Measure under overlap
+   before choosing lead-time targets; avoid turning unmeasured percentiles
+   into guarantees.
+5. **Exercise replacement, then extract.** Run the same scenario with one
+   real producer and CAS/SFTP media delivery, observing it through a client
+   and audiod when hardware is available. Use the evidence to choose which
+   model-specific behavior becomes an optional tool or resolver adapter.
+   `kj audio beats` is a candidate; its new home remains undecided. Remove
+   the kernel dependency and obsolete verb only with a verified replacement
+   or an explicit decision to drop the feature.
+
+The first day's useful checkpoint is a repaired interaction path and a
+repeatable scenario that exposes the next scheduling gap. A controlled
+failure is useful evidence; a new model integration is not required to
+prove the coordination contract. Update the checklist as each step lands,
+and correct adjacent docs/comments in the same change.
+
+### Slow preparation cannot run inside the current resolver call
+
+`kaijutsu-hyoushigi/src/engine.rs::Timeline::speculate` calls
+`Resolver::resolve` synchronously. The server's
+`beat.rs::materialize_track` advances that timeline while holding its lock.
+The production `CasCommitResolver` reads and validates already prepared CAS
+content, estimates a fixed 20 ms, and bases validity on the artifact hash.
+That establishes artifact identity, not whether a model's original context
+is still current. Model turns execute separately from this resolver.
+
+Before admitting long-running model preparation through this seam, pin
+nonblocking timeline advancement and stale-completion rejection in the
+scenario above. Decide how admitted work returns prepared results and their
+input basis to commitment. Merely making `resolve` async and awaiting it in
+the beat loop would retain the stall. Keep the existing fast CAS adapter's
+contract distinct from the model attempt's lifetime and validity.
+
 ## Kaish positional suffix expansion
 
 The locked kaish 0.17.2 expands `${0%.kai}` to an empty value, rather than
