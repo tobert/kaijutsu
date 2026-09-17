@@ -22,11 +22,20 @@ pub struct TurnLease {
     context: ContextId,
     id: TurnId,
     delivery: Option<crate::hyoushigi::model::OutputDelivery>,
+    blocks: std::cell::RefCell<Vec<kaijutsu_types::BlockId>>,
     interrupt: Arc<ContextInterruptState>,
 }
 
 impl TurnLease {
     pub fn id(&self) -> TurnId { self.id }
+    pub(super) fn track_block(&self, block: kaijutsu_types::BlockId) {
+        assert_eq!(block.context_id, self.context, "a turn owns blocks in its context");
+        self.blocks.borrow_mut().push(block);
+    }
+    pub(super) fn settle_blocks(&self, documents: &crate::SharedBlockStore) -> Result<usize, String> {
+        documents.fail_running_blocks(self.context, &self.blocks.borrow()).map_err(|error| error.to_string())
+    }
+
     pub(crate) fn deliver_to(&mut self, delivery: crate::hyoushigi::model::OutputDelivery) {
         assert!(self.delivery.is_none(), "one score delivery per admitted turn");
         self.delivery = Some(delivery);
@@ -91,7 +100,7 @@ impl TurnState {
         active.entry(context).or_default().insert(id, ActiveTurn {
             began: std::time::Instant::now(), interrupt: interrupt.clone(),
         });
-        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, interrupt })
+        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt })
     }
 
     pub fn active_count(&self, context: ContextId) -> usize {

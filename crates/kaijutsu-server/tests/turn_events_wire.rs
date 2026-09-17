@@ -522,3 +522,41 @@ fn timed_drives_keep_admission_targets_through_the_client() {
         assert!(timeline.lock().playhead() > Tick::ZERO);
     });
 }
+
+#[test]
+fn a_provider_panic_publishes_failure_after_its_open_blocks_settle() {
+    run_local(async {
+        use kaijutsu_kernel::llm::{MockClient, Provider, stream::StreamEvent};
+        use kaijutsu_types::Status;
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "panicking-player").await.unwrap();
+        assign_turn_identity(&server, context, PrincipalId::new());
+        kj.join_context(context, "panic-cleanup").await.unwrap();
+        let mock = MockClient::new("").with_scripted_stream(vec![vec![
+            StreamEvent::TextStart, StreamEvent::TextDelta("partial output survives".into()),
+        ]]).panics_when_exhausted();
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        let (callback, mut events) = turn_events_channel(32);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let admitted = kj.execute_kj_quiet(context, &["drive".into(), "--prompt".into(), "begin".into()]).await.unwrap();
+        assert_eq!(admitted.exit_code, 0, "{}", admitted.stderr);
+        let id: kaijutsu_types::TurnId = serde_json::from_value(admitted.data.unwrap()["turn_id"].clone()).unwrap();
+        drop(held);
+        match recv_turn_event(&mut events, context).await {
+            ServerEvent::TurnFailed { turn_id, error, .. } => {
+                assert_eq!(turn_id, id);
+                assert!(error.contains("panicked"));
+            }
+            other => panic!("panic must fail the admitted turn: {other:?}"),
+        }
+        let blocks = kj.get_blocks(context, &BlockQuery::All).await.unwrap();
+        assert_eq!(blocks.iter().find(|b| b.content == "partial output survives").unwrap().status, Status::Error);
+        assert!(!blocks.iter().any(|b| b.status == Status::Running));
+        assert!(!server.kernel.turn_in_flight(context));
+        assert!(server.kernel.shutdown_runtime_worker().await.is_err());
+    });
+}

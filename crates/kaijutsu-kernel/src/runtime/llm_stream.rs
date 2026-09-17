@@ -1279,6 +1279,7 @@ fn pending_shell_operation_receipt(
     tool_ctx: &crate::ExecContext,
     source: &str,
     ask_id: &str,
+    turn_lease: &TurnLease,
 ) -> Result<String, String> {
     if let Some(existing) = kernel.shell_operations().get_by_ask(ask_id, context_id)? {
         return Ok(existing.receipt.operation_id);
@@ -1292,10 +1293,12 @@ fn pending_shell_operation_receipt(
         serde_json::json!({"command": command_source}),
         Some(kaijutsu_types::ToolKind::Shell), Some(tool_ctx.actor_id), None, None,
     ).map_err(|error| error.to_string())?;
+    turn_lease.track_block(command);
     let output = documents.insert_tool_result_as(
         context_id, &command, Some(&command), "", false, None,
         Some(kaijutsu_types::ToolKind::Shell), Some(PrincipalId::system()), None,
     ).map_err(|error| error.to_string())?;
+    turn_lease.track_block(output);
     for block in [&command, &output] {
         documents.set_excluded(context_id, block, true).map_err(|error| error.to_string())?;
         documents.set_status(context_id, block, Status::Waiting).map_err(|error| error.to_string())?;
@@ -1317,6 +1320,7 @@ fn make_pending_shell_receipt(
     kernel: &Arc<Kernel>, documents: &SharedBlockStore, context_id: ContextId,
     tool_ctx: &crate::ExecContext, tool_name: &str, params: &str,
     ask_id: Option<&str>, content: &mut String, is_error: &mut bool, status: &mut Status,
+    turn_lease: &TurnLease,
 ) {
     if !matches!(tool_name, "shell" | "shell_write") || *status != Status::Waiting {
         return;
@@ -1327,7 +1331,7 @@ fn make_pending_shell_receipt(
     {
         return;
     }
-    match pending_shell_operation_receipt(kernel, documents, context_id, tool_ctx, params, ask_id) {
+    match pending_shell_operation_receipt(kernel, documents, context_id, tool_ctx, params, ask_id, turn_lease) {
         Ok(operation_id) => {
             let mut receipt = ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Waiting);
             receipt.stderr = format!("operation {operation_id} is waiting for ask {ask_id}; the command has not run");
@@ -1367,6 +1371,7 @@ async fn dispatch_inline_tool_result(
     // request, the same as an ordinary streamed tool-use event — stamp the
     // caller's actor principal, not a literal system() here.
     actor_principal: PrincipalId,
+    turn_lease: &TurnLease,
 ) -> InlineToolResult {
     // Tool kind no longer has a registry category at this layer.  This is the
     // same conservative marker ordinary streamed tool calls use.
@@ -1383,6 +1388,7 @@ async fn dispatch_inline_tool_result(
         None,
     ) {
         Ok(id) => {
+            turn_lease.track_block(id);
             *last_block_id = id;
             id
         }
@@ -1415,6 +1421,7 @@ async fn dispatch_inline_tool_result(
         Some(tool_use_id.to_owned()),
     ) {
         Ok(id) => {
+            turn_lease.track_block(id);
             let _ = documents.set_status(context_id, &id, Status::Running);
             Some(id)
         }
@@ -1447,7 +1454,7 @@ async fn dispatch_inline_tool_result(
 
     make_pending_shell_receipt(
         kernel, documents, context_id, tool_ctx, tool_name, &input.to_string(),
-        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status,
+        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status, turn_lease,
     );
 
     // ANSI ingest, same policy as the agentic path above: the projection is
@@ -1685,7 +1692,7 @@ async fn process_llm_stream(
             provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, slot_tunables,
             conversation_cache, user_principal_id, span_identity, tool_ctx, interrupt, origin,
-            continuation_epoch, mailbox, turn_id,
+            continuation_epoch, mailbox, &turn_lease,
         )).catch_unwind().await
     } else {
         Ok(TurnFlow::Completed {
@@ -1694,15 +1701,48 @@ async fn process_llm_stream(
         })
     };
 
+    if outcome.is_err() { turn_lease.interrupt().hard(); }
+    let (cleanup, mut cleanup_panic) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| turn_lease.settle_blocks(&documents))) {
+        Ok(result) => (result, None),
+        Err(panic) => (Err("block cleanup panicked; the document may require recovery".into()), Some(panic)),
+    };
+    let can_record_diagnostic = cleanup.is_ok();
     record_continuation_yield(&kernel_db, context_id, continuation_epoch);
     match outcome {
-        Ok(event) => {
+        Ok(mut event) => {
+            let cleanup_error = match cleanup {
+                Err(error) => Some(format!("Model turn block cleanup failed: {error}")),
+                Ok(count) if count > 0 && matches!(event, TurnFlow::Completed { reason, .. } if reason.output_is_complete()) =>
+                    Some(format!("Model turn ended with {count} unfinished block(s); they were marked Error.")),
+                _ => None,
+            };
+            if let Some(mut error) = cleanup_error {
+                if let TurnFlow::Failed { error: original, .. } = &event {
+                    error = format!("{original}; {error}");
+                }
+                tracing::error!(%context_id, %error);
+                // Do not re-enter a document whose cleanup failed. Terminal
+                // publication remains possible when its journal is unavailable.
+                if can_record_diagnostic {
+                    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                        insert_pre_stream_error_block(&documents, context_id, &panic_anchor, &error))) {
+                        tracing::error!(%context_id, "recording the turn diagnostic panicked");
+                        cleanup_panic = Some(panic);
+                    }
+                }
+                event = TurnFlow::Failed { turn_id, context_id, principal_id: user_principal_id, error, origin };
+            }
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
+            if let Some(panic) = cleanup_panic { std::panic::resume_unwind(panic); }
         }
         Err(panic) => {
-            let error = "Model turn panicked; execution stopped and side effects may be incomplete.";
-            insert_pre_stream_error_block(&documents, context_id, &panic_anchor, error);
+            let mut error = "Model turn panicked; execution stopped and side effects may be incomplete.".to_string();
+            if let Err(cleanup_error) = cleanup { error.push_str(&format!(" Block cleanup failed: {cleanup_error}")); }
+            if can_record_diagnostic && std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                insert_pre_stream_error_block(&documents, context_id, &panic_anchor, &error))).is_err() {
+                tracing::error!(%context_id, "recording the panic diagnostic also panicked");
+            }
             let event = TurnFlow::Failed {
                 turn_id, context_id, principal_id: user_principal_id, error: error.into(), origin,
             };
@@ -1748,8 +1788,9 @@ async fn run_llm_stream(
     origin: TurnOrigin,
     continuation_epoch: Option<i64>,
     mailbox: &mut crate::ConversationMailbox,
-    turn_id: kaijutsu_types::TurnId,
+    turn_lease: &TurnLease,
 ) -> TurnFlow {
+    let turn_id = turn_lease.id();
     if let Some(identity) = span_identity {
         let span = tracing::Span::current();
         span.record("actor.id", tracing::field::display(identity.performer.principal_id));
@@ -1899,11 +1940,8 @@ async fn run_llm_stream(
 
     // Track last inserted block for ordering - each new block goes after the previous
     let mut last_block_id = after_block_id;
-    // The last `Role::Model` / `BlockKind::Text` block this stream produced — the
-    // turn's *output*, which the announced `Completed` carries so the OODA Act
-    // crystallizes that exact block (design §7). `None` until the model emits
-    // text (a tool-only turn, an interrupt before any text, or a hard error all
-    // leave it `None`); a `None` Completed schedules nothing downstream.
+    // Exact final model text for the turn event and any admitted score handoff.
+    // A tool-only turn has no text output; consumers must not substitute the tail.
     let mut output_block_id: Option<kaijutsu_types::BlockId> = None;
     // How this turn ends, as the structured reason the tail publishes on
     // `TurnFlow::Completed`. Every `break` out of the agentic loop sets it
@@ -2225,6 +2263,7 @@ async fn run_llm_stream(
                         Some(actor_principal),
                     ) {
                         Ok(block_id) => {
+                            turn_lease.track_block(block_id);
                             last_block_id = block_id;
                             current_block_id = Some(block_id);
                         }
@@ -2310,6 +2349,7 @@ async fn run_llm_stream(
                         Some(actor_principal),
                     ) {
                         Ok(block_id) => {
+                            turn_lease.track_block(block_id);
                             last_block_id = block_id;
                             current_block_id = Some(block_id);
                             // This is the turn's model-text output. A later text
@@ -2368,6 +2408,7 @@ async fn run_llm_stream(
                         None,
                     ) {
                         Ok(block_id) => {
+                            turn_lease.track_block(block_id);
                             last_block_id = block_id;
                             tool_call_blocks.insert(id.clone(), Some(block_id));
                         }
@@ -2403,6 +2444,7 @@ async fn run_llm_stream(
                         interrupt.cancel.clone(),
                         &id,
                         actor_principal,
+                        turn_lease,
                     )
                     .await;
 
@@ -2681,8 +2723,7 @@ async fn run_llm_stream(
                         payload.summary_line(),
                         Some(PrincipalId::system()),
                     );
-                    // Terminal mid-stream error — Failed (not Completed) so an
-                    // announced turn never leaves the scheduler waiting.
+                    // The outer owner settles open blocks before publishing failure.
                     return TurnFlow::Failed {
                         turn_id, context_id,
                         principal_id: user_principal_id,
@@ -2697,8 +2738,7 @@ async fn run_llm_stream(
         // *cancellation*, not a failure: the turn ended exactly where a player
         // told it to, so it publishes `Completed { reason: Cancelled {
         // immediate: true } }` rather than the old bare-string `Failed`. The
-        // `immediate` flag is what tells the beat scheduler the output block is
-        // a fragment (severed mid-token) and must not crystallize into an Act.
+        // `immediate` flag tells the score handoff that its output is a fragment.
         if stream_cancelled {
             stop_reason_out = TurnStopReason::Cancelled { immediate: true };
             break;
@@ -2791,6 +2831,7 @@ async fn run_llm_stream(
                             Some(tool_use_id.clone()),
                         ) {
                             Ok(id) => {
+                                turn_lease.track_block(id);
                                 let _ = documents.set_status(context_id, &id, Status::Running);
                                 result_block_id = Some(id);
                             }
@@ -2832,7 +2873,7 @@ async fn run_llm_stream(
 
                     make_pending_shell_receipt(
                         &kernel, &documents, context_id, &tool_ctx, &tool_name, &params,
-                        ask_id.as_deref(), &mut result_content, &mut is_error, &mut settled_status,
+                        ask_id.as_deref(), &mut result_content, &mut is_error, &mut settled_status, turn_lease,
                     );
 
                     // Step 4a: split the two readers. A `shell` result is a
@@ -4269,6 +4310,7 @@ mod tool_dispatch_timeout_tests {
             CancellationToken::new(),
             "call-1",
             PrincipalId::new(),
+            &kernel.turns().begin(ctx),
         )
         .await;
 
@@ -6121,6 +6163,112 @@ mod lifetime_tests {
             reason: TurnStopReason::Cancelled { immediate: true }, ..
         })));
         assert!(completed.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_settles_only_the_blocks_owned_by_its_turn() {
+        use super::super::turn_request::TurnRequest;
+        for ending in ["panic", "error", "eof", "cancel"] {
+            let mut events = vec![
+                StreamEvent::TextStart, StreamEvent::TextDelta("finished text".into()), StreamEvent::TextEnd,
+                StreamEvent::ThinkingStart, StreamEvent::ThinkingDelta("unfinished thought".into()),
+                StreamEvent::ToolUse { id: "not-run".into(), name: "missing_tool".into(), input: serde_json::json!({}) },
+                StreamEvent::TextStart, StreamEvent::TextDelta("unfinished text".into()),
+            ];
+            if ending == "eof" { events.retain(|event| !matches!(event, StreamEvent::ToolUse { .. })); }
+            if ending == "error" { events.push(StreamEvent::Error("provider broke".into())); }
+            let mock = MockClient::new("").with_scripted_stream(vec![events]);
+            let mock = match ending {
+                "panic" => mock.panics_when_exhausted(), "cancel" => mock.hangs_when_exhausted(), _ => mock,
+            };
+            let (kernel, context, after, call) = fixture(Some(mock)).await;
+            // A context may contain another writer and an approval awaiting an answer.
+            let other = kernel.blocks().insert_block_as(context, None, Some(&after), Role::Model,
+                BlockKind::Text, "another writer", Status::Running, ContentType::Plain, Some(PrincipalId::new())).unwrap();
+            let waiting = kernel.blocks().insert_block_as(context, None, Some(&other), Role::Model,
+                BlockKind::ToolCall, "waiting for review", Status::Waiting, ContentType::Plain, Some(PrincipalId::new())).unwrap();
+            let mut failed = kernel.turn_flows().subscribe("turn.failed");
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            kernel.request_turn(TurnRequest {
+                context_id: context, after_block_id: after, content: String::new(), principal_id: call.principal_id,
+                model: None, continuation_epoch: None, score: None,
+            }).unwrap();
+            if ending == "cancel" {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if kernel.blocks().block_snapshots(context).unwrap().iter().any(|b| b.content == "unfinished text") { break; }
+                        tokio::task::yield_now().await;
+                    }
+                }).await.unwrap();
+                assert!(kernel.turns().interrupt(context, true));
+                let event = tokio::time::timeout(Duration::from_secs(3), completed.recv()).await.unwrap().unwrap();
+                assert!(matches!(event.payload, TurnFlow::Completed { reason: TurnStopReason::Cancelled { immediate: true }, .. }));
+            } else {
+                let event = tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::select! { event = failed.recv() => event, event = completed.recv() => event }
+                }).await.unwrap().unwrap();
+                assert!(matches!(event.payload, TurnFlow::Failed { .. }), "{ending}: {:?}", event.payload);
+            }
+            let blocks = kernel.blocks().block_snapshots(context).unwrap();
+            let unfinished: Vec<_> = blocks.iter().filter(|b| ["unfinished thought", "unfinished text"].contains(&b.content.as_str())
+                || b.tool_use_id.as_deref() == Some("not-run")).collect();
+            assert_eq!(unfinished.len(), if ending == "eof" { 2 } else { 3 }, "{ending}: missing partial output");
+            for block in unfinished {
+                assert_eq!(block.status, Status::Error, "{ending}: orphan {}", block.id);
+            }
+            assert_eq!(blocks.iter().find(|b| b.content == "finished text").unwrap().status, Status::Done);
+            assert_eq!(kernel.blocks().get_block_snapshot(context, &other).unwrap().unwrap().status, Status::Running);
+            assert_eq!(kernel.blocks().get_block_snapshot(context, &waiting).unwrap().unwrap().status, Status::Waiting);
+            let shutdown = kernel.shutdown_runtime_worker().await;
+            assert_eq!(shutdown.is_err(), ending == "panic");
+            assert!(!kernel.turn_in_flight(context));
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_panic_settles_its_pair_and_cancels_the_call() {
+        use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+            KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
+        use tokio_util::sync::CancellationToken;
+        struct PanickingTool {
+            id: InstanceId,
+            cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
+        }
+        #[async_trait::async_trait]
+        impl McpServerLike for PanickingTool {
+            fn instance_id(&self) -> &InstanceId { &self.id }
+            async fn list_tools(&self, _: &CallContext) -> McpResult<Vec<KernelTool>> {
+                Ok(vec![KernelTool { instance: self.id.clone(), name: "explode".into(), description: None,
+                    input_schema: serde_json::json!({"type": "object"}) }])
+            }
+            async fn call_tool(&self, _: KernelCallParams, _: &CallContext, cancel: CancellationToken) -> McpResult<KernelToolResult> {
+                *self.cancel.lock() = Some(cancel);
+                panic!("controlled tool panic");
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<ServerNotification> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+        for inline in [false, true] {
+            let events = if inline { vec![StreamEvent::InlineToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}) }] }
+            else { vec![StreamEvent::ToolUse { id: "call-panic".into(), name: "explode".into(), input: serde_json::json!({}) },
+                StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None }] };
+            let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![events]))).await;
+            let cancel = Arc::new(parking_lot::Mutex::new(None));
+            let instance = InstanceId::new("panic-test");
+            kernel.broker().register(Arc::new(PanickingTool { id: instance.clone(), cancel: cancel.clone() }), InstancePolicy::default()).await.unwrap();
+            kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+            let mut failures = kernel.turn_flows().subscribe("turn.failed");
+            spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+                call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.unwrap().unwrap();
+            let blocks = kernel.blocks().block_snapshots(context).unwrap();
+            let pair: Vec<_> = blocks.iter().filter(|b| b.tool_use_id.as_deref() == Some("call-panic")).collect();
+            assert_eq!(pair.len(), 2, "call and result are both owned: inline={inline}");
+            assert!(pair.iter().all(|b| b.status == Status::Error));
+            assert!(cancel.lock().as_ref().unwrap().is_cancelled(), "panic must stop its outstanding call");
+            assert!(kernel.shutdown_runtime_worker().await.is_err());
+        }
     }
 
     #[tokio::test]

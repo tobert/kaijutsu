@@ -88,6 +88,7 @@ pub struct MockClient {
     /// Combine with `tokio::test(start_paused = true)` so a caller's idle
     /// timeout fires on virtual-clock auto-advance instead of real wall time.
     hangs_when_exhausted: bool,
+    panics_when_exhausted: bool,
     /// Directory a per-model script set was loaded from (`with_script_dir`),
     /// kept only so a missing-model panic can name the expected path.
     script_dir: Option<std::path::PathBuf>,
@@ -122,6 +123,7 @@ impl MockClient {
             stream_start_delay: std::time::Duration::ZERO,
             scripted: None,
             hangs_when_exhausted: false,
+            panics_when_exhausted: false,
             script_dir: None,
             script_by_model: None,
         }
@@ -152,6 +154,12 @@ impl MockClient {
     /// events are exhausted — see the `hangs_when_exhausted` field doc.
     pub fn hangs_when_exhausted(mut self) -> Self {
         self.hangs_when_exhausted = true;
+        self
+    }
+
+    /// Panic after delivering scripted events, to exercise ownership during unwind.
+    pub fn panics_when_exhausted(mut self) -> Self {
+        self.panics_when_exhausted = true;
         self
     }
 
@@ -1008,6 +1016,7 @@ impl Provider {
                 Ok(ProviderStream::Mock(MockStream {
                     events: std::collections::VecDeque::from(events),
                     hangs_when_exhausted: mock.hangs_when_exhausted,
+                    panics_when_exhausted: mock.panics_when_exhausted,
                 }))
             }
         }
@@ -1051,6 +1060,7 @@ pub enum ProviderStream {
 pub struct MockStream {
     events: std::collections::VecDeque<StreamEvent>,
     hangs_when_exhausted: bool,
+    panics_when_exhausted: bool,
 }
 
 impl ProviderStream {
@@ -1064,6 +1074,7 @@ impl ProviderStream {
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(state) => match state.events.pop_front() {
                 Some(ev) => Some(ev),
+                None if state.panics_when_exhausted => panic!("mock stream panic after scripted events"),
                 None if state.hangs_when_exhausted => std::future::pending().await,
                 None => None,
             },

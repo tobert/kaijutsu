@@ -1486,6 +1486,36 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Fail the still-running blocks owned by an exiting writer. Selection and
+    /// mutation share the document lock; completed, waiting and deleted blocks
+    /// stay untouched. All selected status changes commit together.
+    pub(crate) fn fail_running_blocks(&self, context_id: ContextId, ids: &[BlockId]) -> BlockStoreResult<usize> {
+        if ids.is_empty() { return Ok(0); }
+        if ids.iter().any(|id| id.context_id != context_id) {
+            return Err(BlockStoreError::Validation("block cleanup crossed its owning context".into()));
+        }
+        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let mut seen = std::collections::HashSet::new();
+        let running: Vec<_> = ids.iter().copied().filter(|id| seen.insert(*id)
+            && entry.doc.get_block_header(id).is_some_and(|header| header.status == Status::Running)).collect();
+        if running.is_empty() { return Ok(0); }
+        self.accept_locked(context_id, &mut entry, |entry| {
+            let mut headers = Vec::new();
+            for id in &running {
+                entry.doc.set_status(id, Status::Error)?;
+                headers.push(entry.doc.get_block_header(id).expect("selected block remains under this guard"));
+            }
+            entry.touch(self.principal_id());
+            let events = running.iter().map(|id| BlockFlow::StatusChanged {
+                context_id, block_id: *id, status: Status::Error,
+                version: entry.version(), source: OpSource::Local,
+            }).collect();
+            let mut payload = SyncPayload::from_updated_header(headers[0]);
+            payload.updated_headers = headers;
+            Ok((payload, events, running.len()))
+        })
+    }
+
     /// Edit text within a block.
     pub fn edit_text(
         &self,
@@ -5831,6 +5861,38 @@ mod tests {
     // ====================================================================
     // 1. Crash-Recovery: drop + reload
     // ====================================================================
+
+    #[test]
+    fn turn_cleanup_is_selective_idempotent_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, context, workspace) = fresh_db_store(dir.path());
+        let mut ids = Vec::new();
+        for status in [Status::Running, Status::Running, Status::Done, Status::Waiting, Status::Running] {
+            ids.push(store.insert_block(context, None, ids.last(), Role::Model, BlockKind::Text,
+                "retained output", status, ContentType::Plain).unwrap());
+        }
+        assert_eq!(store.fail_running_blocks(context, &[ids[0], ids[1], ids[0], ids[2], ids[3]]).unwrap(), 2);
+        assert_eq!(store.fail_running_blocks(context, &ids[..4]).unwrap(), 0);
+        drop(store);
+        let restored = drop_and_reload(db, workspace);
+        for (id, expected) in ids.iter().zip([Status::Error, Status::Error, Status::Done, Status::Waiting, Status::Running]) {
+            let block = restored.get_block_snapshot(context, id).unwrap().unwrap();
+            assert_eq!(block.status, expected);
+            assert_eq!(block.content, "retained output");
+        }
+    }
+
+    #[test]
+    fn turn_cleanup_refuses_missing_journal_before_changing_status() {
+        let mut store = BlockStore::new(PrincipalId::system());
+        let context = ContextId::new();
+        store.create_document(context, DocumentKind::Conversation, None).unwrap();
+        let id = store.insert_block(context, None, None, Role::Model, BlockKind::Text,
+            "still streaming", Status::Running, ContentType::Plain).unwrap();
+        store.persistent = true;
+        assert!(matches!(store.fail_running_blocks(context, &[id]), Err(BlockStoreError::NoDatabaseConfigured)));
+        assert_eq!(store.get_block_snapshot(context, &id).unwrap().unwrap().status, Status::Running);
+    }
 
     #[test]
     fn test_drop_reload_simple() {

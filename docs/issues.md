@@ -1393,14 +1393,26 @@ a fork and teaches nothing the first copy didn't. Fix has to keep the
 standalone-error path (when the parent's tool result already flushed) and
 skip only the duplicate — a judgment call, not mechanical.
 
-## A dying turn still orphans its blocks mid-run (2026-08-22, half shipped)
+## Model stream write errors and receipt setup ownership
 
-Cold-start recovery fails stale `Running` blocks with an `Error` child. The
-runtime now catches turn panics, releases the conversation lock, clears
-interrupt/liveness, and publishes `TurnFlow::Failed` before resuming unwind.
-The worker reports failure and cancels its other accepted work. Live cleanup
-of blocks left `Running` by a mid-stream panic remains open: track the exact
-blocks owned by that turn; a context-wide sweep can corrupt another writer.
+Turn leases now track their own opened blocks and fail remaining Running ones
+before terminal publication on provider errors, incomplete EOF, cancellation
+and panic. A panic also interrupts the turn's tool calls. Completed blocks,
+Waiting approvals and unrelated writers remain untouched; see
+`docs/kaish-integration.md`. The original live orphan cleanup issue is closed.
+
+The stream still logs some failed text/thinking insert, append, signature and
+status writes and continues. Cleanup catches a remaining Running block, and a
+poisoned document fails loudly, but neither proves every provider byte reached
+the durable log. Audit these writes as part of model-turn settlement: distinguish
+display metadata from provider content and refuse successful completion when
+required content did not persist.
+
+`pending_shell_operation_receipt` records Waiting before receipt registration
+and ask linkage finish. A failure there can leave a Waiting pair without its
+intended receipt owner. Turn cleanup deliberately preserves Waiting; the
+receipt/approval settlement audit must retain setup ownership through transfer,
+including its separate initial pair writes.
 
 ## Asks vs forms — decision open (2026-08-22)
 

@@ -1970,6 +1970,18 @@ reported success while Tokio still held bytes whose host write would fail.
 Awaiting `flush` now makes the VFS result describe host completion and errors,
 without adding an fsync promise. The fix ships separately from timing admission.
 
+A turn's liveness lease did not yet own its opened blocks. Provider panic,
+mid-stream error and an unclosed EOF could leave Running text or thinking after
+the writer exited. The lease now records exact block IDs across ordinary and
+inline tool paths and receipt setup. Terminal cleanup selects Running blocks
+under the document lock and commits their Error statuses together, preserving
+finished output, waiting approvals and another writer's work. Tool-panic testing
+also caught a missing cancellation signal; panic now signals its calls before
+publishing failure. The original panic still reaches worker supervision, and
+cleanup faults cannot turn into a successful terminal event. Tests cover replay
+and the actual SSH callback observing already-settled partial output. Required
+stream writes and transfer of Waiting receipt ownership remain in the audit.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
