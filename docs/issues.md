@@ -71,6 +71,31 @@ input basis to commitment. Merely making `resolve` async and awaiting it in
 the beat loop would retain the stall. Keep the existing fast CAS adapter's
 contract distinct from the model attempt's lifetime and validity.
 
+The controlled SSH scenario now proves that a failed producer reports its error,
+then uses its declared fallback at commitment, including newer accepted content
+from the same lane. It does not yet prove pending or superseded work. Design
+review identified two details to preserve in that extension: completion first
+observed after the intended start cannot be backdated by a jump-ahead clock,
+and dropping a Tokio join handle alone does not cancel its task. Keep terminal
+source cells distinct from new transport-authored fallback cells.
+
+Equal-deadline action ordering currently depends on the open-future vector's
+`swap_remove` order. Define a stable order when adding attempt identity, including
+which accepted content a simultaneous `UseLastGood` can see. Bounded admission
+must also replace `absorb_emitted`'s ignored schedule errors with an observable
+disposition; an emission over capacity must not disappear silently.
+
+`BeatScheduler::drain_track_failures` advances `failure_water` even if the
+producer has no anchor block or error-block insertion fails. That loses client
+feedback after the logged fault. Pin retry ownership and idempotent delivery
+when extending the disposition path; the current SSH scenario covers successful
+delivery only.
+
+`TickClock` accepts public, unvalidated numeric fields. Invalid rates or margins
+can schedule lifecycle actions after their intended start; NaN or infinite rates
+also make duration-to-tick conversion ambiguous. Pin and reject invalid clock
+inputs as part of the pending-work deadline contract.
+
 ## Kaish positional suffix expansion
 
 The locked kaish 0.17.2 expands `${0%.kai}` to an empty value, rather than

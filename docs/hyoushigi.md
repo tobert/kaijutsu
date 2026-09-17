@@ -110,6 +110,29 @@ carries both the predicted and the actual context digest, which is the most valu
 output the system produces — it tells you exactly where the anticipation model is wrong,
 and `estimate_cost` learns from the measured cost.
 
+A resolver error records a `FailureEvent` immediately. The failed source cell
+is terminal, but its scheduled entry retains the commitment deadline. At that
+deadline the transport applies the declared fallback: `Skip` leaves silence,
+`UseLastGood` repeats the latest accepted content on the same track (or leaves
+silence if none exists), and `Literal` commits the supplied reference. Repeats
+and literals create separate cells authored by `beat()`. Selecting the fallback
+at commitment lets another producer supply a newer accepted phrase after the
+failure. A failed re-speculation keeps its final deadline at the intended start.
+Resolver errors do not automatically retry. Neither the error nor its fallback
+fires again on later ticks. `Recovery::ReSpeculated` records that a retry started,
+not that it succeeded; a second basis divergence records a second squash.
+
+Lifecycle actions never rewind the playhead. If a newly admitted cell's nominal
+speculation or commitment time has already passed, its due action runs at the
+current playhead. Its intended start stays unchanged.
+
+The current implementation still calls `resolve` synchronously while advancing
+the timeline. The nonblocking contract below is a design requirement, not yet a
+guarantee for a slow resolver. `timeline_commitment_wire` verifies failure,
+intervening accepted content, and fallback through the SSH client's score and
+conversation reads. Pending, delayed, and superseded work remain the next part
+of that scenario; see `docs/issues.md`, "Anticipation and commitment".
+
 ## Can the playhead block? — the one axis that matters
 
 The character of a context is set by a single question: **is something external driving

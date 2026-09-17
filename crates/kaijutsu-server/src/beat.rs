@@ -1617,9 +1617,7 @@ impl BeatScheduler {
         let Some(score_ctx) = self.tracks.get(track_id).map(|t| t.score_context) else {
             return;
         };
-        // Pump the track timeline to the beat's playhead — forward-only (`advance_to`
-        // panics on backward time, the no-backdating write barrier). This is the
-        // legit clock drive, not the deleted per-context Stage-1 bridge.
+        // Advance once per track. Non-advancing ticks are ignored by the timeline.
         {
             let mut g = timeline.lock();
             if playhead > g.playhead() {
@@ -1911,13 +1909,9 @@ impl BeatScheduler {
         kaijutsu_telemetry::record_beat_sync_published();
     }
 
-    /// Drain the engine failure ledger past `failure_water`, surfacing exactly one
-    /// `BlockKind::Error` block per new `FailureEvent` (design §6, §8). The ledger
-    /// is the data source for the "ABC parse-failure rate" eval ruler AND the
-    /// player's own feedback channel: an erring resolve (CAS read miss, validator
-    /// reject) drops its cell silently in the engine, so the ONLY way the player
-    /// learns of the miss is this surfacing. `failure_water` is monotone, so a
-    /// persistent ledger never re-surfaces a drained event on later beats.
+    /// Surface each new resolver failure in its producer's conversation. Fallback
+    /// content is selected separately at commitment; playing it does not hide the
+    /// failure. `failure_water` prevents repeated delivery on later beats.
     ///
     /// Error blocks anchor at the document tail (the failure carries musical ticks,
     /// not a source block id — the cell that would have been its anchor never

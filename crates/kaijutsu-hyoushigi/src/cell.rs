@@ -77,7 +77,8 @@ pub enum CellState {
     Committed,
     /// Basis diverged at the deadline — discarded; may re-speculate.
     Squashed,
-    /// An illegal/irrecoverable transition. Terminal.
+    /// Resolution failed. Terminal for this source cell; its declared fallback
+    /// may later create a separate, transport-authored committed cell.
     Failed,
 }
 

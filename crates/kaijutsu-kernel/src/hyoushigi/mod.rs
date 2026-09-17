@@ -1633,9 +1633,8 @@ mod tests {
         // A resolver that commits the VAMP ABC but whose BASIS reads ambient "beat" —
         // a change to ambient between speculate and commit drives a squash. With no
         // respeculation budget the squash fires the `UseLastGood` fallback: a concrete
-        // copy of the last good ABC on this lane, at the new tick. This is the
-        // production miss path (a missed/diverged phrase), not a resolve error (which
-        // §6 routes to the failure ledger, not fallback).
+        // copy of the last good ABC on this lane, at the new tick. Resolver errors
+        // also use the declared fallback, after recording their failure separately.
         struct AbcBeat;
         impl Resolver for AbcBeat {
             fn id(&self) -> ResolverId {

@@ -1,16 +1,9 @@
-//! The in-memory speculative engine: a single-context [`Timeline`].
+//! Speculation and commitment on a [`Timeline`] driven by external ticks.
 //!
-//! This is the first proof of the hard core — a **musician-lite** timeline whose
-//! playhead *can't block*. Time is driven by an external beat (here, manual
-//! [`Timeline::advance_to`] calls standing in for the internal beat — which also
-//! makes the loop deterministic and replayable, exactly what TDD wants). Because
-//! the beat won't wait, deferred content must be staged ahead of the playhead:
-//! pre-resolved against a predicted context, committed if the prediction held,
-//! squashed and recovered if it broke.
-//!
-//! Persistence is faked in RAM here (the committed log + a CAS map) — real block
-//! materialization is a later step. The only genuinely live part is the **open
-//! future**: pending/speculated cells ahead of the commit point.
+//! Resolvers currently run synchronously; advancing the playhead waits for each
+//! resolve. Only bounded preparation belongs here until pending work has its own
+//! lifecycle. The kernel materializes committed cells from the in-memory log and
+//! content map into durable CAS and score blocks.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -53,11 +46,11 @@ impl TickClock {
     }
 }
 
-/// How a squashed cell recovered — recorded, never hidden.
+/// The recovery action chosen at a squash, not the eventual output disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
-    /// Enough time remained (`≥ estimate_cost`) to resolve again against the new
-    /// context; a final commit attempt is scheduled at `start`.
+    /// A retry was started because at least `estimate_cost` remained. Its final
+    /// settlement is scheduled at `start`; the retry can still fail or diverge.
     ReSpeculated,
     /// No time to recover — the required fallback fired.
     FellBack,
@@ -116,7 +109,7 @@ impl Scheduled {
     fn next_at(&self) -> Option<Tick> {
         match self.cell.state {
             CellState::Pending => Some(self.speculate_at),
-            CellState::Speculated => Some(if self.final_attempt {
+            CellState::Speculated | CellState::Failed => Some(if self.final_attempt {
                 self.start
             } else {
                 self.commit_deadline
@@ -169,10 +162,8 @@ pub struct Timeline {
     cas: HashMap<ContentHash, Vec<u8>>,
     /// The squash ledger — the bill, and the anticipation-model feedback.
     squashes: Vec<SquashEvent>,
-    /// The failure ledger — sibling to `squashes`. An erring resolve appends here
-    /// and the cell is removed from `future` (no zombie); the kernel drains this
-    /// past a cursor into one Error block per event so the player reads its own
-    /// failure next turn.
+    /// Resolver errors, drained by the kernel into each producer's conversation.
+    /// Failed work keeps its deadline until its declared fallback settles.
     failures: Vec<FailureEvent>,
     /// Wall-clock reading of the last [`pump`](Self::pump), so the playhead is
     /// integrated forward *incrementally* — each interval converted at the rate in
@@ -278,14 +269,12 @@ impl Timeline {
     pub fn squashes(&self) -> &[SquashEvent] {
         &self.squashes
     }
-    /// The failure ledger: every resolve that errored, in record order. The
-    /// kernel drains this past a cursor into Error blocks; tests assert the
-    /// preserved error string and the no-zombie invariant.
+    /// Every resolver error, recorded when observed. The kernel drains these
+    /// into Error blocks independently of the later fallback commitment.
     pub fn failures(&self) -> &[FailureEvent] {
         &self.failures
     }
-    /// Count of cells still in the open future — used to pin the no-zombie
-    /// invariant (a failed cell must not linger here).
+    /// Cells awaiting resolution, commitment, or their declared fallback.
     pub fn future_len(&self) -> usize {
         self.future.len()
     }
@@ -360,12 +349,9 @@ impl Timeline {
 
     /// Drive the playhead from a wall-clock reading — the **internal beat**.
     ///
-    /// The beat advances on its own schedule; it does *not* wait for resolves.
-    /// Every speculation, commit, squash, and fallback the playhead crosses fires
-    /// as it passes. This is the can't-block discipline: an integrator (kernel or
-    /// client timer) calls `pump` on each beat tick, and the playhead is wherever
-    /// wall-clock says — content is either staged ahead in time or the fallback
-    /// fired. Monotonic: a reading at or behind the last pump is ignored.
+    /// Convert elapsed time into ticks and run the due lifecycle actions.
+    /// Resolver calls are synchronous, so callers must keep their work bounded.
+    /// A reading at or behind the last pump is ignored.
     ///
     /// Phase is integrated **incrementally**: the elapsed wall time since the last
     /// pump is converted at the current rate and accumulated (sub-tick remainder
@@ -393,10 +379,9 @@ impl Timeline {
         }
     }
 
-    /// Advance the playhead to `target`, firing each due lifecycle action in tick
-    /// order. The clock can't block: actions happen *because* the playhead
-    /// arrives, not because a resolve finished. Time only moves forward — a
-    /// non-advancing target is a no-op (the write barrier never walks backward).
+    /// Advance to `target`, firing due lifecycle actions in tick order. An action
+    /// whose nominal time has passed runs at the current playhead. Time never
+    /// moves backward; a non-advancing target is a no-op.
     pub fn advance_to(&mut self, target: Tick) {
         if target <= self.playhead {
             return;
@@ -405,7 +390,7 @@ impl Timeline {
             // Find the earliest pending action at or before `target`.
             let mut next: Option<(usize, Tick)> = None;
             for (i, s) in self.future.iter().enumerate() {
-                if let Some(at) = s.next_at()
+                if let Some(at) = s.next_at().map(|at| at.max(self.playhead))
                     && at <= target
                     && next.is_none_or(|(_, best)| at < best)
                 {
@@ -417,6 +402,7 @@ impl Timeline {
             match self.future[idx].cell.state {
                 CellState::Pending => self.speculate(idx),
                 CellState::Speculated => self.commit_or_squash(idx),
+                CellState::Failed => self.fire_fallback(idx),
                 _ => unreachable!("next_at only yields actionable states"),
             }
         }
@@ -452,20 +438,13 @@ impl Timeline {
                 s.cell.state = CellState::Speculated;
             }
             Err(err) => {
-                // A resolve that errors records a FailureEvent and the cell is
-                // removed from the open future — a hole, never a silent empty
-                // commit and never a zombie that re-fires every beat. We pass the
-                // cell through `Failed` first so the state-machine asserts stay
-                // honest (Pending/Squashed → Failed is a legal edge), then drop it.
+                // Report the failure now. Select fallback content at commitment,
+                // after other producers have had time to supply the lane.
                 debug_assert!(s.cell.state.can_advance_to(CellState::Failed));
                 s.cell.state = CellState::Failed;
                 let start = s.start;
                 let played_by = s.cell.played_by;
-                // Single-variant enum today; an irrefutable `let` keeps the error
-                // string verbatim (a future variant would force this back to a
-                // match — fine, the ledger only needs a String).
                 let crate::resolver::ResolveError::Failed(error) = err;
-                // `s`'s borrow ends here; the self-field writes below are disjoint.
                 self.failures.push(FailureEvent {
                     at: self.playhead,
                     start,
@@ -473,13 +452,6 @@ impl Timeline {
                     error,
                     played_by,
                 });
-                // DEFERRED (flagged for Amy, issues.md): routing a Failed cell to
-                // `fire_fallback` instead of dropping it. That would amend the
-                // "crash over corruption, never a silent empty commit" stance —
-                // an approved-later drop-in. The ledger/removal machinery above is
-                // identical whether or not the routing lands; only the next line
-                // changes (`self.fire_fallback(idx)` instead of `swap_remove`).
-                self.future.swap_remove(idx);
             }
         }
     }
@@ -489,13 +461,8 @@ impl Timeline {
     /// squash, then re-speculate if budget remains, else fire the fallback.
     fn commit_or_squash(&mut self, idx: usize) {
         let recipe = self.deferred_recipe(idx);
-        // The validation context's `now` is the cell's musical `start` — the SAME
-        // tick `speculate` used (line ~406). It must NOT be the current playhead
-        // (which equals the commit_deadline here, earlier than `start`): a resolver
-        // whose basis reads `ctx.now()` would then see predicted(start) ≠
-        // actual(deadline) every time and squash forever in an otherwise-stable
-        // context (gemini-pro Stage-3 SEV-2; dormant only because CasCommitResolver
-        // ignores `now()`). The playhead is captured separately for the budget math.
+        // Basis validation sees the same intended start as speculation. The
+        // current playhead measures the remaining recovery budget separately.
         let current_tick = self.playhead;
         let start = self.future[idx].start;
 
@@ -752,8 +719,11 @@ mod tests {
         fn compute_basis(&self, _p: &Value, ctx: &dyn ResolverCtx) -> ContextHash {
             ContextHash::of(&ctx.ambient("beat").unwrap_or_default())
         }
-        fn resolve(&self, _p: &Value, ctx: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
+        fn resolve(&self, p: &Value, ctx: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
             let beat = ctx.ambient("beat").unwrap_or_default();
+            if p.get("fail_on").and_then(Value::as_str).map(str::as_bytes) == Some(beat.as_slice()) {
+                return Err(ResolveError::Failed("changed input cannot resolve".into()));
+            }
             Ok(Resolution::new(beat, "text/plain"))
         }
     }
@@ -983,7 +953,7 @@ mod tests {
     }
 
     /// The internal beat: wall-clock pumps alone drive the playhead through the
-    /// lifecycle — no manual `advance_to`. The beat doesn't wait for the resolve.
+    /// lifecycle — no manual `advance_to` call from the integrator.
     #[test]
     fn beat_drives_commit_from_wallclock() {
         let clock = TickClock {
@@ -1108,8 +1078,8 @@ mod tests {
         fn id(&self) -> ResolverId {
             ResolverId::new("always_fails")
         }
-        fn estimate_cost(&self, _p: &Value, _c: &dyn ResolverCtx) -> Duration {
-            Duration::from_secs(1)
+        fn estimate_cost(&self, p: &Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::from_secs(p.get("cost").and_then(Value::as_u64).unwrap_or(1))
         }
         fn compute_basis(&self, _p: &Value, _c: &dyn ResolverCtx) -> ContextHash {
             ContextHash::of(b"stable")
@@ -1180,6 +1150,173 @@ mod tests {
         // Advancing again must not re-record: the cell is truly gone.
         tl.advance_to(Tick::new(40));
         assert_eq!(tl.failures().len(), 1, "no zombie re-firing on later beats");
+    }
+
+    #[test]
+    fn failed_producer_uses_declared_fallback_at_commitment() {
+        let literal = ContentRef::of(b"declared silence", "text/plain");
+        for fallback in [Fallback::Skip, Fallback::UseLastGood, Fallback::Literal(literal.clone())] {
+            let mut tl = Timeline::new(TickClock {
+                ticks_per_sec: 1.0,
+                safety_factor: 2.0,
+                commit_margin: TickDelta::new(1),
+            });
+            tl.register_resolver(Box::new(AlwaysFails { message: "producer failed" }));
+            tl.register_resolver(Box::new(EchoBeat { cost: Duration::from_secs(1) }));
+            let track = TrackId::solo();
+            let producer = PrincipalId::new();
+            tl.schedule(Cell::deferred_on(
+                Span::instant(Tick::new(12)),
+                Recipe {
+                    resolver: ResolverId::new("always_fails"),
+                    params: serde_json::json!({"cost": 5}),
+                    query: ContextQuery::default(),
+                    fallback: fallback.clone(),
+                },
+                track.clone(),
+                producer,
+            )).unwrap();
+
+            // The failed producer reports now, but another producer can still
+            // supply the lane's last good phrase before this commitment.
+            tl.advance_to(Tick::new(2));
+            assert_eq!(tl.failures().len(), 1);
+            assert_eq!(tl.failures()[0].at, Tick::new(2));
+            assert_eq!(tl.failures()[0].played_by, producer);
+            assert_eq!(tl.future_len(), 1, "the declared fallback still owns its deadline");
+            assert!(tl.committed().is_empty());
+
+            tl.set_ambient("beat", b"accepted phrase".to_vec());
+            tl.schedule(deferred_at_track(6, Fallback::Skip, track.clone())).unwrap();
+            tl.advance_to(Tick::new(6));
+            let last_good = match &tl.committed()[0].body {
+                Body::Concrete(content) => content.clone(),
+                _ => panic!("accepted phrase must be concrete"),
+            };
+            tl.set_ambient("beat", b"another lane".to_vec());
+            tl.schedule(deferred_at_track(9, Fallback::Skip, TrackId::new("other").unwrap())).unwrap();
+            tl.advance_to(Tick::new(10));
+            assert_eq!(tl.committed().len(), 2, "no fallback before its deadline");
+
+            tl.advance_to(Tick::new(11));
+            let expected = match fallback {
+                Fallback::Skip => None,
+                Fallback::UseLastGood => Some(last_good),
+                Fallback::Literal(content) => Some(content),
+            };
+            if let Some(content) = expected {
+                assert_eq!(tl.committed().len(), 3);
+                let accepted = &tl.committed()[2];
+                assert_eq!(accepted.span.start, Tick::new(12));
+                assert_eq!(accepted.body, Body::Concrete(content));
+                assert_eq!(accepted.track, track);
+                assert_eq!(accepted.played_by, PrincipalId::beat());
+            } else {
+                assert_eq!(tl.committed().len(), 2);
+            }
+            assert_eq!(tl.future_len(), 0);
+            let committed = tl.committed().to_vec();
+            tl.advance_to(Tick::new(30));
+            assert_eq!(tl.committed(), committed);
+            assert_eq!(tl.failures().len(), 1, "failure and fallback both settle once");
+        }
+    }
+
+    #[test]
+    fn late_admission_never_rewinds_failure_or_commitment() {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(4),
+        });
+        tl.register_resolver(Box::new(AlwaysFails { message: "late failure" }));
+        tl.advance_to(Tick::new(10));
+        tl.schedule(Cell::deferred_on(
+            Span::instant(Tick::new(11)),
+            Recipe {
+                resolver: ResolverId::new("always_fails"),
+                params: Value::Null,
+                query: ContextQuery::default(),
+                fallback: Fallback::Skip,
+            },
+            TrackId::solo(),
+            PrincipalId::beat(),
+        )).unwrap();
+        tl.advance_to(Tick::new(11));
+        assert_eq!(tl.failures()[0].at, Tick::new(10), "late work starts at the current playhead");
+        assert_eq!(tl.playhead(), Tick::new(11));
+        assert_eq!(tl.future_len(), 0);
+    }
+
+    #[test]
+    fn failed_respeculation_keeps_final_deadline_and_discards_old_output() {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 3.0,
+            commit_margin: TickDelta::new(2),
+        });
+        tl.register_resolver(Box::new(EchoBeat { cost: Duration::from_secs(1) }));
+        let literal = ContentRef::of(b"declared fallback", "text/plain");
+        tl.schedule(Cell::deferred_on(
+            Span::instant(Tick::new(100)),
+            Recipe {
+                resolver: ResolverId::new("echo"),
+                params: serde_json::json!({"fail_on": "B"}),
+                query: ContextQuery::default(),
+                fallback: Fallback::Literal(literal.clone()),
+            },
+            TrackId::solo(),
+            PrincipalId::new(),
+        )).unwrap();
+        tl.set_ambient("beat", b"A".to_vec());
+        tl.advance_to(Tick::new(97));
+        tl.set_ambient("beat", b"B".to_vec());
+        tl.advance_to(Tick::new(98));
+        assert_eq!(tl.squashes()[0].recovery, Recovery::ReSpeculated);
+        assert_eq!(tl.failures()[0].at, Tick::new(98));
+        assert_eq!(tl.future_len(), 1);
+        tl.advance_to(Tick::new(99));
+        assert!(tl.committed().is_empty(), "the final attempt owns the start deadline");
+        tl.advance_to(Tick::new(100));
+        assert_eq!(tl.committed().len(), 1);
+        assert_eq!(tl.committed()[0].body, Body::Concrete(literal));
+        assert_eq!(tl.committed()[0].span.start, Tick::new(100));
+        assert_eq!(tl.committed()[0].played_by, PrincipalId::beat());
+        assert!(tl.content_bytes(&ContentRef::of(b"A", "text/plain").hash).is_none());
+        tl.advance_to(Tick::new(101));
+        assert_eq!(tl.failures().len(), 1);
+        assert_eq!(tl.squashes().len(), 1);
+        assert_eq!(tl.committed().len(), 1);
+        assert_eq!(tl.future_len(), 0);
+    }
+
+    #[test]
+    fn final_attempt_divergence_falls_back_without_a_third_attempt() {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 3.0,
+            commit_margin: TickDelta::new(2),
+        });
+        tl.register_resolver(Box::new(EchoBeat { cost: Duration::from_secs(1) }));
+        let literal = ContentRef::of(b"fallback", "text/plain");
+        tl.schedule(deferred_at(100, Fallback::Literal(literal.clone()))).unwrap();
+        tl.set_ambient("beat", b"A".to_vec());
+        tl.advance_to(Tick::new(97));
+        tl.set_ambient("beat", b"B".to_vec());
+        tl.advance_to(Tick::new(98));
+        tl.set_ambient("beat", b"C".to_vec());
+        tl.advance_to(Tick::new(100));
+        assert_eq!(tl.squashes().len(), 2, "each failed basis check records its own decision");
+        assert_eq!(tl.squashes()[0].recovery, Recovery::ReSpeculated);
+        assert_eq!(tl.squashes()[1].recovery, Recovery::FellBack);
+        assert_eq!(tl.committed().len(), 1);
+        assert_eq!(tl.committed()[0].body, Body::Concrete(literal));
+        assert_eq!(tl.committed()[0].span.start, Tick::new(100));
+        assert!(tl.failures().is_empty());
+        assert_eq!(tl.future_len(), 0);
+        tl.advance_to(Tick::new(110));
+        assert_eq!(tl.committed().len(), 1);
+        assert_eq!(tl.squashes().len(), 2);
     }
 
     /// T11 — the locked two-track cross-contamination test. Track B commits good

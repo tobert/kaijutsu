@@ -1867,6 +1867,25 @@ scenario. Kernel validation also reproduced the recorded ordering-stress flake;
 its evidence remains in docs/issues.md rather than being attributed to this
 unrelated change.
 
+The controlled timing scenario began with a failed producer. The engine recorded
+its error and discarded the cell, so its required fallback never ran. A failed
+source now retains its scheduled commitment deadline; the transport selects the
+fallback there and authors any replacement cell separately. That matters for
+`UseLastGood`: another producer can supply a better phrase between the failure
+and the deadline. Tests cover all three policies, lane isolation, failed
+re-speculation, and no repeated settlement. A second red test found due actions
+could rewind from tick 10 to tick 9 after late admission; those actions now run
+at the current playhead, retaining their original intended start.
+
+The SSH scenario drives the production scheduler with explicit beats and OODA
+disarmed. The actual client reads one error in the producer's conversation and
+one later fallback in the score, attributed to the transport. Its fixture uses
+the context's restored playhead: rc-created history means a real context does
+not necessarily begin at tick zero. Comments now state that resolvers still run
+synchronously under the timeline lock. Pending work, stale completion rejection,
+and bounded admission remain the next part of the scenario; the passing failure
+case is evidence for that part of the contract, not the whole performance goal.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
