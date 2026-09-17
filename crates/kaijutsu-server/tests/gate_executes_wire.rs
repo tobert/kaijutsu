@@ -415,7 +415,7 @@ fn shutdown_keeps_the_approved_turns_delivery_seed() {
             std::fs::read_to_string(&marker).is_ok_and(|content| content == "entered\n")
         }).await;
         tokio::time::timeout(std::time::Duration::from_secs(2),
-            s.kernel.kernel.shutdown_command_worker()).await.unwrap().unwrap();
+            s.kernel.kernel.shutdown_runtime_worker()).await.unwrap().unwrap();
         assert!(s.worker_blocks().iter().any(|block| block.kind == BlockKind::Text
             && block.content.contains("approved the action")),
             "shutdown discarded the durable delivery seed for the spent approval");
@@ -439,7 +439,7 @@ fn shutdown_settles_an_approved_command_before_returning() {
             std::fs::read_to_string(&marker).is_ok_and(|content| content == "entered\n")
         }).await;
         tokio::time::timeout(std::time::Duration::from_secs(2),
-            s.kernel.kernel.shutdown_command_worker()).await
+            s.kernel.kernel.shutdown_runtime_worker()).await
             .expect("shutdown must cancel the approved command").unwrap();
         assert!(matches!(s.block(&output).status, Status::Done | Status::Error),
             "shutdown returned before the approved output settled");
@@ -1387,7 +1387,7 @@ fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
             let kaijutsu_client::RpcError::Refused(refusal) = error else { panic!("expected pending review: {error}") };
             assert_eq!(refusal.kind, kaijutsu_types::RefusalKind::Pending);
             let ask = refusal.ask.unwrap().request_id;
-            tokio::time::timeout(std::time::Duration::from_secs(3), s.kernel.kernel.shutdown_command_worker())
+            tokio::time::timeout(std::time::Duration::from_secs(3), s.kernel.kernel.shutdown_runtime_worker())
                 .await.expect("shutdown must settle retained structured review").unwrap();
             assert_eq!(s.kernel.kernel_db.lock().get_approval(&ask).unwrap().unwrap().status, kaijutsu_kernel::ApprovalStatus::Abandoned);
             let review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask, s.worker).unwrap().unwrap();
@@ -1434,7 +1434,7 @@ fn structured_result_review_survives_rpc_disconnect() {
         assert_eq!(blocks.iter().find(|block| block.id == operation.receipt.output_block_id).unwrap().status, Status::Done);
         drop(approver_kj);
         drop(_approver_client);
-        kernel.kernel.shutdown_command_worker().await.unwrap();
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
 
@@ -1688,7 +1688,7 @@ fn shutdown_settles_retained_stream_review_before_join_returns() {
             .any(|ask| ask.hook_id.as_deref() == Some("shutdown-stream-review"))).await;
         let ask = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()
             .find(|ask| ask.hook_id.as_deref() == Some("shutdown-stream-review")).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), s.kernel.kernel.shutdown_command_worker())
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.kernel.kernel.shutdown_runtime_worker())
             .await.expect("stream review must not hold kernel shutdown").unwrap();
         let review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask.request_id, s.worker).unwrap().unwrap();
         assert_eq!(review.settled.unwrap().block_status(), Status::Error);

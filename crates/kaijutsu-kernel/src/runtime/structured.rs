@@ -42,7 +42,7 @@ pub async fn execute_kj(
     let argv = argv.to_vec();
     let span = tracing::Span::current();
     let hook_depth = crate::mcp::broker::current_hook_depth();
-    kernel.spawn_command(move |stop| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
+    kernel.spawn_runtime_task(move |stop| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
         let result = run_kj(&owner, identity, &argv, quiet, notices, stop).await;
         if let Err(Err(error)) = reply.send(result) {
             tracing::error!(context = %identity.context,
@@ -195,7 +195,7 @@ mod tests {
     async fn stopped_runtime_refuses_structured_execution() {
         let (dispatcher, identity) = fixture().await;
         let kernel = dispatcher.kernel();
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
         let result = execute_kj(kernel, identity, &["help".into()], true).await;
         assert!(matches!(result, Err(ref error) if error.contains("shut down")),
             "structured execution ignored stopped runtime admission");
@@ -239,7 +239,7 @@ mod tests {
         let argv = ["block", "create", "--role", "user", "--kind", "text", "--content", "must-not-run"]
             .into_iter().map(str::to_owned).collect::<Vec<_>>();
         assert!(execute_kj(kernel, identity, &argv, false).await.is_err());
-        assert!(kernel.shutdown_command_worker().await.is_err());
+        assert!(kernel.shutdown_runtime_worker().await.is_err());
         let operations = kernel.shell_operations().list_for_context(identity.context).unwrap();
         assert_eq!(operations.len(), 1);
         assert!(operations[0].completed_at.is_some());
@@ -274,7 +274,7 @@ mod tests {
         local.run_until(tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()))
             .await.expect("structured execution must reach its result hook");
         if shutdown {
-            tokio::time::timeout(std::time::Duration::from_secs(3), kernel.shutdown_command_worker())
+            tokio::time::timeout(std::time::Duration::from_secs(3), kernel.shutdown_runtime_worker())
                 .await.expect("shutdown must cancel result hooks").unwrap();
         } else {
             drop(local);
@@ -290,7 +290,7 @@ mod tests {
         }).await.expect("accepted structured execution must settle independently of its submitter");
         let blocks = kernel.blocks().block_snapshots(identity.context).unwrap();
         assert_eq!(blocks.iter().filter(|block| block.content == "structured-once").count(), if pre_call { 0 } else { 1 });
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]

@@ -1740,7 +1740,10 @@ Regressions first showed stopped kernels accepting source and shutdown leaving
 result hooks pending. The new owner joins cancellation, including retained
 approval review, while preserving captured output. Interactive and streaming
 callers now share the acknowledged context-switch channel, and the unused
-ambient-context constructor wrapper is deleted.
+ambient-context constructor wrapper is deleted. The shared executor is now
+`RuntimeWorker`, with `spawn_runtime_task`, `stop_runtime_worker` and
+`shutdown_runtime_worker` naming its full scope: commands, model turns and
+approval delivery. All callers moved; no command-only compatibility alias remains.
 
 ## The kernel with no one to answer to (September 16)
 

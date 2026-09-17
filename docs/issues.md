@@ -128,7 +128,7 @@ resuming the original unwind, preserving captured output and completed statement
 observations; a failed worker stops admission and reports an error from shutdown.
 Abrupt task destruction before capture still needs live terminal settlement and
 job/receipt agreement; startup reports interruption without replaying source.
-SIGTERM/SIGINT now await the command worker before checkpointing and exiting;
+SIGTERM/SIGINT now await the runtime worker before checkpointing and exiting;
 host Drop remains a cancellation signal without a wait. Streaming RPC now uses
 the same worker for preparation and execution; its adapter retains slot/history,
 interrupts and callbacks. Disconnect cancels while runtime retains settlement.

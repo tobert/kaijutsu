@@ -1617,7 +1617,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while jobs.read_stdout(job.id).await.unwrap().is_empty() { tokio::task::yield_now().await; }
         }).await.unwrap();
-        d.kernel().stop_command_worker();
+        d.kernel().stop_runtime_worker();
         let state = wait_for_operation(&d, context, &id).await;
         let envelope = state.envelope.unwrap();
         assert!(envelope.is_error());
@@ -1719,7 +1719,7 @@ mod tests {
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
         let receipt = broker.call_tool(call_async("echo captured"), &cc, CancellationToken::new()).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await.unwrap();
-        d.kernel().stop_command_worker();
+        d.kernel().stop_runtime_worker();
         let id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
         let settled = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -1894,7 +1894,7 @@ mod tests {
                 assert_eq!(record.operation_id, operation);
                 assert!(record.settled.is_none());
                 if decision == "shutdown" {
-                    d.kernel().stop_command_worker();
+                    d.kernel().stop_runtime_worker();
                 } else if decision == "cancel" {
                     if let Some(operation) = &operation {
                         assert!(d.kernel().shell_operations().cancel(operation, context).await.unwrap());
@@ -1914,7 +1914,7 @@ mod tests {
                 let crate::runtime::command_outcome::CommandExecution::Completed(raw) = settled.execution
                     else { panic!("lost captured tool execution") };
                 assert_eq!(raw.text_out(), "captured\n");
-                if decision == "panic" { assert!(d.kernel().shutdown_command_worker().await.is_err()); }
+                if decision == "panic" { assert!(d.kernel().shutdown_runtime_worker().await.is_err()); }
                 if let Some(operation) = operation {
                     let state = wait_for_operation(&d, context, &operation).await;
                     let jobs = d.kernel().context_job_manager(context);

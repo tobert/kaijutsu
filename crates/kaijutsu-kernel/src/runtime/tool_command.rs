@@ -57,7 +57,7 @@ impl ToolCommand {
         let span = tracing::Span::current();
         let hook_depth = crate::mcp::broker::current_hook_depth();
         let host = self.kernel.clone();
-        let started = host.spawn_command(move |shutdown| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
+        let started = host.spawn_runtime_task(move |shutdown| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
                 let stop_command = task_cancel.clone();
                 let run = CommandRunOptions { stdin: self.stdin,
                     context_switch: CommandContextSwitch::Pinned,
@@ -95,15 +95,15 @@ impl ToolCommand {
         if let Err(error) = started {
             if let Some(receipt) = &receipt {
                 let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
-                outcome.settlement_error = Some(format!("shell worker could not start: {error}"));
+                outcome.settlement_error = Some(format!("runtime worker could not start: {error}"));
                 command::settle_outcome(&failure_kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome)
                     .map_err(McpError::Protocol)?;
             }
-            return Err(McpError::Protocol(format!("shell worker could not start: {error}")));
+            return Err(McpError::Protocol(format!("runtime worker could not start: {error}")));
         }
         if let Some(receipt) = receipt {
             if ready_rx.await.is_err() {
-                let outcome = completed.await.map_err(|_| McpError::Protocol("shell worker stopped before admission".into()))?
+                let outcome = completed.await.map_err(|_| McpError::Protocol("runtime worker stopped before admission".into()))?
                     .map_err(McpError::Protocol)?;
                 let mut envelope = outcome.envelope();
                 envelope.operation_id = Some(receipt.operation_id);
@@ -122,7 +122,7 @@ impl ToolCommand {
                 Err(McpError::Refused(refusal))
             }
             result = completed => {
-                let outcome = result.map_err(|_| McpError::Protocol("shell worker stopped before completion".into()))?
+                let outcome = result.map_err(|_| McpError::Protocol("runtime worker stopped before completion".into()))?
                     .map_err(McpError::Protocol)?;
                 if let Some(refusal) = outcome.refusal() { return Err(McpError::Refused(refusal.clone())); }
                 Ok(shell_envelope_to_tool_result(outcome.envelope()))

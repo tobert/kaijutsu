@@ -231,7 +231,7 @@ mod tests {
         let ctx = register_context(&d, Some("stopped"), None, principal);
         seed_with_block(&d, ctx, principal);
         let mut observer = d.kernel().turn_flows().subscribe("turn.requested");
-        d.kernel().shutdown_command_worker().await.unwrap();
+        d.kernel().shutdown_runtime_worker().await.unwrap();
         let result = d.dispatch(&[s("drive")], &caller_with_context(ctx)).await;
         assert!(!result.is_ok(), "an observer accepted work for a stopped executor");
         assert!(result.message().contains("shut down"), "{}", result.message());
@@ -247,7 +247,7 @@ mod tests {
         seed_with_block(&d, ctx, principal);
         let result = d.dispatch(&[s("drive")], &caller_with_context(ctx)).await;
         assert!(result.is_ok(), "runtime admission should not need observers: {}", result.message());
-        d.kernel().shutdown_command_worker().await.unwrap();
+        d.kernel().shutdown_runtime_worker().await.unwrap();
         assert!(!d.kernel().turn_in_flight(ctx));
     }
 
@@ -486,7 +486,7 @@ mod tests {
         let ctx = register_context(&d, Some("here"), None, principal);
         seed_with_block(&d, ctx, principal);
         let c = caller_with_context(ctx);
-        d.kernel().shutdown_command_worker().await.unwrap();
+        d.kernel().shutdown_runtime_worker().await.unwrap();
 
         let result = d.dispatch(&[s("drive")], &c).await;
         assert!(

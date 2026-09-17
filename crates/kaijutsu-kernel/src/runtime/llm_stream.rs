@@ -588,7 +588,7 @@ pub(super) async fn spawn_admitted_turn(
     assert_eq!(turn_lease.context(), context_id, "turn lease belongs to its request");
     let interrupt = turn_lease.interrupt();
 
-    let accepted = kernel.spawn_command(move |stop| async move {
+    let accepted = kernel.spawn_runtime_task(move |stop| async move {
         let cancel = interrupt.clone();
         let run = process_llm_stream(
             provider, documents, context_id, model_name, kernel_arc, kernel_db,
@@ -5795,7 +5795,7 @@ mod lifetime_tests {
         assert!(!kernel.turn_in_flight(context));
         assert!(completed.try_recv().is_none());
         drop(held);
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]
@@ -5813,7 +5813,7 @@ mod lifetime_tests {
             .expect("startup refusal must reach observers").unwrap();
         assert!(matches!(last.payload, TurnFlow::Failed { .. }));
         assert!(!kernel.turn_in_flight(context));
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
         assert!(events.try_recv().is_none());
     }
 
@@ -5831,7 +5831,7 @@ mod lifetime_tests {
         assert!(events.try_recv().is_none());
         drop(existing);
         assert!(!kernel.turn_in_flight(context));
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]
@@ -5859,7 +5859,7 @@ mod lifetime_tests {
         let event = tokio::time::timeout(Duration::from_secs(3), completed.recv()).await
             .expect("accepted turn must outlive its submitter").unwrap();
         assert!(matches!(event.payload, TurnFlow::Completed { output_block_id: Some(_), .. }));
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
         assert!(!kernel.turn_in_flight(context));
         assert!(kernel.turns().active_count(context) == 0);
         assert!(completed.try_recv().is_none());
@@ -5874,7 +5874,7 @@ mod lifetime_tests {
         local.run_until(async {
             spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_command_worker()).await
+            tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
                 .expect("shutdown must drain accepted turns").unwrap();
         }).await;
         assert!(!kernel.turn_in_flight(context), "shutdown left a live turn");
@@ -5899,7 +5899,7 @@ mod lifetime_tests {
                 .expect("a panicked turn must announce failure").unwrap();
             assert!(matches!(event.payload, TurnFlow::Failed { .. }));
         }).await;
-        assert!(kernel.shutdown_command_worker().await.is_err(), "panic must reach shutdown owner");
+        assert!(kernel.shutdown_runtime_worker().await.is_err(), "panic must reach shutdown owner");
         assert!(!kernel.turn_in_flight(context));
         assert!(kernel.turns().active_count(context) == 0);
         assert!(failed.try_recv().is_none());
@@ -5908,7 +5908,7 @@ mod lifetime_tests {
     #[tokio::test]
     async fn stopped_worker_refuses_turn_without_leaving_state() {
         let (kernel, context, after, call) = fixture(Some(MockClient::new("unused"))).await;
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
         let error = spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("shut down"), "{error}");
@@ -5926,7 +5926,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_command_worker()).await
+        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
             .expect("queued turn must cancel without acquiring the held lock").unwrap();
         drop(held);
         assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
@@ -5952,7 +5952,7 @@ mod lifetime_tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }).await.expect("provider must enter before shutdown");
-        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_command_worker()).await
+        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
             .expect("shutdown must drain the cancelled provider").unwrap();
         assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
             reason: TurnStopReason::Cancelled { immediate: true }, ..
@@ -5980,7 +5980,7 @@ mod lifetime_tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }).await.expect("provider connection must start before shutdown");
-        tokio::time::timeout(Duration::from_millis(500), kernel.shutdown_command_worker()).await
+        tokio::time::timeout(Duration::from_millis(500), kernel.shutdown_runtime_worker()).await
             .expect("shutdown must cancel provider connection, not wait for it to open").unwrap();
         assert!(matches!(completed.try_recv().map(|event| event.payload), Some(TurnFlow::Completed {
             reason: TurnStopReason::Cancelled { immediate: true }, ..

@@ -32,7 +32,7 @@ pub async fn execute(
     let cancel = cancel.child_token();
     let depth = crate::mcp::broker::current_hook_depth();
     let span = tracing::Span::current();
-    kernel.spawn_command(move |shutdown| crate::mcp::broker::inherit_hook_depth(depth, async move {
+    kernel.spawn_runtime_task(move |shutdown| crate::mcp::broker::inherit_hook_depth(depth, async move {
         let run = async {
             let (kaish, call, replacement) = match prepare(&owner, identity, &code, &cancel).await {
                 Ok(Ok(prepared)) => prepared,
@@ -177,7 +177,7 @@ mod tests {
             assert_eq!(blocks.len(), 1, "streaming must author only the requested text, once");
             assert_eq!(blocks[0].content, "streaming-once");
             assert_eq!(blocks[0].id.principal_id, identity.performer);
-            kernel.shutdown_command_worker().await.unwrap();
+            kernel.shutdown_runtime_worker().await.unwrap();
         }
     }
 
@@ -192,12 +192,12 @@ mod tests {
                 "kj block create --role user --kind text --content must-not-run".into(), cancel.clone());
             let stop = async {
                 tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await.unwrap();
-                if shutdown { kernel.shutdown_command_worker().await.unwrap(); } else { cancel.cancel(); }
+                if shutdown { kernel.shutdown_runtime_worker().await.unwrap(); } else { cancel.cancel(); }
             };
             let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async { tokio::join!(submit, stop) }).await.unwrap();
             assert!(matches!(result, Err(ref error) if error.contains("cancelled")));
             assert!(kernel.blocks().block_snapshots(identity.context).unwrap().is_empty());
-            kernel.shutdown_command_worker().await.unwrap();
+            kernel.shutdown_runtime_worker().await.unwrap();
         }
     }
 
@@ -215,7 +215,7 @@ mod tests {
                 let execution = result.unwrap().unwrap();
                 assert!(tokio::time::timeout(std::time::Duration::from_secs(3), execution.completed).await.unwrap().is_err());
             }
-            assert!(kernel.shutdown_command_worker().await.is_err());
+            assert!(kernel.shutdown_runtime_worker().await.is_err());
         }
     }
 }

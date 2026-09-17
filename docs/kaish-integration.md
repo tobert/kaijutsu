@@ -118,8 +118,11 @@ These are source observations, not promises that all paths behave alike.
   Background job streams expose raw output after each completed statement;
   final job results and receipts include result-hook effects. A hook replacement
   never fills an otherwise empty raw stream.
-- `runtime/worker.rs` supplies one lazy kernel-owned LocalSet on a reserved kaish
-  stack. Accepted shell tools and model turns survive the submitting runtime or transport. Hook
+- `runtime/worker.rs::RuntimeWorker` supplies one lazy kernel-owned LocalSet on
+  a reserved kaish stack. `Kernel::spawn_runtime_task` admits work;
+  `stop_runtime_worker` signals cancellation and `shutdown_runtime_worker`
+  joins settlement. The executor thread is named `kernel-runtime`. Accepted shell
+  tools and model turns survive the submitting runtime or transport. Hook
   recursion depth crosses the handoff. Host shutdown cancels accepted commands,
   drains their settlement, and forbids late startup. Already-cancelled admissions
   do not enter kaish. Read-only commands discard local cwd/export changes;
@@ -151,7 +154,7 @@ These are source observations, not promises that all paths behave alike.
   Shutdown retains the claimed action's delivery seed without requesting another
   turn. Shared cwd reads live in
   `runtime/shell_state.rs::context_cwd`.
-- SIGTERM/SIGINT await the command worker's thread before checkpointing and
+- SIGTERM/SIGINT await the runtime worker's thread before checkpointing and
   exiting. Joining is shared across callers and survives a cancelled waiter;
   a worker cannot join itself. Host Drop signals cancellation without waiting.
   Interactive, structured, streaming, model and approval callers use this owner.

@@ -321,10 +321,10 @@ fn spawn_signal_shutdown(kernel: std::sync::Weak<crate::rpc::SharedKernelState>)
         let Some(kernel) = kernel.upgrade() else { return; };
         log::info!("{name} received; settling accepted shell commands before exit");
         kernel.shutdown.cancel();
-        let exit_code = match kernel.kernel.shutdown_command_worker().await {
+        let exit_code = match kernel.kernel.shutdown_runtime_worker().await {
             Ok(()) => 0,
             Err(error) => {
-                log::error!("{name} command worker shutdown failed: {error}");
+                log::error!("{name} runtime worker shutdown failed: {error}");
                 1
             }
         };
@@ -467,7 +467,7 @@ impl SshServer {
         }
 
         // Signal-driven exit must await accepted command settlement; Drop can
-        // signal cancellation but cannot await the command worker.
+        // signal cancellation but cannot await the runtime worker.
         spawn_signal_shutdown(Arc::downgrade(&shared_kernel));
 
         // External MCP servers (mcp.toml — kaibo, bevy_brp, …) start HERE,

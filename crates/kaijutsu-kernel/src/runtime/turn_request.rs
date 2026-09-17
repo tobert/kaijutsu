@@ -39,7 +39,7 @@ impl Kernel {
         let accepted = request.clone();
         let kernel = self.clone();
         let (release, ready) = tokio::sync::oneshot::channel();
-        self.spawn_command(move |stop| async move {
+        self.spawn_runtime_task(move |stop| async move {
             if ready.await.is_err() {
                 drop(lease);
                 report_failure(&kernel, &accepted, "turn admission ended before publication".into());

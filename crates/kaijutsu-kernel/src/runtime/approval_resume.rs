@@ -606,7 +606,7 @@ pub(crate) fn start(kernel: &Arc<Kernel>) -> Result<(), String> {
         .map_err(|error| format!("could not read approval backlog: {error}"))?
         .into_iter().map(|answer| answer.request_id).collect();
     let owner = Arc::downgrade(kernel);
-    kernel.spawn_command(move |stop| run_delivery(owner, sub, woken, stop))
+    kernel.spawn_runtime_task(move |stop| run_delivery(owner, sub, woken, stop))
 }
 
 async fn run_delivery(
@@ -1034,7 +1034,7 @@ mod lifetime_tests {
         kernel.start_approval_delivery().unwrap();
         assert_eq!(kernel.ledger_flows().subscriber_count(), 1,
             "repeated startup must not create another delivery owner");
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
         assert_eq!(kernel.ledger_flows().subscriber_count(), 0,
             "shutdown returned while approval delivery was still listening");
         assert!(kernel.start_approval_delivery().unwrap_err().contains("shut down"));
@@ -1048,7 +1048,7 @@ mod lifetime_tests {
         let error = kernel.start_approval_delivery().unwrap_err();
         assert!(error.contains("could not read approval backlog"), "{error}");
         assert_eq!(kernel.ledger_flows().subscriber_count(), 0);
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]

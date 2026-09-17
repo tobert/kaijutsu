@@ -37,7 +37,7 @@ fn interactive_submission_uses_its_addressed_context() {
         assert!(!envelope.is_error(), "{envelope:?}");
         assert!(envelope.stdout.contains("interactive-addressed"), "{}", envelope.stdout);
         assert!(!envelope.stdout.contains("interactive-joined"));
-        kernel.kernel.shutdown_command_worker().await.unwrap();
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
 
@@ -65,7 +65,7 @@ fn shutdown_settles_streaming_execution_paused_in_post_call() {
         let mut output = kj.subscribe_output().await.unwrap();
         let id = kj.execute("echo captured-stream").await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), kernel.kernel.shutdown_command_worker())
+        tokio::time::timeout(std::time::Duration::from_secs(5), kernel.kernel.shutdown_runtime_worker())
             .await.expect("shutdown must join streaming settlement").unwrap();
         let exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(event) = output.recv().await {
@@ -89,7 +89,7 @@ fn stopped_runtime_refuses_streaming_execution() {
         let contexts = kj.list_contexts().await.unwrap();
         let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
         kj.join_context(context, "stopped-streaming").await.unwrap();
-        kernel.kernel.shutdown_command_worker().await.unwrap();
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
         let result = kj.execute("echo should-not-run").await;
         assert!(result.is_err(), "stopped runtime admitted streaming source");
     });
@@ -115,7 +115,7 @@ fn interactive_lifetime(shutdown: bool) {
         let submission = kj.shell_submit("echo retained-interactive", context, true).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await.unwrap();
         if shutdown {
-            tokio::time::timeout(std::time::Duration::from_secs(5), kernel.kernel.shutdown_command_worker())
+            tokio::time::timeout(std::time::Duration::from_secs(5), kernel.kernel.shutdown_runtime_worker())
                 .await.expect("shutdown must join interactive settlement").unwrap();
         } else {
             drop(kj);
@@ -139,7 +139,7 @@ fn interactive_lifetime(shutdown: bool) {
             else { panic!("captured interactive output was lost") };
         assert_eq!(raw.text_out(), "retained-interactive\n");
         assert_eq!(operation.envelope.unwrap().is_error(), shutdown);
-        kernel.kernel.shutdown_command_worker().await.unwrap();
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
 

@@ -300,7 +300,7 @@ impl Drop for SharedKernelState {
         // `KernelDb` Arcs — deliberately NOT an `Arc<SharedKernelState>`,
         // which would be a cycle that kept this `Drop` from ever running.
         self.shutdown.cancel();
-        self.kernel.stop_command_worker();
+        self.kernel.stop_runtime_worker();
 
         // Best-effort WAL checkpoint on clean teardown so the main `.db` file
         // doesn't linger behind committed history after exit. This fires only

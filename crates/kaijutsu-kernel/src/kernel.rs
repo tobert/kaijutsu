@@ -170,9 +170,9 @@ pub struct Kernel {
     /// Durable shell receipts and context-owned kaish jobs.
     shell_operations: Arc<crate::shell_operations::ShellOperationRegistry>,
     turn_state: crate::runtime::turn_state::TurnState,
-    command_worker: OnceLock<Result<crate::runtime::worker::CommandWorker, String>>,
+    runtime_worker: OnceLock<Result<crate::runtime::worker::RuntimeWorker, String>>,
     approval_delivery: OnceLock<Result<(), String>>,
-    command_worker_shutdown: tokio_util::sync::CancellationToken,
+    runtime_worker_shutdown: tokio_util::sync::CancellationToken,
     /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
     /// "Order from here: kernel wiring of the inbox"). `OnceLock` like
     /// `beat_ingress`/`file_cache`: the server binds the real socket and
@@ -391,9 +391,9 @@ impl Kernel {
                 Arc::new(operations)
             },
             turn_state: crate::runtime::turn_state::TurnState::default(),
-            command_worker: OnceLock::new(),
+            runtime_worker: OnceLock::new(),
             approval_delivery: OnceLock::new(),
-            command_worker_shutdown: tokio_util::sync::CancellationToken::new(),
+            runtime_worker_shutdown: tokio_util::sync::CancellationToken::new(),
             cc_inbox: OnceLock::new(),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
@@ -403,14 +403,16 @@ impl Kernel {
     /// Conversation ownership and interrupts shared by all model entry paths.
     pub fn turns(&self) -> &crate::runtime::turn_state::TurnState { &self.turn_state }
 
-    pub(crate) fn spawn_command<F, W>(&self, work: W) -> Result<(), String>
+    /// Admit a task to the shared executor. Shutdown cancels its token and
+    /// joins the task; each owner must finish its settlement before returning.
+    pub(crate) fn spawn_runtime_task<F, W>(&self, work: W) -> Result<(), String>
     where F: std::future::Future<Output = ()> + 'static, W: FnOnce(tokio_util::sync::CancellationToken) -> F + Send + 'static {
-        if self.command_worker_shutdown.is_cancelled() { return Err("kernel command worker is shut down".into()); }
-        let worker = self.command_worker.get_or_init(crate::runtime::worker::CommandWorker::start)
+        if self.runtime_worker_shutdown.is_cancelled() { return Err("kernel runtime worker is shut down".into()); }
+        let worker = self.runtime_worker.get_or_init(crate::runtime::worker::RuntimeWorker::start)
             .as_ref().map_err(Clone::clone)?;
-        if self.command_worker_shutdown.is_cancelled() {
+        if self.runtime_worker_shutdown.is_cancelled() {
             worker.stop();
-            return Err("kernel command worker is shut down".into());
+            return Err("kernel runtime worker is shut down".into());
         }
         worker.submit(work)
     }
@@ -418,7 +420,7 @@ impl Kernel {
     /// Start exactly one approval delivery subscription on the runtime worker.
     /// Subscription and backlog reads finish before this returns.
     pub fn start_approval_delivery(self: &Arc<Self>) -> Result<(), String> {
-        if self.command_worker_shutdown.is_cancelled() {
+        if self.runtime_worker_shutdown.is_cancelled() {
             return Err("kernel runtime is shut down".into());
         }
         self.approval_delivery.get_or_init(|| crate::runtime::approval_resume::start(self)).clone()
@@ -426,15 +428,15 @@ impl Kernel {
 
     /// Signal commands, model turns, and approval delivery to stop before worker exit.
     /// This does not wait for the worker; transport disconnects do not stop it.
-    pub fn stop_command_worker(&self) {
-        self.command_worker_shutdown.cancel();
-        if let Some(Ok(worker)) = self.command_worker.get() { worker.stop(); }
+    pub fn stop_runtime_worker(&self) {
+        self.runtime_worker_shutdown.cancel();
+        if let Some(Ok(worker)) = self.runtime_worker.get() { worker.stop(); }
     }
 
     /// Stop accepting work and join commands, turns, and approval delivery.
-    pub async fn shutdown_command_worker(&self) -> Result<(), String> {
-        self.stop_command_worker();
-        match self.command_worker.get() {
+    pub async fn shutdown_runtime_worker(&self) -> Result<(), String> {
+        self.stop_runtime_worker();
+        match self.runtime_worker.get() {
             Some(Ok(worker)) => worker.join().await,
             Some(Err(error)) => Err(error.clone()),
             None => Ok(()),

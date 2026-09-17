@@ -35,7 +35,7 @@ pub async fn submit(
     let trace_id = kernel.drift().read().trace_id_for_context(identity.context).unwrap_or([0u8; 16]);
     let span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute");
     let depth = crate::mcp::broker::current_hook_depth();
-    kernel.spawn_command(move |stop| crate::mcp::broker::inherit_hook_depth(depth, async move {
+    kernel.spawn_runtime_task(move |stop| crate::mcp::broker::inherit_hook_depth(depth, async move {
         match prepare(&owner, identity, source, user_initiated, &stop).await {
             Err(error) => {
                 if let Err(Err(error)) = reply.send(Err(error)) {
@@ -207,7 +207,7 @@ mod tests {
     async fn stopped_runtime_does_not_author_interactive_blocks() {
         let (dispatcher, identity) = fixture().await;
         let kernel = dispatcher.kernel();
-        kernel.shutdown_command_worker().await.unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
         let result = submit(kernel, identity, ShellSource::Code("echo never".into()), true).await;
         assert!(matches!(result, Err(ref error) if error.contains("shut down")));
         assert!(kernel.blocks().block_snapshots(identity.context).unwrap().is_empty());
@@ -238,7 +238,7 @@ mod tests {
                     }
                 }).await.expect("acknowledgement must release command completion");
             }
-            tokio::time::timeout(std::time::Duration::from_secs(3), kernel.shutdown_command_worker())
+            tokio::time::timeout(std::time::Duration::from_secs(3), kernel.shutdown_runtime_worker())
                 .await.expect("connection acknowledgement cannot prevent shutdown").unwrap();
             assert!(kernel.shell_operations().get(&submission.operation_id, identity.context).unwrap().unwrap().completed_at.is_some());
         }
@@ -283,7 +283,7 @@ mod tests {
             kernel.blocks().edit_draft(identity.context, identity.performer, code.len(), " later", 0).unwrap();
         }
         if shutdown {
-            tokio::time::timeout(std::time::Duration::from_secs(3), kernel.shutdown_command_worker()).await.unwrap().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), kernel.shutdown_runtime_worker()).await.unwrap().unwrap();
         } else {
             release.notify_one();
         }
@@ -310,6 +310,6 @@ mod tests {
                 [command.id.to_key()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
         assert_eq!(requester, identity.requester.as_bytes());
         assert_eq!(performer, identity.performer.as_bytes());
-        assert_eq!(kernel.shutdown_command_worker().await.is_err(), panic);
+        assert_eq!(kernel.shutdown_runtime_worker().await.is_err(), panic);
     }
 }
