@@ -148,13 +148,6 @@ fn context_row_is_live(row: &crate::kernel_db::ContextRow) -> bool {
     row.context_state == kaijutsu_types::ContextState::Live && !row.is_archived()
 }
 
-fn context_is_live(kernel: &Arc<Kernel>, context_id: ContextId) -> bool {
-    matches!(
-        kernel.kernel_db().lock().get_context(context_id),
-        Ok(Some(row)) if context_row_is_live(&row)
-    )
-}
-
 /// Seed the values an ask's free variables held when the human was asked,
 /// so the approved text expands to what was reviewed and not to whatever
 /// the context holds now. An ask that recorded nothing seeds nothing. A
@@ -348,25 +341,6 @@ async fn act_on_executable_answer(
     let source = ask.source.as_str();
     let linked = ask.pair;
 
-    if linked.is_some_and(|(_, _, owner)| owner == crate::PairOwner::Turn) {
-        let assignment = {
-            let db = kernel.kernel_db().lock();
-            db.get_context(context_id).map(|row| row.and_then(|row| row.played_by))
-        };
-        if !matches!(assignment, Ok(Some(actor)) if actor == ask.actor) {
-            let reason = "The context's performer changed after this ask was raised; nothing was run.".to_string();
-            if let Some((command, output, _)) = linked {
-                settle_pair_error(kernel, context_id, &command, &output, reason.clone());
-            }
-            if let Err(e) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
-                tracing::error!("gate-resume: could not consume stale ask {}: {e}", answer.request_id);
-                return ExecAction::Deferred;
-            }
-            tracing::error!("gate-resume: ask {}: {reason}", answer.request_id);
-            return ExecAction::Settled;
-        }
-    }
-
     // A denial runs nothing. A connected session sees its settled pair
     // directly. A model turn does not: its cached mailbox cannot observe an
     // in-place edit, so it also receives an explicit no-run seed.
@@ -403,7 +377,28 @@ async fn act_on_executable_answer(
         };
     }
 
-    match kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
+    // Validate context state and claim under one database lock. Only the
+    // winner may execute or settle a stale performer's pair. Read faults leave
+    // the approval untouched so delivery can retry after storage recovers.
+    let (claim, performer_changed) = {
+        let db = kernel.kernel_db().lock();
+        match db.get_context(context_id) {
+            Ok(Some(row)) if context_row_is_live(&row) => {
+                let performer_changed = linked.is_some_and(|(_, _, owner)| owner == crate::PairOwner::Turn)
+                    && row.played_by != Some(ask.actor);
+                (db.redeem_ask(&answer.request_id), performer_changed)
+            }
+            Ok(_) => {
+                tracing::info!("gate-resume: {context_id} is no longer live; leaving ask {} unclaimed", answer.request_id);
+                return ExecAction::Deferred;
+            }
+            Err(error) => {
+                tracing::error!("gate-resume: could not read {context_id} before claiming ask {}: {error}", answer.request_id);
+                return ExecAction::Deferred;
+            }
+        }
+    };
+    match claim {
         Ok(true) => {}
         Ok(false) => {
             tracing::info!(
@@ -423,21 +418,19 @@ async fn act_on_executable_answer(
         }
     }
 
+    if performer_changed {
+        let reason = "The context's performer changed after this ask was raised; nothing was run.".to_string();
+        if let Some((command, output, _)) = linked {
+            settle_pair_error(kernel, context_id, &command, &output, reason.clone());
+        }
+        tracing::error!("gate-resume: ask {}: {reason}", answer.request_id);
+        return ExecAction::Settled;
+    }
+
     let mut preparation = ApprovalPreparation {
         kernel, context: context_id, actor: ask.actor,
         pair: linked.map(|(command, output, _)| (command, output)), armed: true,
     };
-
-    // Recheck Live after claiming: archive may race the initial delivery scan.
-    // A spent approval for an archived context runs nothing and stays spent.
-    if !context_is_live(kernel, context_id) {
-        tracing::info!(
-            "gate-resume: {context_id} stopped being Live before ask {} could run; \
-             nothing was run",
-            answer.request_id
-        );
-        return ExecAction::Settled;
-    }
 
     // A synthetic session: the seat that raised this ask is gone (its turn
     // ended when the gate refused, or its connection closed), and a shell
@@ -918,6 +911,10 @@ async fn run_delivery(
                 continue;
             }
 
+            // The durable seed delivered this answer. Turn admission cannot
+            // undo that fact or authorize another copy on a later ledger event.
+            woken.insert(answer.request_id.clone());
+            woken_this_event += 1;
             if let Err(error) = kernel.request_turn(super::turn_request::TurnRequest {
                 context_id, after_block_id: seed_block, content: seed,
                 principal_id, model: None, continuation_epoch: Some(continuation_epoch),
@@ -925,8 +922,6 @@ async fn run_delivery(
                 tracing::warn!("gate-resume: {context_id} was not admitted: {error}");
                 continue;
             }
-            woken.insert(answer.request_id.clone());
-            woken_this_event += 1;
             tracing::info!(
                 "gate-resume: woke {context_id} for {:?} ask {}",
                 answer.status,
@@ -940,6 +935,163 @@ async fn run_delivery(
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unreadable_context_preserves_approval_and_pair_for_retry() {
+        use crate::kj::test_helpers::{test_dispatcher, register_context};
+        use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        for owner in [Some(crate::PairOwner::Turn), Some(crate::PairOwner::Session), None] {
+            let dispatcher = Arc::new(test_dispatcher().await);
+            dispatcher.set_self_arc();
+            let kernel = dispatcher.kernel().clone();
+            kernel.broker().set_kj_dispatcher(&dispatcher).await;
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let context = register_context(&dispatcher, Some("approval-fault"), None, actor);
+            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let pair = owner.map(|owner| {
+                let (command, output) = author_pair_for_ask(&kernel, context, actor, "echo approved-once").unwrap();
+                (command, output, owner)
+            });
+            let answer = {
+                let db = kernel.kernel_db().lock();
+                let request_id = create_ask(db.conn_for_ledger(), &NewAsk {
+                    context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                    reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                    origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                    description: "run captured source".into(), statements: vec![], authorized_label: None,
+                    rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                    exec_source: Some("echo approved-once".into()), exec_stdin: None,
+                    continuation_epoch: None, env: vec![],
+                }).unwrap();
+                decide(db.conn_for_ledger(), &request_id, DecideInput {
+                    allow: true, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                    ..Default::default()
+                }).unwrap();
+                db.undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request_id).unwrap()
+            };
+            let ask = ExecutableAsk { source: "echo approved-once".into(), stdin: None, cwd: None,
+                actor, reviewer, pair, denial: "not denied".into() };
+            let before = kernel.blocks().block_snapshots(context).unwrap();
+            kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                "ALTER TABLE contexts RENAME TO unavailable_contexts"
+            ).unwrap();
+            let stop = tokio_util::sync::CancellationToken::new();
+            let action = act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+            assert!(matches!(action, ExecAction::Deferred), "{owner:?}: an unreadable context is not reassignment or archive");
+            let after = kernel.blocks().block_snapshots(context).unwrap();
+            assert_eq!(after.len(), before.len());
+            for (before, after) in before.iter().zip(after.iter()) {
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.stderr, before.stderr);
+                assert_eq!(after.content, before.content);
+            }
+            assert!(kernel.kernel_db().lock().undelivered_answers().unwrap().iter()
+                .any(|a| a.request_id == answer.request_id), "read failure must not consume approval");
+            kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                "ALTER TABLE unavailable_contexts RENAME TO contexts"
+            ).unwrap();
+            let retried = act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+            assert!(matches!(retried, ExecAction::Tell(_) | ExecAction::Settled));
+            let completed = kernel.blocks().block_snapshots(context).unwrap();
+            assert_eq!(completed.iter().filter(|b| b.content == "approved-once\n").count(), 1,
+                "{owner:?}: approved source must run after storage recovers: {completed:?}");
+            kernel.kernel_db().lock().update_context_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
+            assert!(matches!(act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await,
+                ExecAction::Settled));
+            let repeated = kernel.blocks().block_snapshots(context).unwrap();
+            assert_eq!(repeated.len(), completed.len());
+            for (completed, repeated) in completed.iter().zip(repeated.iter()) {
+                assert_eq!(repeated.status, completed.status, "a spent approval cannot overwrite accepted output after reassignment");
+                assert_eq!(repeated.stderr, completed.stderr);
+                assert_eq!(repeated.content, completed.content);
+            }
+            kernel.shutdown_runtime_worker().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_turn_admission_does_not_repeat_a_delivered_answer() {
+        use crate::kj::test_helpers::{test_dispatcher, register_context};
+        use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        let dispatcher = test_dispatcher().await;
+        let kernel = dispatcher.kernel().clone();
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("wake-admission"), None, actor);
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let request_id = {
+            let db = kernel.kernel_db().lock();
+            let now = kaijutsu_types::now_millis() as i64;
+            let epoch = db.begin_continuation(context, now).unwrap().epoch;
+            assert!(db.record_continuation_request(context, epoch, now).unwrap());
+            assert!(db.record_continuation_yield(context, epoch, now).unwrap());
+            assert!(db.automatic_resume_allowed(context, epoch, now, 1_800_000).unwrap());
+            let request_id = create_ask(db.conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                origin: Origin::KjVerb, instance: None, tool: None, hook_id: None,
+                description: "wake once after approval".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: None, exec_stdin: None, continuation_epoch: Some(epoch), env: vec![],
+            }).unwrap();
+            decide(db.conn_for_ledger(), &request_id, DecideInput {
+                allow: true, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                ..Default::default()
+            }).unwrap();
+            request_id
+        };
+        // Drive delivery independently of the stopped worker so its attempt
+        // to admit the automatic continuation reaches the rejection path.
+        kernel.shutdown_runtime_worker().await.unwrap();
+        let sub = kernel.ledger_flows().subscribe("ledger.changed");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let delivery = run_delivery(Arc::downgrade(&kernel), sub, Default::default(), stop.clone());
+        tokio::pin!(delivery);
+        for generation in 1..=3 {
+            // A later answer proves the scan passed admission for the first
+            // answer, including any asynchronous configuration reads.
+            let marker = format!("scan {generation} complete");
+            {
+                let db = kernel.kernel_db().lock();
+                db.conn_for_ledger().execute("UPDATE approvals SET created_at = 0 WHERE request_id = ?1", [&request_id]).unwrap();
+                let marker_id = create_ask(db.conn_for_ledger(), &NewAsk {
+                    context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                    reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                    origin: Origin::KjVerb, instance: None, tool: None, hook_id: None,
+                    description: marker.clone(), statements: vec![], authorized_label: None,
+                    rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                    exec_source: None, exec_stdin: None, continuation_epoch: None, env: vec![],
+                }).unwrap();
+                decide(db.conn_for_ledger(), &marker_id, DecideInput {
+                    allow: true, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                    ..Default::default()
+                }).unwrap();
+            }
+            kernel.ledger_flows().publish(crate::flows::LedgerFlow::Changed { generation });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::select! {
+                    _ = &mut delivery => panic!("delivery stopped before processing the scan"),
+                    _ = async {
+                        loop {
+                            if kernel.blocks().block_snapshots(context).unwrap().iter()
+                                .any(|block| block.content.contains(&marker)) { break; }
+                            tokio::task::yield_now().await;
+                        }
+                    } => {}
+                }
+            }).await.expect("approval scan did not reach its final answer");
+            let blocks = kernel.blocks().block_snapshots(context).unwrap();
+            assert_eq!(blocks.iter().filter(|block| block.content.contains("wake once after approval")).count(), 1,
+                "ledger change {generation} repeated an already durable delivery: {blocks:?}");
+            assert!(!kernel.turn_in_flight(context));
+            assert!(kernel.kernel_db().lock().undelivered_answers().unwrap().iter()
+                .any(|answer| answer.request_id == request_id), "delivery must leave the answer redeemable by its caller");
+        }
+        stop.cancel();
+        delivery.await;
+    }
 
     #[tokio::test]
     async fn preparation_unwind_settles_only_its_owned_pair() {

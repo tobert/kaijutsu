@@ -1822,6 +1822,17 @@ shared command declaration. `kj synth` now parses, classifies, and renders help
 from that declaration. Synthesis status/help and the dispatcher's existing
 trailing-help normalization remain available without a separate read allow-list.
 
+Approval delivery had conflated context read errors with reassignment or archive.
+Fault injection now verifies that the answer and pair stay untouched until a
+successful retry. Context validation and the execution claim share one database
+lock. A repeated delivery after reassignment had also overwritten completed
+output with an error; only the claim winner may now settle a stale performer's
+pair. A separate regression exposed duplicate wake seeds after turn admission
+failed. Delivery completes when the seed is written, independently of whether
+an automatic model turn can start; ordinary answers remain redeemable by their
+callers. Tests drive actual delivery with a later answer as a scan marker so an
+unfinished configuration read cannot masquerade as a successful check.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

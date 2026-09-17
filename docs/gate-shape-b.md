@@ -466,9 +466,11 @@ unchanged. A denial or cancellation with a linked pair: settle the pair
 `Error` with the reason on stderr, then redeem. A `Session` pair's blocks
 are its delivery. A `Turn` pair also gets a new seed saying that the action
 did not run, because its cached mailbox cannot observe the in-place edit. A
-terminal answer with no pair falls back to the wake. An allow: **redeem
-first**, re-check Live,
-materialize a shell for the ask's principal and context under a synthetic
+terminal answer with no pair falls back to the wake. An allow: read liveness
+and the turn performer's assignment, then claim under the same database lock.
+Read faults leave the answer unclaimed for retry. Only the claim winner may
+settle a changed performer's pair or execute source. A repeated delivery cannot
+replace previously accepted output after reassignment. Then materialize a shell for the ask's principal and context under a synthetic
 session id, resolve or author the pair, move to the ask's cwd, restore the
 ask's env, run.
 
@@ -484,14 +486,17 @@ same distinction applies when an allowed action cannot materialize a shell,
 restore its environment, or enter its recorded directory: a `Turn` receives
 an explicit no-run seed; a `Session` pair stays settled-only.
 
+Once a seed is durable, rejected turn admission does not repeat it on later
+ledger changes. The next manual drive can read the seed. An ordinary answer
+remains unredeemed until its caller retries; delivery does not grant a second
+execution claim.
+
 **What a crash costs.** The redemption row is claimed before the run, so a
 crash between the two loses the action: the ask reads redeemed, nothing
 ran. That is the chosen side; the other ordering runs an approved
-destructive action twice. Short of a crash the same ordering has one
-visible consequence: a context archived between the claim and the re-check
-spends the answer without an execution, which is correct in direction — the
-action can never run there, and a spent answer is a recorded one. A shell
-that will not materialize or a cwd that no longer resolves land in the same
+destructive action twice. Context liveness is checked before the claim under
+the same database lock; missing or archived contexts leave the answer unclaimed.
+A shell that will not materialize or a cwd that no longer resolves land in the same
 place by design: the approval is spent, the pair says why, the human asks
 again if they still want it.
 

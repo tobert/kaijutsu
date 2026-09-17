@@ -121,6 +121,10 @@ Kaibo's identity review found remaining adapter policy/provenance gaps:
   principal. Carry the mutation performer's identity. For shared editor input,
   distinguish the player making the edit from the opener retained for shell
   reads; blindly attributing every edit to the opener would be wrong too.
+  `edit_text_as` currently records that principal only in the in-memory document;
+  `TextEdit`/`SyncPayload` and persisted snapshots do not retain an edit actor.
+  Carrying identity through adapters does not supply durable mutation provenance.
+  A persisted mutation audit record is separate follow-up work.
 - `img_block_from_path` uses host `std::fs::read`, bypassing the shared mount
   namespace. Route it through the existing file/CAS integration.
 Review evidence and disposition are under
@@ -224,11 +228,18 @@ Shutdown cancels preparation and commands and joins settlement. Headless request
 use direct runtime admission;
 per-turn leases own liveness and interrupts, including queued turns.
 
-The approval driver still treats a failed context-row read as a performer
-reassignment, settles with a false explanation, and spends the answer. Defer
-without redemption on a read fault. Its wake path can also repeat a durable
-seed if turn admission fails after the seed was written; make seed delivery
-idempotent separately from turn admission. Kaibo DeepSeek review and disposition:
+Approval execution now validates context state and claims under one database
+lock. Read faults leave answers untouched; repeated delivery cannot overwrite
+completed output after reassignment. A rejected continuation admission cannot
+repeat an already written seed. Continue the settlement audit: denial and
+cancellation delivery still settle or write before redemption, and settlement
+failures can be logged without retry ownership. Pin those storage-fault paths
+before changing their ordering. Startup also suppresses old denied pairs rather
+than settling them. The per-event cap counts delivery, not provider requests;
+large bursts can wait indefinitely for another ledger event. Separate queue
+draining from model-spend admission in the resource audit. Review changed-
+performer settlement's lack of a seed against already running conversations.
+Kaibo review and disposition:
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks

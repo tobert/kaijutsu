@@ -174,7 +174,10 @@ These are source observations, not promises that all paths behave alike.
   `runtime/approval_resume.rs` owns answer delivery, claims, captured cwd/env,
   approved execution, and follow-up seeds on the same kernel worker. Startup
   installs one subscription and snapshots old answers before returning; failure
-  refuses host startup. Shutdown stops delivery, cancels preparation and running
+  refuses host startup. Context validation and execution claims share one database
+  lock; read faults leave approvals available for retry. A spent claim cannot
+  overwrite completed output after performer reassignment. Shutdown stops delivery,
+  cancels preparation and running
   commands, and joins their settlement. Idle delivery holds only a weak kernel
   reference. A preparation unwind settles only its owned pair, or records a
   no-run error when no pair exists, before the original panic reaches the worker.
