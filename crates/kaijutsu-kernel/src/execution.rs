@@ -24,6 +24,8 @@ use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 /// or workspace guard enforcement pull from here.
 #[derive(Debug, Clone)]
 pub struct ExecContext {
+    /// The model result owner will publish its pair before approval delivery.
+    pub publishes_pair: bool,
     /// Authenticated requester. This remains the redemption identity.
     pub principal_id: PrincipalId,
     /// Character performing this invocation.
@@ -48,6 +50,7 @@ impl ExecContext {
         kernel_id: KernelId,
     ) -> Self {
         Self {
+            publishes_pair: false,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,
@@ -69,6 +72,7 @@ impl ExecContext {
         kernel_id: KernelId,
     ) -> Self {
         Self {
+            publishes_pair: false,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,
@@ -82,6 +86,7 @@ impl ExecContext {
     pub fn test() -> Self {
         let principal_id = PrincipalId::new();
         Self {
+            publishes_pair: false,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,

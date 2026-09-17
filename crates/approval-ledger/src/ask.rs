@@ -30,12 +30,20 @@ use crate::types::{
 /// pointing at the existing tree. Position in `req.statements` becomes
 /// `stmt_seq`.
 pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
+    create_ask_recorded(conn, req, |_, _| Ok(()))
+}
+
+/// Create an ask and related caller state in one transaction. The callback
+/// receives the new id before commit; an error rolls back the entire ask.
+/// This function, like `create_ask`, commits before returning its id.
+pub fn create_ask_recorded(
+    conn: &Connection, req: &NewAsk,
+    record: impl FnOnce(&Connection, &str) -> Result<()>,
+) -> Result<String> {
     let request_id = uuid::Uuid::now_v7().to_string();
-    // DEFERRED is fine here (not the claim path's contested `BEGIN
-    // IMMEDIATE`): nothing else can reference `request_id` before this
-    // function hands it back, so there is no race to lose.
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     insert_ask(&tx, &request_id, req)?;
+    record(&tx, &request_id)?;
     tx.commit()?;
     Ok(request_id)
 }
@@ -1056,6 +1064,29 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn recorded_creation_commits_or_rolls_back_ask_and_caller_state_together() {
+        let conn = open_memory();
+        conn.execute_batch("CREATE TABLE caller_state(request_id TEXT PRIMARY KEY REFERENCES approvals(request_id))").unwrap();
+        let mut failed_id = None;
+        let failed = create_ask_recorded(&conn, &minimal_ask(), |conn, id| {
+            failed_id = Some(id.to_owned());
+            conn.execute("INSERT INTO caller_state VALUES (?1)", [id])?;
+            conn.execute("INSERT INTO missing_table VALUES (1)", [])?;
+            Ok(())
+        });
+        assert!(failed.is_err());
+        assert!(get_approval(&conn, failed_id.as_deref().unwrap()).unwrap().is_none());
+        assert_eq!(conn.query_row("SELECT count(*) FROM caller_state", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        let id = create_ask_recorded(&conn, &minimal_ask(), |conn, id| {
+            conn.execute("INSERT INTO caller_state VALUES (?1)", [id])?;
+            Ok(())
+        }).unwrap();
+        assert!(get_approval(&conn, &id).unwrap().is_some());
+        assert_eq!(conn.query_row("SELECT request_id FROM caller_state", [], |row| row.get::<_, String>(0)).unwrap(), id);
+        assert!(conn.is_autocommit());
+    }
 
     // ── `create_auto_allowed_ask` (log-only classifier path) ─────────────
 

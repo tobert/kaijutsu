@@ -299,6 +299,14 @@ async fn act_on_executable_answer(
     // state and claim under one guard; never spend an answer using a stale pair.
     let (linked, claim) = {
         let db = kernel.kernel_db().lock();
+        match db.approval_pair_ready(&answer.request_id) {
+            Ok(true) => {}
+            Ok(false) => return ExecAction::Deferred,
+            Err(error) => {
+                tracing::error!(ask = %answer.request_id, %error, "could not read approval handoff; retaining the answer");
+                return ExecAction::Deferred;
+            }
+        }
         let row = match db.get_approval(&answer.request_id) {
             Ok(Some(row)) => row,
             result => {
@@ -675,6 +683,15 @@ async fn run_delivery(
                 }
             };
 
+            match kernel.kernel_db().lock().approval_pair_ready(&answer.request_id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::error!(ask = %answer.request_id, %error, "could not read approval handoff");
+                    continue;
+                }
+            }
+
             // Executable asks run here; other answers wake the
             // original caller to retry and redeem. Name the answerer
             // in the seed using its current character sheet.
@@ -883,6 +900,99 @@ mod lifetime_tests {
             kind: TypesToolKind::Shell, role: kaijutsu_types::Role::Model, excluded: false, status: Status::Running, ask: None,
         }).unwrap();
         (receipt.command_block_id, receipt.output_block_id)
+    }
+
+    #[tokio::test]
+    async fn paired_approval_waits_for_original_result_publication() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        use approval_ledger::{decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        for mode in ["waiting", "link-fault", "release-fault", "stopped"] {
+            let fail_link = matches!(mode, "link-fault" | "release-fault");
+            let dispatcher = Arc::new(test_dispatcher_persistent().await);
+            dispatcher.set_self_arc();
+            let kernel = dispatcher.kernel();
+            kernel.broker().set_kj_dispatcher(&dispatcher).await;
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let context = register_context(&dispatcher, Some("pair-handoff"), None, actor);
+            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let source = "echo approved-once";
+            let request = kernel.kernel_db().lock().create_approval_ask(&NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "wait for the original pair".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some(source.into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }, true).unwrap();
+            {
+                let db = kernel.kernel_db().lock();
+                decide(db.conn_for_ledger(), &request, DecideInput {
+                    allow: true, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                    ..Default::default()
+                }).unwrap();
+            }
+            let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+            let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None, actor, reviewer, denial: "not denied".into() };
+            let stop = tokio_util::sync::CancellationToken::new();
+            assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Deferred),
+                "an early answer cannot take execution from a caller still publishing its pair");
+            assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+            assert!(kernel.blocks().block_snapshots(context).unwrap().is_empty());
+            let sub = kernel.ledger_flows().subscribe("ledger.changed");
+            let mut delivery = Box::pin(run_delivery(Arc::downgrade(kernel), sub, Default::default(), stop.clone()));
+            crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
+            assert!(futures::poll!(&mut delivery).is_pending());
+            assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+            let (command, output) = test_pair(kernel, context, actor, source);
+            if fail_link {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(if mode == "release-fault" {
+                    "CREATE TRIGGER fail_handoff BEFORE UPDATE OF released ON approval_pair_handoffs BEGIN SELECT RAISE(FAIL, 'handoff fault'); END;"
+                } else {
+                    "CREATE TRIGGER fail_handoff BEFORE UPDATE OF command_block_id ON approvals BEGIN SELECT RAISE(FAIL, 'handoff fault'); END;"
+                }).unwrap();
+            }
+            let mut waiting = super::super::command_outcome::CommandOutcome::new(super::super::command_outcome::CommandExecution::NotRun, 0);
+            waiting.hook = Some(super::super::command_outcome::CommandHookEffect::Refused {
+                reason: "waiting for review".into(), waiting: true, ask_id: Some(request.clone()), refusal: None,
+            });
+            if mode == "stopped" { waiting.settlement_error = Some("caller stopped before handing off execution".into()); }
+            let result = super::super::command::settle_outcome(kernel, context, &command, &output, &waiting, Some(crate::PairOwner::Session));
+            if fail_link {
+                assert!(result.unwrap_err().contains("handoff fault"));
+                assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Deferred));
+                assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+            } else if mode == "stopped" {
+                result.unwrap();
+                assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Deferred),
+                    "a terminal caller failure must not release approved source");
+                assert!(kernel.kernel_db().lock().approval_pair_expected(&request).unwrap());
+                assert!(!kernel.kernel_db().lock().approval_pair_ready(&request).unwrap());
+                assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+                assert_eq!(kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap().status, Status::Error);
+            } else {
+                result.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    tokio::select! {
+                        _ = &mut delivery => panic!("delivery stopped before the accepted pair settled"),
+                        _ = async {
+                            loop {
+                                if kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap().status == Status::Done { break; }
+                                tokio::task::yield_now().await;
+                            }
+                        } => {}
+                    }
+                }).await.expect("publication itself must wake the deferred answer");
+                assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Settled));
+                let result = kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap();
+                assert_eq!(result.content, "approved-once\n");
+                assert_eq!(result.status, Status::Done);
+                assert_eq!(kernel.blocks().block_snapshots(context).unwrap().len(), 2);
+            }
+            stop.cancel();
+            delivery.await;
+        }
     }
 
     #[tokio::test]

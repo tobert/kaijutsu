@@ -101,8 +101,9 @@ async fn prepare(
     let output = receipt.output_block_id;
     let mut submission = ShellSubmission { command_block_id: command,
         operation_id: receipt.operation_id.to_string(), refusal: None };
-    let call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
+    let mut call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
         .with_actor(identity.performer, identity.reviewer);
+    call_ctx.publishes_pair = true;
     // Preparation owns this exact pair until command settlement takes over.
     // Capture and result-hook unwinds belong to command::run_into_blocks.
     let mut settlement_started = false;
@@ -228,6 +229,8 @@ mod tests {
             let row = approval_ledger::ask::list_pending(kernel.kernel_db().lock().conn_for_ledger()).unwrap()
                 .into_iter().find(|row| row.context_id == context.as_bytes()).expect("PreCall must leave its ask");
             let request = &row.request_id;
+            assert!(kernel.kernel_db().lock().approval_pair_expected(request).unwrap());
+            assert_eq!(kernel.kernel_db().lock().approval_pair_ready(request).unwrap(), !fail_link);
             if fail_link {
                 assert!(matches!(result, Err(ref error) if error.contains("injected session link fault")));
                 assert_eq!(output.status, Status::Running, "a failed link cannot publish Waiting");

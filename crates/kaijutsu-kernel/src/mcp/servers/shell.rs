@@ -250,7 +250,7 @@ impl McpServerLike for ShellServer {
             // is `Parse`, so this is always the model's mistake to fix and
             // never a fault: it takes the same D-28 `is_error` channel a
             // post-gate rejection takes, not `McpError::Protocol`.
-            let spec = match crate::kj::shell_gate::build_shell_gate_spec_with_stdin(&parsed.command, parsed.stdin.clone()) {
+            let mut spec = match crate::kj::shell_gate::build_shell_gate_spec_with_stdin(&parsed.command, parsed.stdin.clone()) {
                 Ok(spec) => spec,
                 Err(e) => {
                     let mut env = ShellEnvelope::new(ShellStatus::Rejected);
@@ -258,6 +258,7 @@ impl McpServerLike for ShellServer {
                     return Ok(envelope_result(env));
                 }
             };
+            spec.publishes_pair = ctx.publishes_pair || !parsed.foreground;
             let caller = crate::kj::KjCaller {
                 principal_id: ctx.principal_id,
                 actor_id: ctx.actor_id,
@@ -2035,6 +2036,8 @@ mod tests {
         let pending_body = body_of(&pending);
         assert_eq!(pending_body["status"], serde_json::json!("waiting"));
         let ask_id = pending_body["ask_id"].as_str().expect("ask id");
+        assert!(d.kernel_db().lock().approval_pair_expected(ask_id).unwrap());
+        assert!(d.kernel_db().lock().approval_pair_ready(ask_id).unwrap());
         let operation = d.kernel().shell_operations().get_by_ask(ask_id, context).unwrap()
             .expect("pending ask has a durable operation receipt");
         assert_eq!(operation.receipt.ask_id.as_deref(), Some(ask_id));

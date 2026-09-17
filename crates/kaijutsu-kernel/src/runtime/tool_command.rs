@@ -16,13 +16,15 @@ use super::embedded_kaish::EmbeddedKaish;
 pub(crate) fn create_operation(
     kernel: &crate::Kernel, call: &CallContext, source: &str, ask: Option<&str>,
 ) -> Result<ShellOperationReceipt, String> {
-    kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+    let receipt = kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
         context: call.context_id, principal: call.principal_id, actor: call.actor_id,
         source, tool: "shell", input: serde_json::json!({"command": source}),
         kind: kaijutsu_types::ToolKind::Shell, role: Role::Tool, excluded: true,
         status: if ask.is_some() { kaijutsu_types::Status::Waiting } else { kaijutsu_types::Status::Running },
         ask: ask.map(|ask| (ask, crate::PairOwner::Turn)),
-    }).map_err(|error| error.to_string())
+    }).map_err(|error| error.to_string())?;
+    if ask.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
+    Ok(receipt)
 }
 
 pub(crate) struct ToolCommand {
@@ -168,13 +170,13 @@ mod setup_tests {
 
     #[tokio::test]
     async fn waiting_model_pair_retains_its_execution_owner_in_the_same_acceptance() {
-        use approval_ledger::{ask::create_ask, types::{NewAsk, Origin}};
+        use approval_ledger::types::{NewAsk, Origin};
         for fault in [None, Some("receipt"), Some("link"), Some("context"), Some("actor"), Some("plain")] {
             let (_dir, kernel, context) = fixture().await;
             let requester = PrincipalId::new();
             let actor = PrincipalId::new();
             let reviewer = PrincipalId::new();
-            let ask = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+            let ask = kernel.kernel_db().lock().create_approval_ask(&NewAsk {
                 context_id: if fault == Some("context") { ContextId::new() } else { context }.as_bytes().to_vec(),
                 actor_id: if fault == Some("actor") { PrincipalId::new() } else { actor }.as_bytes().to_vec(),
                 reviewer_id: reviewer.as_bytes().to_vec(), principal_id: requester.as_bytes().to_vec(),
@@ -183,7 +185,7 @@ mod setup_tests {
                 rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
                 exec_source: (fault != Some("plain")).then(|| "echo captured".into()), exec_stdin: None,
                 continuation_epoch: Some(17), env: vec![],
-            }).unwrap();
+            }, true).unwrap();
             let command = kernel.blocks().insert_tool_call_as(context, None, None, "shell",
                 serde_json::json!({"command": "echo captured", "foreground": true}), None,
                 Some(actor), Some("model-call-1".into()), None).unwrap();
@@ -235,6 +237,8 @@ mod setup_tests {
                 assert_eq!(result.status, Status::Waiting);
                 assert_eq!(result.tool_use_id.as_deref(), Some("model-call-1"));
                 let db = kernel.kernel_db().lock();
+                assert!(db.approval_pair_expected(&ask).unwrap());
+                assert!(db.approval_pair_ready(&ask).unwrap());
                 db.link_ask_blocks(&ask, &command, &output, crate::PairOwner::Turn).unwrap();
                 assert!(db.link_ask_blocks(&ask, &command, &output, crate::PairOwner::Session).is_err(), "the waiting owner cannot be replaced");
                 let other = kaijutsu_types::BlockId::new(context, actor, command.seq + 100);

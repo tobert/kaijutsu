@@ -263,7 +263,7 @@ mod tests {
         let stale_caller = test_helpers::caller_with_context(context).with_actor(coder, Some(lead));
         dispatcher.kernel_db().lock().revoke_approval_delegation(lead, amy).unwrap();
         let spec = || gate::GateSpec {
-            origin: approval_ledger::types::Origin::Hook,
+            publishes_pair: false, origin: approval_ledger::types::Origin::Hook,
             instance: "builtin.test".into(), tool: "approval-policy-test".into(), hook_id: None,
             description: "review work after delegation changed".into(), authorized_label: "work".into(),
             statements: vec![gate::GatedStatement {

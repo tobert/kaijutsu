@@ -145,12 +145,16 @@ pub fn settle_outcome(
                 };
                 result.map_err(crate::kernel_db::KernelDbError::Validation)?;
             }
+            if status == Status::Waiting { db.release_approval_pair(envelope.ask_id.as_deref().expect("validated waiting ask"))?; }
             Ok(())
         }).map_err(|e| e.to_string())?;
     if let Some(operation) = &operation
         && status != Status::Waiting
     {
         kernel.shell_operations().finish_projection(&operation.receipt.operation_id)?;
+    }
+    if ask_owner.is_some() && envelope.ask_id.is_some() {
+        crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
     }
     Ok(())
 }

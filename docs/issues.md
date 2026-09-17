@@ -1425,12 +1425,16 @@ validation and redemption. A pair linked after the delivery scan keeps its
 Session/Turn owner and participates in the performer-change check. Regression
 coverage reproduces both stale-scan failures.
 
-The ledger can still expose an answer before its original caller finishes
-linking any blocks. An unlinked ask does not say whether publication is pending
-or the caller has no pair. Add an explicit caller-to-driver handoff across
-session, model, quiet, streaming and MCP paths; cancellation or publication
-failure must not release source for accidental execution. Delaying notification
-alone cannot protect against polling. See docs/gate-resume.md, "Still open".
+The gate now records whether its caller will publish a pair. Waiting publication
+releases that handoff atomically with the link and result; bare linkage and
+terminal failure do not authorize execution. Driver admission and matching gate
+retries honor that ownership. A publication event wakes answers deferred before
+the pair existed. Quiet, streaming and direct foreground calls declare no pair.
+
+Failed or stopped publication can leave a held ask. Define explicit recovery or
+abandonment, retaining the rule that a terminal caller failure never releases
+source for execution. Claimed execution still needs durable notification retry.
+See docs/gate-resume.md, "Still open".
 
 ## Asks vs forms — decision open (2026-08-22)
 

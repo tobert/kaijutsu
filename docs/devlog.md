@@ -2099,6 +2099,22 @@ This closes the scan-to-claim window. The earlier gap still needs explicit
 caller-to-driver ownership transfer: absence of a link cannot distinguish
 pending publication from a caller that will never author a pair.
 
+The gate now records that distinction with the ask. Model results, interactive
+pre-call hooks, authored structured commands and asynchronous shell operations
+promise a pair; quiet, streaming and direct foreground calls do not. The ledger
+creation API accepts related caller state in its transaction without changing
+its commit-before-return contract. No invocation pool or context-wide lock is
+needed.
+
+The first regression reproduced early driver execution, and the second showed
+a matching gate retry taking the same answer. Driver admission now waits for
+the caller's release; executable paired answers remain with their operation.
+Non-executable answers can still return to retry after release. A third test
+showed why linkage alone was insufficient: a caller could link while publishing
+a terminal error. Release now commits only with a Waiting result. Link or release
+faults roll back together, and publication wakes an already-deferred answer.
+Held-ask recovery/abandonment and claimed notification delivery remain open.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

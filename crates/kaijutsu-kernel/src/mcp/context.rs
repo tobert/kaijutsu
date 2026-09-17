@@ -42,6 +42,8 @@ impl TraceContext {
 /// `McpServerLike::call_tool`.
 #[derive(Clone, Debug)]
 pub struct CallContext {
+    /// This invocation publishes a transcript pair before approval delivery.
+    pub publishes_pair: bool,
     /// Attribution only, never authorization (D-22).
     pub principal_id: PrincipalId,
     /// Character performing this invocation; separate from its requester.
@@ -65,6 +67,7 @@ impl CallContext {
         kernel_id: KernelId,
     ) -> Self {
         Self {
+            publishes_pair: false,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,

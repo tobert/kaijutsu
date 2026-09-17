@@ -446,14 +446,21 @@ execution. Other answers write a seed and request automatic continuation
 only within the original window; the caller retries and redeems the answer.
 Result reviews belong to their retained command owner and are excluded here.
 
-The earlier handoff remains open: an unlinked ask may belong to a caller still
-publishing its result, or to a caller that will never author a pair. The driver
-cannot distinguish these from linkage alone. Callers need an explicit handoff
-before driver admission; publishing a ledger notification later does not solve
-this because a reviewer can discover the row by polling. The handoff must cover
-session, model, quiet, streaming and MCP callers, including cancellation and
-failed publication. It must not hold a context-wide lock while unrelated work
-or a captured-result review is pending.
+Callers declare whether they publish a pair before the gate creates an ask.
+That expectation commits with the ask in `approval_pair_handoffs`. Model calls,
+interactive pre-call hooks, authored structured calls and asynchronous shell
+operations declare it; quiet, streaming and direct foreground calls have no
+pair to publish. A paired caller releases delivery in the same transaction as
+its Waiting result, complete ask link and receipt. A bare link or a terminal
+caller failure does not release execution. Publication emits a ledger-change
+hint so an answer received earlier is scanned again.
+
+The driver checks release before admission, under the claim's database guard.
+Matching gate retries cannot redeem a paired executable ask: its original
+operation owns the answer. They report that ownership without an AskRef that
+a new caller might attach to another pair. Non-executable asks remain eligible
+for retry after publication. Failed or stopped publication stays held; explicit
+recovery/abandonment and durable notification delivery remain open.
 
 Shutdown stops delivery, cancels preparation and commands, and waits for command
 settlement. A spent claim never authorizes replay, including after a preparation

@@ -549,6 +549,12 @@ CREATE TABLE IF NOT EXISTS kernel (
     created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
+-- A paired caller retains delivery until its result and ask link commit.
+CREATE TABLE IF NOT EXISTS approval_pair_handoffs (
+    request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    released INTEGER NOT NULL DEFAULT 0 CHECK (released IN (0, 1))
+);
+
 -- ── Quiesce (singleton; the row's absence means running) ────────
 -- A row here means the kernel is quiesced: it accepts writes but starts no
 -- turns. Blocks, ledger answers and config edits still land — a write is
@@ -2295,6 +2301,46 @@ impl KernelDb {
         Ok(approval_ledger::ask::undelivered_answers(
             self.conn_for_ledger(),
         )?)
+    }
+
+    /// Record the caller's publication contract before an ask becomes visible.
+    pub(crate) fn create_approval_ask(&self, ask: &approval_ledger::types::NewAsk, publishes_pair: bool) -> KernelDbResult<String> {
+        Ok(approval_ledger::ask::create_ask_recorded(self.conn_for_ledger(), ask, |conn, request| {
+            if publishes_pair {
+                conn.execute("INSERT INTO approval_pair_handoffs(request_id) VALUES (?1)", [request])?;
+            }
+            Ok(())
+        })?)
+    }
+
+    pub(crate) fn approval_pair_expected(&self, request: &str) -> KernelDbResult<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM approval_pair_handoffs WHERE request_id=?1)",
+            [request], |row| row.get(0))?)
+    }
+
+    /// A caller that promised a pair releases delivery with its Waiting result.
+    /// Call with the same database guard used to admit approval execution.
+    pub(crate) fn approval_pair_ready(&self, request: &str) -> KernelDbResult<bool> {
+        Ok(self.conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM approval_pair_handoffs WHERE request_id=?1)
+             OR EXISTS(SELECT 1 FROM approval_pair_handoffs h JOIN approvals a USING(request_id)
+                 WHERE h.request_id=?1 AND h.released=1 AND a.command_block_id IS NOT NULL
+                 AND a.output_block_id IS NOT NULL AND a.pair_owner IS NOT NULL)",
+            [request], |row| row.get(0),
+        )?)
+    }
+
+    /// Release a paired caller inside the Waiting result's journal transaction.
+    pub(crate) fn release_approval_pair(&self, request: &str) -> KernelDbResult<()> {
+        if !self.approval_pair_expected(request)? { return Ok(()); }
+        if self.conn.is_autocommit() { return Err(KernelDbError::Validation("approval handoff requires the result transaction".into())); }
+        let changed = self.conn.execute(
+            "UPDATE approval_pair_handoffs SET released=1 WHERE request_id=?1
+             AND EXISTS(SELECT 1 FROM approvals WHERE request_id=?1 AND command_block_id IS NOT NULL
+                 AND output_block_id IS NOT NULL AND pair_owner IS NOT NULL)", [request],
+        )?;
+        if changed != 1 { return Err(KernelDbError::Validation("approval handoff requires a complete pair link".into())); }
+        Ok(())
     }
 
     /// One approval row, whole — the executable source, the cwd, the block

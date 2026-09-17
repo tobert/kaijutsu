@@ -1305,6 +1305,9 @@ async fn dispatch_recorded_tool_result(
     turn_lease.track_block(result);
     tokio::task::yield_now().await;
 
+    let mut tool_ctx = tool_ctx.clone();
+    tool_ctx.publishes_pair = true;
+    let tool_ctx = &tool_ctx;
     let params = input.to_string();
     let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload, ask_id } =
         dispatch_and_map_tool_result(kernel, tool_name, &params, tool_ctx, cancel).await;
@@ -1324,6 +1327,7 @@ async fn dispatch_recorded_tool_result(
     let styles = ansi.as_ref().map(|projection| (projection.spans.clone(), source.as_bytes()));
     documents.settle_tool_result_as(context_id, &call, &result, block_content,
         settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
+    if ask_id.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
     let anchor = if let Some(payload) = payload {
         documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
     } else { result };
@@ -5956,7 +5960,8 @@ mod lifetime_tests {
                 Ok(vec![KernelTool { instance: self.id.clone(), name: "envelope".into(), description: None,
                     input_schema: serde_json::json!({"type": "object"}) }])
             }
-            async fn call_tool(&self, _: KernelCallParams, _: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+            async fn call_tool(&self, _: KernelCallParams, call: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+                assert!(call.publishes_pair, "model dispatch must declare its publication owner to the broker");
                 let mut envelope = ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Done);
                 envelope.stdout = "\x1b[31mred\x1b[0m".into();
                 envelope.exit_code = Some(0);

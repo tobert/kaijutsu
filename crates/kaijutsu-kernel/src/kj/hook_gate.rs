@@ -116,7 +116,7 @@ pub(crate) fn build_hook_gate_spec(
         params.arguments.get("stdin").and_then(serde_json::Value::as_str).map(str::to_owned)
     });
     GateSpec {
-        origin: Origin::Hook,
+        publishes_pair: false, origin: Origin::Hook,
         instance,
         tool,
         hook_id: Some(hook_id.to_string()),
@@ -150,7 +150,7 @@ pub(crate) fn build_result_review_spec(
     assert!(matches!(phase, crate::mcp::McpHookPhase::PostCall | crate::mcp::McpHookPhase::OnError));
     let label = format!("{phase:?} {}.{}", params.instance, params.tool);
     GateSpec {
-        origin: Origin::HookResult, instance: params.instance.as_str().into(), tool: params.tool.clone(),
+        publishes_pair: false, origin: Origin::HookResult, instance: params.instance.as_str().into(), tool: params.tool.clone(),
         hook_id: Some(hook_id.into()), description, authorized_label: label.clone(),
         statements: vec![GatedStatement {
             rendered: format!("{label} {}\nCaptured result: {captured}", params.arguments),

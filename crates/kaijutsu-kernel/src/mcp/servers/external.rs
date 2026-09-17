@@ -1028,6 +1028,7 @@ mod tests {
     fn requests_carry_a_self_describing_progress_token() {
         let server = fake_server("test.ext");
         let ctx = CallContext {
+            publishes_pair: false,
             principal_id: PrincipalId::new(),
             actor_id: PrincipalId::new(),
             reviewer_id: None,
@@ -1067,6 +1068,7 @@ mod tests {
     fn meta_carries_kaijutsu_v1_fields() {
         let server = fake_server("test.ext");
         let ctx = CallContext {
+            publishes_pair: false,
             principal_id: PrincipalId::new(),
             actor_id: PrincipalId::new(),
             reviewer_id: None,

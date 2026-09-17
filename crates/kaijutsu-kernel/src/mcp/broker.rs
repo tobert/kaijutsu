@@ -2398,7 +2398,7 @@ impl Broker {
             rc_depth: 0,
             privileged: false,
         };
-        let gate_spec = if matches!(phase, McpHookPhase::PostCall | McpHookPhase::OnError) {
+        let mut gate_spec = if matches!(phase, McpHookPhase::PostCall | McpHookPhase::OnError) {
             if review.is_none() {
                 return PermissionAskOutcome::Unavailable {
                     reason: "Execution has finished, but this caller cannot retain a result review. Do not rerun source to answer this review.".into(),
@@ -2414,6 +2414,7 @@ impl Broker {
         } else {
             crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params)
         };
+        gate_spec.publishes_pair = ctx.publishes_pair && phase == McpHookPhase::PreCall;
         let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
         let outcome = crate::kj::gate::run_gate(
             dispatcher.kernel(),

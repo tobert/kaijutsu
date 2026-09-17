@@ -1532,7 +1532,10 @@ impl BlockStore {
         } else { None };
         self.settle_tool_result_recorded(context_id, call, result,
             ToolResultUpdate { content, status, is_error, author, ansi, shell: None }, |db| {
-                if let Some(ask) = ask { db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?; }
+                if let Some(ask) = ask {
+                    db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?;
+                    db.release_approval_pair(ask)?;
+                }
                 Ok(())
             })
     }

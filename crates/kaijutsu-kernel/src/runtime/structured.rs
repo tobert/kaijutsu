@@ -87,8 +87,9 @@ async fn run_kj(
         }).map_err(|error| error.to_string())?;
         Some((receipt.command_block_id, receipt.output_block_id))
     };
-    let call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
+    let mut call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
         .with_actor(identity.performer, identity.reviewer);
+    call_ctx.publishes_pair = pair.is_some();
     let verdict = tokio::select! {
         biased;
         _ = stop.cancelled() => {

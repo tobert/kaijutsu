@@ -73,6 +73,7 @@ impl ShellOperationStart<'_> {
         insert_operation(db, receipt, self.principal, self.actor, self.source, epoch)?;
         if let Some((ask, owner)) = self.ask {
             db.link_ask_blocks(ask, &receipt.command_block_id, &receipt.output_block_id, owner)?;
+            if self.status == kaijutsu_types::Status::Waiting { db.release_approval_pair(ask)?; }
         }
         Ok(())
     }

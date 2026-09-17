@@ -189,6 +189,8 @@ pub(crate) struct GatedStatement {
 /// crux is that a submission can only be gated as a whole).
 #[derive(Debug)]
 pub(crate) struct GateSpec {
+    /// The caller will publish a transcript pair before yielding this ask.
+    pub publishes_pair: bool,
     pub origin: Origin,
     /// Ledger `instance` column, e.g. `"builtin.kj"` or `"builtin.shell_write"`.
     ///
@@ -558,26 +560,26 @@ pub(crate) async fn run_gate(
     if matches!(verdict, AskVerdict::Escalate) && spec.origin != Origin::HookResult {
         let answered = {
             let db = db.lock();
-            approval_ledger::ask::find_redeemable(
-                db.conn_for_ledger(),
-                &digest_refs,
-                &spec.authorized_label,
-                Some(context.as_slice()),
-                Some(principal.as_slice()),
-                caller.actor_id.as_bytes(),
-            )
-            .and_then(|found| match found {
-                Some((request_id, status)) => {
-                    let row = approval_ledger::ask::get_approval(db.conn_for_ledger(), &request_id)?
-                        .ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request_id.clone()))?;
-                    approval_ledger::decide::redeem_ask(db.conn_for_ledger(), &request_id)
-                        .map(|won| won.then_some((request_id, status, row)))
-                }
-                None => Ok(None),
-            })
+            (|| -> crate::kernel_db::KernelDbResult<_> {
+                let found = approval_ledger::ask::find_redeemable(
+                    db.conn_for_ledger(), &digest_refs, &spec.authorized_label,
+                    Some(context.as_slice()), Some(principal.as_slice()), caller.actor_id.as_bytes(),
+                )?;
+                let Some((request_id, status)) = found else { return Ok(None); };
+                let row = db.get_approval(&request_id)?
+                    .ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request_id.clone()))?;
+                let held = db.approval_pair_expected(&request_id)?
+                    && (row.exec_source.is_some() || !db.approval_pair_ready(&request_id)?);
+                if held { return Ok(Some((request_id, status, row, true))); }
+                Ok(db.redeem_ask(&request_id)?.then_some((request_id, status, row, false)))
+            })()
         };
         match answered {
-            Ok(Some((request_id, status, row))) => {
+            Ok(Some((request_id, _, _, true))) => {
+                return GateOutcome::unavailable_without_row(format!(
+                    "Approval {request_id} belongs to its original invocation. No new command ran. Inspect it with kj ledger show {request_id}."));
+            }
+            Ok(Some((request_id, status, row, false))) => {
                 approval_span.record("ask.id", request_id.as_str());
                 {
                     if let Some(id) = PrincipalId::try_from_slice(&row.principal_id) {
@@ -657,7 +659,7 @@ pub(crate) async fn run_gate(
         approval_span.record("reviewer.id", reviewer.to_string());
         let mut ask = ask;
         ask.reviewer_id = reviewer.as_bytes().to_vec();
-        match approval_ledger::ask::create_ask(db.conn_for_ledger(), &ask) {
+        match db.create_approval_ask(&ask, spec.publishes_pair) {
             Ok(id) => id,
             Err(e) => return GateOutcome::unavailable_without_row(format!("approval gate could not record the ask: {e} (fail-closed — this is a ledger fault, not a decision)")),
         }
@@ -796,7 +798,7 @@ pub(crate) async fn record_dry_run_ask(
         approval_span.record("reviewer.id", reviewer.to_string());
         let mut ask = ask;
         ask.reviewer_id = reviewer.as_bytes().to_vec();
-        match approval_ledger::ask::create_ask(db.conn_for_ledger(), &ask) {
+        match db.create_approval_ask(&ask, false) {
             Ok(id) => id,
             Err(e) => {
                 tracing::warn!(
@@ -887,7 +889,7 @@ mod tests {
 
     fn cc_spec(target: &str) -> GateSpec {
         GateSpec {
-            origin: Origin::KjVerb,
+            publishes_pair: false, origin: Origin::KjVerb,
             instance: "builtin.kj".into(),
             tool: "cc.send".into(),
             hook_id: None,
@@ -913,7 +915,7 @@ mod tests {
     /// stay a pure test of `run_gate`'s composition, not of the planner.
     fn two_statement_spec(label: &str, first: &str, second: &str, second_index: usize) -> GateSpec {
         GateSpec {
-            origin: Origin::ShellGate,
+            publishes_pair: false, origin: Origin::ShellGate,
             instance: "builtin.shell_write".into(),
             tool: "shell_write".into(),
             hook_id: None,
@@ -1140,6 +1142,40 @@ mod tests {
         assert_eq!(row.status, ApprovalStatus::Pending);
         assert_eq!(row.authorized_label.as_deref(), Some("kaijutsu-chan"));
         assert_eq!(row.origin, Origin::KjVerb);
+    }
+
+    #[tokio::test]
+    async fn retry_cannot_redeem_an_answer_owned_by_a_paired_invocation() {
+        for executable in [false, true] {
+            let d = gate_dispatcher().await;
+            let caller = registered_caller(&d);
+            let spec = || {
+                let mut spec = if executable { crate::kj::shell_gate::build_shell_gate_spec("echo paired").unwrap() }
+                    else { cc_spec("paired-retry") };
+                spec.publishes_pair = true;
+                spec
+            };
+            let first = run_gate(d.kernel(), &caller, spec(), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+            assert_eq!(first.verdict, GateVerdict::Pending);
+            let id = first.ask.unwrap().request_id;
+            answer(&d, &id, true);
+            let retry = run_gate(d.kernel(), &caller, spec(), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+            assert_eq!(retry.verdict, GateVerdict::Unavailable, "a second invocation cannot take the original caller's answer");
+            assert!(retry.ask.is_none(), "the retry must not try to relink the original ask to its own pair");
+            assert!(retry.reason.contains(&id));
+            assert!(approval_ledger::ask::redeemed_at(d.kernel_db.lock().conn_for_ledger(), &id).unwrap().is_none());
+            assert_eq!(d.kernel_db.lock().undelivered_answers().unwrap().len(), 1);
+            let context = caller.context_id.unwrap();
+            let command = kaijutsu_types::BlockId::new(context, caller.actor_id, 1);
+            let output = kaijutsu_types::BlockId::new(context, PrincipalId::system(), 1);
+            d.kernel_db.lock().link_ask_blocks(&id, &command, &output, crate::PairOwner::Turn).unwrap();
+            assert!(!d.kernel_db.lock().approval_pair_ready(&id).unwrap(), "a bare link does not release execution");
+            d.kernel_db.lock().in_transaction(|db| db.release_approval_pair(&id)).unwrap();
+            let ready = run_gate(d.kernel(), &caller, spec(), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+            assert_eq!(ready.verdict, if executable { GateVerdict::Unavailable } else { GateVerdict::Allowed });
+            assert_eq!(approval_ledger::ask::redeemed_at(d.kernel_db.lock().conn_for_ledger(), &id).unwrap().is_some(), !executable,
+                "only a non-executable answer is released back to retry after publication");
+        }
     }
 
     #[tokio::test]

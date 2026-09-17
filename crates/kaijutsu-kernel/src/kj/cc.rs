@@ -186,7 +186,7 @@ fn gate_spec_for_send(
         .unwrap_or_default();
     let preview: String = message.chars().take(200).collect();
     crate::kj::gate::GateSpec {
-        origin: approval_ledger::types::Origin::KjVerb,
+        publishes_pair: false, origin: approval_ledger::types::Origin::KjVerb,
         instance: "builtin.kj".into(),
         tool: "cc.send".into(),
         hook_id: None,

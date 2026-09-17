@@ -1994,7 +1994,7 @@ mod tests {
 
     fn spec() -> GateSpec {
         GateSpec {
-            origin: approval_ledger::types::Origin::KjVerb,
+            publishes_pair: false, origin: approval_ledger::types::Origin::KjVerb,
             instance: "builtin.kj".into(),
             tool: "cc.send".into(),
             hook_id: None,
@@ -2024,7 +2024,7 @@ mod tests {
     /// meaningful test.
     fn shell_spec(label: &str, rendered: &str) -> GateSpec {
         GateSpec {
-            origin: approval_ledger::types::Origin::ShellGate,
+            publishes_pair: false, origin: approval_ledger::types::Origin::ShellGate,
             instance: "builtin.shell_write".into(),
             tool: "shell_write".into(),
             hook_id: None,
