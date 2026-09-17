@@ -304,8 +304,8 @@ covered; these are not:
 
 1. **`kj context move` needs authority.** Re-parenting rewrites
    `forked_from`, so it moves accountability with it, and it is gated by
-   Operator alone. A lane could reparent itself under `ROOT` and change
-   its reviewer. Require the authority of the new parent's responsible
+   Operator alone. A lane could reparent itself under a root and change
+   its reviewer and its lineage root. Require the authority of the new parent's responsible
    character or the reviewer's, as casting does.
 2. **`kj context remove` orphans children.** `forked_from` is
    `ON DELETE SET NULL`, so a removed context's children become forest
@@ -314,12 +314,9 @@ covered; these are not:
 3. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a
    parentless context played by a model. The kernel must not guess a root
-   (Amy, 2026-09-16), so it needs an explicit parent. Decide with the
-   default-reviewer removal ("Roots, bootstrap, and rotation", slice 5).
-4. **Wire creates are parentless.** `create_context_inner` writes
-   `forked_from: None` for the app, the tui, ACP with a character, and the
-   MCP bridge's per-session contexts. Resolved by dropping the RPC ("Roots,
-   bootstrap, and rotation", slice 4).
+   (Amy, 2026-09-16), so it needs an explicit parent. Since the default
+   reviewer went away, an ask raised there refuses (nobody is above its
+   model performer) and it has no lineage root. Amy decides its parent.
 
 Open question from the lane: the walk starts at the ask's own context,
 so an actor who is not that context's performer, a human typing in a
@@ -328,61 +325,19 @@ banto. Both are models. Neither the docs nor a test pins it; Amy decides
 whether a human's command in a model's lane is reviewed by that model,
 by its parent, or walks to the nearest root.
 
-## Roots, bootstrap, and rotation (Amy, 2026-09-15 and 2026-09-16)
+## Roots, bootstrap, and rotation: what stays open (2026-09-17)
 
-Guidance in `docs/character.md`, "Roots and rotation", and
-`docs/approval-identity.md`. Accountability is a runtime relation: "if banto
-forks a coder, that coder is accountable to the precise banto that forked
-it, not any banto." A fresh kernel on 2026-09-16 deadlocked: it seeded
-`hajime`, the shipped `approval.toml` named `amy`, and nobody could assign
-ROOT's performer. Amy's decisions that day: the person creates themself
-before the first connection; drop `default_reviewer`; ROOT is "a root for
-attaching bantos to, and a model-less place I can type kj admin commands";
-"there should be no anonymous at all"; adding keys stays host-only; "equal
-roots. 1 will be typical, more than one just needs to be possible for now";
-a root context takes its character's name as its label. Build order, each
-slice green and committed:
+The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
+(`docs/devlog.md`, "The kernel with no one to answer to"). Open:
 
-1. **`root` rc bundle.** Model-less admin console: director's grants, no
-   instruction blocks. Shipped 2026-09-16.
-2. **`root_ctx` on the sheet.** `kj character create <name> --root` creates
-   the character's root context (type `root`, label = name, played by it,
-   no parent). The kernel creates a missing root context at start for each
-   live root character. The performerless `director` ROOT seed goes away.
-3. **`kaijutsu-server init --as <name> --key <pub>`.** Creates the first
-   root character and binds its key. A kernel with no live root character
-   refuses to start. Remove `hajime` and `allow_anonymous`; tests bind keys
-   explicitly.
-4. **Drop the `createContext` RPC.** Clients run `kj context create` through
-   `executeKj` from a context, so its parent is that context and no unrooted
-   context can exist. Not fork: fork copies history, type, and performer.
-   Callers: `kaijutsu-mcp` `register_session`, the tui bridge, the ACP
-   bridge, and the client wrappers. The MCP chooses the context to run from:
-   `--parent`/`KAIJUTSU_PARENT`, then the only live root context with a
-   warning, otherwise it refuses and lists the roots. No wire change. Shipped 2026-09-16. Amy:
-   "we'll drop the RPC and push it to kj and then future changes like this
-   get easier."
-5. **No default reviewer.** Resolution is override, delegation, then the
-   `forked_from` walk. Only a root character self-confirms; a walk that ends
-   at a non-root actor refuses. Routing changes and ask reclaim belong to
-   the lineage root (`KernelDb::lineage_root`); delegation grant and revoke
-   to any live root. `approval.toml` and its cache table are gone. Shipped
-   2026-09-17. Hosts keep a stale `/config/kernel/approval.toml`; delete it
-   by hand.
-6. **`kj context rotate [<context>]`.** Shipped 2026-09-17. Amy chose to
-   rotate a context rather than a character, to copy everything including
-   env, and to let the performer or the lineage root rotate. Unverified: a
-   model rotating its own seat from inside a live turn archives the context
-   that turn is still writing to.
-7. **`create --as` asks instead of refusing.** Apply the held patch
-   (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
-   turn its refusal into an ask to the responsible character above, and
-   accept a redeemed approval for the exact statement as authority.
-
-Migrate zorak by hand or in downtime after slice 4; keep it simple.
-
-Also open: `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
-is flaky under the parallel test runner and passes single-threaded.
+- Deploy: each host needs its kernel wiped and `kaijutsu-server init` run,
+  every client binary rebuilt (wire version 2), rc reseeded, and the stale
+  `/config/kernel/approval.toml` deleted by hand. Migrate zorak by hand or
+  in downtime; keep it simple.
+- A model rotating its own seat from inside a live turn archives the
+  context that turn is still writing to. Untested.
+- `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
+  is flaky under the parallel test runner and passes single-threaded.
 
 ## isotest process tests cannot find a job's process group (2026-09-17)
 
@@ -426,17 +381,6 @@ draft/shell RPC read the identifier the doc names. Open:
 2. The hook listener authors under `for_agent_session` with a `system()`
    fallback (`hook_listener.rs:949`); the bridge-identity design in
    `docs/character.md` replaces it.
-3. ROOT seeds `system()` as `created_by`/`director_id` (`rpc.rs:2534`);
-   benign.
-4. `kj context create --as` is ungated (`kj/context.rs:579`) while
-   `kj context set --as` needs Operator plus reviewer authority. A patch
-   that gates `create --as` the same way exists
-   (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`)
-   and is held back: it refused the director self-rotation, which was
-   `kj context create ... --as banto` from a live model turn. Since
-   2026-09-17 a seat rotates itself with `kj context rotate`, which allows
-   the performer, so that objection is gone. Slice 7 still decides whether
-   a refused `create --as` raises an ask.
 
 Verified by `crates/kaijutsu-server/tests/user_input_identity.rs`: a human
 with nobody responsible above her runs a gated shell command, the ask

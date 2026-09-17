@@ -652,6 +652,13 @@ impl KjDispatcher {
         {
             return denied;
         }
+        // Casting a performer is the same act through `create --as` as
+        // through `set --as`, so it needs the same capability.
+        if matches!(parsed.command, ContextCommand::Create { character: Some(_), .. })
+            && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "context create --as")
+        {
+            return denied;
+        }
 
         match parsed.command {
             ContextCommand::List { tree } => self.context_list(tree, caller).await,
@@ -1404,10 +1411,24 @@ impl KjDispatcher {
             };
             // Only a character can direct: a characterless principal cannot
             // hold a delegation.
-            let director_id = match self.kernel_db().lock().get_character(caller.actor_id) {
-                Ok(sheet) => sheet.map(|_| caller.actor_id),
+            let caller_sheet = match self.kernel_db().lock().get_character(caller.actor_id) {
+                Ok(sheet) => sheet,
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             };
+            // A caster directs what it casts, and the cast character is
+            // accountable to it there, so casting needs a live caller.
+            if played_by.is_some() {
+                match &caller_sheet {
+                    None => return KjResult::Err(
+                        "kj context create: --as needs a caller with a character sheet, since the caller directs the character it casts".into()
+                    ),
+                    Some(sheet) if sheet.retired_at.is_some() => return KjResult::Err(format!(
+                        "kj context create: {} is retired and cannot cast a performer", sheet.name
+                    )),
+                    Some(_) => {}
+                }
+            }
+            let director_id = caller_sheet.map(|_| caller.actor_id);
             if let Some(performer) = played_by {
                 // The context does not exist yet, so the walk starts where
                 // it would continue: at the parent the new row will name.
@@ -3443,6 +3464,56 @@ mod tests {
             assert!(tail.is_ok(), "{}", tail.message());
             assert!(tail.message().contains("what you did, what is next"), "name={name}, advice={advice}, result={result:?}, tail={}", tail.message());
         }
+    }
+
+    /// `create --as` casts as `set --as` does: it needs the Operator
+    /// capability. Creating without a performer stays ungated.
+    #[tokio::test]
+    async fn context_create_as_requires_operator_like_set_as() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let coder = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: coder, name: s("coder"), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        crate::kj::test_helpers::register_rooted_context(&d, Some("cast-parent"), amy);
+        // A caller context with no binding row holds no capability.
+        let caller = caller_with_context(ContextId::new()).with_actor(amy, None);
+        let refused = d.dispatch(&[s("context"), s("create"), s("cast-lane"), s("--parent"), s("cast-parent"), s("--as"), s("coder")], &caller).await;
+        assert!(!refused.is_ok(), "{}", refused.message());
+        assert!(refused.message().contains("operator"), "{}", refused.message());
+        assert!(d.kernel_db().lock().resolve_context("cast-lane").is_err(), "a refusal creates nothing");
+        let plain = d.dispatch(&[s("context"), s("create"), s("plain-lane"), s("--parent"), s("cast-parent")], &caller).await;
+        assert!(plain.is_ok(), "creating without a performer needs no capability: {}", plain.message());
+    }
+
+    /// Casting makes the cast character accountable to the caller, who
+    /// directs the new context, so only a live character may cast.
+    #[tokio::test]
+    async fn context_create_as_requires_a_live_character_caller() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let coder = PrincipalId::new();
+        let ghost = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: coder, name: s("coder"), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let parent = crate::kj::test_helpers::register_rooted_context(&d, Some("cast-parent"), amy);
+        let mut caller = test_caller();
+        caller.context_id = Some(parent);
+        let characterless = d.dispatch(&[s("context"), s("create"), s("ghost-lane"), s("--as"), s("coder")], &caller).await;
+        assert!(!characterless.is_ok(), "{}", characterless.message());
+        assert!(characterless.message().contains("character sheet"), "{}", characterless.message());
+
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: ghost, name: s("ghost"), created_at: 1, retired_at: Some(2), handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let retired = d.dispatch(&[s("context"), s("create"), s("ghost-lane"), s("--as"), s("coder")], &caller.clone().with_actor(ghost, None)).await;
+        assert!(!retired.is_ok() && retired.message().contains("retired"), "{}", retired.message());
+        assert!(d.kernel_db().lock().resolve_context("ghost-lane").is_err(), "a refusal creates nothing");
+
+        let cast = d.dispatch(&[s("context"), s("create"), s("amy-lane"), s("--as"), s("coder")], &caller.with_actor(amy, None)).await;
+        assert!(cast.is_ok(), "a live character directs what it casts: {}", cast.message());
     }
 
     #[tokio::test]

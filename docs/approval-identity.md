@@ -97,7 +97,10 @@ which a fork or a create from the caller's own context records as
 children"). Casting is what makes the cast character accountable to the
 caller in that context; no sheet relation is consulted, and a root
 character cannot be cast, by any caller, through `create --as` or
-`set --as`. This is a second way to earn `--as` authority,
+`set --as`. `kj context create --as` is the same act at birth: it needs the
+Operator capability and a live character caller, who becomes the new
+context's director. It raises no ask; a caller without that authority is
+refused. This is a second way to earn `--as` authority,
 not a change to reviewer authority: it does not let a director assign
 `--reviewer` or `--director`, which still require the lineage root,
 and the performer still cannot review its own work. The lineage root may
@@ -287,13 +290,3 @@ superseded request need explicit linkage so rotation does not duplicate work.
   `--director`, and `--clear-reviewer`, and `kj ledger escalate` by someone
   other than the assigned reviewer. `kj ledger delegation grant|revoke`
   requires any live root character.
-
-## Planned
-
-Guidance from Amy, 2026-09-15; see `docs/character.md`, "Roots and
-rotation".
-
-A `kj context create --as <character>` by a caller without reviewer
-authority raises an ask rather than refusing; approval executes the
-statement and the verb accepts a redeemed approval for that statement as
-authority.

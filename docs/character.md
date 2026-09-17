@@ -20,7 +20,7 @@ does not become an instruction to use nonexistent features.
 | Bootstrap | `kaijutsu-server init --as <name> --key <pubkey-file>` creates the first root character and binds its key, with the service stopped. The server refuses to start without a live root character. There is no seeded character and no anonymous auth. See "Bootstrap: the person creates themself" |
 | Root context | Each live root character has one: type `root` (a model-less admin bundle), labeled with the character's name, played by it, with no parent. `kj character create --root` and `set --root` create it; the server creates any missing one at start. `set --no-root` refuses while it is live |
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
-| Performer | `kj context create --as <character>` records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
+| Performer | `kj context create --as <character>` needs the Operator capability and a live character caller, records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
 | Client creation | There is no create RPC. A client runs `kj context create` through `executeKj` from an existing context, which becomes the parent. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`; `kaijutsu-mcp`, `kaijutsu-tui`, and `kaijutsu-acp` all take `--parent`). Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer, except a root character, which cannot be cast |
 | Review assignment | Explicit context override, then explicit director-wide delegation, then the walk up `forked_from`. There is no configured default. An exhausted walk is a self-confirmation for a live root character and an error for anyone else. The lineage root, the root character at the top of a context's `forked_from` chain, controls its reviewer and director overrides; any live root grants and revokes delegation. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
@@ -182,13 +182,10 @@ Two things follow, and they are the ones to check a change against:
   caller's own context records. Casting is what makes the cast character
   accountable to the caller there; no sheet relation is consulted. Roots
   cannot be cast, since they have no model.
-- **A model asks to rotate itself.** `kj context create --as <character>` by
-  a caller without reviewer authority raises an ask instead of refusing;
-  the reviewer is the responsible character above it; approval executes
-  the statement, and the verb accepts a redeemed approval for that exact
-  statement as its authority. A static rule in the allow tier may pass a
-  rotation whose character, type, and predecessor line up, when Amy wants
-  it unattended.
+- **A model rotates itself with `kj context rotate`.** Amy, 2026-09-17:
+  the performer may rotate its own seat, so no ask is needed.
+  `kj context create --as` follows `set --as` instead: Operator and a live
+  character caller, who directs what it casts, with no ask.
 
 ### A session, inside kaijutsu
 

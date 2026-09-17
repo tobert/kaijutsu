@@ -1851,3 +1851,11 @@ confirms its own statements there, so that check now skips roots. The session
 scenario had been booting amy as an ordinary character beside an unrelated
 ephemeral root; it now boots her as the root, and her rotation of banto's seat
 runs through the verb.
+
+The last slice shrank once rotation existed. The plan was for a refused
+`create --as` to raise an ask, which mattered while self-rotation went
+through `create`. With a creator already directing what it creates, and a
+director allowed to cast its children with `set --as`, an ask on create would
+have put more friction on a create than on the create-then-set path it equals.
+Amy chose parity instead: `create --as` needs Operator and a live character
+caller, like `set --as`.
