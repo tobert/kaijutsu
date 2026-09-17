@@ -58,6 +58,33 @@ pub fn run_local<F: std::future::Future<Output = ()>>(f: F) {
     rt.block_on(local.run_until(f));
 }
 
+/// The harness's setup commands, allowed in the root context it joins.
+///
+/// The harness tests process isolation and VFS protection, not the gate.
+/// Every other statement still meets the shipped policy.
+const HARNESS_ROOT_ALLOW: &[&str] = &[
+    "kj context set",
+    "kj binding allow",
+    "/usr/bin/sleep",
+    "/usr/bin/timeout",
+    "jobs",
+];
+
+/// Write `/config/kernel/gate.toml` under `home` before boot: the shipped
+/// policy plus a `[context_type.root]` allow tier for [`HARNESS_ROOT_ALLOW`].
+/// Without it each setup command raises an ask that the root must confirm
+/// and the harness never answers (`docs/gate-policy-tuning.md`).
+fn write_harness_gate_policy(home: &std::path::Path) {
+    let kernel_config = home.join(".config/kaijutsu/config/kernel");
+    std::fs::create_dir_all(&kernel_config).expect("create /config/kernel host dir");
+    let allow = HARNESS_ROOT_ALLOW.iter().map(|key| format!("  \"{key}\",\n")).collect::<String>();
+    let policy = format!(
+        "{}\n[context_type.root]\nallow = [\n{allow}]\n",
+        include_str!("../../../../assets/defaults/gate.toml"),
+    );
+    std::fs::write(kernel_config.join("gate.toml"), policy).expect("write harness gate.toml");
+}
+
 /// A kaijutsu-server child process on its own $HOME, plus the client key the
 /// server was taught to accept (`kaijutsu-server init` runs before boot,
 /// binding it to the root character — unknown keys are always rejected and
@@ -109,6 +136,7 @@ impl TestKernel {
             .status()
             .expect("run init");
         assert!(status.success(), "init failed with {status}");
+        write_harness_gate_policy(&home);
 
         // Server output goes to files under $HOME so `contrib/isotest --keep`
         // debugging can read the story after the fact.

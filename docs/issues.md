@@ -385,15 +385,16 @@ Migrate zorak by hand or in downtime after slice 4; keep it simple.
 Also open: `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
 is flaky under the parallel test runner and passes single-threaded.
 
-## isotest shell tests pend on their reviewer (2026-09-16)
+## isotest process tests cannot find a job's process group (2026-09-17)
 
-`contrib/isotest` fails 14 tests (8 in `filesystem.rs`, 6 in `isolation.rs`)
-with `gate for shell_write is waiting on its reviewer`. The same 14 failed
-at `13a4e62a`, before the bootstrap change, so the approval gate outgrew the
-harness earlier. The harness never answers an ask. Rechecked after slice 5
-on 2026-09-17: the same 14 fail, and each ask is now a self-confirmation by
-the ephemeral root `tester`. The harness can answer it with
-`kj ledger allow`, or needs an allow rule for its commands; Amy decides.
+`contrib/isotest` passes `filesystem.rs` (8) and fails all 6 `isolation.rs`
+tests in `bg_pid` (`tests/common/mod.rs`): `jobs --json` lists the running
+`/usr/bin/sleep` job with no `pgids`, so the harness never learns the PID it
+signals. Until 2026-09-17 an unanswered gate ask hid this. The harness now
+allows its own setup commands in the root context (`HARNESS_ROOT_ALLOW`, Amy's
+choice over answering each ask). Either kaish's job JSON should carry the
+process group again, or the harness should read it from the durable operation
+receipt.
 
 ## Split admin grants between `root` and `director` (2026-09-16)
 
