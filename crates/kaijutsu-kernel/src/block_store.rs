@@ -1374,7 +1374,10 @@ impl BlockStore {
         if self.journaling_db()?.is_none() { return Err(BlockStoreError::NoDatabaseConfigured); }
         let context = start.context;
         let id = uuid::Uuid::now_v7().to_string();
-        let status = if start.ask.is_some() { Status::Waiting } else { Status::Running };
+        let status = start.status;
+        if !matches!(status, Status::Running | Status::Waiting) || (status == Status::Waiting && start.ask.is_none()) {
+            return Err(BlockStoreError::Validation("shell setup requires Running or Waiting with an ask".into()));
+        }
         let mut entry = self.get_mut(context).ok_or(BlockStoreError::DocumentNotFound(context))?;
         if let Some(receipt) = start.existing(&self.db.as_ref().expect("receipt setup requires a database").lock())
             .map_err(|error| BlockStoreError::Db(error.to_string()))? {

@@ -39,6 +39,8 @@ pub(crate) struct ShellOperationStart<'a> {
     pub kind: kaijutsu_types::ToolKind,
     pub role: kaijutsu_types::Role,
     pub excluded: bool,
+    /// Running after admission; Waiting while an ask still blocks execution.
+    pub status: kaijutsu_types::Status,
     pub ask: Option<(&'a str, crate::PairOwner)>,
 }
 

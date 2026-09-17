@@ -95,7 +95,7 @@ async fn prepare(
     let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
         context, principal: identity.requester, actor: identity.performer, source: &code,
         tool: "shell", input: serde_json::json!({"code": code}), kind: ToolKind::Shell,
-        role: if user_initiated { Role::User } else { Role::Model }, excluded: user_initiated, ask: None,
+        role: if user_initiated { Role::User } else { Role::Model }, excluded: user_initiated, status: kaijutsu_types::Status::Running, ask: None,
     }).map_err(|error| error.to_string())?;
     let command = receipt.command_block_id;
     let output = receipt.output_block_id;

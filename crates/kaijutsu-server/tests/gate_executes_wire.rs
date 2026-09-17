@@ -980,6 +980,12 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
             output.content
         );
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "fresh-pair\n");
+        let operation = s.kernel.kernel.shell_operations().get_by_ask(&ask, s.worker).unwrap()
+            .expect("the driver's pair must retain a recovery receipt");
+        assert_eq!(operation.receipt.output_block_id, output.id);
+        assert!(operation.completed_at.is_some());
+        let retained = s.kernel.kernel.shell_operations().outcome(&operation.receipt.operation_id, s.worker).unwrap().unwrap();
+        assert_eq!(retained.envelope().stdout, "fresh-pair\n");
 
         // The seed says who approved and that it ran — no block id and no
         // "do NOT call it again": the output blocks reach the model as new

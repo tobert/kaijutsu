@@ -1254,7 +1254,7 @@ fn pending_shell_operation_receipt(
     let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
         context: context_id, principal: tool_ctx.principal_id, actor: tool_ctx.actor_id,
         source: command_source, tool: "shell", input: serde_json::json!({"command": command_source}),
-        kind: kaijutsu_types::ToolKind::Shell, role: Role::Model, excluded: true,
+        kind: kaijutsu_types::ToolKind::Shell, role: Role::Model, excluded: true, status: Status::Waiting,
         ask: Some((ask_id, crate::PairOwner::Turn)),
     }).map_err(|error| error.to_string())?;
     Ok(receipt.operation_id)

@@ -168,45 +168,6 @@ async fn seed_ask_env(
         .map_err(|e| format!("could not restore the variable values this ask recorded: {e:#}"))
 }
 
-/// Author the command/output pair for an ask that never had one — the MCP
-/// `shell_write` path, whose ToolCall/ToolResult blocks belong to the layer
-/// above it and were already settled when its turn ended.
-fn author_pair_for_ask(
-    kernel: &Arc<Kernel>,
-    context_id: ContextId,
-    principal_id: PrincipalId,
-    source: &str,
-) -> Result<(BlockId, BlockId), crate::block_store::BlockStoreError> {
-    let documents = &kernel.blocks();
-    let last_block = documents.last_block_id(context_id);
-    let command_block_id = documents.insert_tool_call_as(
-        context_id,
-        None,
-        last_block.as_ref(),
-        "shell",
-        serde_json::json!({"code": source}),
-        Some(TypesToolKind::Shell),
-        Some(principal_id),
-        None,
-        None,
-    )?;
-    let output_block_id = documents.insert_tool_result_as(
-        context_id,
-        &command_block_id,
-        Some(&command_block_id),
-        "",
-        Status::Done,
-        None,
-        Some(TypesToolKind::Shell),
-        Some(PrincipalId::system()),
-        None,
-    )?;
-    if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
-        tracing::warn!("gate-resume: failed to set the new output block Running: {e}");
-    }
-    Ok((command_block_id, output_block_id))
-}
-
 /// Settle a pair to `Error` with `reason` on the output block's stderr —
 /// the shape a refused `shellExecute` already uses, so a human reading the
 /// conversation sees why nothing ran in the place the command would have
@@ -477,15 +438,23 @@ async fn act_on_executable_answer(
         Some((command_block_id, output_block_id, owner)) => {
             (command_block_id, output_block_id, matches!(owner, crate::PairOwner::Turn))
         }
-        None => match author_pair_for_ask(kernel, context_id, ask.actor, source) {
-            Ok((command_block_id, output_block_id)) => (command_block_id, output_block_id, true),
+        None => match kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+            context: context_id, principal: principal_id, actor: ask.actor, source,
+            tool: "shell", input: serde_json::json!({"code": source}), kind: TypesToolKind::Shell,
+            role: kaijutsu_types::Role::Model, excluded: false, status: Status::Running,
+            ask: Some((&answer.request_id, crate::PairOwner::Turn)),
+        }) {
+            Ok(receipt) => (receipt.command_block_id, receipt.output_block_id, true),
             Err(e) => {
                 tracing::error!(
                     "gate-resume: could not author blocks for ask {} ({e}); the approval \
                      is spent and nothing ran",
                     answer.request_id
                 );
-                return ExecAction::Settled;
+                return ExecAction::Tell(format!(
+                    "{who} approved the action you were waiting on: {}\n\nThe approval is spent and nothing ran: its command and result could not be recorded ({e}). Ask again after fixing storage.",
+                    answer.description,
+                ));
             }
         },
     };
@@ -909,6 +878,132 @@ async fn run_delivery(
 mod lifetime_tests {
     use super::*;
 
+    fn test_pair(kernel: &Arc<Kernel>, context: ContextId, actor: PrincipalId, source: &str) -> (BlockId, BlockId) {
+        let receipt = kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+            context, principal: actor, actor, source, tool: "shell", input: serde_json::json!({"code": source}),
+            kind: TypesToolKind::Shell, role: kaijutsu_types::Role::Model, excluded: false, status: Status::Running, ask: None,
+        }).unwrap();
+        (receipt.command_block_id, receipt.output_block_id)
+    }
+
+    #[tokio::test]
+    async fn unlinked_approved_execution_retains_its_pair_and_outcome() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        for fault in ["none", "setup", "projection"] {
+            let dispatcher = Arc::new(test_dispatcher_persistent().await);
+            dispatcher.set_self_arc();
+            let kernel = dispatcher.kernel();
+            kernel.broker().set_kj_dispatcher(&dispatcher).await;
+            let execution_dir = tempfile::tempdir().unwrap();
+            kernel.mount("/approved-probe", crate::vfs::LocalBackend::new(execution_dir.path())).await;
+            let source = "echo approved-once >> /approved-probe/count; cat /approved-probe/count";
+            let requester = PrincipalId::new();
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let context = register_context(&dispatcher, Some("unlinked-approval"), None, requester);
+            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: requester.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "execute once with a durable result".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some(source.into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            decide(kernel.kernel_db().lock().conn_for_ledger(), &request, DecideInput {
+                allow: true, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                ..Default::default()
+            }).unwrap();
+            let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+            let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None,
+                actor, reviewer, pair: None, denial: "not denied".into() };
+            if fault == "setup" {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                    "CREATE TRIGGER reject_approved_receipt BEFORE INSERT ON shell_operations
+                     BEGIN SELECT RAISE(FAIL, 'injected receipt fault'); END;"
+                ).unwrap();
+            }
+            if fault == "projection" {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                    "CREATE TRIGGER reject_approved_projection BEFORE INSERT ON oplog
+                     WHEN EXISTS(SELECT 1 FROM shell_operations WHERE completed_at IS NOT NULL)
+                     BEGIN SELECT RAISE(FAIL, 'injected projection fault'); END;"
+                ).unwrap();
+            }
+            let stop = tokio_util::sync::CancellationToken::new();
+            let action = act_on_executable_answer(kernel, context, requester, &answer, &ask, "reviewer", &stop).await;
+            let operation = kernel.shell_operations().get_by_ask(&request, context).unwrap();
+            if fault == "setup" {
+                assert!(matches!(action, ExecAction::Tell(ref seed) if seed.contains("nothing ran") && seed.contains("injected receipt fault")),
+                    "failed setup must report that the spent approval ran nothing");
+                assert!(operation.is_none());
+                let db = kernel.blocks().db().unwrap().clone();
+                let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+                let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
+                restored.load_from_db().unwrap();
+                assert!(restored.block_snapshots(context).unwrap().is_empty(), "failed setup must leave no partial pair");
+                let row = kernel.kernel_db().lock().get_approval(&request).unwrap().unwrap();
+                assert!(row.command_block_id.is_none() && row.output_block_id.is_none());
+            } else {
+                let operation = operation.expect("approved execution must have a recovery receipt");
+                let receipt = operation.receipt;
+                let log = kernel.kernel_db().lock().load_oplog_since(context, 0).unwrap();
+                let inserted: Vec<_> = log.iter().flat_map(|(_, bytes)| {
+                    let payload: crate::blocks::SyncPayload = kaijutsu_types::codec::decode(bytes).unwrap();
+                    payload.new_blocks
+                }).filter(|block| block.id == receipt.command_block_id || block.id == receipt.output_block_id).collect();
+                assert_eq!(inserted.len(), 2);
+                for block in inserted {
+                    assert_eq!(block.status, Status::Running, "a claimed command is no longer waiting for approval");
+                }
+                assert!(operation.completed_at.is_some());
+                let outcome = kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap();
+                assert_eq!(outcome.envelope().stdout, "approved-once\n");
+                let recovered_dir = tempfile::tempdir().unwrap();
+                let recovered = if fault == "projection" {
+                    assert!(matches!(action, ExecAction::Tell(ref seed) if seed.contains("settlement failed") && seed.contains("injected projection fault")));
+                    assert_eq!(kernel.shell_operations().pending_projections().unwrap().len(), 1);
+                    let db = kernel.kernel_db().clone();
+                    db.lock().conn_for_ledger().execute_batch("DROP TRIGGER reject_approved_projection").unwrap();
+                    let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+                    let restored = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+                    let recovered = Kernel::new("approved-recovery", recovered_dir.path(), restored, db).await;
+                    assert!(recovered.shell_operations().pending_projections().unwrap().is_empty());
+                    assert_eq!(recovered.shell_operations().list_for_context(context).unwrap().len(), 1);
+                    Some(recovered)
+                } else {
+                    assert!(matches!(action, ExecAction::Tell(ref seed) if seed.contains("It has run.")));
+                    None
+                };
+                let settled = recovered.as_ref().unwrap_or(kernel.as_ref());
+                let command = settled.blocks().get_block_snapshot(context, &receipt.command_block_id).unwrap().unwrap();
+                let output = settled.blocks().get_block_snapshot(context, &receipt.output_block_id).unwrap().unwrap();
+                assert_eq!(command.id.principal_id, actor);
+                assert_eq!(command.role, kaijutsu_types::Role::Model);
+                assert_eq!(output.id.principal_id, PrincipalId::system());
+                assert_eq!(output.content, "approved-once\n");
+                assert_eq!(output.status, Status::Done);
+                let db = kernel.kernel_db().lock();
+                let row = db.get_approval(&request).unwrap().unwrap();
+                assert_eq!(row.command_block_id, Some(receipt.command_block_id.to_key()));
+                assert_eq!(row.output_block_id, Some(receipt.output_block_id.to_key()));
+                assert_eq!(row.pair_owner, Some(crate::PairOwner::Turn));
+                let receipt_requester: Vec<u8> = db.conn_for_ledger().query_row(
+                    "SELECT principal_id FROM shell_operations WHERE operation_id=?1", [&receipt.operation_id], |r| r.get(0)).unwrap();
+                assert_eq!(receipt_requester, requester.as_bytes());
+            }
+            assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_some());
+            assert!(matches!(act_on_executable_answer(kernel, context, requester, &answer, &ask, "reviewer", &stop).await,
+                ExecAction::Settled), "a spent approval never authorizes another execution");
+            let marker = execution_dir.path().join("count");
+            if fault == "setup" { assert!(!marker.exists(), "setup failure must not execute source"); }
+            else { assert_eq!(std::fs::read_to_string(marker).unwrap(), "approved-once\n", "recovery and redelivery must not execute source again"); }
+            kernel.shutdown_runtime_worker().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn failed_refusal_settlement_keeps_the_answer_available() {
         use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
@@ -921,7 +1016,7 @@ mod lifetime_tests {
             let reviewer = PrincipalId::new();
             let context = register_context(&dispatcher, Some("denial-write"), None, actor);
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
-            let (command, output) = author_pair_for_ask(kernel, context, actor, "echo must-not-run").unwrap();
+            let (command, output) = test_pair(kernel, context, actor, "echo must-not-run");
             for block in [&command, &output] { kernel.blocks().set_status(context, block, Status::Waiting).unwrap(); }
             let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
                 context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
@@ -1003,10 +1098,10 @@ mod lifetime_tests {
 
     #[tokio::test]
     async fn unreadable_context_preserves_approval_and_pair_for_retry() {
-        use crate::kj::test_helpers::{test_dispatcher, register_context};
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
         use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
         for owner in [Some(crate::PairOwner::Turn), Some(crate::PairOwner::Session), None] {
-            let dispatcher = Arc::new(test_dispatcher().await);
+            let dispatcher = Arc::new(test_dispatcher_persistent().await);
             dispatcher.set_self_arc();
             let kernel = dispatcher.kernel().clone();
             kernel.broker().set_kj_dispatcher(&dispatcher).await;
@@ -1016,7 +1111,7 @@ mod lifetime_tests {
             kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let pair = owner.map(|owner| {
-                let (command, output) = author_pair_for_ask(&kernel, context, actor, "echo approved-once").unwrap();
+                let (command, output) = test_pair(&kernel, context, actor, "echo approved-once");
                 (command, output, owner)
             });
             let answer = {
@@ -1165,8 +1260,8 @@ mod lifetime_tests {
         let context = ContextId::new();
         let actor = PrincipalId::new();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
-        let owned = author_pair_for_ask(&kernel, context, actor, "echo approved").unwrap();
-        let other = author_pair_for_ask(&kernel, context, actor, "echo unrelated").unwrap();
+        let owned = test_pair(&kernel, context, actor, "echo approved");
+        let other = test_pair(&kernel, context, actor, "echo unrelated");
         let snapshot = |id: &BlockId| kernel.blocks().get_block_snapshot(context, id).unwrap().unwrap();
         let before = snapshot(&other.1);
         let panic = std::panic::AssertUnwindSafe(async {
@@ -1210,7 +1305,7 @@ mod lifetime_tests {
         let context = ContextId::new();
         let actor = PrincipalId::new();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
-        let pair = author_pair_for_ask(&kernel, context, actor, "echo captured").unwrap();
+        let pair = test_pair(&kernel, context, actor, "echo captured");
         kernel.blocks().set_status(context, &pair.1, Status::Done).unwrap();
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut preparation = ApprovalPreparation {

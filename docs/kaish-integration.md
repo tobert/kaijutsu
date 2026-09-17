@@ -121,6 +121,12 @@ These are source observations, not promises that all paths behave alike.
   against that record before terminal block publication. Startup finishes pending
   projections without executing code or hooks. Raw records are read separately
   from ordinary receipt polls, so a poll does not duplicate captured output.
+  Approval resumes that need a new pair use the same atomic pair/receipt/ask
+  setup. Their command retains the model role and performer author; the receipt
+  records the requester. A claimed ask starts Running, while a pending ask
+  starts Waiting. Setup failure reports that the approval is spent and nothing
+  ran. Retained outcomes recover without executing the approved source again;
+  notification recovery after redemption remains open.
 - `runtime/interactive.rs` admits shell submissions, constructs the addressed
   context's shell, authors the pair/receipt, and applies PreCall on the kernel
   worker. Accepted work survives RPC teardown. Runtime consumes the captured

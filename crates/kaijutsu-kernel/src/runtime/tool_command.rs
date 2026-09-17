@@ -20,6 +20,7 @@ pub(crate) fn create_operation(
         context: call.context_id, principal: call.principal_id, actor: call.actor_id,
         source, tool: "shell", input: serde_json::json!({"command": source}),
         kind: kaijutsu_types::ToolKind::Shell, role: Role::Tool, excluded: true,
+        status: if ask.is_some() { kaijutsu_types::Status::Waiting } else { kaijutsu_types::Status::Running },
         ask: ask.map(|ask| (ask, crate::PairOwner::Turn)),
     }).map_err(|error| error.to_string())
 }

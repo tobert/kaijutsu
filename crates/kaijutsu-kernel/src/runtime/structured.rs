@@ -83,7 +83,7 @@ async fn run_kj(
         let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
             context, principal: identity.requester, actor: identity.performer, source: &code,
             tool: "kj", input: serde_json::json!({"argv": argv}), kind: ToolKind::Builtin,
-            role: Role::User, excluded: false, ask: None,
+            role: Role::User, excluded: false, status: kaijutsu_types::Status::Running, ask: None,
         }).map_err(|error| error.to_string())?;
         Some((receipt.command_block_id, receipt.output_block_id))
     };

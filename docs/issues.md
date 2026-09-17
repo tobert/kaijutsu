@@ -1410,8 +1410,11 @@ rejected before document mutation.
 
 Session pre-call refusals still use `settle_outcome` before a separate ask link,
 and command settlement writes its output fields and statuses separately.
-The approval path's `author_pair_for_ask` still writes its initial pair in two
-acceptances. Close these handoffs before declaring approval settlement migrated.
+Approval resumes that need a new pair now use atomic pair/receipt/ask setup;
+the separate `author_pair_for_ask` writer is deleted. Their captured outcomes
+can recover through the shared receipt. Already-linked model pairs still need
+the same durable execution owner where no receipt exists. Close these handoffs
+before declaring approval settlement migrated.
 The ledger can expose an answer before its original caller finishes linking
 blocks; driver admission and setup must agree on when ownership is transferable.
 Audit link replacement and ask/context/actor validation together with that race.

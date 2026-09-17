@@ -2052,6 +2052,16 @@ for compaction, and releases it before publishing events. Document-before-
 database lock ordering is preserved. Already-claimed approved actions and
 startup/backlog policy remain in the ownership audit.
 
+Approval resumes that need a new pair now share atomic setup too. The separate
+writer could leave half a pair and gave completed commands no recovery receipt.
+The receipt keeps requester and performer distinct, links the original ask,
+and retains the captured outcome before output projection. A new pair for a
+claimed ask starts Running; merely carrying an ask ID no longer implies
+Waiting. The command preserves its model role. Setup failures report that the
+approval is spent and nothing ran, without leaving durable partial blocks.
+Already-linked pairs without receipts and notification delivery after redemption
+remain separate ownership work.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
