@@ -264,6 +264,11 @@ pub fn ribbon_rows(
         });
         for ask in recent.iter().take(RECENT_CAP) {
             out.push(answered_row(ask, now_ms, cols, label));
+            if let Some(reason) = &ask.publication_abandoned {
+                for text in panel::wrap(&format!("publication abandoned: {reason}"), cols, 2) {
+                    out.push(PanelLine { text, tone: LineTone::Warn });
+                }
+            }
         }
     }
 
@@ -630,7 +635,7 @@ mod tests {
             decided_by_name: None,
             decided_option: None,
             remember_scope: None,
-            redeemed_at: None,
+            redeemed_at: None, publication_abandoned: None,
         }
     }
 
@@ -676,8 +681,23 @@ mod tests {
         assert!(bare.text.contains(&ctx(1).short()), "{:?}", bare.text);
     }
 
-    /// "Was this consumed" is the question the redemption incident taught us
-    /// to ask, so an unredeemed decision says so rather than showing nothing.
+    #[test]
+    fn publication_abandonment_is_visible_with_the_original_decision() {
+        for (status, option) in [("allowed", "allow_once"), ("denied", "deny")] {
+            let mut retired = ask("01a04eaa");
+            retired.status = status.into();
+            retired.decided_option = Some(option.into());
+            retired.redeemed_at = Some(0);
+            retired.publication_abandoned = Some("Caller stopped. Source did not run.".into());
+            let rows = ribbon_rows(true, &[], &[retired], 0, 5000, 100, 40, no_labels);
+            let text = rows.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(text.contains(&option.replace('_', " ")), "{text}");
+            assert!(text.contains("publication abandoned"), "{text}");
+            assert!(text.contains("Source did not run."), "{text}");
+            assert!(rows.last().unwrap().text.contains("Esc back"));
+        }
+    }
+
     #[test]
     fn an_answered_row_says_whether_it_was_redeemed() {
         let mut decided = ask("01a04eaa");

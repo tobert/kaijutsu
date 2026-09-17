@@ -398,6 +398,12 @@ pub fn render_ask_detail(detail: &AskDetailView<'_>, width: u16, palette: &Palet
             palette.status(),
         )),
     ];
+    if let Some(reason) = detail.publication_abandoned {
+        lines.push(Line::from(Span::styled("publication: abandoned", palette.warning())));
+        for row in wrap_plain(reason, width) {
+            lines.push(Line::from(Span::styled(row, palette.warning())));
+        }
+    }
     if let Some(hook) = detail.hook {
         lines.push(Line::from(Span::styled(format!("hook:       {hook}"), palette.status())));
     }
@@ -433,7 +439,7 @@ pub fn render_ask_detail(detail: &AskDetailView<'_>, width: u16, palette: &Palet
         palette.status(),
     )));
     lines.push(Line::from(Span::styled(
-        "a allow once  A allow always  d deny  Esc back".to_string(),
+        if detail.status == "pending" { "a allow once  A allow always  d deny  Esc back" } else { "Esc back" }.to_string(),
         palette.divider(),
     )));
     lines
@@ -457,6 +463,7 @@ pub struct AskDetailView<'a> {
     pub cwd: Option<&'a str>,
     pub env: &'a [(String, Option<String>)],
     pub redeemed: RedeemedMark,
+    pub publication_abandoned: Option<&'a str>,
 }
 
 /// Cut a string to fit a column, marking the cut with `…`.
@@ -625,6 +632,7 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
                 exec_source: detail.exec_source.as_deref(),
                 cwd: detail.cwd.as_deref(),
                 env: &env,
+                publication_abandoned: detail.publication_abandoned.as_deref(),
                 redeemed: match detail.redeemed_at {
                     Some(at) => RedeemedMark::At(crate::render::wallclock(at as u64)),
                     None => RedeemedMark::Never,
@@ -988,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ask_detail_view_shows_the_env_snapshot() {
+    fn the_ask_detail_view_shows_inputs_and_publication_disposition() {
         let env = vec![
             ("TARGET".to_string(), Some("kaish-arith".to_string())),
             ("FORCE".to_string(), None),
@@ -1008,6 +1016,7 @@ mod tests {
             cwd: Some("/home/amy/src/wt/kaish-arith"),
             env: &env,
             redeemed: RedeemedMark::Never,
+            publication_abandoned: None,
         };
         let lines = render_ask_detail(&detail, 100, &Palette::builtin());
         let text: Vec<String> = lines.iter().map(line_text).collect();
@@ -1017,6 +1026,15 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("redeemed:   —")));
         assert!(text.iter().any(|l| l == "asker:      coder"));
         assert!(text.iter().any(|l| l == "reviewer:   amy"));
+        for status in ["allowed", "denied", "abandoned"] {
+            let retired = AskDetailView { status, redeemed: RedeemedMark::At("12:00".into()),
+                publication_abandoned: Some("Caller stopped. Source did not run."), ..detail };
+            let text: Vec<String> = render_ask_detail(&retired, 45, &Palette::builtin()).iter().map(line_text).collect();
+            assert!(text.iter().any(|line| line.contains(&format!("status:     {status}"))));
+            assert!(text.iter().any(|line| line.contains("publication: abandoned")), "{text:?}");
+            assert!(text.join(" ").contains("Source did not run."), "{text:?}");
+            assert_eq!(text.last().unwrap(), "Esc back", "an answered ask offers no decision keys");
+        }
     }
 
     #[test]

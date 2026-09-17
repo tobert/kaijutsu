@@ -1442,9 +1442,6 @@ A live caller that fails without publishing a terminal result still leaves a
 hold until restart. An ask that never linked its original pair cannot identify
 that pair for recovery. The generic unfinished-operation sweep stores an error
 receipt without projecting it into those blocks; finish that ownership audit.
-The typed client's AskDetail still drops `publication_abandoned`; propagate it
-into the GUI/TUI ask detail so those views explain retirement as `kj ledger show`
-already does. Redemption means answer consumption, not proof of execution.
 Claimed execution still needs durable notification retry. See docs/gate-resume.md,
 "Still open".
 

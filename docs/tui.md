@@ -992,7 +992,7 @@ overlay — smaller than the whole card or ledger needs — falls back to
 cropping, and it crops from the top: the key line is the last thing
 either view renders, so it is the last thing to disappear.
 
-### The ledger (`Ctrl+A l`, proposed chord)
+### The ledger (`Ctrl+A l`)
 
 The ask above is one row of a view you work from between sessions: every
 pending ask across every context, then the recent decisions with their
@@ -1019,9 +1019,12 @@ Rules the figure carries:
   it belongs to carries `!`.
 - `Enter` shows one ask in full (`kj ledger show`), including the hook that
   raised it and the statement as the gate saw it.
-- Answered rows keep the answering principal and the redemption, because
-  "was this consumed" is the question the redemption incident taught us to
-  ask (`docs/issues.md`, the resolved redemption entry).
+- Answered rows keep the answering principal and redemption. Redemption means
+  the answer was consumed; it does not prove execution. An invocation retired
+  before publication keeps its reviewer's decision. The TUI's full ask detail
+  and the app's recent ledger rows show `publication abandoned` and the kernel's
+  reason, including that source did not run. The TUI offers only
+  `Esc back` for a terminal ask.
 - `Ctrl+A l` is in the app's prefix table (`input/prefix.rs`; the Bevy
   surfaces shipped 2026-09-12 as `ui/ask_sheet.rs` and
   `ui/ledger_ribbon.rs`). The app's ribbon shows `recent n` rather than

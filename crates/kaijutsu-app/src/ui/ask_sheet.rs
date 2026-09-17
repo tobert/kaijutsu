@@ -941,7 +941,7 @@ mod tests {
             decided_by_name: None,
             decided_option: None,
             remember_scope: None,
-            redeemed_at: None,
+            redeemed_at: None, publication_abandoned: None,
         }
     }
 

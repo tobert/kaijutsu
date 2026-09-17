@@ -273,9 +273,8 @@ pub struct EnvVar {
     pub value: Option<String>,
 }
 
-/// One ask's full detail, decoded from `kj ledger show`'s `.data` — every
-/// field that JSON carries today (`kaijutsu-kernel/src/kj/ledger.rs`,
-/// `ledger_show`).
+/// Ask identity, decision, execution inputs, and publication disposition
+/// decoded from `kj ledger show`'s structured data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskDetail {
     pub request_id: String,
@@ -326,6 +325,8 @@ pub struct AskDetail {
     /// Consumption can deliver a refusal or retire an unpublished invocation;
     /// it does not prove that source executed.
     pub redeemed_at: Option<i64>,
+    /// Why the caller retired this invocation before publishing its Waiting result.
+    pub publication_abandoned: Option<String>,
 }
 
 impl AskDetail {
@@ -426,6 +427,7 @@ fn decode_ask_detail(data: &serde_json::Value) -> Option<AskDetail> {
         decided_option: str_field("decided_option"),
         remember_scope: str_field("remember_scope"),
         redeemed_at: data.get("redeemed_at").and_then(|v| v.as_i64()),
+        publication_abandoned: str_field("publication_abandoned"),
     })
 }
 
@@ -536,6 +538,21 @@ mod detail_tests {
             "cwd": "/home/amy/src/wt/kaish-arith",
             "env": [{"name": "TARGET", "value": "kaish-arith"}, {"name": "FORCE", "value": null}],
         })
+    }
+
+    #[test]
+    fn publication_abandonment_preserves_the_reviewers_decision() {
+        let mut data = full_show_data();
+        data["publication_abandoned"] = "Caller stopped. Source did not run.".into();
+        let detail = decode_ask_detail(&data).unwrap();
+        assert_eq!(detail.status, "allowed");
+        assert_eq!(detail.decided_option.as_deref(), Some("allow_once"));
+        assert!(detail.redeemed_at.is_some());
+        assert_eq!(detail.publication_abandoned.as_deref(), Some("Caller stopped. Source did not run."));
+        data.as_object_mut().unwrap().remove("publication_abandoned");
+        assert!(decode_ask_detail(&data).unwrap().publication_abandoned.is_none());
+        data["publication_abandoned"] = serde_json::Value::Null;
+        assert!(decode_ask_detail(&data).unwrap().publication_abandoned.is_none());
     }
 
     #[test]

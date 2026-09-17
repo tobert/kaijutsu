@@ -6270,6 +6270,7 @@ name = "kaijutsu-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "approval-ledger",
  "async-trait",
  "bytes",
  "capnp",

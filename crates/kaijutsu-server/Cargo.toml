@@ -58,6 +58,7 @@ tempfile = { workspace = true }
 capnpc.workspace = true
 
 [dev-dependencies]
+approval-ledger.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-cas.workspace = true
 kaijutsu-kernel = { workspace = true, features = ["test-mock", "test-util"] }

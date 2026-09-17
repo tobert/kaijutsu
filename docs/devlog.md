@@ -2126,6 +2126,16 @@ remaining unspent after terminal failure; fault injection checks retirement and
 result rollback together. Unlinked original-pair recovery, abrupt live failure
 without a result, and claimed notification delivery remain open.
 
+The typed client now preserves the publication abandonment reason. The TUI's
+full ask detail and the app's recent ledger display it with the unchanged
+decision; terminal TUI details offer no decision keys. The app only opens
+pending asks, so a sheet-only change would have hidden the disposition. An
+isolated startup/SSH test uses the real ActorHandle and show_ask_detail path to
+prove allowed and denied unpublished invocations return their decision and
+retirement reason, with no source side effect. Review caught a misleading
+"Approved source" phrase for denied asks; the reason now says "Source did not run." Rendering tests pin the explanation in both
+views. No running GUI was rebuilt or deployed.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

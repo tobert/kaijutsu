@@ -463,7 +463,9 @@ for retry after publication. Terminal publication abandons an unreleased
 invocation in the result transaction. Pending asks become Abandoned; Allowed
 and Denied decisions remain intact and their answers are spent without execution.
 `kj ledger show` reports the publication abandonment reason separately from the
-decision, including `publication_abandoned` in structured data.
+decision, including `publication_abandoned` in structured data. The typed client
+preserves that reason; the TUI's ask detail and the app's recent ledger display
+it alongside the original decision. Redemption alone never proves execution.
 
 At startup, retained result projections recover first. Any remaining unreleased
 invocation has lost its caller and is abandoned; linked pairs settle to Error,

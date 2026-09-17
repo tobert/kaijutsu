@@ -1537,7 +1537,7 @@ impl BlockStore {
                         db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?;
                         db.release_approval_pair(ask)?;
                     } else if matches!(status, Status::Done | Status::Error) {
-                        db.abandon_approval_pair(ask, Some((call, result)), "Caller stopped before publishing its Waiting result. Approved source did not run.")?;
+                        db.abandon_approval_pair(ask, Some((call, result)), "Caller stopped before publishing its Waiting result. Source did not run.")?;
                     }
                 }
                 Ok(())

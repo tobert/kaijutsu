@@ -546,7 +546,7 @@ async fn act_on_executable_answer(
 /// Run after captured-result recovery and before generic receipt abandonment.
 pub(crate) fn recover_unpublished_pairs(kernel: &Kernel) -> Result<usize, String> {
     let held = kernel.kernel_db().lock().unpublished_approval_pairs().map_err(|error| error.to_string())?;
-    let reason = "Kernel restarted before the caller published its Waiting result. Approved source did not run.";
+    let reason = "Kernel restarted before the caller published its Waiting result. Source did not run.";
     for request in &held {
         let row = kernel.kernel_db().lock().get_approval(request).map_err(|error| error.to_string())?
             .ok_or_else(|| format!("unpublished approval {request} has no ask"))?;

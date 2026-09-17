@@ -147,7 +147,7 @@ pub fn settle_outcome(
             }
             if status == Status::Waiting { db.release_approval_pair(envelope.ask_id.as_deref().expect("validated waiting ask"))?; }
             else if let Some(ask) = envelope.ask_id.as_deref() {
-                db.abandon_approval_pair(ask, Some((command_block_id, output_block_id)), "Caller stopped before publishing its Waiting result. Approved source did not run.")?;
+                db.abandon_approval_pair(ask, Some((command_block_id, output_block_id)), "Caller stopped before publishing its Waiting result. Source did not run.")?;
             }
             Ok(())
         }).map_err(|e| e.to_string())?;
