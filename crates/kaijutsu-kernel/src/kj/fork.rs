@@ -523,10 +523,13 @@ impl KjDispatcher {
         // restart sweep does, so they neither pin a client's in-flight strip
         // nor wait forever on an answer that cannot reach them. The parent's
         // own blocks are untouched. The count rides on the fork marker below.
-        let closed_at_fork = self.block_store().abandon_open_blocks(
+        let closed_at_fork = match self.block_store().abandon_open_blocks(
             new_id,
             "left open in the parent when this context was forked; nothing is being retried here",
-        );
+        ) {
+            Ok(closed) => closed,
+            Err(error) => return KjResult::Err(format!("kj fork: child {new_id} could not close interrupted work: {error}")),
+        };
 
         // 3d — hydration policy travel. The policy row travels iff the marked
         // block survived the selection. The marker remap is mechanical: fork
@@ -891,10 +894,12 @@ impl KjDispatcher {
         ) {
             return KjResult::Err(format!("kj fork --compact: failed to retain working state: {e}"));
         }
-        self.block_store().abandon_open_blocks(
+        if let Err(error) = self.block_store().abandon_open_blocks(
             new_id,
             "left open in the parent when this context was forked; nothing is being retried here",
-        );
+        ) {
+            return KjResult::Err(format!("kj fork --compact: child {new_id} could not close interrupted work: {error}"));
+        }
 
         // Seed with distilled summary as a Drift block
         {
@@ -2029,19 +2034,22 @@ mod tests {
             .unwrap()
     }
 
-    /// A `kj fork --include` range ENDING on a `ToolCall` must not tear the
-    /// tool_use/tool_result pair apart across the cut. Sequence (mirrors
-    /// `llm::splice::tests::prefix_ending_on_tool_call_extends_to_include_its_result`):
-    /// 0:u0(User) 1:m0(Model) 2:tool_call(Model/ToolCall) 3:tool_result(Tool/ToolResult)
-    /// 4:m1(Model) 5:u1(User) 6:m2(Model).
-    /// `--include 0:3` is a RAW keep-set of positions {0,1,2} — a run that
-    /// ends exactly on the tool_call, genuinely cutting between it and its
-    /// result at position 3. Without splicing, `fork_filtered` applies that
-    /// keep-set as bare `contains_position` and the child comes out with the
-    /// `ToolCall` but no `ToolResult` — a torn pair. Confirmed against the
-    /// pre-fix code (temporarily bypassing the `plan_splice` call): this test
-    /// FAILED with `kinds: [Text, Text, ToolCall]` (no `ToolResult`) before
-    /// the fix, and passes after it.
+    #[tokio::test]
+    async fn fork_reports_failed_interrupted_writer_settlement() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("interrupted-source"), None, principal);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        let call = d.block_store().insert_tool_call(source, None, None, "shell", serde_json::json!({}), None).unwrap();
+        d.block_store().arm_accept_fault(1);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("failed-child")], &caller_with_context(source)).await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("could not close interrupted work"), "{}", result.message());
+        assert!(result.message().contains("injected acceptance refusal"), "{}", result.message());
+        assert_eq!(d.block_store().get_block_snapshot(source, &call).unwrap().unwrap().status, kaijutsu_types::Status::Running);
+    }
+
+    /// A fork closes only copied open blocks; the parent's writer keeps ownership.
     #[tokio::test]
     async fn fork_closes_the_parents_open_blocks_in_the_child_only() {
         let d = test_dispatcher().await;

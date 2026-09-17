@@ -693,8 +693,8 @@ impl McpServerLike for BlockToolsServer {
                 // A document that cannot be read is reported, never dropped
                 // in silence: "no matches" and "no matches, and two documents
                 // could not be read" are different answers. Loud but not
-                // fatal on a sweep, matching `abandon_running_blocks_on_restart`
-                // — one unreadable document must not hide every other hit.
+                // fatal during search: one unreadable document must not hide
+                // every other hit.
                 // A single named `document_id` never reaches this, having
                 // already been resolved to an error above.
                 let mut unreadable: Vec<String> = Vec::new();

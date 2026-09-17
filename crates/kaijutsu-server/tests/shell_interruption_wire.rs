@@ -16,7 +16,7 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
         let key = config.root_key();
         let path = config.data_dir.as_ref().unwrap().join("kernel.db");
         let marker = config.data_dir.as_ref().unwrap().join("must-not-run");
-        let (context, command, output) = {
+        let (context, command, output, orphan_call, orphan_result) = {
             let shared = kaijutsu_server::rpc::create_shared_kernel(
                 config.config_dir.as_deref(), &config.config_mounts, config.data_dir.as_deref(),
             ).await.unwrap();
@@ -28,6 +28,10 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
             for id in [&command, &output] { blocks.set_status(context, id, Status::Running).unwrap(); }
             blocks.set_stderr(context, &output, Some("observed stderr".into())).unwrap();
             blocks.set_output(context, &output, Some(&OutputData::new().with_rich_json(serde_json::json!({"observed": 1})))).unwrap();
+            let orphan_call = blocks.insert_tool_call(context, Some(&output), Some(&output), "model_tool", serde_json::json!({}), None).unwrap();
+            let orphan_result = blocks.insert_tool_result(context, &orphan_call, Some(&orphan_call), "partial tool output", false, None, None).unwrap();
+            blocks.set_status(context, &orphan_result, Status::Waiting).unwrap();
+            blocks.set_stderr(context, &orphan_result, Some("partial tool stderr".into())).unwrap();
             // Persist the state of a writer that departed before recording its outcome.
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute("INSERT INTO shell_operations(operation_id,context_id,principal_id,actor_id,command_block_id,output_block_id,source,created_at)
@@ -36,7 +40,7 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
                 format!("echo unexpected > '{}'", marker.display()),
             ]).unwrap();
             shared.kernel.shutdown_runtime_worker().await.unwrap();
-            (context, command, output)
+            (context, command, output, orphan_call, orphan_result)
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let server = tokio::task::spawn_local(async move {
@@ -56,7 +60,7 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
                 }
             }
         }).await.expect("client connects");
-        for id in [command, output] {
+        for id in [command, output, orphan_call, orphan_result] {
             assert_eq!(actor.get_block(context, id).await.unwrap().unwrap().status, Status::Error);
         }
         let result = actor.get_block(context, output).await.unwrap().unwrap();
@@ -66,6 +70,12 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
         assert!(result.stderr.as_deref().unwrap().starts_with("observed stderr\n"));
         assert!(result.stderr.as_deref().unwrap().contains("restarted"));
         assert_eq!(result.output.unwrap().to_json(), serde_json::json!({"observed": 1}));
+        let orphan = actor.get_block(context, orphan_result).await.unwrap().unwrap();
+        assert_eq!(orphan.content, "partial tool output");
+        assert!(orphan.is_error);
+        assert_eq!(orphan.exit_code, None);
+        assert!(orphan.stderr.as_deref().unwrap().starts_with("partial tool stderr\n"));
+        assert!(orphan.stderr.as_deref().unwrap().contains("restarted"));
         for _ in 0..2 {
             let result = actor.execute_kj_quiet(context, vec!["wait".into(), "--operation".into(), "interrupted".into(), "--timeout".into(), "0".into()]).await.unwrap();
             assert_eq!(result.exit_code, 0, "operation polling itself succeeds: {}", result.stderr);

@@ -469,11 +469,13 @@ it alongside the original decision. Redemption alone never proves execution.
 
 At startup, retained result projections recover first. Any remaining unreleased
 invocation has lost its caller and is abandoned; linked pairs settle to Error,
-and unlinked asks create no execution. This precedes generic unfinished receipt
-abandonment. A failed write rolls back retirement, and startup fails visibly so
+and unlinked asks create no execution. Interrupted operations then settle their
+original pairs and receipts atomically. After retiring unresolved asks, server
+startup closes receiptless Running/Waiting blocks: statuses, appended stderr
+and one explanation per context commit together, preserving recorded output.
+A failed write rolls back retirement, and startup fails visibly so
 recovery can retry. An abrupt live failure without a terminal result still holds
-its ask until restart. Unlinked original-pair recovery and durable notification
-delivery remain open.
+its ask until restart. Durable notification delivery remains open.
 
 Shutdown stops delivery, cancels preparation and commands, and waits for command
 settlement. A spent claim never authorizes replay, including after a preparation

@@ -1838,64 +1838,21 @@ pub async fn create_shared_kernel(
         }
     }
 
-    // Bury every ask nobody can answer any more. An ask does not survive a
-    // kernel restart: the machinery to resume an approved action across one
-    // is where the exactly-once risk lives, and an approved destructive
-    // action running twice is worse than an ask that has to be made again
-    // (docs/gate-resume.md, "Rescoped").
-    //
-    // Sweeping is what keeps that honest rather than silent. Left alone, a
-    // pending ask stays answerable-looking: a human decides it, is told
-    // nothing, and nothing runs. `claimed` rows go too — the queue hides
-    // them because an answerer is working them, which stops being true the
-    // moment that process dies.
-    //
-    // Loud but not fatal, matching the two recoveries around it: a kernel
-    // that cannot sweep is still a kernel that can serve, and the stale
-    // rows are visible in `kj ledger list` either way. No ledger-change
-    // notification is published — nothing has subscribed to the bus yet at
-    // this point in boot, so it would be an announcement to nobody.
-    match kernel_db_arc
-        .lock()
-        .abandon_unresolved_asks_on_restart("the kernel restarted before this was answered; this ask cannot authorize further work")
-    {
-        Ok(0) => {}
-        Ok(n) => log::info!(
-            "abandoned {n} approval ask(s) that did not survive the restart; nothing they \
-             guarded was run"
-        ),
-        Err(e) => log::warn!(
-            "failed to abandon unresolved approval asks at startup: {e} — stale asks may \
-             still look answerable in `kj ledger list`"
-        ),
+    // Execution recovery has already settled retained results and receipts.
+    // Retire remaining unresolved asks before closing receiptless writers;
+    // no model or tool from the previous process can resume. Any failure
+    // refuses startup so an incomplete recovery cannot admit new writers.
+    let abandoned = kernel_db_arc.lock().abandon_unresolved_asks_on_restart(
+        "the kernel restarted before this was answered; this ask cannot authorize further work",
+    ).map_err(|error| capnp::Error::failed(format!("Cannot retire interrupted approvals: {error}")))?;
+    if abandoned > 0 {
+        log::info!("retired {abandoned} unresolved approval ask(s) after restart; source will not be retried");
     }
-
-    // Fail every block still `Running` at cold start. A panic or process exit
-    // between insertion and terminal publication can leave unfinished blocks.
-    // Turn cleanup publishes failure, but live block cleanup still needs exact
-    // ownership so it cannot sweep another writer's work. Nothing remains to
-    // finalize it. At cold start no writer can be mid-turn, so any `Running`
-    // block found here is known-stale (docs/issues.md, "Blocks orphaned in
-    // `Running` have no supervisor"). It also sweeps `Waiting`, and the ask
-    // sweep immediately above is why: those blocks are waiting on asks that
-    // were just abandoned, so nothing can ever move them. Order matters —
-    // the asks must be abandoned first, or the sweep would fail blocks whose
-    // questions were still live. `abandon_running_blocks_on_restart` does not
-    // touch `Pending` (the drift queue's own durable waiting state) or
-    // `Draft` (an unsubmitted compose draft), and a completed block is never
-    // in scope.
-    //
-    // Loud but not fatal, matching the ask sweep: the count is reported, and
-    // a per-block failure inside the sweep is logged there rather than
-    // aborting kernel start.
     let swept_blocks = documents.abandon_running_blocks_on_restart(
         "the kernel restarted while this was still in progress; nothing is being retried",
-    );
+    ).map_err(|error| capnp::Error::failed(format!("Cannot recover interrupted blocks: {error}")))?;
     if swept_blocks > 0 {
-        log::info!(
-            "abandoned {swept_blocks} block(s) left `Running` or `Waiting` by a writer or an \
-             ask that did not survive the restart"
-        );
+        log::info!("closed {swept_blocks} block(s) left Running or Waiting by interrupted writers");
     }
 
     // Re-adopt the persisted drift queue and rebuild the cursor from it

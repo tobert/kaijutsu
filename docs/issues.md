@@ -932,6 +932,9 @@ issues. Code inspection confirmed the ordering; no DB fault was injected.
   initialized context. The upfront label check does not cover a label claimed
   concurrently during summarization. Define atomic initialization or cleanup,
   with fault-injection coverage across full, filtered, and compact forks.
+  Interrupted-writer cleanup now returns an error naming the copied child;
+  its statuses and explanation are atomic, but the earlier document copy
+  remains. A fault test pins the caller's refusal and unchanged parent.
 
 `abandon_open_blocks` closes Running/Waiting, leaving Pending untouched. Normal
 tool calls start Running, but `kj block status` can set Pending explicitly.
@@ -1442,8 +1445,10 @@ A live caller that fails without publishing a terminal result still leaves a
 hold until restart. Registered operations now recover their original pair and
 receipt atomically even when an ask never linked. Output and ANSI provenance
 survive; recovery records an interruption without inventing an exit code or
-rerunning source. Receiptless model pairs still depend on the server's separate
-orphan sweep, which can overwrite stored stderr. Historical error receipts
+rerunning source. Receiptless model pairs now settle through one atomic
+acceptance per context during server startup. The sweep appends the reason to
+stored stderr and retains other output; startup refuses approval or block
+recovery failures. Historical error receipts
 already completed by the old receipt-only sweep are not rewritten by the new
 unfinished-operation recovery. Finish that ownership and compatibility audit.
 Claimed execution still needs durable notification retry. See docs/gate-resume.md,

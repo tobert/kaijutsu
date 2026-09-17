@@ -2150,8 +2150,26 @@ settlement or events. Repeated startup preserves later edits and the original
 receipt. The isolated SSH test checks typed block reads and repeated
 `kj wait --operation` polls against the same interrupted operation. DeepSeek's
 review found no actionable defect; fail-fast recovery is intentional, and its
-partial-move compile concern was incorrect. Receiptless model pairs and old
-receipt-only abandonment rows remain recorded in the ownership audit.
+partial-move compile concern was incorrect. Old receipt-only abandonment rows
+remain recorded in the ownership audit.
+
+Receiptless writers used a separate sweep that overwrote stderr and committed
+status before its explanation. The regression reproduced that lost stderr.
+The sweep now selects open blocks under the document guard and commits every
+status, appended tool stderr and one Error child together. Output, structured
+data and ANSI provenance survive. Startup and both fork paths propagate failure;
+startup also refuses a failed approval retirement instead of serving stale asks.
+The error names interrupted writers, so copied fork history no longer claims
+a kernel restart. Adjacent comments now state the recovery rules directly.
+
+Journal and post-commit compaction faults prove the common commit point and
+idempotent recovery. A server boot test rejects approval and journal failures,
+then recovers with one explanation. The SSH client checks receiptless output
+beside registered shell receipts. Fork refusal leaves its parent untouched;
+fork initialization across the earlier document copy remains a separate issue.
+DeepSeek found no actionable defect. Its reachability questions were checked:
+acceptance delegates to the journal transaction, persistent stores refuse a
+missing database, and the fork child has no context registration at this step.
 
 ## The kernel with no one to answer to (September 16)
 

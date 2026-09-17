@@ -3631,130 +3631,70 @@ impl BlockStore {
         })
     }
 
-    /// Fail every block still `Running` at kernel cold start.
-    ///
-    /// `Running` is set only by an active writer — a streaming LLM turn, an
-    /// in-flight tool call — never as a durable "waiting" state. At cold
-    /// start no such writer can exist: the process that would have carried
-    /// it to a terminal status does not survive a restart. So a `Running`
-    /// block found here is known-stale, not merely suspected — the same
-    /// reasoning `KernelDb::abandon_unresolved_asks_on_restart` applies to
-    /// unanswered asks (docs/issues.md, "Blocks orphaned in `Running` have
-    /// no supervisor").
-    ///
-    /// Sweeps every document and every `BlockKind` on purpose, rather than
-    /// naming `model`/`tool_call`/`tool_result` specifically: `Running`
-    /// itself is the writer-in-flight signal regardless of kind, so a
-    /// narrower list would just be a second place to remember to update
-    /// when a new streaming kind is added.
-    ///
-    /// `Waiting` is swept for the same reason, one step removed: the ask a
-    /// waiting block is waiting on was abandoned moments earlier by
-    /// `KernelDb::abandon_unresolved_asks_on_restart`, so the question it
-    /// names can never be answered and nothing will ever move the block.
-    /// Leaving it would be a block that reports an open question with no
-    /// open question behind it.
-    ///
-    /// `Pending` and `Draft` are left untouched — `Pending` is the drift
-    /// queue's durable "waiting to be flushed" state (`drift.rs`) and must
-    /// survive a restart unswept; `Draft` is an unsubmitted compose draft,
-    /// exactly what a player left mid-sentence, not abandoned work.
-    ///
-    /// Each swept block is set `Status::Error` and gets an `Error` child
-    /// block naming `reason`, so both the model and the app can read why —
-    /// see [`Self::insert_error_block_as`]. A per-block failure is logged
-    /// and does not stop the sweep: one document that cannot be written
-    /// must not hide every other orphan (loud but not fatal, matching the
-    /// restart recoveries this sits beside in `create_shared_kernel`).
-    ///
-    /// Returns how many blocks were swept.
-    pub fn abandon_running_blocks_on_restart(&self, reason: &str) -> usize {
-        self.list_ids()
-            .into_iter()
-            .map(|context_id| self.abandon_open_blocks(context_id, reason))
-            .sum()
+    /// Close orphaned writers after execution and approval recovery at startup.
+    /// Each context commits its statuses and explanation together. A failure
+    /// stops the sweep and must refuse startup; committed contexts are safe
+    /// to visit again. Pending work and unsubmitted drafts remain untouched.
+    pub fn abandon_running_blocks_on_restart(&self, reason: &str) -> BlockStoreResult<usize> {
+        self.list_ids().into_iter().try_fold(0, |count, context| {
+            self.abandon_open_blocks(context, reason).map(|closed| count + closed)
+        })
     }
 
-    /// Fail every `Running`/`Waiting` block of one document and leave one
-    /// Error block naming them — the restart sweep's body, also what a fork
-    /// runs on its child, whose copied open blocks no writer will finish.
-    /// Returns how many blocks it failed.
-    pub fn abandon_open_blocks(&self, context_id: ContextId, reason: &str) -> usize {
-        {
-            let running: Vec<BlockSnapshot> = match self.block_snapshots(context_id) {
-                Ok(snaps) => snaps
-                    .into_iter()
-                    .filter(|s| matches!(s.status, Status::Running | Status::Waiting))
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!(
-                        context_id = %context_id.to_hex(),
-                        error = %e,
-                        "abandon_open_blocks: failed to read blocks; skipping this document"
-                    );
-                    return 0;
+    /// Close Running/Waiting blocks whose writers cannot reach this document:
+    /// at startup, or in a fork's copied history. Preserve recorded output and
+    /// append the reason to tool stderr. One Error child names all closed blocks.
+    /// Selection, statuses, stderr and that explanation share one acceptance.
+    pub fn abandon_open_blocks(&self, context_id: ContextId, reason: &str) -> BlockStoreResult<usize> {
+        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let open: Vec<_> = entry.doc.blocks_ordered().into_iter()
+            .filter(|block| matches!(block.status, Status::Running | Status::Waiting)).collect();
+        let Some(last) = open.last() else { return Ok(0); };
+        self.accept_locked(context_id, &mut entry, |entry| {
+            let author = self.principal_id();
+            entry.doc.set_principal_id(author);
+            let mut changed = Vec::new();
+            for block in &open {
+                if block.kind == BlockKind::ToolResult {
+                    let mut stderr = block.stderr.clone().unwrap_or_default();
+                    if !stderr.is_empty() && !stderr.ends_with('\n') { stderr.push('\n'); }
+                    stderr.push_str(reason);
+                    entry.doc.set_stderr(&block.id, Some(stderr))?;
+                    entry.doc.set_tool_result_state(&block.id, Status::Error, true)?;
+                } else {
+                    entry.doc.set_status(&block.id, Status::Error)?;
                 }
+                changed.push(entry.doc.get_block_snapshot(&block.id).expect("selected block remains under this guard"));
+            }
+            let names = open.iter().map(describe_swept_block).collect::<Vec<_>>().join(", ");
+            let content = format!("{reason} — {} block(s) left open: {names}", open.len());
+            let error = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Kernel,
+                severity: kaijutsu_types::ErrorSeverity::Fatal,
+                code: Some("kernel.interrupted_writer".into()),
+                detail: Some(content.clone()), span: None, source_kind: Some(last.kind),
             };
-            let mut failed: Vec<BlockSnapshot> = Vec::new();
-            for snap in running {
-                if let Err(e) = self.set_status(context_id, &snap.id, Status::Error) {
-                    tracing::warn!(
-                        context_id = %context_id.to_hex(),
-                        block_id = %snap.id,
-                        error = %e,
-                        "abandon_open_blocks: failed to set Error status"
-                    );
-                    continue;
+            let id = entry.doc.insert_error_block(&last.id, Some(&last.id), &error, content)?;
+            let explanation = entry.doc.get_block_snapshot(&id).expect("inserted explanation exists");
+            entry.touch(author);
+            let version = entry.version();
+            let mut events = Vec::new();
+            for block in &changed {
+                if block.kind == BlockKind::ToolResult {
+                    events.push(BlockFlow::MetadataChanged { context_id, block_id: block.id,
+                        metadata: block.metadata(), version, source: OpSource::Local });
                 }
-                // A swept tool result carries the reason as its own stderr,
-                // so it prints as what happened rather than as an empty body.
-                if snap.kind == BlockKind::ToolResult
-                    && let Err(e) = self.set_stderr(context_id, &snap.id, Some(reason.to_string()))
-                {
-                    tracing::warn!(
-                        context_id = %context_id.to_hex(),
-                        block_id = %snap.id,
-                        error = %e,
-                        "abandon_open_blocks: failed to record the reason on the result"
-                    );
-                }
-                failed.push(snap);
+                events.push(BlockFlow::StatusChanged { context_id, block_id: block.id,
+                    status: Status::Error, version, source: OpSource::Local });
             }
-            // One Error block per context per restart, off the last block
-            // swept, naming every one — not one block per swept block, which
-            // stacked a fresh row of identical errors on every bounce.
-            if let Some(last) = failed.last() {
-                let names = failed.iter().map(describe_swept_block).collect::<Vec<_>>().join(", ");
-                let content = format!(
-                    "{reason} — {} block(s) left open by the restart: {names}",
-                    failed.len()
-                );
-                let payload = kaijutsu_types::ErrorPayload {
-                    category: kaijutsu_types::ErrorCategory::Kernel,
-                    severity: kaijutsu_types::ErrorSeverity::Fatal,
-                    code: Some("kernel.restart_orphan".to_string()),
-                    detail: Some(content.clone()),
-                    span: None,
-                    source_kind: Some(last.kind),
-                };
-                if let Err(e) = self.insert_error_block_as(
-                    context_id,
-                    &last.id,
-                    &payload,
-                    &content,
-                    Some(self.principal_id()),
-                ) {
-                    tracing::warn!(
-                        context_id = %context_id.to_hex(),
-                        block_id = %last.id,
-                        error = %e,
-                        "abandon_open_blocks: failed to attach error detail"
-                    );
-                }
-            }
-            failed.len()
-        }
+            events.push(BlockFlow::Inserted { context_id, block: Arc::new(explanation.clone()),
+                after_id: Some(last.id), version, source: OpSource::Local });
+            let mut payload = SyncPayload::from_new_block(explanation);
+            payload.updated_snapshots = changed;
+            Ok((payload, events, open.len()))
+        })
     }
+
 }
 
 /// `shell (#586)` for a tool call, `tool_result (#587)` / `text (#12)` for
@@ -8607,6 +8547,79 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn orphan_recovery_commits_statuses_and_explanation_in_one_acceptance() {
+        for fault in ["journal", "compaction"] {
+            let (store, flows, db, _dir) = store_with_db_and_flows();
+            let context = ContextId::new();
+            store.create_document(context, DocumentKind::Conversation, None).unwrap();
+            let call = store.insert_tool_call(context, None, None, "shell", serde_json::json!({}), None).unwrap();
+            let text = if fault == "compaction" { "x".repeat(1_048_576) } else { "observed stdout".into() };
+            let result = store.insert_tool_result(context, &call, Some(&call), &text, false, None, None).unwrap();
+            store.set_status(context, &result, Status::Running).unwrap();
+            store.set_stderr(context, &result, Some("observed stderr".into())).unwrap();
+            db.lock().conn_for_ledger().execute_batch(match fault {
+                "journal" => "CREATE TRIGGER reject_recovery BEFORE INSERT ON oplog BEGIN SELECT RAISE(ABORT, 'interruption journal fault'); END;",
+                _ => "CREATE TRIGGER reject_recovery BEFORE INSERT ON doc_snapshots BEGIN SELECT RAISE(ABORT, 'interruption compaction fault'); END;",
+            }).unwrap();
+            let mut events = flows.subscribe("block.*");
+            let error = store.abandon_open_blocks(context, "writer departed").unwrap_err();
+            assert!(error.to_string().contains(&format!("interruption {fault} fault")), "{error}");
+            assert!(events.try_recv().is_none());
+            let workspace = db.lock().get_or_create_default_workspace(store.principal_id()).unwrap();
+            let restored = BlockStore::with_db(db.clone(), workspace, store.principal_id());
+            restored.load_one_from_db(context).unwrap();
+            let after = restored.get_block_snapshot(context, &result).unwrap().unwrap();
+            let committed = fault == "compaction";
+            for id in [&call, &result] {
+                assert_eq!(restored.get_block_snapshot(context, id).unwrap().unwrap().status,
+                    if committed { Status::Error } else { Status::Running });
+            }
+            assert_eq!(after.content, text);
+            assert_eq!(after.stderr.as_deref(), Some(if committed { "observed stderr\nwriter departed" } else { "observed stderr" }));
+            let explanations = restored.block_snapshots(context).unwrap().into_iter().filter(|b| b.kind == BlockKind::Error).count();
+            assert_eq!(explanations, usize::from(committed), "the explanation and both statuses have the same commit point");
+            db.lock().conn_for_ledger().execute_batch("DROP TRIGGER reject_recovery").unwrap();
+            assert_eq!(restored.abandon_open_blocks(context, "writer departed").unwrap(), if committed { 0 } else { 2 });
+            let again = BlockStore::with_db(db.clone(), workspace, store.principal_id());
+            again.load_one_from_db(context).unwrap();
+            assert_eq!(again.block_snapshots(context).unwrap().iter().filter(|b| b.kind == BlockKind::Error).count(), 1);
+        }
+    }
+
+    #[test]
+    fn orphan_recovery_preserves_recorded_output_and_is_idempotent() {
+        let (db, workspace, store) = store_with_db();
+        let context = ContextId::new();
+        store.create_document(context, DocumentKind::Conversation, None).unwrap();
+        let call = store.insert_tool_call(context, None, None, "shell", serde_json::json!({}), None).unwrap();
+        let result = store.insert_tool_result(context, &call, Some(&call), "observed stdout", false, None, None).unwrap();
+        store.set_status(context, &result, Status::Waiting).unwrap();
+        store.set_stderr(context, &result, Some("observed stderr".into())).unwrap();
+        store.set_output(context, &result, Some(&kaijutsu_types::OutputData::new().with_rich_json(serde_json::json!({"observed": 1})))).unwrap();
+        let original = b"\x1b[31mobserved stdout\x1b[0m";
+        let projection = crate::ansi_ingest::project(original).unwrap();
+        crate::ansi_ingest::record(&store, context, &result, projection.spans, original);
+        let before = store.get_block_snapshot(context, &result).unwrap().unwrap();
+        assert_eq!(store.abandon_running_blocks_on_restart("writer departed").unwrap(), 2);
+        let restored = BlockStore::with_db(db.clone(), workspace, store.principal_id());
+        restored.load_one_from_db(context).unwrap();
+        let after = restored.get_block_snapshot(context, &result).unwrap().unwrap();
+        assert_eq!(after.stderr.as_deref(), Some("observed stderr\nwriter departed"));
+        assert_eq!(after.content, before.content);
+        assert_eq!(after.output, before.output);
+        assert_eq!(after.style_spans, before.style_spans);
+        assert_eq!(after.provenance, before.provenance);
+        assert!(after.is_error);
+        assert_eq!(after.status, Status::Error);
+        assert_eq!(restored.get_block_snapshot(context, &call).unwrap().unwrap().status, Status::Error);
+        assert_eq!(db.lock().get_block_provenance(&result, kaijutsu_ansi::TRANSFORM_NAME).unwrap().unwrap().1, original);
+        let version = restored.version(context).unwrap();
+        assert_eq!(restored.abandon_running_blocks_on_restart("second restart").unwrap(), 0);
+        assert_eq!(restored.version(context).unwrap(), version);
+        assert_eq!(restored.block_snapshots(context).unwrap().iter().filter(|b| b.kind == BlockKind::Error).count(), 1);
+    }
+
+    #[test]
     fn abandon_running_blocks_fails_a_running_block_with_a_readable_reason() {
         let store = BlockStore::new(test_agent());
         let ctx = ContextId::new();
@@ -8628,7 +8641,7 @@ mod tests {
 
         let swept = store.abandon_running_blocks_on_restart(
             "the kernel restarted while this was still in progress; nothing is being retried",
-        );
+        ).unwrap();
         assert_eq!(swept, 1, "exactly the one Running block should be swept");
 
         let snap = store.get_block_snapshot(ctx, &running).unwrap().unwrap();
@@ -8693,7 +8706,7 @@ mod tests {
             )
             .unwrap();
 
-        let swept = store.abandon_running_blocks_on_restart("restarted");
+        let swept = store.abandon_running_blocks_on_restart("restarted").unwrap();
         assert_eq!(swept, 3);
         let blocks = store.block_snapshots(ctx).unwrap();
         let errors: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Error).collect();
@@ -8747,7 +8760,7 @@ mod tests {
             )
             .unwrap();
 
-        let swept = store.abandon_running_blocks_on_restart("reason");
+        let swept = store.abandon_running_blocks_on_restart("reason").unwrap();
         assert_eq!(
             swept, 0,
             "no Running block exists — a terminal block must not be counted or touched"
@@ -8810,7 +8823,7 @@ mod tests {
             )
             .unwrap();
 
-        let swept = store.abandon_running_blocks_on_restart("reason");
+        let swept = store.abandon_running_blocks_on_restart("reason").unwrap();
         assert_eq!(swept, 0);
 
         assert_eq!(
@@ -8853,7 +8866,7 @@ mod tests {
             Status::Running
         );
 
-        let swept = store.abandon_running_blocks_on_restart("reason");
+        let swept = store.abandon_running_blocks_on_restart("reason").unwrap();
         assert_eq!(swept, 1);
         assert_eq!(
             store.get_block_snapshot(ctx, &tool_call).unwrap().unwrap().status,
@@ -8898,7 +8911,7 @@ mod tests {
             )
             .unwrap();
 
-        let swept = store.abandon_running_blocks_on_restart("reason");
+        let swept = store.abandon_running_blocks_on_restart("reason").unwrap();
         assert_eq!(swept, 1, "the waiting block, and only it");
         assert_eq!(
             store.get_block_snapshot(ctx, &waiting).unwrap().unwrap().status,
@@ -8936,7 +8949,7 @@ mod tests {
             )
             .unwrap();
 
-        let swept = store.abandon_running_blocks_on_restart("reason");
+        let swept = store.abandon_running_blocks_on_restart("reason").unwrap();
         assert_eq!(swept, 2, "the sweep must not stop at the first context");
         assert_eq!(
             store.get_block_snapshot(ctx_a, &a).unwrap().unwrap().status,
