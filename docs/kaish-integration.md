@@ -174,7 +174,8 @@ These are source observations, not promises that all paths behave alike.
   `runtime/approval_resume.rs` owns answer delivery, claims, captured cwd/env,
   approved execution, and follow-up seeds on the same kernel worker. Startup
   installs one subscription and snapshots old answers before returning; failure
-  refuses host startup. Context validation and execution claims share one database
+  refuses host startup. Approval input capture rejects unreadable cwd/env before
+  creating an ask; the two values share one database lock. Context validation and execution claims share one database
   lock; read faults leave approvals available for retry. A spent claim cannot
   overwrite completed output after performer reassignment. Shutdown stops delivery,
   cancels preparation and running

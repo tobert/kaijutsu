@@ -429,6 +429,13 @@ one kaish script that `export`s each value through the typed-overlay path
 durable `context_env` uses and `unset`s each recorded absence, identifiers
 validated first. A failure to restore is a reason not to run.
 
+Cwd and free-variable capture share one database lock. A failed read refuses
+before recording an ask, including dry-run audit asks; it never records an
+unreadable value as unset. The hook plan reader also returns its read failure
+before running a classifier body. Interpreter-provided defaults, including
+HOME, still need an effective-environment audit; the reader currently captures
+durable exports only.
+
 **Both consumers call the same function** (Amy: the classifier "should see
 the same data"). The broker's `KJ_TOOL_PLAN` gains an additive top-level
 `env: [{name, value|null}]` beside `statements`. The lfm2d hook script does

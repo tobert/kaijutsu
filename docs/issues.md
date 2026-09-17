@@ -242,6 +242,17 @@ performer settlement's lack of a seed against already running conversations.
 Kaibo review and disposition:
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
+Approval capture now refuses cwd/env read failures before creating either normal
+or dry-run asks. Continue the effective-environment audit: `HOME` is seeded by
+EmbeddedKaish even when absent from `context_env`, but the ask reader currently
+records it as unset. `apply_ask_env` and durable-export seeding use synthetic
+`__kj_ask_env_N__` / `__kj_env_N__` overlay names that may collide with valid
+export names. Pin those collisions and actual approval-driver cwd A versus newer
+cwd B. Shared `context_cwd` still swallows read faults, and context switching
+logs cwd persistence failure then continues. Switching also swallows target cwd
+read failures and keeps the previous directory when the target no longer resolves.
+These paths need explicit error propagation before publishing a successful switch.
+
 Audit context-level outcome consumers with overlapping turns. `kj wait` checks
 aggregate liveness when polling the log but returns on the first terminal event,
 even if another accepted turn remains. Decide whether it joins one turn or an

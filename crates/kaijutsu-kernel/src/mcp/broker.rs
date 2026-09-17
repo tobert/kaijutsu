@@ -2680,10 +2680,10 @@ impl Broker {
         // `env` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): the value
         // every free `${VAR}` across every statement held in `context_env`
         // at fire time — `kj::env_snapshot::free_variable_values`, the same
-        // function `kj::gate::build_ask` calls, so this classifier sees
-        // exactly what the ask will record. `value` is `null` for a
-        // variable that was unset. Additive, top-level, sibling to
-        // `statements`.
+        // reader `kj::gate::build_ask` calls. Each phase snapshots the current
+        // durable exports independently; a later ask can see changed values.
+        // `value` is `null` for an absent export. Read failures stop the hook
+        // before execution. This top-level field is a sibling to `statements`.
         if matches!(params.tool.as_str(), "shell" | "shell_write") {
             if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
                 match kaish_kernel::ast::plan::plan_program(command) {
@@ -2771,11 +2771,13 @@ impl Broker {
                                 }
                             }
                         }
-                        let env_entries = crate::kj::env_snapshot::free_variable_values(
-                            dispatcher.kernel_db(),
-                            ctx.context_id,
-                            &statements,
-                        );
+                        let env_entries = match crate::kj::env_snapshot::free_variable_values(
+                            &dispatcher.kernel_db().lock(), ctx.context_id, &statements,
+                        ) {
+                            Ok(entries) => entries,
+                            Err(error) => return KaishHookOutcome::Escalate(format!(
+                                "could not capture shell plan inputs: {error}")),
+                        };
                         if let Some(obj) = plan_value.as_object_mut() {
                             obj.insert(
                                 "env".to_string(),

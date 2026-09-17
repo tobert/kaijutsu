@@ -266,25 +266,6 @@ fn caller_context_bytes(caller: &KjCaller) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// The caller's persisted cwd, read the same way
-/// `EmbeddedKaish::restore_cwd_from_db` reads it so an ask records the
-/// directory a human sees echoed in `kj ledger show`.
-///
-/// This goes on the `approvals` row rather than into a process-lifetime
-/// map. A DECIDED ask is never swept at boot, so it outlives the process
-/// that raised it; a pin that did not would be absent exactly when a
-/// restart separated the answer from its execution, and the approved
-/// command would run in whatever directory the context had reached by then.
-/// `docs/gate-shape-b.md`, "The cwd moves onto the ask".
-///
-/// `None` for a caller with no `context_id` — a synthetic or internal
-/// caller has no persisted cwd to protect.
-fn caller_cwd(db: &Arc<parking_lot::Mutex<KernelDb>>, caller: &KjCaller) -> Option<String> {
-    let context_id = caller.context_id?;
-    let db = db.lock();
-    db.get_context_shell(context_id).ok().flatten().and_then(|row| row.cwd)
-}
-
 /// The env snapshot's human-facing summary, appended to the ask's
 /// `description` — a per-ask column, never content-addressed. This is
 /// deliberately NOT appended to any statement's `rendered` text: unlike
@@ -315,25 +296,26 @@ fn build_ask(
     db: &Arc<parking_lot::Mutex<KernelDb>>,
     caller: &KjCaller,
     spec: &GateSpec,
-    cwd: Option<String>,
-) -> NewAsk {
-    // The values every free variable in this submission held at ask time —
-    // `Amy, 2026-09-02: snapshot the free variables' values onto the ask at
-    // ask time, restore them verbatim at execution, and show them to the
-    // reviewer in the review rendering` (docs/gate-shape-b.md). `None` for a
-    // caller with no `context_id`, same as `caller_cwd`: there is no
-    // persisted `context_env` to read.
-    let env = caller
-        .context_id
-        .map(|context_id| env_snapshot::free_variable_values(db, context_id, &spec.planned))
-        .unwrap_or_default();
+) -> Result<NewAsk, String> {
+    // Capture cwd and free variables from one durable state view. An absent
+    // value is valid; an unreadable value must refuse before recording an ask.
+    let (cwd, env) = match caller.context_id {
+        Some(context) => {
+            let db = db.lock();
+            let cwd = db.get_context_shell(context)
+                .map_err(|error| format!("could not read context_shell for {context}: {error}"))?
+                .and_then(|row| row.cwd);
+            (cwd, env_snapshot::free_variable_values(&db, context, &spec.planned)?)
+        }
+        None => (None, Vec::new()),
+    };
     let description = if env.is_empty() {
         spec.description.clone()
     } else {
         format!("{}\n\n{}", spec.description, render_env_note(&env))
     };
 
-    NewAsk {
+    Ok(NewAsk {
         context_id: caller_context_bytes(caller),
         actor_id: caller.actor_id.as_bytes().to_vec(),
         reviewer_id: Vec::new(),
@@ -398,7 +380,7 @@ fn build_ask(
             },
         ],
         signals: vec![],
-    }
+    })
 }
 
 /// Announce that the approval ledger moved, to anyone subscribed.
@@ -647,7 +629,11 @@ pub(crate) async fn run_gate(
 
     // Read before the row commits, so the directory recorded is the one the
     // ask was raised in rather than one a later `cd` moved to.
-    let mut ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
+    let mut ask = match build_ask(db, caller, &spec) {
+        Ok(ask) => ask,
+        Err(error) => return GateOutcome::unavailable_without_row(format!(
+            "approval gate could not capture command inputs: {error}")),
+    };
 
     // 3. Durable before asked — the row commits before anyone is told.
     let request_id = {
@@ -789,7 +775,13 @@ pub(crate) async fn record_dry_run_ask(
     if let Some(context) = caller.context_id {
         approval_span.record("context.id", context.to_string());
     }
-    let mut ask = build_ask(db, caller, &spec, caller_cwd(db, caller));
+    let mut ask = match build_ask(db, caller, &spec) {
+        Ok(ask) => ask,
+        Err(error) => {
+            tracing::error!("dry run could not capture command inputs: {error}");
+            return None;
+        }
+    };
     let request_id = {
         let db = db.lock();
         let context = match caller.context_id { Some(context) => context, None => { tracing::warn!("dry run ask has no context"); return None; } };
@@ -1963,12 +1955,38 @@ mod tests {
             .cwd
     }
 
+    #[tokio::test]
+    async fn unreadable_approval_inputs_refuse_without_creating_an_ask() {
+        for table in ["context_shell", "context_env"] {
+            let d = gate_dispatcher().await;
+            let context = crate::kj::test_helpers::register_rooted_context(
+                &d, Some("snapshot-fault"), kaijutsu_types::PrincipalId::new());
+            seed_cwd(&d.kernel_db, context, "/reviewed/dir");
+            d.kernel_db.lock().set_context_env(context, "FOO", "reviewed-value").unwrap();
+            let caller = caller_with_context(context);
+            d.kernel_db.lock().conn_for_ledger().execute_batch(
+                &format!("ALTER TABLE {table} RENAME TO unavailable_{table}")
+            ).unwrap();
+            let spec = || crate::kj::shell_gate::build_shell_gate_spec("echo $FOO").unwrap();
+            let outcome = run_gate(&d.kernel_db, &caller, spec(), d.kernel.ledger_flows(),
+                &crate::kj::gate_policy::no_config()).await;
+            assert_eq!(outcome.verdict, GateVerdict::Unavailable,
+                "{table}: unreadable captured inputs are not an unset value: {}", outcome.reason);
+            assert!(outcome.ask.is_none(), "no reviewer may approve guessed inputs");
+            assert!(outcome.reason.contains(table), "{}", outcome.reason);
+            assert!(record_dry_run_ask(&d.kernel_db, &caller, spec(),
+                d.kernel.ledger_flows(), "fault probe").await.is_none());
+            let count: i64 = d.kernel_db.lock().conn_for_ledger()
+                .query_row("SELECT count(*) FROM approvals", [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 0, "neither normal nor dry-run capture may record invented inputs");
+        }
+    }
+
     /// An escalating gate records its cwd on the ask row, which is where it
     /// has to live: a decided ask is never swept at boot, so it outlives the
     /// process that raised it, and a process-lifetime pin would be absent
     /// exactly when a restart separated the answer from its execution.
     ///
-    /// Falsified by passing `None` for `build_ask`'s cwd argument.
     #[tokio::test]
     async fn an_escalating_gate_records_its_cwd_on_the_ask_row() {
         let d = gate_dispatcher().await;

@@ -1833,6 +1833,14 @@ an automatic model turn can start; ordinary answers remain redeemable by their
 callers. Tests drive actual delivery with a later answer as a scan marker so an
 unfinished configuration read cannot masquerade as a successful check.
 
+The input-capture audit found the same read-error conflation before an ask existed:
+missing cwd and unreadable cwd were both `None`, while an environment read fault
+invented unset variables. Capture now reads cwd and free variables under one
+lock and refuses an unreadable snapshot before creating an ask. Dry runs follow
+the same rule. The classifier's plan reader propagates environment faults before
+executing its hook body. This fixes storage-fault capture; interpreter defaults
+and synthetic export-name collisions remain in the effective-environment audit.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

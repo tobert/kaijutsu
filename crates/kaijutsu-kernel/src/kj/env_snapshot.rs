@@ -1,40 +1,11 @@
-//! The free-variable value snapshot an ask records at ask time — computed
-//! once here so the human reviewing the ask and the lfm2d classifier
-//! reading `KJ_TOOL_PLAN` agree on what "free" means and what each free
-//! variable held.
+//! Capture durable exports referenced by a shell plan.
 //!
-//! ## The union rule
-//!
-//! A statement's free variables are `Plan::free_variables` — everything the
-//! statement reads without lexically binding. A non-literal heredoc adds
-//! more: `PlannedHeredoc::free_variables` names the variables THAT body
-//! substitutes, which `Plan::free_variables` does not repeat (heredoc
-//! expansion is a property of the redirect, not of the command's own
-//! argv — `kj::shell_gate`'s module docs). The snapshot is the union of
-//! both sets, over every statement in the submission, deduplicated in
-//! first-seen order. This function is the one place that union is taken;
-//! a reader must not re-derive "free" from `GatedStatement::vars`, which
-//! only carries the statement-level half.
-//!
-//! ## What a value comes from, and what it deliberately does not cover
-//!
-//! Both gated shell paths run on a single-use materialized shell seeded
-//! ONLY from durable state — `context_env` rows plus the cwd, with no
-//! transient scope surviving between submissions (`docs/gate-shape-b.md`).
-//! So a free variable's value at ask time is exactly its `context_env`
-//! value, or `None` when it is unset there — not an estimate of what kaish
-//! would substitute, the literal source the substitution reads.
-//!
-//! What it cannot cover: a command substitution (`$(...)`) runs a program
-//! rather than a lookup, so there is no value to snapshot ahead of
-//! execution; and the wall clock, which a statement can read (`$(date)`)
-//! but which is never a session variable in the first place. Neither
-//! shows up as a free variable name, so neither shows up here — this is
-//! a gap in what a `${VAR}` snapshot can promise, not a defect in this
-//! function.
+//! Statement and non-literal heredoc free variables form one deduplicated set.
+//! The approval description and hook plan use this reader so they apply the same
+//! rule. A missing export is recorded as unset; a storage fault returns an error.
+//! Command substitution and interpreter-provided defaults are not durable exports.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use kaijutsu_types::ContextId;
 
@@ -77,7 +48,7 @@ fn free_variable_names(statements: &[kaish_kernel::PlannedStatement]) -> Vec<Str
 
 /// The value every free variable in `statements` held at ask time, read
 /// from `context_id`'s durable `context_env` — the same source a
-/// single-use materialized shell seeds from (module docs).
+/// materialized shell reads when applying durable exports.
 ///
 /// Called from exactly two places: `kj::gate::build_ask`, so the ask
 /// records what a human is approving, and the broker's `KJ_TOOL_PLAN`
@@ -85,44 +56,29 @@ fn free_variable_names(statements: &[kaish_kernel::PlannedStatement]) -> Vec<Str
 /// call this rather than deriving their own free-variable set or reading
 /// `context_env` directly.
 ///
-/// A `context_env` read failure degrades to every free variable recording
-/// as unset rather than failing the ask — the same shape `caller_cwd`
-/// takes for a missing cwd. The snapshot is best-effort information
-/// appended to an ask that has already decided to escalate; a database
-/// fault here must not additionally block the human question the gate
-/// exists to ask.
+/// Read failures must reach the caller. An unreadable value cannot be
+/// recorded as unset or presented to a reviewer as a captured input.
 pub fn free_variable_values(
-    db: &Arc<parking_lot::Mutex<KernelDb>>,
+    db: &KernelDb,
     context_id: ContextId,
     statements: &[kaish_kernel::PlannedStatement],
-) -> Vec<AskEnvEntry> {
+) -> Result<Vec<AskEnvEntry>, String> {
     let names = free_variable_names(statements);
     if names.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let known: HashMap<String, String> = {
-        let db = db.lock();
-        match db.get_context_env(context_id) {
-            Ok(rows) => rows.into_iter().map(|row| (row.key, row.value)).collect(),
-            Err(e) => {
-                tracing::warn!(
-                    "env snapshot: could not read context_env for {}: {e} — every free \
-                     variable records as unset rather than blocking the ask",
-                    context_id.short()
-                );
-                HashMap::new()
-            }
-        }
-    };
+    let known: HashMap<String, String> = db.get_context_env(context_id)
+        .map_err(|error| format!("could not read context_env for {context_id}: {error}"))?
+        .into_iter().map(|row| (row.key, row.value)).collect();
 
-    names
+    Ok(names
         .into_iter()
         .map(|name| {
             let value = known.get(&name).cloned();
             AskEnvEntry { name, value }
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -141,7 +97,7 @@ mod tests {
     async fn no_free_variables_snapshots_nothing() {
         let d = test_dispatcher_with_timeouts(TimeoutPolicy::default()).await;
         let ctx_id = register_context(&d, Some("env-empty"), None, PrincipalId::new());
-        let entries = free_variable_values(&d.kernel_db, ctx_id, &planned("echo hi"));
+        let entries = free_variable_values(&d.kernel_db.lock(), ctx_id, &planned("echo hi")).unwrap();
         assert!(entries.is_empty());
     }
 
@@ -157,7 +113,7 @@ mod tests {
         let ctx_id = register_context(&d, Some("env-mixed"), None, PrincipalId::new());
         d.kernel_db.lock().set_context_env(ctx_id, "FOO", "bar").unwrap();
 
-        let entries = free_variable_values(&d.kernel_db, ctx_id, &planned("echo ${FOO} ${BAZ}"));
+        let entries = free_variable_values(&d.kernel_db.lock(), ctx_id, &planned("echo ${FOO} ${BAZ}")).unwrap();
         let mut by_name: HashMap<String, Option<String>> =
             entries.into_iter().map(|e| (e.name, e.value)).collect();
         assert_eq!(by_name.remove("FOO"), Some(Some("bar".to_string())));
@@ -178,7 +134,7 @@ mod tests {
         d.kernel_db.lock().set_context_env(ctx_id, "LOG", "value").unwrap();
 
         let source = "cat <<EOF\n${LOG}\nEOF\n";
-        let entries = free_variable_values(&d.kernel_db, ctx_id, &planned(source));
+        let entries = free_variable_values(&d.kernel_db.lock(), ctx_id, &planned(source)).unwrap();
         assert!(
             entries.iter().any(|e| e.name == "LOG" && e.value.as_deref() == Some("value")),
             "the heredoc's free variable must appear in the snapshot: {entries:?}"
@@ -194,7 +150,7 @@ mod tests {
         d.kernel_db.lock().set_context_env(ctx_id, "FOO", "bar").unwrap();
 
         let source = "echo ${FOO}\necho ${FOO}\n";
-        let entries = free_variable_values(&d.kernel_db, ctx_id, &planned(source));
+        let entries = free_variable_values(&d.kernel_db.lock(), ctx_id, &planned(source)).unwrap();
         assert_eq!(entries.iter().filter(|e| e.name == "FOO").count(), 1);
     }
 }
