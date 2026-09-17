@@ -30,6 +30,49 @@ use kaijutsu_types::{ConsentMode, ContextId, PrincipalId};
 use crate::runtime::interrupt::ContextInterruptState;
 use super::turn_state::{ConversationCache, TurnLease};
 
+#[derive(Debug, thiserror::Error)]
+enum StreamFailure {
+    #[error("Could not persist model output: {0}")]
+    Persistence(#[from] crate::block_store::BlockStoreError),
+    #[error("Invalid provider stream: {0}")]
+    Protocol(String),
+}
+
+#[derive(Clone, Copy)]
+enum OpenContent {
+    Thinking(kaijutsu_types::BlockId),
+    Text(kaijutsu_types::BlockId),
+}
+
+impl OpenContent {
+    fn id(self) -> kaijutsu_types::BlockId {
+        match self { Self::Thinking(id) | Self::Text(id) => id }
+    }
+}
+
+/// Check framing before accepting bytes or dispatching a provider's tool call.
+fn validate_content_event(open: Option<OpenContent>, event: &StreamEvent) -> Result<(), StreamFailure> {
+    let valid = match event {
+        StreamEvent::ThinkingDelta(_) | StreamEvent::ThinkingEnd { .. } => matches!(open, Some(OpenContent::Thinking(_))),
+        StreamEvent::TextDelta(_) | StreamEvent::TextEnd => matches!(open, Some(OpenContent::Text(_))),
+        StreamEvent::ThinkingStart | StreamEvent::TextStart | StreamEvent::ToolUse { .. }
+            | StreamEvent::InlineToolUse { .. } | StreamEvent::Done { .. } => open.is_none(),
+        StreamEvent::ToolResult { .. } => return Err(StreamFailure::Protocol("provider emitted ToolResult; only the runtime authors tool results".into())),
+        StreamEvent::Error(_) => true,
+    };
+    if valid { return Ok(()); }
+    let event_name = match event {
+        StreamEvent::ThinkingStart => "ThinkingStart", StreamEvent::ThinkingDelta(_) => "ThinkingDelta",
+        StreamEvent::ThinkingEnd { .. } => "ThinkingEnd", StreamEvent::TextStart => "TextStart",
+        StreamEvent::TextDelta(_) => "TextDelta", StreamEvent::TextEnd => "TextEnd",
+        StreamEvent::ToolUse { .. } => "ToolUse", StreamEvent::InlineToolUse { .. } => "InlineToolUse",
+        StreamEvent::ToolResult { .. } => "ToolResult", StreamEvent::Done { .. } => "Done", StreamEvent::Error(_) => "Error",
+    };
+    let state = match open { Some(OpenContent::Thinking(_)) => "an open thinking block",
+        Some(OpenContent::Text(_)) => "an open text block", None => "no open content block" };
+    Err(StreamFailure::Protocol(format!("{event_name} is invalid with {state}; providers must bracket matching content and close it before tools or Done")))
+}
+
 /// Record a startup failure after the prompt so readers see why no turn ran.
 fn insert_pre_stream_error_block(
     documents: &SharedBlockStore,
@@ -1589,12 +1632,12 @@ async fn process_llm_stream(
             reason: TurnStopReason::Cancelled { immediate: true }, origin,
         }))
     };
-    let mut write_failure = false;
+    let mut stream_failure = false;
     let outcome = outcome.map(|result| result.unwrap_or_else(|error| {
-        write_failure = true;
+        stream_failure = true;
         turn_lease.interrupt().hard();
         TurnFlow::Failed { turn_id, context_id, principal_id: user_principal_id,
-            error: format!("Could not persist model output: {error}"), origin }
+            error: error.to_string(), origin }
     }));
 
     if outcome.is_err() { turn_lease.interrupt().hard(); }
@@ -1612,7 +1655,7 @@ async fn process_llm_stream(
                     Some(format!("Model turn ended with {count} unfinished block(s); they were marked Error.")),
                 _ => None,
             };
-            let needs_diagnostic = write_failure || cleanup_error.is_some();
+            let needs_diagnostic = stream_failure || cleanup_error.is_some();
             if let Some(mut error) = cleanup_error {
                 if let TurnFlow::Failed { error: original, .. } = &event {
                     error = format!("{original}; {error}");
@@ -1687,7 +1730,7 @@ async fn run_llm_stream(
     continuation_epoch: Option<i64>,
     mailbox: &mut crate::ConversationMailbox,
     turn_lease: &TurnLease,
-) -> crate::block_store::BlockStoreResult<TurnFlow> {
+) -> Result<TurnFlow, StreamFailure> {
     let turn_id = turn_lease.id();
     if let Some(identity) = span_identity {
         let span = tracing::Span::current();
@@ -2045,7 +2088,7 @@ async fn run_llm_stream(
         };
 
         // Process stream events
-        let mut current_block_id: Option<kaijutsu_types::BlockId> = None;
+        let mut open_content: Option<OpenContent> = None;
         // Each pending invocation already has a durable call block.
         let mut tool_calls: Vec<(String, String, serde_json::Value, kaijutsu_types::BlockId)> = vec![];
         // Collect text output for conversation history
@@ -2062,7 +2105,7 @@ async fn run_llm_stream(
         let mut assistant_reasoning: Vec<(String, Option<String>)> = Vec::new();
 
         tracing::debug!("Entering stream event loop");
-        let mut stream_cancelled = false;
+        let mut cancel_deadline = None;
         // Two-layer timeout: total wall-clock cap on the entire completion,
         // and a per-chunk idle guard for providers that open the connection
         // but stop sending tokens — both the backend's own when it set them.
@@ -2071,44 +2114,27 @@ async fn run_llm_stream(
         let total_deadline =
             tokio::time::sleep(request_timeout);
         tokio::pin!(total_deadline);
-        'stream: loop {
-            // After cancel: only poll the stream (not the cancel signal) so rig
-            // can flush its pending block-close + Done events before we stop.
-            // Idle guard still applies — a hung post-cancel drain shouldn't
-            // pin the loop forever.
-            let event = if stream_cancelled {
-                match tokio::time::timeout(idle_timeout, stream.next_event()).await {
-                    Ok(Some(ev)) => ev,
-                    Ok(None) => break 'stream,
+        let received_done = 'stream: loop {
+            // Cancellation retains accepted output and may still report usage.
+            // One absolute drain deadline prevents a trickling provider from
+            // extending cancellation indefinitely.
+            let event = if let Some(deadline) = cancel_deadline {
+                match tokio::time::timeout_at(deadline, stream.next_event()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => break 'stream false,
                     Err(_) => {
-                        // Cancel-is-not-failure (flows.rs) applies here too: a
-                        // hung provider during the post-cancel drain is not a
-                        // stream error, just a confirmation that never
-                        // arrives. Constructing `StreamEvent::Error` here used
-                        // to route through the Error arm below and publish
-                        // `Failed`, overriding the `Cancelled` outcome the
-                        // player actually asked for. `stream_cancelled` is
-                        // already true, so breaking straight out of `'stream`
-                        // lets the `if stream_cancelled` check after the loop
-                        // set `Cancelled { immediate: true }` as it would for
-                        // any other confirmed hard cancel — the flush this
-                        // drain was waiting for was never going to arrive.
-                        tracing::warn!(
-                            "LLM stream idle for {:?} during post-cancel drain — hung \
-                             provider, no confirming flush; treating as a confirmed \
-                             cancel, not a failure ({})",
-                            idle_timeout, context_id
-                        );
-                        break 'stream;
+                        tracing::warn!(%context_id, "provider did not confirm cancellation before the drain deadline");
+                        break 'stream false;
                     }
                 }
             } else {
                 tokio::select! {
+                    biased;
                     _ = interrupt.cancel.cancelled() => {
                         tracing::info!("Hard interrupt: cancelling LLM stream for {}", context_id);
-                        stream.cancel();  // signals rig's AbortHandle → HTTP stream drops
-                        stream_cancelled = true;
-                        continue 'stream;  // drain one Done event for confirmation
+                        stream.cancel();
+                        cancel_deadline = Some(tokio::time::Instant::now() + idle_timeout);
+                        continue 'stream;
                     }
                     _ = &mut total_deadline => {
                         tracing::warn!(
@@ -2123,7 +2149,7 @@ async fn run_llm_stream(
                     r = tokio::time::timeout(idle_timeout, stream.next_event()) => {
                         match r {
                             Ok(Some(ev)) => ev,
-                            Ok(None) => break 'stream,
+                            Ok(None) => break 'stream false,
                             Err(_) => {
                                 tracing::warn!(
                                     "LLM stream idle for {:?} ({})",
@@ -2139,6 +2165,18 @@ async fn run_llm_stream(
                 }
             };
             tracing::debug!("Received stream event: {:?}", event);
+            if cancel_deadline.is_some() {
+                match &event {
+                    StreamEvent::Done { .. } => {},
+                    StreamEvent::Error(error) => {
+                        tracing::debug!(%context_id, %error, "provider stopped during cancellation");
+                        break 'stream false;
+                    }
+                    _ => continue 'stream,
+                }
+            } else {
+                validate_content_event(open_content, &event)?;
+            }
             match event {
                 StreamEvent::ThinkingStart => {
                     // Open a fresh reasoning entry for this block (its deltas
@@ -2157,59 +2195,28 @@ async fn run_llm_stream(
                     )?;
                     turn_lease.track_block(block_id);
                     last_block_id = block_id;
-                    current_block_id = Some(block_id);
+                    open_content = Some(OpenContent::Thinking(block_id));
                 }
 
                 StreamEvent::ThinkingDelta(text) => {
-                    // Keep each reasoning block separate for the next request;
-                    // its signature verifies precisely these provider bytes.
-                    match assistant_reasoning.last_mut() {
-                        Some((t, _)) => t.push_str(&text),
-                        None => assistant_reasoning.push((text.clone(), None)),
-                    }
-                    if let Some(ref block_id) = current_block_id {
-                        documents.append_text_as(context_id, block_id, &text, Some(actor_principal))?;
-                    }
+                    let block_id = open_content.expect("validated thinking delta").id();
+                    documents.append_text_as(context_id, &block_id, &text, Some(actor_principal))?;
+                    assistant_reasoning.last_mut().expect("ThinkingStart opened reasoning").0.push_str(&text);
                 }
 
                 StreamEvent::ThinkingEnd { signature } => {
-                    // Stamp this block's verifier (Anthropic's `signature_delta`,
-                    // surfaced via ThinkingEnd) onto its own reasoning entry — a
-                    // later turn echoes each thinking block back unmodified with
-                    // its matching signature. `None` when the provider doesn't
-                    // emit one.
-                    if let Some(sig) = signature
-                        && !sig.is_empty()
-                    {
-                        if let Some((_, slot)) = assistant_reasoning.last_mut() {
-                            *slot = Some(sig.clone());
-                        }
-                        // Persist the token on the Thinking block so a later
-                        // fork / cold-start / attach can rehydrate the reasoning
-                        // (the hydrator only rehydrates signed Thinking blocks).
-                        // A failed write must stop the turn: the next hydration
-                        // needs the same reasoning and verifier as this call.
-                        if let Some(ref block_id) = current_block_id {
-                            documents.set_signature(context_id, block_id, Some(sig.clone()))?;
-                        }
+                    let block_id = open_content.take().expect("validated thinking end").id();
+                    // Hydration needs the same bytes and verifier as this call.
+                    if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+                        documents.set_signature(context_id, &block_id, Some(signature.clone()))?;
+                        assistant_reasoning.last_mut().expect("ThinkingStart opened reasoning").1 = Some(signature);
                     }
-                    if let Some(ref block_id) = current_block_id {
-                        // Compute and persist the extractive summary BEFORE
-                        // the status flips to Done, so any client reacting
-                        // to the completion (the tui's stub line included)
-                        // already holds it (docs/issues.md, "Thinking folds
-                        // to a summary line once the player has moved on").
-                        // Display only — never fed to the model.
-                        if let Some(summary) = assistant_reasoning
-                            .last()
-                            .and_then(|(text, _)| summarize_thinking(text))
-                            && let Err(e) = documents.set_summary(context_id, block_id, summary)
-                        {
-                            tracing::warn!("Failed to persist thinking summary: {}", e);
-                        }
-                        documents.set_status(context_id, block_id, Status::Done)?;
+                    // Display-only summary precedes the completion status.
+                    if let Some(summary) = assistant_reasoning.last().and_then(|(text, _)| summarize_thinking(text))
+                        && let Err(error) = documents.set_summary(context_id, &block_id, summary) {
+                        tracing::warn!(%error, "Failed to persist thinking summary");
                     }
-                    current_block_id = None;
+                    documents.set_status(context_id, &block_id, Status::Done)?;
                 }
 
                 StreamEvent::TextStart => {
@@ -2226,7 +2233,7 @@ async fn run_llm_stream(
                     )?;
                     turn_lease.track_block(block_id);
                     last_block_id = block_id;
-                    current_block_id = Some(block_id);
+                    open_content = Some(OpenContent::Text(block_id));
                     // This is the turn's model-text output. A later text
                     // block in the same turn supersedes it — Completed
                     // carries the LAST one, the model's final say.
@@ -2234,19 +2241,14 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::TextDelta(text) => {
-                    // Collect text for conversation history
+                    let block_id = open_content.expect("validated text delta").id();
+                    documents.append_text_as(context_id, &block_id, &text, Some(actor_principal))?;
                     assistant_text.push_str(&text);
-
-                    if let Some(ref block_id) = current_block_id {
-                        documents.append_text_as(context_id, block_id, &text, Some(actor_principal))?;
-                    }
                 }
 
                 StreamEvent::TextEnd => {
-                    if let Some(ref block_id) = current_block_id {
-                        documents.set_status(context_id, block_id, Status::Done)?;
-                    }
-                    current_block_id = None;
+                    let block_id = open_content.take().expect("validated text end").id();
+                    documents.set_status(context_id, &block_id, Status::Done)?;
                 }
 
                 StreamEvent::ToolUse { id, name, input } => {
@@ -2258,19 +2260,6 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::InlineToolUse { id, name, input } => {
-                    // A bidirectional agent runtime (currently Codex's
-                    // `item/tool/call`) cannot continue its live turn until
-                    // this callback receives a result.  It must arrive at a
-                    // content boundary; still close a malformed open block
-                    // defensively so it never stays stuck Running.
-                    if let Some(block_id) = current_block_id.take() {
-                        tracing::warn!(
-                            "inline tool {} arrived with an open content block; closing it defensively",
-                            id
-                        );
-                        documents.set_status(context_id, &block_id, Status::Done)?;
-                    }
-
                     let result = dispatch_inline_tool_result(
                         &documents,
                         context_id,
@@ -2320,8 +2309,7 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::ToolResult { .. } => {
-                    // This shouldn't happen during streaming - tool results are generated by us
-                    tracing::warn!("Unexpected ToolResult event during streaming");
+                    unreachable!("provider results are rejected by content validation");
                 }
 
                 StreamEvent::Done {
@@ -2460,27 +2448,9 @@ async fn run_llm_stream(
                         }
                     }
 
-                    if stream_cancelled {
-                        // Hard interrupt confirmation: rig flushed its buffer cleanly.
-                        // stop_reason is None on cancel (vs "end_turn"/"tool_use" normally).
-                        tracing::info!(
-                            "LLM stream cancelled: tokens_in={:?}, tokens_out={:?}",
-                            input_tokens,
-                            output_tokens
-                        );
-                        // Role::System (not Model): this is a kernel-authored
-                        // marker about the turn, not something the model said.
-                        // Hydration's role filter already drops (System, Text)
-                        // outright (llm/hydrate.rs), but `set_ephemeral` is
-                        // added too — the established pattern for an
-                        // out-of-band notice elsewhere in this file (the
-                        // staging-mode warning above) — so the block also
-                        // reads as a machine record to any future UI/hydration
-                        // consumer, not just today's role check. Previously
-                        // this landed as (Role::Model, BlockKind::Text), which
-                        // hydration folds straight into assistant_text: the
-                        // next turn, the model would read its own prior turn
-                        // as having said "⛔ Interrupted" verbatim.
+                    if cancel_deadline.is_some() {
+                        // Usage may arrive during cancellation, but its notice
+                        // is a kernel fact and must not hydrate as model text.
                         let _ = documents
                             .insert_block_as(
                                 context_id,
@@ -2494,27 +2464,11 @@ async fn run_llm_stream(
                                 Some(PrincipalId::system()),
                             )
                             .and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
-                        // Exit the agentic loop; cleanup runs below.
-                        break;
+                        break 'stream true;
                     }
-                    // Carry the provider's terminal stop reason into the turn
-                    // outcome. Anthropic says `max_tokens`, the OpenAI-compatible
-                    // providers say `length`; both mean the model was cut off at
-                    // the output ceiling, which ACP reports as `max_tokens` and a
-                    // frontend renders very differently from a clean end of turn.
-                    // Reassigned (not or-ed) on every Done so a truncated *middle*
-                    // iteration doesn't mislabel a turn that later ends cleanly;
-                    // the cancel/cap breaks below overwrite it in turn.
-                    //
-                    // `refusal` and `stop_sequence` both fall through to the
-                    // `_` arm below and render as a clean `EndTurn` — the wire
-                    // has no dedicated stop reason for either yet (adding one
-                    // is a capnp change, and capnp is owned by a parallel
-                    // lane right now). The minimal fix here is to at least
-                    // log each distinctly rather than let them silently blend
-                    // into "the model finished normally" — `refusal` in
-                    // particular means the model declined to answer, which is
-                    // operationally worth a `warn`, not a `debug`.
+                    // Preserve truncation. Each completion replaces the previous
+                    // iteration's reason; refusal and stop_sequence use EndTurn
+                    // until the public stop-reason type distinguishes them.
                     match stop_reason.as_deref() {
                         Some("refusal") => {
                             tracing::warn!(
@@ -2542,6 +2496,7 @@ async fn run_llm_stream(
                         input_tokens,
                         output_tokens
                     );
+                    break 'stream true;
                 }
 
                 StreamEvent::Error(err) => {
@@ -2570,14 +2525,13 @@ async fn run_llm_stream(
                     });
                 }
             }
+        };
+        if !received_done && cancel_deadline.is_none() {
+            return Err(StreamFailure::Protocol("stream ended before Done".into()));
         }
 
-        // After a hard interrupt, break the agentic loop immediately. This is a
-        // *cancellation*, not a failure: the turn ended exactly where a player
-        // told it to, so it publishes `Completed { reason: Cancelled {
-        // immediate: true } }` rather than the old bare-string `Failed`. The
-        // `immediate` flag tells the score handoff that its output is a fragment.
-        if stream_cancelled {
+        // Hard cancellation ends with a retained fragment, never a score delivery.
+        if cancel_deadline.is_some() {
             stop_reason_out = TurnStopReason::Cancelled { immediate: true };
             break;
         }
@@ -2814,6 +2768,143 @@ mod publish_tests {
         .await;
 
         (documents, ctx, player)
+    }
+
+    #[tokio::test]
+    async fn provider_framing_rejects_missing_or_mismatched_content_boundaries() {
+        let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
+        let tool = || StreamEvent::ToolUse { id: "unrun".into(), name: "missing_tool".into(), input: serde_json::json!({}) };
+        let cases = vec![
+            ("text delta without start", vec![StreamEvent::TextDelta("unframed bytes".into()), done()]),
+            ("thinking delta without start", vec![StreamEvent::ThinkingDelta("unframed bytes".into()), done()]),
+            ("text end without start", vec![StreamEvent::TextEnd, done()]),
+            ("thinking end without start", vec![StreamEvent::ThinkingEnd { signature: Some("orphan signature".into()) }, done()]),
+            ("text in thinking", vec![StreamEvent::ThinkingStart, StreamEvent::TextDelta("wrong-kind bytes".into()), StreamEvent::ThinkingEnd { signature: None }, done()]),
+            ("thinking in text", vec![StreamEvent::TextStart, StreamEvent::ThinkingDelta("wrong-kind bytes".into()), StreamEvent::TextEnd, done()]),
+            ("text end during thinking", vec![StreamEvent::ThinkingStart, StreamEvent::TextEnd, done()]),
+            ("thinking end during text", vec![StreamEvent::TextStart, StreamEvent::ThinkingEnd { signature: Some("wrong signature".into()) }, done()]),
+            ("nested start", vec![StreamEvent::TextStart, StreamEvent::ThinkingStart, StreamEvent::ThinkingEnd { signature: None }, done()]),
+            ("tool inside text", vec![StreamEvent::TextStart, tool(), StreamEvent::TextEnd, done()]),
+            ("inline tool inside text", vec![StreamEvent::TextStart, StreamEvent::InlineToolUse { id: "unrun".into(), name: "missing_tool".into(), input: serde_json::json!({}) }, done()]),
+            ("provider result", vec![StreamEvent::ToolResult { tool_use_id: "invented".into(), content: "invented result".into(), is_error: false }, done()]),
+            ("done inside text", vec![StreamEvent::TextStart, StreamEvent::TextDelta("partial".into()), done()]),
+            ("empty EOF", vec![]),
+            ("closed content EOF", vec![StreamEvent::TextStart, StreamEvent::TextDelta("retained".into()), StreamEvent::TextEnd]),
+            ("pending tool EOF", vec![tool()]),
+        ];
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            for (case, events) in cases {
+                let kernel = Arc::new(Kernel::new_ephemeral("provider-framing").await);
+                let mut terminal = kernel.turn_flows().subscribe("turn.*");
+                let provider = Provider::Mock(MockClient::new("").with_scripted_stream(vec![events]));
+                let (documents, ctx, _) = drive_turn_with(TurnOrigin::Interactive, kernel, provider, |_| {}).await;
+                let event = terminal.try_recv().expect("one terminal event").payload;
+                let TurnFlow::Failed { error, .. } = event else { panic!("{case}: {event:?}") };
+                assert!(error.starts_with("Invalid provider stream:"), "{case}: {error}");
+                assert!(terminal.try_recv().is_none());
+                let blocks = documents.block_snapshots(ctx).unwrap();
+                assert!(!blocks.iter().any(|b| b.status == Status::Running));
+                assert!(!blocks.iter().any(|b| b.content.contains("wrong-kind bytes") || b.content.contains("unframed bytes")));
+                assert!(!blocks.iter().any(|b| b.kind == BlockKind::ToolResult), "{case}: malformed stream must not dispatch tools");
+                assert!(!blocks.iter().any(|b| b.kind == BlockKind::Text && b.signature.is_some()));
+            }
+        }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_framing_done_ends_the_stream_without_waiting_for_eof() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            for trailing in [false, true] {
+                let kernel = Arc::new(Kernel::new_ephemeral("terminal-framing").await);
+                let mut terminal = kernel.turn_flows().subscribe("turn.*");
+                let mut events = vec![StreamEvent::TextStart, StreamEvent::TextDelta("accepted output".into()), StreamEvent::TextEnd,
+                    StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None }];
+                if trailing { events.extend([StreamEvent::TextStart, StreamEvent::TextDelta("after terminal".into()), StreamEvent::TextEnd]); }
+                let provider = Provider::Mock(MockClient::new("").with_scripted_stream(vec![events]).hangs_when_exhausted());
+                let (documents, ctx, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
+                    drive_turn_with(TurnOrigin::Interactive, kernel, provider, |_| {})).await.expect("Done is terminal; no EOF wait");
+                let event = terminal.try_recv().unwrap().payload;
+                let TurnFlow::Completed { output_block_id: Some(output), .. } = event else { panic!("{event:?}") };
+                assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().content, "accepted output");
+                assert!(!documents.block_snapshots(ctx).unwrap().iter().any(|b| b.content == "after terminal"));
+                assert!(terminal.try_recv().is_none());
+            }
+        }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_framing_cancel_drain_has_one_deadline_and_preserves_accepted_prefix() {
+        use std::time::Duration;
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("cancel-framing").await.with_timeouts(kaijutsu_types::TimeoutPolicy {
+                llm_idle_timeout: Duration::from_millis(40), ..Default::default()
+            }));
+            let mut terminal = kernel.turn_flows().subscribe("turn.*");
+            let mut events = vec![StreamEvent::TextStart, StreamEvent::TextDelta("accepted prefix".into())];
+            events.extend((0..100).map(|_| StreamEvent::TextDelta("after cancel".into())));
+            let provider = Provider::Mock(MockClient::new("").with_scripted_stream(vec![events])
+                .with_event_delay(Duration::from_millis(10)).hangs_when_exhausted());
+            let (documents, ctx, _) = tokio::time::timeout(Duration::from_millis(100),
+                drive_turn_with(TurnOrigin::Interactive, kernel, provider, |interrupt| {
+                    let interrupt = interrupt.clone();
+                    tokio::task::spawn_local(async move {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        interrupt.hard();
+                    });
+                })).await.expect("trickling events must not extend cancellation");
+            let event = terminal.try_recv().unwrap().payload;
+            assert!(matches!(event, TurnFlow::Completed { reason: TurnStopReason::Cancelled { immediate: true }, .. }));
+            let blocks = documents.block_snapshots(ctx).unwrap();
+            let partial = blocks.iter().find(|block| block.role == Role::Model && block.kind == BlockKind::Text).unwrap();
+            assert_eq!(partial.content, "accepted prefix");
+            assert_eq!(partial.status, Status::Error);
+            assert!(terminal.try_recv().is_none());
+        }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_framing_requested_cancel_wins_over_a_ready_terminal() {
+        use std::time::Duration;
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            for ending in ["error", "eof", "done"] {
+                for _ in 0..16 {
+                    let kernel = Arc::new(Kernel::new_ephemeral("cancel-terminal-race").await.with_timeouts(kaijutsu_types::TimeoutPolicy {
+                        llm_idle_timeout: Duration::from_millis(40), ..Default::default()
+                    }));
+                    let mut terminal = kernel.turn_flows().subscribe("turn.*");
+                    let mut events = vec![StreamEvent::TextStart, StreamEvent::TextDelta("accepted prefix".into())];
+                    match ending {
+                        "error" => events.push(StreamEvent::Error("transport stopped".into())),
+                        "done" => events.push(StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None }),
+                        _ => {},
+                    }
+                    let provider = Provider::Mock(MockClient::new("").with_scripted_stream(vec![events]).with_event_delay(Duration::from_millis(10)));
+                    let interrupt = Arc::new(parking_lot::Mutex::new(None));
+                    let armed = interrupt.clone();
+                    let mut turn = Box::pin(drive_turn_with(TurnOrigin::Interactive, kernel, provider,
+                        move |state| *armed.lock() = Some(state.clone())));
+                    // Poll through the accepted prefix, then make the provider's
+                    // terminal and cancellation ready before polling either.
+                    for _ in 0..3 {
+                        assert!(futures::poll!(turn.as_mut()).is_pending());
+                        tokio::time::advance(Duration::from_millis(10)).await;
+                    }
+                    interrupt.lock().as_ref().unwrap().hard();
+                    let (documents, ctx, _) = turn.await;
+                    let event = terminal.try_recv().unwrap().payload;
+                    assert!(matches!(event, TurnFlow::Completed { reason: TurnStopReason::Cancelled { immediate: true }, .. }), "{ending}: {event:?}");
+                    let blocks = documents.block_snapshots(ctx).unwrap();
+                    let partial = blocks.iter().find(|block| block.role == Role::Model && block.kind == BlockKind::Text).unwrap();
+                    assert_eq!(partial.content, "accepted prefix");
+                    assert_eq!(partial.status, Status::Error);
+                    assert!(terminal.try_recv().is_none());
+                }
+            }
+        }).await;
     }
 
     #[tokio::test]
@@ -5854,14 +5945,14 @@ mod lifetime_tests {
     #[tokio::test]
     async fn interrupted_stream_settles_only_the_blocks_owned_by_its_turn() {
         use super::super::turn_request::TurnRequest;
-        for ending in ["panic", "error", "eof", "cancel"] {
+        for (ending, thinking) in ["panic", "error", "eof", "cancel"].into_iter().flat_map(|ending| [false, true].map(|thinking| (ending, thinking))) {
+            let partial = if thinking { "unfinished thought" } else { "unfinished text" };
             let mut events = vec![
                 StreamEvent::TextStart, StreamEvent::TextDelta("finished text".into()), StreamEvent::TextEnd,
-                StreamEvent::ThinkingStart, StreamEvent::ThinkingDelta("unfinished thought".into()),
                 StreamEvent::ToolUse { id: "not-run".into(), name: "missing_tool".into(), input: serde_json::json!({}) },
-                StreamEvent::TextStart, StreamEvent::TextDelta("unfinished text".into()),
             ];
-            if ending == "eof" { events.retain(|event| !matches!(event, StreamEvent::ToolUse { .. })); }
+            events.extend(if thinking { [StreamEvent::ThinkingStart, StreamEvent::ThinkingDelta(partial.into())] }
+                else { [StreamEvent::TextStart, StreamEvent::TextDelta(partial.into())] });
             if ending == "error" { events.push(StreamEvent::Error("provider broke".into())); }
             let mock = MockClient::new("").with_scripted_stream(vec![events]);
             let mock = match ending {
@@ -5882,7 +5973,7 @@ mod lifetime_tests {
             if ending == "cancel" {
                 tokio::time::timeout(Duration::from_secs(3), async {
                     loop {
-                        if kernel.blocks().block_snapshots(context).unwrap().iter().any(|b| b.content == "unfinished text") { break; }
+                        if kernel.blocks().block_snapshots(context).unwrap().iter().any(|b| b.content == partial) { break; }
                         tokio::task::yield_now().await;
                     }
                 }).await.unwrap();
@@ -5898,7 +5989,7 @@ mod lifetime_tests {
             let blocks = kernel.blocks().block_snapshots(context).unwrap();
             let unfinished: Vec<_> = blocks.iter().filter(|b| ["unfinished thought", "unfinished text"].contains(&b.content.as_str())
                 || b.tool_use_id.as_deref() == Some("not-run")).collect();
-            assert_eq!(unfinished.len(), if ending == "eof" { 2 } else { 3 }, "{ending}: missing partial output");
+            assert_eq!(unfinished.len(), 2, "{ending}: missing partial output");
             for block in unfinished {
                 assert_eq!(block.status, Status::Error, "{ending}: orphan {}", block.id);
             }

@@ -2000,6 +2000,20 @@ Replay, fault injection, sibling cancellation and an actual SSH read pin these
 contracts. The approval-link and receipt ownership transfer remain separate
 work; this does not turn an accepted ask into completed execution.
 
+Provider framing is now enforced at the model-turn writer: a delta/end must
+match its open text/thinking block, and starts, tools and Done require a content
+boundary. Unframed deltas had disappeared while reporting Completed; even a
+valid Done kept waiting for EOF. The writer now fails incomplete EOF and stops
+at Done, so a complete-looking score without terminal confirmation cannot
+commit. Cancellation preserves the accepted prefix and may drain usage under
+one absolute deadline. A controlled trickling provider proved that resetting
+an idle timeout for each drained event could otherwise extend cancellation
+indefinitely. The SSH timing scenario now includes closed text followed by EOF
+and verifies the declared fallback at its admitted tick. A separate race test
+made cancellation and a provider terminal ready together: the unbiased select
+could report a transport error instead of the requested cancellation. The
+stream select now gives the hard cancel priority over ready provider output.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

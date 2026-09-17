@@ -89,6 +89,7 @@ pub struct MockClient {
     /// timeout fires on virtual-clock auto-advance instead of real wall time.
     hangs_when_exhausted: bool,
     panics_when_exhausted: bool,
+    event_delay: std::time::Duration,
     /// Directory a per-model script set was loaded from (`with_script_dir`),
     /// kept only so a missing-model panic can name the expected path.
     script_dir: Option<std::path::PathBuf>,
@@ -124,6 +125,7 @@ impl MockClient {
             scripted: None,
             hangs_when_exhausted: false,
             panics_when_exhausted: false,
+            event_delay: std::time::Duration::ZERO,
             script_dir: None,
             script_by_model: None,
         }
@@ -154,6 +156,12 @@ impl MockClient {
     /// events are exhausted — see the `hangs_when_exhausted` field doc.
     pub fn hangs_when_exhausted(mut self) -> Self {
         self.hangs_when_exhausted = true;
+        self
+    }
+
+    /// Delay every event to exercise cancellation while a provider trickles output.
+    pub fn with_event_delay(mut self, delay: std::time::Duration) -> Self {
+        self.event_delay = delay;
         self
     }
 
@@ -1017,6 +1025,7 @@ impl Provider {
                     events: std::collections::VecDeque::from(events),
                     hangs_when_exhausted: mock.hangs_when_exhausted,
                     panics_when_exhausted: mock.panics_when_exhausted,
+                    event_delay: mock.event_delay,
                 }))
             }
         }
@@ -1061,6 +1070,7 @@ pub struct MockStream {
     events: std::collections::VecDeque<StreamEvent>,
     hangs_when_exhausted: bool,
     panics_when_exhausted: bool,
+    event_delay: std::time::Duration,
 }
 
 impl ProviderStream {
@@ -1072,11 +1082,14 @@ impl ProviderStream {
             Self::OpenAi(s) => s.next_event().await,
             Self::Codex(s) => s.client.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(state) => match state.events.pop_front() {
-                Some(ev) => Some(ev),
-                None if state.panics_when_exhausted => panic!("mock stream panic after scripted events"),
-                None if state.hangs_when_exhausted => std::future::pending().await,
-                None => None,
+            Self::Mock(state) => {
+                if !state.event_delay.is_zero() { tokio::time::sleep(state.event_delay).await; }
+                match state.events.pop_front() {
+                    Some(ev) => Some(ev),
+                    None if state.panics_when_exhausted => panic!("mock stream panic after scripted events"),
+                    None if state.hangs_when_exhausted => std::future::pending().await,
+                    None => None,
+                }
             },
         }
     }

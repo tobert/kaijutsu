@@ -374,7 +374,7 @@ fn overlapping_drives_keep_their_admission_ids_through_cancellation() {
 fn timed_drives_keep_admission_targets_through_the_client() {
     run_local(async {
         use kaijutsu_hyoushigi::{Disposition, FallbackReason, TickDelta, WorkId, WorkStatus};
-        use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider}};
+        use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider, stream::StreamEvent}};
         use kaijutsu_server::beat::BeatScheduler;
         use kaijutsu_types::{Tick, TrackId, TurnId};
         let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
@@ -403,12 +403,14 @@ fn timed_drives_keep_admission_targets_through_the_client() {
         scheduler.play(&track, base);
         let abc = "X:1\nK:C\nCDEF|\n";
         let mut beat = 0u64;
-        for case in ["good", "stale", "missed", "malformed", "untimed"] {
+        for case in ["good", "stale", "missed", "malformed", "closed_eof", "untimed"] {
             {
                 let mut registry = server.kernel.llm().write().await;
-                registry.register("mock", std::sync::Arc::new(Provider::Mock(MockClient::new(
-                    if case == "malformed" { "not music" } else { abc }
-                ))));
+                let mock = if case == "closed_eof" {
+                    MockClient::new("").with_scripted_stream(vec![vec![StreamEvent::TextStart,
+                        StreamEvent::TextDelta(abc.into()), StreamEvent::TextEnd]])
+                } else { MockClient::new(if case == "malformed" { "not music" } else { abc }) };
+                registry.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
                 assert!(registry.set_default("mock"));
                 registry.set_default_model("mock-model");
             }
@@ -443,12 +445,18 @@ fn timed_drives_keep_admission_targets_through_the_client() {
             match recv_turn_event(&mut events, context).await {
                 ServerEvent::TurnCompleted { turn_id, stop_reason, output_block_id, .. } => {
                     assert_eq!(turn_id, turn);
+                    assert_ne!(case, "closed_eof", "missing terminal confirmation cannot complete");
                     if case == "missed" {
                         assert_eq!(stop_reason, TurnCompletedStopReason::CancelledImmediate);
                         assert!(output_block_id.is_none());
                     } else { assert!(output_block_id.is_some()); }
                 }
-                other => panic!("expected a completed controlled turn: {other:?}"),
+                ServerEvent::TurnFailed { turn_id, error, .. } if case == "closed_eof" => {
+                    assert_eq!(turn_id, turn);
+                    assert!(error.starts_with("Invalid provider stream:"));
+                    assert!(error.contains("before Done"));
+                }
+                other => panic!("unexpected controlled turn outcome for {case}: {other:?}"),
             }
             if case == "stale" { server.documents.set_excluded(context, &seed, true).unwrap(); }
             while timeline.lock().playhead() < intended + TickDelta::new(1) {
@@ -470,7 +478,7 @@ fn timed_drives_keep_admission_targets_through_the_client() {
                     let expected = match case {
                         "stale" => FallbackReason::InvalidBasis,
                         "missed" => FallbackReason::DeadlineMissed,
-                        "malformed" => FallbackReason::ResolveFailed,
+                        "malformed" | "closed_eof" => FallbackReason::ResolveFailed,
                         _ => unreachable!(),
                     };
                     assert!(matches!(&row.disposition, Some(Disposition::Fallback { reason, .. }) if *reason == expected), "{row:?}");

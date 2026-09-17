@@ -1398,30 +1398,7 @@ a fork and teaches nothing the first copy didn't. Fix has to keep the
 standalone-error path (when the parent's tool result already flushed) and
 skip only the duplicate — a judgment call, not mechanical.
 
-## Model stream write errors and receipt setup ownership
-
-Turn leases now track their own opened blocks and fail remaining Running ones
-before terminal publication on provider errors, incomplete EOF, cancellation
-and panic. A panic also interrupts the turn's tool calls. Completed blocks,
-Waiting approvals and unrelated writers remain untouched; see
-`docs/kaish-integration.md`. The original live orphan cleanup issue is closed.
-
-Text/thinking insert, append, signature and completion-status failures now stop
-streaming and publish Failed after owned-block cleanup. The thinking summary
-is display metadata; its pre-mutation rejection remains a warning. Fault
-injection covers each required write and the optional summary separately.
-
-Ordinary and inline calls now share result creation, projection and settlement.
-A result is accepted Running before execution; failed creation stops dispatch.
-Content, styles, error flag and both pair statuses commit together, and a
-persistence fault cancels and joins sibling tool results before turn failure.
-Cleanup sets a failed result's error flag too. The client and hydration see the
-same error outcome. Required error-child insertion also propagates failure.
-
-Malformed event framing still needs validation: a delta with no open content
-block currently updates the in-call message without any durable append; one
-current block slot can accept text into a thinking block. Required content
-must survive hydration unchanged.
+## Receipt setup ownership and remaining result flags
 
 `pending_shell_operation_receipt` records Waiting before receipt registration
 and ask linkage finish. A failure there can leave a Waiting pair without its

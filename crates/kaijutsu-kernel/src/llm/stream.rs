@@ -1,7 +1,7 @@
 //! Streaming primitives for LLM responses.
 //!
 //! Provider-agnostic types that flow from per-provider `Client::stream()`
-//! into the kernel block writer in `kaijutsu-server`. Each per-provider
+//! into the model-turn writer in `kaijutsu-kernel`. Each per-provider
 //! client (`super::claude`, `super::openai`, `super::deepseek`) owns
 //! translation from kaijutsu's `Message` / `ContentBlock` into the
 //! provider's native wire shape and emits the events below.
@@ -15,7 +15,7 @@
 //!          ▼                      ▼
 //!          ┌──────────────────────────────────┐
 //!          │       StreamEvent (this file)    │
-//!          │   (kernel block writer in server)  │
+//!          │   (kernel model-turn writer)      │
 //!          └──────────────────────────────────┘
 //! ```
 
@@ -29,14 +29,18 @@ use super::config::SlotTunables;
 /// Lifecycle (within a single completion):
 ///
 /// 1. `ThinkingStart` → `ThinkingDelta(_)*` → `ThinkingEnd` (extended thinking)
-/// 2. `TextStart` → `TextDelta(_)*` → `TextEnd` (interleavable with thinking)
+/// 2. `TextStart` → `TextDelta(_)*` → `TextEnd` (runs may alternate with thinking)
 /// 3. `ToolUse { … }` (zero or more, atomic once emitted), or
 ///    `InlineToolUse { … }` followed by a provider callback result
 /// 4. `Done { … }` or `Error(_)` — terminal
 ///
 /// The kernel block writer relies on `*Start` / `*End` bracketing each
 /// text/thinking run — provider implementations must close the current
-/// block before opening another or before emitting a tool call.
+/// block before opening another, emitting a tool call, or sending `Done`.
+/// Deltas and ends must match the open content kind. The writer rejects
+/// malformed framing and EOF before a terminal event; `Done` ends consumption
+/// immediately. Hard cancellation retains the accepted prefix and may drain
+/// terminal usage without accepting further content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamEvent {
     /// Start of an extended-thinking block (reasoning before responding).
@@ -117,8 +121,7 @@ pub enum StreamEvent {
         extra: Option<UsageExtra>,
     },
 
-    /// Error during generation. Carries a human-readable string; Phase 2
-    /// will switch to a typed [`StreamError`] variant.
+    /// Generation failed. The detail describes the provider or transport error.
     Error(String),
 }
 
