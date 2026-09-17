@@ -82,6 +82,25 @@ pub enum BlockStoreError {
 /// Result type alias for BlockStore operations.
 pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 
+/// A complete tool-result publication. Shell fields are absent for a model
+/// tool result whose content already carries its response envelope.
+pub(crate) struct ToolResultUpdate<'a> {
+    pub content: &'a str,
+    pub status: Status,
+    pub is_error: bool,
+    pub author: PrincipalId,
+    pub ansi: Option<(Vec<kaijutsu_types::StyleSpan>, &'a [u8])>,
+    pub shell: Option<ShellResultFields>,
+}
+
+pub(crate) struct ShellResultFields {
+    pub stderr: Option<String>,
+    pub output: Option<kaijutsu_types::OutputData>,
+    pub content_type: ContentType,
+    pub exit_code: Option<i32>,
+    pub ephemeral: bool,
+}
+
 /// Text captured for shell submission, tied to one draft revision. This is
 /// process-local: it is neither a persisted receipt nor a wire credential.
 pub struct DraftSubmission {
@@ -1506,13 +1525,28 @@ impl BlockStore {
     pub(crate) fn settle_tool_result_as(
         &self, context_id: ContextId, call: &BlockId, result: &BlockId,
         content: &str, status: Status, is_error: bool, author: PrincipalId,
-        styles: Option<(Vec<kaijutsu_types::StyleSpan>, kaijutsu_types::ProvenanceTag)>,
-        ask: Option<&str>,
+        ansi: Option<(Vec<kaijutsu_types::StyleSpan>, &[u8])>, ask: Option<&str>,
     ) -> BlockStoreResult<()> {
         let ask = if status == Status::Waiting {
-            if self.journaling_db()?.is_none() { return Err(BlockStoreError::NoDatabaseConfigured); }
             Some(ask.ok_or_else(|| BlockStoreError::Validation("waiting tool result has no ask".into()))?)
         } else { None };
+        self.settle_tool_result_recorded(context_id, call, result,
+            ToolResultUpdate { content, status, is_error, author, ansi, shell: None }, |db| {
+                if let Some(ask) = ask { db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?; }
+                Ok(())
+            })
+    }
+
+    /// Publish the complete pair projection and its related execution state in
+    /// one journal transaction. ANSI original bytes commit with their tag.
+    /// Requires the kernel journal; client replicas do not author settlements.
+    pub(crate) fn settle_tool_result_recorded(
+        &self, context_id: ContextId, call: &BlockId, result: &BlockId,
+        update: ToolResultUpdate<'_>,
+        record: impl FnOnce(&KernelDb) -> crate::kernel_db::KernelDbResult<()>,
+    ) -> BlockStoreResult<()> {
+        if self.journaling_db()?.is_none() { return Err(BlockStoreError::NoDatabaseConfigured); }
+        let ToolResultUpdate { content, status, is_error, author, ansi, shell } = update;
         let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         self.accept_locked_recorded(context_id, &mut entry, None, |entry| {
             let command = entry.doc.get_block_header(call).ok_or_else(|| BlockStoreError::Validation("tool call is missing".into()))?;
@@ -1521,10 +1555,21 @@ impl BlockStore {
                 || output.tool_call_id.as_ref() != Some(call) {
                 return Err(BlockStoreError::Validation("tool result does not belong to the supplied call".into()));
             }
+            let styled = ansi.is_some() || !output.style_spans.is_empty() || output.provenance.is_some();
+            let shell_metadata = shell.is_some();
             entry.doc.set_principal_id(author);
             entry.doc.edit_text(result, 0, content, output.content.chars().count())?;
-            if let Some((spans, tag)) = &styles {
-                entry.doc.set_style_spans(result, spans.clone(), Some(tag.clone()))?;
+            let (spans, tag) = match &ansi {
+                Some((spans, _)) => (spans.clone(), Some(kaijutsu_ansi::provenance_tag())),
+                None => (Vec::new(), None),
+            };
+            entry.doc.set_style_spans(result, spans.clone(), tag.clone())?;
+            if let Some(fields) = shell {
+                entry.doc.set_stderr(result, fields.stderr)?;
+                entry.doc.set_output(result, fields.output)?;
+                entry.doc.set_content_type(result, fields.content_type)?;
+                entry.doc.set_exit_code(result, fields.exit_code)?;
+                for id in [call, result] { entry.doc.set_ephemeral(id, fields.ephemeral)?; }
             }
             entry.doc.set_tool_result_state(result, status, is_error)?;
             entry.doc.set_status(call, status)?;
@@ -1537,17 +1582,20 @@ impl BlockStore {
             let mut events = vec![
                 BlockFlow::TextReplaced { context_id, block_id: *result, content: Arc::from(content), version, source: OpSource::Local },
                 BlockFlow::MetadataChanged { context_id, block_id: *result, metadata, version, source: OpSource::Local },
-                BlockFlow::StatusChanged { context_id, block_id: *result, status, version, source: OpSource::Local },
-                BlockFlow::StatusChanged { context_id, block_id: *call, status, version, source: OpSource::Local },
             ];
-            if let Some((style_spans, tag)) = styles {
-                events.insert(1, BlockFlow::SpansChanged { context_id, block_id: *result, style_spans,
-                    provenance: Some(tag), version, source: OpSource::Local });
-            }
+            if styled { events.insert(1, BlockFlow::SpansChanged { context_id, block_id: *result, style_spans: spans,
+                provenance: tag, version, source: OpSource::Local }); }
+            if shell_metadata { events.push(BlockFlow::MetadataChanged { context_id, block_id: *call,
+                metadata: entry.doc.get_block_snapshot(call).expect("accepted call remains under this guard").metadata(),
+                version, source: OpSource::Local }); }
+            for id in [result, call] { events.push(BlockFlow::StatusChanged { context_id, block_id: *id,
+                status, version, source: OpSource::Local }); }
             Ok((payload, events, ()))
         }, |db, ()| {
-            if let Some(ask) = ask { db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?; }
-            Ok(())
+            if let Some((_, original)) = ansi {
+                db.insert_block_provenance(result, kaijutsu_ansi::TRANSFORM_NAME, kaijutsu_ansi::PARSER_VERSION, original)?;
+            }
+            record(db)
         })
     }
 
@@ -6167,7 +6215,7 @@ mod tests {
         assert_eq!(store.get_block_snapshot(context, &result).unwrap().unwrap().content, "");
         let raw = "\x1b[31m失敗\x1b[0m";
         let projection = crate::ansi_ingest::project(raw.as_bytes()).unwrap();
-        let styles = crate::ansi_ingest::prepare_metadata(&store, &result, projection.spans, raw.as_bytes());
+        let styles = Some((projection.spans, raw.as_bytes()));
         store.settle_tool_result_as(context, &call, &result, &projection.text, Status::Error, true,
             PrincipalId::system(), styles, None).unwrap();
         let accepted: Vec<_> = std::iter::from_fn(|| events.try_recv()).map(|event| event.payload).collect();

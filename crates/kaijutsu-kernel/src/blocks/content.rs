@@ -608,9 +608,9 @@ impl BlockContent {
     /// boundaries). A span that fails this could not have come from
     /// projecting this block's own content, so it returns
     /// `StyleSpanOutOfRange` and leaves the block untouched rather than
-    /// silently clearing `edited_since_ingest` over a lie. It does not panic:
-    /// the ingest path above degrades a block to unstyled-but-correct rather
-    /// than failing a command over styling metadata (`ansi_ingest::record`).
+    /// silently clearing `edited_since_ingest` over an invalid projection.
+    /// Command and model result settlement treats this as a required write;
+    /// rc diagnostic ingestion reports the failure through `ansi_ingest::record`.
     pub fn set_style_spans(
         &mut self,
         spans: Vec<kaijutsu_types::StyleSpan>,

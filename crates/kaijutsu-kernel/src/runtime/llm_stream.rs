@@ -1321,8 +1321,7 @@ async fn dispatch_recorded_tool_result(
         Some(env) => env.with_clean_output(block_content).to_value().to_string(),
         None => block_content.to_owned(),
     };
-    let styles = ansi.as_ref().and_then(|projection|
-        crate::ansi_ingest::prepare_metadata(documents, &result, projection.spans.clone(), source.as_bytes()));
+    let styles = ansi.as_ref().map(|projection| (projection.spans.clone(), source.as_bytes()));
     documents.settle_tool_result_as(context_id, &call, &result, block_content,
         settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
     let anchor = if let Some(payload) = payload {
@@ -2602,9 +2601,7 @@ mod publish_tests {
         arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
         rejected_write: usize,
     ) -> (SharedBlockStore, ContextId, PrincipalId) {
-        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
-        let documents: SharedBlockStore =
-            Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let documents = kernel.blocks().clone();
         let ctx = ContextId::new();
         documents
             .create_document(ctx, DocumentKind::Conversation, None)
@@ -2629,7 +2626,7 @@ mod publish_tests {
         documents.arm_accept_fault(rejected_write);
 
         let provider = Arc::new(provider);
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let kernel_db = kernel.kernel_db().clone();
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new();
         arm_interrupt(&interrupt);
@@ -4104,8 +4101,7 @@ mod usage_tests {
     //!    auto-compaction (`kj/compact.rs`, removed along with its only call
     //!    site in `spawn_llm_for_prompt`).
     use super::*;
-    use crate::block_store::{BlockStore, DocumentKind};
-    use crate::flows::{FlowBus, SharedBlockFlowBus};
+    use crate::block_store::DocumentKind;
     use crate::kernel_db::KernelDb;
     use crate::llm::{
         ClaudeUsageExtra, MockClient, OpenAiCompatUsageExtra, Provider, UsageExtra,
@@ -4149,9 +4145,7 @@ mod usage_tests {
         PrincipalId,
         Arc<parking_lot::Mutex<KernelDb>>,
     ) {
-        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
-        let documents: SharedBlockStore =
-            Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let documents = kernel.blocks().clone();
         let ctx = ContextId::new();
         documents
             .create_document(ctx, DocumentKind::Conversation, None)
@@ -4195,27 +4189,10 @@ mod usage_tests {
             .unwrap();
 
         let provider = Arc::new(provider);
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
-        // `set_context_usage` FK-references `contexts.context_id`, which
-        // FK-references `documents.document_id` — both rows must exist
-        // before a usage write will stick. Production always creates them
-        // at `kj context create`/fork time, well before any LLM call; this
-        // test harness talks to `documents` (the kernel block store) directly
-        // and never goes through that path, so it must seed the same two
-        // rows by hand.
+        let kernel_db = kernel.kernel_db().clone();
+        // The journal created the document; usage also needs its context row.
         {
             let db = kernel_db.lock();
-            let ws_id = db.get_or_create_default_workspace(player).unwrap();
-            db.insert_document(&crate::kernel_db::DocumentRow {
-                document_id: ctx,
-                workspace_id: ws_id,
-                doc_kind: kaijutsu_types::DocKind::Conversation,
-                language: None,
-                path: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-                created_by: player,
-            })
-            .unwrap();
             db.insert_context(&crate::ContextRow {
                 context_id: ctx,
                 label: None,
@@ -4818,9 +4795,7 @@ mod error_child_anchor_tests {
     //! agentic turn through `process_llm_stream` end to end and pins
     //! document order across the whole loop, not just the anchor variable.
     use super::*;
-    use crate::block_store::{BlockStore, DocumentKind};
-    use crate::flows::{FlowBus, SharedBlockFlowBus};
-    use crate::kernel_db::KernelDb;
+    use crate::block_store::DocumentKind;
     use crate::llm::{MockClient, Provider};
     use kaijutsu_types::SessionId;
 
@@ -4831,8 +4806,7 @@ mod error_child_anchor_tests {
     /// same shape as `publish_tests::drive_turn_with` and
     /// `usage_tests::drive_turn_with`.
     async fn drive_turn_with(provider: Provider, kernel: Arc<Kernel>) -> (SharedBlockStore, ContextId) {
-        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
-        let documents: SharedBlockStore = Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let documents = kernel.blocks().clone();
         let ctx = ContextId::new();
         documents
             .create_document(ctx, DocumentKind::Conversation, None)
@@ -4854,7 +4828,7 @@ mod error_child_anchor_tests {
             .unwrap();
 
         let provider = Arc::new(provider);
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let kernel_db = kernel.kernel_db().clone();
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new();
         let tool_ctx = crate::ExecContext::new(
@@ -4986,9 +4960,7 @@ mod authorship_tests {
     //!   category — regression coverage against a `None` author or a block
     //!   landing with an unrelated principal;
     use super::*;
-    use crate::block_store::{BlockStore, DocumentKind};
-    use crate::flows::{FlowBus, SharedBlockFlowBus};
-    use crate::kernel_db::KernelDb;
+    use crate::block_store::DocumentKind;
     use crate::llm::{MockClient, Provider};
     use kaijutsu_types::SessionId;
 
@@ -5002,8 +4974,7 @@ mod authorship_tests {
     /// then a second iteration's final text closes the turn. Returns the
     /// documents store so the caller can inspect every block's author.
     async fn drive_turn_with_tool_call(kernel: Arc<Kernel>) -> (SharedBlockStore, ContextId, PrincipalId, PrincipalId) {
-        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
-        let documents: SharedBlockStore = Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let documents = kernel.blocks().clone();
         let ctx = ContextId::new();
         documents
             .create_document(ctx, DocumentKind::Conversation, None)
@@ -5060,7 +5031,7 @@ mod authorship_tests {
             ],
         )));
 
-        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let kernel_db = kernel.kernel_db().clone();
         let conversation_cache = Arc::new(ConversationCache::new(8));
         let interrupt = ContextInterruptState::new();
         let tool_ctx = crate::ExecContext::new(

@@ -109,44 +109,31 @@ kj block reproject <block-id>    # run the CURRENT parser over the original;
                                  # re-emit spans as a normal sequenced edit
 ```
 
-**Ingestion ordering**: the provenance row is written *before* the tag that
-references it, so durable state never claims an original that was not
-stored — not atomic with the text/spans commit (see "Reality checks" below
-for why). Streaming starts with buffer-until-done for the provenance bytes
-(text still commits per flush); upgrade to append-per-flush only if
-crash-loss of provenance ever bites.
+**Ingestion ordering.** Command and model tool results commit clean text,
+spans, original bytes, both block statuses and related execution state in one
+block-journal transaction. A failed transaction preserves the prior projection.
+An error after commit, such as compaction failure, requires restart to recover
+the accepted state before serving that document again.
+Terminal command outcomes are retained first so startup can finish projection
+without repeating execution. Replacing styled output with plain text clears
+its spans and tag.
 
-**Reality checks from the build (2026-08-19).** Three findings from reading
-the actual ingest paths, now load-bearing:
+Rc diagnostics still call `record` after writing clean text. This best-effort
+path stores the original before attaching the tag, but does not commit all
+three together. Its failure policy remains in the rc lifecycle audit.
 
-- **Shell output arrives at a whole-program boundary.** kaish's
-  `ExecuteOptions` has no output sink; `ExecResult` returns one buffer. Both
-  `foreground: true` and asynchronous completion use that result. The latter
-  settles its separate output block after the complete kaish program ends;
-  neither path streams chunks into a block. Read `result.out`
-  (`OutputPayload`) directly; `text_out()` is already lossy on the `Bytes`
-  arm.
+**Current ingest paths.**
+
+- **Shell blocks receive complete results.** Foreground and asynchronous
+  commands settle the returned `ExecResult` once. Live job streams are separate
+  observations; they do not append chunks into the final output block.
 - **kaish truncates upstream** (head+tail spill, Agent profile 8 KB), so shell
-  provenance is *post-cap* bytes — "what kaish handed us" is the honest
-  original.
-- **`journal_op` is not a transaction today** (two autocommit statements
-  under a mutex). The provenance row is therefore its own statement at the
-  hook site: a crash between leaves a detectable gap (tag without row —
-  `kj block original` fails gracefully, the CI invariant skips with a
-  warning), never corruption. Making journal_op transactional is a
-  pre-existing issue, tracked separately.
-
-**Three more, from wiring the hooks (2026-08-19).**
-
-- **One policy function, six sites.** `kaijutsu-kernel/src/ansi_ingest.rs` owns
-  the whole decision: `project(raw) -> Option<AnsiProjection>` (a single
-  `memchr` for "no escape bytes" — the common case allocates nothing, sets no
-  tag, writes no row) and `record(...)`, which writes the **provenance row
-  before the tag** so durable state never claims an original that was not
-  stored. Every hook site is three lines: project, write the clean text where
-  the raw text went, record. `raw_stdout(&ExecResult)` is the matching
-  accessor for kaish results — `text_out()` is lossy on the `Bytes` arm and is
-  never the provenance source.
+  provenance is post-cap bytes: what kaish handed the caller.
+- **One projection policy.** `ansi_ingest::project(raw)` returns clean text
+  and spans when a transform is needed. The no-escape fast path allocates
+  nothing. Transactional tool settlement stores the original with that
+  projection; rc uses `record`. `raw_stdout(&ExecResult)` reads the original
+  payload bytes because `text_out()` is lossy on the `Bytes` arm.
 - **One completed result has one projection.** An asynchronous operation does
   not interleave stdout and stderr chunks into its output block. Project the
   returned result once before settling that block, so span offsets describe the

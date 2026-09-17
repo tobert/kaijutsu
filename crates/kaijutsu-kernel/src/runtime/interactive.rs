@@ -117,12 +117,8 @@ async fn prepare(
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
             outcome.apply_hook(verdict);
             settlement_started = true;
-            command::settle_outcome(kernel, context, &command, &output, &outcome)?;
+            command::settle_outcome(kernel, context, &command, &output, &outcome, Some(crate::PairOwner::Session))?;
             if let Some(refusal) = outcome.refusal() {
-                if let Some(ask) = refusal.ask_id() {
-                    kernel.kernel_db().lock().link_ask_blocks(ask, &command, &output, crate::PairOwner::Session)
-                        .map_err(|e| e.to_string())?;
-                }
                 submission.refusal = Some(refusal.clone());
             } else if let Some(CommandHookEffect::Refused { reason, .. }) = &outcome.hook {
                 return Err(reason.clone());
@@ -148,7 +144,7 @@ async fn prepare(
             if !settlement_started {
                 let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
                 outcome.settlement_error = Some(reason.into());
-                if let Err(error) = command::settle_outcome(kernel, context, &command, &output, &outcome) {
+                if let Err(error) = command::settle_outcome(kernel, context, &command, &output, &outcome, None) {
                     tracing::error!("could not settle interactive preparation failure: {error}");
                 }
             }
@@ -195,6 +191,60 @@ mod tests {
             self.release.notified().await;
             assert!(!self.panic, "interactive pre-call panic sentinel");
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_waiting_projection_and_ask_link_commit_together() {
+        for fail_link in [false, true] {
+            let (dispatcher, mut identity) = fixture().await;
+            identity.reviewer = Some(crate::kj::test_helpers::test_reviewer_principal());
+            let kernel = dispatcher.kernel();
+            let context = identity.context;
+            kernel.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: identity.performer, name: "atomic-session-actor".into(), created_at: 0,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            kernel.kernel_db().lock().update_context_review(context, Some(identity.performer), identity.reviewer).unwrap();
+            kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
+                id: HookId("pending-session".into()), match_instance: None, match_tool: None,
+                match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::Ask(crate::mcp::AskSpec { description: Some("pending session command".into()) }),
+            });
+            if fail_link {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                    "CREATE TRIGGER reject_session_link BEFORE UPDATE OF command_block_id ON approvals BEGIN SELECT RAISE(FAIL, 'injected session link fault'); END;"
+                ).unwrap();
+            }
+            let result = prepare(kernel, identity, ShellSource::Code("echo never-run".into()), true, &CancellationToken::new()).await;
+            let db = kernel.kernel_db().clone();
+            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
+            restored.load_from_db().unwrap();
+            let operations = kernel.shell_operations().list_for_context(context).unwrap();
+            assert_eq!(operations.len(), 1);
+            let receipt = &operations[0].receipt;
+            let output = restored.get_block_snapshot(context, &receipt.output_block_id).unwrap().unwrap();
+            let row = approval_ledger::ask::list_pending(kernel.kernel_db().lock().conn_for_ledger()).unwrap()
+                .into_iter().find(|row| row.context_id == context.as_bytes()).expect("PreCall must leave its ask");
+            let request = &row.request_id;
+            if fail_link {
+                assert!(matches!(result, Err(ref error) if error.contains("injected session link fault")));
+                assert_eq!(output.status, Status::Running, "a failed link cannot publish Waiting");
+                assert_eq!(output.content, "");
+                assert!(output.stderr.is_none());
+                assert!(receipt.ask_id.is_none());
+                assert!(row.command_block_id.is_none() && row.output_block_id.is_none());
+            } else {
+                let (submission, execution) = result.unwrap();
+                assert!(execution.is_none());
+                assert_eq!(submission.refusal.unwrap().ask_id(), Some(request.as_str()));
+                assert_eq!(output.status, Status::Waiting);
+                assert_eq!(receipt.ask_id.as_deref(), Some(request.as_str()));
+                assert_eq!(row.command_block_id, Some(receipt.command_block_id.to_key()));
+                assert_eq!(row.output_block_id, Some(receipt.output_block_id.to_key()));
+                assert_eq!(row.pair_owner, Some(crate::PairOwner::Session));
+            }
         }
     }
 

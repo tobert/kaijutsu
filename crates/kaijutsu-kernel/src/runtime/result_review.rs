@@ -76,7 +76,7 @@ impl CommandResultReview {
 
     pub(super) fn settle(&self, outcome: &CommandOutcome) -> Result<(), String> {
         match self.pair {
-            Some((command, output)) => super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, outcome),
+            Some((command, output)) => super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, outcome, None),
             None => self.kernel.shell_operations().finish_result_review(&self.review_id, outcome),
         }
     }
@@ -116,7 +116,7 @@ impl CommandResultReview {
             operation.as_ref().map(|operation| operation.receipt.operation_id.as_str()), &self.call, &waiting)
             .map_err(McpError::Protocol)?;
         if let Some((command, output)) = self.pair {
-            super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, &waiting)
+            super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, &waiting, None)
                 .map_err(McpError::Protocol)?;
         }
         if let Some(notices) = &self.notices {

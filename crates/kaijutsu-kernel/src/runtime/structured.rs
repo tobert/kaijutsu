@@ -121,11 +121,7 @@ async fn run_kj(
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
             outcome.apply_hook(verdict);
             if let Some((command, output)) = pair {
-                command::settle_outcome(kernel, context, &command, &output, &outcome)?;
-                if let Some(ask) = outcome.refusal().and_then(|refusal| refusal.ask_id()) {
-                    kernel.kernel_db().lock().link_ask_blocks(ask, &command, &output, crate::PairOwner::Session)
-                        .map_err(|e| e.to_string())?;
-                }
+                command::settle_outcome(kernel, context, &command, &output, &outcome, Some(crate::PairOwner::Session))?;
             }
             outcome
         }
@@ -151,7 +147,7 @@ fn settle_unrun(
     if let Some((command, output)) = pair {
         let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
         outcome.settlement_error = Some(reason.into());
-        command::settle_outcome(kernel, context, &command, &output, &outcome)?;
+        command::settle_outcome(kernel, context, &command, &output, &outcome, None)?;
     }
     Ok(())
 }

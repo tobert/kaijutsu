@@ -1,41 +1,16 @@
-//! The `ansi-strip` ingest policy — one decision for all callers.
+//! Project ANSI output into clean text while retaining its original bytes.
 //!
-//! Terminal output reaches kaijutsu through a handful of narrow doors
-//! (interactive shell stdout, `kj` capture, model tool results, rc/hook script
-//! traces, background processes). Every one of them used to write whatever
-//! bytes arrived straight into a block. `docs/ansi-and-beyond.md` says what
-//! should happen instead: **strip to a projection, keep the original**.
+//! `project` returns `None` without allocation when no transform is needed.
+//! Command and model-tool settlement commit clean text, spans, provenance,
+//! and related execution state in one block-journal transaction. A failed
+//! transaction leaves the prior result intact and reports the storage error.
 //!
-//! ```text
-//! raw bytes ──> project() ──┬─ None  : no escape bytes, write the text as-is
-//!                           └─ Some : clean text goes where the raw text went,
-//!                                     then record() lands spans + provenance
-//! ```
+//! Rc diagnostic blocks still use `record` after writing clean text. That
+//! separate, best-effort path stores original bytes before attaching a tag;
+//! it does not provide atomic replacement of an existing projection.
 //!
-//! - **The fast path must stay free.** The overwhelming majority of shell
-//!   output has no `ESC` in it at all. [`project`] answers that case with a
-//!   single `memchr` (`<[u8]>::contains` specializes to `memchr` for `u8`) and
-//!   allocates nothing, sets no tag, writes no provenance row. A block with no
-//!   escape bytes is byte-identical to what it was before this feature.
-//! - **A tag whose original equals its content teaches nobody anything.**
-//!   Escape bytes present but the projection byte-identical (a lone `ESC`
-//!   that survived to `finish` with no other effect) gets the no-op
-//!   treatment too — [`is_noop_projection`], used by the projection.
-//! - **A tagged block always has a row.** Hook sites call [`record`], which
-//!   writes the provenance row *before* the tag, so a crash in between leaves
-//!   an orphan row (invisible, harmless) rather than a tag pointing at bytes
-//!   nobody kept. `journal_op` is not transactional today
-//!   (docs/ansi-and-beyond.md "Reality checks"), so this ordering is the
-//!   guarantee, not a transaction.
-//! - **Spans land after the text.** `BlockContent::edit_text` *clears*
-//!   `style_spans` (char-addressed edit vs byte-addressed spans — see
-//!   `blocks/content.rs`), so a hook that set spans before writing the text
-//!   would silently lose them. End-appends keep spans, but every site here
-//!   still orders text-then-spans so the rule needs no per-site reasoning.
-//!
-//! The transform never touches `edit_text_as`/`append_text_as` in general —
-//! LLM token streams flow through those, and stripping model prose would be a
-//! bug. Hooks are per-site, always.
+//! General text edits and model token streams are not ANSI ingest sites.
+//! See `docs/ansi-and-beyond.md`.
 
 use std::borrow::Cow;
 
@@ -65,8 +40,9 @@ pub struct AnsiProjection {
 /// would have gone, set no spans, write no provenance row, leave the block
 /// tag-free. That is the common case and it costs one `memchr`.
 ///
-/// `Some` means the block is a projection of something else, and the caller
-/// owes it a [`record`] call after the clean text is in place.
+/// `Some` means the block is a projection of something else. Tool settlement
+/// commits its text, spans and original bytes together; other consumers call
+/// [`record`] after writing the clean text.
 ///
 /// The second guard — escape bytes present, but the projection is
 /// byte-identical with no spans — is the pathological leftover (a lone ESC
@@ -115,24 +91,16 @@ pub fn record(
     spans: Vec<StyleSpan>,
     original: &[u8],
 ) {
-    let Some((spans, tag)) = prepare_metadata(blocks, block_id, spans, original) else { return; };
+    if let Err(e) = blocks.store_provenance(block_id, TRANSFORM_NAME, PARSER_VERSION, original) {
+        tracing::warn!(error = %e, block = %block_id,
+            "ansi-strip: could not store provenance; leaving the block untagged and unstyled");
+        return;
+    }
+    let tag = kaijutsu_ansi::provenance_tag();
     if let Err(e) = blocks.set_style_spans(context_id, block_id, spans, Some(tag)) {
         tracing::warn!(error = %e, block = %block_id,
             "ansi-strip: could not set style spans; the provenance row is an orphan (harmless)");
     }
-}
-
-/// Store original bytes before accepting a projection tag. A caller can then
-/// commit the text and styling together without publishing an empty original.
-pub(crate) fn prepare_metadata(
-    blocks: &BlockStore, block_id: &BlockId, spans: Vec<StyleSpan>, original: &[u8],
-) -> Option<(Vec<StyleSpan>, kaijutsu_types::ProvenanceTag)> {
-    if let Err(e) = blocks.store_provenance(block_id, TRANSFORM_NAME, PARSER_VERSION, original) {
-        tracing::warn!(error = %e, block = %block_id,
-            "ansi-strip: could not store provenance; leaving the block untagged and unstyled");
-        return None;
-    }
-    Some((spans, kaijutsu_ansi::provenance_tag()))
 }
 
 /// The raw stdout bytes of a kaish result, without a lossy detour.

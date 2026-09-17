@@ -275,8 +275,13 @@ impl ShellOperationRegistry {
         Ok(receipt)
     }
 
-    pub fn mark_waiting(&self, id: &str, ask: &str) -> OperationResult<()> {
-        let changed = self.db.lock().conn_for_ledger().execute(
+    #[cfg(test)]
+    pub(crate) fn mark_waiting(&self, id: &str, ask: &str) -> OperationResult<()> {
+        Self::mark_waiting_in(&self.db.lock(), id, ask)
+    }
+
+    pub(crate) fn mark_waiting_in(db: &KernelDb, id: &str, ask: &str) -> OperationResult<()> {
+        let changed = db.conn_for_ledger().execute(
             "UPDATE shell_operations SET ask_id=?2 WHERE operation_id=?1
              AND completed_at IS NULL AND (ask_id IS NULL OR ask_id=?2)",
             rusqlite::params![id, ask],
@@ -482,8 +487,10 @@ impl ShellOperationRegistry {
             [id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         if !completed { return Err(format!("shell operation {id} has not committed its receipt")); }
-        conn.execute("DELETE FROM shell_operation_projections WHERE operation_id=?1", [id])
-            .map(|_| ()).map_err(|e| e.to_string())
+        conn.execute("DELETE FROM shell_operation_projections WHERE operation_id=?1", [id]).map_err(|e| e.to_string())?;
+        drop(db);
+        self.jobs.lock().remove(id);
+        Ok(())
     }
 
     /// Commit the public result against its immutable execution record.
@@ -494,15 +501,29 @@ impl ShellOperationRegistry {
         self.complete_record(id, envelope, Some(outcome))
     }
 
-    fn complete_record(&self, id: &str, mut envelope: ShellEnvelope, outcome: Option<&CommandOutcome>) -> OperationResult<bool> {
+    /// Commit in the block journal's transaction without locking the registry
+    /// again. The projection owner retires the live job after publication.
+    pub(crate) fn complete_outcome_in(db: &KernelDb, id: &str, output: &BlockId, outcome: &CommandOutcome) -> OperationResult<bool> {
+        let mut envelope = outcome.envelope();
+        envelope.block_id = Some(output.to_key());
+        Self::complete_record_in(db, id, envelope, Some(outcome))
+    }
+
+    fn complete_record(&self, id: &str, envelope: ShellEnvelope, outcome: Option<&CommandOutcome>) -> OperationResult<bool> {
+        let changed = Self::complete_record_in(&self.db.lock(), id, envelope, outcome)?;
+        self.jobs.lock().remove(id);
+        Ok(changed)
+    }
+
+    fn complete_record_in(db: &KernelDb, id: &str, mut envelope: ShellEnvelope, outcome: Option<&CommandOutcome>) -> OperationResult<bool> {
         if matches!(envelope.status, ShellStatus::Running | ShellStatus::Waiting) {
             return Err("cannot complete a shell operation with a nonterminal receipt".into());
         }
         envelope.operation_id = Some(id.to_owned());
         let json = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
         let outcome_json = outcome.map(serde_json::to_string).transpose().map_err(|e| e.to_string())?;
-        let db = self.db.lock();
-        let conn = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
+        let conn = db.conn_for_ledger();
+        let tx = if conn.is_autocommit() { Some(conn.unchecked_transaction().map_err(|e| e.to_string())?) } else { None };
         let changed = conn.execute(
             "UPDATE shell_operations SET completed_at=?2,envelope_json=?3
              WHERE operation_id=?1 AND completed_at IS NULL",
@@ -535,8 +556,7 @@ impl ShellOperationRegistry {
             ).map_err(|e| e.to_string())?;
             if prepared { return Err(format!("shell operation {id} has a retained outcome; refusing to replace it")); }
         }
-        conn.commit().map_err(|e| e.to_string())?;
-        self.jobs.lock().remove(id);
+        if let Some(tx) = tx { tx.commit().map_err(|e| e.to_string())?; }
         Ok(changed == 1)
     }
 

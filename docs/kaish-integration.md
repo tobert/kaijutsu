@@ -117,9 +117,10 @@ These are source observations, not promises that all paths behave alike.
 - `runtime/command_outcome.rs` retains raw execution, a hook replacement or
   refusal, elapsed time, and shell-state write failures. Interactive and approved
   commands project blocks, receipts, and jobs from it; block reconstruction is
-  deleted. Terminal outcomes are retained before projection; receipts commit
-  against that record before terminal block publication. Startup finishes pending
-  projections without executing code or hooks. Raw records are read separately
+  deleted. Terminal outcomes are retained before projection. Stdout, stderr,
+  structured output, content type, exit, ephemeral flags, ANSI spans/original
+  bytes, both statuses and the receipt commit in one block-journal transaction.
+  Startup finishes pending projections without executing code or hooks. Raw records are read separately
   from ordinary receipt polls, so a poll does not duplicate captured output.
   Approval resumes that need a new pair use the same atomic pair/receipt/ask
   setup. Their command retains the model role and performer author; the receipt
@@ -132,7 +133,9 @@ These are source observations, not promises that all paths behave alike.
   receipt commit together. A non-executable ask only links its pair. Links
   preserve their context, performer and owner; another pair cannot replace
   them. Original execution asks remain usable for receipt lookup when a later
-  result-review ask becomes current.
+  result-review ask becomes current. Session pre-call settlement includes its
+  ask link and Waiting receipt in the same acceptance; a failed link publishes
+  no partial result.
 - `runtime/interactive.rs` admits shell submissions, constructs the addressed
   context's shell, authors the pair/receipt, and applies PreCall on the kernel
   worker. Accepted work survives RPC teardown. Runtime consumes the captured

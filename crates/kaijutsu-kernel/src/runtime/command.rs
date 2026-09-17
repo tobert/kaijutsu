@@ -81,69 +81,72 @@ impl Default for CommandRunOptions<'_> {
     }
 }
 
-/// Retain the outcome before projection and commit its receipt before terminal
-/// block publication. Failed projections keep their recovery marker and return
-/// an error; startup finishes them without executing the command again.
+/// Retain the outcome, then commit its complete block projection and receipt
+/// together. A pre-call ask supplies its pair owner so linkage joins that
+/// acceptance; result-review asks already have an owner. Failed projections
+/// retain their recovery marker; startup finishes them without execution.
 pub fn settle_outcome(
     kernel: &Kernel,
     context_id: ContextId,
     command_block_id: &BlockId,
     output_block_id: &BlockId,
     outcome: &CommandOutcome,
+    ask_owner: Option<crate::PairOwner>,
 ) -> Result<(), String> {
     let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
     if operation.as_ref().is_some_and(|operation| operation.receipt.command_block_id != *command_block_id) {
         return Err("shell operation command block does not match its receipt".into());
     }
     let status = outcome.block_status();
+    let envelope = outcome.envelope();
+    if status == Status::Waiting && envelope.ask_id.is_none() {
+        return Err("waiting command outcome has no ask".into());
+    }
+    if ask_owner.is_some() && envelope.ask_id.is_some() && operation.is_none() {
+        return Err("shell approval settlement requires an execution receipt".into());
+    }
     if let Some(operation) = &operation
         && status != Status::Waiting
     {
         kernel.shell_operations().prepare_settlement(&operation.receipt.operation_id, outcome)?;
     }
     let documents = kernel.blocks();
-    let envelope = outcome.envelope();
     let raw = match (&outcome.hook, &outcome.execution) {
         (None, CommandExecution::Completed(result)) => crate::ansi_ingest::raw_stdout(result),
         _ => std::borrow::Cow::Borrowed(envelope.stdout.as_bytes()),
     };
     let projection = crate::ansi_ingest::project(&raw);
     let text = projection.as_ref().map_or(envelope.stdout.as_str(), |p| p.text.as_str());
-    documents.replace_text_as(context_id, output_block_id, text, Some(PrincipalId::system()))
-        .map_err(|e| e.to_string())?;
-    if let Some(projection) = projection {
-        crate::ansi_ingest::record(documents, context_id, output_block_id, projection.spans, &raw);
-    }
+    let ansi = projection.as_ref().map(|p| (p.spans.clone(), raw.as_ref()));
     let mut stderr = envelope.stderr.clone();
     if let Some(error) = &envelope.error {
         if !stderr.is_empty() && !stderr.ends_with('\n') { stderr.push('\n'); }
         stderr.push_str(error);
     }
-    documents.set_stderr(context_id, output_block_id, if stderr.is_empty() { None } else { Some(stderr) })
-        .map_err(|e| e.to_string())?;
-    documents.set_output(context_id, output_block_id, outcome.output_data().as_ref())
-        .map_err(|e| e.to_string())?;
-    documents.set_content_type(context_id, output_block_id,
-        envelope.content_type.as_deref().map_or(ContentType::Plain, ContentType::from_mime))
-        .map_err(|e| e.to_string())?;
-    documents.set_exit_code(context_id, output_block_id,
-        envelope.exit_code.map(|code| code.clamp(i32::MIN as i64, i32::MAX as i64) as i32))
-        .map_err(|e| e.to_string())?;
-    for block in [command_block_id, output_block_id] {
-        documents.set_ephemeral(context_id, block, envelope.ephemeral.unwrap_or(false))
-            .map_err(|e| e.to_string())?;
-    }
-    if let Some(operation) = &operation {
-        if status == Status::Waiting {
-            let ask = envelope.ask_id.as_deref().ok_or("waiting command outcome has no ask")?;
-            kernel.shell_operations().mark_waiting(&operation.receipt.operation_id, ask)?;
-        } else {
-            kernel.shell_operations().complete_outcome(&operation.receipt.operation_id, output_block_id, outcome)?;
-        }
-    }
-    for block in [output_block_id, command_block_id] {
-        documents.set_status(context_id, block, status).map_err(|e| e.to_string())?;
-    }
+    let fields = crate::block_store::ShellResultFields {
+        stderr: if stderr.is_empty() { None } else { Some(stderr) },
+        output: outcome.output_data(),
+        content_type: envelope.content_type.as_deref().map_or(ContentType::Plain, ContentType::from_mime),
+        exit_code: envelope.exit_code.map(|code| code.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+        ephemeral: envelope.ephemeral.unwrap_or(false),
+    };
+    documents.settle_tool_result_recorded(context_id, command_block_id, output_block_id,
+        crate::block_store::ToolResultUpdate { content: text, status, is_error: status == Status::Error,
+            author: PrincipalId::system(), ansi, shell: Some(fields) }, |db| {
+            if let (Some(owner), Some(ask)) = (ask_owner, envelope.ask_id.as_deref()) {
+                db.link_ask_blocks(ask, command_block_id, output_block_id, owner)?;
+            }
+            if let Some(operation) = &operation {
+                let id = &operation.receipt.operation_id;
+                let result = if status == Status::Waiting {
+                    crate::shell_operations::ShellOperationRegistry::mark_waiting_in(db, id, envelope.ask_id.as_deref().expect("validated waiting ask"))
+                } else {
+                    crate::shell_operations::ShellOperationRegistry::complete_outcome_in(db, id, output_block_id, outcome).map(|_| ())
+                };
+                result.map_err(crate::kernel_db::KernelDbError::Validation)?;
+            }
+            Ok(())
+        }).map_err(|e| e.to_string())?;
     if let Some(operation) = &operation
         && status != Status::Waiting
     {
@@ -175,7 +178,7 @@ pub(crate) fn recover_settlements(kernel: &Kernel) -> Result<usize, String> {
             }
             kernel.shell_operations().finish_projection(&receipt.operation_id)?;
         } else {
-            settle_outcome(kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome)?;
+            settle_outcome(kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome, None)?;
         }
     }
     Ok(pending.len())
@@ -239,7 +242,7 @@ pub async fn run_into_blocks(
                 let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
                 outcome.settlement_error = Some(error);
                 let failure = outcome.exec_result();
-                let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome);
+                let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome, None);
                 manager.finalize_streams(job, &failure).await;
                 let _ = sender.send(failure);
                 return settled.map(|()| outcome);
@@ -259,7 +262,7 @@ pub async fn run_into_blocks(
     let mut attempt = capture_and_review(kaish, code, kernel, context_id, call_ctx,
         Some((*command_block_id, *output_block_id)), options, run, streams).await?;
     let outcome = &mut attempt.outcome;
-    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, outcome);
+    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, outcome, None);
     if let Some((manager, job, sender)) = tracked_job {
         if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
         let result = outcome.exec_result();
@@ -790,20 +793,89 @@ mod fill_tests {
             "CREATE TRIGGER fail_completion BEFORE UPDATE OF completed_at ON shell_operations BEGIN
              SELECT RAISE(ABORT, 'receipt write failed'); END;"
         ).unwrap();
-        let error = settle_outcome(&kernel, ctx, &command, &output, &outcome).unwrap_err();
+        let error = settle_outcome(&kernel, ctx, &command, &output, &outcome, None).unwrap_err();
         assert!(error.contains("receipt write failed"));
+        let db = kernel.kernel_db().clone();
+        let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let restored = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+        restored.load_from_db().unwrap();
         for block in [&command, &output] {
-            assert_eq!(documents.get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Running);
+            assert_eq!(restored.get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Running);
         }
+        assert_eq!(restored.get_block_snapshot(ctx, &output).unwrap().unwrap().content, "waiting");
         assert!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().completed_at.is_none());
-        kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_completion;").unwrap();
-        settle_outcome(&kernel, ctx, &command, &output, &outcome).unwrap();
-        settle_outcome(&kernel, ctx, &command, &output, &outcome).unwrap();
-        assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Done);
-        assert_eq!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap().stdout, "executed-once");
+        db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_completion;").unwrap();
+        let recovered_dir = tempfile::tempdir().unwrap();
+        let recovered = Kernel::new("retry-completion", recovered_dir.path(), restored.clone(), db).await;
+        settle_outcome(&recovered, ctx, &command, &output, &outcome, None).unwrap();
+        assert_eq!(restored.get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Done);
+        assert_eq!(recovered.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap().stdout, "executed-once");
     }
 
-    async fn restart_after_settlement_failure(after_receipt: bool) {
+    #[tokio::test]
+    async fn failed_shell_projection_retains_the_whole_prior_result_and_original_bytes() {
+        for fault in ["receipt", "journal", "provenance"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Arc::new(parking_lot::Mutex::new(crate::KernelDb::open(dir.path().join("kernel.db")).unwrap()));
+            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            let flows = Arc::new(crate::flows::FlowBus::new(64));
+            let blocks = Arc::new(crate::block_store::BlockStore::with_db_and_flows(db.clone(), workspace, PrincipalId::system(), flows.clone()));
+            let kernel = Kernel::with_flows(kaijutsu_types::KernelId::new(), "atomic-shell-projection", flows, dir.path(), blocks, db).await;
+            let context = ContextId::new();
+            let blocks = kernel.blocks();
+            blocks.create_document(context, DocumentKind::Conversation, None).unwrap();
+            let command = blocks.insert_tool_call(context, None, None, "shell", serde_json::json!({}), None).unwrap();
+            let output = blocks.insert_tool_result(context, &command, Some(&command), "old", false, Some(17), None).unwrap();
+            for id in [&command, &output] { blocks.set_status(context, id, Status::Running).unwrap(); }
+            blocks.set_stderr(context, &output, Some("old stderr".into())).unwrap();
+            let original = b"\x1b[32mold\x1b[0m";
+            let projection = crate::ansi_ingest::project(original).unwrap();
+            crate::ansi_ingest::record(blocks, context, &output, projection.spans, original);
+            let before = blocks.get_block_snapshot(context, &output).unwrap().unwrap();
+            let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(),
+                command, output, "never execute during recovery", None).unwrap();
+            let mut result = kaish_kernel::interpreter::ExecResult::success("\x1b[31mnew\x1b[0m");
+            result.code = 7;
+            result.err = "new stderr".into();
+            let outcome = CommandOutcome::new(CommandExecution::Completed(result), 4);
+            kernel.kernel_db().lock().conn_for_ledger().execute_batch(match fault {
+                "receipt" => "CREATE TRIGGER reject_projection BEFORE UPDATE OF completed_at ON shell_operations BEGIN SELECT RAISE(FAIL, 'injected receipt fault'); END;",
+                "journal" => "CREATE TRIGGER reject_projection BEFORE INSERT ON oplog BEGIN SELECT RAISE(FAIL, 'injected journal fault'); END;",
+                _ => "CREATE TRIGGER reject_projection BEFORE INSERT ON block_provenance BEGIN SELECT RAISE(FAIL, 'injected provenance fault'); END;",
+            }).unwrap();
+            let mut events = kernel.block_flows().subscribe("block.*");
+            let error = settle_outcome(&kernel, context, &command, &output, &outcome, None).unwrap_err();
+            assert!(events.try_recv().is_none(), "failed projection must publish no partial result");
+            assert!(error.contains(&format!("injected {fault} fault")), "{error}");
+            let db = kernel.kernel_db().clone();
+            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            let restored = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+            restored.load_from_db().unwrap();
+            let after = restored.get_block_snapshot(context, &output).unwrap().unwrap();
+            assert_eq!(after.content, before.content, "{fault}: a failed receipt cannot publish new stdout");
+            assert_eq!(after.stderr, before.stderr);
+            assert_eq!(after.exit_code, before.exit_code);
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.style_spans, before.style_spans);
+            assert_eq!(db.lock().get_block_provenance(&output, kaijutsu_ansi::TRANSFORM_NAME).unwrap().unwrap().1, original);
+            assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_none());
+            assert!(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().is_some());
+            db.lock().conn_for_ledger().execute_batch("DROP TRIGGER reject_projection").unwrap();
+            let recovered_dir = tempfile::tempdir().unwrap();
+            let recovered = Kernel::new("recovered-atomic-projection", recovered_dir.path(), restored, db).await;
+            let after = recovered.blocks().get_block_snapshot(context, &output).unwrap().unwrap();
+            assert_eq!(after.content, "new");
+            assert_eq!(after.stderr.as_deref(), Some("new stderr"));
+            assert_eq!(after.status, Status::Error);
+            assert_eq!(after.exit_code, Some(7));
+            assert!(after.is_error);
+            assert_eq!(recovered.kernel_db().lock().get_block_provenance(&output, kaijutsu_ansi::TRANSFORM_NAME).unwrap().unwrap().1,
+                b"\x1b[31mnew\x1b[0m");
+            assert!(recovered.shell_operations().pending_projections().unwrap().is_empty());
+        }
+    }
+
+    async fn restart_after_settlement_failure(fault: &str) {
         let kernel = Arc::new(Kernel::new_ephemeral("settlement-recovery").await);
         let documents = kernel.blocks();
         let ctx = ContextId::new();
@@ -813,18 +885,20 @@ mod fill_tests {
         for block in [&command, &output] { documents.set_status(ctx, block, Status::Running).unwrap(); }
         let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
             command, output, "never-execute-this-source-on-recovery", None).unwrap();
+        let captured = if fault == "compaction" { "x".repeat(1_048_576) } else { "captured before failure".into() };
         let outcome = CommandOutcome::new(CommandExecution::Completed(
-            kaish_kernel::interpreter::ExecResult::success("captured before failure")), 13);
+            kaish_kernel::interpreter::ExecResult::success(&captured)), 13);
         let db = kernel.kernel_db().clone();
-        db.lock().conn_for_ledger().execute_batch(if after_receipt {
-            "CREATE TRIGGER fail_settlement BEFORE INSERT ON oplog
-             WHEN EXISTS(SELECT 1 FROM shell_operations WHERE completed_at IS NOT NULL)
-             BEGIN SELECT RAISE(ABORT, 'terminal block write failed'); END;"
-        } else {
-            "CREATE TRIGGER fail_settlement BEFORE UPDATE OF completed_at ON shell_operations
-             BEGIN SELECT RAISE(ABORT, 'receipt write failed'); END;"
+        db.lock().conn_for_ledger().execute_batch(match fault {
+            "cleanup" => "CREATE TRIGGER fail_settlement BEFORE DELETE ON shell_operation_projections
+             BEGIN SELECT RAISE(ABORT, 'projection marker cleanup failed'); END;",
+            "compaction" => "CREATE TRIGGER fail_settlement BEFORE INSERT ON doc_snapshots
+             BEGIN SELECT RAISE(ABORT, 'snapshot write failed'); END;",
+            _ => "CREATE TRIGGER fail_settlement BEFORE UPDATE OF completed_at ON shell_operations
+             BEGIN SELECT RAISE(ABORT, 'receipt write failed'); END;",
         }).unwrap();
-        assert!(settle_outcome(&kernel, ctx, &command, &output, &outcome).is_err());
+        assert!(settle_outcome(&kernel, ctx, &command, &output, &outcome, None).is_err());
+        assert_eq!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().completed_at.is_some(), fault != "receipt");
         assert!(kernel.shell_operations().outcome(&receipt.operation_id, ctx).unwrap().is_some(),
             "a failed receipt write must not discard the captured outcome");
         db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_settlement;").unwrap();
@@ -837,19 +911,25 @@ mod fill_tests {
         for block in [&command, &output] {
             assert_eq!(recovered.blocks().get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Done);
         }
-        assert_eq!(recovered.blocks().get_block_snapshot(ctx, &output).unwrap().unwrap().content, "captured before failure");
+        assert_eq!(recovered.blocks().get_block_snapshot(ctx, &output).unwrap().unwrap().content, captured);
         let saved = recovered.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap();
-        assert_eq!(saved.envelope.unwrap().stdout, "captured before failure");
+        assert_eq!(saved.envelope.unwrap().stdout, captured);
+        assert!(recovered.shell_operations().pending_projections().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn restart_retains_outcome_after_failed_receipt_commit() {
-        restart_after_settlement_failure(false).await;
+        restart_after_settlement_failure("receipt").await;
     }
 
     #[tokio::test]
-    async fn restart_repairs_blocks_after_receipt_committed() {
-        restart_after_settlement_failure(true).await;
+    async fn restart_finishes_projection_after_receipt_and_blocks_committed() {
+        restart_after_settlement_failure("cleanup").await;
+    }
+
+    #[tokio::test]
+    async fn restart_finishes_projection_after_compaction_fails() {
+        restart_after_settlement_failure("compaction").await;
     }
 
     #[tokio::test]
@@ -887,7 +967,7 @@ mod fill_tests {
             "CREATE TRIGGER fail_projection_cleanup BEFORE DELETE ON shell_operation_projections
              BEGIN SELECT RAISE(ABORT, 'cleanup failed'); END;"
         ).unwrap();
-        assert!(settle_outcome(&kernel, ctx, &command, &output, &outcome).is_err());
+        assert!(settle_outcome(&kernel, ctx, &command, &output, &outcome, None).is_err());
         assert_eq!(documents.get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Done);
         documents.replace_text_as(ctx, &output, "later edit", Some(PrincipalId::system())).unwrap();
         kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_projection_cleanup;").unwrap();

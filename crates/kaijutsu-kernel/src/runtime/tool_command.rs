@@ -94,7 +94,7 @@ impl ToolCommand {
             if let Some(receipt) = &receipt {
                 let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
                 outcome.settlement_error = Some(format!("runtime worker could not start: {error}"));
-                command::settle_outcome(&failure_kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome)
+                command::settle_outcome(&failure_kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome, None)
                     .map_err(McpError::Protocol)?;
             }
             return Err(McpError::Protocol(format!("runtime worker could not start: {error}")));

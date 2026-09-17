@@ -1089,10 +1089,8 @@ impl BlockDocument {
         Ok(())
     }
 
-    /// Set the standard-error stream on a ToolResult block. The shell
-    /// execution path calls this at completion so `BlockSnapshot::stderr`
-    /// carries stderr separately from `content` (stdout). Write-once; the
-    /// value is replicated via `MetadataChanged` / snapshot.
+    /// Replace a tool result's stderr, stored separately from stdout. The
+    /// block store publishes the value through metadata and snapshots.
     pub fn set_stderr(&mut self, id: &BlockId, stderr: Option<String>) -> Result<()> {
         let block = self
             .blocks

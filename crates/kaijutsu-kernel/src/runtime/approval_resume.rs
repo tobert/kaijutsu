@@ -183,7 +183,7 @@ fn settle_pair_error(
         crate::runtime::command_outcome::CommandExecution::NotRun, 0);
     outcome.settlement_error = Some(reason);
     crate::runtime::command::settle_outcome(
-        kernel, context_id, command_block_id, output_block_id, &outcome,
+        kernel, context_id, command_block_id, output_block_id, &outcome, None,
     )?;
     // The pair may already be cached from an earlier turn as `Waiting`;
     // this settles it in place, so the next turn must hydrate cold to see
@@ -927,8 +927,7 @@ mod lifetime_tests {
             }
             if fault == "projection" {
                 kernel.kernel_db().lock().conn_for_ledger().execute_batch(
-                    "CREATE TRIGGER reject_approved_projection BEFORE INSERT ON oplog
-                     WHEN EXISTS(SELECT 1 FROM shell_operations WHERE completed_at IS NOT NULL)
+                    "CREATE TRIGGER reject_approved_projection BEFORE DELETE ON shell_operation_projections
                      BEGIN SELECT RAISE(FAIL, 'injected projection fault'); END;"
                 ).unwrap();
             }

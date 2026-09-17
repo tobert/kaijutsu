@@ -2073,6 +2073,22 @@ retries reuse that pair too. The unused ask-based completion API is deleted.
 Early answers racing the original caller and approved notification recovery
 remain open.
 
+Command result publication now uses the same acceptance as model tool results.
+Text, structured output, stderr, exit, content type, ephemeral flags, ANSI
+originals and spans, both statuses and receipt state commit together. Session
+pre-call refusals supply their pair owner there, removing the late ask link.
+Captured terminal outcomes still precede projection so a failed acceptance
+can recover without executing source again.
+
+A fault test first showed new stdout surviving a failed receipt write. Receipt,
+journal and provenance faults now leave the previous durable projection intact
+and publish no events. Restart projects the retained outcome; failure to clear
+the recovery marker preserves later edits after a successful commit. A snapshot
+fault after commit also recovers the accepted result and receipt. The real
+pre-call gate also proves that a link failure cannot publish Waiting. Model
+fixtures now use the kernel's journal database rather than unrelated stores.
+Rc diagnostic provenance remains best effort and belongs to its lifecycle audit.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
