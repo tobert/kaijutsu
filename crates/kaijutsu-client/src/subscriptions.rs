@@ -1182,11 +1182,12 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let output = params
-            .get_output()
-            .ok()
-            .and_then(|r| crate::rpc::parse_output_data(r).ok())
-            .filter(|d| !d.root.is_empty() || d.headers.is_some());
+        let output = if params.has_output() {
+            match params.get_output().and_then(crate::rpc::parse_output_data) {
+                Ok(output) => Some(output),
+                Err(error) => return Promise::err(error),
+            }
+        } else { None };
 
         let event = ServerEvent::BlockOutputChanged {
             context_id,
@@ -1606,10 +1607,10 @@ impl kernel_output::Server for KernelOutputForwarder {
 
 #[cfg(test)]
 mod turn_events_tests {
-    //! Cap'n Proto round-trip for the turn-outcome payloads.
+    //! Cap'n Proto round-trip for block and turn callback payloads.
     //!
-    //! These drive the real generated client/server pair built by
-    //! [`turn_events_channel`] — set the wire fields, send, and assert on the
+    //! These drive the generated block and turn callback clients: set the
+    //! wire fields, send, and assert on the
     //! [`ServerEvent`] that falls out the other side. The decode is where a
     //! wire change goes quietly wrong (an enumerant mapped to the wrong
     //! variant, an unset optional read as if it were set), so it is worth
@@ -1628,6 +1629,38 @@ mod turn_events_tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, f);
+    }
+
+    #[test]
+    fn output_presence_survives_block_callback_decoding() {
+        run_local(async {
+            let (client, mut events) = block_events_channel(16, crate::MidiExchangeSlot::new());
+            let context = ContextId::new();
+            let principal = PrincipalId::new();
+            for (present, rich) in [(false, None), (true, None), (true, Some("{\"beat\":1}"))] {
+                let mut request = client.on_block_output_changed_request();
+                {
+                    let mut params = request.get();
+                    params.set_context_id(context.as_bytes());
+                    let mut id = params.reborrow().init_block_id();
+                    id.set_context_id(context.as_bytes());
+                    id.set_principal_id(principal.as_bytes());
+                    id.set_seq(1);
+                    if present {
+                        let mut output = params.init_output();
+                        if let Some(json) = rich { output.set_rich_json(json); }
+                    }
+                }
+                request.send().promise.await.unwrap();
+                let ServerEvent::BlockOutputChanged { output, .. } = events.try_recv().unwrap() else {
+                    panic!("expected output change");
+                };
+                assert_eq!(output.is_some(), present, "callback must preserve output pointer presence");
+                if let Some(output) = output {
+                    assert_eq!(output.rich_json, rich.map(|json| serde_json::from_str(json).unwrap()));
+                }
+            }
+        });
     }
 
     /// A completed turn carrying an output block: every field survives the

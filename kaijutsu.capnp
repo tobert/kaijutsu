@@ -185,7 +185,8 @@ struct BlockSnapshot {
   stderr @21 :Text;              # Standard error stream — persisted separately from content (stdout)
   hasStderr @22 :Bool;           # True if stderr is set (distinguishes "" from unset)
 
-  # Structured output data for richer formatting (typed Cap'n Proto struct)
+  # Structured output data for richer formatting. An absent pointer means
+  # no structured output; a present empty value is still structured output.
   outputData @23 :OutputData;
 
   # File metadata (file blocks)
@@ -715,6 +716,7 @@ struct BlockMetadataChange {
 
 struct BlockOutputChange {
   blockId @0 :BlockId;
+  # An absent pointer clears structured output. Preserve present empty values.
   output @1 :OutputData;
 }
 
@@ -862,8 +864,8 @@ interface BlockEvents {
   # reconnect even when text ops are gated behind a full resync.
   onBlockMetadataChanged @7 (contextId :Data, blockId :BlockId, metadata :BlockMetadata, subSeq :UInt64);
 
-  # Structured output data changed (output is not DTE-tracked, so it rides
-  # its own event rather than the block text op stream).
+  # Structured output changed independently of block text. An absent output
+  # pointer clears it; a present empty value remains structured output.
   onBlockOutputChanged @8 (contextId :Data, blockId :BlockId, output :OutputData, subSeq :UInt64);
 
   # Render a cue (docs/pcm.md, docs/midi.md "Render is a wire cue"). A kernel

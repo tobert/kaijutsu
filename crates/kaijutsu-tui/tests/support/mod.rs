@@ -271,6 +271,9 @@ impl TuiSession {
         }
         cmd.env("RUST_LOG", "warn");
         cmd.env("TERM", "xterm-256color");
+        // These probes inspect SGR styling. Individual probes can opt into
+        // a monochrome environment through the overrides below.
+        cmd.env_remove("NO_COLOR");
         for (key, value) in env {
             cmd.env(key, value);
         }

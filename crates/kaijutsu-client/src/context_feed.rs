@@ -346,7 +346,7 @@ fn parse_change(reader: context_event::Reader<'_>) -> Result<ContextChange, capn
             let r = r?;
             ContextChange::OutputChanged {
                 block_id: parse_block_id(&r.get_block_id()?).map_err(to_capnp)?,
-                output: Some(Box::new(parse_output_data(r.get_output()?)?)),
+                output: if r.has_output() { Some(Box::new(parse_output_data(r.get_output()?)?)) } else { None },
             }
         }
         context_event::SpansChanged(r) => {
@@ -721,6 +721,37 @@ mod tests {
 
     fn ctx() -> ContextId {
         ContextId::new()
+    }
+
+    #[test]
+    fn output_presence_survives_context_change_decoding() {
+        let context = ctx();
+        let mut initial = block(context, 1, "plain stdout");
+        initial.output = Some(OutputData::text("previous structured output"));
+        for (present, rich) in [(false, None), (true, None), (true, Some("{\"beat\":1}"))] {
+            let mut message = capnp::message::Builder::new_default();
+            let mut change = message.init_root::<context_event::Builder>().init_output_changed();
+            {
+                let mut id = change.reborrow().init_block_id();
+                id.set_context_id(context.as_bytes());
+                id.set_principal_id(initial.id.principal_id.as_bytes());
+                id.set_seq(initial.id.seq);
+            }
+            if present {
+                let mut output = change.init_output();
+                if let Some(json) = rich { output.set_rich_json(json); }
+            }
+            let change = parse_change(message.get_root_as_reader::<context_event::Reader>().unwrap()).unwrap();
+            let mut mirror = ContextMirror::new(context);
+            mirror.apply_snapshot(vec![initial.clone()], 0).unwrap();
+            mirror.receive(delivery(context, 1, vec![change])).unwrap();
+            let seen = &mirror.blocks()[0];
+            assert_eq!(seen.output.is_some(), present, "absent output clears; present empty output remains present");
+            assert_eq!(seen.content, "plain stdout");
+            if let Some(output) = &seen.output {
+                assert_eq!(output.rich_json, rich.map(|json| serde_json::from_str(json).unwrap()));
+            }
+        }
     }
 
     fn block(context_id: ContextId, seq: u64, content: &str) -> BlockSnapshot {

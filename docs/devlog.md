@@ -1775,6 +1775,15 @@ ambient-context constructor wrapper is deleted. The shared executor is now
 `shutdown_runtime_worker` naming its full scope: commands, model turns and
 approval delivery. All callers moved; no command-only compatibility alias remains.
 
+The terminal exposed a result that executed and settled correctly but rendered
+blank. Shared settlement clears obsolete structured output; the context-feed
+decoder turned its absent Cap'n Proto pointer into `Some(empty)`, which the
+renderer preferred over the real stdout. Snapshot and block-callback decoders
+made different guesses about presence. All three now read pointer presence:
+absent clears output, present empty stays present, and JSON-only output survives.
+Three decoding regressions first failed, then passed; the real `:!echo hi`
+terminal probe confirms that accepted output becomes visible to the player.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

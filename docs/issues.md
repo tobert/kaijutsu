@@ -14,8 +14,7 @@ speeds; each change should improve that flow, remove a competing mechanism,
 or establish a testable contract. Keep model placement independent of this
 work. `docs/audio-inference.md` records the workload and measured costs.
 
-1. **Restore dependable interaction.** Reproduce and fix the `:!` completion
-   regression in `terminal_fit` below. Continue the complete kaish/rc caller
+1. **Keep interaction dependable.** Continue the complete kaish/rc caller
    migration alongside the following steps, using `docs/kaish-integration.md`'s
    inventory. Each migrated caller must retain identity, cancellation,
    complete output, and terminal
@@ -743,19 +742,16 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
-## `:!` statements never land in terminal_fit (2026-09-17)
+## Monochrome TUI copy-mode indicators need a contract
 
-Seven `kaijutsu-tui` `terminal_fit` tests fail waiting for a `:!echo`
-result: `a_resize_rewraps_the_transcript`,
-`a_scrolled_context_comes_back_scrolled_after_a_switch`,
-`colon_bang_runs_one_kaish_statement_and_lands_its_output`,
-`space_snaps_to_the_tail_and_typing_lands_in_the_draft`,
-`the_picker_opens_as_an_overlay_and_leaves_the_transcript_intact`,
-`the_wheel_as_arrows_leaves_the_tail_and_q_returns`, and
-`v_then_j_then_y_copies_two_lines_over_osc52_and_into_the_paste_buffer`.
-The statement block appears with no result. Two were rerun at `c6b00a97`
-without the slice 5 changes and fail the same way, so this predates slice 5.
-The kernel runtime command-owner commits just before are the likely area.
+With inherited `NO_COLOR=1`, terminal probes lose the marked-row background
+and reader inverse styling. Clearing that variable makes the Space/copy-mode
+probe pass. Crossterm 0.29.0 formats disabled colors as empty strings inside
+`ESC[...m`, yielding an attribute reset that can erase inverse as well as
+color. Decide the monochrome presentation and preserve a visible reader and
+selection without overriding the user's color preference. The normal
+color-dependent PTY fixtures now remove inherited `NO_COLOR`; dedicated
+monochrome fixtures can set it explicitly. No upstream posting was made.
 
 ## OSC 8 hyperlinks wait on a ratatui span attribute (2026-09-13)
 

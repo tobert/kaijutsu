@@ -51,6 +51,15 @@ getBlocks @35 (contextId :Data, query :BlockQuery, trace :TraceContext)
   -> (blocks :List(BlockSnapshot), version :UInt64);
 ```
 
+## Structured output presence
+
+Structured output preserves pointer presence on every read path: snapshots,
+the context feed, and block callbacks. An absent `OutputData` pointer means
+`None`; in an output-change event it clears the previous structured output.
+A present empty value remains `Some(empty)`, and a value carrying only
+`rich_json` remains present. Decode errors must be reported, not treated as
+absence. Clients must not infer presence from the number of output nodes.
+
 ## Classification happens at the mutation, not at the wire
 
 This is the correction that matters most, and the first proposal got it wrong.
