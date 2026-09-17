@@ -28,6 +28,7 @@ does not become an instruction to use nonexistent features.
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged. A retired character responsible for an ancestor context refuses reviewer resolution below it, by name |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
+| Rotation | `kj context rotate [<context>]` creates a successor from the predecessor's parent that copies its configuration, env, and cwd, sets `ROTATED_FROM` to the predecessor's id, and runs `create` rc. Only a successor with a loadout takes over: one transaction archives the predecessor and moves its label, ring seat, and any `root_ctx` pointer. The performer or the lineage root may rotate. See `docs/prompts.md`, "Rotating a context" |
 | Accountability | A relation between contexts: `forked_from`, set by fork and by `kj context create` from inside a context; the responsible character is the performer, or the director when unset. Reviewer resolution and `kj ledger escalate` both walk it (`KernelDb::responsible_character_above`; `docs/approval-identity.md`). The sheet carries a `root` flag ("Roots and rotation"); there is no `accountable_to` column |
 
 Sources: `kernel_db.rs::CharacterRow`, `kernel_db.rs::effective_approval_reviewer`,
@@ -41,12 +42,12 @@ Banto is a character using the `director` context type. It does not need a new
 type to have its own identity and handoff. `KJ_CHARACTER` was a temporary rc
 name/handoff selector; it never set `played_by`. New instructions read performer
 metadata instead. Existing contexts that used the bridge remain unassigned:
-create a successor with `--as banto` and verify it before archiving its
-predecessor. See `docs/prompts.md`, "Rotating a director context".
+set `--as banto` on the seat, or create a successor with `--as banto`, then
+`kj context rotate` it. See `docs/prompts.md`, "Rotating a context".
 
 Still planned: character rc composition (slice 5), roster grouping and character drift addressing (slices 6–7), and
 scheduled janitor/proctor work (slice 8). The sheet still has no
-`default_cast_id`, `rc_dir`, `memory_root`, or `root_ctx` fields. The handoff
+`default_cast_id`, `rc_dir`, or `memory_root` fields. The handoff
 is a context, not a transport track. Requester and performer remain separate;
 setting `played_by` changes subsequent model invocation and output attribution;
 it never changes credentials or rewrites existing asks and block authors.
@@ -145,15 +146,14 @@ Two things follow, and they are the ones to check a change against:
   a root character, claimed the way the drift queue is claimed on the
   router. The reserved names live in one place: `ROOT`, the drift queue,
   and the factory preset labels.
-- **Rotation belongs to `root_ctx`, and every character has one.** On a
-  root character it names the root context; on a model character it names
-  the home seat. Rotation mints a successor of the same type and cast,
-  played by the same character, from the predecessor's own parent, sets
-  `ROTATED_FROM` from the pointer, moves the pointer, and archives the
-  predecessor, in one transaction. The label follows the live holder, as
-  `ROOT` does today. A root rotates too, when its history goes stale; a
-  root confirms itself, so no one else is asked. Forks and delegated lanes
-  are work, never `root_ctx`.
+- **Rotation replaces a context, not a character.** Amy, 2026-09-17:
+  rotate a context, and move a character's `root_ctx` pointer only when it
+  named that context. The successor is created from the predecessor's own
+  parent, copies its whole configuration including env, sets
+  `ROTATED_FROM`, and takes the label, ring seat, and pointer as the
+  predecessor archives. The label follows the live holder. A root rotates
+  too, when its history goes stale; a root confirms itself, so no one else
+  is asked. The performer or the lineage root may rotate.
 - **banto starts from `ROOT`.** Its home seat is created from the root
   context, so its lineage, and its accountability, begin there. The seat
   takes the character's name as its label. The old arrangement, where

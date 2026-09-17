@@ -76,8 +76,9 @@ See `docs/character.md`, "Current implementation" and "Rollout, smallest first".
 Banto uses the existing `director` type. Create its context with `--as banto`;
 director instructions and handoff injection read the performer metadata. The
 old `KJ_CHARACTER` environment bridge did not set identity and is no longer
-read by the shipped scripts. `ROTATED_FROM` loads predecessor prose.
-Use `docs/prompts.md`, "Rotating a director context" for the current procedure.
+read by the shipped scripts. `kj context rotate` replaces a seat and sets
+`ROTATED_FROM`, which loads predecessor prose. See `docs/prompts.md`,
+"Rotating a context".
 
 Each context type chooses its instructions through rc. Coder, default, and
 director link to `lib/create/S00-base.kai` and its Markdown companion; other types choose their own

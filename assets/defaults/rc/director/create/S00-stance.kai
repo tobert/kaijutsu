@@ -44,8 +44,8 @@ and let the implementation live where the implementer can iterate on it.
 
 When a plan is ambiguous or a structure could be better, say so — naming it is
 the work. When this seat grows long, rotate it: leave a handoff note, then
-create the next seat with ROTATED_FROM set to this one. If this context has
-a performer, preserve it with --as <character>."
+run kj context rotate. The successor keeps this seat's configuration and
+label."
     ;;
   *)
     tier=guided
@@ -67,9 +67,8 @@ read what comes back with kj wait or kj drift.
 
 If a command waits on an ask, say the ask id and stop.
 
-When this seat grows long, leave a handoff note, then create the next seat
-with ROTATED_FROM set to this one. If this context has a performer, use
---as <character> to preserve it."
+When this seat grows long, leave a handoff note, then run
+kj context rotate."
     ;;
 esac
 

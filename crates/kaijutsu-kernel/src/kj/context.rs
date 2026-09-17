@@ -116,7 +116,9 @@ enum ContextCommand {
         /// Parent context to fork the structural edge from
         #[arg(long, short = 'p')]
         parent: Option<String>,
-        /// Existing live character performing model work. Amy reviews unless explicitly delegated
+        /// Existing live character performing model work. The character
+        /// responsible above the new context reviews it unless explicitly
+        /// delegated
         #[arg(long = "as", value_name = "CHARACTER")]
         character: Option<String>,
         #[command(flatten)]
@@ -189,6 +191,19 @@ enum ContextCommand {
         name: String,
         /// Context to rename (default: current)
         #[arg(long, short = 'c')]
+        context: Option<String>,
+    },
+    /// Replace a context with a fresh successor (default: current). The
+    /// successor is created from the same parent and copies the type, cast,
+    /// performer, director, reviewer override, model, system prompt, consent
+    /// mode, workspace, env, and cwd, then runs the `create` rc lifecycle.
+    /// `ROTATED_FROM` names the predecessor by id. When the successor has a
+    /// loadout, it takes the label, the ring seat, and any character's
+    /// `root_ctx` pointer, and the predecessor is archived. The performer
+    /// or the lineage root may rotate.
+    Rotate {
+        /// Context to rotate. Defaults to the current context. Ids and
+        /// labels come from `kj context list`.
         context: Option<String>,
     },
     /// Soft-delete one context (latched). Its children are untouched and
@@ -332,15 +347,27 @@ fn insert_new_context_checked(
     row: &ContextRow,
     parent_id: Option<ContextId>,
 ) -> KernelDbResult<()> {
-    db.in_transaction(|db| {
+    db.in_transaction(|db| insert_new_context_rows(db, row, parent_id))
+}
+
+/// The body of [`insert_new_context_checked`], for a caller that already
+/// holds a transaction and writes more rows in it.
+fn insert_new_context_rows(
+    db: &KernelDb,
+    row: &ContextRow,
+    parent_id: Option<ContextId>,
+) -> KernelDbResult<()> {
+    {
         if let Some(performer) = row.played_by {
-            if !db.get_character(performer)?.is_some_and(|sheet| sheet.retired_at.is_none()) {
+            let Some(sheet) = db.get_character(performer)?.filter(|sheet| sheet.retired_at.is_none()) else {
                 return Err(KernelDbError::Validation("performer must name a live character".into()));
-            }
+            };
             let default_ws = db.get_or_create_default_workspace(row.created_by)?;
             db.insert_context_with_document(row, default_ws)?;
+            // A root plays its root context but performs no model work, and
+            // confirms its own statements there.
             let reviewer = db.effective_approval_reviewer(row.context_id, performer)?.reviewer();
-            if performer == reviewer {
+            if !sheet.root && performer == reviewer {
                 return Err(KernelDbError::Validation("the performer cannot review its own work".into()));
             }
         } else {
@@ -358,7 +385,7 @@ fn insert_new_context_checked(
             })?;
         }
         Ok(())
-    })
+    }
 }
 
 impl KjDispatcher {
@@ -616,6 +643,7 @@ impl KjDispatcher {
                 | ContextCommand::Move { .. }
                 | ContextCommand::Rename { .. }
                 | ContextCommand::Archive { .. }
+                | ContextCommand::Rotate { .. }
                 | ContextCommand::Remove { .. }
                 | ContextCommand::Retag { .. }
                 | ContextCommand::Hydrate { .. }
@@ -667,6 +695,7 @@ impl KjDispatcher {
                 new_parent,
             } => self.context_move(&context, &new_parent, caller).await,
             ContextCommand::Archive { context } => self.context_archive(&context, caller).await,
+            ContextCommand::Rotate { context } => self.context_rotate(context.as_deref(), caller).await,
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
             ContextCommand::Promote { context } => self.context_promote(&context, caller).await,
             ContextCommand::Demote { context } => self.context_demote(&context, caller).await,
@@ -2102,6 +2131,139 @@ impl KjDispatcher {
         }
     }
 
+    /// `kj context rotate [<ctx>]` — replace a context with a successor that
+    /// carries its configuration (`docs/character.md`, "Roots and rotation").
+    ///
+    /// The successor row, env, and cwd land in one transaction, unlabeled.
+    /// The `create` rc lifecycle runs next and cannot share a transaction.
+    /// Only a successor with a usable loadout takes over: one more
+    /// transaction archives the predecessor and moves its label, ring seat,
+    /// and `root_ctx` pointers. Otherwise the predecessor stays live and
+    /// the successor stays unlabeled for inspection. The hydration window
+    /// is not copied: its marker names a block in the predecessor.
+    async fn context_rotate(&self, ctx_ref: Option<&str>, caller: &KjCaller) -> KjResult {
+        let predecessor = {
+            let db = self.kernel_db().lock();
+            let id = match super::refs::resolve_context_arg(ctx_ref, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
+            };
+            match db.get_context(id) {
+                Ok(Some(row)) => row,
+                Ok(None) => return KjResult::Err(format!("kj context rotate: context {} not found", id.short())),
+                Err(e) => return KjResult::Err(format!("kj context rotate: {e}")),
+            }
+        };
+        let name = predecessor.label.clone().unwrap_or_else(|| predecessor.context_id.short());
+        if predecessor.is_archived() {
+            return KjResult::Err(format!("kj context rotate: {name} is archived; rotate a live context"));
+        }
+        if predecessor.played_by != Some(caller.actor_id) {
+            match self.kernel_db().lock().lineage_root(predecessor.context_id) {
+                Ok(root) if root == caller.actor_id => {}
+                Ok(_) => return KjResult::Err(format!(
+                    "kj context rotate: only the character that plays {name} or its lineage root may rotate it"
+                )),
+                Err(e) => return KjResult::Err(format!(
+                    "kj context rotate: only the character that plays {name} or its lineage root may rotate it: {e}"
+                )),
+            }
+        }
+
+        let successor_id = ContextId::new();
+        let parent = predecessor.forked_from;
+        let successor = ContextRow {
+            context_id: successor_id,
+            label: None,
+            context_state: ContextState::Live,
+            created_at: kaijutsu_types::now_millis() as i64,
+            created_by: caller.principal_id,
+            fork_kind: None,
+            archived_at: None,
+            concluded_at: None,
+            last_activity_at: None,
+            promoted_at: None,
+            demoted_at: None,
+            paused_at: None,
+            ..predecessor.clone()
+        };
+        {
+            let db = self.kernel_db().lock();
+            let inserted = db.in_transaction(|db| {
+                insert_new_context_rows(db, &successor, parent)?;
+                db.copy_context_env(predecessor.context_id, successor_id)?;
+                db.set_context_env(successor_id, "ROTATED_FROM", &predecessor.context_id.to_hex())?;
+                if let Some(shell) = db.get_context_shell(predecessor.context_id)? {
+                    db.upsert_context_shell(&ContextShellRow {
+                        context_id: successor_id,
+                        updated_at: kaijutsu_types::now_millis() as i64,
+                        ..shell
+                    })?;
+                }
+                Ok(())
+            });
+            if let Err(e) = inserted {
+                return KjResult::Err(format!("kj context rotate: {e}"));
+            }
+        }
+        {
+            let mut drift = self.drift_router().write();
+            if let Err(e) = drift.register(successor_id, None, parent, caller.principal_id) {
+                return KjResult::Err(format!("kj context rotate: {e}"));
+            }
+            if let (Some(provider), Some(model)) = (&successor.provider, &successor.model) {
+                let _ = drift.configure_llm(successor_id, provider, model);
+            }
+        }
+
+        if let Err(e) = crate::rc::run(
+            self,
+            crate::rc::RcInvocation { parent, ..crate::rc::RcInvocation::new("create", successor_id) },
+            caller,
+        )
+        .await
+        {
+            tracing::warn!("rc create lifecycle for rotation successor: {e}");
+        }
+        match self.has_usable_loadout(successor_id) {
+            Ok(true) => {}
+            Ok(false) => return KjResult::Err(format!(
+                "kj context rotate: the successor {successor_id} has no loadout after its create lifecycle, so {name} stays live. \
+                 Read the successor's Error blocks, then remove it with `kj context remove {successor_id}`"
+            )),
+            Err(e) => return KjResult::Err(format!(
+                "kj context rotate: could not read the successor's loadout, so {name} stays live: {e}"
+            )),
+        }
+
+        let moved = match self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id) {
+            Ok(moved) => moved,
+            Err(e) => return KjResult::Err(format!(
+                "kj context rotate: {e}; {name} stays live and the successor {successor_id} is unlabeled"
+            )),
+        };
+        {
+            let mut drift = self.drift_router().write();
+            let _ = drift.set_state(predecessor.context_id, ContextState::Archived);
+            if let Some(label) = &predecessor.label
+                && let Err(e) = drift.rename(successor_id, Some(label))
+            {
+                return KjResult::Err(format!(
+                    "kj context rotate: rotated in the database but the live label index failed to update ({e}); a kernel restart will converge"
+                ));
+            }
+        }
+
+        let mut msg = format!("rotated {name}: {} archived, {} replaces it", predecessor.context_id.short(), successor_id.short());
+        if moved > 0 {
+            msg.push_str(&format!(" (moved {moved} character pointer{})", if moved == 1 { "" } else { "s" }));
+        }
+        KjResult::ok_with_data(msg, serde_json::json!({
+            "context_id": successor_id.to_hex(),
+            "rotated_from": predecessor.context_id.to_hex(),
+        }))
+    }
+
     /// `kj context conclude <ctx>` — the explicit "this work is done" act.
     ///
     /// Sets `concluded_at` + the `Concluded` lifecycle state (KernelDb first as
@@ -2451,6 +2613,7 @@ impl Classify for ContextCommand {
             | Self::Create { .. }
             | Self::Scratch
             | Self::Rebind { .. }
+            | Self::Rotate { .. }
             | Self::Set { .. }
             | Self::Unset { .. }
             | Self::Move { .. }
@@ -2971,9 +3134,180 @@ mod tests {
         let help = result.message();
         println!("{help}");
         assert!(help.contains("--as <CHARACTER>"));
-        assert!(help.contains("Amy reviews"));
+        assert!(help.contains("responsible above the new context reviews it"));
         let set = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("banto")], &test_caller()).await;
         assert!(!set.is_ok(), "unknown context or character is refused");
+    }
+
+    /// amy (a root) plays her root context; banto plays a `default` seat
+    /// created from it, configured in every way rotation carries.
+    struct RotationFixture {
+        d: std::sync::Arc<crate::kj::KjDispatcher>,
+        amy: PrincipalId,
+        banto: PrincipalId,
+        coder: PrincipalId,
+        root: ContextId,
+        seat: ContextId,
+    }
+
+    async fn rotation_fixture() -> RotationFixture {
+        rotation_fixture_persisting_bindings(true).await
+    }
+
+    /// `persist_bindings: false` leaves the broker's bindings in memory, so
+    /// every successor reads back with no loadout.
+    async fn rotation_fixture_persisting_bindings(persist_bindings: bool) -> RotationFixture {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        if persist_bindings {
+            d.kernel().broker().set_db(d.kernel_db().clone()).await;
+        }
+        let [amy, banto, coder, judge] = [PrincipalId::new(), PrincipalId::new(), PrincipalId::new(), PrincipalId::new()];
+        let db = d.kernel_db().lock();
+        for (principal_id, name, root) in [(amy, "amy", true), (banto, "banto", false), (coder, "coder", false), (judge, "judge", false)] {
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: s(name), created_at: 1, retired_at: None, handoff_ctx: None, root_ctx: None, root,
+            }).unwrap();
+        }
+        drop(db);
+        let root = register_context(&d, Some("amy"), None, amy);
+        let seat = register_context(&d, Some("banto"), Some(root), amy);
+        let db = d.kernel_db().lock();
+        db.update_played_by(root, Some(amy)).unwrap();
+        db.set_character_root_ctx(amy, Some(root)).unwrap();
+        db.update_context_review_assignment(seat, Some(banto), Some(judge), Some(amy)).unwrap();
+        db.set_character_root_ctx(banto, Some(seat)).unwrap();
+        db.update_model(seat, Some("mock"), Some("mock-banto")).unwrap();
+        db.update_settings(seat, Some("seat prompt"), ConsentMode::Autonomous).unwrap();
+        db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
+        db.set_context_env(seat, "ROTATED_FROM", "an-older-seat").unwrap();
+        db.upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: seat, cwd: Some(s("/tmp/seat")), updated_at: 1 }).unwrap();
+        db.promote_context(seat).unwrap();
+        drop(db);
+        RotationFixture { d, amy, banto, coder, root, seat }
+    }
+
+    fn rotation_caller(context: ContextId, actor: PrincipalId) -> crate::kj::KjCaller {
+        crate::kj::KjCaller {
+            principal_id: actor, actor_id: actor, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+        }
+    }
+
+    /// `kj context rotate` replaces a seat with a successor that carries its
+    /// whole configuration, takes its label, ring seat, and character
+    /// pointer, names the predecessor in `ROTATED_FROM`, and archives it.
+    async fn rotate_carries_the_seat_to_its_successor_body() {
+        let f = rotation_fixture().await;
+        let before = f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap();
+        let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let KjResult::Ok { data: Some(data), .. } = &rotated else { panic!("rotate returns ids: {rotated:?}") };
+        let successor = ContextId::parse(data["context_id"].as_str().unwrap()).unwrap();
+        assert_eq!(data["rotated_from"], f.seat.to_hex());
+
+        let db = f.d.kernel_db().lock();
+        let old = db.get_context(f.seat).unwrap().unwrap();
+        assert!(old.archived_at.is_some(), "the predecessor is archived");
+        assert_eq!(old.promoted_at, None);
+        let new = db.get_context(successor).unwrap().unwrap();
+        assert_eq!(new.label.as_deref(), Some("banto"), "the label follows the live holder");
+        assert_eq!(db.resolve_context("banto").unwrap(), successor);
+        assert!(new.archived_at.is_none());
+        assert!(new.promoted_at.is_some(), "the successor takes the ring seat");
+        assert_eq!(new.forked_from, Some(f.root), "created from the predecessor's own parent");
+        assert_eq!(new.context_type, before.context_type);
+        assert_eq!(new.cast_id, before.cast_id);
+        assert_eq!((new.played_by, new.reviewer_id, new.director_id), (before.played_by, before.reviewer_id, before.director_id));
+        assert_eq!((new.provider.as_deref(), new.model.as_deref()), (Some("mock"), Some("mock-banto")));
+        assert_eq!((new.system_prompt.as_deref(), new.consent_mode), (Some("seat prompt"), ConsentMode::Autonomous));
+        assert_eq!(new.workspace_id, before.workspace_id);
+        let env: std::collections::HashMap<_, _> = db.get_context_env(successor).unwrap().into_iter().map(|e| (e.key, e.value)).collect();
+        assert_eq!(env.get("SEAT_VAR").map(String::as_str), Some("kept"));
+        assert_eq!(env.get("ROTATED_FROM"), Some(&f.seat.to_hex()), "names the predecessor it replaced, by id");
+        assert_eq!(db.get_context_shell(successor).unwrap().and_then(|shell| shell.cwd).as_deref(), Some("/tmp/seat"));
+        assert_eq!(db.get_character(f.banto).unwrap().unwrap().root_ctx, Some(successor), "the pointer moves");
+        assert_eq!(db.get_character(f.amy).unwrap().unwrap().root_ctx, Some(f.root), "other pointers stay");
+        drop(db);
+        assert!(f.d.has_usable_loadout(successor).unwrap(), "the create lifecycle ran on the successor");
+        let drift = f.d.drift_router().read();
+        assert_eq!(drift.get(successor).and_then(|h| h.label.clone()).as_deref(), Some("banto"));
+        assert_eq!(drift.get(f.seat).map(|h| h.state), Some(ContextState::Archived));
+    }
+
+    /// Only the performer rotating itself or the lineage root may rotate;
+    /// a refusal creates nothing. An archived context cannot be rotated.
+    async fn rotate_authority_and_liveness_body() {
+        let f = rotation_fixture().await;
+        let count = || f.d.kernel_db().lock().list_documents().unwrap().len();
+        let before = count();
+        let refused = f.d.dispatch(&[s("context"), s("rotate"), s("banto")], &rotation_caller(f.root, f.coder)).await;
+        assert!(!refused.is_ok(), "coder neither plays the seat nor roots it");
+        assert!(refused.message().contains("lineage root"), "{}", refused.message());
+        assert_eq!(count(), before, "a refusal creates nothing");
+        assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_none());
+
+        let by_root = f.d.dispatch(&[s("context"), s("rotate"), s("banto")], &rotation_caller(f.root, f.amy)).await;
+        assert!(by_root.is_ok(), "the lineage root may rotate: {}", by_root.message());
+
+        let archived = f.d.dispatch(&[s("context"), s("rotate"), f.seat.to_hex()], &rotation_caller(f.root, f.amy)).await;
+        assert!(!archived.is_ok() && archived.message().contains("archived"), "{}", archived.message());
+    }
+
+    /// A root context rotates too: a parentless successor, and the root
+    /// character's pointer moves with it.
+    async fn rotate_a_root_context_body() {
+        let f = rotation_fixture().await;
+        let rotated = f.d.dispatch(&[s("context"), s("rotate"), s("amy")], &rotation_caller(f.root, f.amy)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        let db = f.d.kernel_db().lock();
+        let successor = db.get_character(f.amy).unwrap().unwrap().root_ctx.unwrap();
+        assert_ne!(successor, f.root);
+        let row = db.get_context(successor).unwrap().unwrap();
+        assert_eq!((row.forked_from, row.label.as_deref(), row.played_by), (None, Some("amy"), Some(f.amy)));
+        assert_eq!(db.lineage_root(f.seat).unwrap(), f.amy, "children of the archived root keep their lineage root");
+    }
+
+    /// A successor with no loadout does not take over: the predecessor keeps
+    /// its label, seat, and pointer, and the error names the successor.
+    async fn rotate_without_a_successor_loadout_leaves_the_predecessor_live_body() {
+        let f = rotation_fixture_persisting_bindings(false).await;
+        let refused = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(!refused.is_ok() && refused.message().contains("no loadout"), "{}", refused.message());
+        let db = f.d.kernel_db().lock();
+        let seat = db.get_context(f.seat).unwrap().unwrap();
+        assert!(seat.archived_at.is_none() && seat.promoted_at.is_some());
+        assert_eq!(db.resolve_context("banto").unwrap(), f.seat);
+        assert_eq!(db.get_character(f.banto).unwrap().unwrap().root_ctx, Some(f.seat));
+    }
+
+    #[test]
+    fn rotate_without_a_successor_loadout_leaves_the_predecessor_live() {
+        on_rc_thread(rotate_without_a_successor_loadout_leaves_the_predecessor_live_body);
+    }
+
+    fn on_rc_thread<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
+        crate::spawn_kaish_thread("rc-test-thread", move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn rotate_carries_the_seat_to_its_successor() {
+        on_rc_thread(rotate_carries_the_seat_to_its_successor_body);
+    }
+
+    #[test]
+    fn rotate_authority_and_liveness() {
+        on_rc_thread(rotate_authority_and_liveness_body);
+    }
+
+    #[test]
+    fn rotate_a_root_context() {
+        on_rc_thread(rotate_a_root_context_body);
     }
 
     // Creating through a shell re-enters kaish for rc; use the production rc stack.

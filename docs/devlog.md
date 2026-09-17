@@ -1827,3 +1827,18 @@ which a real kernel can no longer build, so they now hang under a root context
 like production work. `kj context prompt` stopped resolving a reviewer for a
 context with no performer, since the runtime fact names who reviews that
 performer's asks.
+
+Rotation became a verb the same day. The plan said `kj context rotate
+<character>` would read the character's `root_ctx`, but only roots had one,
+and a model's "home seat" pointer would have needed either a new flag or a
+guess. Amy cut the knot: rotate a context, and move a character's pointer
+only when it named that context. The successor copies everything, env
+included, and runs the create lifecycle before it takes over. That lifecycle
+cannot share a transaction with the takeover, so the takeover waits for a
+usable loadout, and a failed successor is left unlabeled beside a predecessor
+that is still live. Writing the test showed that a root context could not pass
+the model-performer self-review check. A root plays its root context and
+confirms its own statements there, so that check now skips roots. The session
+scenario had been booting amy as an ordinary character beside an unrelated
+ephemeral root; it now boots her as the root, and her rotation of banto's seat
+runs through the verb.

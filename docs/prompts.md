@@ -86,13 +86,13 @@ executable only. See `docs/rc-on-disk.md`, "Migrating existing rc trees".
 
 ## Characters and lifecycle observations
 
-`kj context create ROOT-next --type director --cast ops --as banto` records
+`kj context create banto --type director --cast ops --as banto` records
 Banto's principal in `played_by`, while `created_by` remains the requester.
 The character must exist and be live; unknown or retired names fail before
 creating a context. Omitting `--as` leaves `played_by` unset on this `kj` path.
 The caller's acting character becomes its director. The reviewer follows
-explicit context assignment, explicit director-wide delegation, then the
-configured Amy default. Model output and tools use the performer;
+explicit context assignment, explicit director-wide delegation, then the walk
+up `forked_from` (`docs/approval-identity.md`). Model output and tools use the performer;
 the model turn refuses missing or self-reviewing identities. This does not
 load a character rc bundle. See `docs/character.md`, "Current implementation".
 
@@ -109,27 +109,27 @@ reads the last twelve notes. A missing handoff log or predecessor is reported
 as fallback text; these optional scripts do not abort creation. This differs
 from the required instruction-file reads described below.
 
-## Rotating a director context
+## Rotating a context
 
 ```sh
 kj handoff note --for banto 'what happened, what is next'
-kj context create ROOT-next --type director --cast ops --as banto \
-  --env 'ROTATED_FROM=ROOT'
-kj context info ROOT-next --json
-kj context prompt ROOT-next
-kj block list -c ROOT-next
+kj context rotate banto
+kj context prompt banto
 ```
 
-Check that `played_by_name` is `banto`, the expected instructions and handoff
-arrived, and the create lifecycle left a usable loadout. Read any Error blocks
-before replacing the previous context. Then:
+`kj context rotate` creates a successor from the predecessor's own parent. It
+copies the type, cast, performer, director, reviewer override, model, system
+prompt, consent mode, workspace, env, and cwd, sets `ROTATED_FROM` to the
+predecessor's id, and runs the `create` lifecycle. The hydration window is not
+copied; a musician's create lifecycle sets its own. When the successor has a
+usable loadout, one transaction archives the predecessor and gives the
+successor its label, ring seat, and any character's `root_ctx` pointer. When
+it has none, the predecessor stays live, and the error names the unlabeled
+successor so you can read its Error blocks and remove it. The character that
+plays the context or its lineage root may rotate it. A root context rotates
+the same way.
 
-```sh
-kj context archive ROOT --confirm
-kj context rename -c ROOT-next ROOT
-```
-
-`ROTATED_FROM` names the predecessor. Director's `S17-predecessor.kai` reads
+`ROTATED_FROM` names the predecessor. `S17-predecessor.kai` reads
 up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes
 400 --include text`, then emits a notification. This is a bounded excerpt,
 not a complete continuation; it omits tool results and can cut prose. An idle

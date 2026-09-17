@@ -30,12 +30,10 @@
 //!
 //! ## What this does not cover
 //!
-//! - **Rotation by verb** (`docs/character.md`, "Roots and rotation",
-//!   slice 5 — "A model asks to rotate itself") is guidance, not shipped;
-//!   rotation here uses today's documented manual procedure
-//!   (`docs/prompts.md`, "Rotating a director context":
-//!   `kj context create <name>-next --type director --as <character> --env
-//!   'ROTATED_FROM=<name>'`), not a verb a model calls itself.
+//! - **A model rotating itself.** amy runs `kj context rotate banto` as
+//!   banto's lineage root. banto running it from its own turn, and the ask
+//!   a model raises when it lacks that authority (`docs/character.md`,
+//!   "Roots and rotation"), are not exercised.
 //! - **Reviewer resolution walks the context forest.** banto's seat is
 //!   created from amy's own context, so the ask this scenario raises
 //!   resolves to `amy` as the character responsible for that parent, and a
@@ -77,10 +75,9 @@ use common::{run_local, seed_mock_backend_with_model, shell_exec_wait};
 use kaijutsu_client::{
     KernelHandle, KeySource, RpcClient, ServerEvent, SshClient, SshConfig, turn_events_channel,
 };
-use kaijutsu_kernel::kernel_db::CharacterRow;
-use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
+use kaijutsu_server::{SharedKernel, SshServer, SshServerConfig};
 use kaijutsu_types::{BlockKind, BlockQuery, ContextId, PrincipalId, Role, Status};
-use russh::keys::{Algorithm, PrivateKey};
+use russh::keys::PrivateKey;
 
 /// Poll until `check` returns true, or fail loudly — every wait in this
 /// file is on work a background driver does, so a timeout IS the bug
@@ -109,17 +106,6 @@ async fn connect_with_key(addr: std::net::SocketAddr, key: PrivateKey, username:
     let mut client = RpcClient::new(channel.into_stream()).await.expect("RPC client init");
     client.retain_ssh_session(ssh);
     client
-}
-
-fn character_row(principal_id: PrincipalId, name: &str) -> CharacterRow {
-    CharacterRow {
-        principal_id,
-        name: name.to_string(),
-        created_at: kaijutsu_types::now_millis() as i64,
-        retired_at: None,
-        handoff_ctx: None, root_ctx: None,
-        root: false,
-    }
 }
 
 /// Drain the turn push channel until a terminal event for `ctx` arrives,
@@ -189,19 +175,18 @@ async fn boot() -> Scenario {
     // Banto nests `kj drive` inside a tool call. The kernel worker uses
     // spawn_kaish_thread to reserve enough stack for this rc recursion.
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let auth_db_path = tmp.path().join("auth.db");
-    let amy_principal = PrincipalId::new();
-    let amy_key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519).expect("key");
-    let auth_db = AuthDb::open(&auth_db_path).expect("open auth db");
-    auth_db
-        .add_key(amy_principal, amy_key.public_key(), Some("amy"))
-        .expect("bind amy's key");
-
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let mut config = SshServerConfig::ephemeral(addr.port());
-    config.auth_db_path = Some(auth_db_path);
+    // amy is the kernel's root character, as `kaijutsu-server init` makes
+    // her, so she is the lineage root of every seat created from her work.
+    let config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
+    let amy_key = (*config.root_key()).clone();
+    let amy_principal = kaijutsu_kernel::KernelDb::open(config.data_dir.as_ref().expect("ephemeral data dir").join("kernel.db"))
+        .expect("open the ephemeral kernel.db")
+        .get_character_by_name("amy")
+        .expect("read amy's sheet")
+        .expect("init created amy")
+        .principal_id;
     if let Some(ref data_dir) = config.data_dir {
         seed_mock_backend_with_model(data_dir, "mock-model");
     }
@@ -245,12 +230,6 @@ async fn boot() -> Scenario {
         }
     });
     let kernel = kernel_rx.await.expect("server dropped the kernel handle");
-
-    kernel
-        .kernel_db
-        .lock()
-        .insert_character(&character_row(amy_principal, "amy"))
-        .expect("seed amy's character sheet");
 
     let amy_client = connect_with_key(addr, amy_key, "amy").await;
     let (amy, _) = amy_client.bind_kernel().await.expect("bind_kernel");
@@ -627,12 +606,19 @@ fn kaijutsu_session_scenario() {
         );
 
         // ------------------------------------------------------------
-        // Rotation: today's documented manual procedure
-        // (`docs/prompts.md`, "Rotating a director context").
+        // Rotation (`docs/prompts.md`, "Rotating a context").
         // ------------------------------------------------------------
-        s.kj("kj context create banto-next --type director --as banto --env 'ROTATED_FROM=banto'")
-            .await;
-        let banto_next_ctx = s.context_by_label("banto-next");
+        let rotated = s.kj("kj context rotate banto").await;
+        assert!(rotated.contains("rotated banto"), "rotate reports the replacement, got: {rotated}");
+        let banto_next_ctx = s.context_by_label("banto");
+        assert_ne!(banto_next_ctx, banto_ctx, "the label follows the live successor");
+        {
+            let db = s.kernel.kernel_db.lock();
+            assert!(db.get_context(banto_ctx).unwrap().unwrap().archived_at.is_some(), "the predecessor is archived");
+            let successor = db.get_context(banto_next_ctx).unwrap().unwrap();
+            assert_eq!(successor.played_by, Some(banto_principal));
+            assert_eq!(successor.context_type, "director");
+        }
 
         // `S16-handoff.kai` injects the handoff tail as a `Notification`
         // block, not into the hydrated instruction text `kj context prompt`

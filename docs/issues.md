@@ -370,11 +370,11 @@ slice green and committed:
    to any live root. `approval.toml` and its cache table are gone. Shipped
    2026-09-17. Hosts keep a stale `/config/kernel/approval.toml`; delete it
    by hand.
-6. **Rotation reads `root_ctx`.** `kj context rotate <character>`: creates
-   the successor from the predecessor's own parent with the same type, cast,
-   and performer, sets `ROTATED_FROM`, moves the pointer, archives the
-   predecessor, in one transaction. `docs/prompts.md`, "Rotating a director
-   context" changes to the verb.
+6. **`kj context rotate [<context>]`.** Shipped 2026-09-17. Amy chose to
+   rotate a context rather than a character, to copy everything including
+   env, and to let the performer or the lineage root rotate. Unverified: a
+   model rotating its own seat from inside a live turn archives the context
+   that turn is still writing to.
 7. **`create --as` asks instead of refusing.** Apply the held patch
    (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`),
    turn its refusal into an ask to the responsible character above, and
@@ -433,12 +433,11 @@ draft/shell RPC read the identifier the doc names. Open:
    `kj context set --as` needs Operator plus reviewer authority. A patch
    that gates `create --as` the same way exists
    (`~/exomemory/kaijutsu/patches/2026-09-15-context-create-as-gated.patch`)
-   and is held back: it refuses the documented director self-rotation,
-   `kj context create ROOT-next --type director --as banto` from a live
-   model turn (`docs/prompts.md`, "Rotating a director context"), which is
-   neither rc-privileged nor the default reviewer. Amy decides: exempt a
-   caller casting itself into a new context, grant banto a delegation, or
-   accept the tightening and change the docs.
+   and is held back: it refused the director self-rotation, which was
+   `kj context create ... --as banto` from a live model turn. Since
+   2026-09-17 a seat rotates itself with `kj context rotate`, which allows
+   the performer, so that objection is gone. Slice 7 still decides whether
+   a refused `create --as` raises an ask.
 
 Verified by `crates/kaijutsu-server/tests/user_input_identity.rs`: a human
 with nobody responsible above her runs a gated shell command, the ask

@@ -4174,6 +4174,33 @@ impl KernelDb {
         Ok(updated > 0)
     }
 
+    /// Finish a rotation in one transaction: archive `predecessor`, give
+    /// `successor` its label and ring placement, and move every character's
+    /// `root_ctx` pointer from one to the other. Returns how many pointers
+    /// moved. A predecessor that is missing or already archived refuses.
+    pub fn commit_rotation(&self, predecessor: ContextId, successor: ContextId) -> KernelDbResult<usize> {
+        self.in_transaction(|db| {
+            let row = db.get_context(predecessor)?.ok_or_else(|| {
+                KernelDbError::NotFound(format!("context {}", predecessor.short()))
+            })?;
+            if !db.archive_context(predecessor)? {
+                return Err(KernelDbError::Validation(format!(
+                    "context {} was archived before the rotation finished",
+                    predecessor.short()
+                )));
+            }
+            db.conn.execute(
+                "UPDATE contexts SET label = ?1, promoted_at = ?2, demoted_at = ?3 WHERE context_id = ?4",
+                params![row.label, row.promoted_at, row.demoted_at, blob_param(successor.as_bytes())],
+            )?;
+            let moved = db.conn.execute(
+                "UPDATE characters SET root_ctx = ?1 WHERE root_ctx = ?2",
+                params![blob_param(successor.as_bytes()), blob_param(predecessor.as_bytes())],
+            )?;
+            Ok(moved)
+        })
+    }
+
     /// Update the lifecycle state of a context.
     pub fn update_context_state(
         &self,
