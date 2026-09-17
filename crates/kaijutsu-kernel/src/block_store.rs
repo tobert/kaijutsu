@@ -644,7 +644,7 @@ impl BlockStore {
                 }
 
                 if let Some(payload) = unjournaled {
-                    self.journal_op(context_id, &entry, payload)?;
+                    self.journal_op(context_id, &entry, payload, |_| Ok(()))?;
                 }
                 self.recompute_live_status(context_id, &[snapshot.status]);
                 let _entry = vacant.insert(entry);
@@ -1042,6 +1042,15 @@ impl BlockStore {
         entry: &mut DocumentEntry,
         mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
     ) -> BlockStoreResult<T> {
+        self.accept_locked_recorded(context_id, entry, mutate, |_, _| Ok(()))
+    }
+
+    /// Record related kernel state in the same transaction as the block journal.
+    fn accept_locked_recorded<T>(
+        &self, context_id: ContextId, entry: &mut DocumentEntry,
+        mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
+        record: impl FnOnce(&KernelDb, &T) -> crate::kernel_db::KernelDbResult<()>,
+    ) -> BlockStoreResult<T> {
         #[cfg(test)]
         if self.fail_accept_countdown.fetch_update(
             std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst,
@@ -1060,7 +1069,7 @@ impl BlockStore {
                 return Err(error);
             }
         };
-        if let Err(error) = self.journal_op(context_id, entry, payload) {
+        if let Err(error) = self.journal_op(context_id, entry, payload, |db| record(db, &result)) {
             self.live_status.remove(&context_id);
             tracing::error!(%context_id, %error, "document acceptance failed; restart required");
             return Err(error);
@@ -1078,6 +1087,7 @@ impl BlockStore {
         context_id: ContextId,
         entry: &DocumentEntry,
         payload: SyncPayload,
+        record: impl FnOnce(&KernelDb) -> crate::kernel_db::KernelDbResult<()>,
     ) -> BlockStoreResult<()> {
         #[cfg(test)]
         {
@@ -1097,6 +1107,7 @@ impl BlockStore {
         let stamp = now - entry.activity_stamped_at.load(Ordering::SeqCst) >= ACTIVITY_STAMP_INTERVAL_MS;
         db.lock().in_transaction(|db| {
             db.append_op(context_id, seq as i64, &payload_bytes)?;
+            record(db)?;
             if stamp { db.touch_context_activity(context_id, now)?; }
             Ok(())
         }).map_err(|e| BlockStoreError::Db(e.to_string()))?;
@@ -1312,6 +1323,51 @@ impl BlockStore {
         })
     }
 
+    /// Accept a shell operation's pair, receipt and optional ask link together.
+    pub(crate) fn start_shell_operation(
+        &self, start: crate::shell_operations::ShellOperationStart<'_>,
+    ) -> BlockStoreResult<crate::shell_operations::ShellOperationReceipt> {
+        // A receipt is durable kernel state; a replica cannot own one.
+        if self.journaling_db()?.is_none() { return Err(BlockStoreError::NoDatabaseConfigured); }
+        let context = start.context;
+        let id = uuid::Uuid::now_v7().to_string();
+        let status = if start.ask.is_some() { Status::Waiting } else { Status::Running };
+        let mut entry = self.get_mut(context).ok_or(BlockStoreError::DocumentNotFound(context))?;
+        if let Some(receipt) = start.existing(&self.db.as_ref().expect("receipt setup requires a database").lock())
+            .map_err(|error| BlockStoreError::Db(error.to_string()))? {
+            return Ok(receipt);
+        }
+        self.accept_locked_recorded(context, &mut entry, |entry| {
+            let after = entry.doc.block_ids_ordered().last().copied();
+            entry.doc.set_principal_id(start.actor);
+            let command = entry.doc.insert_tool_call(None, after.as_ref(), start.tool,
+                start.input.clone(), Some(start.kind), Some(start.role))?;
+            entry.doc.set_status(&command, status)?;
+            entry.doc.set_excluded(&command, start.excluded)?;
+            entry.doc.set_principal_id(PrincipalId::system());
+            let output = entry.doc.insert_tool_result_block(&command, Some(&command), "", false, None, Some(start.kind))?;
+            entry.doc.set_status(&output, status)?;
+            entry.doc.set_excluded(&output, start.excluded)?;
+            entry.touch(start.actor);
+            let version = entry.version();
+            let command_snapshot = entry.doc.get_block_snapshot(&command).expect("inserted command exists");
+            let output_snapshot = entry.doc.get_block_snapshot(&output).expect("inserted result exists");
+            let mut payload = SyncPayload::from_new_block(command_snapshot.clone());
+            payload.new_blocks.push(output_snapshot.clone());
+            let events = vec![
+                BlockFlow::Inserted { context_id: context, block: Arc::new(command_snapshot), after_id: after,
+                    version, source: OpSource::Local },
+                BlockFlow::Inserted { context_id: context, block: Arc::new(output_snapshot), after_id: Some(command),
+                    version, source: OpSource::Local },
+            ];
+            let receipt = crate::shell_operations::ShellOperationReceipt {
+                operation_id: id, context_id: context, command_block_id: command, output_block_id: output,
+                ask_id: start.ask.map(|(ask, _)| ask.to_owned()), job_id: None,
+            };
+            Ok((payload, events, receipt))
+        }, |db, receipt| start.record(db, receipt))
+    }
+
     /// Insert a tool result block into a document.
     pub fn insert_tool_result(
         &self,
@@ -1398,13 +1454,20 @@ impl BlockStore {
         })
     }
 
-    /// Commit a tool result's content, error flag and both pair statuses together.
+    /// Commit a model tool result and both statuses, linking its ask before
+    /// publishing Waiting. A failed link rolls back the result acceptance.
     pub(crate) fn settle_tool_result_as(
         &self, context_id: ContextId, call: &BlockId, result: &BlockId,
         content: &str, status: Status, is_error: bool, author: PrincipalId,
         styles: Option<(Vec<kaijutsu_types::StyleSpan>, kaijutsu_types::ProvenanceTag)>,
+        ask: Option<&str>,
     ) -> BlockStoreResult<()> {
-        self.accept(context_id, |entry| {
+        let ask = if status == Status::Waiting {
+            if self.journaling_db()?.is_none() { return Err(BlockStoreError::NoDatabaseConfigured); }
+            Some(ask.ok_or_else(|| BlockStoreError::Validation("waiting tool result has no ask".into()))?)
+        } else { None };
+        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        self.accept_locked_recorded(context_id, &mut entry, |entry| {
             let command = entry.doc.get_block_header(call).ok_or_else(|| BlockStoreError::Validation("tool call is missing".into()))?;
             let output = entry.doc.get_block_snapshot(result).ok_or_else(|| BlockStoreError::Validation("tool result is missing".into()))?;
             if command.kind != BlockKind::ToolCall || output.kind != BlockKind::ToolResult
@@ -1435,6 +1498,9 @@ impl BlockStore {
                     provenance: Some(tag), version, source: OpSource::Local });
             }
             Ok((payload, events, ()))
+        }, |db, ()| {
+            if let Some(ask) = ask { db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?; }
+            Ok(())
         })
     }
 
@@ -6003,7 +6069,7 @@ mod tests {
         assert_eq!(block.status, Status::Running, "never publish an empty completed result");
         store.arm_accept_fault(1);
         assert!(store.settle_tool_result_as(context, &call, &result, "失敗", Status::Error, true,
-            PrincipalId::system(), None).is_err());
+            PrincipalId::system(), None, None).is_err());
         assert!(events.try_recv().is_none(), "refused acceptance publishes no partial result");
         for id in [&call, &result] { assert_eq!(store.get_block_snapshot(context, id).unwrap().unwrap().status, Status::Running); }
         assert_eq!(store.get_block_snapshot(context, &result).unwrap().unwrap().content, "");
@@ -6011,7 +6077,7 @@ mod tests {
         let projection = crate::ansi_ingest::project(raw.as_bytes()).unwrap();
         let styles = crate::ansi_ingest::prepare_metadata(&store, &result, projection.spans, raw.as_bytes());
         store.settle_tool_result_as(context, &call, &result, &projection.text, Status::Error, true,
-            PrincipalId::system(), styles).unwrap();
+            PrincipalId::system(), styles, None).unwrap();
         let accepted: Vec<_> = std::iter::from_fn(|| events.try_recv()).map(|event| event.payload).collect();
         assert_eq!(accepted.len(), 5);
         assert!(matches!(&accepted[1], BlockFlow::SpansChanged { .. }), "style precedes terminal status");

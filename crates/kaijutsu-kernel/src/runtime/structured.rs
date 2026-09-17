@@ -4,7 +4,9 @@ use std::sync::Arc;
 use futures::FutureExt;
 use tracing::Instrument;
 use tokio_util::sync::CancellationToken;
-use kaijutsu_types::{BlockId, PrincipalId, Refusal, Role, Status, ToolKind};
+use kaijutsu_types::{BlockId, Refusal, Role, ToolKind};
+#[cfg(test)]
+use kaijutsu_types::{PrincipalId, Status};
 use crate::Kernel;
 use super::command::{self, CommandContextSwitch, CommandRunOptions};
 use super::command_outcome::{CommandExecution, CommandHookEffect, CommandOutcome};
@@ -78,16 +80,12 @@ async fn run_kj(
     let mut code = String::from("kj");
     for arg in argv { code.push(' '); code.push_str(&kaish_quote(arg)); }
     let pair = if quiet { None } else {
-        let last = documents.last_block_id(context);
-        let command = documents.insert_tool_call_as(context, None, last.as_ref(), "kj",
-            serde_json::json!({"argv": argv}), Some(ToolKind::Builtin), Some(identity.performer), None, Some(Role::User))
-            .map_err(|e| e.to_string())?;
-        let output = documents.insert_tool_result_as(context, &command, Some(&command), "", Status::Done, None,
-            Some(ToolKind::Builtin), Some(PrincipalId::system()), None).map_err(|e| e.to_string())?;
-        let epoch = kernel.kernel_db().lock().continuation_epoch(context).map_err(|e| e.to_string())?;
-        kernel.shell_operations().register(context, identity.requester, identity.performer, command, output, &code, epoch)?;
-        documents.set_status(context, &output, Status::Running).map_err(|e| e.to_string())?;
-        Some((command, output))
+        let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+            context, principal: identity.requester, actor: identity.performer, source: &code,
+            tool: "kj", input: serde_json::json!({"argv": argv}), kind: ToolKind::Builtin,
+            role: Role::User, excluded: false, ask: None,
+        }).map_err(|error| error.to_string())?;
+        Some((receipt.command_block_id, receipt.output_block_id))
     };
     let call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
         .with_actor(identity.performer, identity.reviewer);
@@ -164,7 +162,7 @@ mod tests {
 
     async fn fixture() -> (Arc<crate::kj::KjDispatcher>, ShellIdentity) {
         use crate::vfs::VfsOps;
-        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher().await);
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
         dispatcher.set_self_arc();
         let kernel = dispatcher.kernel();
         kernel.broker().set_kj_dispatcher(&dispatcher).await;
@@ -295,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn structured_execution_preserves_literal_arguments_and_distinct_identities() {
-        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher().await);
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
         dispatcher.set_self_arc();
         let kernel = dispatcher.kernel();
         kernel.broker().set_kj_dispatcher(&dispatcher).await;

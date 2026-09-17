@@ -2022,6 +2022,22 @@ Fault injection, real nonzero shell exits, and an SSH completion test cover the
 contract. Receipt registration and approval linkage still need their separate
 ownership transfer; consistent error flags do not close that handoff.
 
+Shell operation setup now accepts its command/output pair, receipt and optional
+ask link in one kernel.db transaction. Separate writes had left live-looking
+pairs after registration failed. The same acceptance path serves interactive
+commands, structured kj, background shells and pending model receipts; both
+blocks publish with their initial status, authorship and exclusion already set.
+Waiting model results also require their ask link in the result transaction,
+replacing the best-effort link after publication. Failed writes keep the existing
+fail-closed document policy: no events publish, and durable reload is required.
+
+A repeated setup for the same ask returns the existing receipt under the
+context's document guard; a different source or identity refuses before
+mutation. A regression first reproduced the unique-constraint failure on retry.
+Receipt tests now use one database for the registry and journal, matching
+production; database-free fixtures cannot prove this transaction. Session
+refusal linkage and approval execution/delivery ownership remain separate work.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

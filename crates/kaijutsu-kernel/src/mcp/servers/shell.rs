@@ -298,22 +298,9 @@ impl McpServerLike for ShellServer {
                 };
                 if kind == RefusalKind::Pending && !parsed.foreground {
                     let ask = outcome.ask.as_ref().expect("a pending gate outcome has an ask");
-                    let receipt = crate::runtime::tool_command::create_operation(
-                        dispatcher.kernel(), ctx, &parsed.command, kaijutsu_types::Status::Waiting,
+                    crate::runtime::tool_command::create_operation(
+                        dispatcher.kernel(), ctx, &parsed.command, Some(&ask.request_id),
                     ).map_err(McpError::Protocol)?;
-                    dispatcher.kernel().shell_operations().mark_waiting(
-                        &receipt.operation_id, &ask.request_id,
-                    ).map_err(|error| McpError::Protocol(format!(
-                        "mark waiting shell operation: {error}"
-                    )))?;
-                    dispatcher.kernel_db().lock().link_ask_blocks(
-                        &ask.request_id,
-                        &receipt.command_block_id,
-                        &receipt.output_block_id,
-                        crate::PairOwner::Turn,
-                    ).map_err(|error| McpError::Protocol(format!(
-                        "link waiting shell operation to ask: {error}"
-                    )))?;
                 }
                 if kind == RefusalKind::Pending && !parsed.foreground {
                     let receipt = dispatcher.kernel().shell_operations().get_by_ask(
@@ -367,7 +354,7 @@ impl McpServerLike for ShellServer {
 mod tests {
     use super::*;
     use crate::kernel_db::ContextShellRow;
-    use crate::kj::test_helpers::{register_context, test_caller, test_dispatcher};
+    use crate::kj::test_helpers::{register_context, test_caller, test_dispatcher_persistent};
     use crate::mcp::binding::{Capability, ContextToolBinding};
     use crate::mcp::{InstancePolicy, KernelCallParams};
     use kaijutsu_types::{ContextId, PrincipalId, SessionId};
@@ -469,7 +456,7 @@ mod tests {
     /// (`set_self_arc` + `set_kj_dispatcher`), so facade gating across the two
     /// can be exercised together.
     async fn wired() -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
-        let d = Arc::new(test_dispatcher().await);
+        let d = Arc::new(test_dispatcher_persistent().await);
         d.set_self_arc();
         let broker = Arc::new(Broker::new());
         broker.set_kj_dispatcher(&d).await;

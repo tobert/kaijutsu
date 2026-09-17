@@ -1209,8 +1209,18 @@ pub(crate) mod test_helpers {
     pub async fn test_dispatcher_with_timeouts(
         policy: kaijutsu_types::TimeoutPolicy,
     ) -> KjDispatcher {
+        test_dispatcher_with_storage(policy, false).await
+    }
+
+    /// Exercise receipt/journal transactions against the same database.
+    pub async fn test_dispatcher_persistent() -> KjDispatcher {
+        test_dispatcher_with_storage(kaijutsu_types::TimeoutPolicy::default(), true).await
+    }
+
+    async fn test_dispatcher_with_storage(
+        policy: kaijutsu_types::TimeoutPolicy, persistent: bool,
+    ) -> KjDispatcher {
         let drift = shared_drift_router();
-        let blocks = shared_block_store(PrincipalId::system());
         let kernel_db = Arc::new(parking_lot::Mutex::new(
             KernelDb::temporary().expect("temporary KernelDb"),
         ));
@@ -1229,6 +1239,12 @@ pub(crate) mod test_helpers {
             })
             .unwrap();
         }
+        let blocks = if persistent {
+            let workspace = kernel_db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            shared_block_store_with_db(kernel_db.clone(), workspace, PrincipalId::system())
+        } else {
+            shared_block_store(PrincipalId::system())
+        };
         // One throwaway root holds BOTH the kernel data_dir and the seeded
         // /config/rc tree, so the kernel's cleanup guard removes them together when
         // the dispatcher (and its kernel) drops — no leaked `/tmp` dirs across
@@ -1246,11 +1262,7 @@ pub(crate) mod test_helpers {
                 .with_timeouts(policy)
                 .with_temp_cleanup(root.clone()),
         );
-        // Mount a host-backed /config/rc tree (LocalBackend). `kj rc` is now
-        // VFS-direct, so it works over either backend; this keeps the broadly-
-        // used dispatcher db-less (a DB-backed block store deadlocks unrelated
-        // fork tests — see test_dispatcher_rc). The document-backed backend is
-        // covered by its own unit tests + test_dispatcher_rc.
+        // Rc tests use host files; receipt tests also journal their block store.
         kernel
             .mount(RC_ROOT, crate::vfs::LocalBackend::new(&rc_tmp))
             .await;

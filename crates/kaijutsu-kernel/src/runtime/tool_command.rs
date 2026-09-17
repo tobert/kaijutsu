@@ -2,7 +2,7 @@
 //! result hooks when execution finishes and settles its optional receipt.
 
 use std::sync::Arc;
-use kaijutsu_types::{ContentType, PrincipalId, Role, BlockKind, Status};
+use kaijutsu_types::Role;
 use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -14,17 +14,14 @@ use super::command_result::shell_envelope_to_tool_result;
 use super::embedded_kaish::EmbeddedKaish;
 
 pub(crate) fn create_operation(
-    kernel: &crate::Kernel, call: &CallContext, source: &str, status: Status,
+    kernel: &crate::Kernel, call: &CallContext, source: &str, ask: Option<&str>,
 ) -> Result<ShellOperationReceipt, String> {
-    let blocks = kernel.blocks();
-    let command = blocks.insert_block_as(call.context_id, None, None, Role::Tool, BlockKind::ToolCall,
-        source, status, ContentType::Plain, Some(call.actor_id)).map_err(|e| e.to_string())?;
-    let output = blocks.insert_block_as(call.context_id, Some(&command), Some(&command), Role::Tool,
-        BlockKind::ToolResult, String::new(), status, ContentType::Plain, Some(PrincipalId::system()))
-        .map_err(|e| e.to_string())?;
-    for block in [&command, &output] { blocks.set_excluded(call.context_id, block, true).map_err(|e| e.to_string())?; }
-    let epoch = kernel.kernel_db().lock().continuation_epoch(call.context_id).map_err(|e| e.to_string())?;
-    kernel.shell_operations().register(call.context_id, call.principal_id, call.actor_id, command, output, source, epoch)
+    kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+        context: call.context_id, principal: call.principal_id, actor: call.actor_id,
+        source, tool: "shell", input: serde_json::json!({"command": source}),
+        kind: kaijutsu_types::ToolKind::Shell, role: Role::Tool, excluded: true,
+        ask: ask.map(|ask| (ask, crate::PairOwner::Turn)),
+    }).map_err(|error| error.to_string())
 }
 
 pub(crate) struct ToolCommand {
@@ -42,7 +39,7 @@ pub(crate) struct ToolCommand {
 impl ToolCommand {
     pub(crate) async fn execute(self, cancel: CancellationToken) -> McpResult<KernelToolResult> {
         let receipt = if self.foreground { None } else {
-            Some(create_operation(&self.kernel, &self.call, &self.code, Status::Running).map_err(McpError::Protocol)?)
+            Some(create_operation(&self.kernel, &self.call, &self.code, None).map_err(McpError::Protocol)?)
         };
         let policy = self.broker.policy_of(&self.params.instance).await.unwrap_or_default();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -129,4 +126,113 @@ impl ToolCommand {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use kaijutsu_types::{ContextId, PrincipalId, Status};
+
+    async fn fixture() -> (tempfile::TempDir, crate::Kernel, ContextId) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(parking_lot::Mutex::new(crate::KernelDb::open(dir.path().join("kernel.db")).unwrap()));
+        let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let flows = Arc::new(crate::flows::FlowBus::new(64));
+        let blocks = Arc::new(crate::block_store::BlockStore::with_db_and_flows(db.clone(), workspace, PrincipalId::system(), flows.clone()));
+        let kernel = crate::Kernel::with_flows(kaijutsu_types::KernelId::new(), "operation-setup", flows, dir.path(), blocks, db).await;
+        let context = ContextId::new();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        (dir, kernel, context)
+    }
+
+    #[tokio::test]
+    async fn operation_registration_failure_publishes_no_partial_pair() {
+        let (_dir, kernel, context) = fixture().await;
+        let mut events = kernel.block_flows().subscribe("block.*");
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER reject_operation BEFORE INSERT ON shell_operations
+             BEGIN SELECT RAISE(FAIL, 'injected operation registration fault'); END;"
+        ).unwrap();
+        let call = CallContext::new(PrincipalId::new(), context, kaijutsu_types::SessionId::new(), kernel.id());
+        let error = create_operation(&kernel, &call, "echo never-run", None).unwrap_err();
+        assert!(error.contains("injected operation registration fault"), "{error}");
+        assert!(events.try_recv().is_none(), "registration failure must not publish a partial pair");
+        assert!(kernel.shell_operations().list_for_context(context).unwrap().is_empty());
+        let db = kernel.blocks().db().unwrap().clone();
+        let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
+        restored.load_from_db().unwrap();
+        assert!(restored.block_snapshots(context).unwrap().is_empty(), "failed setup must not survive replay");
+    }
+    #[tokio::test]
+    async fn operation_pair_receipt_and_ask_link_commit_together() {
+        use approval_ledger::ask::create_ask;
+        use approval_ledger::types::{NewAsk, Origin};
+        for fault in [None, Some("link"), Some("journal")] {
+            let (_dir, kernel, context) = fixture().await;
+            let requester = PrincipalId::new();
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let call = CallContext::new(requester, context, kaijutsu_types::SessionId::new(), kernel.id())
+                .with_actor(actor, Some(reviewer));
+            let ask = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: requester.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "captured command".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some("echo captured".into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            if let Some(fault) = fault {
+                let sql = match fault {
+                    "link" => "CREATE TRIGGER reject_link BEFORE UPDATE OF command_block_id ON approvals BEGIN SELECT RAISE(FAIL, 'injected link fault'); END;",
+                    _ => "CREATE TRIGGER reject_journal BEFORE INSERT ON oplog BEGIN SELECT RAISE(FAIL, 'injected journal fault'); END;",
+                };
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(sql).unwrap();
+            }
+            let mut events = kernel.block_flows().subscribe("block.*");
+            let result = create_operation(&kernel, &call, "echo captured", Some(&ask));
+            let db = kernel.blocks().db().unwrap().clone();
+            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
+            restored.load_from_db().unwrap();
+            let blocks = restored.block_snapshots(context).unwrap();
+            let linked: (Option<String>, Option<String>, Option<String>) = kernel.kernel_db().lock().conn_for_ledger()
+                .query_row("SELECT command_block_id,output_block_id,pair_owner FROM approvals WHERE request_id=?1",
+                    [&ask], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            if let Some(fault) = fault {
+                assert!(result.unwrap_err().contains(&format!("injected {fault} fault")));
+                assert!(events.try_recv().is_none());
+                assert!(blocks.is_empty());
+                assert!(kernel.shell_operations().list_for_context(context).unwrap().is_empty());
+                assert_eq!(linked, (None, None, None));
+            } else {
+                let receipt = result.unwrap();
+                assert_eq!(linked, (Some(receipt.command_block_id.to_key()), Some(receipt.output_block_id.to_key()), Some("turn".into())));
+                assert_eq!(blocks.len(), 2);
+                assert!(blocks.iter().all(|block| block.status == Status::Waiting && block.excluded));
+                let command = blocks.iter().find(|block| block.id == receipt.command_block_id).unwrap();
+                let output = blocks.iter().find(|block| block.id == receipt.output_block_id).unwrap();
+                assert_eq!(command.id.principal_id, actor);
+                assert_eq!(output.id.principal_id, PrincipalId::system());
+                assert_eq!(output.tool_call_id, Some(command.id));
+                let saved = kernel.shell_operations().get_by_ask(&ask, context).unwrap().unwrap();
+                assert_eq!(saved.receipt.operation_id, receipt.operation_id);
+                assert_eq!(saved.source, "echo captured");
+                let crate::flows::BlockFlow::Inserted { version: first, block, .. } = events.try_recv().unwrap().payload else { panic!("command insert") };
+                assert_eq!(block.status, Status::Waiting);
+                let crate::flows::BlockFlow::Inserted { version: second, block, .. } = events.try_recv().unwrap().payload else { panic!("result insert") };
+                assert_eq!(block.status, Status::Waiting);
+                assert_eq!(first, second);
+                assert!(events.try_recv().is_none(), "pair is published once with its final setup metadata");
+                let repeated = create_operation(&kernel, &call, "echo captured", Some(&ask)).unwrap();
+                assert_eq!(repeated.operation_id, receipt.operation_id, "retry must retain its original owner");
+                assert!(events.try_recv().is_none());
+                assert!(create_operation(&kernel, &call, "echo changed", Some(&ask)).is_err());
+                assert_eq!(kernel.blocks().block_snapshots(context).unwrap().len(), 2,
+                    "conflicting setup must reject before mutating or poisoning the document");
+            }
+        }
+    }
+
 }

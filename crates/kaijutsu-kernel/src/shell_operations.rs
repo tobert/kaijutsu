@@ -9,6 +9,7 @@ use kaish_kernel::scheduler::{JobId, JobManager};
 use parking_lot::Mutex;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use uuid::Uuid;
 
 use crate::kernel_db::KernelDb;
@@ -24,6 +25,56 @@ pub struct ShellOperationReceipt {
     pub output_block_id: BlockId,
     pub ask_id: Option<String>,
     pub job_id: Option<String>,
+}
+
+/// The command pair and durable owner accepted before execution or waiting.
+pub(crate) struct ShellOperationStart<'a> {
+    pub context: ContextId,
+    /// The requester is recorded on the receipt; the performer authors the command.
+    pub principal: PrincipalId,
+    pub actor: PrincipalId,
+    pub source: &'a str,
+    pub tool: &'a str,
+    pub input: serde_json::Value,
+    pub kind: kaijutsu_types::ToolKind,
+    pub role: kaijutsu_types::Role,
+    pub excluded: bool,
+    pub ask: Option<(&'a str, crate::PairOwner)>,
+}
+
+impl ShellOperationStart<'_> {
+    /// The caller holds the context's document guard, serializing setup retries.
+    pub(crate) fn existing(&self, db: &KernelDb) -> crate::kernel_db::KernelDbResult<Option<ShellOperationReceipt>> {
+        let Some((ask, _)) = self.ask else { return Ok(None); };
+        let prior = db.conn_for_ledger().query_row(&format!("{SELECT_STATE} WHERE ask_id=?1"),
+            [ask], decode_state).optional()?;
+        let Some(prior) = prior else { return Ok(None); };
+        let same_identity: bool = db.conn_for_ledger().query_row(
+            "SELECT principal_id=?2 AND actor_id=?3 FROM shell_operations WHERE operation_id=?1",
+            rusqlite::params![prior.receipt.operation_id, self.principal.as_bytes(), self.actor.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if prior.receipt.context_id != self.context || prior.source != self.source || !same_identity {
+            return Err(crate::kernel_db::KernelDbError::Validation("ask already owns a different shell operation".into()));
+        }
+        Ok(Some(prior.receipt))
+    }
+
+    pub(crate) fn record(&self, db: &KernelDb, receipt: &ShellOperationReceipt) -> crate::kernel_db::KernelDbResult<()> {
+        let epoch = db.continuation_epoch(self.context)?;
+        db.conn_for_ledger().execute(
+            "INSERT INTO shell_operations(operation_id,context_id,principal_id,actor_id,
+             command_block_id,output_block_id,source,continuation_epoch,ask_id,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![receipt.operation_id, self.context.as_bytes(), self.principal.as_bytes(), self.actor.as_bytes(),
+                receipt.command_block_id.to_key(), receipt.output_block_id.to_key(), self.source, epoch,
+                receipt.ask_id, kaijutsu_types::now_millis() as i64],
+        )?;
+        if let Some((ask, owner)) = self.ask {
+            db.link_ask_blocks(ask, &receipt.command_block_id, &receipt.output_block_id, owner)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,8 +193,9 @@ impl ShellOperationRegistry {
         self.managers.lock().entry(context).or_insert_with(|| Arc::new(JobManager::new())).clone()
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn register(
+    pub(crate) fn register(
         &self, context: ContextId, principal: PrincipalId, actor: PrincipalId,
         command: BlockId, output: BlockId, source: &str, epoch: Option<i64>,
     ) -> OperationResult<ShellOperationReceipt> {

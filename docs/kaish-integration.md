@@ -207,7 +207,12 @@ These are source observations, not promises that all paths behave alike.
   A requested hard cancel takes priority over a ready chunk, error or EOF.
   Generic status writes also synchronize the tool-result error flag, including
   command outcomes and client completion; metadata precedes terminal status.
-  Approval linkage and receipt ownership transfer remain open.
+  Waiting results link the ask in the same acceptance as their content and
+  statuses. Initial shell pairs, receipts and optional ask links also commit
+  together, including interactive, structured, background and pending-model
+  setup. Retrying an ask reuses its receipt; conflicting source or identity
+  fails before mutation. Session refusal linkage and approval-driver ownership
+  transfer remain open.
 - Timed `kj drive --track <name> --score-at <tick>` pairs a turn lease with
   timeline-owned preparation before model work starts. Rc chooses the target
   and fallback; runtime validates complete performer-authored ABC and retains

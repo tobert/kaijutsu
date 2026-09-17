@@ -1398,17 +1398,21 @@ a fork and teaches nothing the first copy didn't. Fix has to keep the
 standalone-error path (when the parent's tool result already flushed) and
 skip only the duplicate — a judgment call, not mechanical.
 
-## Receipt setup ownership
+## Approval transfer after operation setup
 
-`pending_shell_operation_receipt` records Waiting before receipt registration
-and ask linkage finish. A failure there can leave a Waiting pair without its
-intended receipt owner. Turn cleanup deliberately preserves Waiting; the
-receipt/approval settlement audit must retain setup ownership through transfer,
-including its separate initial pair writes. `link_waiting_pair_to_ask` also
-still logs linkage failures after publishing Waiting. Make the transfer and
-retry owner explicit before declaring model settlement migrated. Runtime
-interactive/structured/approval setup still has separate initial pair writes;
-the new explicit initial-status parameter does not close those ownership gaps.
+Initial command/output pairs, shell receipts and an optional ask link now commit
+together. Model Waiting results also link their ask in the result acceptance;
+failed registration or linkage publishes no partial Waiting pair. Repeated
+setup for the same ask reuses the receipt; conflicting source or identity is
+rejected before document mutation.
+
+Session pre-call refusals still use `settle_outcome` before a separate ask link,
+and command settlement writes its output fields and statuses separately.
+The approval path's `author_pair_for_ask` still writes its initial pair in two
+acceptances. Close these handoffs before declaring approval settlement migrated.
+The ledger can expose an answer before its original caller finishes linking
+blocks; driver admission and setup must agree on when ownership is transferable.
+Audit link replacement and ask/context/actor validation together with that race.
 
 ## Asks vs forms — decision open (2026-08-22)
 

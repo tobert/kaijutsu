@@ -1082,18 +1082,10 @@ struct ToolDispatch {
     content: String,
     is_error: bool,
     status: Status,
-    /// The error to author as a `system/error` child of the `ToolResult`
-    /// block, when there is one to author. `None` for a settled `Waiting`
-    /// dispatch even though `is_error` is true: a pending ask is not an
-    /// error, the `ToolResult` block already carries the refusal's text via
-    /// `content`, and nothing outside this file reads the `gate.pending`
-    /// child; the fill touches only the linked pair, so a child authored
-    /// here would outlive the ask it described.
+    /// Error child for a terminal refusal. A pending ask uses only its pair,
+    /// which the approval owner can settle in place.
     payload: Option<kaijutsu_types::ErrorPayload>,
-    /// The ask this dispatch left holding its pair, when it left one
-    /// `Waiting` — `None` for every settled outcome. The settle sites hand it
-    /// to [`link_waiting_pair_to_ask`], which is what lets a human's answer
-    /// fill *this* pair instead of authoring a second one beside it.
+    /// Link this ask atomically before publishing the pair as Waiting.
     ask_id: Option<String>,
 }
 
@@ -1245,76 +1237,6 @@ async fn dispatch_and_map_tool_result(
     map_tool_dispatch_result(tool_name, result)
 }
 
-/// What to record on an ask for a dispatch that left a pair `Waiting`: the
-/// ask id, and the block the pair's output belongs in. `None` when nothing
-/// should be linked.
-///
-/// The pure half of [`link_waiting_pair_to_ask`], split out so the predicate
-/// has a test that needs no ledger and no broker.
-fn ask_link_for<'a>(
-    status: Status,
-    ask_id: Option<&'a str>,
-    result_block_id: Option<&'a kaijutsu_types::BlockId>,
-) -> Option<(&'a str, &'a kaijutsu_types::BlockId)> {
-    if status != Status::Waiting {
-        return None;
-    }
-    ask_id.zip(result_block_id)
-}
-
-/// Tell the ask which `ToolCall`/`ToolResult` pair is holding it, as
-/// `PairOwner::Turn`: this pair belongs to a model's own tool call, and that
-/// turn ended when the gate refused it, so an execution on approval must
-/// tell it — `act_on_executable_answer`'s `tell`.
-///
-/// **The one place the pair's ids and the refusal's ask id are in scope
-/// together.** The gate runs inside the broker's hook evaluation, which never
-/// sees a block id (`KernelDb::link_ask_blocks`'s own note), and the pair is
-/// authored only after the dispatch returns. The rpc shell path writes this
-/// same link for its own pair, as `PairOwner::Session` (`rpc.rs`'s
-/// `link_ask_blocks` site); this is that link for the path a model's tool
-/// call takes.
-///
-/// Without it the gate-resume driver finds no pair to fill
-/// (`act_on_executable_answer`'s `linked`), so an allow authors a *second*
-/// pair beside this one and a deny settles nothing at all — either way these
-/// blocks stay `Waiting` for the life of the kernel process. Nothing else
-/// reaps them: `Waiting` is deliberately not settled
-/// (`kaijutsu-tui/src/render.rs`'s `is_settled` counts `Done | Error`), so
-/// the block is never printed and the tui's in-flight strip goes on drawing
-/// the call as "waiting on ask" until the kernel restarts.
-///
-/// Only a `Waiting` dispatch links, via [`ask_link_for`]: every other refusal
-/// settles its blocks `Error`, so there is nothing left holding an ask, and
-/// linking one would have the driver write the reason onto a block that
-/// already carries it. An ask left with no `exec_source` still falls back to
-/// the driver's wake, whose retry authors its own pair — that residual gap is
-/// the old wake shape, not something this link introduces.
-///
-/// Best-effort on purpose, exactly like the rpc path's link: the refusal is
-/// already correct and already returned, and failing the call because a
-/// convenience link did not write would turn a working refusal into an error.
-/// Logged, never swallowed.
-fn link_waiting_pair_to_ask(
-    kernel_db: &parking_lot::Mutex<KernelDb>,
-    status: Status,
-    ask_id: Option<&str>,
-    tool_call_block_id: &kaijutsu_types::BlockId,
-    result_block_id: Option<&kaijutsu_types::BlockId>,
-) {
-    let Some((ask_id, output_block_id)) = ask_link_for(status, ask_id, result_block_id) else {
-        return;
-    };
-    if let Err(e) = kernel_db.lock().link_ask_blocks(
-        ask_id,
-        tool_call_block_id,
-        output_block_id,
-        crate::PairOwner::Turn,
-    ) {
-        tracing::error!("ask {ask_id}: could not record the blocks waiting on it: {e}");
-    }
-}
-
 fn pending_shell_operation_receipt(
     kernel: &Arc<Kernel>,
     documents: &SharedBlockStore,
@@ -1322,7 +1244,6 @@ fn pending_shell_operation_receipt(
     tool_ctx: &crate::ExecContext,
     source: &str,
     ask_id: &str,
-    turn_lease: &TurnLease,
 ) -> Result<String, String> {
     if let Some(existing) = kernel.shell_operations().get_by_ask(ask_id, context_id)? {
         return Ok(existing.receipt.operation_id);
@@ -1330,32 +1251,12 @@ fn pending_shell_operation_receipt(
     let arguments: serde_json::Value = serde_json::from_str(source).map_err(|error| error.to_string())?;
     let command_source = arguments.get("command").and_then(serde_json::Value::as_str)
         .ok_or_else(|| "pending shell call has no command".to_string())?;
-    let tail = documents.last_block_id(context_id);
-    let command = documents.insert_tool_call_as(
-        context_id, None, tail.as_ref(), "shell",
-        serde_json::json!({"command": command_source}),
-        Some(kaijutsu_types::ToolKind::Shell), Some(tool_ctx.actor_id), None, None,
-    ).map_err(|error| error.to_string())?;
-    turn_lease.track_block(command);
-    let output = documents.insert_tool_result_as(
-        context_id, &command, Some(&command), "", Status::Done, None,
-        Some(kaijutsu_types::ToolKind::Shell), Some(PrincipalId::system()), None,
-    ).map_err(|error| error.to_string())?;
-    turn_lease.track_block(output);
-    for block in [&command, &output] {
-        documents.set_excluded(context_id, block, true).map_err(|error| error.to_string())?;
-        documents.set_status(context_id, block, Status::Waiting).map_err(|error| error.to_string())?;
-    }
-    let epoch = kernel.kernel_db().lock().continuation_epoch(context_id).map_err(|error| error.to_string())?;
-    let receipt = kernel.shell_operations().register(
-        context_id, tool_ctx.principal_id, tool_ctx.actor_id, command, output,
-        command_source, epoch,
-    )?;
-    kernel.shell_operations().mark_waiting(&receipt.operation_id, ask_id)?;
-    kernel.kernel_db().lock().link_ask_blocks(
-        ask_id, &receipt.command_block_id, &receipt.output_block_id,
-        crate::PairOwner::Turn,
-    ).map_err(|error| error.to_string())?;
+    let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+        context: context_id, principal: tool_ctx.principal_id, actor: tool_ctx.actor_id,
+        source: command_source, tool: "shell", input: serde_json::json!({"command": command_source}),
+        kind: kaijutsu_types::ToolKind::Shell, role: Role::Model, excluded: true,
+        ask: Some((ask_id, crate::PairOwner::Turn)),
+    }).map_err(|error| error.to_string())?;
     Ok(receipt.operation_id)
 }
 
@@ -1363,7 +1264,6 @@ fn make_pending_shell_receipt(
     kernel: &Arc<Kernel>, documents: &SharedBlockStore, context_id: ContextId,
     tool_ctx: &crate::ExecContext, tool_name: &str, params: &str,
     ask_id: Option<&str>, content: &mut String, is_error: &mut bool, status: &mut Status,
-    turn_lease: &TurnLease,
 ) {
     if !matches!(tool_name, "shell" | "shell_write") || *status != Status::Waiting {
         return;
@@ -1374,7 +1274,7 @@ fn make_pending_shell_receipt(
     {
         return;
     }
-    match pending_shell_operation_receipt(kernel, documents, context_id, tool_ctx, params, ask_id, turn_lease) {
+    match pending_shell_operation_receipt(kernel, documents, context_id, tool_ctx, params, ask_id) {
         Ok(operation_id) => {
             let mut receipt = ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Waiting);
             receipt.stderr = format!("operation {operation_id} is waiting for ask {ask_id}; the command has not run");
@@ -1409,7 +1309,7 @@ async fn dispatch_recorded_tool_result(
     let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload, ask_id } =
         dispatch_and_map_tool_result(kernel, tool_name, &params, tool_ctx, cancel).await;
     make_pending_shell_receipt(kernel, documents, context_id, tool_ctx, tool_name, &params,
-        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status, turn_lease);
+        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status);
 
     // The model receives the shell envelope; people and hydration read its
     // output. Project the actual output once so both readers get clean text.
@@ -1424,8 +1324,7 @@ async fn dispatch_recorded_tool_result(
     let styles = ansi.as_ref().and_then(|projection|
         crate::ansi_ingest::prepare_metadata(documents, &result, projection.spans.clone(), source.as_bytes()));
     documents.settle_tool_result_as(context_id, &call, &result, block_content,
-        settled_status, is_error, PrincipalId::system(), styles)?;
-    link_waiting_pair_to_ask(&kernel.kernel_db(), settled_status, ask_id.as_deref(), &call, Some(&result));
+        settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
     let anchor = if let Some(payload) = payload {
         documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
     } else { result };
@@ -4137,14 +4036,7 @@ mod tool_dispatch_timeout_tests {
     }
 }
 
-/// The ask-to-pair link the model path was missing.
-///
-/// A gate that leaves a tool call holding an ask settles its pair `Waiting`
-/// (`settled_block_status`), not `Error`: nothing prints such a pair, and the
-/// tui keeps drawing it in the in-flight strip. The fix is the link the rpc
-/// shell path already writes; the two halves of it are tested here — the ask
-/// id must survive the mapping, and the predicate must fire only for the
-/// `Waiting` pair that needs filling.
+/// Pending refusals retain the ask identity needed for result settlement.
 #[cfg(test)]
 mod ask_link_tests {
     use super::*;
@@ -4189,23 +4081,7 @@ mod ask_link_tests {
         assert_eq!(out.ask_id, None);
     }
 
-    /// Falsified by dropping the `Waiting` arm (a settled `Error` then links
-    /// too) or the `result_block_id` arm (the command block would be recorded
-    /// as the output block as well).
-    #[test]
-    fn only_a_waiting_pair_with_an_ask_and_an_output_links() {
-        let ctx = ContextId::new();
-        let principal = PrincipalId::new();
-        let result = kaijutsu_types::BlockId::new(ctx, principal, 2);
 
-        assert!(
-            ask_link_for(Status::Waiting, Some("01a05d19-ask"), Some(&result)).is_some(),
-            "a waiting pair with an ask and an output block must link"
-        );
-        assert!(ask_link_for(Status::Error, Some("01a05d19-ask"), Some(&result)).is_none());
-        assert!(ask_link_for(Status::Waiting, None, Some(&result)).is_none());
-        assert!(ask_link_for(Status::Waiting, Some("01a05d19-ask"), None).is_none());
-    }
 }
 
 #[cfg(test)]
@@ -6059,6 +5935,42 @@ mod lifetime_tests {
                 assert!(terminal.try_recv().is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn waiting_model_result_requires_its_ask_link_before_publication() {
+        use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+            KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
+        struct PendingTool { id: InstanceId }
+        #[async_trait::async_trait]
+        impl McpServerLike for PendingTool {
+            fn instance_id(&self) -> &InstanceId { &self.id }
+            async fn list_tools(&self, _: &CallContext) -> McpResult<Vec<KernelTool>> {
+                Ok(vec![KernelTool { instance: self.id.clone(), name: "pending".into(), description: None,
+                    input_schema: serde_json::json!({"type": "object"}) }])
+            }
+            async fn call_tool(&self, _: KernelCallParams, _: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+                Err(crate::mcp::McpError::refused_gate(kaijutsu_types::RefusalKind::Pending,
+                    "pending", Some(kaijutsu_types::AskRef { request_id: "missing-ask".into(), status: kaijutsu_types::AskStatus::Pending }), "waiting"))
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<ServerNotification> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+        let (kernel, context, mut anchor, call) = fixture(None).await;
+        let instance = InstanceId::new("pending-test");
+        kernel.broker().register(Arc::new(PendingTool { id: instance.clone() }), InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+        let lease = kernel.turns().begin(context);
+        let result = dispatch_inline_tool_result(kernel.blocks(), context, &mut anchor, &kernel,
+            "pending", serde_json::json!({}), &call, tokio_util::sync::CancellationToken::new(),
+            "pending-call", call.actor_id, &lease).await;
+        assert!(result.is_err(), "failed ask linkage cannot acknowledge a waiting result");
+        let db = kernel.blocks().db().unwrap().clone();
+        let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
+        restored.load_from_db().unwrap();
+        assert!(!restored.block_snapshots(context).unwrap().iter().any(|block| block.status == Status::Waiting));
     }
 
     #[tokio::test]

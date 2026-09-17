@@ -5,7 +5,9 @@ use futures::FutureExt;
 use tracing::Instrument;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use kaijutsu_types::{BlockId, PrincipalId, Refusal, Role, Status, ToolKind};
+use kaijutsu_types::{BlockId, Refusal, Role, ToolKind};
+#[cfg(test)]
+use kaijutsu_types::{PrincipalId, Status};
 use crate::{Kernel, block_store::DraftSubmission};
 use super::command::{self, CommandContextSwitch, CommandRunOptions, ContextSwitch};
 use super::command_outcome::{CommandExecution, CommandHookEffect, CommandOutcome};
@@ -90,15 +92,13 @@ async fn prepare(
     };
     let documents = kernel.blocks();
     if documents.get(context).is_none() { return Err(format!("context {context} is not materialized")); }
-    let last = documents.last_block_id(context);
-    let command = documents.insert_tool_call_as(context, None, last.as_ref(), "shell",
-        serde_json::json!({"code": code}), Some(ToolKind::Shell), Some(identity.performer), None,
-        user_initiated.then_some(Role::User)).map_err(|e| e.to_string())?;
-    let output = documents.insert_tool_result_as(context, &command, Some(&command), "", Status::Done, None,
-        Some(ToolKind::Shell), Some(PrincipalId::system()), None).map_err(|e| e.to_string())?;
-    let epoch = kernel.kernel_db().lock().continuation_epoch(context).map_err(|e| e.to_string())?;
-    let receipt = kernel.shell_operations().register(context, identity.requester, identity.performer,
-        command, output, &code, epoch)?;
+    let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+        context, principal: identity.requester, actor: identity.performer, source: &code,
+        tool: "shell", input: serde_json::json!({"code": code}), kind: ToolKind::Shell,
+        role: if user_initiated { Role::User } else { Role::Model }, excluded: user_initiated, ask: None,
+    }).map_err(|error| error.to_string())?;
+    let command = receipt.command_block_id;
+    let output = receipt.output_block_id;
     let mut submission = ShellSubmission { command_block_id: command,
         operation_id: receipt.operation_id.to_string(), refusal: None };
     let call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
@@ -107,11 +107,6 @@ async fn prepare(
     // Capture and result-hook unwinds belong to command::run_into_blocks.
     let mut settlement_started = false;
     let preparation = std::panic::AssertUnwindSafe(async {
-        documents.set_status(context, &output, Status::Running).map_err(|e| e.to_string())?;
-        if user_initiated {
-            documents.set_excluded(context, &command, true).map_err(|e| e.to_string())?;
-            documents.set_excluded(context, &output, true).map_err(|e| e.to_string())?;
-        }
         let verdict = tokio::select! {
             biased;
             _ = stop.cancelled() => return Err("kernel runtime shut down before interactive execution".to_string()),
@@ -174,7 +169,7 @@ mod tests {
 
     async fn fixture() -> (Arc<crate::kj::KjDispatcher>, ShellIdentity) {
         use crate::vfs::VfsOps;
-        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher().await);
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
         dispatcher.set_self_arc();
         let kernel = dispatcher.kernel();
         kernel.broker().set_kj_dispatcher(&dispatcher).await;
