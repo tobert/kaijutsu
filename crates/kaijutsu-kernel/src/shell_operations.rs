@@ -301,6 +301,7 @@ impl ShellOperationRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn complete(&self, id: &str, envelope: ShellEnvelope) -> OperationResult<bool> {
         self.complete_record(id, envelope, None)
     }
@@ -516,7 +517,7 @@ impl ShellOperationRegistry {
         Ok(changed)
     }
 
-    fn complete_record_in(db: &KernelDb, id: &str, mut envelope: ShellEnvelope, outcome: Option<&CommandOutcome>) -> OperationResult<bool> {
+    pub(crate) fn complete_record_in(db: &KernelDb, id: &str, mut envelope: ShellEnvelope, outcome: Option<&CommandOutcome>) -> OperationResult<bool> {
         if matches!(envelope.status, ShellStatus::Running | ShellStatus::Waiting) {
             return Err("cannot complete a shell operation with a nonterminal receipt".into());
         }
@@ -621,21 +622,17 @@ impl ShellOperationRegistry {
         Ok(())
     }
 
-    pub fn abandon_unfinished(&self) -> OperationResult<usize> {
-        let mut envelope = ShellEnvelope::new(ShellStatus::Error);
-        envelope.error = Some("kernel restarted before the shell operation finished".into());
-        let ids: Vec<String> = {
-            let db = self.db.lock();
-            let mut stmt = db.conn_for_ledger().prepare(
-                "SELECT operation_id FROM shell_operations WHERE completed_at IS NULL
-                 AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)
-                 AND NOT EXISTS (SELECT 1 FROM shell_result_reviews r WHERE r.operation_id=shell_operations.operation_id AND r.final_json IS NULL)",
-            ).map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| row.get(0)).map_err(|e| e.to_string())?
-                .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?
-        };
-        for id in &ids { self.complete(id, envelope.clone())?; }
-        Ok(ids.len())
+    /// Startup must project these interruptions into their original pairs.
+    /// Known outcomes and unresolved result reviews have separate recovery.
+    pub(crate) fn unfinished_without_outcome(&self) -> OperationResult<Vec<ShellOperationState>> {
+        let db = self.db.lock();
+        let mut stmt = db.conn_for_ledger().prepare(&format!(
+            "{SELECT_STATE} WHERE completed_at IS NULL
+             AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)
+             AND NOT EXISTS (SELECT 1 FROM shell_result_reviews r WHERE r.operation_id=shell_operations.operation_id AND r.final_json IS NULL)",
+        )).map_err(|e| e.to_string())?;
+        stmt.query_map([], decode_state).map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())
     }
 
     pub fn summary_by_context(&self) -> OperationResult<HashMap<ContextId, ShellOperationSummary>> {
@@ -799,7 +796,7 @@ mod tests {
         registry.prepare_settlement(&receipt.operation_id, &outcome).unwrap();
         assert_eq!(registry.pending_projections().unwrap().len(), 1);
         assert!(registry.finish_projection(&receipt.operation_id).is_err());
-        assert_eq!(registry.abandon_unfinished().unwrap(), 0, "restart must retain a known outcome");
+        assert!(registry.unfinished_without_outcome().unwrap().is_empty(), "restart must retain a known outcome");
         assert!(registry.complete(&receipt.operation_id, ShellEnvelope::new(ShellStatus::Error)).is_err());
         assert!(registry.get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_none());
         let different = CommandOutcome::new(CommandExecution::Fault("different result".into()), 1);
@@ -825,18 +822,19 @@ mod tests {
     }
 
     #[test]
-    fn restart_marks_unfinished_work_without_discarding_receipts() {
+    fn restart_selects_unfinished_work_without_mutating_receipts() {
         let db = Arc::new(Mutex::new(KernelDb::open(":memory:").unwrap()));
         let registry = ShellOperationRegistry::new(db.clone()).unwrap();
         let context = ContextId::new();
         let receipt = register(&registry, context);
         drop(registry);
         let registry = ShellOperationRegistry::new(db).unwrap();
-        assert_eq!(registry.abandon_unfinished().unwrap(), 1);
-        assert_eq!(registry.abandon_unfinished().unwrap(), 0);
+        let unfinished = registry.unfinished_without_outcome().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].receipt.operation_id, receipt.operation_id);
         let state = registry.get(&receipt.operation_id, context).unwrap().unwrap();
-        assert!(state.completed_at.is_some());
-        assert!(state.envelope.unwrap().error.unwrap().contains("restarted"));
+        assert!(state.completed_at.is_none());
+        assert!(state.envelope.is_none());
     }
 }
 

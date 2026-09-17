@@ -128,10 +128,10 @@ pub fn settle_outcome(
         output: outcome.output_data(),
         content_type: envelope.content_type.as_deref().map_or(ContentType::Plain, ContentType::from_mime),
         exit_code: envelope.exit_code.map(|code| code.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
-        ephemeral: envelope.ephemeral.unwrap_or(false),
+        ephemeral: Some(envelope.ephemeral.unwrap_or(false)),
     };
     documents.settle_tool_result_recorded(context_id, command_block_id, output_block_id,
-        crate::block_store::ToolResultUpdate { content: text, status, is_error: status == Status::Error,
+        crate::block_store::ToolResultUpdate { content: Some(text), status, is_error: status == Status::Error,
             author: PrincipalId::system(), ansi, shell: Some(fields) }, |db| {
             if let (Some(owner), Some(ask)) = (ask_owner, envelope.ask_id.as_deref()) {
                 db.link_ask_blocks(ask, command_block_id, output_block_id, owner)?;
@@ -189,6 +189,47 @@ pub(crate) fn recover_settlements(kernel: &Kernel) -> Result<usize, String> {
         }
     }
     Ok(pending.len())
+}
+
+/// Settle interrupted operations at startup, before any writer can resume.
+/// Without a captured outcome, preserve observations and report uncertainty;
+/// neither kaish nor hooks run, and no exit code is inferred.
+/// A missing pair or failed acceptance aborts startup; an incomplete recovery
+/// must not admit writers against inconsistent blocks and receipts.
+pub(crate) fn recover_unfinished(kernel: &Kernel) -> Result<usize, String> {
+    let unfinished = kernel.shell_operations().unfinished_without_outcome()?;
+    for operation in &unfinished {
+        let receipt = &operation.receipt;
+        let context = receipt.context_id;
+        let blocks = kernel.blocks();
+        if !blocks.contains(context) { blocks.load_one_from_db(context).map_err(|e| e.to_string())?; }
+        let output = blocks.get_block_snapshot(context, &receipt.output_block_id).map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("shell operation {} lost its output block", receipt.operation_id))?;
+        let reason = "The kernel restarted before the command outcome was recorded. Execution may have begun; source was not run again.";
+        let mut envelope = kaijutsu_types::shell_envelope::ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Error);
+        envelope.stdout = output.content.clone();
+        envelope.stderr = output.stderr.clone().unwrap_or_default();
+        envelope.data = output.output.as_ref().map(|data| data.to_json());
+        envelope.block_id = Some(receipt.output_block_id.to_key());
+        envelope.ask_id = receipt.ask_id.clone();
+        envelope.content_type = Some(output.content_type.as_mime().into());
+        envelope.ephemeral = Some(output.ephemeral);
+        envelope.error = Some(reason.into());
+        let mut stderr = envelope.stderr.clone();
+        if !stderr.is_empty() && !stderr.ends_with('\n') { stderr.push('\n'); }
+        stderr.push_str(reason);
+        let fields = crate::block_store::ShellResultFields {
+            stderr: Some(stderr), output: output.output, content_type: output.content_type,
+            exit_code: None, ephemeral: None,
+        };
+        blocks.settle_tool_result_recorded(context, &receipt.command_block_id, &receipt.output_block_id,
+            crate::block_store::ToolResultUpdate { content: None, status: Status::Error, is_error: true,
+                author: PrincipalId::system(), ansi: None, shell: Some(fields) }, |db| {
+                crate::shell_operations::ShellOperationRegistry::complete_record_in(db, &receipt.operation_id, envelope, None)
+                    .map(|_| ()).map_err(crate::kernel_db::KernelDbError::Validation)
+            }).map_err(|e| e.to_string())?;
+    }
+    Ok(unfinished.len())
 }
 
 /// Detect an in-shell context switch, tell the sink about it, and report the
@@ -880,6 +921,105 @@ mod fill_tests {
                 b"\x1b[31mnew\x1b[0m");
             assert!(recovered.shell_operations().pending_projections().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn restart_settles_unfinished_pair_without_losing_output_or_inventing_exit() {
+        for status in [Status::Running, Status::Waiting] {
+            recover_interrupted_pair(status, None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_recovery_rolls_back_pair_and_receipt_together() {
+        for fault in ["receipt", "journal"] {
+            recover_interrupted_pair(Status::Running, Some(fault)).await;
+        }
+    }
+
+    async fn recover_interrupted_pair(status: Status, fault: Option<&str>) {
+        let kernel = Kernel::new_ephemeral("unfinished-pair").await;
+        let context = ContextId::new();
+        let blocks = kernel.blocks();
+        blocks.create_document(context, DocumentKind::Conversation, None).unwrap();
+        let command = blocks.insert_tool_call(context, None, None, "shell", serde_json::json!({}), None).unwrap();
+        let output = blocks.insert_tool_result(context, &command, Some(&command), "observed output", false, None, None).unwrap();
+        for id in [&command, &output] { blocks.set_status(context, id, status).unwrap(); }
+        blocks.set_ephemeral(context, &command, true).unwrap();
+        blocks.set_stderr(context, &output, Some("observed stderr".into())).unwrap();
+        blocks.set_output(context, &output, Some(&kaijutsu_types::OutputData::new().with_rich_json(serde_json::json!({"observed": 1})))).unwrap();
+        let original = b"\x1b[32mobserved output\x1b[0m";
+        let projection = crate::ansi_ingest::project(original).unwrap();
+        crate::ansi_ingest::record(blocks, context, &output, projection.spans, original);
+        let before = blocks.get_block_snapshot(context, &output).unwrap().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-run");
+        let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(),
+            command, output, &format!("echo unexpected > '{}'", marker.display()), None).unwrap();
+        let db = kernel.kernel_db().clone();
+        let principal = blocks.principal_id();
+        let workspace = db.lock().get_or_create_default_workspace(principal).unwrap();
+        if let Some(fault) = fault {
+            db.lock().conn_for_ledger().execute_batch(match fault {
+                "receipt" => "CREATE TRIGGER reject_interruption BEFORE UPDATE OF completed_at ON shell_operations BEGIN SELECT RAISE(FAIL, 'injected receipt fault'); END;",
+                _ => "CREATE TRIGGER reject_interruption BEFORE INSERT ON oplog BEGIN SELECT RAISE(FAIL, 'injected journal fault'); END;",
+            }).unwrap();
+            let mut events = kernel.block_flows().subscribe("block.*");
+            let error = recover_unfinished(&kernel).unwrap_err();
+            assert!(error.contains(&format!("injected {fault} fault")), "{error}");
+            assert!(events.try_recv().is_none(), "failed recovery publishes no partial result");
+            let restored = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
+            restored.load_one_from_db(context).unwrap();
+            {
+                let unchanged = restored.get_block_snapshot(context, &output).unwrap().unwrap();
+                assert_eq!(unchanged.content, before.content);
+                assert_eq!(unchanged.stderr, before.stderr);
+                assert_eq!(unchanged.output, before.output);
+                assert_eq!(unchanged.style_spans, before.style_spans);
+                assert_eq!(unchanged.provenance, before.provenance);
+                for id in [&command, &output] {
+                    assert_eq!(restored.get_block_snapshot(context, id).unwrap().unwrap().status, status);
+                }
+            }
+            assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_none());
+            db.lock().conn_for_ledger().execute_batch("DROP TRIGGER reject_interruption").unwrap();
+        }
+        let restored = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
+        let recovered = Kernel::new("recovered-unfinished", dir.path(), restored, db.clone()).await;
+        recovered.blocks().load_one_from_db(context).unwrap();
+        for id in [&command, &output] {
+            assert_eq!(recovered.blocks().get_block_snapshot(context, id).unwrap().unwrap().status, Status::Error,
+                "restart must settle the original pair, not only its receipt");
+        }
+        let after = recovered.blocks().get_block_snapshot(context, &output).unwrap().unwrap();
+        assert_eq!(after.content, before.content);
+        assert_eq!(after.output, before.output);
+        assert_eq!(after.style_spans, before.style_spans);
+        assert_eq!(after.provenance, before.provenance);
+        assert_eq!(after.exit_code, None);
+        assert_eq!(after.ephemeral, before.ephemeral);
+        assert!(recovered.blocks().get_block_snapshot(context, &command).unwrap().unwrap().ephemeral);
+        assert!(after.is_error);
+        assert!(after.stderr.as_deref().unwrap().starts_with("observed stderr"));
+        assert!(after.stderr.as_deref().unwrap().contains("restarted"));
+        assert_eq!(db.lock().get_block_provenance(&output, kaijutsu_ansi::TRANSFORM_NAME).unwrap().unwrap().1, original);
+        let state = recovered.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap();
+        assert!(state.completed_at.is_some());
+        let envelope = state.envelope.unwrap();
+        assert_eq!(envelope.stdout, before.content);
+        assert_eq!(envelope.stderr, "observed stderr");
+        assert_eq!(envelope.exit_code, None);
+        assert_eq!(envelope.data, Some(serde_json::json!({"observed": 1})));
+        assert!(envelope.error.as_deref().unwrap().contains("restarted"));
+        assert!(recovered.shell_operations().outcome(&receipt.operation_id, context).unwrap().is_none());
+        recovered.blocks().replace_text_as(context, &output, "later edit", Some(principal)).unwrap();
+        let restored = crate::block_store::shared_block_store_with_db(db.clone(), workspace, principal);
+        let again = Kernel::new("recovered-again", dir.path(), restored, db).await;
+        again.blocks().load_one_from_db(context).unwrap();
+        assert_eq!(again.blocks().get_block_snapshot(context, &output).unwrap().unwrap().content, "later edit");
+        assert_eq!(again.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().envelope.unwrap().to_value(), envelope.to_value());
+        assert_eq!(recover_unfinished(&again).unwrap(), 0);
+        assert!(!marker.exists(), "recovery must never execute interrupted source");
     }
 
     async fn restart_after_settlement_failure(fault: &str) {

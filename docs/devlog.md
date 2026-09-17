@@ -2119,11 +2119,11 @@ but is spent without executing source. Publication abandonment has its own
 reason in `kj ledger show`, so an Allowed decision never implies execution.
 
 Startup first recovers retained results, then retires unpublished invocations,
-and only then applies generic unfinished-receipt abandonment. This ordering
+and only then settles other interrupted operations. This ordering
 keeps generic cleanup from taking a receipt that still has a more specific
 settlement. Tests reproduce pending holds surviving restart and answered holds
 remaining unspent after terminal failure; fault injection checks retirement and
-result rollback together. Unlinked original-pair recovery, abrupt live failure
+result rollback together. Receiptless original-pair recovery, abrupt live failure
 without a result, and claimed notification delivery remain open.
 
 The typed client now preserves the publication abandonment reason. The TUI's
@@ -2135,6 +2135,23 @@ prove allowed and denied unpublished invocations return their decision and
 retirement reason, with no source side effect. Review caught a misleading
 "Approved source" phrase for denied asks; the reason now says "Source did not run." Rendering tests pin the explanation in both
 views. No running GUI was rebuilt or deployed.
+
+The unfinished-operation sweep previously completed only receipts. A restart
+regression left both original blocks Running. Startup now commits the original
+pair and receipt through the shared journal acceptance, preserving stored text,
+structured output, ANSI spans and original bytes, and each block's hydration
+policy. It appends an interruption reason to stderr without inventing an exit
+code. Source and hooks are never replayed. Known outcomes and retained reviews
+keep their more specific recovery paths; a corrupt pair or failed acceptance
+refuses startup before admitting writers.
+
+Receipt and journal fault tests reload durable state and prove no partial
+settlement or events. Repeated startup preserves later edits and the original
+receipt. The isolated SSH test checks typed block reads and repeated
+`kj wait --operation` polls against the same interrupted operation. DeepSeek's
+review found no actionable defect; fail-fast recovery is intentional, and its
+partial-move compile concern was incorrect. Receiptless model pairs and old
+receipt-only abandonment rows remain recorded in the ownership audit.
 
 ## The kernel with no one to answer to (September 16)
 

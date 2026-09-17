@@ -82,10 +82,11 @@ pub enum BlockStoreError {
 /// Result type alias for BlockStore operations.
 pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 
-/// A complete tool-result publication. Shell fields are absent for a model
-/// tool result whose content already carries its response envelope.
+/// A tool-result publication, or recovery that preserves its stored content.
+/// Shell fields are absent for a model result carrying its response envelope.
 pub(crate) struct ToolResultUpdate<'a> {
-    pub content: &'a str,
+    /// None preserves stored text, styles, and provenance during recovery.
+    pub content: Option<&'a str>,
     pub status: Status,
     pub is_error: bool,
     pub author: PrincipalId,
@@ -98,7 +99,8 @@ pub(crate) struct ShellResultFields {
     pub output: Option<kaijutsu_types::OutputData>,
     pub content_type: ContentType,
     pub exit_code: Option<i32>,
-    pub ephemeral: bool,
+    /// None preserves each block's existing hydration policy.
+    pub ephemeral: Option<bool>,
 }
 
 /// Text captured for shell submission, tied to one draft revision. This is
@@ -1531,7 +1533,7 @@ impl BlockStore {
             return Err(BlockStoreError::Validation("waiting tool result has no ask".into()));
         }
         self.settle_tool_result_recorded(context_id, call, result,
-            ToolResultUpdate { content, status, is_error, author, ansi, shell: None }, |db| {
+            ToolResultUpdate { content: Some(content), status, is_error, author, ansi, shell: None }, |db| {
                 if let Some(ask) = ask {
                     if status == Status::Waiting {
                         db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?;
@@ -1554,6 +1556,9 @@ impl BlockStore {
     ) -> BlockStoreResult<()> {
         if self.journaling_db()?.is_none() { return Err(BlockStoreError::NoDatabaseConfigured); }
         let ToolResultUpdate { content, status, is_error, author, ansi, shell } = update;
+        if content.is_none() && ansi.is_some() {
+            return Err(BlockStoreError::Validation("ANSI projection requires replacement text".into()));
+        }
         let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         self.accept_locked_recorded(context_id, &mut entry, None, |entry| {
             let command = entry.doc.get_block_header(call).ok_or_else(|| BlockStoreError::Validation("tool call is missing".into()))?;
@@ -1562,21 +1567,25 @@ impl BlockStore {
                 || output.tool_call_id.as_ref() != Some(call) {
                 return Err(BlockStoreError::Validation("tool result does not belong to the supplied call".into()));
             }
-            let styled = ansi.is_some() || !output.style_spans.is_empty() || output.provenance.is_some();
+            let styled = content.is_some() && (ansi.is_some() || !output.style_spans.is_empty() || output.provenance.is_some());
             let shell_metadata = shell.is_some();
             entry.doc.set_principal_id(author);
-            entry.doc.edit_text(result, 0, content, output.content.chars().count())?;
             let (spans, tag) = match &ansi {
                 Some((spans, _)) => (spans.clone(), Some(kaijutsu_ansi::provenance_tag())),
                 None => (Vec::new(), None),
             };
-            entry.doc.set_style_spans(result, spans.clone(), tag.clone())?;
+            if let Some(content) = content {
+                entry.doc.edit_text(result, 0, content, output.content.chars().count())?;
+                entry.doc.set_style_spans(result, spans.clone(), tag.clone())?;
+            }
             if let Some(fields) = shell {
                 entry.doc.set_stderr(result, fields.stderr)?;
                 entry.doc.set_output(result, fields.output)?;
                 entry.doc.set_content_type(result, fields.content_type)?;
                 entry.doc.set_exit_code(result, fields.exit_code)?;
-                for id in [call, result] { entry.doc.set_ephemeral(id, fields.ephemeral)?; }
+                if let Some(ephemeral) = fields.ephemeral {
+                    for id in [call, result] { entry.doc.set_ephemeral(id, ephemeral)?; }
+                }
             }
             entry.doc.set_tool_result_state(result, status, is_error)?;
             entry.doc.set_status(call, status)?;
@@ -1587,9 +1596,10 @@ impl BlockStore {
             payload.updated_headers.push(entry.doc.get_block_header(call).expect("accepted call remains under this guard"));
             let version = entry.version();
             let mut events = vec![
-                BlockFlow::TextReplaced { context_id, block_id: *result, content: Arc::from(content), version, source: OpSource::Local },
                 BlockFlow::MetadataChanged { context_id, block_id: *result, metadata, version, source: OpSource::Local },
             ];
+            if let Some(content) = content { events.insert(0,
+                BlockFlow::TextReplaced { context_id, block_id: *result, content: Arc::from(content), version, source: OpSource::Local }); }
             if styled { events.insert(1, BlockFlow::SpansChanged { context_id, block_id: *result, style_spans: spans,
                 provenance: tag, version, source: OpSource::Local }); }
             if shell_metadata { events.push(BlockFlow::MetadataChanged { context_id, block_id: *call,

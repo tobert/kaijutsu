@@ -1439,9 +1439,13 @@ answer. Linked pairs settle to Error; retirement faults roll back and retry on
 restart.
 
 A live caller that fails without publishing a terminal result still leaves a
-hold until restart. An ask that never linked its original pair cannot identify
-that pair for recovery. The generic unfinished-operation sweep stores an error
-receipt without projecting it into those blocks; finish that ownership audit.
+hold until restart. Registered operations now recover their original pair and
+receipt atomically even when an ask never linked. Output and ANSI provenance
+survive; recovery records an interruption without inventing an exit code or
+rerunning source. Receiptless model pairs still depend on the server's separate
+orphan sweep, which can overwrite stored stderr. Historical error receipts
+already completed by the old receipt-only sweep are not rewritten by the new
+unfinished-operation recovery. Finish that ownership and compatibility audit.
 Claimed execution still needs durable notification retry. See docs/gate-resume.md,
 "Still open".
 

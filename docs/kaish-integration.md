@@ -120,7 +120,11 @@ These are source observations, not promises that all paths behave alike.
   deleted. Terminal outcomes are retained before projection. Stdout, stderr,
   structured output, content type, exit, ephemeral flags, ANSI spans/original
   bytes, both statuses and the receipt commit in one block-journal transaction.
-  Startup finishes pending projections without executing code or hooks. Raw records are read separately
+  Startup finishes pending projections without executing code or hooks. An
+  unfinished receipt without a captured outcome settles its original pair and
+  receipt in one journal acceptance. Recovery preserves recorded output and ANSI
+  provenance, reports the interruption, and leaves the exit code unknown.
+  Recovery failure aborts startup before writers are admitted. Raw records are read separately
   from ordinary receipt polls, so a poll does not duplicate captured output.
   Approval resumes that need a new pair use the same atomic pair/receipt/ask
   setup. Their command retains the model role and performer author; the receipt
@@ -144,8 +148,9 @@ These are source observations, not promises that all paths behave alike.
   answers owned by another paired invocation. Terminal publication retires a
   held invocation atomically; startup retires remaining holds after recovering
   captured results. Decisions remain auditable through `kj ledger show`.
-  Abrupt live failure and recovery of an original pair that never linked remain
-  in the ownership audit.
+  Registered operations recover their original pair even when an ask never
+  linked. Receiptless model pairs, abrupt live failure and notification delivery
+  remain in the ownership audit.
 - `runtime/interactive.rs` admits shell submissions, constructs the addressed
   context's shell, authors the pair/receipt, and applies PreCall on the kernel
   worker. Accepted work survives RPC teardown. Runtime consumes the captured
