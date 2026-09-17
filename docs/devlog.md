@@ -1841,6 +1841,17 @@ the same rule. The classifier's plan reader propagates environment faults before
 executing its hook body. This fixes storage-fault capture; interpreter defaults
 and synthetic export-name collisions remain in the effective-environment audit.
 
+The temporary-name test then lost a legitimate `__kj_env_0__` export when its
+restore overlay was popped. Durable exports and approval values now share one
+restore helper, choosing temporary names outside the complete target set,
+including unset entries. The regression also preserves existing globals that
+share temporary names, literal dollar signs/quotes/newlines, and refuses an
+invalid name before changing any value. Kaibo review raised duplicate names:
+the planner deduplicates, but approval rows only key by sequence number. A second
+red/green check now rejects that ambiguous capture before mutation too. This
+removes two copies of the restore mechanism without reserving a namespace from
+players.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

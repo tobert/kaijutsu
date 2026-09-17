@@ -94,6 +94,10 @@ These are source observations, not promises that all paths behave alike.
   projections live in `runtime/command_result.rs`, used by command execution,
   structured/streaming RPC, and MCP shell envelopes. The duplicate text-replace
   helper is deleted; callers use the block store's atomic replacement operation.
+- Durable-export seeding and approval environment restoration share one helper.
+  Values cross as typed kaish overlays; temporary names cannot collide with any
+  target, including an unset name. Invalid or duplicate names refuse before any
+  value changes.
 - `runtime/shell_state.rs` snapshots cwd/exports and commits their changed
   values in one transaction. Failed writes roll back and reach the caller.
   Interactive and structured `kj` block completion now waits for result hooks;

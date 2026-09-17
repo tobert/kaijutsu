@@ -637,40 +637,11 @@ impl EmbeddedKaish {
         })
     }
 
-    /// Export `vars` durably into the shell's persistent (root-frame) scope,
-    /// in one call.
-    ///
-    /// No *value* ever becomes literal script text: each crosses into kaish
-    /// through this call's own `ExecuteOptions::vars` overlay (a typed
-    /// `Value`, not a string), referenced from the generated script by a
-    /// synthetic `$__kj_env_N__` name. Only the row's *key* is spliced into
-    /// source, as the left side of `export KEY="$…"` —
-    /// [`context_env_values`] rejects anything that is not a legal kaish
-    /// identifier before this runs, so there is nothing to shell-escape on
-    /// that side either. This is the replacement for the old hand-rolled
-    /// `value.replace('\'', "'\\''")` loop.
-    ///
-    /// `export`'s assignment form (`kaish-kernel`'s `tools/builtin/export.rs`)
-    /// writes through `Scope::set_exported_global`, which searches every
-    /// frame for an existing `KEY` and otherwise creates it in the *root*
-    /// frame — never the transient overlay frame the temp name lives in — so
-    /// the export outlives this call while the overlay frame dies with it
-    /// (`execute_with_options`'s per-call `VarsFrameGuard` pops it on return).
+    /// Apply durable exports through the shared environment restore path.
     async fn export_env_vars(&self, vars: &[crate::kernel_db::ContextEnvRow]) -> Result<()> {
-        let pairs = context_env_values(vars)?;
-        let mut overlay = std::collections::HashMap::with_capacity(pairs.len());
-        let mut script = String::new();
-        for (i, (key, value)) in pairs.into_iter().enumerate() {
-            let tmp = format!("__kj_env_{i}__");
-            overlay.insert(tmp.clone(), value);
-            script.push_str(&format!("export {key}=\"${tmp}\"\n"));
-        }
-        let opts = ExecuteOptions::new().with_vars(overlay);
-        let result = self.execute_with_options(&script, opts).await?;
-        if result.code != 0 {
-            anyhow::bail!("export script exited {}: {}", result.code, result.err);
-        }
-        Ok(())
+        let values = context_env_values(vars)?.into_iter()
+            .map(|(name, value)| (name, Some(value))).collect();
+        self.restore_env_values(values).await
     }
 }
 
@@ -682,28 +653,49 @@ impl EmbeddedKaish {
     /// cannot change what runs. Rejects a name that is not a legal kaish
     /// identifier before anything is executed. `docs/gate-shape-b.md`.
     pub async fn apply_ask_env(&self, rows: &[approval_ledger::types::AskEnvRow]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
+        let values = rows.iter().map(|row| (row.name.clone(),
+            row.value.clone().map(kaish_kernel::ast::Value::String))).collect();
+        self.restore_env_values(values).await
+    }
+
+    /// Values cross through typed overlays, never script interpolation. Temporary
+    /// names must differ from every target, including unset targets: export writes
+    /// an existing scope entry, and unset removes one. Otherwise either operation
+    /// could alter the temporary frame instead of the persistent environment.
+    async fn restore_env_values(
+        &self,
+        values: Vec<(String, Option<kaish_kernel::ast::Value>)>,
+    ) -> Result<()> {
+        if values.is_empty() { return Ok(()); }
+        let mut names = std::collections::HashSet::with_capacity(values.len());
+        for (name, _) in &values {
+            if !is_valid_env_key(name) {
+                anyhow::bail!("environment name {name:?} is not a valid identifier");
+            }
+            if !names.insert(name.as_str()) {
+                anyhow::bail!("duplicate environment name {name:?} in captured values");
+            }
         }
         let mut overlay = std::collections::HashMap::new();
         let mut script = String::new();
-        for (i, row) in rows.iter().enumerate() {
-            if !is_valid_env_key(&row.name) {
-                anyhow::bail!("ask env: name {:?} is not a valid identifier", row.name);
-            }
-            match &row.value {
+        let mut next_temp = 0;
+        for (name, value) in &values {
+            match value {
                 Some(value) => {
-                    let tmp = format!("__kj_ask_env_{i}__");
-                    overlay.insert(tmp.clone(), kaish_kernel::ast::Value::String(value.clone()));
-                    script.push_str(&format!("export {}=\"${tmp}\"\n", row.name));
+                    let tmp = loop {
+                        let candidate = format!("__kj_env_{next_temp}__");
+                        next_temp += 1;
+                        if !names.contains(candidate.as_str()) { break candidate; }
+                    };
+                    overlay.insert(tmp.clone(), value.clone());
+                    script.push_str(&format!("export {name}=\"${tmp}\"\n"));
                 }
-                None => script.push_str(&format!("unset {}\n", row.name)),
+                None => script.push_str(&format!("unset {name}\n")),
             }
         }
-        let opts = ExecuteOptions::new().with_vars(overlay);
-        let result = self.execute_with_options(&script, opts).await?;
+        let result = self.execute_with_options(&script, ExecuteOptions::new().with_vars(overlay)).await?;
         if result.code != 0 {
-            anyhow::bail!("ask env script exited {}: {}", result.code, result.err);
+            anyhow::bail!("environment restore exited {}: {}", result.code, result.err);
         }
         Ok(())
     }
@@ -1355,6 +1347,56 @@ mod tests {
             format!("{home}/sub"),
             "`~/sub` must root at the seeded HOME",
         );
+    }
+
+    #[tokio::test]
+    async fn captured_exports_preserve_names_that_resemble_temporary_variables() {
+        use kaish_kernel::ast::Value;
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kaish = EmbeddedKaish::new("env-name-collision", blocks,
+            test_kernel("env-name-collision").await, None).unwrap();
+        let names = ["__kj_env_0__", "__kj_env_1__", "PLAIN"];
+        let rows: Vec<_> = names.iter().enumerate().map(|(i, name)| crate::kernel_db::ContextEnvRow {
+            context_id: ContextId::new(), key: (*name).into(), value: format!("value {i} '$HOME\n"),
+        }).collect();
+        kaish.export_env_vars(&rows).await.unwrap();
+        for row in &rows {
+            assert_eq!(kaish.get_var(&row.key).await, Some(Value::String(row.value.clone())),
+                "durable export {} was lost with the temporary overlay", row.key);
+        }
+        let restored = [
+            approval_ledger::types::AskEnvRow { seq: 0, name: "__kj_ask_env_1__".into(), value: None },
+            approval_ledger::types::AskEnvRow { seq: 1, name: "PLAIN".into(), value: Some("approved ' $value\n".into()) },
+            approval_ledger::types::AskEnvRow { seq: 2, name: "__kj_ask_env_2__".into(), value: Some("keep this".into()) },
+            approval_ledger::types::AskEnvRow { seq: 3, name: "__kj_env_2__".into(), value: None },
+            approval_ledger::types::AskEnvRow { seq: 4, name: "__kj_env_3__".into(), value: Some("also keep this".into()) },
+        ];
+        kaish.set_var("__kj_ask_env_1__", Value::String("later value".into())).await;
+        kaish.apply_ask_env(&restored).await.unwrap();
+        for row in &restored {
+            assert_eq!(kaish.get_var(&row.name).await, row.value.clone().map(Value::String),
+                "approved export {} collided with a restore temporary", row.name);
+        }
+        let exports = kaish.exported_vars().await;
+        for row in rows.iter().filter(|row| row.key != "PLAIN") {
+            assert!(exports.contains(&(row.key.clone(), row.value.clone())));
+        }
+        assert!(exports.contains(&("PLAIN".into(), "approved ' $value\n".into())));
+        assert!(!exports.iter().any(|(name, _)| name == "__kj_ask_env_1__"));
+        let invalid = [
+            approval_ledger::types::AskEnvRow { seq: 0, name: "PLAIN".into(), value: Some("must not apply".into()) },
+            approval_ledger::types::AskEnvRow { seq: 1, name: "bad;name".into(), value: None },
+        ];
+        assert!(kaish.apply_ask_env(&invalid).await.unwrap_err().to_string().contains("not a valid identifier"));
+        assert_eq!(kaish.get_var("PLAIN").await, Some(Value::String("approved ' $value\n".into())),
+            "validate the whole capture before applying any entry");
+        let duplicate = [
+            approval_ledger::types::AskEnvRow { seq: 0, name: "PLAIN".into(), value: Some("first".into()) },
+            approval_ledger::types::AskEnvRow { seq: 1, name: "PLAIN".into(), value: Some("second".into()) },
+        ];
+        assert!(kaish.apply_ask_env(&duplicate).await.unwrap_err().to_string().contains("duplicate"));
+        assert_eq!(kaish.get_var("PLAIN").await, Some(Value::String("approved ' $value\n".into())),
+            "ambiguous capture must not change the environment");
     }
 
     #[tokio::test]
