@@ -14,6 +14,26 @@ use super::command_result::exec_result_to_hook_tool_result;
 use super::command_outcome::{CommandExecution, CommandOutcome};
 use super::shell_state::{persist_shell_state, snapshot_shell_state};
 
+/// The adapter acknowledges a switch after updating its connection binding.
+/// Dropping the acknowledgement means the connection has departed.
+pub struct ContextSwitch {
+    pub context: ContextId,
+    pub applied: tokio::sync::oneshot::Sender<()>,
+}
+
+pub(crate) async fn send_context_switch(
+    context: ContextId, switches: &tokio::sync::mpsc::UnboundedSender<ContextSwitch>,
+    stop: &tokio_util::sync::CancellationToken,
+) {
+    let (applied, received) = tokio::sync::oneshot::channel();
+    if switches.send(ContextSwitch { context, applied }).is_ok() {
+        tokio::select! {
+            _ = received => {},
+            _ = stop.cancelled() => {},
+        }
+    }
+}
+
 /// Where an in-shell context switch is recorded.
 ///
 /// `None` means nothing is listening: the switch still stops the durable

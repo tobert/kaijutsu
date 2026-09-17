@@ -46,6 +46,55 @@ fn shutdown_settles_interactive_execution_paused_in_post_call() {
     interactive_lifetime(true);
 }
 
+#[test]
+fn shutdown_settles_streaming_execution_paused_in_post_call() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let contexts = kj.list_contexts().await.unwrap();
+        let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        kj.join_context(context, "streaming-lifetime").await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("streaming-lifetime".into()), match_instance: None, match_tool: None,
+            match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+            action: HookAction::Invoke(HookBody::Builtin { name: "pause".into(),
+                hook: Arc::new(PausedHook { entered: entered.clone(), release: Arc::new(tokio::sync::Notify::new()) }) }),
+        });
+        let mut output = kj.subscribe_output().await.unwrap();
+        let id = kj.execute("echo captured-stream").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), kernel.kernel.shutdown_command_worker())
+            .await.expect("shutdown must join streaming settlement").unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = output.recv().await {
+                if let kaijutsu_client::OutputEvent::ExitCode { exec_id, code } = event {
+                    if exec_id == id { return code; }
+                }
+            }
+            panic!("streaming output closed without an exit");
+        })
+            .await.expect("joined shutdown must leave a completed streaming output");
+        assert_ne!(exit, 0);
+    });
+}
+
+#[test]
+fn stopped_runtime_refuses_streaming_execution() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let contexts = kj.list_contexts().await.unwrap();
+        let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        kj.join_context(context, "stopped-streaming").await.unwrap();
+        kernel.kernel.shutdown_command_worker().await.unwrap();
+        let result = kj.execute("echo should-not-run").await;
+        assert!(result.is_err(), "stopped runtime admitted streaming source");
+    });
+}
+
 fn interactive_lifetime(shutdown: bool) {
     run_local(async move {
         let (addr, kernel) = start_server_with_kernel_handle().await;

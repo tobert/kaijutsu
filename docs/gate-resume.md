@@ -42,8 +42,10 @@ Quiet structured calls use the same review owner without authoring transcript
 blocks. `kj ledger show <request-id>` includes the captured execution and final
 result; its structured data exposes `result_review.captured` and
 `result_review.settled`. Every ask in a sequence retains the same invocation link.
-Streaming RPC retains review too; its execution ID stays active until the
-result is settled or interrupted, then subscribers receive the final output.
+Streaming commands retain review on the kernel worker too; their connection
+keeps the execution ID active until settlement and output delivery. Interrupt
+or disconnect cancels the caller token. Kernel shutdown cancels and joins review
+settlement, preserving captured execution even after the RPC adapter departs.
 MCP shell commands use the same review owner. Async calls keep their operation
 receipt; foreground calls return typed Pending while execution remains retained.
 Their kernel worker survives caller disconnect. Other MCP tools still lack a

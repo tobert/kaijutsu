@@ -1672,6 +1672,39 @@ fn disconnect_settles_retained_stream_review_and_removes_the_session() {
 }
 
 #[test]
+fn shutdown_settles_retained_stream_review_before_join_returns() {
+    run_local(async {
+        let s = seats().await;
+        s.worker_kj.join_context(s.worker, "shutdown-stream-review").await.unwrap();
+        s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("shutdown-stream-review".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_principal: None, priority: 0, kaish_script_id: None,
+            action: HookAction::Ask(AskSpec { description: Some("Review before shutdown".into()) }),
+        });
+        let mut rx = s.worker_kj.subscribe_output().await.unwrap();
+        let id = s.worker_kj.execute("echo retained-before-shutdown").await.unwrap();
+        wait_for("stream review before shutdown", || s.kernel.kernel_db.lock().list_pending_asks().unwrap().iter()
+            .any(|ask| ask.hook_id.as_deref() == Some("shutdown-stream-review"))).await;
+        let ask = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()
+            .find(|ask| ask.hook_id.as_deref() == Some("shutdown-stream-review")).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.kernel.kernel.shutdown_command_worker())
+            .await.expect("stream review must not hold kernel shutdown").unwrap();
+        let review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask.request_id, s.worker).unwrap().unwrap();
+        assert_eq!(review.settled.unwrap().block_status(), Status::Error);
+        assert_eq!(s.kernel.kernel_db.lock().get_approval(&ask.request_id).unwrap().unwrap().status,
+            kaijutsu_kernel::ApprovalStatus::Abandoned);
+        let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = review.captured.execution
+            else { panic!("shutdown lost captured execution") };
+        assert_eq!(raw.text_out(), "retained-before-shutdown\n");
+        let (_, stderr, exit) = streaming_output(&mut rx, id).await;
+        assert!(!stderr.is_empty());
+        assert_ne!(exit, 0);
+        s.close().await;
+    });
+}
+
+#[test]
 fn mcp_result_review_survives_rpc_disconnect() {
     run_local(async {
         use kaijutsu_kernel::mcp::{Capability, ContextToolBinding, KernelToolResult};

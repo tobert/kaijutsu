@@ -5,9 +5,9 @@ use futures::FutureExt;
 use tracing::Instrument;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use kaijutsu_types::{BlockId, ContextId, PrincipalId, Refusal, Role, Status, ToolKind};
+use kaijutsu_types::{BlockId, PrincipalId, Refusal, Role, Status, ToolKind};
 use crate::{Kernel, block_store::DraftSubmission};
-use super::command::{self, CommandContextSwitch, CommandRunOptions};
+use super::command::{self, CommandContextSwitch, CommandRunOptions, ContextSwitch};
 use super::command_outcome::{CommandExecution, CommandHookEffect, CommandOutcome};
 use super::context_shell::{ShellIdentity, ShellPolicy};
 use super::embedded_kaish::EmbeddedKaish;
@@ -16,13 +16,6 @@ pub enum ShellSource {
     Code(String),
     /// Consume this revision only after admission succeeds. Later typing survives.
     Draft(DraftSubmission),
-}
-
-/// The adapter acknowledges a switch after updating its connection binding.
-/// Dropping the acknowledgement means the connection has departed.
-pub struct ContextSwitch {
-    pub context: ContextId,
-    pub applied: oneshot::Sender<()>,
 }
 
 pub struct ShellSubmission {
@@ -54,17 +47,7 @@ pub async fn submit(
                 let _ = reply.send(Ok(submission));
                 if let Some((kaish, call_ctx, output, code)) = execution {
                     let record = |context| -> futures::future::LocalBoxFuture<'_, ()> {
-                        let (applied, received) = oneshot::channel();
-                        let sent = switches.send(ContextSwitch { context, applied }).is_ok();
-                        let stop = stop.clone();
-                        Box::pin(async move {
-                            if sent {
-                                tokio::select! {
-                                    _ = received => {},
-                                    _ = stop.cancelled() => {},
-                                }
-                            }
-                        })
+                        Box::pin(command::send_context_switch(context, &switches, &stop))
                     };
                     if let Err(error) = command::run_into_blocks(&kaish, &code, identity.context,
                         &command, &output, &owner, &call_ctx,

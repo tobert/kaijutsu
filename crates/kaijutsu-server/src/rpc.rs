@@ -58,7 +58,6 @@
 
 #![allow(refining_impl_trait)]
 
-use kaijutsu_kernel::runtime::command::{CommandContextSwitch, CommandRunOptions};
 use kaijutsu_kernel::runtime::structured::ExecutedKj;
 
 use kaijutsu_kernel::runtime::context_shell::{ShellIdentity, ShellPolicy};
@@ -234,9 +233,8 @@ fn register_subscription(
 
 /// Kernel state shared across all connections via Arc.
 /// Created once at server startup.
-// TODO: Join runtime driver threads and move transport-owned command tasks
-// into the shared shutdown owner. Keep connection subscriptions in the server.
-// See docs/issues.md, "Turn execution and shell settlement".
+/// The kernel runtime owns execution and joined shutdown. Connection-local
+/// subscriptions and callback delivery remain in the server.
 pub struct SharedKernelState {
     pub id: KernelId,
     pub name: String,
@@ -399,6 +397,35 @@ pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
 /// A background execution tracked by exec_id.
 struct RunningExecution {
     cancel: CancellationToken,
+}
+
+/// Reserve the connection's streaming slot through preparation and output
+/// delivery. Dropping the adapter cancels work; the kernel still joins settlement.
+struct StreamingRegistration {
+    connection: Rc<RefCell<ConnectionState>>,
+    exec_id: u64,
+    cancel: CancellationToken,
+}
+
+impl StreamingRegistration {
+    fn new(connection: Rc<RefCell<ConnectionState>>) -> Result<Self, capnp::Error> {
+        let (exec_id, cancel) = {
+            let mut conn = connection.borrow_mut();
+            if conn.has_running_execution() {
+                return Err(capnp::Error::failed("execution already in progress".into()));
+            }
+            let exec_id = conn.next_exec_id();
+            (exec_id, conn.register_execution(exec_id))
+        };
+        Ok(Self { connection, exec_id, cancel })
+    }
+}
+
+impl Drop for StreamingRegistration {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.connection.borrow_mut().complete_execution(self.exec_id);
+    }
 }
 
 /// Per-connection state. Lives in each connection's LocalSet.
@@ -2371,89 +2398,47 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
         trace_span.record("principal.id", self.connection.borrow().principal.to_string());
 
-        // Non-blocking execute: return exec_id immediately, spawn execution in background.
+        // Return exec_id after preparation accepts; output arrives through callbacks.
 
         Promise::from_future(
             async move {
-                // Materialize a single-use context shell seeded from L1. One
-                // instance per execute call — durable env + cwd persist in the
-                // DB, transient scope dies with the instance.
-                let started_ctx = connection.borrow().require_context()?;
-                let reviewer = context_reviewer(&kernel, started_ctx).await;
-                let kaish = materialize_context_shell(&kernel, &connection).await?;
-
-                let (principal, session) = {
+                let (started_ctx, principal, session) = {
                     let conn = connection.borrow();
-                    (conn.principal, conn.session_id)
+                    (conn.require_context()?, conn.principal, conn.session_id)
                 };
-                let call_ctx = kaijutsu_kernel::mcp::CallContext::new(principal, started_ctx, session, kernel.id)
-                    .with_actor(principal, reviewer);
-                // Refusal precedes admission. A synthetic result still gets an
-                // execution id and follows the same output subscription path.
-                let admission = kernel.kernel.broker().shell_pre_call_hooks(&code, &call_ctx).await;
-                let replacement = match admission {
-                    kaijutsu_kernel::mcp::ShellHookVerdict::Proceed => None,
-                    kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result) => {
-                        use kaijutsu_kernel::runtime::command_outcome::{CommandExecution, CommandOutcome};
-                        let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
-                        outcome.apply_hook(kaijutsu_kernel::mcp::ShellHookVerdict::ShortCircuit(result));
-                        Some(outcome)
-                    }
-                    kaijutsu_kernel::mcp::ShellHookVerdict::Denied(err) => {
-                        let refusal = refusal_or_fault(err, "execute")?;
+                let registration = StreamingRegistration::new(connection.clone())?;
+                let reviewer = context_reviewer_for(&kernel, started_ctx, principal).await;
+                let identity = ShellIdentity { requester: principal, performer: principal,
+                    reviewer, context: started_ctx, session };
+                let mut execution = match kaijutsu_kernel::runtime::streaming::execute(
+                    &kernel.kernel, identity, code.clone(), registration.cancel.clone(),
+                ).await.map_err(capnp::Error::failed)? {
+                    Ok(execution) => execution,
+                    Err(refusal) => {
                         set_refusal(&mut results.get().init_outcome().init_refused(), &refusal);
                         return Ok(());
                     }
                 };
-
-                // Keep one active streaming execution per connection, including review.
-                {
-                    let conn = connection.borrow();
-                    if conn.has_running_execution() {
-                        return Err(capnp::Error::failed("execution already in progress".into()));
-                    }
-                }
-
-                // Allocate exec_id and register the execution before spawning.
-                let (exec_id, cancel_token) = {
-                    let mut conn = connection.borrow_mut();
-                    let id = conn.next_exec_id();
-                    let token = conn.register_execution(id);
-
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("system clock before UNIX epoch")
-                        .as_secs();
-
-                    conn.command_history.push(CommandEntry {
-                        id,
-                        code: code.clone(),
-                        timestamp,
-                    });
-
-                    (id, token)
-                };
-
-                // Return exec_id to the caller immediately.
+                let exec_id = registration.exec_id;
+                connection.borrow_mut().command_history.push(CommandEntry {
+                    id: exec_id, code,
+                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .expect("system clock before UNIX epoch").as_secs(),
+                });
                 results.get().init_outcome().set_ok(exec_id);
 
-                // Retain execution and any result review until output settles.
-                let connection_bg = connection.clone();
+                // Only connection callbacks live here. The kernel retains
+                // cancellation and settlement if this LocalSet disappears.
                 tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
-                    let record = |new_id| -> futures::future::LocalBoxFuture<'_, ()> {
-                        record_context_switch(&connection_bg, new_id);
-                        Box::pin(std::future::ready(()))
-                    };
-                    let outcome = match replacement {
-                        Some(outcome) => Ok(outcome),
-                        None => {
-                            use kaijutsu_kernel::runtime::command::run_without_blocks;
-                            let mut options = kaish_kernel::ExecuteOptions::default();
-                            options.cancel_token = Some(cancel_token);
-                            run_without_blocks(&kaish, &code, &kernel.kernel, &call_ctx, options,
-                                CommandRunOptions { stdin: None, context_switch: CommandContextSwitch::Publish(Some(&record)),
-                                    review_notices: None, ..Default::default() }).await
+                    let outcome = loop {
+                        tokio::select! {
+                            Some(switch) = execution.switches.recv() => {
+                                record_context_switch(&registration.connection, switch.context);
+                                let _ = switch.applied.send(());
+                            }
+                            result = &mut execution.completed => break result
+                                .unwrap_or_else(|_| Err("streaming command task stopped before completion".into())),
                         }
                     };
                     let result = match outcome {
@@ -2463,8 +2448,7 @@ impl kernel::Server for KernelImpl {
                             kaish_kernel::interpreter::ExecResult::failure(1, error)
                         }
                     };
-                    dispatch_output_events(exec_id, &result, &connection_bg).await;
-                    connection_bg.borrow_mut().complete_execution(exec_id);
+                    dispatch_output_events(exec_id, &result, &registration.connection).await;
                 }.instrument(tracing::Span::current()));
 
                 Ok(())
@@ -7943,10 +7927,6 @@ fn set_peer_info(builder: &mut peer_info::Builder, info: &PeerInfo) {
 // Shell Execution Dispatch
 // ============================================================================
 //
-/// Create kaish, insert ToolCall + ToolResult blocks, spawn execution.
-///
-/// Shared by `shell_execute` (direct RPC) and `submit_input` (shell mode).
-/// Exit codes 0/2/3 map to Done; everything else is Error.
 /// Render a kaish value as a string for durable `context_env` storage.
 ///
 /// `context_env` is string-only (a normalized KV table — defense in depth), so
@@ -7966,26 +7946,6 @@ fn value_to_env_string(value: &kaish_kernel::ast::Value) -> String {
         // faithful (round-trippable) text form for inline binary.
         Value::Bytes(_) => kaish_kernel::interpreter::value_to_json(value).to_string(),
     }
-}
-
-/// Materialize a single-use context shell for this connection's current
-/// identity (principal + active context + session), seeded from the context's
-/// durable L1 state (`context_env` + `context_shell.cwd`).
-///
-/// The instance is throwaway: run exactly one command against it and drop it.
-/// `kj context set` writes durable state explicitly; runtime execution writes
-/// back changed cwd and exports after execution unless the context switched.
-/// In-flight scope belongs to this invocation. The factory hands back a kaish
-/// whose session→context map is *isolated* from the
-/// connection's; callers that run context-switching commands (`kj context
-/// switch`, `kj fork`) must read `kaish.context_id()` afterward and write any
-/// change back to the connection's `session_contexts`.
-async fn materialize_context_shell(
-    kernel: &SharedKernelState,
-    connection: &Rc<RefCell<ConnectionState>>,
-) -> Result<EmbeddedKaish, capnp::Error> {
-    let context_id = connection.borrow().require_context()?;
-    materialize_context_shell_for(kernel, connection, context_id).await
 }
 
 /// Materialize a shell for an explicitly addressed context without consulting
@@ -10412,6 +10372,20 @@ mod connection_state_tests {
 
     fn test_principal() -> PrincipalId {
         PrincipalId::new()
+    }
+
+    #[test]
+    fn dropping_streaming_preparation_cancels_work_and_releases_its_slot() {
+        let connection = Rc::new(RefCell::new(ConnectionState::new(test_principal(), session_context_map())));
+        let pending = StreamingRegistration::new(connection.clone()).unwrap();
+        let cancel = pending.cancel.clone();
+        let first_id = pending.exec_id;
+        assert!(StreamingRegistration::new(connection.clone()).is_err());
+        drop(pending);
+        assert!(cancel.is_cancelled());
+        assert!(connection.borrow().command_history.is_empty(), "preparation alone is not accepted history");
+        let next = StreamingRegistration::new(connection.clone()).unwrap();
+        assert!(next.exec_id > first_id);
     }
 
     #[test]

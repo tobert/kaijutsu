@@ -100,6 +100,17 @@ A channel returns context switches to the RPC thread, which updates its session
 binding and acknowledges before runtime publishes the switch and completion.
 Disconnect and shutdown release that acknowledgement wait.
 
+## Streaming commands
+
+`execute` reserves a connection-local execution ID and slot, then calls
+`runtime/streaming.rs`. Kernel work owns construction, PreCall, execution, review
+and settlement. Refusal or failure releases the reservation without adding
+history. Accepted work records history and returns its ID; the RPC LocalSet only
+applies acknowledged context switches and delivers output callbacks. Interrupt,
+adapter destruction and disconnect cancel the caller token. Kernel shutdown
+cancels and joins settlement even after the adapter disappears. A panicked
+worker closes the result channel, yielding an error completion to a live adapter.
+
 ## Structured commands
 
 `executeKj` resolves connection identity and calls `runtime/structured.rs` in the

@@ -1731,6 +1731,17 @@ ambient context. The adapter acknowledges context switches before runtime
 publishes completion, with disconnect/shutdown releasing the wait. PreCall
 unwinds settle the unrun pair and preserve the original panic.
 
+Streaming RPC completes this execution-owner migration. Its construction,
+PreCall, execution and result review now run on the kernel worker. The adapter
+reserves its slot before preparation and retains IDs, accepted history, output
+subscriptions and connection-local context switches. A dropped reservation
+cancels execution and releases the slot; the kernel still owns settlement.
+Regressions first showed stopped kernels accepting source and shutdown leaving
+result hooks pending. The new owner joins cancellation, including retained
+approval review, while preserving captured output. Interactive and streaming
+callers now share the acknowledged context-switch channel, and the unused
+ambient-context constructor wrapper is deleted.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

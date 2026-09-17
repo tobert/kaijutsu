@@ -4,7 +4,8 @@
 //! asks and executes captured approved source. `llm_stream` owns model turns;
 //! `turn_state` owns their conversations and interrupts. `context_shell` owns contextual construction and builtin wiring.
 //! `command` owns captured execution, result review, and block-pair settlement;
-//! `structured` owns addressed kj invocation; `interactive` owns shell submission. `command_outcome` retains execution
+//! `structured` owns addressed kj invocation; `interactive` owns shell submission;
+//! `streaming` owns cancellable transport commands. `command_outcome` retains execution
 //! and hook results. `command_result` and `shell_state` supply shared projections
 //! and durable write-back.
 //! `embedded_kaish` owns the interpreter and its execution adapters. Backend,
@@ -20,6 +21,7 @@ mod turn_identity;
 pub mod command;
 pub mod structured;
 pub mod interactive;
+pub mod streaming;
 pub(crate) mod tool_command;
 pub(crate) mod worker;
 pub mod command_result;
