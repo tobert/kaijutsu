@@ -211,8 +211,10 @@ These are source observations, not promises that all paths behave alike.
   statuses. Initial shell pairs, receipts and optional ask links also commit
   together, including interactive, structured, background and pending-model
   setup. Retrying an ask reuses its receipt; conflicting source or identity
-  fails before mutation. Session refusal linkage and approval-driver ownership
-  transfer remain open.
+  fails before mutation. Denied/cancelled pair settlement must succeed before
+  consuming an answer. Model refusal notifications and redemption commit together;
+  repeated notification delivery creates no second block. Session refusal linkage
+  and already-claimed approval ownership transfer remain open.
 - Timed `kj drive --track <name> --score-at <tick>` pairs a turn lease with
   timeline-owned preparation before model work starts. Rc chooses the target
   and fallback; runtime validates complete performer-authored ABC and retains

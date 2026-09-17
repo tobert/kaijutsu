@@ -2038,6 +2038,20 @@ Receipt tests now use one database for the registry and journal, matching
 production; database-free fixtures cannot prove this transaction. Session
 refusal linkage and approval execution/delivery ownership remain separate work.
 
+Refusal delivery now preserves its answer when pair settlement fails. A model
+pair's denial or cancellation is consumed with its notification block in the
+same journal transaction; a session consumes only after its pair settles.
+The ledger's redemption operation can join its caller's transaction, retaining
+its redemption-event atomicity. SQLite fault injection proves rollback of both
+notification and redemption, and retry creates one notification.
+
+Review exposed a competing gate redemption between delivery's precheck and
+commit. A test reproduced a poisoned document after losing that race. The
+notification writer now retains the database guard through commit, reuses it
+for compaction, and releases it before publishing events. Document-before-
+database lock ordering is preserved. Already-claimed approved actions and
+startup/backlog policy remain in the ownership audit.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

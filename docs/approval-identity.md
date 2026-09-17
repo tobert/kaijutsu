@@ -258,6 +258,12 @@ superseded request need explicit linkage so rotation does not duplicate work.
   and status `waiting`.
 - The original model receipt stays `done`. The operation has a separate,
   excluded command/output pair, followed by a completion notification.
+- A denied or cancelled model pair settles before notification. Its notification
+  and answer redemption commit together; a failed write leaves the answer
+  available. A session reads its pair directly and consumes the answer after
+  successful settlement. Repeating a delivered refusal creates no second
+  notification. Restart recovery for old answers remains limited as described
+  in `docs/issues.md`.
 - Native kaish jobs use a manager per context, so jobs survive materialized
   shell instances. The RPC shell path runs kaish in a detached task to preserve cwd, env,
   and session switching, while its job registration supplies the same waiting

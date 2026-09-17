@@ -644,7 +644,7 @@ impl BlockStore {
                 }
 
                 if let Some(payload) = unjournaled {
-                    self.journal_op(context_id, &entry, payload, |_| Ok(()))?;
+                    self.journal_op(context_id, &entry, payload, None, |_| Ok(()))?;
                 }
                 self.recompute_live_status(context_id, &[snapshot.status]);
                 let _entry = vacant.insert(entry);
@@ -1042,12 +1042,15 @@ impl BlockStore {
         entry: &mut DocumentEntry,
         mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
     ) -> BlockStoreResult<T> {
-        self.accept_locked_recorded(context_id, entry, mutate, |_, _| Ok(()))
+        self.accept_locked_recorded(context_id, entry, None, mutate, |_, _| Ok(()))
     }
 
     /// Record related kernel state in the same transaction as the block journal.
+    /// A caller may retain the database guard from its precondition check;
+    /// release it after journaling and compaction, before publishing events.
     fn accept_locked_recorded<T>(
         &self, context_id: ContextId, entry: &mut DocumentEntry,
+        db_guard: Option<parking_lot::MutexGuard<'_, KernelDb>>,
         mutate: impl FnOnce(&mut DocumentEntry) -> BlockStoreResult<(SyncPayload, Vec<BlockFlow>, T)>,
         record: impl FnOnce(&KernelDb, &T) -> crate::kernel_db::KernelDbResult<()>,
     ) -> BlockStoreResult<T> {
@@ -1069,11 +1072,12 @@ impl BlockStore {
                 return Err(error);
             }
         };
-        if let Err(error) = self.journal_op(context_id, entry, payload, |db| record(db, &result)) {
+        if let Err(error) = self.journal_op(context_id, entry, payload, db_guard.as_deref(), |db| record(db, &result)) {
             self.live_status.remove(&context_id);
             tracing::error!(%context_id, %error, "document acceptance failed; restart required");
             return Err(error);
         }
+        drop(db_guard);
         self.recompute_live_status(context_id, &entry.doc.statuses_ordered());
         self.emit_group(events);
         entry.poisoned = false;
@@ -1087,6 +1091,7 @@ impl BlockStore {
         context_id: ContextId,
         entry: &DocumentEntry,
         payload: SyncPayload,
+        supplied_db: Option<&KernelDb>,
         record: impl FnOnce(&KernelDb) -> crate::kernel_db::KernelDbResult<()>,
     ) -> BlockStoreResult<()> {
         #[cfg(test)]
@@ -1094,9 +1099,7 @@ impl BlockStore {
             let hook = self.before_journal.lock().take();
             if let Some(hook) = hook { hook(); }
         }
-        let Some(db) = self.journaling_db()? else {
-            return Ok(());
-        };
+        let Some(handle) = self.journaling_db()? else { return Ok(()); };
         let payload_bytes = codec::encode(&payload)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
         let payload_len = payload_bytes.len() as u64;
@@ -1105,7 +1108,12 @@ impl BlockStore {
         let count = entry.uncompacted_count.load(Ordering::SeqCst) + 1;
         let bytes = entry.uncompacted_bytes.load(Ordering::SeqCst) + payload_len;
         let stamp = now - entry.activity_stamped_at.load(Ordering::SeqCst) >= ACTIVITY_STAMP_INTERVAL_MS;
-        db.lock().in_transaction(|db| {
+        let owned_guard;
+        let db = match supplied_db {
+            Some(db) => db,
+            None => { owned_guard = handle.lock(); &owned_guard },
+        };
+        db.in_transaction(|db| {
             db.append_op(context_id, seq as i64, &payload_bytes)?;
             record(db)?;
             if stamp { db.touch_context_activity(context_id, now)?; }
@@ -1116,23 +1124,21 @@ impl BlockStore {
         entry.uncompacted_bytes.store(bytes, Ordering::SeqCst);
         if stamp { entry.activity_stamped_at.store(now, Ordering::SeqCst); }
         if count >= COMPACTION_OP_THRESHOLD || bytes >= COMPACTION_BYTE_THRESHOLD {
-            self.compact_locked(context_id, entry)?;
+            self.compact_locked(context_id, entry, db)?;
         }
         Ok(())
     }
 
     /// Compact exactly the accepted journal prefix represented by this
     /// document. The caller holds its guard until publication is complete.
-    fn compact_locked(&self, context_id: ContextId, entry: &DocumentEntry) -> BlockStoreResult<()> {
-        let Some(db) = self.journaling_db()? else { return Ok(()); };
+    fn compact_locked(&self, context_id: ContextId, entry: &DocumentEntry, db: &KernelDb) -> BlockStoreResult<()> {
         let snapshot_bytes = codec::encode(&entry.doc.snapshot())
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
         let version = entry.version() as i64;
         let max_seq = entry.next_journal_seq.load(Ordering::SeqCst);
-        let db_guard = db.lock();
-        db_guard.write_snapshot_and_truncate(context_id, max_seq as i64, version, &snapshot_bytes)
+        db.write_snapshot_and_truncate(context_id, max_seq as i64, version, &snapshot_bytes)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        if let Ok((busy, _, _)) = db_guard.checkpoint()
+        if let Ok((busy, _, _)) = db.checkpoint()
             && busy != 0
         {
             tracing::debug!(document_id = %context_id.to_hex(), "wal_checkpoint(TRUNCATE) busy after doc compaction");
@@ -1250,6 +1256,43 @@ impl BlockStore {
         })
     }
 
+    /// Deliver a denied/cancelled answer and consume it in one acceptance.
+    /// A repeated delivery returns None without changing the document.
+    pub(crate) fn insert_refusal_seed(
+        &self, context: ContextId, request: &str, content: &str,
+    ) -> BlockStoreResult<Option<BlockId>> {
+        let db = self.journaling_db()?.ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let mut entry = self.get_mut(context).ok_or(BlockStoreError::DocumentNotFound(context))?;
+        let db = db.lock();
+        {
+            let row = db.get_approval(request).map_err(|error| BlockStoreError::Db(error.to_string()))?
+                .ok_or_else(|| BlockStoreError::Validation("answer not found".into()))?;
+            if row.context_id.as_slice() != context.as_bytes()
+                || !(row.status == crate::ApprovalStatus::Denied || (row.status == crate::ApprovalStatus::Abandoned
+                    && row.decided_option.as_deref() == Some("cancel"))) {
+                return Err(BlockStoreError::Validation("answer is not a denial or cancellation for this context".into()));
+            }
+            if approval_ledger::ask::redeemed_at(db.conn_for_ledger(), request)
+                .map_err(|error| BlockStoreError::Db(error.to_string()))?.is_some() { return Ok(None); }
+        }
+        self.accept_locked_recorded(context, &mut entry, Some(db), |entry| {
+            let after = entry.doc.block_ids_ordered().last().copied();
+            let author = self.principal_id();
+            entry.doc.set_principal_id(author);
+            let id = entry.doc.insert_block(None, after.as_ref(), Role::User, BlockKind::Text,
+                content, Status::Done, ContentType::Plain)?;
+            entry.touch(author);
+            let snapshot = entry.doc.get_block_snapshot(&id).expect("inserted notification exists");
+            let payload = SyncPayload::from_new_block(snapshot.clone());
+            let events = vec![BlockFlow::Inserted { context_id: context, block: Arc::new(snapshot),
+                after_id: after, version: entry.version(), source: OpSource::Local }];
+            Ok((payload, events, id))
+        }, |db, _| {
+            if !db.redeem_ask(request)? { return Err(KernelDbError::Validation("answer was already consumed".into())); }
+            Ok(())
+        }).map(Some)
+    }
+
     /// Insert a tool call block into a document.
     pub fn insert_tool_call(
         &self,
@@ -1337,7 +1380,7 @@ impl BlockStore {
             .map_err(|error| BlockStoreError::Db(error.to_string()))? {
             return Ok(receipt);
         }
-        self.accept_locked_recorded(context, &mut entry, |entry| {
+        self.accept_locked_recorded(context, &mut entry, None, |entry| {
             let after = entry.doc.block_ids_ordered().last().copied();
             entry.doc.set_principal_id(start.actor);
             let command = entry.doc.insert_tool_call(None, after.as_ref(), start.tool,
@@ -1467,7 +1510,7 @@ impl BlockStore {
             Some(ask.ok_or_else(|| BlockStoreError::Validation("waiting tool result has no ask".into()))?)
         } else { None };
         let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        self.accept_locked_recorded(context_id, &mut entry, |entry| {
+        self.accept_locked_recorded(context_id, &mut entry, None, |entry| {
             let command = entry.doc.get_block_header(call).ok_or_else(|| BlockStoreError::Validation("tool call is missing".into()))?;
             let output = entry.doc.get_block_snapshot(result).ok_or_else(|| BlockStoreError::Validation("tool result is missing".into()))?;
             if command.kind != BlockKind::ToolCall || output.kind != BlockKind::ToolResult
@@ -6016,6 +6059,51 @@ mod tests {
     // ====================================================================
     // 1. Crash-Recovery: drop + reload
     // ====================================================================
+
+    #[test]
+    fn refusal_delivery_serializes_with_a_competing_gate_redemption() {
+        use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, context, _) = fresh_db_store(dir.path());
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
+            context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+            reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+            origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+            description: "denied command".into(), statements: vec![], authorized_label: None,
+            rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+            exec_source: None, exec_stdin: None, continuation_epoch: None, env: vec![],
+        }).unwrap();
+        decide(db.lock().conn_for_ledger(), &request, DecideInput {
+            allow: false, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+            ..Default::default()
+        }).unwrap();
+        let competing_db = db.clone();
+        let competing_request = request.clone();
+        let competing_task = Arc::new(parking_lot::Mutex::new(None));
+        let task_slot = competing_task.clone();
+        *store.before_journal.lock() = Some(Box::new(move || {
+            let (attempted, ready) = std::sync::mpsc::channel();
+            *task_slot.lock() = Some(std::thread::spawn(move || {
+                let immediate = competing_db.try_lock().map(|db| db.redeem_ask(&competing_request).unwrap());
+                attempted.send(()).unwrap();
+                // Without the retained guard the gate wins before journaling;
+                // with it the gate waits and observes the committed redemption.
+                immediate.unwrap_or_else(|| competing_db.lock().redeem_ask(&competing_request).unwrap())
+            }));
+            ready.recv().unwrap();
+        }));
+        // Exercise compaction while the notification retains its database guard.
+        store.get(context).unwrap().uncompacted_count.store(COMPACTION_OP_THRESHOLD - 1, Ordering::SeqCst);
+        let delivery = store.insert_refusal_seed(context, &request, "denied; nothing ran");
+        let competitor_won = competing_task.lock().take().unwrap().join().unwrap();
+        assert!(delivery.is_ok(), "a competing redemption must not poison delivery: {delivery:?}");
+        assert!(!competitor_won);
+        assert_eq!(store.get(context).unwrap().uncompacted_count.load(Ordering::SeqCst), 0);
+        assert!(!db.lock().redeem_ask(&request).unwrap());
+        assert!(store.insert_refusal_seed(context, &request, "duplicate").unwrap().is_none());
+    }
 
     #[test]
     fn result_status_changes_publish_and_replay_the_error_flag() {

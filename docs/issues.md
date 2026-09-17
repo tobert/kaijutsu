@@ -233,11 +233,13 @@ per-turn leases own liveness and interrupts, including queued turns.
 Approval execution now validates context state and claims under one database
 lock. Read faults leave answers untouched; repeated delivery cannot overwrite
 completed output after reassignment. A rejected continuation admission cannot
-repeat an already written seed. Continue the settlement audit: denial and
-cancellation delivery still settle or write before redemption, and settlement
-failures can be logged without retry ownership. Pin those storage-fault paths
-before changing their ordering. Startup also suppresses old denied pairs rather
-than settling them. The per-event cap counts delivery, not provider requests;
+repeat an already written seed. Denied/cancelled pair failures now retain the
+answer, and model refusal notifications consume it atomically with their block.
+Continue the audit for already-claimed approved actions: a failed result or
+notification write can still lose its retry owner after redemption. Session
+refusals settle before a separate redemption; a retry can re-emit the same pair's
+metadata/status updates. Startup also suppresses old denied pairs rather than
+settling them. The per-event cap counts delivery, not provider requests;
 large bursts can wait indefinitely for another ledger event. Separate queue
 draining from model-spend admission in the resource audit. Review changed-
 performer settlement's lack of a seed against already running conversations.

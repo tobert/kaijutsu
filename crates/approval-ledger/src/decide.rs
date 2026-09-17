@@ -480,6 +480,7 @@ fn transition(
 /// terminal (`approvals_decided_is_immutable` in `schema.rs`), so a row
 /// read as either here can never read as anything else later — there is no
 /// staleness window to close.
+/// Participates in an existing transaction; its caller must roll back on error.
 pub fn redeem_ask(conn: &Connection, request_id: &str) -> Result<bool> {
     let status: Option<String> = conn
         .query_row("SELECT status FROM approvals WHERE request_id = ?1", params![request_id], |row| row.get(0))
@@ -494,8 +495,10 @@ pub fn redeem_ask(conn: &Connection, request_id: &str) -> Result<bool> {
         return Err(LedgerError::NotDecided { request_id: request_id.to_string(), status });
     }
 
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let inserted = tx.execute(
+    let tx = if conn.is_autocommit() {
+        Some(Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?)
+    } else { None };
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO approval_redemptions (request_id) VALUES (?1)",
         params![request_id],
     )?;
@@ -503,12 +506,12 @@ pub fn redeem_ask(conn: &Connection, request_id: &str) -> Result<bool> {
         // Lost the race (or a plain repeat call) — no event, same
         // reasoning as claim.rs's losing side: only a successful
         // redemption writes anything.
-        tx.commit()?;
+        if let Some(tx) = tx { tx.commit()?; }
         return Ok(false);
     }
 
-    events::append(&tx, request_id, EventKind::Redeemed, None, None, None, None, None)?;
-    tx.commit()?;
+    events::append(conn, request_id, EventKind::Redeemed, None, None, None, None, None)?;
+    if let Some(tx) = tx { tx.commit()?; }
     Ok(true)
 }
 
@@ -521,6 +524,24 @@ mod tests {
     use crate::types::{ApprovalStatus, EventKind};
 
     use super::*;
+
+    #[test]
+    fn redemption_participates_in_its_callers_transaction() {
+        let conn = open_memory();
+        let request = create_ask(&conn, &minimal_ask()).unwrap();
+        decide(&conn, &request, DecideInput { allow: false, decided_by: Some(reviewer(b"amy")), ..Default::default() }).unwrap();
+        let before = list_events(&conn, &request).unwrap().len();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(redeem_ask(&tx, &request).unwrap());
+        assert!(crate::ask::redeemed_at(&tx, &request).unwrap().is_some());
+        tx.rollback().unwrap();
+        assert!(crate::ask::redeemed_at(&conn, &request).unwrap().is_none());
+        assert_eq!(list_events(&conn, &request).unwrap().len(), before);
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(redeem_ask(&tx, &request).unwrap());
+        tx.commit().unwrap();
+        assert!(!redeem_ask(&conn, &request).unwrap());
+    }
 
     #[test]
     fn decide_allow_reaches_the_one_true_allowed_state() {

@@ -217,19 +217,18 @@ fn settle_pair_error(
     command_block_id: &BlockId,
     output_block_id: &BlockId,
     reason: String,
-) {
+) -> Result<(), String> {
     let mut outcome = crate::runtime::command_outcome::CommandOutcome::new(
         crate::runtime::command_outcome::CommandExecution::NotRun, 0);
     outcome.settlement_error = Some(reason);
-    if let Err(error) = crate::runtime::command::settle_outcome(
+    crate::runtime::command::settle_outcome(
         kernel, context_id, command_block_id, output_block_id, &outcome,
-    ) {
-        tracing::error!("could not settle refused shell operation: {error}");
-    }
+    )?;
     // The pair may already be cached from an earlier turn as `Waiting`;
     // this settles it in place, so the next turn must hydrate cold to see
     // it (see `crate::runtime::turn_state::ConversationCache::evict`).
     kernel.turns().conversations().evict(context_id);
+    Ok(())
 }
 
 /// Tell a model whose own tool pair was settled without execution. A turn's
@@ -294,7 +293,9 @@ impl Drop for ApprovalPreparation<'_> {
         if !self.armed || !std::thread::panicking() { return; }
         let reason = "Approved action preparation panicked; nothing was run. The approval is spent.";
         if let Some((command, output)) = self.pair {
-            settle_pair_error(self.kernel, self.context, &command, &output, reason.into());
+            if let Err(error) = settle_pair_error(self.kernel, self.context, &command, &output, reason.into()) {
+                tracing::error!(%error, "could not persist approved preparation panic");
+            }
         } else {
             let tail = self.kernel.blocks().last_block_id(self.context);
             if let Err(error) = self.kernel.blocks().insert_block_as(
@@ -348,33 +349,20 @@ async fn act_on_executable_answer(
         let Some((command_block_id, output_block_id, owner)) = linked else {
             return ExecAction::FallThrough;
         };
-        settle_pair_error(
-            kernel,
-            context_id,
-            &command_block_id,
-            &output_block_id,
-            ask.denial.clone(),
-        );
-        // Redeem after the blocks carry the reason: the answer is not
-        // delivered until there is something to read.
-        if let Err(e) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
-            tracing::error!(
-                "gate-resume: ask {} was refused and its blocks settled, but the \
-                 redemption did not write ({e}); it may be delivered again",
-                answer.request_id
-            );
+        if let Err(error) = settle_pair_error(kernel, context_id, &command_block_id, &output_block_id, ask.denial.clone()) {
+            tracing::error!(ask = %answer.request_id, %error, "refusal settlement failed; retaining the answer");
             return ExecAction::Deferred;
         }
-        return if owner == crate::PairOwner::Turn {
-            ExecAction::Tell(unrun_turn_seed(
-                who,
-                answer.status,
-                &answer.description,
-                &output_block_id,
-            ))
-        } else {
-            ExecAction::Settled
-        };
+        if owner == crate::PairOwner::Turn {
+            return ExecAction::Tell(unrun_turn_seed(who, answer.status, &answer.description, &output_block_id));
+        }
+        // A session reads its pair directly. A model's notification consumes
+        // its answer later, in the same acceptance as the notification block.
+        if let Err(error) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
+            tracing::error!(ask = %answer.request_id, %error, "refusal settled but redemption failed");
+            return ExecAction::Deferred;
+        }
+        return ExecAction::Settled;
     }
 
     // Validate context state and claim under one database lock. Only the
@@ -421,7 +409,9 @@ async fn act_on_executable_answer(
     if performer_changed {
         let reason = "The context's performer changed after this ask was raised; nothing was run.".to_string();
         if let Some((command, output, _)) = linked {
-            settle_pair_error(kernel, context_id, &command, &output, reason.clone());
+            if let Err(error) = settle_pair_error(kernel, context_id, &command, &output, reason.clone()) {
+                return ExecAction::Tell(format!("{reason} Its result could not be persisted: {error}. Inspect block {}.", output.to_key()));
+            }
         }
         tracing::error!("gate-resume: ask {}: {reason}", answer.request_id);
         return ExecAction::Settled;
@@ -461,13 +451,10 @@ async fn act_on_executable_answer(
                 answer.request_id
             );
             if let Some((command_block_id, output_block_id, _owner)) = linked {
-                settle_pair_error(
-                    kernel,
-                    context_id,
-                    &command_block_id,
-                    &output_block_id,
-                    format!("approved, but no shell could be built to run it: {e}"),
-                );
+                if let Err(error) = settle_pair_error(kernel, context_id, &command_block_id, &output_block_id,
+                    format!("approved, but no shell could be built to run it: {e}")) {
+                    return ExecAction::Tell(format!("The approved action did not run because no shell could be built: {e}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
+                }
             }
             if needs_no_shell_turn_seed(linked) {
                 return ExecAction::Tell(no_shell_turn_seed(
@@ -508,13 +495,9 @@ async fn act_on_executable_answer(
     // spends the approval but settles its pair without running the source.
     if let Err(why) = prepare_while_running(stop, seed_ask_env(&kaish, &answer.request_id, kernel)).await {
         let reason = format!("approved, but not run: {why}");
-        settle_pair_error(
-            kernel,
-            context_id,
-            &command_block_id,
-            &output_block_id,
-            reason.clone(),
-        );
+        if let Err(error) = settle_pair_error(kernel, context_id, &command_block_id, &output_block_id, reason.clone()) {
+            return ExecAction::Tell(format!("{reason}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
+        }
         return if tell {
             ExecAction::Tell(format!(
                 "{who} approved the action you were waiting on: {}\n\n\
@@ -805,33 +788,22 @@ async fn run_delivery(
                 format!("{who} {decision} the action you were waiting on: {}\n\nNothing has run yet. {next}", answer.description)
             });
 
-            let tail = kernel.blocks().last_block_id(context_id);
-            let seed_block = match kernel.blocks().insert_block_as(
-                context_id,
-                None,
-                tail.as_ref(),
-                kaijutsu_types::Role::User,
-                kaijutsu_types::BlockKind::Text,
-                seed.clone(),
-                kaijutsu_types::Status::Done,
-                kaijutsu_types::ContentType::Plain,
-                None,
-            ) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(
-                        "gate-resume: failed to write the seed block for {context_id}: {e}"
-                    );
+            let seed_result = if matches!(answer.status, crate::ApprovalStatus::Denied | crate::ApprovalStatus::Abandoned) {
+                kernel.blocks().insert_refusal_seed(context_id, &answer.request_id, &seed)
+            } else {
+                let tail = kernel.blocks().last_block_id(context_id);
+                kernel.blocks().insert_block_as(context_id, None, tail.as_ref(), kaijutsu_types::Role::User,
+                    kaijutsu_types::BlockKind::Text, seed.clone(), Status::Done,
+                    kaijutsu_types::ContentType::Plain, None).map(Some)
+            };
+            let seed_block = match seed_result {
+                Ok(Some(id)) => id,
+                Ok(None) => { woken.insert(answer.request_id.clone()); continue; }
+                Err(error) => {
+                    tracing::error!(%context_id, %error, "gate-resume: could not persist answer notification");
                     continue;
                 }
             };
-
-            if answer.status == crate::ApprovalStatus::Abandoned {
-                if let Err(e) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
-                    tracing::error!("gate-resume: cancellation delivery could not be recorded for {}: {e}", answer.request_id);
-                    continue;
-                }
-            }
 
             // The seed is part of settling work already claimed. Shutdown
             // retains that fact, but never spends another model request on it.
@@ -936,6 +908,98 @@ async fn run_delivery(
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_refusal_settlement_keeps_the_answer_available() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        use approval_ledger::{ask::create_ask, decide::{cancel, decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        for (owner, cancelled) in [crate::PairOwner::Turn, crate::PairOwner::Session].into_iter()
+            .flat_map(|owner| [false, true].map(|cancelled| (owner, cancelled))) {
+            let dispatcher = Arc::new(test_dispatcher_persistent().await);
+            let kernel = dispatcher.kernel();
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let context = register_context(&dispatcher, Some("denial-write"), None, actor);
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let (command, output) = author_pair_for_ask(kernel, context, actor, "echo must-not-run").unwrap();
+            for block in [&command, &output] { kernel.blocks().set_status(context, block, Status::Waiting).unwrap(); }
+            let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "run captured source".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some("echo must-not-run".into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            if cancelled { cancel(kernel.kernel_db().lock().conn_for_ledger(), &request, actor.as_bytes()).unwrap(); }
+            else { decide(kernel.kernel_db().lock().conn_for_ledger(), &request, DecideInput {
+                allow: false, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                ..Default::default()
+            }).unwrap(); }
+            let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+            let ask = ExecutableAsk { source: "echo must-not-run".into(), stdin: None, cwd: None, actor, reviewer,
+                pair: Some((command, output, owner)), denial: "denied; nothing ran".into() };
+            kernel.blocks().arm_accept_fault(1);
+            let stop = tokio_util::sync::CancellationToken::new();
+            let action = act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+            assert!(matches!(action, ExecAction::Deferred), "failed settlement must retain delivery ownership");
+            assert!(kernel.kernel_db().lock().undelivered_answers().unwrap().iter().any(|a| a.request_id == request));
+            let retried = act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+            assert!(matches!(retried, ExecAction::Tell(_) | ExecAction::Settled));
+            for block in [&command, &output] { assert_eq!(kernel.blocks().get_block_snapshot(context, block).unwrap().unwrap().status, Status::Error); }
+            let output = kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap();
+            assert!(output.is_error);
+            assert_eq!(output.stderr.as_deref(), Some("command was not run\ndenied; nothing ran"));
+            assert_eq!(kernel.kernel_db().lock().undelivered_answers().unwrap().iter().any(|a| a.request_id == request),
+                owner == crate::PairOwner::Turn, "a model denial still needs its durable notification");
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_notification_and_redemption_roll_back_and_retry_together() {
+        use approval_ledger::{ask::{create_ask, redeemed_at}, decide::{cancel, decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        for cancelled in [false, true] {
+            let kernel = Kernel::new_ephemeral("refusal-notification").await;
+            let context = ContextId::new();
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "refused command".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: None, exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            {
+                let db = kernel.kernel_db().lock();
+                if cancelled { cancel(db.conn_for_ledger(), &request, actor.as_bytes()).unwrap(); }
+                else { decide(db.conn_for_ledger(), &request, DecideInput {
+                    allow: false, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                    ..Default::default()
+                }).unwrap(); }
+                db.conn_for_ledger().execute_batch("CREATE TRIGGER reject_redemption BEFORE INSERT ON approval_redemptions
+                    BEGIN SELECT RAISE(FAIL, 'injected redemption fault'); END;").unwrap();
+            }
+            let error = kernel.blocks().insert_refusal_seed(context, &request, "nothing ran").unwrap_err();
+            assert!(error.to_string().contains("injected redemption fault"), "{error}");
+            assert!(redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_none());
+            let db = kernel.blocks().db().unwrap().clone();
+            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
+            restored.load_from_db().unwrap();
+            assert!(restored.block_snapshots(context).unwrap().is_empty(), "failed redemption must roll back its notification");
+            kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER reject_redemption").unwrap();
+            let id = restored.insert_refusal_seed(context, &request, "nothing ran").unwrap().unwrap();
+            assert!(redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &request).unwrap().is_some());
+            assert!(restored.insert_refusal_seed(context, &request, "duplicate notice").unwrap().is_none());
+            let blocks = restored.block_snapshots(context).unwrap();
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].id, id);
+            assert_eq!(blocks[0].content, "nothing ran");
+        }
+    }
 
     #[tokio::test]
     async fn unreadable_context_preserves_approval_and_pair_for_retry() {
