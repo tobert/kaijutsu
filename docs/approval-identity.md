@@ -1,10 +1,11 @@
 # Approval identity
 
-Amy reviews by default. Delegation is explicit. The character performing an
-operation cannot approve it, from any context — except the self-confirmation
-whose assigned reviewer IS that character, which nobody else may answer. The
-assigned reviewer may be Amy, a directing model, or a separate adjudicator
-character.
+The character responsible for the context above the work reviews it.
+Delegation is explicit. The character performing an operation cannot approve
+it, from any context — except the self-confirmation whose assigned reviewer
+IS that character, which nobody else may answer. The assigned reviewer may be
+a root character such as Amy, a directing model, or a separate adjudicator
+character. There is no configured default reviewer.
 
 ```sh
 kj character create coder
@@ -13,21 +14,16 @@ kj context info repair
 ```
 
 The caller's acting character becomes the context's director. Creating or
-directing a context does not grant review authority. Without an explicit
-assignment or delegation, Amy reviews coder whether Amy, Banto, or an external
-lead created `repair`.
+directing a context does not grant review authority. Run from Amy's root
+context, `repair` is a child of it, so without an explicit assignment or
+delegation Amy reviews coder. Run from banto's seat, banto reviews coder.
 
-`/config/kernel/approval.toml` names the default reviewer, as a character name
-or full principal ID. The shipped value is `amy`. The reviewer must resolve to
-a live character; a missing or retired character is an error, never a reason
-to substitute the caller.
-
-A broken default does not replace a valid explicit or delegated reviewer.
-It clears the cached default, so work that needs default review refuses
-until configuration is repaired. `kj context info` keeps the context's
-metadata visible and reports a reviewer error when its assignment cannot
-resolve. Direct client commands remain available for inspection and repair;
-the gate still refuses an ask with no valid reviewer.
+Every reviewer must resolve to a live character; a missing or retired
+character is an error, never a reason to substitute the caller.
+`kj context info` keeps the context's metadata visible and reports a reviewer
+error when its assignment cannot resolve. Direct client commands remain
+available for inspection and repair; the gate refuses an ask with no valid
+reviewer.
 
 Reviewer resolution takes the acting character (the actor) and the
 context, and follows this order:
@@ -44,13 +40,13 @@ context, and follows this order:
    retired responsible character refuses by name, and a `forked_from`
    pointing at no row is an error (`docs/character.md`, "Roots and
    rotation").
-4. Configured default reviewer, Amy.
 
-The default layer skips itself when it would name the actor, since it is
-independently configured and unrelated to the actor's own assignment.
-When every layer is exhausted, the actor is at its own root: the ask is
-raised with the actor as its reviewer, the actor alone may answer it, and
-the ledger records the answer as a self-confirmation. A model turn refuses
+When every layer is exhausted and the actor is a live root character, the
+actor is at its own root: the ask is raised with the actor as its reviewer,
+the actor alone may answer it, and the ledger records the answer as a
+self-confirmation. When the actor is not a root character, resolution
+refuses and names the actor and the context; assign a reviewer with
+`kj context set <context> --reviewer <character>`. A model turn refuses
 to start when its performer resolves as its own reviewer, and a root can
 never be a performer, so self-confirmation is a human's act. An explicit
 override or delegation that names the actor resolves the same way, as a
@@ -58,7 +54,8 @@ self-confirmation, since the human set it up. Escalation runs the same walk
 past the context that yielded the current reviewer, and refuses at a root,
 naming it.
 
-Amy can delegate review across a director's coder contexts:
+Any live root character can delegate review across a director's coder
+contexts:
 
 ```sh
 kj ledger delegation grant banto --to banto
@@ -71,10 +68,15 @@ not create a model, select its inference provider, or start a review context.
 It applies across that director's contexts without overriding explicit
 context assignments. A director cannot grant this authority to itself.
 Changing or revoking a delegation refuses while affected contexts have
-pending asks. Settle or cancel those asks first. Amy can reclaim an ask from
-an unavailable reviewer, settle it, then revoke the delegation.
+pending asks. Settle or cancel those asks first. The lineage root of an ask's
+context can reclaim it from an unavailable reviewer, settle it, then revoke
+the delegation.
 
-For an explicit context assignment, Amy runs:
+A context's **lineage root** is the character responsible for the context at
+the top of its `forked_from` chain. It must be a live root character; a
+lineage that ends anywhere else refuses. The lineage root changes approval
+routing on its contexts. For an explicit context assignment, Amy runs, from
+a context in her lineage:
 
 ```sh
 kj context set repair --as coder --reviewer banto
@@ -97,8 +99,9 @@ caller in that context; no sheet relation is consulted, and a root
 character cannot be cast, by any caller, through `create --as` or
 `set --as`. This is a second way to earn `--as` authority,
 not a change to reviewer authority: it does not let a director assign
-`--reviewer` or `--director`, which still require the default reviewer,
-and the performer still cannot review its own work.
+`--reviewer` or `--director`, which still require the lineage root,
+and the performer still cannot review its own work. The lineage root may
+also assign `--as` on any context in its lineage.
 
 ## Three identities
 
@@ -159,9 +162,9 @@ kj ledger cancel <request-id>
 
 An ask snapshots its requester, performer, and reviewer. `show` reports all
 three plus the deciding character. The assigned reviewer may allow or deny.
-The assigned reviewer or Amy, as the default review authority, may explicitly
-reassign a pending ask with `escalate`. This lets Amy reclaim a delegated ask
-when its reviewer is unavailable. Escalation records both reviewer identities
+The assigned reviewer or the lineage root of the ask's context may
+explicitly reassign a pending ask with `escalate`. This lets Amy reclaim a
+delegated ask in her lineage when its reviewer is unavailable. Escalation records both reviewer identities
 and the actual caller, and refuses to assign the performer. The requester or
 performer may cancel a pending ask. Cancellation runs nothing; it does not
 undo an executed action.
@@ -194,7 +197,7 @@ Old asks with no recorded performer/reviewer remain audit history and cannot
 be approved through a guessed identity. The policy migration removes old
 automatic reviewer assignments from contexts; it does not manufacture
 director relationships or grants from requester identity. Existing contexts
-therefore use the configured default unless explicitly reassigned. A missing
+therefore resolve through the walk unless explicitly reassigned. A missing
 performer still requires assignment before kernel model work.
 
 ## Continuation windows and async work
@@ -276,7 +279,14 @@ superseded request need explicit linkage so rotation does not duplicate work.
   excluding the current reviewer and refuses at a root.
 - Self-confirmation: an ask whose reviewer is its own actor is answerable
   only by that actor, and the decision is recorded as a self-confirmation.
-  The performer-cannot-approve rule holds for every other ask.
+  An exhausted walk self-confirms only for a live root character
+  (`CharacterRow::root`) and refuses for anyone else. The
+  performer-cannot-approve rule holds for every other ask.
+- Authority: `KernelDb::lineage_root` finds the root character at the top
+  of a context's `forked_from` chain. It gates `kj context set --reviewer`,
+  `--director`, and `--clear-reviewer`, and `kj ledger escalate` by someone
+  other than the assigned reviewer. `kj ledger delegation grant|revoke`
+  requires any live root character.
 
 ## Planned
 
@@ -286,4 +296,4 @@ rotation".
 A `kj context create --as <character>` by a caller without reviewer
 authority raises an ask rather than refusing; approval executes the
 statement and the verb accepts a redeemed approval for that statement as
-authority. `ROOT` is a reserved, single name.
+authority.

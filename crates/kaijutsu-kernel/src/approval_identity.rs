@@ -1,15 +1,9 @@
-//! Resolve approval reviewers from explicit context assignment, delegation, and defaults.
+//! Resolve approval reviewers from explicit context assignment, delegation, and the context forest.
 
-use std::path::Path;
-
-use serde::Deserialize;
 use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::kernel::Kernel;
 use crate::llm::CharacterIdentity;
-use crate::vfs::{VfsError, VfsOps};
-
-const APPROVAL_CONFIG_FILE: &str = "approval.toml";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewSource {
@@ -19,9 +13,8 @@ pub enum ReviewSource {
     /// ask's own, walking `forked_from` (`docs/character.md`, "Roots and
     /// rotation").
     Walk,
-    Default,
-    /// Every layer is exhausted: the actor is at its own root and
-    /// confirms its own statement.
+    /// Every layer is exhausted and the actor is a live root character:
+    /// it is at its own root and confirms its own statement.
     SelfConfirmation,
 }
 
@@ -31,7 +24,6 @@ impl ReviewSource {
             Self::Explicit => "explicit",
             Self::Delegation => "delegation",
             Self::Walk => "walk",
-            Self::Default => "default",
             Self::SelfConfirmation => "self_confirmation",
         }
     }
@@ -41,23 +33,6 @@ impl ReviewSource {
 pub struct ResolvedContextReview {
     pub reviewer: CharacterIdentity,
     pub source: ReviewSource,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovalConfig {
-    default_reviewer: String,
-}
-
-impl ApprovalConfig {
-    fn parse(text: &str) -> Result<Self, String> {
-        let config: Self = toml::from_str(text)
-            .map_err(|error| format!("approval.toml parse error: {error}"))?;
-        if config.default_reviewer.trim().is_empty() {
-            return Err("approval.toml default_reviewer must not be empty".into());
-        }
-        Ok(config)
-    }
 }
 
 impl Kernel {
@@ -92,14 +67,13 @@ impl Kernel {
     /// Resolve a hypothetical context assignment before committing it.
     ///
     /// Order: explicit override, the director's delegation, the walk up
-    /// `forked_from` from `context`, then the configured default
-    /// (`docs/character.md`, "Roots and rotation"). The walk needs both a
-    /// context to start from and a known actor to exclude; `context` is
-    /// `None` only where the context does not exist yet, and a create
-    /// passes its parent, which is where the walk would continue anyway.
-    /// The walk never returns `actor`, and the default skips itself when
-    /// it names `actor`: past that the actor is at its own root and
-    /// confirms its own statement.
+    /// `forked_from` from `context` (`docs/character.md`, "Roots and
+    /// rotation"). The walk needs both a context to start from and a known
+    /// actor to exclude; `context` is `None` only where the context does
+    /// not exist yet, and a create passes its parent, which is where the
+    /// walk would continue anyway. The walk never returns `actor`. Past it,
+    /// a live root actor confirms its own statement and any other actor
+    /// has no reviewer, which is an error.
     pub async fn resolve_review_assignment(
         &self,
         context: Option<ContextId>,
@@ -107,11 +81,6 @@ impl Kernel {
         director: Option<PrincipalId>,
         explicit_reviewer: Option<PrincipalId>,
     ) -> Result<ResolvedContextReview, String> {
-        // Refresh the default even when a higher-precedence route wins, so a
-        // later gate cannot use a stale cached default after config breaks.
-        // An explicit assignment or live director grant remains usable on its
-        // own; only the default fallback needs this refresh to succeed.
-        let default_reviewer = self.default_approval_reviewer().await;
         let (reviewer_id, source) = if let Some(reviewer) = explicit_reviewer {
             (reviewer, ReviewSource::Explicit)
         } else if let Some(director) = director {
@@ -119,23 +88,22 @@ impl Kernel {
                 .map_err(|error| format!("could not read approval delegation: {error}"))?;
             match delegation {
                 Some(reviewer) => (reviewer, ReviewSource::Delegation),
-                None => self.walk_then_default(context, actor, default_reviewer)?,
+                None => self.walk_then_root(context, actor)?,
             }
         } else {
-            self.walk_then_default(context, actor, default_reviewer)?
+            self.walk_then_root(context, actor)?
         };
 
         let reviewer = self.live_character(reviewer_id, "reviewer")?;
         Ok(ResolvedContextReview { reviewer, source })
     }
 
-    /// The walk, default, and self-confirmation layers of
+    /// The walk and self-confirmation layers of
     /// [`Self::resolve_review_assignment`].
-    fn walk_then_default(
+    fn walk_then_root(
         &self,
         context: Option<ContextId>,
         actor: Option<PrincipalId>,
-        default_reviewer: Result<PrincipalId, String>,
     ) -> Result<(PrincipalId, ReviewSource), String> {
         if let (Some(context), Some(actor)) = (context, actor) {
             let responsible = self.kernel_db().lock().responsible_character_above(context, &[actor])
@@ -144,12 +112,19 @@ impl Kernel {
                 return Ok((responsible, ReviewSource::Walk));
             }
         }
-        // A broken default is a configuration fault, not a root: refuse
-        // rather than quietly promoting the actor to its own reviewer.
-        let default_reviewer = default_reviewer?;
-        match actor {
-            Some(actor) if actor == default_reviewer => Ok((actor, ReviewSource::SelfConfirmation)),
-            _ => Ok((default_reviewer, ReviewSource::Default)),
+        let Some(actor) = actor else {
+            return Err("no reviewer: the context has no explicit reviewer or delegation, and there is no actor to walk above".into());
+        };
+        let sheet = self.kernel_db().lock().get_character(actor)
+            .map_err(|error| format!("could not read the actor's character sheet: {error}"))?;
+        match sheet {
+            Some(sheet) if sheet.root && sheet.retired_at.is_none() => Ok((actor, ReviewSource::SelfConfirmation)),
+            sheet => {
+                let name = sheet.map_or_else(|| actor.short(), |sheet| sheet.name);
+                Err(format!(
+                    "nobody reviews {name}: no one is responsible above it, and only a live root character confirms its own statements; assign one with `kj context set <context> --reviewer <character>`"
+                ))
+            }
         }
     }
 
@@ -168,46 +143,6 @@ impl Kernel {
         Ok(review)
     }
 
-    pub async fn default_approval_reviewer(&self) -> Result<PrincipalId, String> {
-        let result = self.load_default_approval_reviewer().await;
-        let db = self.kernel_db().lock();
-        match result {
-            Ok(reviewer) => {
-                db.set_default_approval_reviewer(reviewer)
-                    .map_err(|error| format!("could not cache default reviewer: {error}"))?;
-                Ok(reviewer)
-            }
-            Err(error) => {
-                db.clear_default_approval_reviewer()
-                    .map_err(|clear_error| format!("{error}; could not clear cached default reviewer: {clear_error}"))?;
-                Err(error)
-            }
-        }
-    }
-
-    async fn load_default_approval_reviewer(&self) -> Result<PrincipalId, String> {
-        let path = kaijutsu_types::paths::config_path(APPROVAL_CONFIG_FILE);
-        let text = match self.vfs().read_all(Path::new(&path)).await {
-            Ok(bytes) => String::from_utf8(bytes)
-                .map_err(|error| format!("approval.toml is not valid UTF-8: {error}"))?,
-            Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => {
-                crate::config_seed::DEFAULT_APPROVAL_CONFIG.to_string()
-            }
-            Err(error) => return Err(format!("could not read {path}: {error}")),
-        };
-        let configured = ApprovalConfig::parse(&text)?.default_reviewer;
-        let db = self.kernel_db().lock();
-        let character = match PrincipalId::parse(&configured) {
-            Ok(principal) => db.get_character(principal),
-            Err(_) => db.get_character_by_name(&configured),
-        }.map_err(|error| format!("could not resolve default reviewer '{configured}': {error}"))?
-            .ok_or_else(|| format!("default reviewer '{configured}' has no character sheet"))?;
-        if character.retired_at.is_some() {
-            return Err(format!("default reviewer '{}' is retired", character.name));
-        }
-        Ok(character.principal_id)
-    }
-
     fn live_character(&self, principal: PrincipalId, purpose: &str) -> Result<CharacterIdentity, String> {
         let character = self.kernel_db().lock().get_character(principal)
             .map_err(|error| format!("could not resolve {purpose}: {error}"))?
@@ -224,6 +159,7 @@ mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
     use crate::kernel_db::KernelDb;
+    use std::path::Path;
     use std::sync::Arc;
 
     async fn kernel_with_characters(names: &[&str]) -> (Kernel, Vec<PrincipalId>) {
@@ -238,37 +174,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_reviewer_is_amy_not_the_requester() {
+    async fn exhausted_walk_confirms_a_root_and_refuses_anyone_else() {
         let (kernel, ids) = kernel_with_characters(&["amy", "coder"]).await;
-        let review = kernel.resolve_review_assignment(None, Some(ids[1]), None, None).await.unwrap();
-        assert_eq!(review.reviewer.principal_id, ids[0]);
-        assert_eq!(review.source, ReviewSource::Default);
+        let error = kernel.resolve_review_assignment(None, Some(ids[1]), None, None).await.unwrap_err();
+        assert!(error.contains("coder") && error.contains("root"), "{error}");
+        assert!(kernel.resolve_review_assignment(None, Some(ids[0]), None, None).await.is_err(), "amy is not a root yet");
+        kernel.kernel_db().lock().update_character_root(ids[0], true).unwrap();
+        let review = kernel.resolve_review_assignment(None, Some(ids[0]), None, None).await.unwrap();
+        assert_eq!((review.reviewer.principal_id, review.source), (ids[0], ReviewSource::SelfConfirmation));
+        assert!(kernel.resolve_review_assignment(None, None, None, None).await.is_err(), "no actor, no walk, no reviewer");
     }
 
     #[tokio::test]
-    async fn explicit_override_precedes_director_grant_and_revoke_restores_default() {
+    async fn explicit_override_precedes_director_grant_and_revoke_restores_the_walk() {
         let (kernel, ids) = kernel_with_characters(&["amy", "lead", "judge", "coder", "specialist"]).await;
         let [amy, lead, judge, coder, specialist] = ids.as_slice() else { unreachable!() };
-        let review = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), None).await.unwrap();
-        assert_eq!((review.reviewer.principal_id, review.source), (*amy, ReviewSource::Default));
+        let error = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), None).await.unwrap_err();
+        assert!(error.contains("coder"), "{error}");
         kernel.kernel_db().lock().grant_approval_delegation(*lead, *judge, *amy).unwrap();
         let review = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), None).await.unwrap();
         assert_eq!((review.reviewer.principal_id, review.source), (*judge, ReviewSource::Delegation));
         let review = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), Some(*specialist)).await.unwrap();
         assert_eq!((review.reviewer.principal_id, review.source), (*specialist, ReviewSource::Explicit));
         kernel.kernel_db().lock().revoke_approval_delegation(*lead, *amy).unwrap();
-        let review = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), None).await.unwrap();
-        assert_eq!((review.reviewer.principal_id, review.source), (*amy, ReviewSource::Default));
+        assert!(kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), None).await.is_err());
     }
 
     #[tokio::test]
     async fn director_may_review_distinct_coder_but_never_its_own_model_work() {
         let (kernel, ids) = kernel_with_characters(&["amy", "lead", "coder"]).await;
+        kernel.kernel_db().lock().update_character_root(ids[0], true).unwrap();
         kernel.kernel_db().lock().grant_approval_delegation(ids[1], ids[1], ids[0]).unwrap();
         assert!(kernel.validate_model_review_assignment(None, ids[2], Some(ids[1]), None).await.is_ok());
         let error = kernel.validate_model_review_assignment(None, ids[1], Some(ids[1]), None).await.unwrap_err();
         assert!(error.contains("cannot review its own work"), "{error}");
-        // Direct RPC resolves a reviewer without turning the connected human into a model.
+        // A root confirms its own direct statements, but is never a model performer.
         assert!(kernel.resolve_review_assignment(None, Some(ids[0]), None, None).await.is_ok());
         assert!(kernel.validate_model_review_assignment(None, ids[0], None, None).await.is_err());
     }
@@ -287,63 +227,12 @@ mod tests {
             let error = kernel.resolve_review_assignment(None, Some(ids[3]), director, explicit).await.unwrap_err();
             assert!(error.contains("retired"), "{error}");
         }
+        kernel.kernel_db().lock().update_character_root(ids[0], true).unwrap();
         kernel.kernel_db().lock().conn_for_ledger().execute(
             "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [ids[0].as_bytes().as_slice()],
         ).unwrap();
-        assert!(kernel.default_approval_reviewer().await.unwrap_err().contains("retired"));
-        let (missing, _) = kernel_with_characters(&["coder"]).await;
-        assert!(missing.default_approval_reviewer().await.unwrap_err().contains("no character sheet"));
-    }
-
-    #[tokio::test]
-    async fn config_selects_name_or_id_and_invalid_config_fails_loudly() {
-        let (kernel, ids) = kernel_with_characters(&["amy", "judge"]).await;
-        let config = tempfile::tempdir().unwrap();
-        kernel.mount(kaijutsu_types::paths::CONFIG_ROOT, crate::vfs::LocalBackend::new(config.path())).await;
-        let path = config.path().join("approval.toml");
-        for selector in ["judge".to_string(), ids[1].to_string()] {
-            std::fs::write(&path, format!("default_reviewer = \"{selector}\"\n")).unwrap();
-            assert_eq!(kernel.default_approval_reviewer().await.unwrap(), ids[1]);
-        }
-        for invalid in ["default_reviewer = \"\"", "default_reviewer = \"amy\"\nunknown = true", "broken = ["] {
-            std::fs::write(&path, invalid).unwrap();
-            assert!(kernel.default_approval_reviewer().await.is_err(), "accepted {invalid}");
-        }
-        std::fs::write(&path, b"\xff").unwrap();
-        assert!(kernel.default_approval_reviewer().await.unwrap_err().contains("UTF-8"));
-    }
-
-    #[tokio::test]
-    async fn explicit_and_delegated_reviewers_survive_bad_default_without_a_stale_cache() {
-        let (kernel, ids) = kernel_with_characters(&["amy", "lead", "judge", "coder", "specialist"]).await;
-        let [amy, lead, judge, coder, specialist] = ids.as_slice() else { unreachable!() };
-        let config = tempfile::tempdir().unwrap();
-        kernel.mount(kaijutsu_types::paths::CONFIG_ROOT, crate::vfs::LocalBackend::new(config.path())).await;
-        let path = config.path().join("approval.toml");
-        std::fs::write(&path, "default_reviewer = \"amy\"\n").unwrap();
-        assert_eq!(kernel.default_approval_reviewer().await.unwrap(), *amy);
-        kernel.kernel_db().lock().grant_approval_delegation(*lead, *judge, *amy).unwrap();
-
-        for invalid in ["default_reviewer = \"missing\"\n", "broken = ["] {
-            std::fs::write(&path, invalid).unwrap();
-            let explicit = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), Some(*specialist)).await.unwrap();
-            assert_eq!((explicit.reviewer.principal_id, explicit.source), (*specialist, ReviewSource::Explicit));
-            let delegated = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), None).await.unwrap();
-            assert_eq!((delegated.reviewer.principal_id, delegated.source), (*judge, ReviewSource::Delegation));
-            assert!(kernel.resolve_review_assignment(None, Some(*coder), None, None).await.is_err());
-            assert_eq!(kernel.kernel_db().lock().cached_default_approval_reviewer().unwrap(), None);
-        }
-
-        std::fs::write(&path, "default_reviewer = \"amy\"\n").unwrap();
-        kernel.kernel_db().lock().conn_for_ledger().execute(
-            "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [amy.as_bytes().as_slice()],
-        ).unwrap();
-        let explicit = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), Some(*specialist)).await.unwrap();
-        assert_eq!((explicit.reviewer.principal_id, explicit.source), (*specialist, ReviewSource::Explicit));
-        let delegated = kernel.resolve_review_assignment(None, Some(*coder), Some(*lead), None).await.unwrap();
-        assert_eq!((delegated.reviewer.principal_id, delegated.source), (*judge, ReviewSource::Delegation));
-        assert!(kernel.resolve_review_assignment(None, Some(*coder), None, None).await.is_err());
-        assert_eq!(kernel.kernel_db().lock().cached_default_approval_reviewer().unwrap(), None);
+        let error = kernel.resolve_review_assignment(None, Some(ids[0]), None, None).await.unwrap_err();
+        assert!(error.contains("amy"), "a retired root does not confirm itself: {error}");
     }
 
     #[tokio::test]
@@ -363,7 +252,7 @@ mod tests {
                 }
             }
         }
-        let context = test_helpers::register_context(&dispatcher, Some("coder-work"), None, amy);
+        let context = test_helpers::register_rooted_context(&dispatcher, Some("coder-work"), amy);
         {
             let db = dispatcher.kernel_db().lock();
             db.update_context_review_assignment(context, Some(coder), None, Some(lead)).unwrap();

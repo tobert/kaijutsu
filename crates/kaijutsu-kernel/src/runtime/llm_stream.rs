@@ -1749,14 +1749,7 @@ async fn run_llm_stream(
         if let Some(director) = identity.director {
             span.record("director.id", tracing::field::display(director));
         }
-        let review_source = match identity.review_source {
-            crate::approval_identity::ReviewSource::Explicit => "explicit",
-            crate::approval_identity::ReviewSource::Delegation => "delegation",
-            crate::approval_identity::ReviewSource::Walk => "walk",
-            crate::approval_identity::ReviewSource::Default => "default",
-            crate::approval_identity::ReviewSource::SelfConfirmation => "self_confirmation",
-        };
-        span.record("review.source", review_source);
+        span.record("review.source", identity.review_source.as_str());
         span.record("actor.name", identity.performer.name.as_str());
         span.record("reviewer.name", identity.reviewer.name.as_str());
     }
@@ -4589,7 +4582,7 @@ mod usage_tests {
                     name: "Lead".to_string(),
                 },
                 director: Some(player),
-                review_source: crate::approval_identity::ReviewSource::Default,
+                review_source: crate::approval_identity::ReviewSource::Walk,
             }),
             tool_ctx,
             interrupt,
@@ -5083,7 +5076,7 @@ mod usage_tests {
         assert_ne!(seen["actor.id"].text, seen["reviewer.id"].text);
         assert_eq!(seen["actor.name"].text.as_deref(), Some("Coder"));
         assert_eq!(seen["reviewer.name"].text.as_deref(), Some("Lead"));
-        assert_eq!(seen["review.source"].text.as_deref(), Some("default"));
+        assert_eq!(seen["review.source"].text.as_deref(), Some("walk"));
         for field in [
             "llm.usage.input_tokens",
             "llm.usage.output_tokens",

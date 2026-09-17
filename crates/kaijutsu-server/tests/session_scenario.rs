@@ -13,7 +13,7 @@
 //! banto then drives and waits on them, and each lane drifts a report back
 //! to banto's seat. banto then notes a handoff, and a later
 //! turn issues a gated statement that raises an ask; amy answers it as the
-//! default reviewer; a final turn signs off, closing the continuation
+//! character responsible above banto's seat; a final turn signs off, closing the continuation
 //! window; amy rotates banto's seat and reads the successor's instructions.
 //!
 //! **This scenario currently fails at the performer-assignment step** — see
@@ -175,9 +175,8 @@ struct Scenario {
 /// `tests/mock_scripts/` fixtures, a mock backend seeded (`mock-model` stays
 /// the registry default; the scenario's contexts pick their own models via
 /// cast slot / explicit override), and one real SSH credential bound to a
-/// character named `amy` — the shipped default reviewer
-/// (`docs/approval-identity.md`, "`/config/kernel/approval.toml` names the
-/// default reviewer... shipped value is `amy`").
+/// character named `amy`, whose context banto's seat is created from
+/// (`docs/approval-identity.md`).
 async fn boot() -> Scenario {
     // SAFETY: this binary has exactly one #[test] (see the module doc) —
     // nothing else in this process reads or writes this variable.

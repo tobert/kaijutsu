@@ -86,8 +86,7 @@ fn typing_creates_an_ephemeral_draft_block_at_the_end() {
 fn chat_submit_promotes_the_draft_rather_than_copying_it() {
     run_local(async {
         // Submit starts a model turn, which needs a performer and a distinct
-        // reviewer; wire creation leaves the performer unset and an ephemeral
-        // kernel has no sheet for the default reviewer.
+        // reviewer; client creation leaves the performer unset.
         let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
         let client = connect_client(addr).await;
         let kernel = bind(&client).await;

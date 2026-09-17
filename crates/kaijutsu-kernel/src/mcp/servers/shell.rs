@@ -625,7 +625,7 @@ mod tests {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("shw"), None, principal);
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("shw"), principal);
 
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
@@ -715,7 +715,7 @@ mod tests {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("validrej"), None, principal);
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("validrej"), principal);
 
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
@@ -808,7 +808,7 @@ mod tests {
     async fn shell_write_with_no_answer_escalates_and_returns_pending_refusing_the_call() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("pending-shw"), None, principal);
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("pending-shw"), principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
@@ -839,7 +839,7 @@ mod tests {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("deny-multi"), None, principal);
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("deny-multi"), principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
         broker.set_binding(ctx_id, binding).await.unwrap();
@@ -967,7 +967,7 @@ mod tests {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("dead-pin"), None, principal);
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("dead-pin"), principal);
         {
             let db = d.kernel_db().lock();
             db.upsert_context_shell(&ContextShellRow {
@@ -1509,7 +1509,7 @@ mod tests {
             .await;
         let principal = PrincipalId::new();
         let reviewer = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("write-exec"), None, principal);
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("write-exec"), principal);
 
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell_write".into()));
@@ -1668,7 +1668,7 @@ mod tests {
             for foreground in [true, false] {
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
-                let context = register_context(&d, Some("tool-state"), None, principal);
+                let context = crate::kj::test_helpers::register_rooted_context(&d, Some("tool-state"), principal);
                 d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
                 let mut binding = ContextToolBinding::new();
                 binding.grant(Capability::Facade(if read_only { "shell" } else { "shell_write" }.into()));
@@ -1849,7 +1849,7 @@ mod tests {
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
                 let reviewer = PrincipalId::new();
-                let context = register_context(&d, Some("tool-review"), None, principal);
+                let context = crate::kj::test_helpers::register_rooted_context(&d, Some("tool-review"), principal);
                 d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
                 d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
                     principal_id: reviewer, name: "tool-reviewer".into(), created_at: 0, retired_at: None,

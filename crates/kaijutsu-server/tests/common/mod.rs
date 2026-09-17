@@ -172,10 +172,10 @@ pub async fn start_server_with_mock_llm_kernel_handle(
     (addr, kernel)
 }
 
-/// Arrange the identity a model turn needs on an ephemeral kernel: a sheet
-/// for the shipped default reviewer (`amy`) and a performer assigned to
-/// `context`. The reviewer is left unset on the context so the turn resolves
-/// it through the default path, the way a fresh context does.
+/// Arrange the identity a model turn needs on an ephemeral kernel: a
+/// performer assigned to `context`. The reviewer is left unset on the
+/// context, so the turn resolves it through the walk to the ephemeral root
+/// character that plays the root context above it.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn seed_turn_identity(
     kernel: &kaijutsu_server::SharedKernel,
@@ -191,8 +191,6 @@ pub fn seed_turn_identity(
     };
     let performer = sheet("mock-performer");
     let db = kernel.kernel_db.lock();
-    db.insert_character(&sheet("amy"))
-        .expect("seed the default reviewer's character sheet");
     db.insert_character(&performer)
         .expect("seed the performer's character sheet");
     db.update_context_review(context, Some(performer.principal_id), None)

@@ -300,13 +300,15 @@ struct ReviewAssignment {
     authority: AssignAuthority,
 }
 
-/// Which rule justified a non-default caller's authority to assign a
-/// context's performer, so [`KjDispatcher::apply_context_config`]'s
+/// Which rule justified a caller's authority to change a context's
+/// approval assignment, so [`KjDispatcher::apply_context_config`]'s
 /// commit-time re-check can redo that SAME rule under its transaction lock
 /// instead of assuming the reviewer path (`docs/approval-identity.md`, the
-/// assignment paragraph). Unused (and irrelevant) whenever the caller IS
-/// the default reviewer — that path bypasses both rules entirely.
+/// assignment paragraph). Only [`Self::LineageRoot`] may change routing.
 enum AssignAuthority {
+    /// The caller is the root character at the top of the target's
+    /// `forked_from` chain ([`crate::kernel_db::KernelDb::lineage_root`]).
+    LineageRoot,
     /// The caller was the target's resolved effective reviewer.
     EffectiveReviewer(kaijutsu_types::PrincipalId),
     /// The caller's actor directs the target. Casting is what makes the
@@ -448,25 +450,19 @@ impl KjDispatcher {
                 if let Some(review) = &cfg.review {
                     let current = db.get_context(target_id)?
                         .ok_or_else(|| crate::kernel_db::KernelDbError::Validation("context disappeared before assignment".into()))?;
-                    let is_default = db.cached_default_approval_reviewer()? == Some(review.caller_actor);
-                    if review.routing_changed && !is_default {
-                        return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
-                    }
-                    if !review.routing_changed && !is_default {
-                        match &review.authority {
-                            AssignAuthority::EffectiveReviewer(expected_reviewer) => {
-                                let review_actor = current.played_by.unwrap_or(review.caller_actor);
-                                let current_reviewer = db.effective_approval_reviewer(target_id, review_actor)?.reviewer();
-                                if review.caller_actor != *expected_reviewer || current_reviewer != *expected_reviewer {
-                                    return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
-                                }
-                            }
-                            AssignAuthority::Directs => {
-                                if current.director_id != Some(review.caller_actor) {
-                                    return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
-                                }
-                            }
+                    let authority_holds = match &review.authority {
+                        AssignAuthority::LineageRoot => {
+                            matches!(db.lineage_root(target_id), Ok(root) if root == review.caller_actor)
                         }
+                        AssignAuthority::EffectiveReviewer(expected_reviewer) => {
+                            let review_actor = current.played_by.unwrap_or(review.caller_actor);
+                            let current_reviewer = db.effective_approval_reviewer(target_id, review_actor)?.reviewer();
+                            !review.routing_changed && review.caller_actor == *expected_reviewer && current_reviewer == *expected_reviewer
+                        }
+                        AssignAuthority::Directs => !review.routing_changed && current.director_id == Some(review.caller_actor),
+                    };
+                    if !authority_holds {
+                        return Err(crate::kernel_db::KernelDbError::Validation("approval assignment authority changed before commit".into()));
                     }
                     if db.list_pending_asks()?.iter().any(|ask| ask.context_id.as_slice() == target_id.as_bytes()) {
                         return Err(crate::kernel_db::KernelDbError::Validation("settle or cancel pending asks before changing this context's approval assignment".into()));
@@ -1123,9 +1119,14 @@ impl KjDispatcher {
             };
             (target_id, row, cast_label, performer, ())
         };
-        let reviewer = match self.kernel().resolve_context_review(target_id).await {
-            Ok(review) => Some(review.reviewer),
-            Err(error) => return KjResult::Err(format!("kj context prompt: {error}")),
+        // The reviewer reviews the performer's asks; a context with no
+        // performer has none to review, so the fact is absent.
+        let reviewer = match performer {
+            None => None,
+            Some(_) => match self.kernel().resolve_context_review(target_id).await {
+                Ok(review) => Some(review.reviewer),
+                Err(error) => return KjResult::Err(format!("kj context prompt: {error}")),
+            },
         };
 
         // Situational label/state/provider/model come from the live
@@ -1668,7 +1669,7 @@ impl KjDispatcher {
     /// Whether `caller` may assign `performer` as `target_id`'s performer
     /// via `kj context set <ctx> --as <character>`. Called only once the
     /// outer `context_set` has already established that `caller` is not
-    /// the default reviewer and that this is a pure `--as` (no
+    /// the target's lineage root and that this is a pure `--as` (no
     /// `--reviewer`/`--director`/`--clear-reviewer` in the same call — that
     /// routing-change case is gated separately, above, and unaffected by
     /// this rule).
@@ -1714,7 +1715,7 @@ impl KjDispatcher {
         if director_id == Some(caller) {
             return Ok(AssignAuthority::Directs);
         }
-        Err("only the default reviewer, the effective reviewer, or the context's director may assign a performer".into())
+        Err("only the context's lineage root, its effective reviewer, or its director may assign a performer".into())
     }
 
     /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
@@ -1748,21 +1749,20 @@ impl KjDispatcher {
                 return KjResult::Err("kj context set: --reviewer and --clear-reviewer cannot be used together".into());
             }
             let changes_routing = reviewer.is_some() || clear_reviewer || director.is_some();
-            let authority = match self.kernel().default_approval_reviewer().await {
-                Ok(authority) => Some(authority),
-                Err(error) if changes_routing => return KjResult::Err(format!("kj context set: {error}")),
-                Err(error) => {
-                    tracing::warn!("could not load default approval reviewer while assigning performer: {error}");
-                    None
-                }
-            };
-            if changes_routing && authority != Some(caller.actor_id) {
-                return KjResult::Err("kj context set: only the default reviewer may change approval routing".into());
+            // A lineage that cannot name its root only removes this route;
+            // the performer rules below still apply to a pure `--as`.
+            let lineage_root = self.kernel_db().lock().lineage_root(target_id);
+            let is_lineage_root = matches!(lineage_root, Ok(root) if root == caller.actor_id);
+            if changes_routing && !is_lineage_root {
+                return match lineage_root {
+                    Ok(_) => KjResult::Err("kj context set: only the lineage root of this context may change approval routing".into()),
+                    Err(error) => KjResult::Err(format!("kj context set: only the lineage root may change approval routing: {error}")),
+                };
             }
             // `--as` is the only field this branch can be reached for
             // without `changes_routing` (the early return above already
             // covers every `--reviewer`/`--director`/`--clear-reviewer`
-            // case for a non-default caller), so `character` is resolved up
+            // case for any other caller), so `character` is resolved up
             // front: both the authority check below and the eventual
             // assignment need its principal id, and an unknown or retired
             // name fails the same way regardless of which rule would
@@ -1786,13 +1786,13 @@ impl KjDispatcher {
                 }
                 None => None,
             };
-            let authority_record = if authority != Some(caller.actor_id) {
+            let authority_record = if is_lineage_root {
+                AssignAuthority::LineageRoot
+            } else {
                 match self.caller_may_assign_performer(target_id, caller.actor_id).await {
                     Ok(record) => record,
                     Err(error) => return KjResult::Err(format!("kj context set: {error}")),
                 }
-            } else {
-                AssignAuthority::EffectiveReviewer(caller.actor_id)
             };
             let assignment = {
                 let db = self.kernel_db().lock();
@@ -2620,16 +2620,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_reviewer_repairs_a_retired_explicit_reviewer() {
+    async fn lineage_root_repairs_a_retired_explicit_reviewer() {
         let d = test_dispatcher().await;
         let amy = test_reviewer_principal();
         let retired = PrincipalId::new();
         let owner = PrincipalId::new();
-        let context = register_context(&d, Some("repair-reviewer"), None, owner);
+        let root = crate::kj::test_helpers::register_root_context(&d);
+        let context = register_context(&d, Some("repair-reviewer"), Some(root), owner);
         {
             let db = d.kernel_db().lock();
             db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired-reviewer".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None, root_ctx: None, root: false }).unwrap();
-            db.set_default_approval_reviewer(amy).unwrap();
             db.update_context_review_assignment(context, None, Some(retired), None).unwrap();
         }
         let caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
@@ -2641,12 +2641,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_reviewer_can_assign_a_performer_when_default_is_retired() {
+    async fn explicit_reviewer_can_assign_a_performer_when_the_lineage_root_is_retired() {
         let d = test_dispatcher().await;
         let amy = test_reviewer_principal();
         let lead = PrincipalId::new();
         let coder = PrincipalId::new();
-        let context = register_context(&d, Some("explicit-reviewer"), None, amy);
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("explicit-reviewer"), amy);
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
@@ -2683,24 +2683,24 @@ mod tests {
 
         let routing = d.dispatch(&[s("context"), s("set"), s("."), s("--reviewer"), s("coder")], &lead_caller).await;
         assert!(!routing.is_ok());
-        assert!(routing.message().contains("retired") || routing.message().contains("default reviewer"), "{}", routing.message());
+        assert!(routing.message().contains("lineage root") && routing.message().contains("retired"), "{}", routing.message());
         let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
         assert_eq!(row.reviewer_id, Some(lead));
     }
 
     #[tokio::test]
-    async fn pending_ask_blocks_default_reviewer_routing_changes() {
+    async fn pending_ask_blocks_lineage_root_routing_changes() {
         let d = test_dispatcher().await;
         let amy = test_reviewer_principal();
         let coder = PrincipalId::new();
         let director = PrincipalId::new();
-        let context = register_context(&d, Some("pending-routing"), None, amy);
+        let root = crate::kj::test_helpers::register_root_context(&d);
+        let context = register_context(&d, Some("pending-routing"), Some(root), amy);
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(coder, "coder"), (director, "lead")] {
                 db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
-            db.set_default_approval_reviewer(amy).unwrap();
             db.update_context_review_assignment(context, Some(coder), Some(amy), None).unwrap();
         }
         let gate_caller = crate::kj::KjCaller { principal_id: amy, actor_id: coder, reviewer_id: Some(amy), context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
@@ -2746,13 +2746,13 @@ mod tests {
         let amy = test_reviewer_principal();
         let lead = PrincipalId::new();
         let coder = PrincipalId::new();
-        let context = register_context(&d, Some("stale-reviewer"), None, amy);
+        let root = crate::kj::test_helpers::register_root_context(&d);
+        let context = register_context(&d, Some("stale-reviewer"), Some(root), amy);
         {
             let db = d.kernel_db().lock();
             for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
                 db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
-            db.set_default_approval_reviewer(amy).unwrap();
             db.update_context_review_assignment(context, None, None, Some(lead)).unwrap();
             db.grant_approval_delegation(lead, lead, amy).unwrap();
         }
@@ -2822,7 +2822,7 @@ mod tests {
                 principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
-        let context = register_context(&d, Some("review-work"), None, amy.actor_id);
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("review-work"), amy.actor_id);
         let amy = crate::kj::KjCaller { context_id: Some(context), ..amy };
         let set = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder"), s("--reviewer"), s("lead")], &amy).await;
         assert!(set.is_ok(), "{}", set.message());
@@ -2830,7 +2830,7 @@ mod tests {
         assert_eq!(assigned.played_by, Some(coder));
         assert_eq!(assigned.reviewer_id, Some(lead));
         let coder_call = amy.clone().with_actor(coder, Some(lead));
-        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("amy")], &coder_call).await;
+        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("lead")], &coder_call).await;
         assert!(!refused.is_ok());
         assert!(refused.message().contains("may assign a performer"));
         let self_review = d.dispatch(&[s("context"), s("set"), s("."), s("--reviewer"), s("coder")], &amy).await;
@@ -2839,6 +2839,38 @@ mod tests {
         let unchanged = d.kernel_db().lock().get_context(context).unwrap().unwrap();
         assert_eq!(unchanged.played_by, Some(coder));
         assert_eq!(unchanged.reviewer_id, Some(lead));
+    }
+
+    /// Routing belongs to the lineage root. Another live root, outside the
+    /// target's lineage, cannot change it, and neither can the context's
+    /// own director.
+    #[tokio::test]
+    async fn only_the_lineage_root_changes_approval_routing() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let bob = PrincipalId::new();
+        let lead = PrincipalId::new();
+        let judge = PrincipalId::new();
+        for (principal_id, name, root) in [(bob, "bob", true), (lead, "lead", false), (judge, "judge", false)] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root,
+            }).unwrap();
+        }
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("routed"), amy);
+        d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(lead)).unwrap();
+        let caller = |actor| crate::kj::KjCaller {
+            principal_id: actor, actor_id: actor, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+        };
+        let set_reviewer = [s("context"), s("set"), s("."), s("--reviewer"), s("judge")];
+        for outsider in [bob, lead] {
+            let refused = d.dispatch(&set_reviewer, &caller(outsider)).await;
+            assert!(!refused.is_ok() && refused.message().contains("lineage root"), "{}", refused.message());
+        }
+        assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().reviewer_id, None);
+        let routed = d.dispatch(&set_reviewer, &caller(amy)).await;
+        assert!(routed.is_ok(), "{}", routed.message());
+        assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().reviewer_id, Some(judge));
     }
 
     /// A director casts its own children: `--as` is allowed when the
@@ -2856,7 +2888,7 @@ mod tests {
                 principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
         }
-        let context = register_context(&d, Some("banto-directed"), None, amy_id);
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("banto-directed"), amy_id);
         d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(banto)).unwrap();
         let banto_caller = crate::kj::KjCaller {
             principal_id: banto, actor_id: banto, reviewer_id: None, context_id: Some(context),
@@ -2893,7 +2925,7 @@ mod tests {
         assert!(refused.message().contains("root character"), "{}", refused.message());
         assert_eq!(d.kernel_db().lock().get_context(context).unwrap().unwrap().played_by, None);
 
-        // The default reviewer cannot cast a root either.
+        // A root cannot cast a root either.
         let amy = crate::kj::KjCaller {
             principal_id: amy_id, actor_id: amy_id, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
@@ -3034,11 +3066,13 @@ mod tests {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let mut caller = test_caller();
-        caller.context_id = None;
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: caller.principal_id, name: s("amy"), created_at: 1,
-            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
         }).unwrap();
+        let root = register_context(&d, Some("amy"), None, caller.principal_id);
+        d.kernel_db().lock().update_context_review(root, Some(caller.principal_id), None).unwrap();
+        caller.context_id = Some(root);
         for (index, name) in ["two words", "O'Brien", "null", "$literal", "1.0"].into_iter().enumerate() {
             let actor = PrincipalId::new();
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
@@ -3112,7 +3146,6 @@ mod tests {
                 retired_at: Some(2),
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.set_default_approval_reviewer(amy).unwrap();
         }
         let context_id = ContextId::new();
         let row = crate::kernel_db::ContextRow {
@@ -3163,7 +3196,6 @@ mod tests {
                 retired_at: None,
                 handoff_ctx: None, root_ctx: None, root: false,
             }).unwrap();
-            db.set_default_approval_reviewer(amy).unwrap();
             db.grant_approval_delegation(performer, performer, amy).unwrap();
         }
         let context_id = ContextId::new();

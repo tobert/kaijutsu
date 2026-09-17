@@ -22,7 +22,7 @@ does not become an instruction to use nonexistent features.
 | Credentials | `auth.db` binds fingerprints to principals; `add-key --as <character>` binds to an existing character |
 | Performer | `kj context create --as <character>` records `played_by` before create rc, rejects unknown, retired, root, or self-reviewing assignments, and preserves the requester's `created_by`. Without `--as`, this path leaves it unset. Fork copies it |
 | Client creation | There is no create RPC. A client runs `kj context create` through `executeKj` from an existing context, which becomes the parent. A client with no context yet uses `--parent <label>`, or the kernel's only live root context, and refuses with several roots (`kaijutsu_client::choose_parent`; `kaijutsu-mcp`, `kaijutsu-tui`, and `kaijutsu-acp` all take `--parent`). Ordinary client contexts leave the performer unset. Creation records the acting caller as director when it has a character sheet, and leaves the director unset otherwise; it grants no approval authority. MCP session registration records the credential character as performer, except a root character, which cannot be cast |
-| Review assignment | Explicit context override, then explicit director-wide delegation, then the walk up `forked_from`, then the configured Amy default; an exhausted walk is a self-confirmation. Amy controls delegation and reviewer/director overrides. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
+| Review assignment | Explicit context override, then explicit director-wide delegation, then the walk up `forked_from`. There is no configured default. An exhausted walk is a self-confirmation for a live root character and an error for anyone else. The lineage root, the root character at the top of a context's `forked_from` chain, controls its reviewer and director overrides; any live root grants and revokes delegation. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation whose reviewer IS its performer. See `docs/approval-identity.md` |
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged. A retired character responsible for an ancestor context refuses reviewer resolution below it, by name |
@@ -163,14 +163,16 @@ Two things follow, and they are the ones to check a change against:
   actor.** Resolution takes the actor and the context: an explicit
   override on the context, then the director's delegation, then the walk
   up `forked_from` to the first context whose responsible character is
-  live and is not the actor, then the configured default. The walk starts
-  at the context itself, which is how a context with no parent still
-  resolves through its own director. Archived ancestors are walked
+  live and is not the actor. There is no configured default. The walk
+  starts at the context itself, which is how a context with no parent
+  still resolves through its own director. Archived ancestors are walked
   through; what matters is who is responsible for them. When the walk
-  ends without finding anyone else, the actor is at its own root and the
-  ask is a **self-confirmation**: the row is raised with the actor as its
-  reviewer, the actor alone may answer it, and the ledger records the
-  answer as a self-confirmation. Every other ask has a reviewer who is not
+  ends without finding anyone else and the actor is a live root
+  character, the actor is at its own root and the ask is a
+  **self-confirmation**: the row is raised with the actor as its reviewer,
+  the actor alone may answer it, and the ledger records the answer as a
+  self-confirmation. A non-root actor with nobody above it has no
+  reviewer, and the ask refuses. Every other ask has a reviewer who is not
   its actor, so an ask nobody can answer cannot exist. Escalation runs the
   same walk past the context that yielded the current reviewer, and
   refuses at a root. See `docs/approval-identity.md`.

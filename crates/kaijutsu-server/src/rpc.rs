@@ -8008,8 +8008,8 @@ async fn context_reviewer(
 /// command is performed by the CONNECTED human, so that is the identity
 /// the walk excludes — resolving for the context's `played_by` instead
 /// would answer a different question, and in a context with no performer
-/// set would fall straight to the default reviewer, which can equal the
-/// connected human (`docs/approval-identity.md`, "Three identities").
+/// set would have no actor to walk above (`docs/approval-identity.md`,
+/// "Three identities").
 async fn context_reviewer_for(
     kernel: &SharedKernelState,
     context_id: ContextId,

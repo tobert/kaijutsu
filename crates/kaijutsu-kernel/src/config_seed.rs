@@ -28,9 +28,6 @@ pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.
 /// `kj::gate_policy` reads beneath the ledger's rules.
 pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gate.toml");
 
-/// Embedded default approval identity configuration.
-pub const DEFAULT_APPROVAL_CONFIG: &str = include_str!("../../../assets/defaults/approval.toml");
-
 /// Embedded continuation-window policy for automatic gate-resume turns.
 pub const DEFAULT_CONTINUATION_CONFIG: &str =
     include_str!("../../../assets/defaults/continuation.toml");
@@ -81,7 +78,6 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("theme.toml"), DEFAULT_THEME),
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
         (config_path("gate.toml"), DEFAULT_GATE_CONFIG),
-        (config_path("approval.toml"), DEFAULT_APPROVAL_CONFIG),
         (config_path("continuation.toml"), DEFAULT_CONTINUATION_CONFIG),
         (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
         (config_path("continuation.md"), DEFAULT_CONTINUATION_PROMPT),
@@ -207,7 +203,7 @@ mod tests {
         assert!(names.contains(&config_path("theme.toml").as_str()));
         assert!(names.contains(&config_path("mcp.toml").as_str()));
         assert!(names.contains(&config_path("gate.toml").as_str()));
-        assert!(names.contains(&config_path("approval.toml").as_str()));
+        assert!(!names.contains(&config_path("approval.toml").as_str()), "review has no configured default");
         assert!(names.contains(&config_path("continuation.toml").as_str()));
         assert!(names.contains(&config_path("distillation.md").as_str()));
         assert!(names.contains(&config_path("continuation.md").as_str()));

@@ -213,10 +213,9 @@ pub const ACTIVE_RING_CAPACITY: i64 = kaijutsu_types::RING_SLOTS as i64;
 pub enum EffectiveReviewer {
     /// A live character, distinct from the acting one, reviews its work.
     Assigned(PrincipalId),
-    /// Every resolution layer is exhausted for this actor: no explicit
-    /// override or delegation applies, no context at or above this one has
-    /// a live responsible character other than the actor, and the
-    /// configured default either is unset or names the actor itself. The
+    /// Every resolution layer is exhausted for a live root actor: no
+    /// explicit override or delegation applies, and no context at or above
+    /// this one has a live responsible character other than the actor. The
     /// actor is at its own root, so it reviews its own work: the ask is
     /// raised with the actor as reviewer and only the actor may answer it
     /// (`docs/approval-identity.md`).
@@ -678,11 +677,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(label) WHERE label IS NOT NULL AND archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS approval_identity_config (
-    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
-    default_reviewer_id BLOB NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS context_continuations (
     context_id     BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
@@ -1960,33 +1954,6 @@ impl KernelDb {
         Ok(approval_ledger::ask::load_ask_env(self.conn_for_ledger(), request_id)?)
     }
 
-    /// Cache the configured default reviewer for atomic ask routing.
-    pub fn set_default_approval_reviewer(&self, reviewer: PrincipalId) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT INTO approval_identity_config (id, default_reviewer_id) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET default_reviewer_id = excluded.default_reviewer_id
-             WHERE approval_identity_config.default_reviewer_id != excluded.default_reviewer_id",
-            params![blob_param(reviewer.as_bytes())],
-        )?;
-        Ok(())
-    }
-
-    /// Clear the cached configured default reviewer after configuration can no
-    /// longer be resolved. Gates must fail rather than reuse an old default.
-    pub fn clear_default_approval_reviewer(&self) -> KernelDbResult<()> {
-        self.conn.execute("DELETE FROM approval_identity_config WHERE id = 1", [])?;
-        Ok(())
-    }
-
-    /// Read the default reviewer cached from approval.toml.
-    pub fn cached_default_approval_reviewer(&self) -> KernelDbResult<Option<PrincipalId>> {
-        let cached = self.conn.query_row("SELECT default_reviewer_id FROM approval_identity_config WHERE id = 1", [], |row| read_principal_id(row, 0)).optional()?;
-        match cached {
-            Some(reviewer) if self.get_character(reviewer)?.is_some_and(|character| character.retired_at.is_none()) => Ok(Some(reviewer)),
-            Some(_) | None => Ok(None),
-        }
-    }
-
     /// Open a new continuation epoch for an explicit model drive.
     pub fn begin_continuation(&self, context_id: ContextId, opened_at: i64) -> KernelDbResult<ContinuationOrigin> {
         if self.conn.is_autocommit() {
@@ -2092,20 +2059,19 @@ impl KernelDb {
     /// for the character `actor` currently performing an invocation in it.
     ///
     /// Order: the context's explicit reviewer override, the director's
-    /// active delegation, the walk up `forked_from`
-    /// ([`Self::responsible_character_above`]), then the cached default
-    /// reviewer. Explicit override and delegation are resolved as
+    /// active delegation, then the walk up `forked_from`
+    /// ([`Self::responsible_character_above`]). Explicit override and
+    /// delegation are resolved as
     /// configured even when they name `actor`: a director may legitimately
     /// delegate review of its OTHER contexts to itself
     /// (`kj ledger delegation grant banto --to banto`), and a self-review
     /// specifically for `actor`'s own work is caught by the caller that
     /// knows it is validating a performer assignment
     /// (`validate_model_review_assignment`), not by this general-purpose
-    /// resolver. The walk never returns `actor`. Only the default layer
-    /// skips itself when it equals `actor` — an unrelated, independently
-    /// configured character sheet — and there is no layer left after it:
-    /// that exhaustion is [`EffectiveReviewer::SelfConfirmation`], not an
-    /// error. `actor` is at its own root and confirms its own statement.
+    /// resolver. The walk never returns `actor`. When it runs out, a live
+    /// root `actor` is at its own root and confirms its own statement
+    /// ([`EffectiveReviewer::SelfConfirmation`]); any other actor has no
+    /// reviewer, and that is a validation error naming it.
     ///
     /// A missing context is an error, not an exhausted walk: resolving a
     /// reviewer for a context that is not there means the caller is
@@ -2129,11 +2095,61 @@ impl KernelDb {
             return Ok(EffectiveReviewer::Assigned(responsible));
         }
 
-        match self.cached_default_approval_reviewer()? {
-            Some(default_reviewer) if default_reviewer != actor => {
-                self.live_approval_reviewer(default_reviewer).map(EffectiveReviewer::Assigned)
+        match self.get_character(actor)? {
+            Some(sheet) if sheet.root && sheet.retired_at.is_none() => Ok(EffectiveReviewer::SelfConfirmation(actor)),
+            sheet => {
+                let name = sheet.map_or_else(|| actor.short(), |sheet| sheet.name);
+                Err(KernelDbError::Validation(format!(
+                    "nobody reviews {name} in context {}: no one is responsible above it, and only a live root character confirms its own statements; assign one with `kj context set <context> --reviewer <character>`",
+                    context_id.short()
+                )))
             }
-            _ => Ok(EffectiveReviewer::SelfConfirmation(actor)),
+        }
+    }
+
+    /// The root character at the top of `context_id`'s `forked_from`
+    /// chain: the responsible character of the parentless context the
+    /// chain ends at. It holds routing authority over every context in
+    /// that lineage (`docs/approval-identity.md`). A top with no
+    /// responsible character, a non-root, or a retired root refuses, and
+    /// a broken chain is the same corruption the reviewer walk refuses.
+    pub fn lineage_root(&self, context_id: ContextId) -> KernelDbResult<PrincipalId> {
+        let mut current = context_id;
+        let mut visited = HashSet::new();
+        let top = loop {
+            if !visited.insert(current) {
+                return Err(KernelDbError::Validation(format!(
+                    "context {} is its own ancestor; the context forest has a cycle",
+                    current.short()
+                )));
+            }
+            let row = self.get_context(current)?.ok_or_else(|| KernelDbError::NotFound(format!(
+                "context {} is missing, so its lineage root cannot be found",
+                current.short()
+            )))?;
+            match row.forked_from {
+                Some(parent) => current = parent,
+                None => break row,
+            }
+        };
+        let responsible = top.played_by.or(top.director_id).ok_or_else(|| KernelDbError::Validation(format!(
+            "context {} tops a lineage with no responsible character, so no root holds authority over it",
+            top.context_id.short()
+        )))?;
+        match self.get_character(responsible)? {
+            Some(sheet) if !sheet.root => Err(KernelDbError::Validation(format!(
+                "{} is responsible for context {} at the top of this lineage and is not a root character",
+                sheet.name, top.context_id.short()
+            ))),
+            Some(sheet) if sheet.retired_at.is_some() => Err(KernelDbError::Validation(format!(
+                "root character {} is retired, so context {} has no lineage root",
+                sheet.name, top.context_id.short()
+            ))),
+            Some(_) => Ok(responsible),
+            None => Err(KernelDbError::Validation(format!(
+                "the character responsible for context {} has no character sheet",
+                top.context_id.short()
+            ))),
         }
     }
 
@@ -2492,6 +2508,9 @@ impl KernelDb {
         Self::migrate_archived_context_state(conn)?;
         Self::migrate_label_index_live_only(conn)?;
         Self::drop_doc_snapshots_content_column(conn)?;
+        // Review has no configured default; the lineage root holds that
+        // authority (`docs/approval-identity.md`).
+        conn.execute_batch("DROP TABLE IF EXISTS approval_identity_config")?;
         Ok(())
     }
 
@@ -10396,20 +10415,6 @@ mod tests {
         assert_eq!(db.list_characters(true).unwrap().len(), 1);
     }
 
-    #[test]
-    fn cached_default_reviewer_requires_a_live_character_sheet() {
-        let db = KernelDb::temporary().unwrap();
-        let reviewer = PrincipalId::new();
-        db.set_default_approval_reviewer(reviewer).unwrap();
-        assert_eq!(db.cached_default_approval_reviewer().unwrap(), None);
-        db.insert_character(&CharacterRow {
-            principal_id: reviewer, name: "amy".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-        }).unwrap();
-        assert_eq!(db.cached_default_approval_reviewer().unwrap(), Some(reviewer));
-        assert!(db.retire_character(reviewer, 1).unwrap());
-        assert_eq!(db.cached_default_approval_reviewer().unwrap(), None);
-    }
-
     /// A duplicate name fails loudly rather than minting a second principal
     /// under the same name.
     #[test]
@@ -10528,19 +10533,20 @@ mod tests {
         }).collect()
     }
 
-    /// ROOT (director amy) → banto's seat (played by banto) → a lane
-    /// (played by coder): the coder's ask resolves to banto, banto's to
-    /// amy, and amy's own statement in ROOT exhausts every layer and
-    /// becomes a self-confirmation rather than an unanswerable ask.
+    /// amy's root context (played by amy, a root) → banto's seat (played
+    /// by banto) → a lane (played by coder): the coder's ask resolves to
+    /// banto, banto's to amy, and amy's own statement in her root context
+    /// exhausts every layer and becomes a self-confirmation rather than an
+    /// unanswerable ask.
     #[test]
     fn effective_approval_reviewer_walks_the_fork_chain_and_a_root_confirms_itself() {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
         let [coder, banto, amy] = seed_characters(&db, &["coder", "banto", "amy"])[..] else { unreachable!() };
-        db.set_default_approval_reviewer(amy).unwrap();
+        db.update_character_root(amy, true).unwrap();
 
-        let mut root = make_context_row(Some("ROOT"));
-        root.director_id = Some(amy);
+        let mut root = make_context_row(Some("amy"));
+        root.played_by = Some(amy);
         insert_context_with_doc(&db, &root, ws_id);
 
         let mut seat = make_context_row(Some("banto"));
@@ -10563,13 +10569,79 @@ mod tests {
         assert_eq!(
             db.effective_approval_reviewer(seat.context_id, banto).unwrap(),
             EffectiveReviewer::Assigned(amy),
-            "the seat's parent is ROOT, whose responsible character is its director",
+            "the seat's parent is amy's root context, which amy plays",
         );
         assert_eq!(
             db.effective_approval_reviewer(root.context_id, amy).unwrap(),
             EffectiveReviewer::SelfConfirmation(amy),
-            "amy is responsible for ROOT, which has no parent, and is the default too",
+            "amy is a root responsible for her root context, which has no parent",
         );
+        for context in [root.context_id, seat.context_id, lane.context_id] {
+            assert_eq!(db.lineage_root(context).unwrap(), amy, "amy is the lineage root of every context under her root context");
+        }
+    }
+
+    /// Only a root character confirms its own statements. A non-root actor
+    /// whose walk runs out has no reviewer, and resolution refuses by name
+    /// instead of making it the reviewer of its own work.
+    #[test]
+    fn effective_approval_reviewer_exhausted_walk_refuses_a_non_root_actor() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [bob] = seed_characters(&db, &["bob"])[..] else { unreachable!() };
+
+        let mut orphan = make_context_row(Some("orphan"));
+        orphan.played_by = Some(bob);
+        insert_context_with_doc(&db, &orphan, ws_id);
+
+        let error = db.effective_approval_reviewer(orphan.context_id, bob).unwrap_err();
+        assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
+        assert!(error.to_string().contains("bob"), "{error}");
+        assert!(error.to_string().contains("root"), "{error}");
+        assert!(error.to_string().contains("--reviewer"), "{error}");
+
+        let retired_root = seed_characters(&db, &["gone"])[0];
+        db.update_character_root(retired_root, true).unwrap();
+        assert!(db.retire_character(retired_root, 1).unwrap());
+        let mut abandoned = make_context_row(Some("abandoned-root"));
+        abandoned.played_by = Some(retired_root);
+        insert_context_with_doc(&db, &abandoned, ws_id);
+        let error = db.effective_approval_reviewer(abandoned.context_id, retired_root).unwrap_err();
+        assert!(error.to_string().contains("gone"), "a retired root does not confirm itself: {error}");
+    }
+
+    /// The lineage root is the root character responsible for the top of a
+    /// context's `forked_from` chain. A lineage that tops out anywhere else
+    /// has no authority to change routing, and says so.
+    #[test]
+    fn lineage_root_requires_a_live_root_character_at_the_top() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [banto, coder, amy] = seed_characters(&db, &["banto", "coder", "amy"])[..] else { unreachable!() };
+
+        let mut seat = make_context_row(Some("unrooted-seat"));
+        seat.played_by = Some(banto);
+        insert_context_with_doc(&db, &seat, ws_id);
+        let mut lane = make_context_row(Some("unrooted-lane"));
+        lane.forked_from = Some(seat.context_id);
+        lane.played_by = Some(coder);
+        insert_context_with_doc(&db, &lane, ws_id);
+        let error = db.lineage_root(lane.context_id).unwrap_err();
+        assert!(error.to_string().contains("banto"), "names the character at the top: {error}");
+        assert!(error.to_string().contains("not a root"), "{error}");
+
+        let bare = make_context_row(Some("nobody-top"));
+        insert_context_with_doc(&db, &bare, ws_id);
+        assert!(db.lineage_root(bare.context_id).unwrap_err().to_string().contains("no responsible character"));
+
+        db.update_character_root(amy, true).unwrap();
+        let mut root = make_context_row(Some("amy"));
+        root.played_by = Some(amy);
+        insert_context_with_doc(&db, &root, ws_id);
+        assert!(db.retire_character(amy, 1).unwrap());
+        assert!(db.lineage_root(root.context_id).unwrap_err().to_string().contains("retired"));
+
+        assert!(matches!(db.lineage_root(ContextId::new()).unwrap_err(), KernelDbError::NotFound(_)));
     }
 
     /// A retired responsible character on an ancestor refuses, naming it,
@@ -10636,14 +10708,12 @@ mod tests {
         assert!(matches!(missing, KernelDbError::NotFound(_)), "{missing}");
     }
 
-    /// A wire-created context has no parent: its own director is the
-    /// responsible character the walk finds, ahead of the default.
+    /// A context with no parent resolves through its own director.
     #[test]
     fn effective_approval_reviewer_parentless_context_resolves_through_its_director() {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
-        let [banto, amy, stranger] = seed_characters(&db, &["banto", "amy", "stranger"])[..] else { unreachable!() };
-        db.set_default_approval_reviewer(stranger).unwrap();
+        let [banto, amy] = seed_characters(&db, &["banto", "amy"])[..] else { unreachable!() };
 
         let mut wire = make_context_row(Some("wire-created"));
         wire.director_id = Some(amy);
@@ -10652,7 +10722,7 @@ mod tests {
         assert_eq!(
             db.effective_approval_reviewer(wire.context_id, banto).unwrap(),
             EffectiveReviewer::Assigned(amy),
-            "the context's own director is responsible for it, so the default is never reached",
+            "the context's own director is responsible for it",
         );
     }
 
@@ -10742,8 +10812,6 @@ mod tests {
     /// its OTHER contexts to itself, and self-review specifically is a
     /// separate, caller-side check (`validate_model_review_assignment`,
     /// `kj/context.rs`'s commit-time comparison), not this resolver's job.
-    /// Only the default layer (the one layer unrelated to `actor`'s own
-    /// configuration) skips itself on a match.
     #[test]
     fn effective_approval_reviewer_explicit_and_delegation_resolve_even_naming_the_actor() {
         let db = KernelDb::temporary().unwrap();

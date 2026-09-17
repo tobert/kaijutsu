@@ -1225,10 +1225,9 @@ pub(crate) mod test_helpers {
                 name: "amy".to_string(),
                 created_at: 0,
                 retired_at: None,
-                handoff_ctx: None, root_ctx: None, root: false,
+                handoff_ctx: None, root_ctx: None, root: true,
             })
             .unwrap();
-            db.set_default_approval_reviewer(reviewer).unwrap();
         }
         // One throwaway root holds BOTH the kernel data_dir and the seeded
         // /config/rc tree, so the kernel's cleanup guard removes them together when
@@ -1401,6 +1400,26 @@ pub(crate) mod test_helpers {
         *REVIEWER.get_or_init(PrincipalId::new)
     }
 
+    /// The test reviewer's root context, registered on first use: labeled
+    /// `amy`, played by the root character `amy`, with no parent. `amy` is
+    /// the lineage root of every context registered under it.
+    pub fn register_root_context(dispatcher: &KjDispatcher) -> ContextId {
+        let amy = test_reviewer_principal();
+        if let Some(root) = dispatcher.kernel_db().lock().find_context_by_label("amy").unwrap() {
+            return root.context_id;
+        }
+        let root = register_context(dispatcher, Some("amy"), None, amy);
+        dispatcher.kernel_db().lock().update_context_review(root, Some(amy), None).unwrap();
+        root
+    }
+
+    /// Register a context under `amy`'s root context, so `amy` reviews its
+    /// asks through the walk.
+    pub fn register_rooted_context(dispatcher: &KjDispatcher, label: Option<&str>, created_by: PrincipalId) -> ContextId {
+        let root = register_root_context(dispatcher);
+        register_context(dispatcher, label, Some(root), created_by)
+    }
+
     /// Create a caller with a specific context_id.
     pub fn caller_with_context(context_id: ContextId) -> KjCaller {
         let principal_id = PrincipalId::new();
@@ -1416,11 +1435,12 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// A normal gate caller whose context exists and can therefore resolve
-    /// the configured approval reviewer.
+    /// A normal gate caller whose context exists under `amy`'s root context,
+    /// so its asks resolve `amy` as reviewer through the walk.
     pub fn registered_caller(dispatcher: &KjDispatcher) -> KjCaller {
         let mut caller = test_caller();
-        caller.context_id = Some(register_context(dispatcher, None, None, caller.principal_id));
+        let root = register_root_context(dispatcher);
+        caller.context_id = Some(register_context(dispatcher, None, Some(root), caller.principal_id));
         caller
     }
 

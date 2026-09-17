@@ -299,9 +299,11 @@ slice green and committed:
    get easier."
 5. **No default reviewer.** Resolution is override, delegation, then the
    `forked_from` walk. Only a root character self-confirms; a walk that ends
-   at a non-root actor refuses. Routing changes and ask escalation belong to
-   the root at the top of the context's walk; delegation grant and revoke to
-   any live root. Remove `approval.toml` and its cache.
+   at a non-root actor refuses. Routing changes and ask reclaim belong to
+   the lineage root (`KernelDb::lineage_root`); delegation grant and revoke
+   to any live root. `approval.toml` and its cache table are gone. Shipped
+   2026-09-17. Hosts keep a stale `/config/kernel/approval.toml`; delete it
+   by hand.
 6. **Rotation reads `root_ctx`.** `kj context rotate <character>`: creates
    the successor from the predecessor's own parent with the same type, cast,
    and performer, sets `ROTATED_FROM`, moves the pointer, archives the
@@ -322,11 +324,10 @@ is flaky under the parallel test runner and passes single-threaded.
 `contrib/isotest` fails 14 tests (8 in `filesystem.rs`, 6 in `isolation.rs`)
 with `gate for shell_write is waiting on its reviewer`. The same 14 failed
 at `13a4e62a`, before the bootstrap change, so the approval gate outgrew the
-harness earlier. The harness never answers an ask. Recheck after the
-default-reviewer removal ("Roots, bootstrap, and rotation", slice 5): the
-ephemeral root acts in its own root context, so its asks become
-self-confirmations it can answer with `kj ledger allow`, or the harness
-needs an allow rule for its commands.
+harness earlier. The harness never answers an ask. Rechecked after slice 5
+on 2026-09-17: the same 14 fail, and each ask is now a self-confirmation by
+the ephemeral root `tester`. The harness can answer it with
+`kj ledger allow`, or needs an allow rule for its commands; Amy decides.
 
 ## Split admin grants between `root` and `director` (2026-09-16)
 
@@ -676,6 +677,20 @@ One mechanism would cover all four: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 
+## `:!` statements never land in terminal_fit (2026-09-17)
+
+Seven `kaijutsu-tui` `terminal_fit` tests fail waiting for a `:!echo`
+result: `a_resize_rewraps_the_transcript`,
+`a_scrolled_context_comes_back_scrolled_after_a_switch`,
+`colon_bang_runs_one_kaish_statement_and_lands_its_output`,
+`space_snaps_to_the_tail_and_typing_lands_in_the_draft`,
+`the_picker_opens_as_an_overlay_and_leaves_the_transcript_intact`,
+`the_wheel_as_arrows_leaves_the_tail_and_q_returns`, and
+`v_then_j_then_y_copies_two_lines_over_osc52_and_into_the_paste_buffer`.
+The statement block appears with no result. Two were rerun at `c6b00a97`
+without the slice 5 changes and fail the same way, so this predates slice 5.
+The kernel runtime command-owner commits just before are the likely area.
+
 ## OSC 8 hyperlinks wait on a ratatui span attribute (2026-09-13)
 
 `present::links` detects the paths and URLs a hyperlink would target, with
@@ -684,10 +699,7 @@ no hyperlink attribute on a `Style` or a `Span`, and the backend diffs
 cells — escape bytes smuggled into a cell's symbol would be miscounted as
 width and overwritten by the next diff. The exit is a ratatui feature that
 adds the attribute, or a custom backend that writes OSC 8 around a cell's
-own bytes; neither is built. Separately, the ephemeral kernel a probe runs
-against needs `arrange_a_reviewer` (`tests/terminal_fit.rs`) before it can
-raise an ask at all — the default reviewer has no character sheet — which
-is worth a harness helper in `support/mod.rs` if a second probe needs it.
+own bytes; neither is built.
 
 ## transcript_plan clones every block per frame (2026-09-13)
 

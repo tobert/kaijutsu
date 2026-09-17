@@ -823,10 +823,13 @@ mod tests {
             }
         }
 
-        let created = d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
-        assert_eq!(created.len(), 1, "only the live root gets a context");
-        let sheet = d.kernel_db().lock().get_character(keeper).unwrap().unwrap();
-        assert_eq!(sheet.root_ctx, Some(created[0]));
+        let mut created = d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+        let amy = super::super::test_helpers::test_reviewer_principal();
+        let live_roots = [keeper, amy].map(|root| d.kernel_db().lock().get_character(root).unwrap().unwrap().root_ctx.expect("a live root gets a context"));
+        let mut live_roots = live_roots.to_vec();
+        created.sort_by_key(|id| id.to_hex());
+        live_roots.sort_by_key(|id| id.to_hex());
+        assert_eq!(created, live_roots, "only the live roots get contexts");
         assert_eq!(d.kernel_db().lock().get_character(retired).unwrap().unwrap().root_ctx, None);
 
         assert!(d.ensure_root_contexts(PrincipalId::system()).await.unwrap().is_empty());

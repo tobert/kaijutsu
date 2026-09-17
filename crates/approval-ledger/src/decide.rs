@@ -370,8 +370,8 @@ pub fn escalate(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[
     escalate_with_authority(conn, request_id, caller, reviewer, None)
 }
 
-/// Reassign a pending ask as its current reviewer or an explicit default authority.
-pub fn escalate_with_authority(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[u8], default_authority: Option<&[u8]>) -> Result<ApprovalRow> {
+/// Reassign a pending ask as its current reviewer or an explicit reclaim authority.
+pub fn escalate_with_authority(conn: &Connection, request_id: &str, caller: &[u8], reviewer: &[u8], reclaim_authority: Option<&[u8]>) -> Result<ApprovalRow> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let row = tx.query_row(
         &format!("SELECT {APPROVAL_COLUMNS} FROM approvals WHERE request_id = ?1"),
@@ -381,7 +381,7 @@ pub fn escalate_with_authority(conn: &Connection, request_id: &str, caller: &[u8
     if row.status != ApprovalStatus::Pending {
         return Err(LedgerError::AlreadyDecided { request_id: request_id.to_string(), status: row.status.to_string() });
     }
-    if row.reviewer_id.as_deref() != Some(caller) && default_authority != Some(caller) {
+    if row.reviewer_id.as_deref() != Some(caller) && reclaim_authority != Some(caller) {
         return Err(LedgerError::EscalateUnauthorized { request_id: request_id.to_string() });
     }
     if row.actor_id.as_deref() == Some(reviewer) {
@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn default_authority_can_reclaim_with_its_own_audit_actor() {
+    fn reclaim_authority_can_reclaim_with_its_own_audit_actor() {
         let conn = open_memory();
         let request_id = create_ask(&conn, &minimal_ask()).unwrap();
         assert!(matches!(escalate_with_authority(&conn, &request_id, b"stranger", b"amy", Some(b"amy")), Err(LedgerError::EscalateUnauthorized { .. })));

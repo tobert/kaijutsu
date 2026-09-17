@@ -1157,7 +1157,7 @@ mod tests {
     async fn an_escalated_gate_returns_pending_and_leaves_a_durable_row() {
         let d = gate_dispatcher().await;
         let mut caller = test_caller();
-        caller.context_id = Some(register_context(&d, Some("gate-caller"), None, caller.principal_id));
+        caller.context_id = Some(crate::kj::test_helpers::register_rooted_context(&d, Some("gate-caller"), caller.principal_id));
         let outcome = run_gate(
             &d.kernel_db.clone(),
             &caller,
@@ -1927,7 +1927,7 @@ mod tests {
     #[tokio::test]
     async fn archiving_a_context_sweeps_the_asks_it_left_open() {
         let d = gate_dispatcher().await;
-        let ctx_id = register_context(&d, Some("arch-sweep"), None, kaijutsu_types::PrincipalId::new());
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("arch-sweep"), kaijutsu_types::PrincipalId::new());
         let caller = caller_with_context(ctx_id);
 
         let outcome = run_gate(
@@ -1968,7 +1968,7 @@ mod tests {
     #[tokio::test]
     async fn archiving_does_not_destroy_an_answer_already_given() {
         let d = gate_dispatcher().await;
-        let ctx_id = register_context(&d, Some("arch-decided"), None, kaijutsu_types::PrincipalId::new());
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("arch-decided"), kaijutsu_types::PrincipalId::new());
         let caller = caller_with_context(ctx_id);
 
         run_gate(&d.kernel_db.clone(), &caller, cc_spec("kaijutsu-chan"), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config())
@@ -2013,7 +2013,7 @@ mod tests {
     #[tokio::test]
     async fn an_escalating_gate_records_its_cwd_on_the_ask_row() {
         let d = gate_dispatcher().await;
-        let ctx_id = register_context(&d, Some("pin-capture"), None, kaijutsu_types::PrincipalId::new());
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("pin-capture"), kaijutsu_types::PrincipalId::new());
         seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
         let caller = caller_with_context(ctx_id);
 
@@ -2050,7 +2050,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_returns_the_cwd_captured_at_ask_time_even_after_it_moved() {
         let d = gate_dispatcher().await;
-        let ctx_id = register_context(&d, Some("pin-redeem"), None, kaijutsu_types::PrincipalId::new());
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("pin-redeem"), kaijutsu_types::PrincipalId::new());
         seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
         let caller = caller_with_context(ctx_id);
 
@@ -2100,7 +2100,7 @@ mod tests {
     #[tokio::test]
     async fn the_recorded_cwd_survives_its_own_redemption() {
         let d = gate_dispatcher().await;
-        let ctx_id = register_context(&d, Some("cwd-survives"), None, kaijutsu_types::PrincipalId::new());
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("cwd-survives"), kaijutsu_types::PrincipalId::new());
         seed_cwd(&d.kernel_db, ctx_id, "/original/dir");
         let caller = caller_with_context(ctx_id);
 
@@ -2199,7 +2199,7 @@ mod tests {
     async fn an_escalating_shell_ask_records_the_free_variable_env_snapshot() {
         let d = gate_dispatcher().await;
         let ctx_id =
-            register_context(&d, Some("env-snapshot"), None, kaijutsu_types::PrincipalId::new());
+            crate::kj::test_helpers::register_rooted_context(&d, Some("env-snapshot"), kaijutsu_types::PrincipalId::new());
         d.kernel_db.lock().set_context_env(ctx_id, "FOO", "bar").unwrap();
         let caller = caller_with_context(ctx_id);
 
@@ -2233,7 +2233,7 @@ mod tests {
     async fn an_escalating_hook_ask_on_a_shell_call_records_the_env_snapshot() {
         let d = gate_dispatcher().await;
         let ctx_id =
-            register_context(&d, Some("hook-env-snapshot"), None, kaijutsu_types::PrincipalId::new());
+            crate::kj::test_helpers::register_rooted_context(&d, Some("hook-env-snapshot"), kaijutsu_types::PrincipalId::new());
         d.kernel_db.lock().set_context_env(ctx_id, "FOO", "bar").unwrap();
         let caller = caller_with_context(ctx_id);
 
@@ -2449,7 +2449,7 @@ mod tests {
         let d = gate_dispatcher().await;
         let principal = kaijutsu_types::PrincipalId::new();
         let context_id =
-            crate::kj::test_helpers::register_context(&d, Some("ctype-gate"), None, principal);
+            crate::kj::test_helpers::register_rooted_context(&d, Some("ctype-gate"), principal);
         d.kernel_db.lock().update_context_type(context_id, "explorer").unwrap();
         let caller = crate::kj::test_helpers::caller_with_context(context_id);
         let config = gate_config(

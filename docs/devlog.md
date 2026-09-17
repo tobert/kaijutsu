@@ -1784,3 +1784,16 @@ context; with several roots it refuses. Removing the RPC exposed that the `kj`
 path recorded a characterless caller as director, which the documented rule
 never allowed. A transport error and a kernel refusal stay distinct types, so
 the MCP's label-conflict retry cannot mistake a dropped connection for a race.
+
+The default reviewer came out on September 17. Resolution is now override,
+delegation, then the walk. When the walk runs out, only a live root character
+confirms its own statement; anyone else has no reviewer, and the ask refuses by
+name instead of quietly naming its own actor. The authority the default used to
+hold went to the **lineage root**, the root character at the top of a context's
+`forked_from` chain. It changes routing and reclaims asks in its lineage, while
+any live root grants and revokes delegation. Test fixtures had leaned on the
+default: about thirty raised asks from parentless contexts with nobody above,
+which a real kernel can no longer build, so they now hang under a root context
+like production work. `kj context prompt` stopped resolving a reviewer for a
+context with no performer, since the runtime fact names who reviews that
+performer's asks.

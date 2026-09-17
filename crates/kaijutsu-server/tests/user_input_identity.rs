@@ -343,13 +343,6 @@ fn a_humans_own_shell_command_is_gated_like_a_models_and_user_initiated_grants_n
         let (kernel, _) = client.bind_kernel().await.unwrap();
         let ctx = create_context(&kernel, "human-shell-gate").await.unwrap();
         kernel.join_context(ctx, "human").await.unwrap();
-        // The gate needs a resolvable reviewer to raise an ask at all — the
-        // shipped default reviewer name, unused by this test beyond that.
-        server
-            .kernel_db
-            .lock()
-            .insert_character(&character(PrincipalId::new(), "amy"))
-            .unwrap();
         install_ask_hook(&server, ctx, "wire-user-initiated-ask").await;
 
         let code = "echo should-not-run-yet";
@@ -447,10 +440,9 @@ fn output_after(server: &SharedKernel, ctx: ContextId, command_block_id: &kaijut
 
 /// **4. A root's own gated command is a self-confirmation.** amy is the
 /// kernel's root character; her context sits under her own root context,
-/// which she plays, and assets/defaults/approval.toml's shipped
-/// `default_reviewer = "amy"` names her too, so nobody else is above her
-/// when she runs a gated shell command. Every resolution layer is
-/// exhausted, so the ask is raised with amy as its own reviewer, amy alone
+/// which she plays, so nobody else is above her when she runs a gated
+/// shell command. Every resolution layer is exhausted and amy is a root,
+/// so the ask is raised with amy as its own reviewer, amy alone
 /// may answer it, and her answer EXECUTES the command
 /// (`docs/approval-identity.md`).
 ///

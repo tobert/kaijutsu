@@ -963,16 +963,11 @@ impl KjDispatcher {
     }
 
     async fn ledger_delegation(&self, command: DelegationCommand, caller: &KjCaller) -> KjResult {
-        if !matches!(command, DelegationCommand::List) {
-            if let Err(error) = self.kernel().default_approval_reviewer().await {
-                return KjResult::Err(format!("kj ledger delegation: {error}"));
-            }
-        }
         let db = self.kernel_db().lock();
         if !matches!(command, DelegationCommand::List) {
-            match db.cached_default_approval_reviewer() {
-                Ok(Some(authority)) if authority == caller.actor_id => {}
-                Ok(_) => return KjResult::Err("kj ledger delegation: only the configured default reviewer may grant or revoke delegations".into()),
+            match db.get_character(caller.actor_id) {
+                Ok(Some(sheet)) if sheet.root && sheet.retired_at.is_none() => {}
+                Ok(_) => return KjResult::Err("kj ledger delegation: only a live root character may grant or revoke delegations".into()),
                 Err(error) => return KjResult::Err(format!("kj ledger delegation: could not resolve current authority: {error}")),
             }
         }
@@ -1049,12 +1044,10 @@ impl KjDispatcher {
     /// `to` names the next reviewer explicitly; omitted, it continues the
     /// same walk reviewer resolution made, from the ask's own context up
     /// `forked_from`, past the ancestor that yielded the current reviewer
-    /// (`docs/character.md`, "Roots and rotation"). Refuses at a root —
-    /// there is nothing above it to default to.
+    /// (`docs/character.md`, "Roots and rotation"). Refuses at a root,
+    /// where nobody is above. The assigned reviewer or the lineage root of
+    /// the ask's context may escalate.
     async fn ledger_escalate(&self, request_id: &str, to: Option<&str>, caller: &KjCaller) -> KjResult {
-        if let Err(error) = self.kernel().default_approval_reviewer().await {
-            tracing::warn!(%error, "default review authority unavailable; only the assigned reviewer may escalate");
-        }
         let span = tracing::info_span!(
             "approval.escalate",
             ask.id = %request_id,
@@ -1067,9 +1060,19 @@ impl KjDispatcher {
         let _guard = span.enter();
         let result = {
             let db = self.kernel_db.lock();
-            let default_authority = match db.cached_default_approval_reviewer() {
-                Ok(authority) => authority,
-                Err(error) => return KjResult::Err(format!("kj ledger: could not resolve current authority: {error}")),
+            // The lineage root of the ask's context may reclaim it. When the
+            // lineage has no root, only the assigned reviewer may escalate.
+            let root_authority = match db.get_approval(request_id) {
+                Ok(Some(row)) => kaijutsu_types::ContextId::try_from_slice(&row.context_id)
+                    .and_then(|context| match db.lineage_root(context) {
+                        Ok(root) => Some(root),
+                        Err(error) => {
+                            tracing::warn!(%error, "ask has no lineage root; only the assigned reviewer may escalate");
+                            None
+                        }
+                    }),
+                Ok(None) => return KjResult::Err(format!("kj ledger: no such ask '{request_id}'")),
+                Err(e) => return KjResult::Err(format!("kj ledger: could not read ask '{request_id}': {e}")),
             };
             let (target, target_name) = match to {
                 Some(name) => match db.get_character_by_name(name) {
@@ -1117,7 +1120,7 @@ impl KjDispatcher {
             };
             approval_ledger::decide::escalate_with_authority(
                 db.conn_for_ledger(), request_id, caller.actor_id.as_bytes(), target.as_bytes(),
-                default_authority.as_ref().map(|authority| authority.as_bytes().as_slice()),
+                root_authority.as_ref().map(|authority| authority.as_bytes().as_slice()),
             ).map(|row| (row, target_name))
         };
         match result {
@@ -2117,11 +2120,7 @@ mod tests {
         let d = test_dispatcher().await;
         // A REGISTERED context, because the check reads the context row —
         // `test_caller` mints an id that was never stored.
-        let ctx_id = crate::kj::test_helpers::register_context(
-            &d,
-            Some("arch-answer"),
-            None,
-            kaijutsu_types::PrincipalId::new(),
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("arch-answer"), kaijutsu_types::PrincipalId::new(),
         );
         let mut c = test_caller();
         c.context_id = Some(ctx_id);
@@ -2481,11 +2480,7 @@ mod tests {
     #[tokio::test]
     async fn ledger_show_reports_what_an_approval_runs_with() {
         let d = test_dispatcher().await;
-        let ctx_id = crate::kj::test_helpers::register_context(
-            &d,
-            Some("show-exec-source"),
-            None,
-            PrincipalId::new(),
+        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("show-exec-source"), PrincipalId::new(),
         );
         d.kernel_db.lock().set_context_env(ctx_id, "FOO", "asked").unwrap();
         d.kernel_db
@@ -3258,10 +3253,10 @@ mod tests {
     async fn a_session_scoped_family_covers_its_own_context_only() {
         let d = test_dispatcher().await;
         let mut mine = test_caller();
-        let mine_context = register_context(&d, Some("session-family-mine"), None, mine.principal_id);
+        let mine_context = crate::kj::test_helpers::register_rooted_context(&d, Some("session-family-mine"), mine.principal_id);
         mine.context_id = Some(mine_context);
         let mut theirs = test_caller();
-        let theirs_context = register_context(&d, Some("session-family-theirs"), None, theirs.principal_id);
+        let theirs_context = crate::kj::test_helpers::register_rooted_context(&d, Some("session-family-theirs"), theirs.principal_id);
         theirs.context_id = Some(theirs_context);
         let first = gate_once(&d, &mine, planned_shell_spec("kj handoff note 'mine'")).await;
         let request_id = first.ask.expect("row").request_id;
@@ -3359,7 +3354,7 @@ mod tests {
     async fn remember_session_scope_round_trips_through_kj_ledger_rules() {
         let d = test_dispatcher().await;
         let mut c = test_caller();
-        let context = register_context(&d, Some("session-rule"), None, c.principal_id);
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("session-rule"), c.principal_id);
         c.context_id = Some(context);
         let label = "kaish-source";
         let rendered = "echo session-scoped";
@@ -4181,7 +4176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_director_delegation_can_be_revoked_by_default_reviewer() {
+    async fn retired_director_delegation_can_be_revoked_by_a_root() {
         let d = test_dispatcher().await;
         let amy = crate::kj::test_helpers::test_reviewer_principal();
         let lead = PrincipalId::new();
@@ -4191,7 +4186,6 @@ mod tests {
             for (principal_id, name) in [(lead, "lead"), (judge, "judge")] {
                 db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
-            db.set_default_approval_reviewer(amy).unwrap();
         }
         let amy_caller = KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
         assert!(d.dispatch(&[s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")], &amy_caller).await.is_ok());
@@ -4201,8 +4195,64 @@ mod tests {
         assert_eq!(d.kernel_db().lock().active_approval_delegation(lead).unwrap(), None);
     }
 
+    /// Delegation authority belongs to any live root character, and to
+    /// nobody else: a director cannot grant review of its own contexts.
     #[tokio::test]
-    async fn assigned_reviewer_can_escalate_when_default_authority_is_unavailable() {
+    async fn only_a_live_root_may_grant_or_revoke_a_delegation() {
+        let d = test_dispatcher().await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let lead = PrincipalId::new();
+        let judge = PrincipalId::new();
+        let bob = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name, root) in [(lead, "lead", false), (judge, "judge", false), (bob, "bob", true)] {
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
+            }
+        }
+        let caller = |actor| KjCaller { principal_id: actor, actor_id: actor, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let grant = [s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")];
+        let refused = d.dispatch(&grant, &caller(lead)).await;
+        assert!(!refused.is_ok() && refused.message().contains("only a live root character"), "{}", refused.message());
+        assert_eq!(d.kernel_db().lock().active_approval_delegation(lead).unwrap(), None);
+
+        assert!(d.dispatch(&grant, &caller(bob)).await.is_ok(), "a second root has the same delegation authority");
+        let revoke = [s("ledger"), s("delegation"), s("revoke"), s("lead")];
+        assert!(!d.dispatch(&revoke, &caller(judge)).await.is_ok());
+        assert!(d.dispatch(&revoke, &caller(amy)).await.is_ok(), "any live root may revoke");
+
+        d.kernel_db().lock().conn_for_ledger().execute("UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [bob.as_bytes().as_slice()]).unwrap();
+        assert!(!d.dispatch(&grant, &caller(bob)).await.is_ok(), "a retired root has no authority");
+    }
+
+    /// The lineage root of an ask's context may reclaim it from its
+    /// assigned reviewer; another root, outside that lineage, may not.
+    #[tokio::test]
+    async fn the_lineage_root_reclaims_an_ask_and_another_root_cannot() {
+        let d = test_dispatcher().await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let lead = PrincipalId::new();
+        let bob = PrincipalId::new();
+        let caller = crate::kj::test_helpers::registered_caller(&d);
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name, root) in [(lead, "lead", false), (bob, "bob", true)] {
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
+            }
+            db.update_context_review(caller.context_id.unwrap(), None, Some(lead)).unwrap();
+        }
+        let ask = gate_once(&d, &caller, spec()).await.ask.unwrap();
+        let reclaim = [s("ledger"), s("escalate"), ask.request_id.clone(), s("--to"), s("amy")];
+        let refused = d.dispatch(&reclaim, &caller.clone().with_actor(bob, None)).await;
+        assert!(!refused.is_ok(), "bob is a root, but not this ask's lineage root: {}", refused.message());
+        let reclaimed = d.dispatch(&reclaim, &caller.clone().with_actor(amy, None)).await;
+        assert!(reclaimed.is_ok(), "{}", reclaimed.message());
+        let row = d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap();
+        assert_eq!(row.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
+    }
+
+    #[tokio::test]
+    async fn assigned_reviewer_can_escalate_when_the_lineage_root_is_unavailable() {
         let d = test_dispatcher().await;
         let amy = crate::kj::test_helpers::test_reviewer_principal();
         let lead = PrincipalId::new();

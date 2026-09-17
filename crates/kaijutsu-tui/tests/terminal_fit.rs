@@ -635,27 +635,6 @@ fn colon_line(session: &TuiSession, line: &str) {
     std::thread::sleep(Duration::from_millis(2000));
 }
 
-/// Make this kernel able to raise an ask at all, and return the client to
-/// the `probe` seat.
-///
-/// Two facts the ephemeral kernel starts without: the default approval
-/// reviewer (`amy`) has no character sheet, so the gate cannot resolve a
-/// reviewer and records nothing at all; and `kj character create` needs
-/// `config-write`, which a `coder` context does not carry. ROOT is seat 1
-/// and is the binding-admin context, so the grant is made from there.
-fn arrange_a_reviewer(session: &TuiSession) {
-    session.send("\x011"); // Ctrl+A 1 — the ROOT seat
-    std::thread::sleep(Duration::from_millis(1500));
-    colon_line(session, ":kj binding allow config-write probe");
-    session.send("\x010"); // Ctrl+A 0 — back to the probe seat
-    std::thread::sleep(Duration::from_millis(1500));
-    colon_line(session, ":kj character create amy");
-    let created = session.wait_until(Duration::from_secs(10), |screen| {
-        screen_contains_str(screen, "\"name\": \"amy\"")
-    });
-    assert!(created, "no reviewer character: {}", session.dump("arranging a reviewer"));
-}
-
 /// An ask that lands while the terminal is unfocused says so to the desktop
 /// — one OSC 777 and one OSC 9, written once — and an ask that lands in
 /// front of the player says nothing, because it is already the card on
@@ -665,7 +644,6 @@ fn an_ask_notifies_the_desktop_only_while_unfocused() {
     let _serial = serial();
     let (_server, _key_dir, session) = spawn_session(24, 100);
     wait_for_attach(&session);
-    arrange_a_reviewer(&session);
     assert_eq!(session.notifications(), (0, 0), "nothing has been asked yet");
 
     // The focus report goes out *after* the line, and the pty delivers them
