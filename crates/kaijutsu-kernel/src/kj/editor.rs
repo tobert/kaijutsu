@@ -31,7 +31,7 @@ pub(crate) struct EditorArgs {
 enum EditorCommand {
     /// Open an editor on a path, binding to the kernel block that owns it.
     Open {
-        /// File or rc/config path to edit (e.g. /config/rc/coder/create/S00.kai).
+        /// File or rc/config path to edit (e.g. /config/rc/coder/create/S00-stance.kai).
         path: String,
     },
     /// Feed vim keys to a session (e.g. "iX<Esc>", "dw", "<C-w>"). A batch
@@ -120,10 +120,12 @@ impl KjDispatcher {
         };
 
         let kernel = self.kernel();
-        // Record the opener (principal + context) so `fg` and `:r !cmd` work;
+        // Preserve invocation identity for `fg` and later shell reads;
         // a caller with no joined context degrades to a headless-style open.
         let opener = caller.context_id.map(|context_id| crate::editor::EditorOpener {
             principal: caller.principal_id,
+            performer: caller.actor_id,
+            reviewer: caller.reviewer_id,
             context_id,
             session_id: caller.session_id,
         });

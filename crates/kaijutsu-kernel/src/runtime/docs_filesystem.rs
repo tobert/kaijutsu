@@ -149,9 +149,7 @@ mod tests {
         let backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
                     ));
         let fs = KaijutsuFilesystem::new(backend);
         assert!(!fs.read_only());
@@ -167,9 +165,7 @@ mod tests {
         let backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
                     ));
         let fs = KaijutsuFilesystem::new(backend);
         assert!(fs.real_path(Path::new("some/path")).is_none());
@@ -185,9 +181,7 @@ mod tests {
         let backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
                     ));
         let fs = KaijutsuFilesystem::new(backend);
 

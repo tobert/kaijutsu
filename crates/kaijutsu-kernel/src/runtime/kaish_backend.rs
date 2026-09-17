@@ -12,7 +12,7 @@
 //!     ↓
 //! KaijutsuBackend
 //!     ├── File ops → BlockStore
-//!     └── Tool calls → ToolRegistry (ExecutionEngines)
+//!     └── Tool calls → MCP broker
 //! ```
 //!
 //! # Path Mapping
@@ -36,7 +36,7 @@ use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::ExecResult;
 use kaijutsu_types::DocKind;
-use kaijutsu_types::{ContextId, PrincipalId, SessionId};
+use kaijutsu_types::ContextId;
 
 /// Minimal name/description tuple for converting a broker-visible tool into
 /// kaish's `ToolInfo`. The full tool metadata lives on `KernelTool`; this
@@ -61,6 +61,7 @@ use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
 
+use super::context_shell::ShellIdentity;
 use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Backend that routes kaish operations to kaijutsu's kernel block store.
@@ -70,38 +71,34 @@ use super::context_engine::{SessionContextExt, SessionContextMap};
 /// - `echo "text" >> /docs/{ctx_hex}/block-key` → append to block
 /// - `ls /docs/` → list documents
 ///
-/// Tool calls route through kaijutsu's Kernel which includes:
-/// - Block tools (block_create, block_edit, etc.)
-/// - MCP tools (when McpServerPool is implemented)
+/// Tool calls preserve requester, performer, reviewer, and session through the
+/// MCP broker. Each call resolves the current context from the invocation's map.
 pub struct KaijutsuBackend {
     /// kernel document/block storage.
     blocks: SharedBlockStore,
     /// The kaijutsu kernel for tool dispatch.
     kernel: Arc<KaijutsuKernel>,
     /// Identity fields for bridging kaish ExecContext → kaijutsu ToolContext.
-    principal_id: PrincipalId,
+    identity: ShellIdentity,
     /// Shared mutable context tracking map.
     session_contexts: SessionContextMap,
-    session_id: SessionId,
 }
 
 impl KaijutsuBackend {
     /// Create a new backend with block store, kernel, and identity fields.
     ///
-    /// Reads context switches from the global `SessionContextMap` using `session_id`.
+    /// Read context switches from the invocation's shared session map.
     pub fn new(
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
-        principal_id: PrincipalId,
+        identity: ShellIdentity,
         session_contexts: SessionContextMap,
-        session_id: SessionId,
     ) -> Self {
         Self {
             blocks,
             kernel,
-            principal_id,
+            identity,
             session_contexts,
-            session_id,
         }
     }
 
@@ -642,15 +639,15 @@ impl KernelBackend for KaijutsuBackend {
         // context_id is read from the session map so context switches propagate.
         let context_id = self
             .session_contexts
-            .current(&self.session_id)
+            .current(&self.identity.session)
             .ok_or_else(|| BackendError::Io("no active context joined".to_string()))?;
         let tool_ctx = crate::ExecContext::new(
-            self.principal_id,
+            self.identity.requester,
             context_id,
             ctx.cwd().to_path_buf(),
-            self.session_id,
+            self.identity.session,
             self.kernel.id(),
-        );
+        ).with_actor(self.identity.performer, self.identity.reviewer);
 
         // Carry kaish's invocation cancellation through the broker. Its
         // watchdog signals this token; replacing it would strand pending tools
@@ -807,7 +804,7 @@ fn json_to_kaish_value(json: JsonValue) -> kaish_kernel::ast::Value {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use kaijutsu_types::PrincipalId;
+    use kaijutsu_types::{PrincipalId, SessionId};
 
     #[tokio::test]
     async fn test_path_resolution() {
@@ -820,9 +817,7 @@ mod tests {
         let backend = KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid);
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts);
 
 
         // Test root paths
@@ -860,7 +855,7 @@ mod tests {
         let sid = SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, ctx_id);
-        KaijutsuBackend::new(blocks, kernel, PrincipalId::system(), session_contexts, sid)
+        KaijutsuBackend::new(blocks, kernel, crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts)
     }
 
     #[tokio::test]
@@ -934,9 +929,7 @@ mod tests {
         let backend = KaijutsuBackend::new(
             blocks.clone(),
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         );
         let path = std::path::PathBuf::from(format!(
             "/docs/{}/{}",
@@ -986,7 +979,7 @@ mod tests {
         let sid = SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, ctx_id);
-        let backend = KaijutsuBackend::new(blocks, kernel, PrincipalId::system(), session_contexts, sid);
+        let backend = KaijutsuBackend::new(blocks, kernel, crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts);
         let path = std::path::PathBuf::from(format!(
             "/docs/{}/{}",
             ctx_id.to_hex(),

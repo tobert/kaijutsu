@@ -1657,7 +1657,7 @@ impl Kernel {
                     "editor: ':r !cmd' unavailable — kj dispatcher not wired".to_string()
                 })?;
                 crate::runtime::editor_read::read_shell(dispatcher, ShellIdentity {
-                    requester: opener.principal, performer: opener.principal, reviewer: None,
+                    requester: opener.principal, performer: opener.performer, reviewer: opener.reviewer,
                     context: opener.context_id, session: opener.session_id,
                 }, cmd.clone()).await.map_err(|e| format!("editor: ':r !{cmd}' failed: {e}"))
             }
@@ -2445,7 +2445,7 @@ mod tests {
 
         // Open as `me` (records the opener), then resume finds it by principal.
         let me_opener = crate::editor::EditorOpener {
-            principal: me,
+            principal: me, performer: me, reviewer: None,
             context_id: ContextId::new(),
             session_id: kaijutsu_types::SessionId::new(),
         };
@@ -2488,7 +2488,7 @@ mod tests {
         let principal = PrincipalId::system();
         let context_id = register_context(&d, Some("vi-r"), None, principal);
         let opener = crate::editor::EditorOpener {
-            principal,
+            principal, performer: principal, reviewer: None,
             context_id,
             session_id: SessionId::new(),
         };
@@ -2519,7 +2519,7 @@ mod tests {
         let context_id = register_context(&d, Some("vi-binary"), None, principal);
         let path = "/config/rc/vitest/create/S00-foo.kai";
         install_rc_script_file(&d, path, "unchanged").await;
-        let opener = crate::editor::EditorOpener { principal, context_id, session_id: kaijutsu_types::SessionId::new() };
+        let opener = crate::editor::EditorOpener { principal, performer: principal, reviewer: None, context_id, session_id: kaijutsu_types::SessionId::new() };
         let (id, _) = d.kernel().editor_open_as(path, Some(opener)).await.unwrap();
         let state = d.kernel().editor_keys(id, ":r !echo '/w==' | base64 -d<CR>").await.unwrap();
         assert_eq!(state.text, "unchanged", "invalid UTF-8 must not become replacement characters");
@@ -2537,7 +2537,7 @@ mod tests {
         let context_id = register_context(&d, Some("vi-shutdown"), None, principal);
         let path = "/config/rc/vitest/create/S00-foo.kai";
         install_rc_script_file(&d, path, "unchanged").await;
-        let opener = crate::editor::EditorOpener { principal, context_id, session_id: kaijutsu_types::SessionId::new() };
+        let opener = crate::editor::EditorOpener { principal, performer: principal, reviewer: None, context_id, session_id: kaijutsu_types::SessionId::new() };
         let (id, _) = d.kernel().editor_open_as(path, Some(opener)).await.unwrap();
         d.kernel().shutdown_runtime_worker().await.unwrap();
         let state = d.kernel().editor_keys(id, ":r !echo must-not-run<CR>").await.unwrap();

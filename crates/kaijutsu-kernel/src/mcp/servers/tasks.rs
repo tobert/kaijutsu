@@ -260,7 +260,7 @@ impl McpServerLike for BuiltinTasksServer {
                         &p.content,
                         Status::Done,
                         ContentType::Plain,
-                        Some(tool_ctx.principal_id),
+                        Some(tool_ctx.actor_id),
                     )
                     .map_err(|e| McpError::Protocol(e.to_string()))?;
 
@@ -471,7 +471,7 @@ impl BuiltinTasksServer {
                 0,
                 new_content,
                 old_char_count,
-                Some(tool_ctx.principal_id),
+                Some(tool_ctx.actor_id),
             )
             .map_err(|e| McpError::Protocol(e.to_string()))
     }

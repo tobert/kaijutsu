@@ -348,7 +348,7 @@ impl McpServerLike for BlockToolsServer {
                         &content,
                         Status::Done,
                         ContentType::Plain,
-                        Some(tool_ctx.principal_id),
+                        Some(tool_ctx.actor_id),
                     )
                     .map_err(|e| McpError::Protocol(e.to_string()))?;
 
@@ -383,7 +383,7 @@ impl McpServerLike for BlockToolsServer {
                 };
 
                 self.documents
-                    .edit_text_as(context_id, &block_id, char_offset, &p.content, 0, Some(tool_ctx.principal_id))
+                    .edit_text_as(context_id, &block_id, char_offset, &p.content, 0, Some(tool_ctx.actor_id))
                     .map_err(|e| McpError::Protocol(e.to_string()))?;
 
                 let version = self.documents.get(context_id).map(|c| c.version()).unwrap_or(0);
@@ -448,7 +448,7 @@ impl McpServerLike for BlockToolsServer {
                         p.offset,
                         &insert,
                         p.delete_count,
-                        Some(tool_ctx.principal_id),
+                        Some(tool_ctx.actor_id),
                     )
                     .map_err(|e| McpError::Protocol(e.to_string()))?;
 
@@ -933,7 +933,7 @@ impl BlockToolsServer {
         };
 
         self.documents
-            .insert_block(
+            .insert_block_as(
                 context_id,
                 None,
                 last_block_id.as_ref(),
@@ -942,6 +942,7 @@ impl BlockToolsServer {
                 content,
                 Status::Done,
                 content_type,
+                Some(ctx.actor_id),
             )
             .map(|id| id.to_key())
             .map_err(|e| McpError::Protocol(e.to_string()))
@@ -986,7 +987,7 @@ impl BlockToolsServer {
                         pos,
                         &text_with_newline,
                         0,
-                        Some(ctx.principal_id),
+                        Some(ctx.actor_id),
                     )
                     .map_err(|e| McpError::Protocol(e.to_string()))?;
             }
@@ -1004,7 +1005,7 @@ impl BlockToolsServer {
                             start,
                             "",
                             end - start,
-                            Some(ctx.principal_id),
+                            Some(ctx.actor_id),
                         )
                         .map_err(|e| McpError::Protocol(e.to_string()))?;
                 }
@@ -1033,7 +1034,7 @@ impl BlockToolsServer {
                         start,
                         &text_with_newline,
                         end - start,
-                        Some(ctx.principal_id),
+                        Some(ctx.actor_id),
                     )
                     .map_err(|e| McpError::Protocol(e.to_string()))?;
             }

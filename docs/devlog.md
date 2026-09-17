@@ -1798,6 +1798,16 @@ captured unset cwd. A real auto-allowed shell test failed by landing in HOME;
 starts independently of the previous directory, so it can repair a removed
 cwd instead of refusing its own remedy.
 
+The identity audit found two adapter losses: MCP dispatch rebuilt the performer
+from the requester, and editor opens retained only the requester. Interpreter
+constructors now carry `ShellIdentity`; editor reads retain all five fields.
+`vi` resolves the current context at open, matching `kj editor open`, and later
+navigation leaves that captured context alone. Actual block-author regressions
+also exposed requester/default-store authorship in MCP block, rich-content,
+and task writes. These now attribute content and edit provenance to the
+performer. Lower-level identity constructors are crate-private, with explicit
+engine fixtures retained.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

@@ -85,23 +85,11 @@ impl EmbeddedKaish {
                   sid: SessionId,
                   tools: &mut kaish_kernel::ToolRegistry| {
                 let d = kj_dispatcher;
-                // ToolCtx carries no Kaijutsu identity. Capture the opener
-                // for editor commands and later foregrounding.
-                let opener = Some(crate::editor::EditorOpener {
-                    principal,
-                    context_id,
-                    session_id: sid,
-                });
-                // Both editor names share Kernel::editor_open.
                 tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
-                    d.clone(),
-                    "vi",
-                    opener,
+                    d.clone(), "vi", identity, scm.clone(),
                 ));
                 tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
-                    d.clone(),
-                    "edit",
-                    opener,
+                    d.clone(), "edit", identity, scm.clone(),
                 ));
                 // `fg` — job-control resume of an editor suspended with Ctrl+Z.
                 tools.register(crate::runtime::vi_builtin::FgBuiltin::new(
@@ -132,9 +120,7 @@ impl EmbeddedKaish {
                 dispatcher.block_store().clone(),
                 dispatcher.kernel().clone(),
                 None,
-                principal,
-                context_id,
-                session_id,
+                identity,
                 session_contexts,
                 configure_tools,
             )?
@@ -161,9 +147,7 @@ impl EmbeddedKaish {
                 dispatcher.block_store().clone(),
                 dispatcher.kernel().clone(),
                 None,
-                principal,
-                context_id,
-                session_id,
+                identity,
                 session_contexts,
                 external_exec,
                 output,
@@ -342,6 +326,141 @@ mod tests {
             binding.grant(crate::mcp::Capability::Exec);
         }
         d.kernel().broker().set_binding(ctx, binding).await.unwrap();
+    }
+
+    struct IdentityProbe {
+        id: crate::mcp::InstanceId,
+        calls: Arc<parking_lot::Mutex<Vec<crate::mcp::CallContext>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::McpServerLike for IdentityProbe {
+        fn instance_id(&self) -> &crate::mcp::InstanceId { &self.id }
+        async fn list_tools(&self, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<Vec<crate::mcp::KernelTool>> {
+            Ok(vec![crate::mcp::KernelTool { instance: self.id.clone(), name: "identity-probe".into(),
+                description: None, input_schema: serde_json::json!({"type":"object","properties":{}}) }])
+        }
+        async fn call_tool(&self, _: crate::mcp::KernelCallParams, ctx: &crate::mcp::CallContext,
+            _: tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<crate::mcp::KernelToolResult> {
+            self.calls.lock().push(ctx.clone());
+            Ok(crate::mcp::KernelToolResult { is_error: false, content: vec![], structured: None })
+        }
+        fn notifications(&self) -> tokio::sync::broadcast::Receiver<crate::mcp::ServerNotification> {
+            tokio::sync::broadcast::channel(1).1
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_dispatch_preserves_complete_invocation_identity() {
+        for read_only in [false, true] {
+            let d = dispatcher_with_full_broker().await;
+            let requester = PrincipalId::new();
+            let initial = register_context(&d, Some("probe-initial"), None, requester);
+            let switched = register_context(&d, Some("probe-switched"), None, requester);
+            for context in [initial, switched] { grant_broad_binding(&d, context, false).await; }
+            let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            d.kernel().broker().register_silently(Arc::new(IdentityProbe {
+                id: crate::mcp::InstanceId("identity-probe".into()), calls: calls.clone(),
+            }), crate::mcp::InstancePolicy::default()).await.unwrap();
+            let identity = ShellIdentity { requester, performer: PrincipalId::new(), reviewer: Some(PrincipalId::new()),
+                context: initial, session: SessionId::new() };
+            let kaish = EmbeddedKaish::for_context(&d, "probe", identity,
+                if read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
+                ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
+            kaish.set_context_id(switched);
+            let result = kaish.execute_with_options("identity-probe", ExecuteOptions::default()).await.unwrap();
+            assert!(result.ok(), "{result:?}");
+            let calls = calls.lock();
+            assert_eq!(calls.len(), 1);
+            let observed = &calls[0];
+            assert_eq!(observed.principal_id, identity.requester);
+            assert_eq!(observed.actor_id, identity.performer);
+            assert_eq!(observed.reviewer_id, identity.reviewer);
+            assert_eq!(observed.session_id, identity.session);
+            assert_eq!(observed.context_id, switched);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_block_authorship_preserves_shell_performer_after_context_switch() {
+        let d = dispatcher_with_full_broker().await;
+        let requester = PrincipalId::new();
+        let performer = PrincipalId::new();
+        let initial = register_context(&d, Some("identity-initial"), None, requester);
+        let switched = register_context(&d, Some("identity-switched"), None, requester);
+        for context in [initial, switched] {
+            grant_broad_binding(&d, context, false).await;
+            d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        }
+        let kaish = EmbeddedKaish::for_context(&d, "mcp-identity", ShellIdentity {
+            requester, performer, reviewer: Some(PrincipalId::new()), context: initial, session: SessionId::new(),
+        }, ShellPolicy::Agent, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
+        kaish.set_context_id(switched);
+        for command in [
+            "block_create --role user --kind text --content performer-block",
+            "svg_block --content '<svg xmlns=\"http://www.w3.org/2000/svg\"/>'",
+            "task_create --content performer-task",
+        ] {
+            let result = kaish.execute_with_options(command, ExecuteOptions::default()).await.unwrap();
+            assert!(result.ok(), "{command}: {result:?}");
+        }
+        let blocks = d.block_store().block_snapshots(switched).unwrap();
+        assert_eq!(blocks.len(), 3);
+        for block in blocks {
+            assert_eq!(block.author(), performer, "MCP writes belong to the performer: {}", block.content);
+        }
+        assert!(d.block_store().block_snapshots(initial).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn editor_reads_preserve_performer_and_context_at_open() {
+        for front_door in ["vi", "edit", "kj editor open"] {
+            let d = dispatcher_with_full_broker().await;
+            let requester = PrincipalId::new();
+            let performer = PrincipalId::new();
+            let initial = register_context(&d, Some("editor-initial"), None, requester);
+            let switched = register_context(&d, Some("editor-switched"), None, requester);
+            for context in [initial, switched] {
+                grant_broad_binding(&d, context, false).await;
+                d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+            }
+            use crate::vfs::VfsOps;
+            d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/identity-editor.txt"), b"original").await.unwrap();
+            let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            d.kernel().broker().register_silently(Arc::new(IdentityProbe {
+                id: crate::mcp::InstanceId("editor-identity-probe".into()), calls: calls.clone(),
+            }), crate::mcp::InstancePolicy::default()).await.unwrap();
+            let identity = ShellIdentity {
+                requester, performer, reviewer: Some(PrincipalId::new()), context: initial, session: SessionId::new(),
+            };
+            let kaish = EmbeddedKaish::for_context(&d, "editor-identity", identity,
+                ShellPolicy::Agent, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
+            kaish.set_context_id(switched);
+            let opened = kaish.execute_with_options(&format!("{front_door} /config/kernel/identity-editor.txt"), ExecuteOptions::default()).await.unwrap();
+            assert!(opened.ok(), "{front_door}: {opened:?}");
+            let data = kaish_kernel::interpreter::value_to_json(opened.data.as_ref().unwrap());
+            let session = crate::editor::EditorSessionId::from_u64(data["session"].as_u64().unwrap());
+            // Later shell switches do not retarget an existing editor's read.
+            kaish.set_context_id(initial);
+            let state = d.kernel().editor_keys(session, ":r !kj block create --role user --kind text --content editor-performer; identity-probe<CR>").await.unwrap();
+            let blocks = d.block_store().block_snapshots(switched).unwrap();
+            let block = blocks.iter().find(|block| block.content == "editor-performer")
+                .unwrap_or_else(|| panic!("{front_door}: read must author in context at open; {:?}", state.message));
+            assert_eq!(block.author(), performer, "{front_door}: read must preserve performer");
+            {
+                let calls = calls.lock();
+                assert_eq!(calls.len(), 1, "{front_door}: editor read must reach MCP");
+                let observed = &calls[0];
+                assert_eq!(observed.principal_id, identity.requester);
+                assert_eq!(observed.actor_id, identity.performer);
+                assert_eq!(observed.reviewer_id, identity.reviewer);
+                assert_eq!(observed.session_id, identity.session);
+                assert_eq!(observed.context_id, switched);
+            }
+            let initial_blocks = d.block_store().block_snapshots(initial).unwrap();
+            assert!(initial_blocks.is_empty(), "{front_door}: unexpected initial-context blocks: {initial_blocks:?}");
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+        }
     }
 
     async fn assert_model_shell_cannot_reach_compose_draft(command: &str) {

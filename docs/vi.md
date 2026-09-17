@@ -398,7 +398,9 @@ push channel; the app renders it read-only.
   kernel `CommandRequest`: it mutates the `EditorCore` buffer and rides the
   existing diff→`EditOp`→block-mirror path.
 - **Read:** `:r <file>` reads through `FileDocumentCache::try_read_content`.
-  `:r !cmd` runs in the opener's context on the kernel runtime. Both splice
+  `:r !cmd` runs on the kernel runtime with the requester, performer, reviewer,
+  session, and context captured when the editor opened. Later shell navigation
+  does not retarget the read. Both splice
   **at the cursor**, rather than below its line. Accepted spellings also include
   `:read <file>`, `:read !cmd`, and the adjacent-bang `:r!cmd`.
   A missing file, denied or failed command, invalid UTF-8, or truncated output

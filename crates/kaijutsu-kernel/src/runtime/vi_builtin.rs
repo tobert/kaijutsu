@@ -1,17 +1,6 @@
-//! `vi` / `edit` kaish builtin — open a kernel-owned editor session on a path.
-//!
-//! The canonical, ergonomic front door to the editor surface (`docs/vi.md`).
-//! `vi /config/rc/coder/create/S00-stance.kai` resolves the path to its owning
-//! block and opens a session, returning the session handle + initial state. It
-//! does **no editing logic of its own** — it is a thin alias onto the kernel's
-//! shared `editor_open` primitive, the same primitive `kj editor open` and (when
-//! it needs to open an editor) `kj editor open` route through. One primitive, many
-//! front doors.
-//!
-//! Opening signals the submitter's app windows to pop a renderer (the
-//! `open_editor` peer signal, via `Kernel::editor_open_signaled`), threading the
-//! caller's principal off the `ExecContext`. Best-effort: a headless `vi` (a
-//! model, a test) with no app still opens a real session. See `docs/vi.md`.
+//! `vi` and `edit` open kernel-owned editor sessions through the same entry
+//! point as `kj editor open`. The opener retains the invocation identity and
+//! context at open; editor signals target the requester. See `docs/vi.md`.
 
 use std::sync::Arc;
 
@@ -25,28 +14,28 @@ use kaijutsu_types::PrincipalId;
 
 use crate::editor::EditorOpener;
 use crate::kj::KjDispatcher;
+use super::context_shell::ShellIdentity;
+use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// kaish builtin that opens an editor session via `Kernel::editor_open`.
 ///
 /// Registered once per user-facing name (`vi`, `edit`) so both resolve to the
 /// same behavior; `name` is the registry key this instance answers to.
 ///
-/// The opener is captured when `EmbeddedKaish::for_context` constructs the
-/// invocation. Kaish's `ToolCtx` does not carry Kaijutsu principal or context
-/// identity, so editor commands use this captured value.
+/// Requester, performer, reviewer, and session remain fixed for the invocation.
+/// Resolve its current context when opening, then retain that complete opener
+/// on the editor session for later shell reads.
 pub struct ViBuiltin {
     dispatcher: Arc<KjDispatcher>,
     name: &'static str,
-    opener: Option<EditorOpener>,
+    identity: ShellIdentity,
+    session_contexts: SessionContextMap,
 }
 
 impl ViBuiltin {
-    pub fn new(dispatcher: Arc<KjDispatcher>, name: &'static str, opener: Option<EditorOpener>) -> Self {
-        Self {
-            dispatcher,
-            name,
-            opener,
-        }
+    pub fn new(dispatcher: Arc<KjDispatcher>, name: &'static str,
+        identity: ShellIdentity, session_contexts: SessionContextMap) -> Self {
+        Self { dispatcher, name, identity, session_contexts }
     }
 }
 
@@ -83,14 +72,17 @@ impl Tool for ViBuiltin {
             }
         };
 
-        // The opener (captured at construction) is who `open_editor` fans the
-        // renderer signal to, and whose context `:r !cmd` shells out in. A
-        // headless instance (no opener) still opens a real session — it just
-        // pops no window and can't `:r !cmd`.
+        let Some(context_id) = self.session_contexts.current(&self.identity.session) else {
+            return ExecResult::failure(1, format!("{}: no active context joined", self.name));
+        };
+        let opener = EditorOpener {
+            principal: self.identity.requester, performer: self.identity.performer,
+            reviewer: self.identity.reviewer, context_id, session_id: self.identity.session,
+        };
         match self
             .dispatcher
             .kernel()
-            .editor_open_signaled(&path, self.opener)
+            .editor_open_signaled(&path, Some(opener))
             .await
         {
             Ok((id, st)) => {
@@ -182,13 +174,10 @@ mod tests {
             move |_scm: SessionContextMap,
                   sid: SessionId,
                   tools: &mut kaish_kernel::ToolRegistry| {
-                let opener = Some(EditorOpener {
-                    principal: PrincipalId::system(),
-                    context_id: ctx,
-                    session_id: sid,
-                });
-                tools.register(ViBuiltin::new(dispatcher.clone(), "vi", opener));
-                tools.register(ViBuiltin::new(dispatcher.clone(), "edit", opener));
+                let identity = ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
+                    reviewer: None, context: ctx, session: sid };
+                tools.register(ViBuiltin::new(dispatcher.clone(), "vi", identity, _scm.clone()));
+                tools.register(ViBuiltin::new(dispatcher.clone(), "edit", identity, _scm));
             };
 
         EmbeddedKaish::with_identity(
@@ -196,9 +185,7 @@ mod tests {
             blocks,
             kernel,
             None,
-            PrincipalId::system(),
-            ctx,
-            session_id,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: ctx, session: session_id },
             session_contexts,
             crate::runtime::embedded_kaish::ExternalExec::Deny,
             crate::runtime::embedded_kaish::OutputProfile::Agent,

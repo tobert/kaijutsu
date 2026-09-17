@@ -116,11 +116,19 @@ deleted. The synthesis block-source adapter still ignores hydration errors;
 retain that finding for the adapter audit instead of treating an empty result
 as proof that loading succeeded.
 
-The editor opener and kaish MCP backend currently retain the requester but
-lose the distinct performer/reviewer. Carry the complete invocation identity
-through both adapters, including context switches, and pin actual authored
-blocks in regression tests. The editor's runtime ownership and complete-text
-checks do not finish this identity audit.
+Kaibo's identity review found remaining adapter policy/provenance gaps:
+- Read-only construction blocks filesystem and host execution, but still
+  exposes mutating `kj` and MCP tools. An editor opened there can run an
+  Internal shell through `:r !cmd`. Pin the intended read-only contract through
+  the actual model shell, including nested calls, before completing this row.
+- `/v/docs` writes and editor mirrors call `edit_text` with the store's default
+  principal. Carry the mutation performer's identity. For shared editor input,
+  distinguish the player making the edit from the opener retained for shell
+  reads; blindly attributing every edit to the opener would be wrong too.
+- `img_block_from_path` uses host `std::fs::read`, bypassing the shared mount
+  namespace. Route it through the existing file/CAS integration.
+Review evidence and disposition are under
+`~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
 Rc orchestration and its path grammar now belong to `rc`; every lifecycle caller
 uses `rc::run` with `RcInvocation`. The old dispatcher lifecycle methods and

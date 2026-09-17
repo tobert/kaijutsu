@@ -51,6 +51,7 @@ use super::kaish_backend::KaijutsuBackend;
 use super::mount_backend::MountBackend;
 use super::read_only_fs::ReadOnlyFs;
 use super::swap_filesystem::SwapFilesystem;
+use super::context_shell::ShellIdentity;
 use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Embedded kaish executor backed by kernel blocks.
@@ -186,9 +187,8 @@ impl EmbeddedKaish {
             blocks,
             kernel,
             project_root,
-            PrincipalId::system(),
-            ContextId::new(),
-            SessionId::new(),
+            ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
+                reviewer: None, context: ContextId::new(), session: SessionId::new() },
             crate::runtime::context_engine::session_context_map(),
             ExternalExec::Deny,
             OutputProfile::Agent,
@@ -196,27 +196,17 @@ impl EmbeddedKaish {
         )
     }
 
-    /// Create an embedded kaish executor with explicit identity fields.
-    ///
-    /// Identity flows through to `ToolContext` for drift/whoami engines.
-    /// The `context_id` is tracked via the shared `SessionContextMap`.
-    ///
-    /// The `configure_tools` callback receives the map and session ID so callers
-    /// can register tools (like KjBuiltin) that need context awareness.
-    ///
-    /// One argument per independent piece of construction state (identity,
-    /// storage handles, execution/output policy, tool wiring) — this and
-    /// `with_identity_read_only`/`with_identity_mode` below all share the
-    /// shape for the same reason; this is the one comment for the family.
+    /// Build the interpreter and adapters with a complete invocation identity.
+    /// Context switches share the supplied session map. The tool callback uses
+    /// the same map; contextual policy and durable scope are applied by
+    /// `for_context` before production execution.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_identity(
+    pub(crate) fn with_identity(
         name: &str,
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
         project_root: Option<PathBuf>,
-        principal_id: PrincipalId,
-        context_id: ContextId,
-        session_id: SessionId,
+        identity: ShellIdentity,
         session_contexts: SessionContextMap,
         external_exec: ExternalExec,
         output: OutputProfile,
@@ -227,9 +217,7 @@ impl EmbeddedKaish {
             blocks,
             kernel,
             project_root,
-            principal_id,
-            context_id,
-            session_id,
+            identity,
             session_contexts,
             false,
             external_exec,
@@ -242,17 +230,13 @@ impl EmbeddedKaish {
     /// every filesystem mutation and every external command is refused by
     /// construction, while reads — real files *and* the kernel document views at
     /// `/v/docs` — still work. Used by the model `shell` tool.
-    // See with_identity's doc above for why this family's argument count is
-    // what it is.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_identity_read_only(
+    pub(crate) fn with_identity_read_only(
         name: &str,
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
         project_root: Option<PathBuf>,
-        principal_id: PrincipalId,
-        context_id: ContextId,
-        session_id: SessionId,
+        identity: ShellIdentity,
         session_contexts: SessionContextMap,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
@@ -261,9 +245,7 @@ impl EmbeddedKaish {
             blocks,
             kernel,
             project_root,
-            principal_id,
-            context_id,
-            session_id,
+            identity,
             session_contexts,
             true,
             // Read-only never spawns: external exec is the sandbox's fourth
@@ -281,25 +263,20 @@ impl EmbeddedKaish {
     /// read-only, and external command execution is disabled — three structural
     /// levers, mirroring kaibo's read-only sandbox recipe (`sandbox.rs`) adapted
     /// to kaijutsu's *shared*, kernel-owned mount table.
-    // See with_identity's doc for why this family's argument count is what
-    // it is — this is the shared implementation both public constructors
-    // above funnel into.
     #[allow(clippy::too_many_arguments)]
     fn with_identity_mode(
         name: &str,
         blocks: SharedBlockStore,
         kernel: Arc<KaijutsuKernel>,
         project_root: Option<PathBuf>,
-        principal_id: PrincipalId,
-        context_id: ContextId,
-        session_id: SessionId,
+        identity: ShellIdentity,
         session_contexts: SessionContextMap,
         read_only: bool,
         external_exec: ExternalExec,
         output: OutputProfile,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
-        // Initialize session map entry if missing
+        let ShellIdentity { context: context_id, session: session_id, .. } = identity;
         session_contexts.entry(session_id).or_insert(context_id);
 
         // The kernel's own file cache — the same instance the MCP file tools
@@ -310,9 +287,8 @@ impl EmbeddedKaish {
         let docs_backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel.clone(),
-            principal_id,
+            identity,
             session_contexts.clone(),
-            session_id,
                     ));
         let mount_table = kernel.vfs().clone();
 
@@ -1207,9 +1183,7 @@ mod tests {
                 blocks.clone(),
                 kernel.clone(),
                 Some(std::env::temp_dir()),
-                principal,
-                ContextId::new(),
-                SessionId::new(),
+                crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
                 crate::runtime::context_engine::session_context_map(),
                 exec,
                 OutputProfile::Agent,
@@ -1272,9 +1246,7 @@ mod tests {
                 blocks.clone(),
                 kernel.clone(),
                 Some(std::env::temp_dir()),
-                principal,
-                ContextId::new(),
-                SessionId::new(),
+                crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
                 crate::runtime::context_engine::session_context_map(),
                 ExternalExec::Deny,
                 profile,
@@ -1505,9 +1477,7 @@ mod tests {
             blocks,
             kernel,
             None,
-            principal,
-            context_id,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: context_id, session: sid },
             session_contexts,
             ExternalExec::Deny,
             OutputProfile::Agent,
@@ -1603,9 +1573,7 @@ mod tests {
             blocks,
             kernel,
             None,
-            principal,
-            context_id,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: context_id, session: sid },
             session_contexts,
             ExternalExec::Deny,
             OutputProfile::Agent,
@@ -1710,9 +1678,7 @@ mod tests {
             blocks,
             kernel,
             None,
-            principal,
-            context_id,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: context_id, session: sid },
             session_contexts,
             ExternalExec::Deny,
             OutputProfile::Agent,

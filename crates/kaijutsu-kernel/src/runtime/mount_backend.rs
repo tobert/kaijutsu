@@ -882,9 +882,7 @@ mod tests {
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
 
         MountBackend::new(mount_table, docs, file_cache)
@@ -1007,9 +1005,7 @@ mod tests {
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
         let backend = MountBackend::new(mount_table, docs, file_cache.clone());
 
@@ -1073,9 +1069,7 @@ mod tests {
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
         let backend = MountBackend::new(mount_table, docs, file_cache);
 
@@ -1121,9 +1115,7 @@ mod tests {
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
 
         // Seed a file through a writable backend sharing the same cache/mount.
@@ -1201,9 +1193,7 @@ mod tests {
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
         let backend = MountBackend::new(mount_table, docs, file_cache.clone());
 
@@ -1278,9 +1268,7 @@ mod tests {
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            PrincipalId::system(),
-            session_contexts,
-            sid,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
         let backend = MountBackend::new(mount_table.clone(), docs, file_cache.clone());
 

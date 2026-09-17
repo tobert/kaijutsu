@@ -542,7 +542,7 @@ mod fill_tests {
             let code = if during_hook { "echo captured" } else { "echo observed; panic-test" };
             let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(), command, output, code, None).unwrap();
             let kaish = EmbeddedKaish::with_identity("panic-settlement", documents.clone(), kernel.clone(), None,
-                PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(),
+                crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: ctx, session: kaijutsu_types::SessionId::new() },
                 crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
                 super::super::embedded_kaish::OutputProfile::Agent,
                 |_, _, tools| { tools.register(PanicBuiltin); }).unwrap();

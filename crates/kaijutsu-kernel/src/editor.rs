@@ -225,15 +225,16 @@ impl EditorState {
 /// session. Two consumers:
 ///
 /// - **`fg`** re-foregrounds the caller's most-recent session by `principal`.
-/// - **`:r !cmd`** materializes a kaish in `(principal, context_id, session_id)`
-///   so the command runs in the *opener's* working context and capability
-///   allow-set — not the edited block's context.
+/// - **`:r !cmd`** preserves requester, performer, reviewer, session, and the
+///   context at open. Later shell navigation does not retarget the read.
 ///
 /// `None` for a headless open (a test driver, the wire `editorOpen` handler):
 /// nobody to foreground, and `:r !cmd` then fails loud rather than guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorOpener {
     pub principal: PrincipalId,
+    pub performer: PrincipalId,
+    pub reviewer: Option<PrincipalId>,
     pub context_id: ContextId,
     pub session_id: SessionId,
 }
@@ -1468,7 +1469,7 @@ mod session_tests {
         // `fg` keys on the opener's principal; context/session are irrelevant here.
         let as_opener = |p: PrincipalId| {
             Some(EditorOpener {
-                principal: p,
+                principal: p, performer: p, reviewer: None,
                 context_id: ContextId::new(),
                 session_id: SessionId::new(),
             })
@@ -1534,7 +1535,7 @@ mod session_tests {
         // reports no opener.
         assert!(list[0].opener.is_none(), "B was opened headless");
         let opener = Some(EditorOpener {
-            principal: PrincipalId::system(),
+            principal: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None,
             context_id: ContextId::new(),
             session_id: SessionId::new(),
         });
