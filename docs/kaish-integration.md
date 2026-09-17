@@ -185,6 +185,15 @@ These are source observations, not promises that all paths behave alike.
   before publishing its terminal event. A panic publishes Failed, then resumes
   unwinding so worker shutdown reports failure. Shutdown cancels queued turns
   and provider work and joins cleanup.
+- Timed `kj drive --track <name> --score-at <tick>` pairs a turn lease with
+  timeline-owned preparation before model work starts. Rc chooses the target
+  and fallback; runtime validates complete performer-authored ABC and retains
+  durable rejection feedback; the timeline validates its seed/score basis and
+  commits or falls back at the original target. Turn and work IDs correlate
+  through the command result. Dropping the handoff interrupts only its turn.
+  The completion-bus scheduler and `schedule_abc_cell` are deleted. Untimed
+  drives no longer schedule notation. See `docs/hyoushigi.md`, "Model turns with
+  an intended score tick" for the basis scope and controlled SSH scenario.
 - `runtime/turn_request.rs` admits headless requests directly to the kernel
   worker. Fork/drive, approval continuation, and async shell completion all call
   it; FlowBus subscriber counts never authorize execution. Requested publishes

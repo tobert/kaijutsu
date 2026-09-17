@@ -5,12 +5,9 @@
 # the capability that gates self-driving — narrowing the binding now actually
 # stops the tick (it didn't before kj grew capability gates).
 #
-# A player is an ABC-only voice: its turn output text *is* the score for the
-# phrase (on_turn_completed eager-parses it; no tool call required). So we grant
-# NO model-visible tools — a small local model plays best with an empty tool
-# palette (Chameleon: "ABC-only output is ideal small-local-model UX"), and it
-# sidesteps the tool-call turn path entirely (a small model handed the full
-# palette stalls the turn). Only `drive` (the tick) is granted.
+# A player's complete ABC text is prepared for the tick admitted by `kj drive`.
+# The runtime validates notation; no model tool call is required. This loadout
+# grants `drive` to the tick script and exposes no model-visible tools.
 set -e
 kj binding allow "drive"
 # Deliberately NOT granted: any builtin.* tool instance (block/file/resources/

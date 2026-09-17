@@ -92,6 +92,16 @@ pub enum ResolveError {
 pub trait Resolver: Send + Sync {
     fn id(&self) -> ResolverId;
 
+    /// Whether an invalid basis may start another preparation attempt. A handoff
+    /// from an already admitted producer returns false: only its caller can
+    /// decide to run that producer again.
+    fn can_respeculate(&self) -> bool { true }
+
+    /// Durable input that requested this work, when there is one. Failure
+    /// feedback uses this anchor instead of guessing from performer identity.
+    fn source_block(&self) -> Option<kaijutsu_types::BlockId> { None }
+
+
     /// Wall-clock estimate; feeds lead-time derivation
     /// (`speculate_at = start − beats_for(estimate × safety)`).
     fn estimate_cost(&self, params: &serde_json::Value, rctx: &dyn ResolverCtx) -> Duration;

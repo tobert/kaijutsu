@@ -54,24 +54,16 @@ failure is useful evidence; a new model integration is not required to
 prove the coordination contract. Update the checklist as each step lands,
 and correct adjacent docs/comments in the same change.
 
-### Connect live model attempts to admitted timeline work
+### Measure and recover admitted timeline work
 
-The timeline now owns pending futures, rejects late/stale completions, bounds open
-admission, and exposes work status through `kj transport work`. The controlled SSH
-scenario exercises those contracts. Production CAS read/validation runs on the
-existing Tokio blocking pool with a shared four-operation limit.
-
-`BeatScheduler::on_turn_completed` still schedules one phrase ahead of completion;
-it does not capture an intended target or input basis when the model turn begins.
-Migrate that handoff to admitted work and cancellation ownership. The CAS adapter's
-artifact-hash basis establishes artifact identity, not model-context freshness.
-Keep rc tick lifecycle policy distinct from model preparation and commitment.
-The runtime lease now supplies a stable `TurnId` across admission, startup and
-terminal events, including client callbacks. Use it to bind each attempt's target
-and input basis before model work starts. Keep an owned completion handoff: the
-live event bus is an observation channel, not durable or lossless settlement.
-Do not associate by context alone, and do not treat already accepted model/tool
-side effects as rollbackable resolver output.
+Live model score work now binds an absolute target and a seed/score basis at
+admission, with turn-owned delivery and timeline-owned cancellation. The old
+completion listener is deleted. Controlled SSH tests exercise both the generic
+producer scenario and timed `kj drive`, including the shipped musician tick
+script. See `docs/hyoushigi.md`, "Model turns with an intended score tick".
+The basis deliberately excludes the changing conversation, tool inputs and
+cross-track heard view. Broader dependencies need an explicit projection;
+current model handoffs do not automatically replay their producer on invalidity.
 
 CAS preparation has a process-wide limit of four operations. An uninterruptible
 host read retains its slot even after its owner is cancelled; four stuck reads
@@ -82,11 +74,11 @@ The open-work bound counts operations, not bytes; ready-source and committed CAS
 residency still need measurement before admitting large rendered artifacts through
 this adapter (placed clips carry small records referring to media in CAS).
 
-`BeatScheduler::drain_track_failures` advances `failure_water` even if the producer
-has no anchor block or error-block insertion fails. That loses client feedback
-after the logged fault. Pin retry ownership and idempotent delivery. Work status
-supplies live error/disposition visibility, but its bounded history is not durable
-recovery or provenance.
+Feedback retains its original source anchor when available and retries missing
+anchors or failed writes on subsequent pulses. The delivery cursor and bounded
+work history remain live state, not restart recovery or durable work provenance.
+A persistent write fault also holds later feedback behind the failed event.
+Measure and design recovery before promising durable admission or delivery.
 
 ## Kaish positional suffix expansion
 
@@ -164,13 +156,6 @@ buffers do not detect target changes for the guarded-write check. Clean symlink
 reads now refresh target content; preserve dirty work while fixing the remaining
 metadata/guard behavior in the file-cache audit. Also check stale-read error
 branches that remove cache entries without preserving editor pins.
-
-A full kernel run during the turn-owner move exposed an intermittent empty read
-in `read_all_follows_symlink_without_truncating` (3055 passed, one failed;
-a repeat passed all 3056). `LocalBackend::write` awaits Tokio `File::write_all` but drops the handle without
-`flush`; buffered write completion is a contributing factor to investigate.
-Pin visibility through a separately opened reader and late write errors before
-changing this adapter. Evidence: `/tmp/kaijutsu-turn-owner-kernel.log`.
 
 Command execution for interactive submissions and approval resume now lives in
 `runtime/command.rs`; server `shell_run.rs` is deleted. Result projections and
@@ -2359,7 +2344,7 @@ carry the mechanism; these are what none of them cover:
 - **Perception is notation-only.** `KJ_HEARD` is ABC; no `MidiToAbcDeriver`,
   so a captured MIDI window is invisible to a model.
 - **No chart is seeded into a player's context**, and the OODA Act is
-  hardwired to ABC (`schedule_abc_cell`, `hyoushigi/mod.rs:445`).
+  hardwired to ABC (`kj drive --score-at`, `hyoushigi/model.rs`).
 - **Players get no tools at all.** A read-only kaish (kaibo's posture) would
   remove the tool-palette-hangs-small-models cliff by construction and give
   bar math an escape hatch. Decide which RO builtins.

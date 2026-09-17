@@ -1457,7 +1457,7 @@ impl TurnStopReason {
 /// Who asked for the turn — a human at a prompt, or the kernel driving itself.
 ///
 /// Every turn publishes an outcome. Consumers that act only on autonomous
-/// turns, such as the beat scheduler, filter by origin.
+/// turns, such as the score-output handoff, filter by origin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnOrigin {
     /// A player submitted a prompt (`prompt` / `submitInput`). The default,

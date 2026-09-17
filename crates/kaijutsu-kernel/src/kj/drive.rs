@@ -23,13 +23,22 @@ pub(crate) struct DriveArgs {
     /// whatever is already in the context's block log.
     #[arg(long)]
     prompt: Option<String>,
+    /// Commit this turn's complete ABC output at this absolute track tick.
+    #[arg(long, requires = "track")]
+    score_at: Option<i64>,
+    /// Track for the intended score commitment; must already be armed.
+    #[arg(long, requires = "score_at")]
+    track: Option<String>,
+    /// Missed or invalid score output uses last-good (default) or skip.
+    #[arg(long, requires = "score_at", value_parser = ["last-good", "skip"])]
+    fallback: Option<String>,
     /// Target context to drive (label or id); defaults to the current context.
     target: Option<String>,
 }
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_drive(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Both arguments are optional: bare `kj drive` drives this context.
+        // Bare `kj drive` drives this context without a score commitment.
         // Only --help/-h requests help.
         let parsed = match DriveArgs::try_parse_from(argv) {
             Ok(p) => p,
@@ -43,6 +52,22 @@ impl KjDispatcher {
                 }
                 return KjResult::Err(format!("kj drive: {e}"));
             }
+        };
+
+        let score = match parsed.score_at {
+            Some(start) => {
+                let track = match kaijutsu_types::TrackId::new(parsed.track.as_deref().expect("clap requires track")) {
+                    Ok(track) => track,
+                    Err(error) => return KjResult::Err(format!("kj drive: {error}")),
+                };
+                Some(crate::hyoushigi::model::ScoreIntent {
+                    track, start: kaijutsu_types::Tick::new(start),
+                    fallback: if parsed.fallback.as_deref() == Some("skip") {
+                        kaijutsu_hyoushigi::Fallback::Skip
+                    } else { kaijutsu_hyoushigi::Fallback::UseLastGood },
+                })
+            }
+            None => None,
         };
 
         // Self-driving is gated: the caller's loadout must hold `drive`. This is
@@ -132,11 +157,12 @@ impl KjDispatcher {
             None => tail,
         };
 
-        let turn_id = match self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
+        let (turn_id, work_id) = match self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
+            score,
             context_id: target, after_block_id: after, content: seed,
             principal_id: caller.principal_id, model: None, continuation_epoch: None,
         }) {
-            Ok(crate::runtime::turn_request::TurnAdmission::Accepted(id)) => id,
+            Ok(crate::runtime::turn_request::TurnAdmission::Accepted { turn_id, work_id }) => (turn_id, work_id),
             Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) => unreachable!("explicit drive admits a turn"),
             Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),
         };
@@ -151,6 +177,7 @@ impl KjDispatcher {
                 "context_id": target.to_hex(),
                 "accepted": true,
                 "turn_id": turn_id,
+                "work_id": work_id,
             })),
         }
     }

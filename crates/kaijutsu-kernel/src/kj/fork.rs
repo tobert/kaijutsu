@@ -1457,6 +1457,7 @@ impl KjDispatcher {
             return;
         };
         let admitted = self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
+            score: None,
             context_id: new_id, after_block_id: after, content: note.into(),
             principal_id: caller.principal_id, model: None, continuation_epoch: None,
         });

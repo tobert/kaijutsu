@@ -741,6 +741,7 @@ impl crate::Kernel {
             ).map_err(|e| e.to_string())?
         {
             self.request_turn(crate::runtime::turn_request::TurnRequest {
+                score: None,
                 context_id: context, after_block_id: notification, content: message,
                 principal_id: principal, model: None, continuation_epoch: Some(epoch),
             })?;

@@ -35,6 +35,7 @@ impl std::future::Future for Pending {
 
 impl Resolver for Controlled {
     fn id(&self) -> ResolverId { ResolverId::new("controlled") }
+    fn can_respeculate(&self) -> bool { false }
     fn estimate_cost(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> Duration { Duration::from_secs(5) }
     fn compute_basis(&self, _: &serde_json::Value, ctx: &dyn ResolverCtx) -> ContextHash {
         ContextHash::of(&ctx.ambient("basis").unwrap_or_default())
@@ -62,6 +63,57 @@ fn fixture() -> (Timeline, mpsc::Sender<Result<Resolution, ResolveError>>, Arc<s
     let mut timeline = Timeline::new(TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(2) });
     timeline.register_resolver(Box::new(Controlled { receiver: Mutex::new(Some(receiver)), dropped: dropped.clone() }));
     (timeline, sender, dropped)
+}
+
+#[test]
+fn dedicated_preparation_starts_at_admission_and_never_replays_its_producer() {
+    let (sender, receiver) = mpsc::channel();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tl = Timeline::new(TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(20) });
+    let work = tl.schedule_preparing(cell(100), Box::new(Controlled {
+        receiver: Mutex::new(Some(receiver)), dropped: dropped.clone(),
+    })).unwrap();
+    assert_eq!(tl.status(work).unwrap().started_at, Some(Tick::ZERO));
+    sender.send(Ok(Resolution::new(b"ready", "text/plain"))).unwrap();
+    tl.advance_to(Tick::new(1));
+    tl.set_ambient("basis", b"changed".to_vec());
+    tl.advance_to(Tick::new(80));
+    assert_eq!(tl.status(work).unwrap().attempt, 1);
+    assert!(matches!(tl.status(work).unwrap().disposition,
+        Some(Disposition::Fallback { reason: FallbackReason::InvalidBasis, .. })));
+    assert_eq!(Arc::strong_count(&dropped), 1, "terminal history must not retain the resolver");
+}
+
+#[test]
+fn dedicated_preparation_releases_its_owner_on_cancel_and_refusal() {
+    for at in [0, 100] {
+        let (sender, receiver) = mpsc::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tl = Timeline::new(TickClock::default());
+        let result = tl.schedule_preparing(cell(at), Box::new(Controlled {
+            receiver: Mutex::new(Some(receiver)), dropped: dropped.clone(),
+        }));
+        if at == 0 { assert!(matches!(result, Err(ScheduleError::InThePast { .. }))); }
+        else { assert!(tl.cancel(result.unwrap())); }
+        assert_eq!(Arc::strong_count(&dropped), 1);
+        assert!(sender.send(Ok(Resolution::new(b"too late", "text/plain"))).is_err());
+    }
+}
+
+#[test]
+fn admitted_work_keeps_its_resolver_when_registration_changes() {
+    let (mut tl, sender, _) = fixture();
+    let work = tl.schedule(cell(10)).unwrap();
+    let (_replacement, receiver) = mpsc::channel();
+    tl.register_resolver(Box::new(Controlled {
+        receiver: Mutex::new(Some(receiver)),
+        dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }));
+    sender.send(Ok(Resolution::new(b"original", "text/plain")))
+        .expect("admission must retain its original preparation owner");
+    tl.advance_to(Tick::new(5));
+    tl.advance_to(Tick::new(8));
+    assert!(matches!(tl.status(work).unwrap().disposition, Some(Disposition::Committed { .. })));
 }
 
 #[test]

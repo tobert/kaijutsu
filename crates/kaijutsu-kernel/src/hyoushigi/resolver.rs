@@ -61,9 +61,7 @@ impl Resolver for CasCommitResolver {
     ) -> kaijutsu_hyoushigi::ResolveFuture {
         let cas = self.cas.clone();
         let params = params.clone();
-        static READS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-        let slots = READS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))).clone();
-        prepare_on_runtime(slots, move || Self::prepare(&cas, &params))
+        prepare_output(move || Self::prepare(&cas, &params))
     }
 }
 
@@ -89,6 +87,15 @@ impl CasCommitResolver {
 
 }
 
+
+/// Share the bounded blocking preparation budget with admitted model output.
+pub(super) fn prepare_output(
+    work: impl FnOnce() -> Result<Resolution, ResolveError> + Send + 'static,
+) -> kaijutsu_hyoushigi::ResolveFuture {
+    static READS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let slots = READS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))).clone();
+    prepare_on_runtime(slots, work)
+}
 
 fn prepare_on_runtime(
     slots: Arc<tokio::sync::Semaphore>,

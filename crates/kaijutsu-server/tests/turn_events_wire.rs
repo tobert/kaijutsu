@@ -369,3 +369,156 @@ fn overlapping_drives_keep_their_admission_ids_through_cancellation() {
         drop(held);
     });
 }
+
+#[test]
+fn timed_drives_keep_admission_targets_through_the_client() {
+    run_local(async {
+        use kaijutsu_hyoushigi::{Disposition, FallbackReason, TickDelta, WorkId, WorkStatus};
+        use kaijutsu_kernel::{hyoushigi::{Attachment, BeatPolicy}, llm::{MockClient, Provider}};
+        use kaijutsu_server::beat::BeatScheduler;
+        use kaijutsu_types::{Tick, TrackId, TurnId};
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "timed-player").await.unwrap();
+        let performer = PrincipalId::new();
+        assign_turn_identity(&server, context, performer);
+        kj.join_context(context, "timed-player").await.unwrap();
+        let (callback, mut events) = turn_events_channel(64);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let help = kj.execute_kj_quiet(context, &["drive".into(), "--help".into()]).await.unwrap();
+        assert_eq!(help.exit_code, 0);
+        for flag in ["--score-at", "--track", "--fallback"] { assert!(help.stdout.contains(flag)); }
+        eprintln!("{}", help.stdout);
+        let track = TrackId::new("admitted-score").unwrap();
+        let mut scheduler = BeatScheduler::new(server.kernel.clone(), server.documents.clone());
+        let mut attachment = Attachment::musician_default();
+        attachment.ooda_armed = false;
+        scheduler.attach(track.clone(), context, attachment, BeatPolicy {
+            period: Duration::from_secs(1), beats_per_phrase: 16,
+        }).unwrap();
+        let timeline = server.kernel.track_timeline(&track).unwrap();
+        let score = server.kernel_db.lock().get_track(track.as_str()).unwrap().unwrap().score_context_id.unwrap();
+        let base = tokio::time::Instant::now();
+        scheduler.play(&track, base);
+        let abc = "X:1\nK:C\nCDEF|\n";
+        let mut beat = 0u64;
+        for case in ["good", "stale", "missed", "malformed", "untimed"] {
+            {
+                let mut registry = server.kernel.llm().write().await;
+                registry.register("mock", std::sync::Arc::new(Provider::Mock(MockClient::new(
+                    if case == "malformed" { "not music" } else { abc }
+                ))));
+                assert!(registry.set_default("mock"));
+                registry.set_default_model("mock-model");
+            }
+            let before = kj.get_blocks(score, &BlockQuery::All).await.unwrap().len();
+            let admitted_at = timeline.lock().playhead();
+            let intended = admitted_at + TickDelta::new(6);
+            let session = server.kernel.turns().conversations().get_or_create(context);
+            let held = session.lock().await;
+            let mut args = vec!["drive".into(), "--prompt".into(), format!("phrase {case}")];
+            if case != "untimed" {
+                args.extend(["--track".into(), track.as_str().into(), "--score-at".into(), intended.get().to_string(),
+                    "--fallback".into(), "last-good".into()]);
+            }
+            let result = kj.execute_kj_quiet(context, &args).await.unwrap();
+            assert_eq!(result.exit_code, 0, "{}", result.stderr);
+            let data = result.data.unwrap();
+            let turn: TurnId = serde_json::from_value(data["turn_id"].clone()).unwrap();
+            let work: Option<WorkId> = serde_json::from_value(data["work_id"].clone()).unwrap();
+            assert_eq!(work.is_some(), case != "untimed");
+            let seed = server.documents.block_snapshots(context).unwrap().into_iter()
+                .find(|block| block.content == format!("phrase {case}")).unwrap().id;
+            let advance = if case == "missed" { 6 } else { 2 };
+            for _ in 0..advance {
+                beat += 1;
+                scheduler.fire_due(base + Duration::from_secs(beat));
+            }
+            if let Some(work) = work {
+                assert_eq!(timeline.lock().status(work).unwrap().start, intended);
+                assert_eq!(timeline.lock().status(work).unwrap().started_at, Some(admitted_at));
+            }
+            drop(held);
+            match recv_turn_event(&mut events, context).await {
+                ServerEvent::TurnCompleted { turn_id, stop_reason, output_block_id, .. } => {
+                    assert_eq!(turn_id, turn);
+                    if case == "missed" {
+                        assert_eq!(stop_reason, TurnCompletedStopReason::CancelledImmediate);
+                        assert!(output_block_id.is_none());
+                    } else { assert!(output_block_id.is_some()); }
+                }
+                other => panic!("expected a completed controlled turn: {other:?}"),
+            }
+            if case == "stale" { server.documents.set_excluded(context, &seed, true).unwrap(); }
+            while timeline.lock().playhead() < intended + TickDelta::new(1) {
+                beat += 1;
+                scheduler.fire_due(base + Duration::from_secs(beat));
+            }
+            if let Some(work) = work {
+                let result = kj.execute_kj_quiet(context, &[
+                    "transport".into(), "work".into(), "--track".into(), track.as_str().into(),
+                ]).await.unwrap();
+                assert_eq!(result.exit_code, 0, "{}", result.stderr);
+                let rows: Vec<WorkStatus> = serde_json::from_value(result.data.unwrap()).unwrap();
+                let row = rows.iter().find(|row| row.id == work).unwrap();
+                assert_eq!(row.start, intended);
+                assert_eq!(row.attempt, 1);
+                if case == "good" {
+                    assert!(matches!(row.disposition, Some(Disposition::Committed { .. })), "{row:?}");
+                } else {
+                    let expected = match case {
+                        "stale" => FallbackReason::InvalidBasis,
+                        "missed" => FallbackReason::DeadlineMissed,
+                        "malformed" => FallbackReason::ResolveFailed,
+                        _ => unreachable!(),
+                    };
+                    assert!(matches!(&row.disposition, Some(Disposition::Fallback { reason, .. }) if *reason == expected), "{row:?}");
+                }
+            }
+            let blocks = kj.get_blocks(score, &BlockQuery::All).await.unwrap();
+            if case == "untimed" { assert_eq!(blocks.len(), before); }
+            else {
+                let notation: Vec<_> = blocks.iter().filter(|block| block.tick == Some(intended) && block.content == abc).collect();
+                assert_eq!(notation.len(), 1, "exactly one phrase at the admitted tick: {case}");
+                assert_eq!(notation[0].id.principal_id, if case == "good" { performer } else { PrincipalId::beat() });
+            }
+            assert_eq!(timeline.lock().future_len(), 0);
+        }
+        // Run the shipped tick body through rc, with the same captured transport
+        // variables the scheduler supplies. Nothing is reseeded on the host.
+        server.kernel_db.lock().update_context_type(context, "musician").unwrap();
+        let admitted_at = timeline.lock().playhead();
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let vars = std::collections::HashMap::from([
+            ("KJ_TRACK".into(), track.as_str().into()), ("KJ_TICK".into(), admitted_at.get().to_string()),
+            ("KJ_PHRASE_BEATS".into(), "8".into()), ("KJ_TEMPO".into(), "120".into()),
+            ("KJ_PHRASE".into(), "1".into()), ("KJ_HEARD".into(), "[]".into()),
+        ]);
+        kaijutsu_kernel::rc::run(&server.kj_dispatcher, kaijutsu_kernel::rc::RcInvocation {
+            vars, ..kaijutsu_kernel::rc::RcInvocation::new("tick", context)
+        }, &kaijutsu_kernel::KjCaller {
+            principal_id: performer, actor_id: performer, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,
+        }).await.unwrap();
+        assert_eq!(timeline.lock().future_len(), 1, "shipped tick script admits a score turn");
+        assert!(server.documents.block_snapshots(context).unwrap().iter().any(|block|
+            block.content.starts_with(&format!("Commit at tick {}.", admitted_at.get() + 8))));
+        drop(held);
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+        while timeline.lock().playhead() < admitted_at + TickDelta::new(9) {
+            beat += 1;
+            scheduler.fire_due(base + Duration::from_secs(beat));
+        }
+        let blocks = kj.get_blocks(score, &BlockQuery::All).await.unwrap();
+        assert_eq!(blocks.iter().filter(|block| block.content == abc && block.tick == Some(admitted_at + TickDelta::new(8))).count(), 1);
+        // Neither missing track nor a past target may start a producer.
+        for args in [vec!["drive", "--score-at", "1"], vec!["drive", "--track", "admitted-score", "--score-at", "1"]] {
+            let result = kj.execute_kj_quiet(context, &args.into_iter().map(str::to_string).collect::<Vec<_>>()).await.unwrap();
+            assert_ne!(result.exit_code, 0);
+            assert!(!server.kernel.turn_in_flight(context));
+        }
+        assert!(timeline.lock().playhead() > Tick::ZERO);
+    });
+}

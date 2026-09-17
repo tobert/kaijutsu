@@ -1106,7 +1106,7 @@ impl Kernel {
     // beat scheduler arms a track once (on first attach / track creation), pumps
     // it each beat, and disarms it only on track teardown — NOT on context
     // detach, so the timeline (and continuity) never leaves when a producer
-    // rotates out. `schedule_abc_cell` and the materialize bridge route here via
+    // rotates out. Model score admission and materialization route here via
     // the cell's/attachment's `TrackId`.
 
     /// Arm a track's timeline: idempotent create-and-seed, keyed by `TrackId`.

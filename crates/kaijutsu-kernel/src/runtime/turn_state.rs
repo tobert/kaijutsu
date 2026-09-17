@@ -21,13 +21,25 @@ pub struct TurnLease {
     active: Arc<parking_lot::Mutex<ActiveTurns>>,
     context: ContextId,
     id: TurnId,
+    delivery: Option<crate::hyoushigi::model::OutputDelivery>,
     interrupt: Arc<ContextInterruptState>,
 }
 
 impl TurnLease {
     pub fn id(&self) -> TurnId { self.id }
-    pub(super) fn interrupt(&self) -> Arc<ContextInterruptState> { self.interrupt.clone() }
-    pub(super) fn context(&self) -> ContextId { self.context }
+    pub(crate) fn deliver_to(&mut self, delivery: crate::hyoushigi::model::OutputDelivery) {
+        assert!(self.delivery.is_none(), "one score delivery per admitted turn");
+        self.delivery = Some(delivery);
+    }
+    pub(super) async fn finish(mut self, event: &crate::flows::TurnFlow) {
+        assert_eq!(self.id, event.turn_id(), "terminal outcome belongs to its lease");
+        if let Some(delivery) = self.delivery.take() {
+            // A dropped receiver means the score has already cancelled or settled.
+            delivery.finish(event, self.interrupt.clone()).await;
+        }
+    }
+    pub(crate) fn interrupt(&self) -> Arc<ContextInterruptState> { self.interrupt.clone() }
+    pub(crate) fn context(&self) -> ContextId { self.context }
 }
 
 impl Drop for TurnLease {
@@ -79,7 +91,7 @@ impl TurnState {
         active.entry(context).or_default().insert(id, ActiveTurn {
             began: std::time::Instant::now(), interrupt: interrupt.clone(),
         });
-        Some(TurnLease { active: self.active.clone(), context, id, interrupt })
+        Some(TurnLease { active: self.active.clone(), context, id, delivery: None, interrupt })
     }
 
     pub fn active_count(&self, context: ContextId) -> usize {

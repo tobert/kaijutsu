@@ -258,7 +258,7 @@ impl KjDispatcher {
                     // The clip's mime is what the SINK decodes — only real audio
                     // formats make sense here (unlike bare `kj play`, `.abc` isn't
                     // accepted: an ABC phrase is a musician's committed notation,
-                    // scheduled through `schedule_abc_cell`, never a placed clip).
+                    // admitted through `kj drive --score-at`, never a placed clip).
                     let mime = match AudioFormatHint::from_path_extension(path) {
                         Some(f) => f.mime().to_string(),
                         None => {

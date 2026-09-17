@@ -106,9 +106,10 @@ A player's whole behavior is rc (`assets/defaults/rc/musician/`):
   --window 16`): the cost guard. Turns hydrate `[0, marker] ∪ last-N`; the
   prefix stays byte-stable for prompt caching; a player's log can grow forever
   at tempo without unbounded per-turn cost.
-- **tick/S10-drive.kai** — the OODA hook: fires `kj drive --prompt` with the
-  **transport report** each cadence (default: every 8 phrases of 16 beats).
-  The kernel seeds `KJ_TICK`, `KJ_PHRASE`, `KJ_TEMPO`, `KJ_HEARD` (the last 8
+- **tick/S10-drive.kai** — the OODA hook: admits `kj drive --track "$KJ_TRACK" --score-at`
+  for the captured tick plus one phrase, with a transport report as `--prompt`
+  (default: every 32-beat phrase).
+  The kernel seeds `KJ_TRACK`, `KJ_TICK`, `KJ_PHRASE`, `KJ_TEMPO`, `KJ_HEARD` (the last 8
   phrases of committed notation, all tracks, as a JSON string — the only
   channel that shows a player what was just played, since score blocks are
   hydration-silent), plus `KJ_PULSE`, `KJ_EPOCH_NS`, `KJ_PHRASE_BEATS`
@@ -221,6 +222,8 @@ players whose work is not quantized.
    on a short recording if unsure. Upgrade to `kj transport clock --track
    <track> modeled` once `kj audio devices` confirms the daemon can hear the
    rack's clock.
-3. `kj transport play --track <track>`, then seed the first phrase with
-   `kj drive --prompt` on the player. The vamp (`UseLastGood`, or the house
-   first-loop above) covers until the band locks in.
+3. `kj transport play --track <track>` starts the cadence. To admit a phrase
+   explicitly, use `kj drive --track <track> --score-at <future-tick> --prompt
+   '<phrase request>'` on the player. The target stays fixed while the model
+   works. `last-good` repeats accepted notation on a miss; without a prior
+   phrase, it leaves silence.

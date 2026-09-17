@@ -162,9 +162,53 @@ safety factor and margin.
 `timeline_commitment_wire` drives the real scheduler with controlled fast, delayed,
 failed, superseded, missed-deadline, and stale-basis producers. The actual SSH client
 reads progress and final disposition through `kj`, and reads accepted score blocks.
-OODA is disarmed during this test; no model inference is involved. Live model turns
-still choose a target relative to completion and need the same admitted-work
-contract; see `docs/issues.md`, "Anticipation and commitment".
+OODA is disarmed during this test; no model inference is involved.
+
+### Model turns with an intended score tick
+
+```sh
+kj drive --track bass --score-at 64 --fallback last-good --prompt 'Write the next phrase.'
+kj transport work --track bass
+```
+
+`kj drive --score-at` admits a model turn and a score commitment together. It
+returns `turn_id` and `work_id`; an ordinary drive returns a null `work_id` and
+does not put its output on the score. The track must already be armed, and the
+absolute target must be ahead of its playhead. `last-good` is the default fallback;
+`skip` leaves silence. Rc chooses this policy and target. The shipped musician
+tick script adds `KJ_PHRASE_BEATS` to its captured `KJ_TICK` and uses `KJ_TRACK`.
+A delayed script cannot give old work a new target.
+
+The timeline retains the resolver selected at admission. Dedicated preparation
+starts immediately and owns a one-shot result channel. The runtime turn lease
+prepares and delivers its exact output block; FlowBus only reports observations.
+Dropping the timeline future interrupts that turn, including while it waits for
+the conversation lock, without cancelling another turn in the same context.
+Capacity refusal starts no model work; runtime refusal cancels its reservation.
+
+The score basis covers the seed block's content, status and inclusion, plus the
+latest committed content at or before the intended tick on that timeline. This
+is a declared score dependency, not a claim that the model's whole conversation,
+tool inputs, or cross-track `KJ_HEARD` view is frozen. Changed basis uses fallback;
+a handoff cannot replay the model as an automatic resolver retry. Already accepted
+model/tool effects remain in the durable log.
+
+The runtime validates complete autonomous model text from the admitted performer,
+rejecting excluded, ephemeral, track-bearing, transport-authored, or unfinished
+blocks. Soft cancellation may supply a complete phrase; hard cancellation may
+not. A hard interrupt also wins over prepared bytes that the timeline has not
+yet observed. Copying and ABC validation share the existing four-slot blocking preparation
+budget with CAS. Invalid notation gets an anchored Error block and is excluded
+from future hydration before delivery fails. The timeline separately records the
+failed commitment and its fallback. Failure feedback carries the original seed
+anchor, so it remains addressed after detachment or performer reassignment.
+The scheduler retries failed feedback writes on later pulses without redelivering
+successful inserts; this cursor is live state, not restart recovery.
+
+`turn_events_wire::timed_drives_keep_admission_targets_through_the_client` exercises
+this path through SSH using mock inference, manual beats and the shipped rc tick
+script. It checks fixed targets, timely output, seed invalidation, queued deadline
+cancellation, malformed notation, fallback provenance, and untimed drives.
 
 ## Can the playhead block? — the one axis that matters
 
@@ -671,10 +715,9 @@ fallback are exercised by their first user.
 >   and resume picks up at +1 — no wall-clock catch-up, no rewind (revisiting
 >   the past is an export, not a seek). Tracks arm **stopped** (no surprise
 >   token spend). The OODA (observe–orient–decide–act) loop is closed: on
->   `turn.completed` for an OODA-armed attachment, the scheduler validates the
->   model's ABC and schedules a notation cell **one phrase ahead**
->   (`beats_per_phrase` on the policy; `phrase_delta()`/`is_phrase_boundary()`
->   are the consumers). Clock sources are pluggable behind `ClockSourceKind`
+>   a cadence wakeup, tick rc admits a model turn for an absolute tick one phrase
+>   ahead. Complete ABC arrives through the turn's owned handoff; the timeline
+>   validates its basis and commits or uses the declared fallback. Clock sources are pluggable behind `ClockSourceKind`
 >   (`kaijutsu-server/src/clock.rs` — `SystemClock`, and the drift-modeled
 >   `ModeledClock` for an external MIDI master, `docs/midi.md`), and committed
 >   cells publish as `RenderCue`s: `kaijutsu-audiod` (the DJ thread in

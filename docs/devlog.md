@@ -1941,6 +1941,35 @@ that each original ID settles once without inference. Normal completion, startup
 failure and panic coverage follow the same identity. Timing admission still needs
 an owned target/basis handoff; an observation event is not its completion owner.
 
+Timing now belongs to admission. Musician rc chooses an absolute future tick;
+`kj drive` returns its turn and work IDs, and the lease delivers prepared ABC
+through a channel owned by that timeline entry. Completion no longer grants a
+new phrase of lead. Expiry cancels only the owning turn. Replacing a registered
+resolver cannot change already-admitted work, and a model handoff cannot replay
+its producer on a changed basis. Accepted model/tool effects remain durable.
+
+The dependency projection is deliberately small: seed content and eligibility,
+plus the latest committed score content before the target. It does not promise a
+snapshot of every model input. Runtime owns notation validation and quarantine;
+the timeline consumes prepared bytes and chooses fallback. Feedback keeps the
+source anchor and only advances its cursor after a successful write. Removing
+the completion listener also removed its duplicate scheduling API and tests;
+identity, completeness, malformed-output and score behavior now exercise the
+admission handoff and actual client.
+
+DeepSeek's review prompted an extra cancellation audit. A deterministic test
+found prepared bytes could win over a hard interrupt before the timeline had
+observed them. Both handoff observation and runtime preparation now prioritize
+that interruption. Two reasoning-enabled review calls exhausted their answer
+budget; smaller direct-answer reviews completed, with findings and dispositions
+kept in the private execution review notes.
+
+The broader check also reproduced the recorded LocalBackend empty-read race.
+A deterministic `/dev/full` test showed its stronger failure mode: the adapter
+reported success while Tokio still held bytes whose host write would fail.
+Awaiting `flush` now makes the VFS result describe host completion and errors,
+without adding an fsync promise. The fix ships separately from timing admission.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

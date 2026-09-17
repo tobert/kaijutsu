@@ -220,8 +220,8 @@ would come with the verb growing a flag, not as a default.
 
 Bare `kj play` stays play-now; `--track <t>` commits a clip cell instead:
 cas-put the media (or take `--cas`), author the record through the
-validator, commit via `schedule_clip_cell` (`hyoushigi/mod.rs`, the sibling
-of `schedule_abc_cell` — eager `parse_validated` → armed-track lookup → CAS
+validator, commit via `schedule_clip_cell` (`hyoushigi/mod.rs`: eager
+`parse_validated` → armed-track lookup → CAS
 store → schedule, but `Fallback::Skip`, never `UseLastGood`). `--at <tick>`
 places into the future; omitted, it defaults to ASAP = `playhead + 1`,
 computed inside the timeline lock (no TOCTOU). `label` defaults to the file

@@ -916,6 +916,7 @@ async fn run_delivery(
             woken.insert(answer.request_id.clone());
             woken_this_event += 1;
             if let Err(error) = kernel.request_turn(super::turn_request::TurnRequest {
+                score: None,
                 context_id, after_block_id: seed_block, content: seed,
                 principal_id, model: None, continuation_epoch: Some(continuation_epoch),
             }) {

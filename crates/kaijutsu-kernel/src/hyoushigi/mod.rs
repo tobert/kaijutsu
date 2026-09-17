@@ -25,6 +25,7 @@ use kaijutsu_types::{
 use parking_lot::Mutex;
 
 mod resolver;
+pub mod model;
 use resolver::CasCommitResolver;
 
 use crate::flows::BlockFlow;
@@ -50,33 +51,19 @@ pub struct BeatPolicy {
     /// Beats per phrase — the kernel's only musical chunking unit above the beat
     /// (phrases, not bars; bars live in ABC content and human-facing edges,
     /// translated at the edge). Plain `u64` for now; the field shape is documented
-    /// open to per-phrase counts (irregular phrases) later — consumers go through
-    /// [`phrase_delta`](Self::phrase_delta)/[`is_phrase_boundary`](Self::is_phrase_boundary),
-    /// never the raw value.
+    /// open to per-phrase counts (irregular phrases) later.
     pub beats_per_phrase: u64,
 }
 
 impl BeatPolicy {
-    /// The musician default clock: a quarter note at 120 BPM (500 ms/beat) in 4/4,
-    /// a **32-beat phrase** (8 bars of 4/4). At 120 BPM that's a ~16 s window, and
-    /// since the schedule lead is one phrase ([`on_turn_completed`] schedules at
-    /// `playhead + phrase_delta`), the producer has ~16 s to compose the next phrase
-    /// while the current one plays — a generous buffer so a slow/loaded GPU doesn't
-    /// gap the line (it composes more bars, less often). The OODA wakeup cadence is
-    /// no longer here — it rides the [`Attachment`] ([`Attachment::musician_default`],
-    /// set to one phrase so phrases tile back-to-back). Tunable per track via rc.
+    /// A quarter-note beat at 120 BPM, with 32-beat phrases (8 bars of 4/4).
+    /// Musician tick rc admits a turn for the next phrase boundary before it
+    /// runs. Wakeup cadence belongs to `Attachment::musician_default`.
     pub fn musician_default() -> Self {
         Self {
             period: Duration::from_millis(500),
             beats_per_phrase: 32,
         }
-    }
-
-    /// One phrase of scheduling lead, as a tick delta. Returns a [`TickDelta`] and
-    /// says so in the name — the OODA Act handoff schedules its ABC cell this far
-    /// ahead of the playhead so the fast write-barrier derive has room.
-    pub fn phrase_delta(&self) -> TickDelta {
-        TickDelta::new(self.beats_per_phrase as i64)
     }
 
     /// Whether `beat_count` lands on a phrase boundary. A zero `beats_per_phrase`
@@ -415,84 +402,11 @@ pub fn register_resolvers(timeline: &mut Timeline, cas: Arc<FileStore>) {
     timeline.register_resolver(Box::new(CasCommitResolver::new(cas)));
 }
 
-/// Absorb a completed OODA turn's ABC decision onto a context's timeline — the
-/// **Act** handoff. Stores the ABC text in CAS and schedules a `cas_commit` cell
-/// `lead` ticks ahead of the playhead (fallback `UseLastGood`, so a missed resolve
-/// repeats the last layer rather than dropping out). The model turn that
-/// *produced* the ABC is the side-effecting, token-costing part and already ran
-/// on the turn path; only this pure commit lands on the timeline.
+/// Schedule a producer-authored clip record on a track. Placed samples use
+/// `Fallback::Skip`: a missed one-shot must not repeat an older sample.
+/// See `docs/pcm.md`, "Fallback semantics".
 ///
-/// Eager validation (§3): the ABC is parsed **before** anything is stored or
-/// scheduled — the first of three loud gates (schedule → resolve → derive).
-/// Malformed ABC Errs here, leaving nothing in CAS and nothing in the future (it
-/// used to become a silently-Failed zombie cell). This preserves the
-/// first-commit-validation invariant: every ABC that enters `committed` parsed at
-/// least once, which is what makes a derive-time parse failure an *invariant
-/// violation* (§5c) rather than weather.
-///
-/// `track` is the lane this section belongs to; `played_by` is the principal whose
-/// turn produced the ABC (becomes BlockId.principal_id at materialization). A
-/// `UseLastGood` fallback repeat under this cell is played by `beat()`, not the
-/// player — that re-stamp happens in the engine, keeping vamp-insurance provenance
-/// truthful.
-///
-/// Returns the scheduled cell's start tick. Errors (malformed ABC, no timeline,
-/// CAS write, schedule-in-the-past) bubble — crash over silently dropping the
-/// section.
-pub fn schedule_abc_cell(
-    kernel: &Kernel,
-    context_id: ContextId,
-    abc: &str,
-    lead: TickDelta,
-    track: TrackId,
-    played_by: PrincipalId,
-) -> anyhow::Result<kaijutsu_types::Tick> {
-    // Gate 1 of 3: eager parse. Reject garbage before it touches CAS or the
-    // timeline — a rejected schedule must leave zero residue.
-    validate_abc(abc.as_bytes())
-        .map_err(|e| anyhow::anyhow!("schedule_abc_cell: malformed ABC: {e}"))?;
-
-    // Stage 2: the score lives on the TRACK timeline now (shared by every producer
-    // attached to the track), not the producing context's. `context_id` is kept for
-    // diagnostics; the cell carries `track` + `played_by` so provenance survives.
-    let _ = context_id;
-    let timeline = kernel.track_timeline(&track).ok_or_else(|| {
-        anyhow::anyhow!("schedule_abc_cell: track {} is not armed", track.as_str())
-    })?;
-    let hash = kernel.cas().store(abc.as_bytes(), ABC_MIME)?;
-
-    let mut g = timeline.lock();
-    let start = g.playhead() + lead;
-    g.schedule(Cell::deferred_on(
-        Span::instant(start),
-        Recipe {
-            resolver: ResolverId::new(CasCommitResolver::ID),
-            params: serde_json::json!({ "hash": hash.as_str(), "mime": ABC_MIME }),
-            query: ContextQuery::default(),
-            fallback: Fallback::UseLastGood,
-        },
-        track,
-        played_by,
-    ))
-    .map_err(|e| anyhow::anyhow!("schedule_abc_cell: {e}"))?;
-    Ok(start)
-}
-
-/// Absorb a producer-authored clip record onto a track's timeline — the
-/// sibling of [`schedule_abc_cell`] for placed samples (`docs/pcm.md` R2, "The
-/// clip record — Shape A"). Where a musician's ABC phrase is *vamped*
-/// (repeated on a missed resolve via `Fallback::UseLastGood`), a clip is a
-/// deliberately placed one-shot authored directly by a producer (`kj play
-/// --track`) — so its recipe carries **`Fallback::Skip`**, never
-/// `UseLastGood`. `docs/pcm.md` "Fallback semantics": a fresh clip lane's
-/// default is silence-until-the-first-good-clip; a placed one-shot must never
-/// vamp-repeat a stale sample on a missed resolve the way a continuously-vamped
-/// ABC lane does.
-///
-/// Gate 1 of 3: [`Clip::parse_validated`] rejects a structurally malformed
-/// record OR one whose `media` hash is absent from CAS **before** anything is
-/// stored or scheduled — the same eager-gate discipline as `schedule_abc_cell`'s
-/// `validate_abc`, so a rejected commit leaves zero residue.
+/// Validate the record and its media reference before storage or scheduling.
 ///
 /// `at`: `Some(tick)` places the clip at that absolute tick (rejected by
 /// [`Timeline::schedule`] if it isn't strictly ahead of the playhead — the same
@@ -1219,35 +1133,6 @@ mod tests {
         );
     }
 
-    /// T7 (design §3, §16) — malformed ABC is rejected at SCHEDULE time, eagerly,
-    /// before anything is stored or scheduled. The first of three loud validation
-    /// points (schedule → resolve → derive). Garbage must never enter the score.
-    #[tokio::test]
-    async fn malformed_abc_rejected_at_schedule() {
-        let kernel = Kernel::new_ephemeral("test").await;
-        let ctx = ContextId::new();
-        kernel.arm_timeline(ctx, TickClock::default(), kaijutsu_types::Tick::ZERO);
-
-        let lead = TickDelta::new(16);
-        let track = kaijutsu_types::TrackId::solo();
-        let player = kaijutsu_types::PrincipalId::beat();
-
-        let err = super::schedule_abc_cell(
-            &kernel,
-            ctx,
-            "this is not abc {{{ ][",
-            lead,
-            track.clone(),
-            player,
-        );
-        assert!(err.is_err(), "malformed ABC must be rejected loudly at schedule time");
-
-        let tl = kernel.timeline(ctx).expect("armed");
-        let g = tl.lock();
-        assert_eq!(g.future_len(), 0, "a rejected schedule leaves the future empty");
-        assert_eq!(g.committed().len(), 0, "nothing committed either");
-    }
-
     /// A malformed `hash` param fails the `cas_commit` resolve (crash over
     /// corruption), never a silent commit. The cell ends `Failed`, nothing commits.
     /// (Renamed from `abc_to_midi_rejects_malformed_hash`; same asymmetric-boundary
@@ -1915,13 +1800,11 @@ mod tests {
     /// above the beat (32 = an 8-bar phrase in 4/4). The OODA wakeup cadence is no
     /// longer on `BeatPolicy` — it moved to `Attachment::wakeup` (Stage 1:
     /// `docs/tracks.md`) and is one phrase (32 beats) in the musician default so
-    /// phrases tile back-to-back. Consumers go through
-    /// `phrase_delta()`/`is_phrase_boundary()`, never the raw field.
+    /// phrases tile back-to-back.
     #[test]
     fn musician_default_speaks_phrases() {
         let p = super::BeatPolicy::musician_default();
         assert_eq!(p.beats_per_phrase, 32, "an 8-bar phrase in 4/4 is 32 beats");
-        assert_eq!(p.phrase_delta(), TickDelta::new(32), "one phrase of lead is 32 beat-ticks");
         assert!(p.is_phrase_boundary(32), "beat 32 is a phrase boundary");
         assert!(p.is_phrase_boundary(64), "beat 64 is a phrase boundary");
         assert!(!p.is_phrase_boundary(33), "beat 33 is mid-phrase, not a boundary");
@@ -2034,7 +1917,7 @@ mod tests {
 
     /// Happy path: a valid clip record with present media schedules under the
     /// ASAP default (`playhead + 1`) and commits at the barrier under the
-    /// `CLIP_MIME` mime — the sibling shape of `schedule_abc_cell`'s cell.
+    /// `CLIP_MIME` mime — an immutable prepared artifact.
     #[tokio::test]
     async fn schedule_clip_cell_commits_and_returns_tick() {
         let kernel = Kernel::new_ephemeral("test").await;
@@ -2211,7 +2094,7 @@ mod tests {
     }
 
     /// A valid clip aimed at a track with no armed timeline is a loud error
-    /// naming the track — never a silent no-op (mirrors `schedule_abc_cell`'s
+    /// naming the track — never a silent no-op (the
     /// "track is not armed" error).
     #[tokio::test]
     async fn schedule_clip_cell_rejects_unarmed_track() {

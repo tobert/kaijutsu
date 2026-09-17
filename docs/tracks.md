@@ -198,6 +198,7 @@ convention, cf. `KJ_PARENT_BLOCK_COUNT`):
 
 | var | source | job |
 |-----|--------|-----|
+| `KJ_TRACK` | attachment's track name | target for `kj drive --track` |
 | `KJ_TICK` | the track's playhead | musical position (frozen off-beat by design) |
 | `KJ_PHRASE` / `KJ_TEMPO` / `KJ_ROTATE_EVERY` | track policy + attachment | cadence facts |
 | `KJ_HEARD` | the track's score context | recent committed notation — the **band view**, spanning all producers across rotations |

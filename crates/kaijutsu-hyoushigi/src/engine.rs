@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
+use std::sync::Arc;
 
 use kaijutsu_cas::ContentHash;
 use kaijutsu_types::{PrincipalId, Tick, TickDelta, TrackId};
@@ -80,6 +81,8 @@ pub struct SquashEvent {
 /// rate" eval ruler and the input to the kernel's per-event Error-block surfacing.
 #[derive(Debug, Clone)]
 pub struct FailureEvent {
+    /// Original input anchor for feedback, independent of current attachments.
+    pub source_block: Option<kaijutsu_types::BlockId>,
     /// Absent for an emitted cell that could not be admitted.
     pub work_id: Option<WorkId>,
     pub attempt: u32,
@@ -102,6 +105,7 @@ struct Scheduled {
     status: WorkStatus,
     order: u64,
     work: Option<ResolveFuture>,
+    resolver: Arc<dyn Resolver>,
     observed_at: Tick,
     cell: Cell,
     start: Tick,
@@ -143,6 +147,8 @@ pub enum ScheduleError {
     AtCapacity(usize),
     #[error("work is no longer pending on this timeline")]
     NotPending,
+    #[error("the supplied resolver does not match the recipe")]
+    ResolverMismatch,
 }
 
 /// Why a [`Timeline::seed_playhead`] call was rejected. Seeding is a
@@ -168,7 +174,7 @@ pub enum SeedError {
 pub struct Timeline {
     clock: TickClock,
     playhead: Tick,
-    resolvers: HashMap<String, Box<dyn Resolver + Send + Sync>>,
+    resolvers: HashMap<String, Arc<dyn Resolver>>,
     /// The mutable context resolvers read (a beat counter, environment, …).
     ambient: HashMap<String, Vec<u8>>,
     /// The open future: deferred cells ahead of the commit point.
@@ -207,8 +213,8 @@ impl Timeline {
         }
     }
 
-    pub fn register_resolver(&mut self, resolver: Box<dyn Resolver + Send + Sync>) {
-        self.resolvers.insert(resolver.id().0, resolver);
+    pub fn register_resolver(&mut self, resolver: Box<dyn Resolver>) {
+        self.resolvers.insert(resolver.id().0, Arc::from(resolver));
     }
 
     pub fn with_capacity(clock: TickClock, capacity: std::num::NonZeroUsize) -> Self {
@@ -245,10 +251,11 @@ impl Timeline {
     /// Validate and admit the replacement before cancelling its predecessor.
     pub fn supersede(&mut self, id: WorkId, cell: Cell) -> Result<WorkId, ScheduleError> {
         let idx = self.future.iter().position(|s| s.status.id == id).ok_or(ScheduleError::NotPending)?;
-        let by = self.schedule_inner(cell, true)?;
+        let by = self.schedule_inner(cell, true, None)?;
         let old = self.future.swap_remove(idx);
         self.finish(old.status, Disposition::Superseded { by });
         drop(old.work);
+        drop(old.resolver);
         let idx = self.future.iter().position(|s| s.status.id == by).expect("replacement was admitted");
         if self.future[idx].speculate_at <= self.playhead {
             self.speculate(idx);
@@ -336,10 +343,17 @@ impl Timeline {
     /// `speculate_at = start − beats_for(estimate × safety)`,
     /// `commit_deadline = start − commit_margin`.
     pub fn schedule(&mut self, cell: Cell) -> Result<WorkId, ScheduleError> {
-        self.schedule_inner(cell, false)
+        self.schedule_inner(cell, false, None)
     }
 
-    fn schedule_inner(&mut self, cell: Cell, replacing: bool) -> Result<WorkId, ScheduleError> {
+    /// Admit a dedicated preparation owner and capture its basis immediately.
+    /// The resolver belongs to this work item, not the shared registry. Dropping
+    /// or rejecting the admission releases it and its pending output channel.
+    pub fn schedule_preparing(&mut self, cell: Cell, resolver: Box<dyn Resolver>) -> Result<WorkId, ScheduleError> {
+        self.schedule_inner(cell, false, Some(resolver))
+    }
+
+    fn schedule_inner(&mut self, cell: Cell, replacing: bool, owned: Option<Box<dyn Resolver>>) -> Result<WorkId, ScheduleError> {
         if !replacing && self.future.len() >= self.capacity {
             return Err(ScheduleError::AtCapacity(self.capacity));
         }
@@ -353,10 +367,15 @@ impl Timeline {
                 now: self.playhead,
             });
         }
-        let resolver = self
-            .resolvers
-            .get(&recipe.resolver.0)
-            .ok_or_else(|| ScheduleError::UnknownResolver(recipe.resolver.0.clone()))?;
+        let preparing = owned.is_some();
+        let resolver: Arc<dyn Resolver> = match owned {
+            Some(resolver) => {
+                if resolver.id() != recipe.resolver { return Err(ScheduleError::ResolverMismatch); }
+                Arc::from(resolver)
+            }
+            None => self.resolvers.get(&recipe.resolver.0)
+                .ok_or_else(|| ScheduleError::UnknownResolver(recipe.resolver.0.clone()))?.clone(),
+        };
 
         let ctx = CommittedCtx {
             now: start,
@@ -380,9 +399,10 @@ impl Timeline {
             },
             order,
             work: None,
+            resolver,
             observed_at: self.playhead,
             start,
-            speculate_at: start - lead,
+            speculate_at: if preparing { self.playhead } else { start - lead },
             commit_deadline: start - self.clock.commit_margin,
             est_cost,
             resolution: None,
@@ -460,8 +480,7 @@ impl Timeline {
     /// Snapshot the basis and start an owned resolution without waiting for it.
     fn speculate(&mut self, idx: usize) {
         let recipe = self.deferred_recipe(idx);
-        let resolver = self.resolvers.get(&recipe.resolver.0)
-            .expect("resolver presence checked at schedule time");
+        let resolver = &self.future[idx].resolver;
         let ctx = CommittedCtx {
             now: self.future[idx].start,
             ambient: &self.ambient,
@@ -503,6 +522,7 @@ impl Timeline {
                 s.cell.state = CellState::Failed;
                 let Body::Deferred(recipe) = &s.cell.body else { unreachable!("scheduled work is deferred") };
                 self.failures.push(FailureEvent {
+                    source_block: s.resolver.source_block(),
                     work_id: Some(s.status.id), attempt: s.status.attempt,
                     at: self.playhead, start: s.start, resolver: recipe.resolver.clone(),
                     error, played_by: s.cell.played_by,
@@ -521,16 +541,14 @@ impl Timeline {
         let current_tick = self.playhead;
         let start = self.future[idx].start;
 
-        let resolver = self
-            .resolvers
-            .get(&recipe.resolver.0)
-            .expect("resolver presence checked at schedule time");
+        let resolver = &self.future[idx].resolver;
         let ctx = CommittedCtx {
             now: start,
             ambient: &self.ambient,
             committed: &self.committed,
         };
         let actual = resolver.compute_basis(&recipe.params, &ctx);
+        let retry_allowed = resolver.can_respeculate();
         let predicted = self.future[idx].status.predicted.clone().expect("speculated");
 
         self.future[idx].status.actual = Some(actual.clone());
@@ -543,7 +561,7 @@ impl Timeline {
         // --- squash ---------------------------------------------------------
         let est_cost = self.future[idx].est_cost;
         let budget = start - current_tick; // ticks left until the content is actually needed
-        let can_respeculate = !self.future[idx].final_attempt && budget >= est_cost;
+        let can_respeculate = retry_allowed && !self.future[idx].final_attempt && budget >= est_cost;
 
         let recovery = if can_respeculate {
             Recovery::ReSpeculated
@@ -671,6 +689,7 @@ impl Timeline {
                 let played_by = cell.played_by;
                 if let Err(error) = self.schedule(cell) {
                     self.failures.push(FailureEvent {
+                        source_block: None,
                         work_id: None, attempt: 0,
                         at: self.playhead, start, resolver, played_by,
                         error: format!("emitted work was not admitted: {error}"),
@@ -723,13 +742,9 @@ impl ResolverCtx for CommittedCtx<'_> {
     fn ambient(&self, key: &str) -> Option<Vec<u8>> {
         self.ambient.get(key).cloned()
     }
-    /// Deliberately **track-blind**: returns the most recent committed content
-    /// across *all* lanes at or before `tick`. No current resolver reads this
-    /// (AbcToMidi reads CAS by hash), and the first real consumer of a
-    /// track-scoped read is `$HEARD` — that API is designed with its consumer
-    /// (two-voices rule), not speculatively widened here. Contrast
-    /// [`Timeline::last_committed_content_in`], which is lane-scoped for the
-    /// `UseLastGood` fallback.
+    /// Latest committed content across this timeline's lanes at or before the
+    /// target tick. Model score admission uses this as part of its input basis.
+    /// `last_committed_content_in` narrows the fallback read to one lane.
     fn content_before(&self, tick: Tick) -> Option<ContentRef> {
         self.committed
             .iter()

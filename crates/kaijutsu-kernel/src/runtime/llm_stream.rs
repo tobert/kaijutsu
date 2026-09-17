@@ -1695,15 +1695,19 @@ async fn process_llm_stream(
     };
 
     record_continuation_yield(&kernel_db, context_id, continuation_epoch);
-    drop(turn_lease);
     match outcome {
-        Ok(event) => { kernel.turn_flows().publish(event); }
+        Ok(event) => {
+            turn_lease.finish(&event).await;
+            kernel.turn_flows().publish(event);
+        }
         Err(panic) => {
             let error = "Model turn panicked; execution stopped and side effects may be incomplete.";
             insert_pre_stream_error_block(&documents, context_id, &panic_anchor, error);
-            kernel.turn_flows().publish(TurnFlow::Failed {
+            let event = TurnFlow::Failed {
                 turn_id, context_id, principal_id: user_principal_id, error: error.into(), origin,
-            });
+            };
+            turn_lease.finish(&event).await;
+            kernel.turn_flows().publish(event);
             std::panic::resume_unwind(panic);
         }
     }
@@ -5796,6 +5800,170 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
+    async fn score_turn_keeps_its_admitted_target_and_validates_its_seed() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        use kaijutsu_hyoushigi::{Disposition, Fallback, FallbackReason, Readiness, TickClock};
+        use kaijutsu_types::{Tick, TrackId};
+        for changed_seed in [false, true] {
+            let (kernel, context, after, call) = fixture(Some(MockClient::new("X:1\nK:C\nCDEF|\n"))).await;
+            let track = TrackId::new("score-admission").unwrap();
+            let timeline = kernel.arm_track_timeline(track.clone(), TickClock::default(), Tick::ZERO);
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let TurnAdmission::Accepted { turn_id, work_id: Some(work) } = kernel.request_turn(TurnRequest {
+                context_id: context, after_block_id: after.clone(), content: String::new(),
+                principal_id: call.principal_id, model: None, continuation_epoch: None,
+                score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
+            }).unwrap() else { panic!("score admission must return its work ID") };
+            assert_eq!(timeline.lock().status(work).unwrap().started_at, Some(Tick::ZERO));
+            let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+            assert_eq!(event.payload.turn_id(), turn_id);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    {
+                        let mut tl = timeline.lock();
+                        tl.advance_to(Tick::new(4));
+                        if tl.status(work).unwrap().readiness == Readiness::Ready { break; }
+                        assert_ne!(tl.status(work).unwrap().readiness, Readiness::Failed, "{:?}", tl.status(work));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            if changed_seed { kernel.blocks().set_excluded(context, &after, true).unwrap(); }
+            let mut tl = timeline.lock();
+            tl.advance_to(Tick::new(9));
+            let status = tl.status(work).unwrap();
+            assert_eq!(status.start, Tick::new(10));
+            assert_eq!(status.attempt, 1);
+            if changed_seed {
+                assert!(matches!(status.disposition, Some(Disposition::Fallback { reason: FallbackReason::InvalidBasis, .. })));
+                assert!(tl.committed().is_empty());
+            } else {
+                assert!(matches!(status.disposition, Some(Disposition::Committed { .. })));
+                assert_eq!(tl.committed().len(), 1);
+            }
+            drop(tl);
+            kernel.shutdown_runtime_worker().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn score_capacity_and_cancellation_belong_to_one_turn() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        use kaijutsu_hyoushigi::{Fallback, TickClock, Timeline};
+        use kaijutsu_types::{Tick, TrackId};
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![]))).await;
+        let session = kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let track = TrackId::new("bounded-score").unwrap();
+        let timeline = kernel.arm_track_timeline(track.clone(), TickClock::default(), Tick::ZERO);
+        *timeline.lock() = Timeline::with_capacity(TickClock::default(), std::num::NonZeroUsize::new(1).unwrap());
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let request = TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
+        };
+        let TurnAdmission::Accepted { turn_id, work_id: Some(work) } = kernel.request_turn(request.clone()).unwrap()
+            else { panic!("expected score admission") };
+        let TurnAdmission::Accepted { turn_id: other, .. } = kernel.request_turn(TurnRequest { score: None, ..request.clone() }).unwrap()
+            else { panic!("expected ordinary admission") };
+        assert!(kernel.request_turn(request).unwrap_err().contains("capacity"));
+        assert_eq!(kernel.turns().active_count(context), 2);
+        assert!(timeline.lock().cancel(work));
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert_eq!(event.payload.turn_id(), turn_id);
+        assert_eq!(kernel.turns().active_count(context), 1, "score cancellation must leave the unrelated queued turn alive");
+        assert!(kernel.turns().interrupt(context, true));
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert_eq!(event.payload.turn_id(), other);
+        assert_eq!(timeline.lock().future_len(), 0);
+        assert!(!kernel.turn_in_flight(context));
+        drop(held);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn score_reservation_is_cancelled_when_runtime_admission_is_closed() {
+        use super::super::turn_request::TurnRequest;
+        use kaijutsu_hyoushigi::{Disposition, Fallback, TickClock};
+        use kaijutsu_types::{Tick, TrackId};
+        let (kernel, context, after, call) = fixture(None).await;
+        let track = TrackId::new("closed-runtime").unwrap();
+        let timeline = kernel.arm_track_timeline(track.clone(), TickClock::default(), Tick::ZERO);
+        kernel.shutdown_runtime_worker().await.unwrap();
+        assert!(kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
+        }).is_err());
+        assert_eq!(timeline.lock().future_len(), 0);
+        assert_eq!(timeline.lock().statuses()[0].disposition, Some(Disposition::Cancelled));
+        assert!(!kernel.turn_in_flight(context));
+    }
+
+    #[tokio::test]
+    async fn score_malformed_output_is_quarantined_with_anchored_feedback() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        use kaijutsu_hyoushigi::{Fallback, Readiness, TickClock};
+        use kaijutsu_types::{Tick, TrackId};
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("this is not music"))).await;
+        let track = TrackId::new("bad-score").unwrap();
+        let timeline = kernel.arm_track_timeline(track.clone(), TickClock::default(), Tick::ZERO);
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let TurnAdmission::Accepted { work_id: Some(work), .. } = kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
+        }).unwrap() else { panic!("expected score admission") };
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let TurnFlow::Completed { output_block_id: Some(output), .. } = event.payload else { panic!("model output") };
+        let block = kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap();
+        assert!(block.excluded, "malformed output must not teach the next turn its bad notation");
+        let errors: Vec<_> = kernel.blocks().block_snapshots(context).unwrap().into_iter()
+            .filter(|b| b.kind == BlockKind::Error).collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].parent_id, Some(output));
+        assert_eq!(errors[0].id.principal_id, output.principal_id);
+        timeline.lock().advance_to(Tick::new(4));
+        assert_eq!(timeline.lock().status(work).unwrap().readiness, Readiness::Failed);
+        timeline.lock().advance_to(Tick::new(10));
+        assert!(timeline.lock().committed().is_empty());
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn score_deadline_cancels_a_queued_turn_without_rescheduling_it() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        use kaijutsu_hyoushigi::{Disposition, Fallback, FallbackReason, TickClock};
+        use kaijutsu_types::{Tick, TrackId};
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![]))).await;
+        let session = kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let track = TrackId::new("missed-score").unwrap();
+        let timeline = kernel.arm_track_timeline(track.clone(), TickClock::default(), Tick::ZERO);
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let TurnAdmission::Accepted { work_id: Some(work), .. } = kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
+        }).unwrap() else { panic!("expected score admission") };
+        timeline.lock().advance_to(Tick::new(10));
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(matches!(event.payload, TurnFlow::Completed { reason: TurnStopReason::Cancelled { immediate: true }, .. }));
+        assert!(!kernel.turn_in_flight(context));
+        {
+            let mut tl = timeline.lock();
+            tl.advance_to(Tick::new(100));
+            assert!(matches!(tl.status(work).unwrap().disposition,
+                Some(Disposition::Fallback { reason: FallbackReason::DeadlineMissed, .. })));
+            assert!(tl.committed().is_empty());
+            assert_eq!(tl.future_len(), 0);
+        }
+        drop(held);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn headless_turn_ids_survive_queuing_and_cancellation() {
         use super::super::turn_request::TurnRequest;
         let (kernel, context, after, call) = fixture(Some(
@@ -5806,6 +5974,7 @@ mod lifetime_tests {
         let mut ids = std::collections::HashSet::new();
         for _ in 0..2 {
             kernel.request_turn(TurnRequest {
+                score: None,
                 context_id: context, after_block_id: after.clone(), content: String::new(),
                 principal_id: call.principal_id, model: None, continuation_epoch: None,
             }).unwrap();
@@ -5844,7 +6013,8 @@ mod lifetime_tests {
         }).unwrap();
         ready.await.unwrap();
         let mut events = kernel.turn_flows().subscribe("turn.*");
-        let TurnAdmission::Accepted(id) = kernel.request_turn(TurnRequest {
+        let TurnAdmission::Accepted { turn_id: id, .. } = kernel.request_turn(TurnRequest {
+            score: None,
             context_id: context, after_block_id: after, content: String::new(),
             principal_id: call.principal_id, model: None, continuation_epoch: None,
         }).unwrap() else { panic!("explicit request must be admitted") };
@@ -5865,10 +6035,11 @@ mod lifetime_tests {
         let (kernel, context, after, call) = fixture(None).await;
         let mut events = kernel.turn_flows().subscribe("turn.*");
         let admission = kernel.request_turn(TurnRequest {
+            score: None,
             context_id: context, after_block_id: after, content: String::new(),
             principal_id: call.principal_id, model: None, continuation_epoch: None,
         }).unwrap();
-        let TurnAdmission::Accepted(admitted_id) = admission else { panic!("turn was not admitted") };
+        let TurnAdmission::Accepted { turn_id: admitted_id, .. } = admission else { panic!("turn was not admitted") };
         let first = events.recv().await.unwrap();
         assert!(matches!(first.payload, TurnFlow::Requested { .. }));
         assert_eq!(first.payload.turn_id(), admitted_id);
@@ -5890,6 +6061,7 @@ mod lifetime_tests {
         let existing = kernel.turns().begin(context);
         let mut events = kernel.turn_flows().subscribe("turn.*");
         assert_eq!(kernel.request_turn(TurnRequest {
+            score: None,
             context_id: context, after_block_id: after, content: String::new(),
             principal_id: call.principal_id, model: None, continuation_epoch: Some(1),
         }).unwrap(), TurnAdmission::AlreadyActive);
@@ -5961,7 +6133,8 @@ mod lifetime_tests {
             let mut completed = kernel.turn_flows().subscribe("turn.completed");
             let mut requested = kernel.turn_flows().subscribe("turn.requested");
             let turn_id = if headless {
-                let TurnAdmission::Accepted(id) = kernel.request_turn(TurnRequest {
+                let TurnAdmission::Accepted { turn_id: id, .. } = kernel.request_turn(TurnRequest {
+                    score: None,
                     context_id: context, after_block_id: after, content: String::new(),
                     principal_id: call.principal_id, model: None, continuation_epoch: None,
                 }).unwrap() else { panic!("explicit request must be admitted") };

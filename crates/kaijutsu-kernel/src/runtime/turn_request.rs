@@ -16,11 +16,12 @@ pub struct TurnRequest {
     pub principal_id: PrincipalId,
     pub model: Option<String>,
     pub continuation_epoch: Option<i64>,
+    pub score: Option<crate::hyoushigi::model::ScoreIntent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnAdmission {
-    Accepted(TurnId),
+    Accepted { turn_id: TurnId, work_id: Option<kaijutsu_hyoushigi::WorkId> },
     AlreadyActive,
 }
 
@@ -29,7 +30,7 @@ impl Kernel {
     /// presence never determines execution. The lease covers startup and queuing
     /// as well as inference, so an immediate `kj wait` sees accepted work.
     pub fn request_turn(self: &Arc<Self>, request: TurnRequest) -> Result<TurnAdmission, String> {
-        let lease = match request.continuation_epoch {
+        let mut lease = match request.continuation_epoch {
             Some(_) => match self.turns().begin_if_idle(request.context_id) {
                 Some(lease) => lease,
                 None => return Ok(TurnAdmission::AlreadyActive),
@@ -37,10 +38,14 @@ impl Kernel {
             None => self.turns().begin(request.context_id),
         };
         let turn_id = lease.id();
+        let score = request.score.as_ref().map(|intent|
+            crate::hyoushigi::model::admit(self, &mut lease, request.after_block_id.clone(), intent)
+        ).transpose()?;
+        let work_id = score.as_ref().map(|(id, _)| *id);
         let accepted = request.clone();
         let kernel = self.clone();
         let (release, ready) = tokio::sync::oneshot::channel();
-        self.spawn_runtime_task(move |stop| async move {
+        let admitted = self.spawn_runtime_task(move |stop| async move {
             if ready.await.is_err() {
                 drop(lease);
                 report_failure(&kernel, turn_id, &accepted, "turn admission ended before publication".into());
@@ -73,7 +78,11 @@ impl Kernel {
                     std::panic::resume_unwind(panic);
                 }
             }
-        })?;
+        });
+        if let Err(error) = admitted {
+            if let Some((id, timeline)) = score { timeline.lock().cancel(id); }
+            return Err(error);
+        }
         self.turn_flows().publish(TurnFlow::Requested {
             turn_id,
             context_id: request.context_id, after_block_id: request.after_block_id,
@@ -82,7 +91,7 @@ impl Kernel {
         });
         // The worker cannot publish a terminal event ahead of Requested.
         let _ = release.send(());
-        Ok(TurnAdmission::Accepted(turn_id))
+        Ok(TurnAdmission::Accepted { turn_id, work_id })
     }
 }
 
@@ -127,6 +136,7 @@ mod tests {
         ).unwrap();
         let mut failures = dispatcher.kernel().turn_flows().subscribe("turn.failed");
         dispatcher.kernel().request_turn(TurnRequest {
+            score: None,
             context_id: context, after_block_id: anchor, content: String::new(),
             principal_id: principal, model: None, continuation_epoch: None,
         }).unwrap();
