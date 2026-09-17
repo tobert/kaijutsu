@@ -3573,7 +3573,7 @@ mod tests {
             Some(principal), Some("call-score".to_string()), None).unwrap();
         d.block_store().set_status(source, &call, Status::Done).unwrap();
         d.block_store().insert_tool_result_as(source, &call, Some(&call),
-            "bar 7 still fails", true, Some(1), None, Some(principal),
+            "bar 7 still fails", Status::Error, Some(1), None, Some(principal),
             Some("call-score".to_string())).unwrap();
         let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("child")],
             &caller_with_context(source)).await;

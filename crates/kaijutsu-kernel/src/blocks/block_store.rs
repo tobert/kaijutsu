@@ -1047,6 +1047,20 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Set a tool result's status and provider-visible error flag together.
+    pub fn set_tool_result_state(&mut self, id: &BlockId, status: Status, is_error: bool) -> Result<()> {
+        let block = self.blocks.get_mut(id)
+            .filter(|block| !block.is_deleted() && block.header().kind == BlockKind::ToolResult)
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
+        let mut header = *block.header();
+        header.status = status;
+        header.is_error = is_error;
+        header.updated_at = now_millis();
+        block.replace_header(header);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set collapsed state.
     pub fn set_collapsed(&mut self, id: &BlockId, collapsed: bool) -> Result<()> {
         let block = self

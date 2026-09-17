@@ -560,3 +560,70 @@ fn a_provider_panic_publishes_failure_after_its_open_blocks_settle() {
         assert!(server.kernel.shutdown_runtime_worker().await.is_err());
     });
 }
+
+#[test]
+fn tool_failure_reaches_the_client_with_its_result_and_error_flag() {
+    run_local(async {
+        use kaijutsu_kernel::llm::{MockClient, Provider, stream::StreamEvent};
+        use kaijutsu_types::{BlockKind, Status};
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "tool-error-player").await.unwrap();
+        let performer = PrincipalId::new();
+        assign_turn_identity(&server, context, performer);
+        kj.join_context(context, "tool-error-settlement").await.unwrap();
+        let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
+        let mock = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "wire-tool-error".into(), name: "missing_tool".into(), input: serde_json::json!({}) }, done()],
+            vec![StreamEvent::TextStart, StreamEvent::TextDelta("The tool is unavailable.".into()), StreamEvent::TextEnd, done()],
+        ]);
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        let (callback, mut events) = turn_events_channel(32);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        let admitted = kj.execute_kj_quiet(context, &["drive".into(), "--prompt".into(), "use the tool".into()]).await.unwrap();
+        assert_eq!(admitted.exit_code, 0, "{}", admitted.stderr);
+        drop(held);
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+        let blocks = kj.get_blocks(context, &BlockQuery::All).await.unwrap();
+        let pair: Vec<_> = blocks.iter().filter(|block| block.tool_use_id.as_deref() == Some("wire-tool-error")).collect();
+        assert_eq!(pair.len(), 2);
+        assert!(pair.iter().all(|block| block.status == Status::Error));
+        let call = pair.iter().find(|block| block.kind == BlockKind::ToolCall).unwrap();
+        let result = pair.iter().find(|block| block.kind == BlockKind::ToolResult).unwrap();
+        assert_eq!(call.id.principal_id, performer);
+        assert_eq!(result.id.principal_id, PrincipalId::system());
+        assert!(result.is_error);
+        assert!(!result.content.is_empty());
+        assert!(!blocks.iter().any(|block| block.status == Status::Running));
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+#[test]
+fn authored_tool_results_preserve_their_initial_status() {
+    run_local(async {
+        use kaijutsu_client::AuthorBlock;
+        use kaijutsu_types::{BlockKind, Role, Status};
+        let (addr, _server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "reserved-result").await.unwrap();
+        kj.join_context(context, "result-status").await.unwrap();
+        let author = PrincipalId::new();
+        for status in [Status::Running, Status::Waiting, Status::Done, Status::Error] {
+            let call = kj.author_block(&AuthorBlock::tool_call(context, author, "external", serde_json::json!({}), None)).await.unwrap();
+            let mut request = AuthorBlock::text(context, author, Role::Tool, "output");
+            request.kind = BlockKind::ToolResult;
+            request.parent_id = Some(call);
+            request.status = status;
+            let result = kj.author_block(&request).await.unwrap();
+            let blocks = kj.get_blocks(context, &BlockQuery::All).await.unwrap();
+            let output = blocks.iter().find(|block| block.id == result).unwrap();
+            assert_eq!(output.status, status);
+            assert_eq!(output.is_error, status == Status::Error);
+        }
+    });
+}

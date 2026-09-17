@@ -1989,6 +1989,17 @@ Failed. Fault injection rejects each write before mutation and distinguishes
 optional display summaries from content needed for hydration. Tool persistence
 and malformed content framing remain in the same audit.
 
+Ordinary and inline tools now share result creation, shell/ANSI projection and
+settlement. A rejected result insert had still allowed execution; Running is
+now part of the insertion acceptance, and a missing pair stops dispatch.
+Content, styles, error flag and both pair statuses commit together. The prior
+status-only update left failed results with is_error=false, changing hydration;
+settlement and orphan cleanup now retain the error meaning. A persistence fault
+signals cancellation while joining sibling results before terminal failure.
+Replay, fault injection, sibling cancellation and an actual SSH read pin these
+contracts. The approval-link and receipt ownership transfer remain separate
+work; this does not turn an accepted ask into completed execution.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

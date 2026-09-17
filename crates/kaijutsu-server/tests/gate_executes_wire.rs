@@ -294,7 +294,7 @@ impl Seats {
                 &command_block_id,
                 Some(&command_block_id),
                 "",
-                false,
+                Status::Done,
                 None,
                 Some(ToolKind::Shell),
                 Some(PrincipalId::system()),

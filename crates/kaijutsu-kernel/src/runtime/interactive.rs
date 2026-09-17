@@ -94,7 +94,7 @@ async fn prepare(
     let command = documents.insert_tool_call_as(context, None, last.as_ref(), "shell",
         serde_json::json!({"code": code}), Some(ToolKind::Shell), Some(identity.performer), None,
         user_initiated.then_some(Role::User)).map_err(|e| e.to_string())?;
-    let output = documents.insert_tool_result_as(context, &command, Some(&command), "", false, None,
+    let output = documents.insert_tool_result_as(context, &command, Some(&command), "", Status::Done, None,
         Some(ToolKind::Shell), Some(PrincipalId::system()), None).map_err(|e| e.to_string())?;
     let epoch = kernel.kernel_db().lock().continuation_epoch(context).map_err(|e| e.to_string())?;
     let receipt = kernel.shell_operations().register(context, identity.requester, identity.performer,

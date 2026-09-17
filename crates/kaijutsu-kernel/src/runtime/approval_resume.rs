@@ -195,7 +195,7 @@ fn author_pair_for_ask(
         &command_block_id,
         Some(&command_block_id),
         "",
-        false,
+        Status::Done,
         None,
         Some(TypesToolKind::Shell),
         Some(PrincipalId::system()),

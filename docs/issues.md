@@ -361,6 +361,11 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   context that turn is still writing to. Untested.
 - `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
   is flaky under the parallel test runner and passes single-threaded.
+- `mcp::broker::tests::tool_call_spans_keep_requester_actor_and_reviewer_distinct`
+  missed both spans in a parallel `tool_` test run; its isolated rerun passed
+  (2026-09-17, /tmp/kaijutsu-tool-write-tests.log). Audit tracing subscriber and
+  callsite ownership alongside the ledger test; the contributing factors are
+  not established.
 
 ## isotest process tests cannot find a job's process group (2026-09-17)
 
@@ -1406,19 +1411,31 @@ streaming and publish Failed after owned-block cleanup. The thinking summary
 is display metadata; its pre-mutation rejection remains a warning. Fault
 injection covers each required write and the optional summary separately.
 
-Tool-call/result insert, content and settlement writes still sometimes log a
-failure and continue. Audit ordinary and inline tools together: do not execute
-a tool without its durable pair, or send the provider a result missing from the
-log. Join concurrent tool settlement on failure. Malformed event framing also
-needs validation: a delta with no open content block currently updates the
-in-call message without any durable append; one current block slot can accept
-text into a thinking block. Required content must survive hydration unchanged.
+Ordinary and inline calls now share result creation, projection and settlement.
+A result is accepted Running before execution; failed creation stops dispatch.
+Content, styles, error flag and both pair statuses commit together, and a
+persistence fault cancels and joins sibling tool results before turn failure.
+Cleanup sets a failed result's error flag too. The client and hydration see the
+same error outcome. Required error-child insertion also propagates failure.
+
+Malformed event framing still needs validation: a delta with no open content
+block currently updates the in-call message without any durable append; one
+current block slot can accept text into a thinking block. Required content
+must survive hydration unchanged.
 
 `pending_shell_operation_receipt` records Waiting before receipt registration
 and ask linkage finish. A failure there can leave a Waiting pair without its
 intended receipt owner. Turn cleanup deliberately preserves Waiting; the
 receipt/approval settlement audit must retain setup ownership through transfer,
-including its separate initial pair writes.
+including its separate initial pair writes. `link_waiting_pair_to_ask` also
+still logs linkage failures after publishing Waiting. Make the transfer and
+retry owner explicit before declaring model settlement migrated. Runtime
+interactive/structured/approval setup still has separate initial pair writes;
+the new explicit initial-status parameter does not close those ownership gaps.
+Other result-status writers also need the error-flag audit: `completeBlock` is
+intended for tool-call completion but accepts result IDs, and generic
+`set_status` does not update a result's `is_error`. The shared model path is
+fixed; do not infer the same guarantee for command/receipt completion yet.
 
 ## Asks vs forms — decision open (2026-08-22)
 

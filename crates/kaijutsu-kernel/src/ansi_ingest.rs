@@ -115,24 +115,24 @@ pub fn record(
     spans: Vec<StyleSpan>,
     original: &[u8],
 ) {
+    let Some((spans, tag)) = prepare_metadata(blocks, block_id, spans, original) else { return; };
+    if let Err(e) = blocks.set_style_spans(context_id, block_id, spans, Some(tag)) {
+        tracing::warn!(error = %e, block = %block_id,
+            "ansi-strip: could not set style spans; the provenance row is an orphan (harmless)");
+    }
+}
+
+/// Store original bytes before accepting a projection tag. A caller can then
+/// commit the text and styling together without publishing an empty original.
+pub(crate) fn prepare_metadata(
+    blocks: &BlockStore, block_id: &BlockId, spans: Vec<StyleSpan>, original: &[u8],
+) -> Option<(Vec<StyleSpan>, kaijutsu_types::ProvenanceTag)> {
     if let Err(e) = blocks.store_provenance(block_id, TRANSFORM_NAME, PARSER_VERSION, original) {
-        // No row means no tag: `kj block reproject` would have nothing to
-        // reproject from and the CI invariant would report a phantom gap.
-        tracing::warn!(
-            error = %e,
-            block = %block_id,
-            "ansi-strip: could not store provenance; leaving the block untagged and unstyled",
-        );
-        return;
+        tracing::warn!(error = %e, block = %block_id,
+            "ansi-strip: could not store provenance; leaving the block untagged and unstyled");
+        return None;
     }
-    if let Err(e) = blocks.set_style_spans(context_id, block_id, spans, Some(kaijutsu_ansi::provenance_tag()))
-    {
-        tracing::warn!(
-            error = %e,
-            block = %block_id,
-            "ansi-strip: could not set style spans; the provenance row is an orphan (harmless)",
-        );
-    }
+    Some((spans, kaijutsu_ansi::provenance_tag()))
 }
 
 /// The raw stdout bytes of a kaish result, without a lossy detour.

@@ -1044,7 +1044,7 @@ impl HookListener {
                 &call_id,
                 None,
                 &truncated,
-                is_error,
+                if is_error { Status::Error } else { Status::Done },
                 None,
                 Some(ToolKind::Mcp),
                 Some(self.author_principal()),

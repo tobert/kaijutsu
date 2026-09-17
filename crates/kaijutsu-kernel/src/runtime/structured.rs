@@ -82,7 +82,7 @@ async fn run_kj(
         let command = documents.insert_tool_call_as(context, None, last.as_ref(), "kj",
             serde_json::json!({"argv": argv}), Some(ToolKind::Builtin), Some(identity.performer), None, Some(Role::User))
             .map_err(|e| e.to_string())?;
-        let output = documents.insert_tool_result_as(context, &command, Some(&command), "", false, None,
+        let output = documents.insert_tool_result_as(context, &command, Some(&command), "", Status::Done, None,
             Some(ToolKind::Builtin), Some(PrincipalId::system()), None).map_err(|e| e.to_string())?;
         let epoch = kernel.kernel_db().lock().continuation_epoch(context).map_err(|e| e.to_string())?;
         kernel.shell_operations().register(context, identity.requester, identity.performer, command, output, &code, epoch)?;

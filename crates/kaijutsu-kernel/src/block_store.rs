@@ -1328,7 +1328,7 @@ impl BlockStore {
             tool_call_id,
             after,
             content,
-            is_error,
+            if is_error { Status::Error } else { Status::Done },
             exit_code,
             tool_kind,
             None,
@@ -1336,7 +1336,7 @@ impl BlockStore {
         )
     }
 
-    /// Insert a tool result block with an explicit author identity.
+    /// Insert a tool result with its initial status and author in one acceptance.
     ///
     /// `tool_use_id` is the LLM-assigned tool invocation ID for correlating
     /// tool calls with results during hydration.
@@ -1346,7 +1346,7 @@ impl BlockStore {
         tool_call_id: &BlockId,
         after: Option<&BlockId>,
         content: impl Into<String>,
-        is_error: bool,
+        status: Status,
         exit_code: Option<i32>,
         tool_kind: Option<ToolKind>,
         principal_id: Option<PrincipalId>,
@@ -1362,10 +1362,12 @@ impl BlockStore {
                 tool_call_id,
                 after,
                 content,
-                is_error,
+                status == Status::Error,
                 exit_code,
                 tool_kind,
             )?;
+
+            entry.doc.set_status(&block_id, status)?;
 
             // Persist tool_use_id to BlockContent so it survives snapshot round-trips
             if let Some(ref tui) = tool_use_id {
@@ -1393,6 +1395,46 @@ impl BlockStore {
             });
 
             Ok((ops, events, block_id))
+        })
+    }
+
+    /// Commit a tool result's content, error flag and both pair statuses together.
+    pub(crate) fn settle_tool_result_as(
+        &self, context_id: ContextId, call: &BlockId, result: &BlockId,
+        content: &str, status: Status, is_error: bool, author: PrincipalId,
+        styles: Option<(Vec<kaijutsu_types::StyleSpan>, kaijutsu_types::ProvenanceTag)>,
+    ) -> BlockStoreResult<()> {
+        self.accept(context_id, |entry| {
+            let command = entry.doc.get_block_header(call).ok_or_else(|| BlockStoreError::Validation("tool call is missing".into()))?;
+            let output = entry.doc.get_block_snapshot(result).ok_or_else(|| BlockStoreError::Validation("tool result is missing".into()))?;
+            if command.kind != BlockKind::ToolCall || output.kind != BlockKind::ToolResult
+                || output.tool_call_id.as_ref() != Some(call) {
+                return Err(BlockStoreError::Validation("tool result does not belong to the supplied call".into()));
+            }
+            entry.doc.set_principal_id(author);
+            entry.doc.edit_text(result, 0, content, output.content.chars().count())?;
+            if let Some((spans, tag)) = &styles {
+                entry.doc.set_style_spans(result, spans.clone(), Some(tag.clone()))?;
+            }
+            entry.doc.set_tool_result_state(result, status, is_error)?;
+            entry.doc.set_status(call, status)?;
+            entry.touch(author);
+            let output = entry.doc.get_block_snapshot(result).expect("accepted result remains under this guard");
+            let metadata = output.metadata();
+            let mut payload = SyncPayload::from_updated_snapshot(output);
+            payload.updated_headers.push(entry.doc.get_block_header(call).expect("accepted call remains under this guard"));
+            let version = entry.version();
+            let mut events = vec![
+                BlockFlow::TextReplaced { context_id, block_id: *result, content: Arc::from(content), version, source: OpSource::Local },
+                BlockFlow::MetadataChanged { context_id, block_id: *result, metadata, version, source: OpSource::Local },
+                BlockFlow::StatusChanged { context_id, block_id: *result, status, version, source: OpSource::Local },
+                BlockFlow::StatusChanged { context_id, block_id: *call, status, version, source: OpSource::Local },
+            ];
+            if let Some((style_spans, tag)) = styles {
+                events.insert(1, BlockFlow::SpansChanged { context_id, block_id: *result, style_spans,
+                    provenance: Some(tag), version, source: OpSource::Local });
+            }
+            Ok((payload, events, ()))
         })
     }
 
@@ -1525,14 +1567,26 @@ impl BlockStore {
         self.accept_locked(context_id, &mut entry, |entry| {
             let mut headers = Vec::new();
             for id in &running {
-                entry.doc.set_status(id, Status::Error)?;
+                if entry.doc.get_block_header(id).is_some_and(|header| header.kind == BlockKind::ToolResult) {
+                    entry.doc.set_tool_result_state(id, Status::Error, true)?;
+                } else {
+                    entry.doc.set_status(id, Status::Error)?;
+                }
                 headers.push(entry.doc.get_block_header(id).expect("selected block remains under this guard"));
             }
             entry.touch(self.principal_id());
-            let events = running.iter().map(|id| BlockFlow::StatusChanged {
+            let mut events = Vec::new();
+            for id in &running {
+                let block = entry.doc.get_block_snapshot(id).expect("selected block remains under this guard");
+                if block.kind == BlockKind::ToolResult {
+                    events.push(BlockFlow::MetadataChanged { context_id, block_id: *id,
+                        metadata: block.metadata(), version: entry.version(), source: OpSource::Local });
+                }
+            }
+            events.extend(running.iter().map(|id| BlockFlow::StatusChanged {
                 context_id, block_id: *id, status: Status::Error,
                 version: entry.version(), source: OpSource::Local,
-            }).collect();
+            }));
             let mut payload = SyncPayload::from_updated_header(headers[0]);
             payload.updated_headers = headers;
             Ok((payload, events, running.len()))
@@ -5884,6 +5938,48 @@ mod tests {
     // ====================================================================
     // 1. Crash-Recovery: drop + reload
     // ====================================================================
+
+    #[test]
+    fn tool_result_acceptance_keeps_pair_content_and_error_flag_together_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut store, context, workspace) = fresh_db_store(dir.path());
+        let flows = Arc::new(crate::flows::FlowBus::new(32));
+        store.block_flows = Some(flows.clone());
+        let mut events = flows.subscribe("block.*");
+        let call = store.insert_tool_call_as(context, None, None, "run", serde_json::json!({}),
+            None, Some(PrincipalId::new()), Some("tool-1".into()), None).unwrap();
+        let result = store.insert_tool_result_as(context, &call, Some(&call), "", Status::Running,
+            None, None, Some(PrincipalId::system()), Some("tool-1".into())).unwrap();
+        assert!(matches!(events.try_recv().unwrap().payload, BlockFlow::Inserted { .. }));
+        let BlockFlow::Inserted { block, .. } = events.try_recv().unwrap().payload else { panic!("result insert") };
+        assert_eq!(block.status, Status::Running, "never publish an empty completed result");
+        store.arm_accept_fault(1);
+        assert!(store.settle_tool_result_as(context, &call, &result, "失敗", Status::Error, true,
+            PrincipalId::system(), None).is_err());
+        assert!(events.try_recv().is_none(), "refused acceptance publishes no partial result");
+        for id in [&call, &result] { assert_eq!(store.get_block_snapshot(context, id).unwrap().unwrap().status, Status::Running); }
+        assert_eq!(store.get_block_snapshot(context, &result).unwrap().unwrap().content, "");
+        let raw = "\x1b[31m失敗\x1b[0m";
+        let projection = crate::ansi_ingest::project(raw.as_bytes()).unwrap();
+        let styles = crate::ansi_ingest::prepare_metadata(&store, &result, projection.spans, raw.as_bytes());
+        store.settle_tool_result_as(context, &call, &result, &projection.text, Status::Error, true,
+            PrincipalId::system(), styles).unwrap();
+        let accepted: Vec<_> = std::iter::from_fn(|| events.try_recv()).map(|event| event.payload).collect();
+        assert_eq!(accepted.len(), 5);
+        assert!(matches!(&accepted[1], BlockFlow::SpansChanged { .. }), "style precedes terminal status");
+        let BlockFlow::MetadataChanged { metadata, .. } = &accepted[2] else { panic!("result metadata") };
+        assert!(metadata.is_error);
+        drop(store);
+        let restored = drop_and_reload(db, workspace);
+        let output = restored.get_block_snapshot(context, &result).unwrap().unwrap();
+        assert_eq!(output.content, "失敗");
+        assert_eq!(output.status, Status::Error);
+        assert!(output.is_error, "hydration must preserve the tool's error flag");
+        assert!(!output.style_spans.is_empty());
+        assert!(output.provenance.is_some());
+        assert_eq!(output.tool_use_id.as_deref(), Some("tool-1"));
+        assert_eq!(restored.get_block_snapshot(context, &call).unwrap().unwrap().status, Status::Error);
+    }
 
     #[test]
     fn turn_cleanup_is_selective_idempotent_and_survives_reload() {

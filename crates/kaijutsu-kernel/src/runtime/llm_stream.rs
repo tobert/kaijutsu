@@ -1295,7 +1295,7 @@ fn pending_shell_operation_receipt(
     ).map_err(|error| error.to_string())?;
     turn_lease.track_block(command);
     let output = documents.insert_tool_result_as(
-        context_id, &command, Some(&command), "", false, None,
+        context_id, &command, Some(&command), "", Status::Done, None,
         Some(kaijutsu_types::ToolKind::Shell), Some(PrincipalId::system()), None,
     ).map_err(|error| error.to_string())?;
     turn_lease.track_block(output);
@@ -1349,14 +1349,48 @@ fn make_pending_shell_receipt(
     }
 }
 
-/// Execute a provider-owned, in-flight tool callback through Kaijutsu's one
-/// broker path, while materializing the same durable ToolCall/ToolResult pair
-/// an ordinary `StreamEvent::ToolUse` gets.
-///
-/// Unlike ordinary tool use, the provider is waiting on this function's
-/// return before it can continue the current turn.  Keep it sequential: that
-/// preserves callback ordering and lets `last_block_id` remain the anchor for
-/// the provider's next streamed item.
+/// Execute a recorded model call only after its Running result exists. Both
+/// ordinary and inline providers use this content projection and settlement.
+async fn dispatch_recorded_tool_result(
+    documents: &SharedBlockStore, context_id: ContextId, kernel: &Arc<Kernel>,
+    tool_name: &str, input: &serde_json::Value, tool_ctx: &crate::ExecContext,
+    cancel: tokio_util::sync::CancellationToken, tool_use_id: &str,
+    call: kaijutsu_types::BlockId, turn_lease: &TurnLease,
+) -> crate::block_store::BlockStoreResult<(InlineToolResult, kaijutsu_types::BlockId)> {
+    let result = documents.insert_tool_result_as(context_id, &call, Some(&call), "", Status::Running,
+        None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.to_owned()))?;
+    turn_lease.track_block(result);
+    tokio::task::yield_now().await;
+
+    let params = input.to_string();
+    let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload, ask_id } =
+        dispatch_and_map_tool_result(kernel, tool_name, &params, tool_ctx, cancel).await;
+    make_pending_shell_receipt(kernel, documents, context_id, tool_ctx, tool_name, &params,
+        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status, turn_lease);
+
+    // The model receives the shell envelope; people and hydration read its
+    // output. Project the actual output once so both readers get clean text.
+    let envelope = ShellEnvelope::from_tool_result(&content);
+    let source = envelope.as_ref().map_or_else(|| content.clone(), |env| env.readable_output());
+    let ansi = crate::ansi_ingest::project(source.as_bytes());
+    let block_content = ansi.as_ref().map_or(source.as_str(), |projection| projection.text.as_str());
+    let model_content = match envelope {
+        Some(env) => env.with_clean_output(block_content).to_value().to_string(),
+        None => block_content.to_owned(),
+    };
+    let styles = ansi.as_ref().and_then(|projection|
+        crate::ansi_ingest::prepare_metadata(documents, &result, projection.spans.clone(), source.as_bytes()));
+    documents.settle_tool_result_as(context_id, &call, &result, block_content,
+        settled_status, is_error, PrincipalId::system(), styles)?;
+    link_waiting_pair_to_ask(&kernel.kernel_db(), settled_status, ask_id.as_deref(), &call, Some(&result));
+    let anchor = if let Some(payload) = payload {
+        documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
+    } else { result };
+    Ok((InlineToolResult { content: model_content, is_error }, anchor))
+}
+
+/// An inline provider waits for this callback. Reply only after durable
+/// settlement and retain the final result/error block as the next anchor.
 async fn dispatch_inline_tool_result(
     documents: &SharedBlockStore,
     context_id: ContextId,
@@ -1367,162 +1401,17 @@ async fn dispatch_inline_tool_result(
     tool_ctx: &crate::ExecContext,
     cancel: tokio_util::sync::CancellationToken,
     tool_use_id: &str,
-    // PROVIDER-OUTPUT: this ToolCall block records the model's own callback
-    // request, the same as an ordinary streamed tool-use event — stamp the
-    // caller's actor principal, not a literal system() here.
     actor_principal: PrincipalId,
     turn_lease: &TurnLease,
-) -> InlineToolResult {
-    // Tool kind no longer has a registry category at this layer.  This is the
-    // same conservative marker ordinary streamed tool calls use.
-    let tool_kind = TypesToolKind::Builtin;
-    let tool_call_block_id = match documents.insert_tool_call_as(
-        context_id,
-        None,
-        Some(last_block_id),
-        tool_name,
-        input.clone(),
-        Some(tool_kind),
-        Some(actor_principal),
-        Some(tool_use_id.to_owned()),
-        None,
-    ) {
-        Ok(id) => {
-            turn_lease.track_block(id);
-            *last_block_id = id;
-            id
-        }
-        Err(error) => {
-            tracing::error!(
-                "Failed to insert inline tool call block for {} ({}): {}",
-                tool_name,
-                tool_use_id,
-                error
-            );
-            return InlineToolResult {
-                content: format!(
-                    "Internal error: failed to create ToolCall block for {}. The tool was not executed.",
-                    tool_name
-                ),
-                is_error: true,
-            };
-        }
-    };
-
-    let result_block_id = match documents.insert_tool_result_as(
-        context_id,
-        &tool_call_block_id,
-        Some(&tool_call_block_id),
-        "",
-        false,
-        None,
-        Some(tool_kind),
-        Some(PrincipalId::system()),
-        Some(tool_use_id.to_owned()),
-    ) {
-        Ok(id) => {
-            turn_lease.track_block(id);
-            let _ = documents.set_status(context_id, &id, Status::Running);
-            Some(id)
-        }
-        Err(error) => {
-            // Match the ordinary agentic path: execute and return a real
-            // result even when the UI block could not be created, but make the
-            // missing durable representation loud in logs.
-            tracing::warn!(
-                "Failed to insert inline tool result block for {} ({}): {}",
-                tool_name,
-                tool_use_id,
-                error
-            );
-            None
-        }
-    };
-
-    // Let the client observe the running ToolResult before it completes.
-    tokio::task::yield_now().await;
-
-    let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload: error_payload, ask_id } =
-        dispatch_and_map_tool_result(
-        kernel,
-        tool_name,
-        &input.to_string(),
-        tool_ctx,
-        cancel,
-    )
-    .await;
-
-    make_pending_shell_receipt(
-        kernel, documents, context_id, tool_ctx, tool_name, &input.to_string(),
-        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status, turn_lease,
-    );
-
-    // ANSI ingest, same policy as the agentic path above: the projection is
-    // what the block stores AND what the model reads back.
-    let ansi = crate::ansi_ingest::project(content.as_bytes());
-    let raw_result = ansi.as_ref().map(|_| content.clone());
-    let content = match ansi {
-        Some(ref p) => p.text.clone(),
-        None => content,
-    };
-
-    if let Some(result_block_id) = result_block_id {
-        if !content.is_empty()
-            && let Err(error) = documents.edit_text_as(
-                context_id,
-                &result_block_id,
-                0,
-                &content,
-                0,
-                Some(PrincipalId::system()),
-            )
-        {
-            tracing::error!("Failed to write inline tool result text: {}", error);
-        }
-        // After the edit — `edit_text` clears style_spans.
-        if let (Some(p), Some(raw)) = (ansi, raw_result) {
-            crate::ansi_ingest::record(
-                documents,
-                context_id,
-                &result_block_id,
-                p.spans,
-                raw.as_bytes(),
-            );
-        }
-        let _ = documents.set_status(context_id, &result_block_id, settled_status);
-        // An error child anchors after the result block
-        // (`insert_error_block_as`), so it is the new tail of this tool's
-        // output: advance `last_block_id` past it, or the next iteration's
-        // blocks land between the result and its own error child.
-        let mut anchor = result_block_id;
-        if let Some(payload) = error_payload {
-            match documents.insert_error_block_as(
-                context_id,
-                &result_block_id,
-                &payload,
-                payload.summary_line(),
-                Some(PrincipalId::system()),
-            ) {
-                Ok(child_id) => anchor = child_id,
-                Err(error) => tracing::warn!(
-                    "Failed to insert inline tool error block for {}: {}",
-                    tool_name,
-                    error
-                ),
-            }
-        }
-        *last_block_id = anchor;
-    }
-    let _ = documents.set_status(context_id, &tool_call_block_id, settled_status);
-    link_waiting_pair_to_ask(
-        &kernel.kernel_db(),
-        settled_status,
-        ask_id.as_deref(),
-        &tool_call_block_id,
-        result_block_id.as_ref(),
-    );
-
-    InlineToolResult { content, is_error }
+) -> crate::block_store::BlockStoreResult<InlineToolResult> {
+    let call = documents.insert_tool_call_as(context_id, None, Some(last_block_id), tool_name,
+        input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal), Some(tool_use_id.to_owned()), None)?;
+    turn_lease.track_block(call);
+    *last_block_id = call;
+    let (result, anchor) = dispatch_recorded_tool_result(documents, context_id, kernel, tool_name, &input,
+        tool_ctx, cancel, tool_use_id, call, turn_lease).await?;
+    *last_block_id = anchor;
+    Ok(result)
 }
 
 /// The `llm.turn` span's usage fields, recorded exactly once per turn.
@@ -2157,13 +2046,8 @@ async fn run_llm_stream(
 
         // Process stream events
         let mut current_block_id: Option<kaijutsu_types::BlockId> = None;
-        // Collect tool calls for this iteration
-        let mut tool_calls: Vec<(String, String, serde_json::Value, TypesToolKind)> = vec![]; // (id, name, input, tool_kind)
-        // Track tool_use_id → BlockId mapping
-        let mut tool_call_blocks: std::collections::HashMap<
-            String,
-            Option<kaijutsu_types::BlockId>,
-        > = std::collections::HashMap::new();
+        // Each pending invocation already has a durable call block.
+        let mut tool_calls: Vec<(String, String, serde_json::Value, kaijutsu_types::BlockId)> = vec![];
         // Collect text output for conversation history
         let mut assistant_text = String::new();
         // Collect thinking output for in-call continuity (A3), one
@@ -2366,38 +2250,11 @@ async fn run_llm_stream(
                 }
 
                 StreamEvent::ToolUse { id, name, input } => {
-                    // Tool kind no longer tracked by a registry category after
-                    // Phase 1 M5 — default to Builtin. Phase 2+ can enrich via
-                    // broker instance metadata when we have a reason.
-                    let tool_kind = TypesToolKind::Builtin;
-
-                    // Store for later execution
-                    tool_calls.push((id.clone(), name.clone(), input.clone(), tool_kind));
-
-                    // Insert block and track it — on failure, store None so
-                    // the execution future can surface the error to the model
-                    // instead of silently losing the tool result.
-                    match documents.insert_tool_call_as(
-                        context_id,
-                        None,
-                        Some(&last_block_id),
-                        &name,
-                        input.clone(),
-                        Some(tool_kind),
-                        Some(actor_principal),
-                        Some(id.clone()),
-                        None,
-                    ) {
-                        Ok(block_id) => {
-                            turn_lease.track_block(block_id);
-                            last_block_id = block_id;
-                            tool_call_blocks.insert(id.clone(), Some(block_id));
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to insert tool call block for {}: {}", name, e);
-                            tool_call_blocks.insert(id.clone(), None);
-                        }
-                    }
+                    let call = documents.insert_tool_call_as(context_id, None, Some(&last_block_id), &name,
+                        input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal), Some(id.clone()), None)?;
+                    turn_lease.track_block(call);
+                    last_block_id = call;
+                    tool_calls.push((id, name, input, call));
                 }
 
                 StreamEvent::InlineToolUse { id, name, input } => {
@@ -2427,7 +2284,7 @@ async fn run_llm_stream(
                         actor_principal,
                         turn_lease,
                     )
-                    .await;
+                    .await?;
 
                     // Reply only after the durable blocks have reached their
                     // final states.  A failed reply is fatal: continuing to
@@ -2752,249 +2609,35 @@ async fn run_llm_stream(
             })
             .collect();
 
-        // Execute all tools concurrently with streaming results.
-        // Pattern mirrors shell_execute: create empty Running block → yield →
-        // execute → write content → set final status.
-        let futures: Vec<_> = tool_calls
-            .into_iter()
-            .map(|(tool_use_id, tool_name, input, tool_kind)| {
-                let kernel = kernel.clone();
-                let documents = documents.clone();
-                let tool_ctx = tool_ctx.clone();
-                let interrupt = interrupt.clone();
-                // Option<Option<BlockId>>: None = not in map (shouldn't happen),
-                // Some(None) = insertion failed, Some(Some(id)) = normal
-                let tool_call_entry = tool_call_blocks.get(&tool_use_id).cloned();
-                async move {
-                    let params = input.to_string();
-                    tracing::debug!("Executing tool: {} with params: {}", tool_name, params);
-
-                    let tool_call_block_id = match tool_call_entry {
-                        Some(Some(id)) => Some(id),
-                        Some(None) => {
-                            // ToolCall block insertion failed — the model should
-                            // know its tool infrastructure is broken rather than
-                            // getting a phantom result with no call.
-                            tracing::warn!(
-                                "Tool {} (id={}) has no ToolCall block — \
-                                 returning error to model",
-                                tool_name,
-                                tool_use_id,
-                            );
-                            return (
-                                ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content: format!(
-                                        "Internal error: failed to create ToolCall block for {}. \
-                                         The tool was not executed. Try again.",
-                                        tool_name,
-                                    ),
-                                    is_error: true,
-                                },
-                                None,
-                            );
-                        }
-                        None => None,
-                    };
-
-                    // Step 1-2: Create empty ToolResult block and set Running
-                    let mut result_block_id = None;
-                    if let Some(ref tcb_id) = tool_call_block_id {
-                        match documents.insert_tool_result_as(
-                            context_id,
-                            tcb_id,
-                            Some(tcb_id),
-                            "",
-                            false,
-                            None,
-                            Some(tool_kind),
-                            Some(PrincipalId::system()),
-                            Some(tool_use_id.clone()),
-                        ) {
-                            Ok(id) => {
-                                turn_lease.track_block(id);
-                                let _ = documents.set_status(context_id, &id, Status::Running);
-                                result_block_id = Some(id);
-                            }
-                            Err(e) => tracing::warn!(
-                                // TODO: surface this in the UI — the model continues with a result
-                                // the user never sees, which is confusing to debug. One option:
-                                // insert a System/Text block with an error notice so the gap is
-                                // visible in the conversation view.
-                                "Failed to insert tool result block for {} — \
-                                 model will still receive result but user won't see it: {}",
-                                tool_name,
-                                e,
-                            ),
-                        }
+        // Signal cancellation on the first persistence fault, but join every
+        // admitted call before terminal cleanup. Dropping siblings here would
+        // leave side effects without their final result.
+        let futures = tool_calls.into_iter().map(|(tool_use_id, tool_name, input, call)| {
+            let kernel = kernel.clone();
+            let documents = documents.clone();
+            let tool_ctx = tool_ctx.clone();
+            let interrupt = interrupt.clone();
+            async move {
+                let result = dispatch_recorded_tool_result(&documents, context_id, &kernel, &tool_name, &input,
+                    &tool_ctx, interrupt.cancel.clone(), &tool_use_id, call, turn_lease).await;
+                match result {
+                    Ok((result, anchor)) => Ok((ContentBlock::ToolResult {
+                        tool_use_id, content: result.content, is_error: result.is_error,
+                    }, anchor)),
+                    Err(error) => {
+                        tracing::error!(%tool_name, %tool_use_id, %error, "tool persistence failed");
+                        interrupt.hard();
+                        Err(error)
                     }
-
-                    // Step 3: Let BlockInserted flush to clients before text ops
-                    tokio::task::yield_now().await;
-
-                    // Step 4: Execute tool via the Phase 1 broker.
-                    // `interrupt.cancel` (M2-B5) flows through to the broker
-                    // so a hard interrupt aborts in-flight work promptly —
-                    // no outer timeout wrapper needed here; see
-                    // `dispatch_and_map_tool_result`'s doc for why.
-                    let ToolDispatch {
-                        content: mut result_content,
-                        mut is_error,
-                        status: mut settled_status,
-                        payload: error_payload,
-                        ask_id,
-                    } = dispatch_and_map_tool_result(
-                        &kernel,
-                        &tool_name,
-                        &params,
-                        &tool_ctx,
-                        interrupt.cancel.clone(),
-                    )
-                    .await;
-
-                    make_pending_shell_receipt(
-                        &kernel, &documents, context_id, &tool_ctx, &tool_name, &params,
-                        ask_id.as_deref(), &mut result_content, &mut is_error, &mut settled_status, turn_lease,
-                    );
-
-                    // Step 4a: split the two readers. A `shell` result is a
-                    // JSON envelope (`docs/shell-envelope.md`) — that is what
-                    // the MODEL reads. The durable block is read by people and
-                    // replayed by hydration, so it holds the command's output,
-                    // not the envelope around it. Every other tool has one
-                    // text and both readers get it.
-                    let shell_envelope = ShellEnvelope::from_tool_result(&result_content);
-                    let block_source = match shell_envelope {
-                        Some(ref env) => env.readable_output(),
-                        None => result_content.clone(),
-                    };
-
-                    // Step 4b: ANSI ingest (docs/ansi-and-beyond.md). A tool
-                    // that shells out hands back escape codes; the model must
-                    // not see them (they burn tokens and, worse, poison the
-                    // byte-offset arithmetic every edit/exclusion range uses).
-                    // The projection runs on the command's real output — an
-                    // envelope's JSON has no raw ESC bytes to find, only the
-                    // six characters `\u001b`, so projecting the envelope
-                    // would strip nothing and hand the model the escapes it
-                    // exists to remove.
-                    let ansi = crate::ansi_ingest::project(block_source.as_bytes());
-                    let raw_result = ansi.as_ref().map(|_| block_source.clone());
-                    let block_content = match ansi {
-                        Some(ref p) => p.text.clone(),
-                        None => block_source,
-                    };
-                    // The model's copy is the envelope carrying the SAME
-                    // cleaned text, so both readers see one output with one
-                    // set of offsets.
-                    let result_content = match shell_envelope {
-                        Some(env) => env.with_clean_output(&block_content).to_value().to_string(),
-                        None => block_content.clone(),
-                    };
-
-                    // Step 5: Write result content via a block edit
-                    if let Some(ref rb_id) = result_block_id {
-                        if !block_content.is_empty()
-                            && let Err(e) = documents.edit_text_as(
-                                context_id,
-                                rb_id,
-                                0,
-                                &block_content,
-                                0,
-                                Some(PrincipalId::system()),
-                            )
-                        {
-                            tracing::error!("Failed to write tool result text: {}", e);
-                        }
-                        // After the edit — `edit_text` clears style_spans.
-                        if let (Some(p), Some(raw)) = (ansi, raw_result) {
-                            crate::ansi_ingest::record(
-                                &documents,
-                                context_id,
-                                rb_id,
-                                p.spans,
-                                raw.as_bytes(),
-                            );
-                        }
-
-                        // Step 6: Set final status on result and call blocks.
-                        // `settled_status` rather than `is_error`: a gate
-                        // that recorded a durable ask settles `Waiting`, and
-                        // deriving the status from the error flag is what
-                        // used to make a pending ask read as a failed call.
-                        let _ = documents.set_status(context_id, rb_id, settled_status);
-                    }
-                    if let Some(ref tcb_id) = tool_call_block_id {
-                        let _ = documents.set_status(context_id, tcb_id, settled_status);
-                    }
-                    // Tell the ask which pair is holding it, so a human's
-                    // answer fills this pair instead of authoring a second one
-                    // beside it (`link_waiting_pair_to_ask`).
-                    if let (Some(rb_id), Some(tcb_id)) =
-                        (result_block_id.as_ref(), tool_call_block_id.as_ref())
-                    {
-                        link_waiting_pair_to_ask(
-                            &kernel.kernel_db(),
-                            settled_status,
-                            ask_id.as_deref(),
-                            tcb_id,
-                            Some(rb_id),
-                        );
-                    }
-
-                    // Step 6b: Emit structured Error child block if tool
-                    // failed, and anchor this dispatch's return past it. An
-                    // error child anchors after the result block
-                    // (`insert_error_block_as`), so it is the new tail of
-                    // this tool's output; returning the result id here would
-                    // put the next iteration's thinking and text between the
-                    // result and its own error child. A result block that
-                    // failed to insert leaves the call block as this tool's
-                    // tail: returning `None` would keep the previous tool's
-                    // anchor and put the next iteration's blocks before this
-                    // call in document order.
-                    let mut anchor_block_id = result_block_id.or(tool_call_block_id.clone());
-                    if let (Some(rb_id), Some(payload)) = (&result_block_id, &error_payload) {
-                        match documents.insert_error_block_as(
-                            context_id,
-                            rb_id,
-                            payload,
-                            payload.summary_line(),
-                            Some(PrincipalId::system()),
-                        ) {
-                            Ok(child_id) => anchor_block_id = Some(child_id),
-                            Err(e) => tracing::warn!(
-                                "Failed to insert error block for tool {}: {}",
-                                tool_name,
-                                e
-                            ),
-                        }
-                    }
-
-                    // Step 7: Return for conversation history
-                    (
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content: result_content,
-                            is_error,
-                        },
-                        anchor_block_id,
-                    )
                 }
-            })
-            .collect();
-
-        let results_with_ids = futures::future::join_all(futures).await;
-
-        // Unzip and update last_block_id so the next iteration's blocks
-        // appear after tool results (or their error child, when one was
-        // authored), not after tool calls.
-        let mut tool_results = Vec::new();
-        for (content_block, block_id_opt) in results_with_ids {
-            tool_results.push(content_block);
-            if let Some(id) = block_id_opt {
-                last_block_id = id;
             }
+        });
+        let results = futures::future::join_all(futures).await;
+        let mut tool_results = Vec::new();
+        for result in results {
+            let (content, anchor) = result?;
+            tool_results.push(content);
+            last_block_id = anchor;
         }
 
         // Add assistant message with tool uses to conversation. Preserve
@@ -4342,7 +3985,7 @@ mod tool_dispatch_timeout_tests {
             kernel_with_refusing_tool("inline-anchor").await;
         let mut last_block_id = anchor;
 
-        let _ = dispatch_inline_tool_result(
+        dispatch_inline_tool_result(
             &documents,
             ctx,
             &mut last_block_id,
@@ -4355,7 +3998,7 @@ mod tool_dispatch_timeout_tests {
             PrincipalId::new(),
             &kernel.turns().begin(ctx),
         )
-        .await;
+        .await.unwrap();
 
         // Simulate the next iteration's block, anchored wherever this
         // dispatch left `last_block_id`.
@@ -5690,7 +5333,7 @@ mod gate_resume_cache_eviction_tests {
                 &command_block,
                 Some(&command_block),
                 "waiting on a human",
-                false,
+                Status::Done,
                 None,
                 Some(TypesToolKind::Shell),
                 Some(PrincipalId::system()),
@@ -6266,6 +5909,174 @@ mod lifetime_tests {
             assert_eq!(shutdown.is_err(), ending == "panic");
             assert!(!kernel.turn_in_flight(context));
         }
+    }
+
+    #[tokio::test]
+    async fn tool_write_refusal_stops_execution_or_provider_continuation() {
+        use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+            KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingTool {
+            id: InstanceId,
+            calls: Arc<AtomicUsize>,
+            documents: SharedBlockStore,
+            reject_settlement: bool,
+        }
+        #[async_trait::async_trait]
+        impl McpServerLike for CountingTool {
+            fn instance_id(&self) -> &InstanceId { &self.id }
+            async fn list_tools(&self, _: &CallContext) -> McpResult<Vec<KernelTool>> {
+                Ok(vec![KernelTool { instance: self.id.clone(), name: "count".into(), description: None,
+                    input_schema: serde_json::json!({"type": "object"}) }])
+            }
+            async fn call_tool(&self, _: KernelCallParams, _: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.reject_settlement { self.documents.arm_accept_fault(1); }
+                Ok(KernelToolResult::text("required tool output"))
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<ServerNotification> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+        for inline in [false, true] {
+            for refused in ["result", "call", "settlement"] {
+                let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
+                let first = if inline { vec![StreamEvent::InlineToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}) }] }
+                    else { vec![StreamEvent::ToolUse { id: "call-count".into(), name: "count".into(), input: serde_json::json!({}) }, done()] };
+                let mock = MockClient::new("").with_scripted_stream(vec![first,
+                    vec![StreamEvent::TextStart, StreamEvent::TextDelta("continued past lost result".into()), StreamEvent::TextEnd, done()]]);
+                let (kernel, context, after, call) = fixture(Some(mock)).await;
+                let calls = Arc::new(AtomicUsize::new(0));
+                let instance = InstanceId::new("count-test");
+                kernel.broker().register(Arc::new(CountingTool { id: instance.clone(), calls: calls.clone(),
+                    documents: kernel.blocks().clone(), reject_settlement: refused == "settlement" }), InstancePolicy::default()).await.unwrap();
+                kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+                let session = kernel.turns().conversations().get_or_create(context);
+                let held = session.lock().await;
+                let mut terminal = kernel.turn_flows().subscribe("turn.*");
+                spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+                kernel.blocks().arm_accept_fault(match refused { "call" => 1, "result" => 2, _ => 0 });
+                drop(held);
+                let event = tokio::time::timeout(Duration::from_secs(3), terminal.recv()).await.unwrap().unwrap().payload;
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(refused == "settlement"), "inline={inline} refused={refused}: must create durable pair before execution");
+                let TurnFlow::Failed { error, .. } = event else { panic!("inline={inline} refused={refused}: {event:?}") };
+                assert!(error.contains("Could not persist model output") && error.contains("injected acceptance refusal"), "{error}");
+                let blocks = kernel.blocks().block_snapshots(context).unwrap();
+                assert!(!blocks.iter().any(|block| block.status == Status::Running || block.content == "continued past lost result"));
+                assert!(!blocks.iter().any(|block| block.kind == BlockKind::ToolResult && (block.status == Status::Done || !block.is_error)), "a refused result cannot look complete or hydrate as success");
+                kernel.shutdown_runtime_worker().await.unwrap();
+                assert!(terminal.try_recv().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_inline_tools_preserve_the_same_shell_projection() {
+        use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+            KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
+        struct EnvelopeTool { id: InstanceId }
+        #[async_trait::async_trait]
+        impl McpServerLike for EnvelopeTool {
+            fn instance_id(&self) -> &InstanceId { &self.id }
+            async fn list_tools(&self, _: &CallContext) -> McpResult<Vec<KernelTool>> {
+                Ok(vec![KernelTool { instance: self.id.clone(), name: "envelope".into(), description: None,
+                    input_schema: serde_json::json!({"type": "object"}) }])
+            }
+            async fn call_tool(&self, _: KernelCallParams, _: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+                let mut envelope = ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Done);
+                envelope.stdout = "\x1b[31mred\x1b[0m".into();
+                envelope.exit_code = Some(0);
+                envelope.data = Some(serde_json::json!({"phase": 3}));
+                Ok(KernelToolResult::text(envelope.to_value().to_string()))
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<ServerNotification> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+        for inline in [false, true] {
+            let (kernel, context, after, call) = fixture(None).await;
+            let instance = InstanceId::new("envelope-test");
+            kernel.broker().register(Arc::new(EnvelopeTool { id: instance.clone() }), InstancePolicy::default()).await.unwrap();
+            kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+            let lease = kernel.turns().begin(context);
+            let mut anchor = after;
+            let result = if inline {
+                dispatch_inline_tool_result(kernel.blocks(), context, &mut anchor, &kernel, "envelope", serde_json::json!({}),
+                    &call, lease.interrupt().cancel.clone(), "envelope-call", call.actor_id, &lease).await.unwrap()
+            } else {
+                let id = kernel.blocks().insert_tool_call_as(context, None, Some(&after), "envelope", serde_json::json!({}),
+                    Some(TypesToolKind::Builtin), Some(call.actor_id), Some("envelope-call".into()), None).unwrap();
+                lease.track_block(id);
+                let (result, tail) = dispatch_recorded_tool_result(kernel.blocks(), context, &kernel, "envelope", &serde_json::json!({}),
+                    &call, lease.interrupt().cancel.clone(), "envelope-call", id, &lease).await.unwrap();
+                anchor = tail;
+                result
+            };
+            assert!(!result.is_error);
+            let model = ShellEnvelope::from_tool_result(&result.content).unwrap();
+            assert_eq!(model.stdout, "red");
+            assert_eq!(model.data, Some(serde_json::json!({"phase": 3})));
+            let block = kernel.blocks().get_block_snapshot(context, &anchor).unwrap().unwrap();
+            assert_eq!(block.content, "red");
+            assert_eq!(block.status, Status::Done);
+            assert!(!block.style_spans.is_empty());
+            assert!(block.provenance.is_some());
+            assert!(!block.is_error);
+            assert_eq!(lease.settle_blocks(kernel.blocks()).unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_write_failure_cancels_and_joins_its_sibling_result() {
+        use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+            KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
+        struct PairedTools {
+            id: InstanceId,
+            entered: tokio::sync::Notify,
+            documents: SharedBlockStore,
+        }
+        #[async_trait::async_trait]
+        impl McpServerLike for PairedTools {
+            fn instance_id(&self) -> &InstanceId { &self.id }
+            async fn list_tools(&self, _: &CallContext) -> McpResult<Vec<KernelTool>> {
+                Ok(["fault", "pending"].iter().map(|name| KernelTool { instance: self.id.clone(),
+                    name: (*name).into(), description: None, input_schema: serde_json::json!({"type": "object"}) }).collect())
+            }
+            async fn call_tool(&self, params: KernelCallParams, _: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+                if params.tool == "pending" {
+                    self.entered.notify_one();
+                    std::future::pending().await
+                } else {
+                    self.entered.notified().await;
+                    self.documents.arm_accept_fault(1);
+                    Ok(KernelToolResult::text("result whose persistence fails"))
+                }
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<ServerNotification> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+        let events = vec![
+            StreamEvent::ToolUse { id: "fault-call".into(), name: "fault".into(), input: serde_json::json!({}) },
+            StreamEvent::ToolUse { id: "pending-call".into(), name: "pending".into(), input: serde_json::json!({}) },
+            StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None },
+        ];
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![events]))).await;
+        let instance = InstanceId::new("paired-tools");
+        kernel.broker().register(Arc::new(PairedTools { id: instance.clone(), entered: Default::default(),
+            documents: kernel.blocks().clone() }), InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+        let mut failures = kernel.turn_flows().subscribe("turn.failed");
+        spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.expect("fault must interrupt the pending sibling").unwrap();
+        let blocks = kernel.blocks().block_snapshots(context).unwrap();
+        let sibling = blocks.iter().find(|block| block.kind == BlockKind::ToolResult
+            && block.tool_use_id.as_deref() == Some("pending-call")).unwrap();
+        assert_eq!(sibling.status, Status::Error);
+        assert!(sibling.is_error);
+        assert!(sibling.content.to_lowercase().contains("cancel"), "join sibling settlement rather than only sweeping its empty block: {}", sibling.content);
+        assert!(!blocks.iter().any(|block| block.status == Status::Running));
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]
