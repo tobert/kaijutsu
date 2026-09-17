@@ -437,10 +437,23 @@ startup state. `runtime/approval_resume.rs` re-reads uncollected answers on each
 event, handles only Live contexts, and caps wakes at four per event.
 
 Allowed executable asks are claimed before execution, then fill their existing
-command/output pair or author one. Denied and cancelled linked pairs settle
-without execution. Other answers write a seed and request automatic continuation
+command/output pair or author one. Admission reads current pair linkage and
+context state under the same database guard as redemption. A link completed
+after the delivery scan therefore determines pair ownership and whether the
+model performer has changed. Missing approval rows, read errors and malformed
+pair identifiers leave the answer unconsumed. Denied and cancelled linked pairs settle without
+execution. Other answers write a seed and request automatic continuation
 only within the original window; the caller retries and redeems the answer.
 Result reviews belong to their retained command owner and are excluded here.
+
+The earlier handoff remains open: an unlinked ask may belong to a caller still
+publishing its result, or to a caller that will never author a pair. The driver
+cannot distinguish these from linkage alone. Callers need an explicit handoff
+before driver admission; publishing a ledger notification later does not solve
+this because a reviewer can discover the row by polling. The handoff must cover
+session, model, quiet, streaming and MCP callers, including cancellation and
+failed publication. It must not hold a context-wide lock while unrelated work
+or a captured-result review is pending.
 
 Shutdown stops delivery, cancels preparation and commands, and waits for command
 settlement. A spent claim never authorizes replay, including after a preparation

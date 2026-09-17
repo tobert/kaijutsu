@@ -2089,6 +2089,16 @@ pre-call gate also proves that a link failure cannot publish Waiting. Model
 fixtures now use the kernel's journal database rather than unrelated stores.
 Rc diagnostic provenance remains best effort and belongs to its lifecycle audit.
 
+The approval scan also cached linkage before claiming an answer. A session
+could publish its pair between those operations; the driver then spent the
+answer and tried to adopt that session pair as its own Turn pair. A late model
+link could miss the performer-change check entirely. Admission now reads
+linkage, context state and redemption under one database guard. The regression
+fails against both stale-scan assumptions, and fixtures now record real links.
+This closes the scan-to-claim window. The earlier gap still needs explicit
+caller-to-driver ownership transfer: absence of a link cannot distinguish
+pending publication from a caller that will never author a pair.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

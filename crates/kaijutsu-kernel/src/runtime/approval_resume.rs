@@ -46,20 +46,14 @@ enum ExecAction {
     Deferred,
 }
 
-/// What the driver needs off an approval row to act on its answer, lifted
-/// out of the row so nothing below has to name a ledger type.
-///
-/// `pair` is `None` only when the ask names no blocks. Partial or malformed
-/// linkage is an error: it must never authorize a different output pair.
-/// The `PairOwner` decides who a fill has to tell: `Turn` for a model
-/// turn's own pair, `Session` for a connected session's.
+/// Immutable captured inputs used to prepare approved execution. Pair linkage
+/// remains in the ledger and is read again under the claim's database guard.
 struct ExecutableAsk {
     source: String,
     stdin: Option<String>,
     cwd: Option<String>,
     actor: PrincipalId,
     reviewer: PrincipalId,
-    pair: Option<(BlockId, BlockId, crate::PairOwner)>,
     /// The denial as the model reads it on the output block's stderr. Short
     /// on purpose — `kj ledger show <id>` is where the whole ask lives.
     denial: String,
@@ -301,7 +295,43 @@ async fn act_on_executable_answer(
 ) -> ExecAction {
     if stop.is_cancelled() { return ExecAction::Deferred; }
     let source = ask.source.as_str();
-    let linked = ask.pair;
+    // Linkage may have completed since the delivery scan. Read it with context
+    // state and claim under one guard; never spend an answer using a stale pair.
+    let (linked, claim) = {
+        let db = kernel.kernel_db().lock();
+        let row = match db.get_approval(&answer.request_id) {
+            Ok(Some(row)) => row,
+            result => {
+                tracing::error!(ask = %answer.request_id, ?result, "could not read approval before claiming; retaining the answer");
+                return ExecAction::Deferred;
+            }
+        };
+        let linked = match approval_pair(row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::error!(ask = %answer.request_id, %error, "invalid approval linkage; retaining the answer");
+                return ExecAction::Deferred;
+            }
+        };
+        let claim = if matches!(answer.status, crate::ApprovalStatus::Allowed) {
+            match db.get_context(context_id) {
+                Ok(Some(row)) if context_row_is_live(&row) => {
+                    let performer_changed = linked.is_some_and(|(_, _, owner)| owner == crate::PairOwner::Turn)
+                        && row.played_by != Some(ask.actor);
+                    Some((db.redeem_ask(&answer.request_id), performer_changed))
+                }
+                Ok(_) => {
+                    tracing::info!("gate-resume: {context_id} is no longer live; leaving ask {} unclaimed", answer.request_id);
+                    return ExecAction::Deferred;
+                }
+                Err(error) => {
+                    tracing::error!("gate-resume: could not read {context_id} before claiming ask {}: {error}", answer.request_id);
+                    return ExecAction::Deferred;
+                }
+            }
+        } else { None };
+        (linked, claim)
+    };
 
     // A denial runs nothing. A connected session sees its settled pair
     // directly. A model turn does not: its cached mailbox cannot observe an
@@ -326,27 +356,7 @@ async fn act_on_executable_answer(
         return ExecAction::Settled;
     }
 
-    // Validate context state and claim under one database lock. Only the
-    // winner may execute or settle a stale performer's pair. Read faults leave
-    // the approval untouched so delivery can retry after storage recovers.
-    let (claim, performer_changed) = {
-        let db = kernel.kernel_db().lock();
-        match db.get_context(context_id) {
-            Ok(Some(row)) if context_row_is_live(&row) => {
-                let performer_changed = linked.is_some_and(|(_, _, owner)| owner == crate::PairOwner::Turn)
-                    && row.played_by != Some(ask.actor);
-                (db.redeem_ask(&answer.request_id), performer_changed)
-            }
-            Ok(_) => {
-                tracing::info!("gate-resume: {context_id} is no longer live; leaving ask {} unclaimed", answer.request_id);
-                return ExecAction::Deferred;
-            }
-            Err(error) => {
-                tracing::error!("gate-resume: could not read {context_id} before claiming ask {}: {error}", answer.request_id);
-                return ExecAction::Deferred;
-            }
-        }
-    };
+    let (claim, performer_changed) = claim.expect("allowed answers attempt a claim");
     match claim {
         Ok(true) => {}
         Ok(false) => {
@@ -676,16 +686,6 @@ async fn run_delivery(
                 woken.insert(answer.request_id.clone());
                 continue;
             };
-            let pair = match approval_pair(
-                row.command_block_id.as_deref(), row.output_block_id.as_deref(), row.pair_owner,
-            ) {
-                Ok(pair) => pair,
-                Err(reason) => {
-                    tracing::error!("gate-resume: ask {}: {reason}; nothing was run", answer.request_id);
-                    woken.insert(answer.request_id.clone());
-                    continue;
-                }
-            };
             let executable = row.exec_source.clone().map(|source| {
                 let denial = match row.decided_option.as_deref() {
                     Some("cancel") => format!("cancelled by {who} — nothing was run"),
@@ -698,7 +698,6 @@ async fn run_delivery(
                     cwd: row.cwd.clone(),
                     actor,
                     reviewer,
-                    pair,
                     denial,
                 }
             });
@@ -887,6 +886,58 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
+    async fn approval_claim_rechecks_a_pair_linked_after_the_delivery_scan() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
+        for changed_performer in [false, true] {
+            let dispatcher = Arc::new(test_dispatcher_persistent().await);
+            dispatcher.set_self_arc();
+            let kernel = dispatcher.kernel();
+            kernel.broker().set_kj_dispatcher(&dispatcher).await;
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let context = register_context(&dispatcher, Some("late-pair-link"), None, actor);
+            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let source = "echo approved-once";
+            let request = create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "answer before original linkage".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some(source.into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            decide(kernel.kernel_db().lock().conn_for_ledger(), &request, DecideInput {
+                allow: true, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
+                ..Default::default()
+            }).unwrap();
+            let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+            let scanned = ExecutableAsk { source: source.into(), stdin: None, cwd: None,
+                actor, reviewer, denial: "not denied".into() };
+            let (command, output) = test_pair(kernel, context, actor, source);
+            let owner = if changed_performer { crate::PairOwner::Turn } else { crate::PairOwner::Session };
+            kernel.kernel_db().lock().link_ask_blocks(&request, &command, &output, owner).unwrap();
+            if changed_performer {
+                kernel.kernel_db().lock().update_context_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
+            }
+            let action = act_on_executable_answer(kernel, context, actor, &answer, &scanned, "reviewer", &tokio_util::sync::CancellationToken::new()).await;
+            assert!(matches!(action, ExecAction::Settled), "a fresh link determines session delivery or performer rejection");
+            let blocks = kernel.blocks().block_snapshots(context).unwrap();
+            assert_eq!(blocks.len(), 2, "the original pair must remain the only pair");
+            let result = kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap();
+            if changed_performer {
+                assert_eq!(result.status, Status::Error);
+                assert!(result.stderr.as_deref().unwrap().contains("performer changed"));
+                assert!(!result.content.contains("approved-once"), "a stale scan cannot bypass performer validation");
+            } else {
+                assert_eq!(result.status, Status::Done);
+                assert_eq!(result.content, "approved-once\n");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn unlinked_approved_execution_retains_its_pair_and_outcome() {
         use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
         use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
@@ -918,7 +969,7 @@ mod lifetime_tests {
             }).unwrap();
             let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
             let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None,
-                actor, reviewer, pair: None, denial: "not denied".into() };
+                actor, reviewer, denial: "not denied".into() };
             if fault == "setup" {
                 kernel.kernel_db().lock().conn_for_ledger().execute_batch(
                     "CREATE TRIGGER reject_approved_receipt BEFORE INSERT ON shell_operations
@@ -1025,6 +1076,7 @@ mod lifetime_tests {
                 rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
                 exec_source: Some("echo must-not-run".into()), exec_stdin: None, continuation_epoch: None, env: vec![],
             }).unwrap();
+            kernel.kernel_db().lock().link_ask_blocks(&request, &command, &output, owner).unwrap();
             if cancelled { cancel(kernel.kernel_db().lock().conn_for_ledger(), &request, actor.as_bytes()).unwrap(); }
             else { decide(kernel.kernel_db().lock().conn_for_ledger(), &request, DecideInput {
                 allow: false, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
@@ -1032,7 +1084,7 @@ mod lifetime_tests {
             }).unwrap(); }
             let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
             let ask = ExecutableAsk { source: "echo must-not-run".into(), stdin: None, cwd: None, actor, reviewer,
-                pair: Some((command, output, owner)), denial: "denied; nothing ran".into() };
+                denial: "denied; nothing ran".into() };
             kernel.blocks().arm_accept_fault(1);
             let stop = tokio_util::sync::CancellationToken::new();
             let action = act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
@@ -1128,10 +1180,13 @@ mod lifetime_tests {
                     allow: true, decided_by: Some(Answerer { principal: reviewer.as_bytes(), context: None }),
                     ..Default::default()
                 }).unwrap();
+                if let Some((command, output, owner)) = pair {
+                    db.link_ask_blocks(&request_id, &command, &output, owner).unwrap();
+                }
                 db.undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request_id).unwrap()
             };
             let ask = ExecutableAsk { source: "echo approved-once".into(), stdin: None, cwd: None,
-                actor, reviewer, pair, denial: "not denied".into() };
+                actor, reviewer, denial: "not denied".into() };
             let before = kernel.blocks().block_snapshots(context).unwrap();
             kernel.kernel_db().lock().conn_for_ledger().execute_batch(
                 "ALTER TABLE contexts RENAME TO unavailable_contexts"

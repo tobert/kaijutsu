@@ -1420,9 +1420,17 @@ owners, contexts and performers are rejected. Original executable asks retain
 receipt lookup through their pair when a result-review ask becomes current.
 Close the remaining ownership and delivery handoffs before declaring approval
 settlement migrated.
-The ledger can expose an answer before its original caller finishes linking
-blocks; driver admission and setup must agree on when ownership is transferable.
-Audit link replacement and ask/context/actor validation together with that race.
+Admission now re-reads pair linkage under the same database guard as context
+validation and redemption. A pair linked after the delivery scan keeps its
+Session/Turn owner and participates in the performer-change check. Regression
+coverage reproduces both stale-scan failures.
+
+The ledger can still expose an answer before its original caller finishes
+linking any blocks. An unlinked ask does not say whether publication is pending
+or the caller has no pair. Add an explicit caller-to-driver handoff across
+session, model, quiet, streaming and MCP paths; cancellation or publication
+failure must not release source for accidental execution. Delaying notification
+alone cannot protect against polling. See docs/gate-resume.md, "Still open".
 
 ## Asks vs forms — decision open (2026-08-22)
 

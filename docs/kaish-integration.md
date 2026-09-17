@@ -135,7 +135,10 @@ These are source observations, not promises that all paths behave alike.
   them. Original execution asks remain usable for receipt lookup when a later
   result-review ask becomes current. Session pre-call settlement includes its
   ask link and Waiting receipt in the same acceptance; a failed link publishes
-  no partial result.
+  no partial result. Approval admission re-reads linkage with context state
+  under the redemption guard, so a link completed after the delivery scan
+  controls owner and performer checks. The earlier caller-to-driver handoff,
+  before any pair is linked, remains open.
 - `runtime/interactive.rs` admits shell submissions, constructs the addressed
   context's shell, authors the pair/receipt, and applies PreCall on the kernel
   worker. Accepted work survives RPC teardown. Runtime consumes the captured
