@@ -2014,6 +2014,14 @@ made cancellation and a provider terminal ready together: the unbiased select
 could report a transport error instead of the requested cancellation. The
 stream select now gives the hard cancel priority over ready provider output.
 
+Generic block status writes also synchronize a ToolResult's `is_error` in the
+same acceptance, including the `completeBlock` client path. Command failures
+had published Error while hydration still classified their results as success.
+Metadata now precedes terminal status, and replay preserves both fields.
+Fault injection, real nonzero shell exits, and an SSH completion test cover the
+contract. Receipt registration and approval linkage still need their separate
+ownership transfer; consistent error flags do not close that handoff.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

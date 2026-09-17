@@ -632,6 +632,13 @@ fn authored_tool_results_preserve_their_initial_status() {
             let output = blocks.iter().find(|block| block.id == result).unwrap();
             assert_eq!(output.status, status);
             assert_eq!(output.is_error, status == Status::Error);
+            let final_status = if status == Status::Error { Status::Done } else { Status::Error };
+            kj.complete_block(context, &result, final_status, final_status == Status::Error, Some(9)).await.unwrap();
+            let completed = kj.get_blocks(context, &BlockQuery::All).await.unwrap();
+            let output = completed.iter().find(|block| block.id == result).unwrap();
+            assert_eq!(output.status, final_status);
+            assert_eq!(output.is_error, final_status == Status::Error);
+            assert_eq!(output.exit_code, Some(9));
         }
     });
 }

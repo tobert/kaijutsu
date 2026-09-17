@@ -1398,7 +1398,7 @@ a fork and teaches nothing the first copy didn't. Fix has to keep the
 standalone-error path (when the parent's tool result already flushed) and
 skip only the duplicate — a judgment call, not mechanical.
 
-## Receipt setup ownership and remaining result flags
+## Receipt setup ownership
 
 `pending_shell_operation_receipt` records Waiting before receipt registration
 and ask linkage finish. A failure there can leave a Waiting pair without its
@@ -1409,10 +1409,6 @@ still logs linkage failures after publishing Waiting. Make the transfer and
 retry owner explicit before declaring model settlement migrated. Runtime
 interactive/structured/approval setup still has separate initial pair writes;
 the new explicit initial-status parameter does not close those ownership gaps.
-Other result-status writers also need the error-flag audit: `completeBlock` is
-intended for tool-call completion but accepts result IDs, and generic
-`set_status` does not update a result's `is_error`. The shared model path is
-fixed; do not infer the same guarantee for command/receipt completion yet.
 
 ## Asks vs forms — decision open (2026-08-22)
 

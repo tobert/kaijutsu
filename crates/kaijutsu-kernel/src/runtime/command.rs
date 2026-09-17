@@ -766,6 +766,7 @@ mod fill_tests {
                 &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), CommandRunOptions::default()).await.unwrap();
             let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
             assert_eq!(block.status, Status::Error, "exit {exit} is a command failure");
+            assert!(block.is_error, "exit {exit} must also hydrate as a failed tool result");
             let envelope = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().envelope.unwrap();
             assert!(envelope.is_error());
             assert_eq!(envelope.exit_code, Some(exit));

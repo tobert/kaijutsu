@@ -205,6 +205,8 @@ These are source observations, not promises that all paths behave alike.
   text. Done ends consumption immediately. Hard cancellation preserves only
   accepted content and drains terminal usage under one absolute idle deadline.
   A requested hard cancel takes priority over a ready chunk, error or EOF.
+  Generic status writes also synchronize the tool-result error flag, including
+  command outcomes and client completion; metadata precedes terminal status.
   Approval linkage and receipt ownership transfer remain open.
 - Timed `kj drive --track <name> --score-at <tick>` pairs a turn lease with
   timeline-owned preparation before model work starts. Rc chooses the target

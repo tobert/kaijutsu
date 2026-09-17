@@ -1501,7 +1501,8 @@ impl BlockStore {
         })
     }
 
-    /// Set the status of a block.
+    /// Set status; tool results derive their error flag from Status::Error in
+    /// the same acceptance. Other block kinds only change status.
     pub fn set_status(
         &self,
         context_id: ContextId,
@@ -1511,7 +1512,13 @@ impl BlockStore {
         self.accept(context_id, |entry| {
             let mut events = Vec::new();
             let principal_id = self.principal_id();
-            entry.doc.set_status(block_id, status)?;
+            let is_result = entry.doc.get_block_header(block_id)
+                .is_some_and(|header| header.kind == BlockKind::ToolResult);
+            if is_result {
+                entry.doc.set_tool_result_state(block_id, status, status == Status::Error)?;
+            } else {
+                entry.doc.set_status(block_id, status)?;
+            }
             entry.touch(principal_id);
             let version = entry.version();
             let header = entry.doc.get_block_header(block_id).expect(
@@ -1519,9 +1526,14 @@ impl BlockStore {
             );
             let ops = SyncPayload::from_updated_header(header);
 
-            // Emit flow event. Output is not carried here — it is a struct field
-            // that can't travel via DTE ops and rides its own `OutputChanged`
-            // event (see `set_output`).
+            // Readers must have the result's error flag before terminal status.
+            if is_result {
+                let metadata = entry.doc.get_block_snapshot(block_id)
+                    .expect("accepted result remains under this guard").metadata();
+                events.push(BlockFlow::MetadataChanged {
+                    context_id, block_id: *block_id, metadata, version, source: OpSource::Local,
+                });
+            }
             events.push(BlockFlow::StatusChanged {
                 context_id,
                 block_id: *block_id,
@@ -5938,6 +5950,42 @@ mod tests {
     // ====================================================================
     // 1. Crash-Recovery: drop + reload
     // ====================================================================
+
+    #[test]
+    fn result_status_changes_publish_and_replay_the_error_flag() {
+        for status in [Status::Error, Status::Done, Status::Running, Status::Waiting] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, mut store, context, workspace) = fresh_db_store(dir.path());
+            let flows = Arc::new(crate::flows::FlowBus::new(32));
+            store.block_flows = Some(flows.clone());
+            let call = store.insert_tool_call(context, None, None, "shell", serde_json::json!({}), None).unwrap();
+            let result = store.insert_tool_result(context, &call, Some(&call), "retained output",
+                status != Status::Error, Some(7), None).unwrap();
+            let mut events = flows.subscribe("block.*");
+            store.arm_accept_fault(1);
+            assert!(store.set_status(context, &result, status).is_err());
+            assert!(events.try_recv().is_none());
+            assert_eq!(store.get_block_snapshot(context, &result).unwrap().unwrap().is_error, status != Status::Error);
+            store.set_status(context, &result, status).unwrap();
+            let output = store.get_block_snapshot(context, &result).unwrap().unwrap();
+            assert_eq!(output.is_error, status == Status::Error, "{status:?}: hydration must agree with status");
+            let BlockFlow::MetadataChanged { metadata, version: metadata_version, .. } = events.try_recv().unwrap().payload
+                else { panic!("result error metadata must precede status") };
+            assert_eq!(metadata.is_error, status == Status::Error);
+            let BlockFlow::StatusChanged { status: observed, version, .. } = events.try_recv().unwrap().payload
+                else { panic!("result status follows metadata") };
+            assert_eq!(observed, status);
+            assert_eq!(metadata_version, version);
+            assert!(events.try_recv().is_none());
+            drop(store);
+            let restored = drop_and_reload(db, workspace);
+            let output = restored.get_block_snapshot(context, &result).unwrap().unwrap();
+            assert_eq!(output.status, status);
+            assert_eq!(output.is_error, status == Status::Error);
+            assert_eq!(output.content, "retained output");
+            assert_eq!(output.exit_code, Some(7));
+        }
+    }
 
     #[test]
     fn tool_result_acceptance_keeps_pair_content_and_error_flag_together_on_reload() {
